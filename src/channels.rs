@@ -56,6 +56,10 @@ impl Channel {
 }
 
 impl Channels {
+    pub fn get_channel(&self, channel_id: u32) -> Option<&Channel> {
+        self.channel_list.get(&channel_id)
+    }
+
     pub fn get_parent(&self, channel: &Channel) -> Option<&Channel> {
         match channel.parent_id {
             Some(parent_id) => self.channel_list.get(&parent_id),
@@ -68,6 +72,4 @@ impl Channels {
             .filter(|c| c.parent_id == Some(channel.id))
             .collect()
     }
-
-
 }

@@ -1,1 +1,1 @@
-pub type NodeIdentifier = i64;
+pub type NodeIdentifier = u16;

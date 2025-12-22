@@ -6,14 +6,21 @@ edition = "2021"
 [dependencies]
 chrono = "0.4.41"
 cidr = "0.3.2"
+config = "0.15.19"
 enumflags2 = "0.7.12"
 hex = "0.4.3"
 maxminddb = { version = "0.26.0", features = ["mmap", "simdutf8"] }
 parking_lot = { version = "0.12.3", features = ["arc_lock", "hardware-lock-elision"] }
+paste = "1.0.15"
 prost = "0.13.5"
 prost-types = "0.13.5"
+rustls = "0.23.35"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
 tokio = { version = "1.45.0", features = ["full"] }
-toml = "0.8.22"
+tokio-rustls = "0.26.4"
+tracing-appender = { version = "0.2.4", features = ["parking_lot"] }
+tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde"] }
 
 [build-dependencies]
 prost-build = "0.13.5"
