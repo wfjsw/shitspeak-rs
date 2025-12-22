@@ -12,6 +12,7 @@ hex = "0.4.3"
 maxminddb = { version = "0.26.0", features = ["mmap", "simdutf8"] }
 parking_lot = { version = "0.12.3", features = ["arc_lock", "hardware-lock-elision"] }
 paste = "1.0.15"
+ppp = "2.3.0"
 prost = "0.13.5"
 prost-types = "0.13.5"
 rustls = "0.23.35"

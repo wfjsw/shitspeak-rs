@@ -25,7 +25,7 @@ pub struct Client {
 
     real_ip_address: IpAddr,
     tcp_address: SocketAddr,
-    udp_address: SocketAddr,
+    udp_address: Option<SocketAddr>,
     local_address: SocketAddr,
 
     connection: TlsStream<TcpStream>,
@@ -60,7 +60,7 @@ impl Client {
         session_id: ClientSessionIdentifier,
         real_ip_address: IpAddr,
         tcp_address: SocketAddr,
-        udp_address: SocketAddr,
+        udp_address: Option<SocketAddr>,
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
         user_version: UserVersion,

@@ -13,6 +13,7 @@ mod server;
 mod types;
 mod voice_crypto;
 mod client_certificate_verifier;
+mod proxy_protocol;
 
 mod mumble_proto {
     include!(concat!(env!("OUT_DIR"), "/mumble_proto.rs"));

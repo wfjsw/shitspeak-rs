@@ -11,6 +11,7 @@ pub struct Config {
     pub register_name: String,
     pub cert_path: String,
     pub key_path: String,
+    pub allowed_proxies: Vec<String>,
 }
 
 impl Config {
