@@ -1,4 +1,4 @@
-pub enum UserState {
+pub enum ConnectionState {
     Connected,
     ServerSentVersion,
     ClientSentVersion,
@@ -7,8 +7,8 @@ pub enum UserState {
     Dead
 }
 
-impl Default for UserState {
+impl Default for ConnectionState {
     fn default() -> Self {
-        UserState::Connected
+        ConnectionState::Connected
     }
 }

@@ -6,19 +6,19 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use parking_lot::{lock_api::MappedMutexGuard, Mutex, MutexGuard, RwLock};
-use tokio::net::TcpStream;
+use tokio::{io::AsyncReadExt, net::TcpStream};
 use tokio_rustls::server::TlsStream;
 
-use crate::client::{
+use crate::{client::{
     client_session_identifier::ClientSessionIdentifier,
     client_session_state::ClientSessionState,
     client_stats::ClientStats,
     options::ClientOptions,
-    states::UserState,
+    states::ConnectionState,
     udp_state::UdpState,
     user_info::{UserInfo, UserInfoExtended},
     user_version::UserVersion,
-};
+}, messages::{Message}};
 
 pub struct Client {
     session_id: ClientSessionIdentifier,
@@ -29,7 +29,7 @@ pub struct Client {
     local_address: SocketAddr,
 
     connection: TlsStream<TcpStream>,
-    connection_state: Mutex<UserState>,
+    connection_state: Mutex<ConnectionState>,
 
     // This is only concerned if the client is a local client
     has_userlist: Option<AtomicBool>,
@@ -104,7 +104,7 @@ impl Client {
             user_info_extended: None,
             options: RwLock::new(ClientOptions::default()),
             session_state: None,
-            connection_state: Mutex::new(UserState::Connected),
+            connection_state: Mutex::new(ConnectionState::Connected),
         })
     }
 
@@ -148,7 +148,11 @@ impl Client {
     }
 
     pub fn get_node_id(&self) -> u16 {
-        self.session_id.node_id()
+        self.session_id.get_node_id()
+    }
+
+    pub fn get_local_session_id(&self) -> u32 {
+        self.session_id.get_local_session_id()
     }
 
     pub fn get_tokens(&self) -> Option<HashSet<String>> {
@@ -206,5 +210,8 @@ impl Client {
             .map_or(false, |certs| !certs.is_empty())
     }
 
-    pub fn disconnect(&self) {}
+    pub fn disconnect(&self) {
+
+    }
+
 }

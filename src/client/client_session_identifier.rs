@@ -36,6 +36,14 @@ impl ClientSessionIdentifier {
     pub fn to_u32(self) -> u32 {
         ((self.node_id as u32) << 20) | (self.local_session_id & MAX_LOCAL_SESSION_ID)
     }
+
+    pub fn get_node_id(&self) -> u16 {
+        self.node_id
+    }
+
+    pub fn get_local_session_id(&self) -> u32 {
+        self.local_session_id
+    }
 }
 
 impl From<ClientSessionIdentifier> for u32 {

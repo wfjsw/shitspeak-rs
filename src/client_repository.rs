@@ -11,7 +11,6 @@ use tokio_rustls::server::TlsStream;
 use crate::{
     client::{
         client::Client, client_session_identifier::ClientSessionIdentifier,
-        user_version::UserVersion,
     },
     constants::MAX_LOCAL_SESSION_ID,
 };
@@ -41,7 +40,7 @@ impl ClientRepository {
     }
 
     pub fn allocate_client(
-        &mut self,
+        &self,
         real_ip_address: IpAddr,
         tcp_address: SocketAddr,
         udp_address: Option<SocketAddr>,
@@ -95,16 +94,16 @@ impl ClientRepository {
         client
     }
 
-    pub fn add_remote_client(&mut self, id: ClientSessionIdentifier, client: Arc<Box<Client>>) {
+    pub fn add_remote_client(&self, id: ClientSessionIdentifier, client: Arc<Box<Client>>) {
         if client.get_node_id() == self.local_node_id {
             panic!("Not supposed to add a remote client with the local node ID");
         }
-        
+
         let client = Arc::clone(&client);
         self.clients.write().insert(id, client);
     }
 
-    pub fn remove_client(&mut self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
+    pub fn remove_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
         if let Some(client) = self.clients.write().remove(&id) {
 
             if client.get_node_id() == self.local_node_id {
@@ -133,7 +132,7 @@ impl ClientRepository {
         }
     }
 
-    pub fn clear_clients_from_node(&mut self, node_id: u16) {
+    pub fn clear_clients_from_node(&self, node_id: u16) {
         if node_id == self.local_node_id {
             panic!("Not supposed to clear clients from the local node");
         }
@@ -149,11 +148,11 @@ impl ClientRepository {
 
         for id in ids_to_remove {
             clients.remove(&id);
-            free_ids.insert(id.local_session_id);
+            free_ids.insert(id.get_local_session_id());
         }
     }
 
     pub fn get_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
-        self.clients.lock().get(&id).cloned()
+        self.clients.read().get(&id).cloned()
     }
 }

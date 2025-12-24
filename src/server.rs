@@ -33,7 +33,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(config: Config) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
         let listen_address = config
             .listen
             .to_socket_addrs()?
@@ -61,7 +61,7 @@ impl Server {
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-        Ok(Server {
+        Ok(Arc::new(Box::new(Server {
             node_identifier: config.node_id,
             allowed_proxies,
             tcp_listener,
@@ -69,10 +69,10 @@ impl Server {
             udp_socket,
             clients: ClientRepository::new(config.node_id),
             codec_info: CodecInfo::default(),
-        })
+        })))
     }
 
-    pub async fn run(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(self: Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
         println!("Server is running on {}", self.tcp_listener.local_addr()?);
         loop {
             let (tcp_stream, remote_addr) = self.tcp_listener.accept().await?;
@@ -90,7 +90,7 @@ impl Server {
     }
 
     pub async fn handle_incoming_connection(
-        &mut self,
+        &self,
         tcp_stream: tokio::net::TcpStream,
         remote_addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
