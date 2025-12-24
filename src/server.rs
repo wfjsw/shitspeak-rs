@@ -75,10 +75,13 @@ impl Server {
     pub async fn run(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
         println!("Server is running on {}", self.tcp_listener.local_addr()?);
         loop {
-            let (tcp_stream, addr) = self.tcp_listener.accept().await?;
+            let (tcp_stream, remote_addr) = self.tcp_listener.accept().await?;
             let server = Arc::clone(&self);
             tokio::spawn(async move {
-                if let Err(e) = server.handle_incoming_connection(tcp_stream, addr).await {
+                if let Err(e) = server
+                    .handle_incoming_connection(tcp_stream, remote_addr)
+                    .await
+                {
                     eprintln!("Error handling connection: {}", e);
                 }
             });
@@ -87,31 +90,31 @@ impl Server {
     }
 
     pub async fn handle_incoming_connection(
-        &self,
+        &mut self,
         tcp_stream: tokio::net::TcpStream,
-        addr: std::net::SocketAddr,
+        remote_addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let real_ip = if self
             .allowed_proxies
             .iter()
-            .any(|proxy| proxy.contains(&addr.ip()))
+            .any(|proxy| proxy.contains(&remote_addr.ip()))
         {
             match get_proxy_protocol_real_ip(&tcp_stream).await? {
                 Some(ip) => ip,
-                None => addr.ip(),
+                None => remote_addr.ip(),
             }
         } else {
-            addr.ip()
+            remote_addr.ip()
         };
 
-        // self.clients.allocate_client(
-        //     real_ip,
-        //     addr.ip(),
-        //     None,
-        //     addr,
-        //     tcp_stream,
-        //     UserVersion::default(),
-        // );
+        let local_addr = tcp_stream.local_addr()?;
+
+        let tls_acceptor = self.tls_acceptor.clone();
+        let tls_stream = tls_acceptor.accept(tcp_stream).await?;
+
+        let client =
+            self.clients
+                .allocate_client(real_ip, remote_addr, None, local_addr, tls_stream);
 
         Ok(())
     }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+aws-lc-rs = "1.15.2"
 chrono = "0.4.41"
 cidr = "0.3.2"
 config = "0.15.19"
