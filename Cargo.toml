@@ -28,6 +28,8 @@ tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde"] }
 
 # local proc-macro to derive message helpers
 message_macro = { path = "src/messages/macros" }
+os_info = "3.14.0"
 
 [build-dependencies]
+chrono = "0.4.41"
 prost-build = "0.13.5"

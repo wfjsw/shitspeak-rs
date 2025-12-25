@@ -18,7 +18,7 @@ use crate::{client::{
     udp_state::UdpState,
     user_info::{UserInfo, UserInfoExtended},
     user_version::UserVersion,
-}, messages::{Message}};
+}, messages::{Message, ReadMessageExt, WriteMessageExt}};
 
 pub struct Client {
     session_id: ClientSessionIdentifier,
@@ -28,7 +28,7 @@ pub struct Client {
     udp_address: Option<SocketAddr>,
     local_address: SocketAddr,
 
-    connection: TlsStream<TcpStream>,
+    connection: Mutex<TlsStream<TcpStream>>,
     connection_state: Mutex<ConnectionState>,
 
     // This is only concerned if the client is a local client
@@ -90,7 +90,7 @@ impl Client {
             tcp_address,
             udp_address,
             local_address,
-            connection,
+            connection: Mutex::new(connection),
             user_version: None,
             has_userlist: None,
             login_time: now,
@@ -205,7 +205,8 @@ impl Client {
 
     // FIXME: not sure if it is verified or just exists
     pub fn is_verified(&self) -> bool {
-        let (_, conn) = self.connection.get_ref();
+        let conn = self.connection.lock();
+        let (_, conn) = conn.get_ref();
         conn.peer_certificates()
             .map_or(false, |certs| !certs.is_empty())
     }
@@ -214,4 +215,21 @@ impl Client {
 
     }
 
+    pub fn get_connection_state(&self) -> ConnectionState {
+        let connection_state = self.connection_state.lock();
+        *connection_state
+    }
+
+    pub fn set_connection_state(&self, state: ConnectionState) {
+        let mut connection_state = self.connection_state.lock();
+        *connection_state = state;
+    }
+
+    pub async fn read_proto_message(&self) -> Result<Message, Box<dyn std::error::Error>> {
+        self.connection.lock().read_proto_message().await
+    }
+
+    pub async fn write_proto_message(&self, message: &Message) -> Result<(), Box<dyn std::error::Error>> {
+        self.connection.lock().write_proto_message(message).await
+    }
 }

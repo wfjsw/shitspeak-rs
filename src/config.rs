@@ -11,6 +11,9 @@ pub struct Config {
     pub register_name: String,
     pub cert_path: String,
     pub key_path: String,
+    pub send_version: bool,
+    pub send_build_info: bool,
+    pub send_os_info: bool,
     pub allowed_proxies: Vec<String>,
 }
 

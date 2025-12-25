@@ -11,7 +11,11 @@ use rustls::version::{TLS12, TLS13};
 use tokio::io::ReadBuf;
 use tokio_rustls::TlsAcceptor;
 
+use crate::client::states::ConnectionState;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
+use crate::constants::{release, APP_PROTO_VER};
+use crate::messages::{Message, WriteMessageExt};
+use crate::mumble_proto::Version;
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
 use crate::{
     client_repository::ClientRepository, codec_info::CodecInfo, config::Config,
@@ -21,6 +25,10 @@ use crate::{
 pub struct Server {
     node_identifier: NodeIdentifier,
 
+    // Config
+    send_version: bool,
+    send_build_info: bool,
+    send_os_info: bool,
     allowed_proxies: Vec<AnyIpCidr>,
 
     tcp_listener: tokio::net::TcpListener,
@@ -64,6 +72,9 @@ impl Server {
         Ok(Arc::new(Box::new(Server {
             node_identifier: config.node_id,
             allowed_proxies,
+            send_version: config.send_version,
+            send_build_info: config.send_build_info,
+            send_os_info: config.send_os_info,
             tcp_listener,
             tls_acceptor,
             udp_socket,
@@ -109,14 +120,52 @@ impl Server {
 
         let local_addr = tcp_stream.local_addr()?;
 
-        let tls_acceptor = self.tls_acceptor.clone();
-        let tls_stream = tls_acceptor.accept(tcp_stream).await?;
-
         let client =
             self.clients
                 .allocate_client(real_ip, remote_addr, None, local_addr, tls_stream);
 
-        Ok(())
+        let tls_acceptor = self.tls_acceptor.clone();
+        let mut tls_stream = tls_acceptor.accept(tcp_stream).await?;
+
+        let os_info = os_info::get();
+
+        let version_message = Version {
+            version_v1: if self.send_version {
+                Some(APP_PROTO_VER.into())
+            } else {
+                None
+            },
+            version_v2: if self.send_version {
+                Some(APP_PROTO_VER.into())
+            } else {
+                None
+            },
+            release: if self.send_build_info {
+                Some(release())
+            } else {
+                None
+            },
+            os: if self.send_os_info {
+                Some(os_info.os_type().to_string())
+            } else {
+                None
+            },
+            os_version: if self.send_os_info {
+                Some(os_info.version().to_string())
+            } else {
+                None
+            },
+        };
+
+        tls_stream
+            .write_proto_message(&Message::Version(version_message))
+            .await?;
+
+        client.set_connection_state(ConnectionState::ServerSentVersion);
+
+        loop {
+            if client
+        }
     }
 
     pub async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>> {

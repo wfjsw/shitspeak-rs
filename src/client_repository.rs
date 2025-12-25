@@ -73,6 +73,7 @@ impl ClientRepository {
             local_address,
             connection,
         );
+        
         let client = Arc::new(client);
 
         self.clients
