@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use parking_lot::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 
@@ -39,7 +39,7 @@ impl ClientRepository {
         }
     }
 
-    pub fn allocate_client(
+    pub async fn allocate_local_client(
         &self,
         real_ip_address: IpAddr,
         tcp_address: SocketAddr,
@@ -47,13 +47,17 @@ impl ClientRepository {
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
     ) -> Arc<Box<Client>> {
+        let mut clients_guard = self.clients.write().await;
+        let mut client_by_udp_address_guard = self.clients_by_udp_address.write().await;
+        let mut client_by_host_guard = self.clients_by_host.write().await;
+        let mut free_ids_guard = self.free_ids.lock().await;
+
         let id = {
-            let mut free_ids = self.free_ids.lock();
-            if let Some(free_id) = free_ids.iter().next().copied() {
-                free_ids.remove(&free_id);
+            if let Some(free_id) = free_ids_guard.iter().next().copied() {
+                free_ids_guard.remove(&free_id);
                 free_id
             } else {
-                let mut allocation_pointer = self.allocation_pointer.lock();
+                let mut allocation_pointer = self.allocation_pointer.lock().await;
                 let id = *allocation_pointer;
 
                 if id > MAX_LOCAL_SESSION_ID {
@@ -65,7 +69,7 @@ impl ClientRepository {
             }
         };
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
-        let client = Client::new(
+        let client = Client::new_local(
             client_identifier,
             real_ip_address,
             tcp_address,
@@ -76,55 +80,55 @@ impl ClientRepository {
         
         let client = Arc::new(client);
 
-        self.clients
-            .write()
-            .insert(client_identifier, Arc::clone(&client));
+        clients_guard.insert(client_identifier, Arc::clone(&client));
 
         if let Some(udp_address) = udp_address {
-            self.clients_by_udp_address
-                .write()
+            client_by_udp_address_guard
                 .insert(udp_address, client_identifier);
         }
 
-        self.clients_by_host
-            .write()
-            .entry(tcp_address.ip())
-            .or_insert_with(HashSet::new)
-            .insert(client_identifier);
+        if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
+            set.insert(client_identifier);
+        } else {
+            let mut set = HashSet::new();
+            set.insert(client_identifier);
+            client_by_host_guard.insert(tcp_address.ip(), set);
+        }
 
         client
     }
 
-    pub fn add_remote_client(&self, id: ClientSessionIdentifier, client: Arc<Box<Client>>) {
+    pub async fn add_remote_client(&self, id: ClientSessionIdentifier, client: Arc<Box<Client>>) {
         if client.get_node_id() == self.local_node_id {
             panic!("Not supposed to add a remote client with the local node ID");
         }
 
         let client = Arc::clone(&client);
-        self.clients.write().insert(id, client);
+        self.clients.write().await.insert(id, client);
     }
 
-    pub fn remove_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
-        if let Some(client) = self.clients.write().remove(&id) {
+    pub async fn remove_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
+        let mut clients_guard = self.clients.write().await;
+        let mut client_by_udp_address_guard = self.clients_by_udp_address.write().await;
+        let mut client_by_host_guard = self.clients_by_host.write().await;
+        let mut free_ids_guard = self.free_ids.lock().await;
 
+        if let Some(client) = clients_guard.remove(&id) {
             if client.get_node_id() == self.local_node_id {
                 if let Some(udp_address) = client.get_udp_address() {
-                    self.clients_by_udp_address.write().remove(&udp_address);
+                    client_by_udp_address_guard.remove(&udp_address);
                 }
 
                 let tcp_address = client.get_tcp_address();
 
-                self.clients_by_host
-                    .write()
-                    .entry(tcp_address.ip())
-                    .and_modify(|set| {
-                        set.remove(&id);
-                        if set.is_empty() {
-                            self.clients_by_host.write().remove(&tcp_address.ip());
-                        }
-                    });
+                if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
+                    set.remove(&id);
+                    if set.is_empty() {
+                        client_by_host_guard.remove(&tcp_address.ip());
+                    }
+                }
 
-                self.free_ids.lock().insert(id.local_session_id);
+                free_ids_guard.insert(id.local_session_id);
             }
 
             Some(client)
@@ -133,13 +137,13 @@ impl ClientRepository {
         }
     }
 
-    pub fn clear_clients_from_node(&self, node_id: u16) {
+    pub async fn clear_clients_from_node(&self, node_id: u16) {
         if node_id == self.local_node_id {
             panic!("Not supposed to clear clients from the local node");
         }
 
-        let mut clients = self.clients.write();
-        let mut free_ids = self.free_ids.lock();
+        let mut clients = self.clients.write().await;
+        let mut free_ids = self.free_ids.lock().await;
 
         let ids_to_remove: Vec<ClientSessionIdentifier> = clients
             .keys()
@@ -153,7 +157,8 @@ impl ClientRepository {
         }
     }
 
-    pub fn get_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
-        self.clients.read().get(&id).cloned()
+    pub async fn get_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
+        self.clients.read().await.get(&id).cloned()
     }
+
 }

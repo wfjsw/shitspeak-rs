@@ -119,52 +119,81 @@ impl Server {
         };
 
         let local_addr = tcp_stream.local_addr()?;
-
-        let client =
-            self.clients
-                .allocate_client(real_ip, remote_addr, None, local_addr, tls_stream);
-
         let tls_acceptor = self.tls_acceptor.clone();
         let mut tls_stream = tls_acceptor.accept(tcp_stream).await?;
 
         let os_info = os_info::get();
 
-        let version_message = Version {
-            version_v1: if self.send_version {
-                Some(APP_PROTO_VER.into())
-            } else {
-                None
-            },
-            version_v2: if self.send_version {
-                Some(APP_PROTO_VER.into())
-            } else {
-                None
-            },
-            release: if self.send_build_info {
-                Some(release())
-            } else {
-                None
-            },
-            os: if self.send_os_info {
-                Some(os_info.os_type().to_string())
-            } else {
-                None
-            },
-            os_version: if self.send_os_info {
-                Some(os_info.version().to_string())
-            } else {
-                None
-            },
-        };
-
         tls_stream
-            .write_proto_message(&Message::Version(version_message))
+            .write_proto_message(&Message::Version(Version {
+                version_v1: if self.send_version {
+                    Some(APP_PROTO_VER.into())
+                } else {
+                    None
+                },
+                version_v2: if self.send_version {
+                    Some(APP_PROTO_VER.into())
+                } else {
+                    None
+                },
+                release: if self.send_build_info {
+                    Some(release())
+                } else {
+                    None
+                },
+                os: if self.send_os_info {
+                    Some(os_info.os_type().to_string())
+                } else {
+                    None
+                },
+                os_version: if self.send_os_info {
+                    Some(os_info.version().to_string())
+                } else {
+                    None
+                },
+            }))
             .await?;
 
-        client.set_connection_state(ConnectionState::ServerSentVersion);
+        let client = self
+            .clients
+            .allocate_local_client(real_ip, remote_addr, None, local_addr, tls_stream)
+            .await;
 
         loop {
-            if client
+            // Handle incoming messages from the client
+            match client.read_proto_message().await {
+                Ok(message) => match message {
+                    Message::Version(version) => todo!(),
+                    Message::UDPTunnel(items) => todo!(),
+                    Message::Authenticate(authenticate) => todo!(),
+                    Message::Ping(ping) => todo!(),
+                    Message::Reject(reject) => todo!(),
+                    Message::ServerSync(server_sync) => todo!(),
+                    Message::ChannelRemove(channel_remove) => todo!(),
+                    Message::ChannelState(channel_state) => todo!(),
+                    Message::UserRemove(user_remove) => todo!(),
+                    Message::UserState(user_state) => todo!(),
+                    Message::BanList(ban_list) => todo!(),
+                    Message::TextMessage(text_message) => todo!(),
+                    Message::PermissionDenied(permission_denied) => todo!(),
+                    Message::ACL(acl) => todo!(),
+                    Message::QueryUsers(query_users) => todo!(),
+                    Message::CryptSetup(crypt_setup) => todo!(),
+                    Message::ContextActionModify(context_action_modify) => todo!(),
+                    Message::ContextAction(context_action) => todo!(),
+                    Message::UserList(user_list) => todo!(),
+                    Message::VoiceTarget(voice_target) => todo!(),
+                    Message::PermissionQuery(permission_query) => todo!(),
+                    Message::CodecVersion(codec_version) => todo!(),
+                    Message::UserStats(user_stats) => todo!(),
+                    Message::RequestBlob(request_blob) => todo!(),
+                    Message::ServerConfig(server_config) => todo!(),
+                    Message::SuggestConfig(suggest_config) => todo!(),
+                },
+                Err(e) => {
+                    break Err(format!("Error reading message from client: {:?}", e).into());
+                }
+            }
         }
     }
 

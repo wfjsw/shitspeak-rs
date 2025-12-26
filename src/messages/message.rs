@@ -1,7 +1,6 @@
-use bytes::BufMut;
 use prost::Message as _;
 
-use crate::{constants::MTU, mumble_proto::*};
+use crate::{mumble_proto::*};
 
 use message_macro::MessageConversion;
 

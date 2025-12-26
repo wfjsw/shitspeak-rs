@@ -1,18 +1,34 @@
 use std::collections::HashSet;
 
-pub struct ClientSessionState {
+use crate::client::user_version::UserVersion;
+
+pub struct ClientGlobalState {
+    user_id: Option<u32>,
+    user_version: Option<UserVersion>, 
+
     current_channel_id: u32,
     last_active_timestamp: Option<std::time::Instant>,
     listening_channel_id: HashSet<u32>,
 }
 
-impl ClientSessionState {
-    pub fn new(initial_channel_id: u32) -> Self {
-        ClientSessionState {
-            current_channel_id: initial_channel_id,
+impl ClientGlobalState {
+    pub fn new() -> Self {
+        ClientGlobalState {
+            user_id: None,
+            user_version: None,
+
+            current_channel_id: 0,
             last_active_timestamp: None,
             listening_channel_id: HashSet::new(),
         }
+    }
+
+    pub fn get_user_id(&self) -> Option<u32> {
+        self.user_id
+    }
+
+    pub fn set_user_id(&mut self, user_id: Option<u32>) {
+        self.user_id = user_id;
     }
 
     pub fn set_current_channel_id(&mut self, channel_id: u32) {
@@ -37,5 +53,11 @@ impl ClientSessionState {
 
     pub fn is_listening_channel(&self, channel_id: u32) -> bool {
         self.listening_channel_id.contains(&channel_id)
+    }
+}
+
+impl Default for ClientGlobalState {
+    fn default() -> Self {
+        Self::new()
     }
 }

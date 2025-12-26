@@ -8,5 +8,6 @@ pub mod user_info;
 pub mod user_version;
 pub mod session_states;
 pub mod group;
-pub mod client_session_state;
+pub mod client_global_state;
 pub mod client_session_identifier;
+mod client_local_state;

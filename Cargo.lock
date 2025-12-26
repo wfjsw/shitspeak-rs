@@ -1407,7 +1407,6 @@ dependencies = [
  "message_macro",
  "num_enum",
  "os_info",
- "parking_lot",
  "paste",
  "ppp",
  "prost",
