@@ -11,6 +11,7 @@ use rustls::version::{TLS12, TLS13};
 use tokio::io::ReadBuf;
 use tokio_rustls::TlsAcceptor;
 
+use crate::client::handlers::{handle_authenticate, handle_channel_remove, handle_channel_state, handle_crypt_setup, handle_permission_query, handle_ping};
 use crate::client::states::ConnectionState;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::constants::{release, APP_PROTO_VER};
@@ -83,11 +84,11 @@ impl Server {
         })))
     }
 
-    pub async fn run(self: Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
         println!("Server is running on {}", self.tcp_listener.local_addr()?);
         loop {
             let (tcp_stream, remote_addr) = self.tcp_listener.accept().await?;
-            let server = Arc::clone(&self);
+            let server = Arc::clone(self);
             tokio::spawn(async move {
                 if let Err(e) = server
                     .handle_incoming_connection(tcp_stream, remote_addr)
@@ -101,7 +102,7 @@ impl Server {
     }
 
     pub async fn handle_incoming_connection(
-        &self,
+        self: &Arc<Box<Self>>,
         tcp_stream: tokio::net::TcpStream,
         remote_addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -154,23 +155,23 @@ impl Server {
             }))
             .await?;
 
-        let client = self
-            .clients
-            .allocate_local_client(real_ip, remote_addr, None, local_addr, tls_stream)
-            .await;
+        let client =
+            self.clients
+                .allocate_local_client(real_ip, remote_addr, None, local_addr, tls_stream).await;
 
         loop {
             // Handle incoming messages from the client
+
             match client.read_proto_message().await {
                 Ok(message) => match message {
                     Message::Version(version) => todo!(),
                     Message::UDPTunnel(items) => todo!(),
-                    Message::Authenticate(authenticate) => todo!(),
-                    Message::Ping(ping) => todo!(),
+                    Message::Authenticate(authenticate) => handle_authenticate(&self, &client, authenticate).await,
+                    Message::Ping(ping) => handle_ping(&self, &client, ping).await,
                     Message::Reject(reject) => todo!(),
                     Message::ServerSync(server_sync) => todo!(),
-                    Message::ChannelRemove(channel_remove) => todo!(),
-                    Message::ChannelState(channel_state) => todo!(),
+                    Message::ChannelRemove(channel_remove) => handle_channel_remove(&self, &client, channel_remove).await,
+                    Message::ChannelState(channel_state) => handle_channel_state(&self, &client, channel_state).await,
                     Message::UserRemove(user_remove) => todo!(),
                     Message::UserState(user_state) => todo!(),
                     Message::BanList(ban_list) => todo!(),
@@ -178,12 +179,12 @@ impl Server {
                     Message::PermissionDenied(permission_denied) => todo!(),
                     Message::ACL(acl) => todo!(),
                     Message::QueryUsers(query_users) => todo!(),
-                    Message::CryptSetup(crypt_setup) => todo!(),
+                    Message::CryptSetup(crypt_setup) => handle_crypt_setup(&self, &client, crypt_setup).await,
                     Message::ContextActionModify(context_action_modify) => todo!(),
                     Message::ContextAction(context_action) => todo!(),
                     Message::UserList(user_list) => todo!(),
                     Message::VoiceTarget(voice_target) => todo!(),
-                    Message::PermissionQuery(permission_query) => todo!(),
+                    Message::PermissionQuery(permission_query) => handle_permission_query(&self, &client, permission_query).await,
                     Message::CodecVersion(codec_version) => todo!(),
                     Message::UserStats(user_stats) => todo!(),
                     Message::RequestBlob(request_blob) => todo!(),

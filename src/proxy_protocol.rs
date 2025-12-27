@@ -1,7 +1,9 @@
-use std::{future::poll_fn, result::Result};
+use std::{fmt::Display, future::poll_fn, result::Result};
 
 use ppp::{HeaderResult, PartialResult as _};
 use tokio::io::ReadBuf;
+
+use crate::errors::ProxyProtocolHeaderTooLargeError;
 
 pub fn convert_v1_addresses_to_ipaddr(addresses: ppp::v1::Addresses) -> Option<std::net::IpAddr> {
     match addresses {
@@ -19,10 +21,38 @@ pub fn convert_v2_addresses_to_ipaddr(addresses: ppp::v2::Addresses) -> Option<s
     }
 }
 
+#[derive(Debug)]
+pub enum GetProxyProtocolRealIpError {
+    ProxyProtocolHeaderTooLarge(ProxyProtocolHeaderTooLargeError),
+    IOError(std::io::Error),
+}
+
+impl From<std::io::Error> for GetProxyProtocolRealIpError {
+    fn from(err: std::io::Error) -> Self {
+        GetProxyProtocolRealIpError::IOError(err)
+    }
+}
+
+impl From<ProxyProtocolHeaderTooLargeError> for GetProxyProtocolRealIpError {
+    fn from(err: ProxyProtocolHeaderTooLargeError) -> Self {
+        GetProxyProtocolRealIpError::ProxyProtocolHeaderTooLarge(err)
+    }
+}
+
+impl Display for GetProxyProtocolRealIpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GetProxyProtocolRealIpError::IOError(err) => write!(f, "IO error: {}", err),
+            GetProxyProtocolRealIpError::ProxyProtocolHeaderTooLarge(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+impl std::error::Error for GetProxyProtocolRealIpError {}
 
 pub async fn get_proxy_protocol_real_ip(
     tcp_stream: &tokio::net::TcpStream,
-) -> Result<Option<std::net::IpAddr>, Box<dyn std::error::Error>> {
+) -> Result<Option<std::net::IpAddr>, GetProxyProtocolRealIpError> {
     let mut buffer = Vec::with_capacity(1600);
     let header = {
         let mut read = 0;
@@ -39,7 +69,7 @@ pub async fn get_proxy_protocol_real_ip(
             }
 
             if buffer.len() > 16384 {
-                return Err(Box::<dyn std::error::Error>::from("Header too large"));
+                return Err(ProxyProtocolHeaderTooLargeError::new(16384, buffer.len()).into());
             }
 
             if buffer.len() == buffer.capacity() {

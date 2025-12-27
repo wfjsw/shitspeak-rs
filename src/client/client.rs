@@ -31,7 +31,7 @@ pub struct Client {
     // Might be a registered user, might not
     // Basic user info are synchronized.
     certificate_hash: Option<Vec<u8>>,
-    user_info: Mutex<Option<UserInfo>>,
+    user_info: RwLock<UserInfo>,
     user_info_extended: Mutex<Option<UserInfoExtended>>,
 
     options: RwLock<ClientOptions>,
@@ -82,7 +82,7 @@ impl Client {
             udp_state: None,
             stats: RwLock::new(ClientStats::default()),
             certificate_hash,
-            user_info: Mutex::new(None),
+            user_info: RwLock::new(UserInfo::default()),
             user_info_extended: Mutex::new(None),
             options: RwLock::new(ClientOptions::default()),
             local_state: RwLock::new(Some(ClientLocalState::new())),
@@ -99,18 +99,14 @@ impl Client {
         self.certificate_hash.is_some()
     }
 
-    pub async fn get_groups_clone(&self) -> Option<HashSet<String>> {
-        match &*self.user_info.lock().await {
-            Some(info) => Some(info.get_groups().clone()),
-            None => None,
-        }
+    pub async fn get_groups_clone(&self) -> HashSet<String> {
+        let user_info = self.user_info.read().await;
+        user_info.get_groups().clone()
     }
 
     pub async fn has_group(&self, group: &str) -> bool {
-        match &*self.user_info.lock().await {
-            Some(info) => info.has_group(group),
-            None => false,
-        }
+        let user_info = self.user_info.read().await;
+        user_info.has_group(group)
     }
 
     pub fn get_certificate_hash(&self) -> Option<&[u8]> {
@@ -129,18 +125,14 @@ impl Client {
         self.session_id.get_local_session_id()
     }
 
-    pub async fn get_tokens(&self) -> Option<HashSet<String>> {
-        match &*self.user_info.lock().await {
-            Some(info) => Some(info.get_tokens().clone()),
-            None => None,
-        }
+    pub async fn get_tokens_clone(&self) -> HashSet<String> {
+        let user_info = self.user_info.read().await;
+        user_info.get_tokens().clone()
     }
 
     pub async fn has_token(&self, token: &str) -> bool {
-        match &*self.user_info.lock().await {
-            Some(info) => info.has_token(token),
-            None => false,
-        }
+        let user_info = self.user_info.read().await;
+        user_info.has_token(token)
     }
 
     pub async fn get_current_channel_id(&self) -> u32 {
@@ -198,5 +190,10 @@ impl Client {
     pub async fn write_proto_message(&self, message: &Message) -> Result<(), Box<dyn std::error::Error>> {
         let mut guard = self.connection.lock().await;
         guard.write_proto_message(message).await
+    }
+
+    pub async fn set_tokens(&self, tokens: HashSet<String>) {
+        let mut user_info = self.user_info.write().await;
+        user_info.set_tokens(tokens);
     }
 }

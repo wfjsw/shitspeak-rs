@@ -1,5 +1,4 @@
 mod message;
-mod handlers;
 mod message_reader;
 mod message_writer;
 

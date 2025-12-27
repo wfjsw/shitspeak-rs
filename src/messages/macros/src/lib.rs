@@ -119,7 +119,6 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
             pub fn to_proto(&self, buf: &mut impl bytes::BufMut) -> Result<(), Box<dyn std::error::Error>> {
                 match self {
                     #(#to_proto_arms)*
-                    _ => Err("Unknown message type".into())
                 }
             }
 

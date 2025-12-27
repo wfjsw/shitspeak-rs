@@ -40,6 +40,18 @@ impl UserInfo {
         &self.tokens
     }
 
+    pub fn add_token(&mut self, token: String) {
+        self.tokens.insert(token);
+    }
+
+    pub fn del_token(&mut self, token: &str) {
+        self.tokens.remove(token);
+    }
+
+    pub fn set_tokens(&mut self, tokens: HashSet<String>) {
+        self.tokens = tokens;
+    }
+
     // TODO: case insensitive
     pub fn has_token(&self, token: &str) -> bool {
         self.tokens.contains(&token.to_string())
@@ -47,5 +59,15 @@ impl UserInfo {
 
     pub fn get_display_name(&self) -> &Option<String> {
         &self.display_name
+    }
+}
+
+impl Default for UserInfo {
+    fn default() -> Self {
+        UserInfo {
+            groups: HashSet::new(),
+            tokens: HashSet::new(),
+            display_name: None,
+        }
     }
 }

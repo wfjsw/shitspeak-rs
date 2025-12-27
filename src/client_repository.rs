@@ -10,7 +10,7 @@ use tokio_rustls::server::TlsStream;
 
 use crate::{
     client::{
-        client::Client, client_session_identifier::ClientSessionIdentifier,
+        Client, client_session_identifier::ClientSessionIdentifier,
     },
     constants::MAX_LOCAL_SESSION_ID,
 };
