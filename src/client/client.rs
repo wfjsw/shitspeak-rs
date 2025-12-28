@@ -258,4 +258,12 @@ impl Client {
             }
         }
     }
+
+    pub async fn is_authenticated(&self) -> bool {
+        let local_state_guard = self.local_state.read().await;
+        match &*local_state_guard {
+            Some(state) => state.is_authenticated(),
+            None => panic!("Accessing local state on remote user"),
+        }
+    }
 }
