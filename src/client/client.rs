@@ -4,12 +4,28 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use tokio::{net::TcpStream, sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock}};
+use tokio::{
+    net::TcpStream,
+    sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock},
+};
 use tokio_rustls::server::TlsStream;
 
-use crate::{client::{
-    client_global_state::ClientGlobalState, client_local_state::ClientLocalState, client_session_identifier::ClientSessionIdentifier, client_stats::ClientStats, options::ClientOptions, states::ConnectionState, udp_state::UdpState, user_info::{UserInfo, UserInfoExtended}
-}, errors::{ReadProtoMessageError, WriteProtoMessageError}, messages::{Message, ReadMessageExt, WriteMessageExt}};
+use crate::{
+    client::{
+        client_global_state::ClientGlobalState,
+        client_local_state::ClientLocalState,
+        client_session_identifier::ClientSessionIdentifier,
+        client_stats::ClientStats,
+        crypt::{CryptState, CryptoMode},
+        options::ClientOptions,
+        states::ConnectionState,
+        udp_state::UdpState,
+        user_info::{UserInfo, UserInfoExtended},
+    },
+    errors::{ReadProtoMessageError, WriteProtoMessageError},
+    messages::{Message, ReadMessageExt, WriteMessageExt},
+    mumble_proto::Ping,
+};
 
 pub struct Client {
     session_id: ClientSessionIdentifier,
@@ -38,6 +54,7 @@ pub struct Client {
 
     local_state: RwLock<Option<ClientLocalState>>,
     global_state: RwLock<ClientGlobalState>,
+    crypt_state: Mutex<Option<CryptState>>,
 }
 
 impl Client {
@@ -87,6 +104,7 @@ impl Client {
             options: RwLock::new(ClientOptions::default()),
             local_state: RwLock::new(Some(ClientLocalState::new())),
             global_state: RwLock::new(ClientGlobalState::new()),
+            crypt_state: Mutex::new(None),
         })
     }
 
@@ -136,21 +154,18 @@ impl Client {
     }
 
     pub async fn get_current_channel_id(&self) -> u32 {
-        self.global_state
-            .read().await
-            .get_current_channel_id()
+        self.global_state.read().await.get_current_channel_id()
     }
 
     pub async fn set_current_channel_id(&self, channel_id: u32) {
         self.global_state
-            .write().await
+            .write()
+            .await
             .set_current_channel_id(channel_id);
     }
 
     pub async fn get_user_id(&self) -> Option<u32> {
-        self.global_state
-            .read().await
-            .get_user_id()
+        self.global_state.read().await.get_user_id()
     }
 
     // pub fn get_display_name(&self) -> Option<String> {
@@ -175,19 +190,21 @@ impl Client {
     pub async fn is_verified(&self) -> bool {
         let guard = self.connection.lock().await;
         let (_, conn) = guard.get_ref();
-        conn.peer_certificates().map_or(false, |certs| !certs.is_empty())
+        conn.peer_certificates()
+            .map_or(false, |certs| !certs.is_empty())
     }
 
-    pub fn disconnect(&self) {
-
-    }
+    pub fn disconnect(&self) {}
 
     pub async fn read_proto_message(&self) -> Result<Message, ReadProtoMessageError> {
         let mut guard = self.connection.lock().await;
         guard.read_proto_message().await
     }
 
-    pub async fn write_proto_message(&self, message: &Message) -> Result<(), WriteProtoMessageError> {
+    pub async fn write_proto_message(
+        &self,
+        message: &Message,
+    ) -> Result<(), WriteProtoMessageError> {
         let mut guard = self.connection.lock().await;
         guard.write_proto_message(message).await
     }
@@ -195,5 +212,50 @@ impl Client {
     pub async fn set_tokens(&self, tokens: HashSet<String>) {
         let mut user_info = self.user_info.write().await;
         user_info.set_tokens(tokens);
+    }
+
+    pub async fn get_last_ping(&self) -> DateTime<Utc> {
+        let last_ping = self.last_ping.lock().await;
+        *last_ping
+    }
+
+    pub async fn reset_last_ping(&self) {
+        let mut last_ping = self.last_ping.lock().await;
+        *last_ping = Utc::now();
+    }
+
+    pub async fn update_from_ping_message(&self, ping_message: &Ping) {
+        {
+            let mut crypt_state = self.crypt_state.lock().await;
+            if let Some(state) = crypt_state.as_mut() {
+                state.update_from_ping_message(ping_message);
+            }
+        }
+
+        {
+            let mut stats = self.stats.write().await;
+            stats.update_from_ping_message(ping_message);
+        }
+    }
+
+    pub async fn create_ping_response(&self, ping_message: &Ping) -> Ping {
+        let crypt_state = self.crypt_state.lock().await;
+        if let Some(state) = crypt_state.as_ref() {
+            state.create_ping_response(ping_message)
+        } else {
+            Ping {
+                good: Some(0),
+                late: Some(0),
+                lost: Some(0),
+                resync: Some(0),
+                timestamp: ping_message.timestamp,
+                udp_packets: None,
+                tcp_packets: None,
+                udp_ping_avg: None,
+                udp_ping_var: None,
+                tcp_ping_avg: None,
+                tcp_ping_var: None,
+            }
+        }
     }
 }

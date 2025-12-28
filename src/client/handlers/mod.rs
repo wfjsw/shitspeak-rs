@@ -18,7 +18,7 @@ mod ping;
 
 pub(crate) use acl::handle_acl;
 pub(crate) use authenticate::handle_authenticate;
-pub(crate) use ban_list::handle_ban_list;
+// pub(crate) use ban_list::handle_ban_list;
 pub(crate) use channel_remove::handle_channel_remove;
 pub(crate) use channel_state::handle_channel_state;
 pub(crate) use crypt_setup::handle_crypt_setup;

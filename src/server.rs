@@ -13,7 +13,10 @@ use crate::client::handlers::{
 };
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::constants::{release, APP_PROTO_VER};
-use crate::errors::{HandleIncomingConnectionError, ReadProtoMessageError};
+use crate::errors::{
+    HandleIncomingConnectionError, MessageHandlerError, MessageTypeNotForIncoming,
+    ReadProtoMessageError,
+};
 use crate::messages::{Message, WriteMessageExt};
 use crate::mumble_proto::Version;
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
@@ -162,7 +165,7 @@ impl Server {
         loop {
             // Handle incoming messages from the client
 
-            match client.read_proto_message().await {
+            let result = match client.read_proto_message().await {
                 Ok(message) => match message {
                     Message::Version(version) => todo!(),
                     Message::UDPTunnel(items) => todo!(),
@@ -170,8 +173,8 @@ impl Server {
                         handle_authenticate(&self, &client, authenticate).await
                     }
                     Message::Ping(ping) => handle_ping(&self, &client, ping).await,
-                    Message::Reject(reject) => todo!(),
-                    Message::ServerSync(server_sync) => todo!(),
+                    Message::Reject(_) => Err(MessageTypeNotForIncoming::new(message).into()),
+                    Message::ServerSync(_) => Err(MessageTypeNotForIncoming::new(message).into()),
                     Message::ChannelRemove(channel_remove) => {
                         handle_channel_remove(&self, &client, channel_remove).await
                     }
@@ -182,7 +185,9 @@ impl Server {
                     Message::UserState(user_state) => todo!(),
                     Message::BanList(ban_list) => todo!(),
                     Message::TextMessage(text_message) => todo!(),
-                    Message::PermissionDenied(permission_denied) => todo!(),
+                    Message::PermissionDenied(_) => {
+                        Err(MessageTypeNotForIncoming::new(message).into())
+                    }
                     Message::ACL(acl) => todo!(),
                     Message::QueryUsers(query_users) => todo!(),
                     Message::CryptSetup(crypt_setup) => {
@@ -195,18 +200,22 @@ impl Server {
                     Message::PermissionQuery(permission_query) => {
                         handle_permission_query(&self, &client, permission_query).await
                     }
-                    Message::CodecVersion(codec_version) => todo!(),
+                    Message::CodecVersion(_) => Err(MessageTypeNotForIncoming::new(message).into()),
                     Message::UserStats(user_stats) => todo!(),
                     Message::RequestBlob(request_blob) => todo!(),
-                    Message::ServerConfig(server_config) => todo!(),
-                    Message::SuggestConfig(suggest_config) => todo!(),
+                    Message::ServerConfig(_) => Err(MessageTypeNotForIncoming::new(message).into()),
+                    Message::SuggestConfig(suggest_config) => {
+                        Err(MessageTypeNotForIncoming::new(message).into())
+                    }
                 },
-                Err(ReadProtoMessageError::UnknownMessageType(e)) => {
-                    eprintln!("Unknown message type: {}", e);
-                }
                 Err(e) => {
                     break Err(e.into());
                 }
+            };
+
+            match result {
+                Ok(_) => {}
+                Err(_) => {}
             }
         }
     }

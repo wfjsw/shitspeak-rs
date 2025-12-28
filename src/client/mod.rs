@@ -12,5 +12,6 @@ pub mod client_global_state;
 pub mod client_session_identifier;
 pub mod handlers;
 pub mod client_local_state;
+mod crypt;
 
 pub use client::Client;

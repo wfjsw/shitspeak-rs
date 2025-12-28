@@ -1,0 +1,46 @@
+use crate::errors::{AuthRejection, MessageTypeNotForIncoming, ReadProtoMessageError, WriteProtoMessageError};
+
+#[derive(Debug)]
+pub enum MessageHandlerError {
+    AuthRejection(AuthRejection),
+    WriteProtoMessageError(WriteProtoMessageError),
+    ReadProtoMessageError(ReadProtoMessageError),
+    MessageTypeNotForIncoming(MessageTypeNotForIncoming),
+}
+
+impl From<WriteProtoMessageError> for MessageHandlerError {
+    fn from(err: WriteProtoMessageError) -> Self {
+        MessageHandlerError::WriteProtoMessageError(err)
+    }
+}
+
+impl From<ReadProtoMessageError> for MessageHandlerError {
+    fn from(err: ReadProtoMessageError) -> Self {
+        MessageHandlerError::ReadProtoMessageError(err)
+    }
+}
+
+impl From<AuthRejection> for MessageHandlerError {
+    fn from(err: AuthRejection) -> Self {
+        MessageHandlerError::AuthRejection(err)
+    }
+}
+
+impl From<MessageTypeNotForIncoming> for MessageHandlerError {
+    fn from(err: MessageTypeNotForIncoming) -> Self {
+        MessageHandlerError::MessageTypeNotForIncoming(err)
+    }
+}
+
+impl std::fmt::Display for MessageHandlerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageHandlerError::AuthRejection(e) => write!(f, "Authentication rejected: {}", e),
+            MessageHandlerError::WriteProtoMessageError(e) => write!(f, "Write proto message error: {}", e),
+            MessageHandlerError::ReadProtoMessageError(e) => write!(f, "Read proto message error: {}", e),
+            MessageHandlerError::MessageTypeNotForIncoming(e) => write!(f, "Message type not for incoming: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for MessageHandlerError {}

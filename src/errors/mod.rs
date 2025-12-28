@@ -5,6 +5,9 @@ mod read_proto_message_error;
 mod write_proto_message_error;
 mod from_proto_to_message_error;
 mod handle_incoming_connection_error;
+mod auth_rejection;
+mod message_handler_error;
+mod message_type_not_for_incoming;
 
 pub use proxy_protocol_header_too_large::ProxyProtocolHeaderTooLargeError;
 pub use message_length_exceeded::MessageLengthExceededError;
@@ -13,3 +16,6 @@ pub use read_proto_message_error::ReadProtoMessageError;
 pub use write_proto_message_error::WriteProtoMessageError;
 pub use from_proto_to_message_error::FromProtoToMessageError;
 pub use handle_incoming_connection_error::HandleIncomingConnectionError;
+pub use auth_rejection::AuthRejection;
+pub use message_handler_error::MessageHandlerError;
+pub use message_type_not_for_incoming::MessageTypeNotForIncoming;

@@ -1,3 +1,5 @@
+use std::ffi::os_str::Display;
+
 use prost::Message as _;
 
 use crate::{mumble_proto::*};
@@ -33,4 +35,10 @@ pub enum Message {
     RequestBlob(RequestBlob),
     ServerConfig(ServerConfig),
     SuggestConfig(SuggestConfig),
+}
+
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
