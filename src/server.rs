@@ -1,20 +1,19 @@
-use std::future::poll_fn;
 use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use cidr::{AnyIpCidr, IpCidr};
-use ppp::{HeaderResult, PartialResult};
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
 use rustls::version::{TLS12, TLS13};
-use tokio::io::ReadBuf;
 use tokio_rustls::TlsAcceptor;
 
-use crate::client::handlers::{handle_authenticate, handle_channel_remove, handle_channel_state, handle_crypt_setup, handle_permission_query, handle_ping};
-use crate::client::states::ConnectionState;
+use crate::client::handlers::{
+    handle_authenticate, handle_channel_remove, handle_channel_state, handle_crypt_setup,
+    handle_permission_query, handle_ping,
+};
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::constants::{release, APP_PROTO_VER};
+use crate::errors::{HandleIncomingConnectionError, ReadProtoMessageError};
 use crate::messages::{Message, WriteMessageExt};
 use crate::mumble_proto::Version;
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
@@ -105,7 +104,7 @@ impl Server {
         self: &Arc<Box<Self>>,
         tcp_stream: tokio::net::TcpStream,
         remote_addr: std::net::SocketAddr,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), HandleIncomingConnectionError> {
         let real_ip = if self
             .allowed_proxies
             .iter()
@@ -155,9 +154,10 @@ impl Server {
             }))
             .await?;
 
-        let client =
-            self.clients
-                .allocate_local_client(real_ip, remote_addr, None, local_addr, tls_stream).await;
+        let client = self
+            .clients
+            .allocate_local_client(real_ip, remote_addr, None, local_addr, tls_stream)
+            .await;
 
         loop {
             // Handle incoming messages from the client
@@ -166,12 +166,18 @@ impl Server {
                 Ok(message) => match message {
                     Message::Version(version) => todo!(),
                     Message::UDPTunnel(items) => todo!(),
-                    Message::Authenticate(authenticate) => handle_authenticate(&self, &client, authenticate).await,
+                    Message::Authenticate(authenticate) => {
+                        handle_authenticate(&self, &client, authenticate).await
+                    }
                     Message::Ping(ping) => handle_ping(&self, &client, ping).await,
                     Message::Reject(reject) => todo!(),
                     Message::ServerSync(server_sync) => todo!(),
-                    Message::ChannelRemove(channel_remove) => handle_channel_remove(&self, &client, channel_remove).await,
-                    Message::ChannelState(channel_state) => handle_channel_state(&self, &client, channel_state).await,
+                    Message::ChannelRemove(channel_remove) => {
+                        handle_channel_remove(&self, &client, channel_remove).await
+                    }
+                    Message::ChannelState(channel_state) => {
+                        handle_channel_state(&self, &client, channel_state).await
+                    }
                     Message::UserRemove(user_remove) => todo!(),
                     Message::UserState(user_state) => todo!(),
                     Message::BanList(ban_list) => todo!(),
@@ -179,20 +185,27 @@ impl Server {
                     Message::PermissionDenied(permission_denied) => todo!(),
                     Message::ACL(acl) => todo!(),
                     Message::QueryUsers(query_users) => todo!(),
-                    Message::CryptSetup(crypt_setup) => handle_crypt_setup(&self, &client, crypt_setup).await,
+                    Message::CryptSetup(crypt_setup) => {
+                        handle_crypt_setup(&self, &client, crypt_setup).await
+                    }
                     Message::ContextActionModify(context_action_modify) => todo!(),
                     Message::ContextAction(context_action) => todo!(),
                     Message::UserList(user_list) => todo!(),
                     Message::VoiceTarget(voice_target) => todo!(),
-                    Message::PermissionQuery(permission_query) => handle_permission_query(&self, &client, permission_query).await,
+                    Message::PermissionQuery(permission_query) => {
+                        handle_permission_query(&self, &client, permission_query).await
+                    }
                     Message::CodecVersion(codec_version) => todo!(),
                     Message::UserStats(user_stats) => todo!(),
                     Message::RequestBlob(request_blob) => todo!(),
                     Message::ServerConfig(server_config) => todo!(),
                     Message::SuggestConfig(suggest_config) => todo!(),
                 },
+                Err(ReadProtoMessageError::UnknownMessageType(e)) => {
+                    eprintln!("Unknown message type: {}", e);
+                }
                 Err(e) => {
-                    break Err(format!("Error reading message from client: {:?}", e).into());
+                    break Err(e.into());
                 }
             }
         }

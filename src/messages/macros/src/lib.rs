@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Ident, Type};
+use quote::quote;
+use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
 
 fn is_vec_u8(ty: &Type) -> bool {
     if let Type::Path(p) = ty {
@@ -97,10 +97,10 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl #name {
-            pub fn from_proto(message_type: u16, buffer: Vec<u8>) -> Result<#name, Box<dyn std::error::Error>> {
+            pub fn from_proto(message_type: u16, buffer: Vec<u8>) -> Result<#name, crate::errors::FromProtoToMessageError> {
                 match message_type {
                     #(#from_arms)*
-                    _ => Err("Unknown message type".into()),
+                    t => Err(crate::errors::UnknownMessageTypeError::new(t).into()),
                 }
             }
 
@@ -116,13 +116,13 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
                 }
             }
 
-            pub fn to_proto(&self, buf: &mut impl bytes::BufMut) -> Result<(), Box<dyn std::error::Error>> {
+            pub fn to_proto(&self, buf: &mut impl bytes::BufMut) -> Result<(), prost::EncodeError> {
                 match self {
                     #(#to_proto_arms)*
                 }
             }
 
-            pub fn to_proto_vec(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            pub fn to_proto_vec(&self) -> Result<Vec<u8>, prost::EncodeError> {
                 match self {
                     #(#to_proto_vec_arms)*
                 }

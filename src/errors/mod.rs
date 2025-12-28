@@ -1,7 +1,15 @@
 mod proxy_protocol_header_too_large;
 mod message_length_exceeded;
 mod unknown_message_type;
+mod read_proto_message_error;
+mod write_proto_message_error;
+mod from_proto_to_message_error;
+mod handle_incoming_connection_error;
 
 pub use proxy_protocol_header_too_large::ProxyProtocolHeaderTooLargeError;
 pub use message_length_exceeded::MessageLengthExceededError;
 pub use unknown_message_type::UnknownMessageTypeError;
+pub use read_proto_message_error::ReadProtoMessageError;
+pub use write_proto_message_error::WriteProtoMessageError;
+pub use from_proto_to_message_error::FromProtoToMessageError;
+pub use handle_incoming_connection_error::HandleIncomingConnectionError;

@@ -9,7 +9,7 @@ use tokio_rustls::server::TlsStream;
 
 use crate::{client::{
     client_global_state::ClientGlobalState, client_local_state::ClientLocalState, client_session_identifier::ClientSessionIdentifier, client_stats::ClientStats, options::ClientOptions, states::ConnectionState, udp_state::UdpState, user_info::{UserInfo, UserInfoExtended}
-}, messages::{Message, ReadMessageExt, WriteMessageExt}};
+}, errors::{ReadProtoMessageError, WriteProtoMessageError}, messages::{Message, ReadMessageExt, WriteMessageExt}};
 
 pub struct Client {
     session_id: ClientSessionIdentifier,
@@ -182,12 +182,12 @@ impl Client {
 
     }
 
-    pub async fn read_proto_message(&self) -> Result<Message, Box<dyn std::error::Error>> {
+    pub async fn read_proto_message(&self) -> Result<Message, ReadProtoMessageError> {
         let mut guard = self.connection.lock().await;
         guard.read_proto_message().await
     }
 
-    pub async fn write_proto_message(&self, message: &Message) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn write_proto_message(&self, message: &Message) -> Result<(), WriteProtoMessageError> {
         let mut guard = self.connection.lock().await;
         guard.write_proto_message(message).await
     }

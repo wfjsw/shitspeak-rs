@@ -1,11 +1,11 @@
-use crate::{messages::Message};
+use crate::{errors::WriteProtoMessageError, messages::Message};
 
 pub trait WriteMessageExt {
-    async fn write_proto_message(&mut self, message: &Message) -> Result<(), Box<dyn std::error::Error>>;
+    async fn write_proto_message(&mut self, message: &Message) -> Result<(), WriteProtoMessageError>;
 }
 
 impl<T: tokio::io::AsyncWriteExt + Unpin> WriteMessageExt for T {
-    async fn write_proto_message(&mut self, message: &Message) -> Result<(), Box<dyn std::error::Error>> {
+    async fn write_proto_message(&mut self, message: &Message) -> Result<(), WriteProtoMessageError> {
         let proto_tag = message.proto_tag();
         let length = message.encoded_len();
         self.write_u16(proto_tag).await?;
