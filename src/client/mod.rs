@@ -10,8 +10,9 @@ pub mod session_states;
 pub mod group;
 pub mod client_global_state;
 pub mod client_session_identifier;
-pub mod handlers;
+mod handlers;
 pub mod client_local_state;
 mod crypt;
 
 pub use client::Client;
+pub use handlers::AsyncMessageHandlerExt;

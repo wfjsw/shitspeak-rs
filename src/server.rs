@@ -2,23 +2,19 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use cidr::{AnyIpCidr, IpCidr};
+use cidr::AnyIpCidr;
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
 use rustls::version::{TLS12, TLS13};
 use tokio_rustls::TlsAcceptor;
 
-use crate::client::handlers::{
-    handle_authenticate, handle_channel_remove, handle_channel_state, handle_crypt_setup,
-    handle_permission_query, handle_ping,
-};
+use crate::client::AsyncMessageHandlerExt;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
-use crate::constants::{release, APP_PROTO_VER};
 use crate::errors::{
     HandleIncomingConnectionError, MessageHandlerError, MessageTypeNotForIncoming,
     ReadProtoMessageError,
 };
-use crate::messages::{Message, WriteMessageExt};
-use crate::mumble_proto::Version;
+use crate::messages::encoder::Version;
+use crate::messages::WriteMessageExt;
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
 use crate::{
     client_repository::ClientRepository, codec_info::CodecInfo, config::Config,
@@ -100,7 +96,6 @@ impl Server {
                 }
             });
         }
-        Ok(())
     }
 
     pub async fn handle_incoming_connection(
@@ -125,36 +120,12 @@ impl Server {
         let tls_acceptor = self.tls_acceptor.clone();
         let mut tls_stream = tls_acceptor.accept(tcp_stream).await?;
 
-        let os_info = os_info::get();
-
+        // Send server version
         tls_stream
-            .write_proto_message(&Message::Version(Version {
-                version_v1: if self.send_version {
-                    Some(APP_PROTO_VER.into())
-                } else {
-                    None
-                },
-                version_v2: if self.send_version {
-                    Some(APP_PROTO_VER.into())
-                } else {
-                    None
-                },
-                release: if self.send_build_info {
-                    Some(release())
-                } else {
-                    None
-                },
-                os: if self.send_os_info {
-                    Some(os_info.os_type().to_string())
-                } else {
-                    None
-                },
-                os_version: if self.send_os_info {
-                    Some(os_info.version().to_string())
-                } else {
-                    None
-                },
-            }))
+            .write_proto_message(
+                &Version::for_server(self.send_version, self.send_build_info, self.send_os_info)
+                    .into(),
+            )
             .await?;
 
         let client = self
@@ -164,56 +135,7 @@ impl Server {
 
         loop {
             // Handle incoming messages from the client
-
-            let result = match client.read_proto_message().await {
-                Ok(message) => match message {
-                    Message::Version(version) => todo!(),
-                    Message::UDPTunnel(items) => todo!(),
-                    Message::Authenticate(authenticate) => {
-                        handle_authenticate(&self, &client, authenticate).await
-                    }
-                    Message::Ping(ping) => handle_ping(&self, &client, ping).await,
-                    Message::Reject(_) => Err(MessageTypeNotForIncoming::new(message).into()),
-                    Message::ServerSync(_) => Err(MessageTypeNotForIncoming::new(message).into()),
-                    Message::ChannelRemove(channel_remove) => {
-                        handle_channel_remove(&self, &client, channel_remove).await
-                    }
-                    Message::ChannelState(channel_state) => {
-                        handle_channel_state(&self, &client, channel_state).await
-                    }
-                    Message::UserRemove(user_remove) => todo!(),
-                    Message::UserState(user_state) => todo!(),
-                    Message::BanList(ban_list) => todo!(),
-                    Message::TextMessage(text_message) => todo!(),
-                    Message::PermissionDenied(_) => {
-                        Err(MessageTypeNotForIncoming::new(message).into())
-                    }
-                    Message::ACL(acl) => todo!(),
-                    Message::QueryUsers(query_users) => todo!(),
-                    Message::CryptSetup(crypt_setup) => {
-                        handle_crypt_setup(&self, &client, crypt_setup).await
-                    }
-                    Message::ContextActionModify(context_action_modify) => todo!(),
-                    Message::ContextAction(context_action) => todo!(),
-                    Message::UserList(user_list) => todo!(),
-                    Message::VoiceTarget(voice_target) => todo!(),
-                    Message::PermissionQuery(permission_query) => {
-                        handle_permission_query(&self, &client, permission_query).await
-                    }
-                    Message::CodecVersion(_) => Err(MessageTypeNotForIncoming::new(message).into()),
-                    Message::UserStats(user_stats) => todo!(),
-                    Message::RequestBlob(request_blob) => todo!(),
-                    Message::ServerConfig(_) => Err(MessageTypeNotForIncoming::new(message).into()),
-                    Message::SuggestConfig(suggest_config) => {
-                        Err(MessageTypeNotForIncoming::new(message).into())
-                    }
-                },
-                Err(e) => {
-                    break Err(e.into());
-                }
-            };
-
-            match result {
+            match client.read_and_handle_message(self).await {
                 Ok(_) => {}
                 Err(_) => {}
             }

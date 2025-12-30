@@ -28,33 +28,33 @@ use crate::{
 };
 
 pub struct Client {
-    session_id: ClientSessionIdentifier,
+    pub(crate) session_id: ClientSessionIdentifier,
 
-    real_ip_address: IpAddr,
-    tcp_address: SocketAddr,
-    udp_address: Option<SocketAddr>,
-    local_address: SocketAddr,
+    pub(crate) real_ip_address: IpAddr,
+    pub(crate) tcp_address: SocketAddr,
+    pub(crate) udp_address: Option<SocketAddr>,
+    pub(crate) local_address: SocketAddr,
 
-    connection: Mutex<TlsStream<TcpStream>>,
+    pub(crate) connection: Mutex<TlsStream<TcpStream>>,
 
     // Statistics
-    login_time: DateTime<Utc>,
-    last_active: Mutex<DateTime<Utc>>,
-    last_ping: Mutex<DateTime<Utc>>,
-    udp_state: Option<Mutex<UdpState>>,
-    stats: RwLock<ClientStats>,
+    pub(crate) login_time: DateTime<Utc>,
+    pub(crate) last_active: Mutex<DateTime<Utc>>,
+    pub(crate) last_ping: Mutex<DateTime<Utc>>,
+    pub(crate) udp_state: Option<Mutex<UdpState>>,
+    pub(crate) stats: RwLock<ClientStats>,
 
     // Might be a registered user, might not
     // Basic user info are synchronized.
-    certificate_hash: Option<Vec<u8>>,
-    user_info: RwLock<UserInfo>,
-    user_info_extended: Mutex<Option<UserInfoExtended>>,
+    pub(crate) certificate_hash: Option<Vec<u8>>,
+    pub(crate) user_info: RwLock<UserInfo>,
+    pub(crate) user_info_extended: Mutex<Option<UserInfoExtended>>,
 
-    options: RwLock<ClientOptions>,
+    pub(crate) options: RwLock<ClientOptions>,
 
-    local_state: RwLock<Option<ClientLocalState>>,
-    global_state: RwLock<ClientGlobalState>,
-    crypt_state: Mutex<Option<CryptState>>,
+    pub(crate) local_state: RwLock<Option<ClientLocalState>>,
+    pub(crate) global_state: RwLock<ClientGlobalState>,
+    pub(crate) crypt_state: Mutex<Option<CryptState>>,
 }
 
 impl Client {

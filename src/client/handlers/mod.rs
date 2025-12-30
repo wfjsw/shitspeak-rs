@@ -16,14 +16,18 @@ mod ping;
 // mod user_stats;
 // mod voice_target;
 
-pub(crate) use acl::handle_acl;
-pub(crate) use authenticate::handle_authenticate;
+use std::sync::Arc;
+
+use acl::handle_acl;
+use authenticate::handle_authenticate;
 // pub(crate) use ban_list::handle_ban_list;
-pub(crate) use channel_remove::handle_channel_remove;
-pub(crate) use channel_state::handle_channel_state;
-pub(crate) use crypt_setup::handle_crypt_setup;
-pub(crate) use permission_query::handle_permission_query;
-pub(crate) use ping::handle_ping;
+use channel_remove::handle_channel_remove;
+use channel_state::handle_channel_state;
+use crypt_setup::handle_crypt_setup;
+use permission_query::handle_permission_query;
+use ping::handle_ping;
+
+use crate::{errors::{MessageHandlerError, MessageTypeNotForIncoming}, messages::Message, server::Server};
 // pub(crate) use query_users::handle_query_users;
 // pub use request_blob::handle_request_blob;
 // pub use text_message::handle_text_message;
@@ -32,3 +36,60 @@ pub(crate) use ping::handle_ping;
 // pub use user_state::handle_user_state;
 // pub use user_stats::handle_user_stats;
 // pub use voice_target::handle_voice_target;
+
+
+pub trait AsyncMessageHandlerExt {
+    async fn read_and_handle_message(&self, server: &Arc<Box<Server>>) -> Result<(), MessageHandlerError>;
+}
+
+impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
+    async fn read_and_handle_message(&self, server: &Arc<Box<Server>>) -> Result<(), MessageHandlerError> {
+        match self.read_proto_message().await {
+            Ok(message) => match message {
+                Message::Version(version) => todo!(),
+                Message::UDPTunnel(items) => todo!(),
+                Message::Authenticate(authenticate) => {
+                    handle_authenticate(server, self, authenticate).await
+                }
+                Message::Ping(ping) => handle_ping(server, self, ping).await,
+                Message::Reject(_) => Err(MessageTypeNotForIncoming::new(message).into()),
+                Message::ServerSync(_) => Err(MessageTypeNotForIncoming::new(message).into()),
+                Message::ChannelRemove(channel_remove) => {
+                    handle_channel_remove(server, self, channel_remove).await
+                }
+                Message::ChannelState(channel_state) => {
+                    handle_channel_state(server, self, channel_state).await
+                }
+                Message::UserRemove(user_remove) => todo!(),
+                Message::UserState(user_state) => todo!(),
+                Message::BanList(ban_list) => todo!(),
+                Message::TextMessage(text_message) => todo!(),
+                Message::PermissionDenied(_) => {
+                    Err(MessageTypeNotForIncoming::new(message).into())
+                }
+                Message::ACL(acl) => todo!(),
+                Message::QueryUsers(query_users) => todo!(),
+                Message::CryptSetup(crypt_setup) => {
+                    handle_crypt_setup(server, self, crypt_setup).await
+                }
+                Message::ContextActionModify(context_action_modify) => todo!(),
+                Message::ContextAction(context_action) => todo!(),
+                Message::UserList(user_list) => todo!(),
+                Message::VoiceTarget(voice_target) => todo!(),
+                Message::PermissionQuery(permission_query) => {
+                    handle_permission_query(server, self, permission_query).await
+                }
+                Message::CodecVersion(_) => Err(MessageTypeNotForIncoming::new(message).into()),
+                Message::UserStats(user_stats) => todo!(),
+                Message::RequestBlob(request_blob) => todo!(),
+                Message::ServerConfig(_) => Err(MessageTypeNotForIncoming::new(message).into()),
+                Message::SuggestConfig(suggest_config) => {
+                    Err(MessageTypeNotForIncoming::new(message).into())
+                }
+            },
+            Err(e) => {
+                Err(e.into())
+            },
+        }
+    }
+}
