@@ -23,38 +23,37 @@ use crate::{
         user_info::{UserInfo, UserInfoExtended},
     },
     errors::{ReadProtoMessageError, WriteProtoMessageError},
-    messages::{Message, ReadMessageExt, WriteMessageExt},
-    mumble_proto::Ping,
+    messages::{Message, ReadMessageExt, WriteMessageExt, encoder::Ping},
 };
 
 pub struct Client {
-    pub(crate) session_id: ClientSessionIdentifier,
+    session_id: ClientSessionIdentifier,
 
-    pub(crate) real_ip_address: IpAddr,
-    pub(crate) tcp_address: SocketAddr,
-    pub(crate) udp_address: Option<SocketAddr>,
-    pub(crate) local_address: SocketAddr,
+    real_ip_address: IpAddr,
+    tcp_address: SocketAddr,
+    udp_address: Option<SocketAddr>,
+    local_address: SocketAddr,
 
-    pub(crate) connection: Mutex<TlsStream<TcpStream>>,
+    connection: Mutex<TlsStream<TcpStream>>,
 
     // Statistics
-    pub(crate) login_time: DateTime<Utc>,
-    pub(crate) last_active: Mutex<DateTime<Utc>>,
-    pub(crate) last_ping: Mutex<DateTime<Utc>>,
-    pub(crate) udp_state: Option<Mutex<UdpState>>,
-    pub(crate) stats: RwLock<ClientStats>,
+    login_time: DateTime<Utc>,
+    last_active: Mutex<DateTime<Utc>>,
+    last_ping: Mutex<DateTime<Utc>>,
+    udp_state: Option<Mutex<UdpState>>,
+    stats: RwLock<ClientStats>,
 
     // Might be a registered user, might not
     // Basic user info are synchronized.
-    pub(crate) certificate_hash: Option<Vec<u8>>,
-    pub(crate) user_info: RwLock<UserInfo>,
-    pub(crate) user_info_extended: Mutex<Option<UserInfoExtended>>,
+    certificate_hash: Option<Vec<u8>>,
+    user_info: RwLock<UserInfo>,
+    user_info_extended: Mutex<Option<UserInfoExtended>>,
 
-    pub(crate) options: RwLock<ClientOptions>,
+    options: RwLock<ClientOptions>,
 
-    pub(crate) local_state: RwLock<Option<ClientLocalState>>,
-    pub(crate) global_state: RwLock<ClientGlobalState>,
-    pub(crate) crypt_state: Mutex<Option<CryptState>>,
+    local_state: RwLock<Option<ClientLocalState>>,
+    global_state: RwLock<ClientGlobalState>,
+    crypt_state: Mutex<Option<CryptState>>,
 }
 
 impl Client {
@@ -243,19 +242,7 @@ impl Client {
         if let Some(state) = crypt_state.as_ref() {
             state.create_ping_response(ping_message)
         } else {
-            Ping {
-                good: Some(0),
-                late: Some(0),
-                lost: Some(0),
-                resync: Some(0),
-                timestamp: ping_message.timestamp,
-                udp_packets: None,
-                tcp_packets: None,
-                udp_ping_avg: None,
-                udp_ping_var: None,
-                tcp_ping_avg: None,
-                tcp_ping_var: None,
-            }
+            ping_message.default_from_self()
         }
     }
 

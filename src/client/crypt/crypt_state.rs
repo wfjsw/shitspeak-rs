@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 
-use crate::{client::crypt::CryptoMode, mumble_proto::Ping};
+use crate::{client::crypt::CryptoMode, messages::encoder::Ping};
 
 const DECRYPT_HISTORY_SIZE: usize = 0x100;
 
@@ -26,21 +26,10 @@ pub struct CryptState {
 
 impl CryptState {
     pub fn update_from_ping_message(&mut self, ping_message: &Ping) {
-        if let Some(good) = ping_message.good {
-            self.remote_good = good;
-        }
-
-        if let Some(late) = ping_message.late {
-            self.remote_late = late;
-        }
-
-        if let Some(lost) = ping_message.lost {
-            self.remote_lost = lost;
-        }
-
-        if let Some(resync) = ping_message.resync {
-            self.remote_resync = resync;
-        }
+        self.remote_good = ping_message.good;
+        self.remote_late = ping_message.late;
+        self.remote_lost = ping_message.lost;
+        self.remote_resync = ping_message.resync;
     }
 
     pub fn create_ping_response(&self, ping_message: &Ping) -> Ping {

@@ -1,4 +1,5 @@
-use crate::mumble_proto::Ping;
+use crate::messages::encoder::Ping;
+
 
 
 #[derive(Debug, Clone, Copy)]
