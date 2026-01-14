@@ -34,6 +34,7 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
     let mut encoded_len_arms = Vec::new();
     let mut to_proto_arms = Vec::new();
     let mut to_proto_vec_arms = Vec::new();
+    let mut from_impls = Vec::new();
 
     for (idx, variant) in data.variants.iter().enumerate() {
         let var_ident = &variant.ident;
@@ -66,6 +67,14 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
                     to_proto_vec_arms.push(quote! {
                         #name::#var_ident(data) => Ok((data.clone())),
                     });
+
+                    from_impls.push(quote! {
+                        impl From<#ty> for #name {
+                            fn from(value: #ty) -> Self {
+                                #name::#var_ident(value)
+                            }
+                        }
+                    });
                 } else {
                     from_arms.push(quote! {
                         #discr => Ok(#name::#var_ident(<#ty as prost::Message>::decode(&*buffer)?)),
@@ -88,6 +97,15 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
 
                     to_proto_vec_arms.push(quote! {
                         #name::#var_ident(msg) => Ok((msg.encode_to_vec())),
+                    });
+
+                    // generate `impl From<Inner> for Enum` for convenience
+                    from_impls.push(quote! {
+                        impl From<#ty> for #name {
+                            fn from(value: #ty) -> Self {
+                                #name::#var_ident(value)
+                            }
+                        }
                     });
                 }
             }
@@ -128,6 +146,8 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
                 }
             }
         }
+        
+        #(#from_impls)*
     };
 
     TokenStream::from(expanded)

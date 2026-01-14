@@ -34,10 +34,10 @@ impl CryptState {
 
     pub fn create_ping_response(&self, ping_message: &Ping) -> Ping {
         Ping {
-            good: Some(self.good),
-            late: Some(self.late),
-            lost: Some(self.lost),
-            resync: Some(self.resync),
+            good: self.good,
+            late: self.late,
+            lost: self.lost,
+            resync: self.resync,
             timestamp: ping_message.timestamp,
             udp_packets: None,
             tcp_packets: None,

@@ -1,4 +1,3 @@
-
 mod acl;
 mod authenticate;
 mod ban_list;
@@ -7,6 +6,7 @@ mod channel_state;
 mod crypt_setup;
 mod permission_query;
 mod ping;
+mod user_state;
 // mod query_users;
 // mod request_blob;
 // mod text_message;
@@ -27,7 +27,11 @@ use crypt_setup::handle_crypt_setup;
 use permission_query::handle_permission_query;
 use ping::handle_ping;
 
-use crate::{errors::{MessageHandlerError, MessageTypeNotForIncoming}, messages::Message, server::Server};
+use crate::{
+    errors::{MessageHandlerError, MessageTypeNotForIncoming},
+    messages::{encoder::*, errors::MessageProtocolError, Message},
+    server::Server,
+};
 // pub(crate) use query_users::handle_query_users;
 // pub use request_blob::handle_request_blob;
 // pub use text_message::handle_text_message;
@@ -37,21 +41,33 @@ use crate::{errors::{MessageHandlerError, MessageTypeNotForIncoming}, messages::
 // pub use user_stats::handle_user_stats;
 // pub use voice_target::handle_voice_target;
 
-
 pub trait AsyncMessageHandlerExt {
-    async fn read_and_handle_message(&self, server: &Arc<Box<Server>>) -> Result<(), MessageHandlerError>;
+    async fn read_and_handle_message(
+        &self,
+        server: &Arc<Box<Server>>,
+    ) -> Result<(), MessageHandlerError>;
 }
 
 impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
-    async fn read_and_handle_message(&self, server: &Arc<Box<Server>>) -> Result<(), MessageHandlerError> {
+    async fn read_and_handle_message(
+        &self,
+        server: &Arc<Box<Server>>,
+    ) -> Result<(), MessageHandlerError> {
         match self.read_proto_message().await {
             Ok(message) => match message {
                 Message::Version(version) => todo!(),
                 Message::UDPTunnel(items) => todo!(),
                 Message::Authenticate(authenticate) => {
-                    handle_authenticate(server, self, authenticate).await
+                    handle_authenticate(server, self, authenticate.into()).await
                 }
-                Message::Ping(ping) => handle_ping(server, self, ping).await,
+                Message::Ping(ping) => {
+                    handle_ping(
+                        server,
+                        self,
+                        ping.try_into().map_err(MessageProtocolError::from)?,
+                    )
+                    .await
+                }
                 Message::Reject(_) => Err(MessageTypeNotForIncoming::new(message).into()),
                 Message::ServerSync(_) => Err(MessageTypeNotForIncoming::new(message).into()),
                 Message::ChannelRemove(channel_remove) => {
@@ -64,13 +80,11 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 Message::UserState(user_state) => todo!(),
                 Message::BanList(ban_list) => todo!(),
                 Message::TextMessage(text_message) => todo!(),
-                Message::PermissionDenied(_) => {
-                    Err(MessageTypeNotForIncoming::new(message).into())
-                }
+                Message::PermissionDenied(_) => Err(MessageTypeNotForIncoming::new(message).into()),
                 Message::ACL(acl) => todo!(),
                 Message::QueryUsers(query_users) => todo!(),
                 Message::CryptSetup(crypt_setup) => {
-                    handle_crypt_setup(server, self, crypt_setup).await
+                    handle_crypt_setup(server, self, crypt_setup.into()).await
                 }
                 Message::ContextActionModify(context_action_modify) => todo!(),
                 Message::ContextAction(context_action) => todo!(),
@@ -87,9 +101,7 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                     Err(MessageTypeNotForIncoming::new(message).into())
                 }
             },
-            Err(e) => {
-                Err(e.into())
-            },
+            Err(e) => Err(e.into()),
         }
     }
 }

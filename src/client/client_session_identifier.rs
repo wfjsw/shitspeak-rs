@@ -52,13 +52,11 @@ impl From<ClientSessionIdentifier> for u32 {
     }
 }
 
-impl TryFrom<u32> for ClientSessionIdentifier {
-    type Error = ClientSessionIdentifierError;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
+impl From<u32> for ClientSessionIdentifier {
+    fn from(value: u32) -> Self {
         let local_session_id = value & MAX_LOCAL_SESSION_ID;
         let node_id = ((value >> 20) & (MAX_NODE_ID as u32)) as u16;
-        Ok(ClientSessionIdentifier { node_id, local_session_id })
+        ClientSessionIdentifier { node_id, local_session_id }
     }
 }
 

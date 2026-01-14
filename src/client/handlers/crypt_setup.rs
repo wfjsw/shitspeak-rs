@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    client::Client, errors::MessageHandlerError, mumble_proto::CryptSetup, server::Server,
+    client::Client, errors::MessageHandlerError, messages::encoder::CryptSetup, server::Server,
 };
 
 pub async fn handle_crypt_setup(

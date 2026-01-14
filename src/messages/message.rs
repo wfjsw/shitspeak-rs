@@ -1,5 +1,3 @@
-use std::ffi::os_str::Display;
-
 use prost::Message as _;
 
 use crate::{mumble_proto::*};
@@ -7,7 +5,7 @@ use crate::{mumble_proto::*};
 use message_macro::MessageConversion;
 
 #[repr(u16)]
-#[derive(Debug, Clone, PartialEq, MessageConversion)]
+#[derive(Debug, Clone, MessageConversion)]
 pub enum Message {
     Version(Version),
     UDPTunnel(Vec<u8>),

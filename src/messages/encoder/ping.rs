@@ -1,4 +1,4 @@
-use crate::messages::Message;
+use crate::messages::{Message, errors::PingProtocolError};
 
 #[derive(Debug, Clone)]
 pub struct Ping {
@@ -18,9 +18,9 @@ pub struct Ping {
 
 
 impl TryFrom<crate::mumble_proto::Ping> for Ping {
-    fn try_from(proto: crate::mumble_proto::Ping) -> Result<Self, Self::Error> {
+    fn try_from(proto: crate::mumble_proto::Ping) -> Result<Self, PingProtocolError> {
         Ok(Self {
-            timestamp: proto.timestamp.ok_or(Self::Error::MissingTimestamp)?,
+            timestamp: proto.timestamp.ok_or(PingProtocolError::MissingTimestamp)?,
             good: proto.good.unwrap_or(0),
             late: proto.late.unwrap_or(0),
             lost: proto.lost.unwrap_or(0),
@@ -33,7 +33,7 @@ impl TryFrom<crate::mumble_proto::Ping> for Ping {
             tcp_ping_var: proto.tcp_ping_var,
         })
     }
-    type Error = crate::mumble_proto::PingError;
+    type Error = PingProtocolError;
 }
 
 impl Ping {

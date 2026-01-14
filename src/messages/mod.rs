@@ -2,6 +2,7 @@ mod message;
 mod message_reader;
 mod message_writer;
 
+pub mod errors;
 pub mod encoder;
 
 pub use message::Message;
