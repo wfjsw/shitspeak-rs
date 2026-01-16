@@ -7,6 +7,7 @@ use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
 use rustls::version::{TLS12, TLS13};
 use tokio_rustls::TlsAcceptor;
 
+use crate::api::Authenticator;
 use crate::client::AsyncMessageHandlerExt;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{
@@ -37,10 +38,12 @@ pub struct Server {
     clients: ClientRepository,
 
     codec_info: CodecInfo,
+
+    authenticator: Box<dyn Authenticator>,
 }
 
 impl Server {
-    pub async fn new(config: Config) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
+    pub async fn new<A: Authenticator>(config: Config, authenticator: A) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
         let listen_address = config
             .listen
             .to_socket_addrs()?
@@ -79,6 +82,7 @@ impl Server {
             udp_socket,
             clients: ClientRepository::new(config.node_id),
             codec_info: CodecInfo::default(),
+            authenticator: Box::new(authenticator),
         })))
     }
 
@@ -145,5 +149,9 @@ impl Server {
     pub async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // self.config = Config::load();
         Ok(())
+    }
+
+    pub fn get_authenticator(&self) -> &dyn Authenticator {
+        self.authenticator.as_ref()
     }
 }

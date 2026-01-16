@@ -16,6 +16,7 @@ mod client_certificate_verifier;
 mod proxy_protocol;
 mod protocol_version;
 mod errors;
+mod api;
 
 mod mumble_proto {
     include!(concat!(env!("OUT_DIR"), "/mumble_proto.rs"));

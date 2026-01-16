@@ -5,6 +5,11 @@ pub struct ProtocolVersion {
     pub patch: u64,
 }
 
+impl ProtocolVersion {
+    pub fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self { major, minor, patch }
+    }
+}
 
 impl From<u32> for ProtocolVersion {
     fn from(version: u32) -> Self {

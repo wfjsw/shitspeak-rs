@@ -12,8 +12,22 @@ pub async fn handle_ping(
 ) -> Result<(), MessageHandlerError> {
     // Handle the ping message logic here
     sender.reset_last_ping().await;
-    sender.update_from_ping_message(&msg).await;
-    let response = sender.create_ping_response(&msg).await;
+    
+    {
+        let mut stats = sender.write_stats().await;
+        stats.update_from_ping_message(&msg);
+    }
+
+    let response = {
+        let mut crypt_state = sender.crypt_state().await;
+        if let Some(state) = crypt_state.as_mut() {
+            state.update_from_ping_message(&msg);
+            state.create_ping_response(&msg)
+        } else {
+            msg.default_from_self()
+        }
+    };
+
     // Send the ping response back to the sender
     sender.write_proto_message(&response.into()).await?;
     Ok(())

@@ -6,7 +6,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use tokio::{
     net::TcpStream,
-    sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock},
+    sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
 };
 use tokio_rustls::server::TlsStream;
 
@@ -23,7 +23,8 @@ use crate::{
         user_info::{UserInfo, UserInfoExtended},
     },
     errors::{ReadProtoMessageError, WriteProtoMessageError},
-    messages::{Message, ReadMessageExt, WriteMessageExt, encoder::Ping},
+    messages::{encoder::Ping, Message, ReadMessageExt, WriteMessageExt},
+    protocol_version::ProtocolVersion,
 };
 
 pub struct Client {
@@ -223,28 +224,38 @@ impl Client {
         *last_ping = Utc::now();
     }
 
-    pub async fn update_from_ping_message(&self, ping_message: &Ping) {
-        {
-            let mut crypt_state = self.crypt_state.lock().await;
-            if let Some(state) = crypt_state.as_mut() {
-                state.update_from_ping_message(ping_message);
-            }
-        }
+    // pub async fn update_from_ping_message(&self, ping_message: &Ping) {
+    //     {
+    //         let mut crypt_state = self.crypt_state.lock().await;
+    //         if let Some(state) = crypt_state.as_mut() {
+    //             state.update_from_ping_message(ping_message);
+    //         }
+    //     }
 
-        {
-            let mut stats = self.stats.write().await;
-            stats.update_from_ping_message(ping_message);
-        }
+    //     {
+    //         let mut stats = self.stats.write().await;
+    //         stats.update_from_ping_message(ping_message);
+    //     }
+    // }
+
+    pub async fn crypt_state(
+        &self,
+    ) -> MutexGuard<'_, Option<CryptState>> {
+        self.crypt_state.lock().await
     }
 
-    pub async fn create_ping_response(&self, ping_message: &Ping) -> Ping {
-        let crypt_state = self.crypt_state.lock().await;
-        if let Some(state) = crypt_state.as_ref() {
-            state.create_ping_response(ping_message)
-        } else {
-            ping_message.default_from_self()
-        }
+    pub async fn write_stats(&self) -> RwLockWriteGuard<'_, ClientStats> {
+        self.stats.write().await
     }
+
+    // pub async fn create_ping_response(&self, ping_message: &Ping) -> Ping {
+    //     let crypt_state = self.crypt_state.lock().await;
+    //     if let Some(state) = crypt_state.as_ref() {
+    //         state.create_ping_response(ping_message)
+    //     } else {
+    //         ping_message.default_from_self()
+    //     }
+    // }
 
     pub async fn is_authenticated(&self) -> bool {
         let local_state_guard = self.local_state.read().await;
@@ -253,4 +264,37 @@ impl Client {
             None => panic!("Accessing local state on remote user"),
         }
     }
+
+    pub async fn set_protocol_version(&self, version: Option<ProtocolVersion>) {
+        let mut global_state_guard = self.global_state.write().await;
+        global_state_guard.set_protocol_version(version);
+    }
+
+    pub async fn set_release(&self, release: Option<String>) {
+        let mut global_state_guard = self.global_state.write().await;
+        global_state_guard.set_release(release);
+    }
+
+    pub async fn set_os(&self, os: Option<String>) {
+        let mut global_state_guard = self.global_state.write().await;
+        global_state_guard.set_os(os);
+    }
+
+    pub async fn set_os_version(&self, os_version: Option<String>) {
+        let mut global_state_guard = self.global_state.write().await;
+        global_state_guard.set_os_version(os_version);
+    }
+
+    pub async fn write_global_state(
+        &self,
+    ) -> RwLockWriteGuard<'_, ClientGlobalState> {
+        self.global_state.write().await
+    }
+
+    pub async fn user_info_extended(
+        &self,
+    ) -> MutexGuard<'_, Option<UserInfoExtended>> {
+        self.user_info_extended.lock().await
+    }
+
 }

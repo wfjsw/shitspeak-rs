@@ -1,10 +1,9 @@
 use crate::{
-    constants::{APP_PROTO_VER, release}, messages::Message
+    constants::{APP_PROTO_VER, release}, messages::Message, protocol_version::ProtocolVersion
 };
 
 pub struct Version {
-    pub version_v1: Option<u32>,
-    pub version_v2: Option<u64>,
+    pub version: Option<ProtocolVersion>,
     pub release: Option<String>,
     pub os: Option<String>,
     pub os_version: Option<String>,
@@ -13,8 +12,11 @@ pub struct Version {
 impl From<crate::mumble_proto::Version> for Version {
     fn from(proto: crate::mumble_proto::Version) -> Self {
         Self {
-            version_v1: proto.version_v1,
-            version_v2: proto.version_v2,
+            version: match (proto.version_v2, proto.version_v1) {
+                (Some(v2), _) => Some(ProtocolVersion::from(v2)),
+                (_, Some(v1)) => Some(ProtocolVersion::from(v1)),
+                _ => None,
+            },
             release: proto.release.clone(),
             os: proto.os.clone(),
             os_version: proto.os_version.clone(),
@@ -27,12 +29,7 @@ impl Version {
         let os_info = os_info::get();
 
         Version {
-            version_v1: if send_version {
-                Some(APP_PROTO_VER.into())
-            } else {
-                None
-            },
-            version_v2: if send_version {
+            version: if send_version {
                 Some(APP_PROTO_VER.into())
             } else {
                 None
@@ -59,8 +56,8 @@ impl Version {
 impl Into<crate::mumble_proto::Version> for Version {
     fn into(self) -> crate::mumble_proto::Version {
         crate::mumble_proto::Version {
-            version_v1: self.version_v1,
-            version_v2: self.version_v2,
+            version_v1: self.version.map(|v| v.into()),
+            version_v2: self.version.map(|v| v.into()),
             release: self.release,
             os: self.os,
             os_version: self.os_version,

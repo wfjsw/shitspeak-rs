@@ -8,6 +8,7 @@ pub struct AuthRejection {
 
 impl AuthRejection {
     pub fn new(rejection_type: RejectType) -> Self {
+        // TODO: populate reason based on type
         Self { rejection_type, reason: None }
     }
 

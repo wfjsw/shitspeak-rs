@@ -4,8 +4,8 @@ use crate::{client::client_session_identifier::ClientSessionIdentifier, messages
 
 #[derive(Debug, Clone)]
 pub struct VolumeAdjustment {
-        listening_channel: u32,
-        volume_adjustment: f32,
+    pub listening_channel: u32,
+    pub volume_adjustment: f32,
 }
 
 impl TryFrom<crate::mumble_proto::user_state::VolumeAdjustment> for VolumeAdjustment {
@@ -21,29 +21,29 @@ impl TryFrom<crate::mumble_proto::user_state::VolumeAdjustment> for VolumeAdjust
 
 #[derive(Debug, Clone)]
 pub struct UserState {
-    session: ClientSessionIdentifier,
-    actor: Option<ClientSessionIdentifier>,
-    name: Option<String>,
-    user_id: Option<u32>,
-    channel_id: Option<u32>,
-    mute: Option<bool>,
-    deaf: Option<bool>,
-    suppress: Option<bool>,
-    self_mute: Option<bool>,
-    self_deaf: Option<bool>,
-    texture: Option<Vec<u8>>,
-    plugin_context: Option<Vec<u8>>,
-    plugin_identity: Option<String>,
-    comment: Option<String>,
-    hash: Option<String>,
-    comment_hash: Option<Vec<u8>>,
-    texture_hash: Option<Vec<u8>>,
-    priority_speaker: Option<bool>,
-    recording: Option<bool>,
-    temporary_access_tokens: Vec<String>,
-    listening_channel_add: Vec<u32>,
-    listening_channel_remove: Vec<u32>,
-    listening_volume_adjustment: Vec<VolumeAdjustment>,
+    pub session: ClientSessionIdentifier,
+    pub actor: Option<ClientSessionIdentifier>,
+    pub name: Option<String>,
+    pub user_id: Option<u32>,
+    pub channel_id: Option<u32>,
+    pub mute: Option<bool>,
+    pub deaf: Option<bool>,
+    pub suppress: Option<bool>,
+    pub self_mute: Option<bool>,
+    pub self_deaf: Option<bool>,
+    pub texture: Option<Vec<u8>>,
+    pub plugin_context: Option<Vec<u8>>,
+    pub plugin_identity: Option<String>,
+    pub comment: Option<String>,
+    pub hash: Option<String>,
+    pub comment_hash: Option<Vec<u8>>,
+    pub texture_hash: Option<Vec<u8>>,
+    pub priority_speaker: Option<bool>,
+    pub recording: Option<bool>,
+    pub temporary_access_tokens: Vec<String>,
+    pub listening_channel_add: Vec<u32>,
+    pub listening_channel_remove: Vec<u32>,
+    pub listening_volume_adjustment: Vec<VolumeAdjustment>,
 }
 
 impl TryFrom<crate::mumble_proto::UserState> for UserState {

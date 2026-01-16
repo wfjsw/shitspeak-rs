@@ -3,6 +3,7 @@ use crate::{
         AuthRejection, MessageTypeNotForIncoming, ReadProtoMessageError, WriteProtoMessageError,
     },
     messages::errors::MessageProtocolError,
+    mumble_proto::reject::RejectType,
 };
 
 #[derive(Debug)]
@@ -32,6 +33,12 @@ impl From<AuthRejection> for MessageHandlerError {
     }
 }
 
+impl From<RejectType> for MessageHandlerError {
+    fn from(err: RejectType) -> Self {
+        MessageHandlerError::AuthRejection(AuthRejection::new(err))
+    }
+}
+
 impl From<MessageTypeNotForIncoming> for MessageHandlerError {
     fn from(err: MessageTypeNotForIncoming) -> Self {
         MessageHandlerError::MessageTypeNotForIncoming(err)
@@ -58,7 +65,7 @@ impl std::fmt::Display for MessageHandlerError {
                 write!(f, "Message type not for incoming: {}", e)
             }
             MessageHandlerError::MessageProtocolError(e) => {
-                write!(f, "Message protocol error: {}", e)  
+                write!(f, "Message protocol error: {}", e)
             }
         }
     }

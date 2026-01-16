@@ -7,6 +7,7 @@ mod crypt_setup;
 mod permission_query;
 mod ping;
 mod user_state;
+mod version;
 // mod query_users;
 // mod request_blob;
 // mod text_message;
@@ -26,21 +27,16 @@ use channel_state::handle_channel_state;
 use crypt_setup::handle_crypt_setup;
 use permission_query::handle_permission_query;
 use ping::handle_ping;
+use version::handle_version;
 
 use crate::{
+    client::handlers::user_state::handle_user_state,
     errors::{MessageHandlerError, MessageTypeNotForIncoming},
-    messages::{encoder::*, errors::MessageProtocolError, Message},
+    messages::{errors::MessageProtocolError, Message},
     server::Server,
 };
-// pub(crate) use query_users::handle_query_users;
-// pub use request_blob::handle_request_blob;
-// pub use text_message::handle_text_message;
-// pub use user_list::handle_user_list;
-// pub use user_remove::handle_user_remove;
-// pub use user_state::handle_user_state;
-// pub use user_stats::handle_user_stats;
-// pub use voice_target::handle_voice_target;
 
+ 
 pub trait AsyncMessageHandlerExt {
     async fn read_and_handle_message(
         &self,
@@ -55,7 +51,7 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
     ) -> Result<(), MessageHandlerError> {
         match self.read_proto_message().await {
             Ok(message) => match message {
-                Message::Version(version) => todo!(),
+                Message::Version(version) => handle_version(server, self, version.into()).await,
                 Message::UDPTunnel(items) => todo!(),
                 Message::Authenticate(authenticate) => {
                     handle_authenticate(server, self, authenticate.into()).await
@@ -77,7 +73,14 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                     handle_channel_state(server, self, channel_state).await
                 }
                 Message::UserRemove(user_remove) => todo!(),
-                Message::UserState(user_state) => todo!(),
+                Message::UserState(user_state) => {
+                    handle_user_state(
+                        server,
+                        self,
+                        user_state.try_into().map_err(MessageProtocolError::from)?,
+                    )
+                    .await
+                }
                 Message::BanList(ban_list) => todo!(),
                 Message::TextMessage(text_message) => todo!(),
                 Message::PermissionDenied(_) => Err(MessageTypeNotForIncoming::new(message).into()),
