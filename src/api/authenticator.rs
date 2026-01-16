@@ -20,8 +20,8 @@ pub struct AuthenticateResult {
 
 pub struct AuthenticateAuxiliaryData {
     pub certificate_hash: Option<Vec<u8>>,
-    pub session_id: Option<u32>,
-    pub ip_address: Option<IpAddr>,
+    pub session_id: u32,
+    pub ip_address: IpAddr,
     pub version: Option<ProtocolVersion>,
     pub client_name: Option<String>,
     pub os_name: Option<String>,

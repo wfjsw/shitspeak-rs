@@ -186,6 +186,9 @@ impl Client {
         self.udp_address
     }
 
+    pub fn get_real_ip_address(&self) -> IpAddr {
+        self.real_ip_address
+    }
     // FIXME: not sure if it is verified or just exists
     pub async fn is_verified(&self) -> bool {
         let guard = self.connection.lock().await;
@@ -283,6 +286,12 @@ impl Client {
     pub async fn set_os_version(&self, os_version: Option<String>) {
         let mut global_state_guard = self.global_state.write().await;
         global_state_guard.set_os_version(os_version);
+    }
+
+    pub async fn read_global_state(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, ClientGlobalState> {
+        self.global_state.read().await
     }
 
     pub async fn write_global_state(

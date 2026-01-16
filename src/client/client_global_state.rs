@@ -63,6 +63,10 @@ impl ClientGlobalState {
         self.listening_channel_id.contains(&channel_id)
     }
 
+    pub fn get_protocol_version(&self) -> Option<ProtocolVersion> {
+        self.protocol_version.clone()
+    }
+
     pub fn set_protocol_version(&mut self, version: Option<ProtocolVersion>) {
         if self.protocol_version.is_some() {
             return;
@@ -71,6 +75,10 @@ impl ClientGlobalState {
             None => Some(ProtocolVersion::new(1, 2, 0)),
             Some(v) => Some(v),
         }
+    }
+
+    pub fn get_release(&self) -> Option<&str> {
+        self.release.as_deref()
     }
 
     pub fn set_release(&mut self, release: Option<String>) {
@@ -84,6 +92,10 @@ impl ClientGlobalState {
         }
     }
 
+    pub fn get_os_name(&self) -> Option<&str> {
+        self.os.as_deref()
+    }
+
     pub fn set_os(&mut self, os: Option<String>) {
         if os.is_none() && self.os.is_some() {
             return;
@@ -93,6 +105,10 @@ impl ClientGlobalState {
             Some(o) => Some(o.chars().take(40).collect()),
             None => None,
         }
+    }
+
+    pub fn get_os_version(&self) -> Option<&str> {
+        self.os_version.as_deref()
     }
 
     pub fn set_os_version(&mut self, os_version: Option<String>) {
