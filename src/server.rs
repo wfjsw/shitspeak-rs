@@ -154,4 +154,8 @@ impl Server {
     pub fn get_authenticator(&self) -> &dyn Authenticator {
         self.authenticator.as_ref()
     }
+
+    pub fn get_clients(&self) -> &ClientRepository {
+        &self.clients
+    }
 }

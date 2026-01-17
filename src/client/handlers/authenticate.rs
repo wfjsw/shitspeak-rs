@@ -49,7 +49,7 @@ pub async fn handle_authenticate(
             password.as_deref(),
             &AuthenticateAuxiliaryData {
                 certificate_hash,
-                session_id,
+                session_id: session_id.into(),
                 ip_address,
                 version,
                 client_name,

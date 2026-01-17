@@ -128,8 +128,8 @@ impl Client {
         self.certificate_hash.as_deref()
     }
 
-    pub fn get_session_id(&self) -> u32 {
-        self.session_id.into()
+    pub fn get_session_id(&self) -> ClientSessionIdentifier {
+        self.session_id
     }
 
     pub fn get_node_id(&self) -> u16 {

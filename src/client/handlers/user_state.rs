@@ -9,6 +9,18 @@ pub async fn handle_user_state(
     sender: &Arc<Box<Client>>,
     msg: UserState,
 ) -> Result<(), MessageHandlerError> {
-    // Handle channel remove message logic here
+    let target = match msg.session {
+        Some(session) => server.get_clients().get_client(session).await.ok_or("Client not found in server's client map")?,
+        None => sender.clone(),
+    };
+
+    let mut broadcast_message = UserState::default();
+    broadcast_message.session = Some(target.get_session_id());
+    broadcast_message.actor = Some(sender.get_session_id());
+
+
+
+    let mut should_broadcast = false;
+    
     Ok(())
 }

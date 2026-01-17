@@ -21,7 +21,7 @@ impl TryFrom<crate::mumble_proto::user_state::VolumeAdjustment> for VolumeAdjust
 
 #[derive(Debug, Clone)]
 pub struct UserState {
-    pub session: ClientSessionIdentifier,
+    pub session: Option<ClientSessionIdentifier>,
     pub actor: Option<ClientSessionIdentifier>,
     pub name: Option<String>,
     pub user_id: Option<u32>,
@@ -49,7 +49,7 @@ pub struct UserState {
 impl TryFrom<crate::mumble_proto::UserState> for UserState {
     fn try_from(proto: crate::mumble_proto::UserState) -> Result<Self, Self::Error> {
         Ok(Self {
-            session: proto.session.ok_or(UserStateProtocolError::MissingSessionId)?.into(),
+            session: proto.session.map(|a| a.into()),
             actor: proto.actor.map(|a| a.into()),
             name: proto.name,
             user_id: proto.user_id,
@@ -81,10 +81,40 @@ impl TryFrom<crate::mumble_proto::UserState> for UserState {
 impl UserState {
 }
 
+impl Default for UserState {
+    fn default() -> Self {
+        Self {
+            session: None,
+            actor: None,
+            name: None,
+            user_id: None,
+            channel_id: None,
+            mute: None,
+            deaf: None,
+            suppress: None,
+            self_mute: None,
+            self_deaf: None,
+            texture: None,
+            plugin_context: None,
+            plugin_identity: None,
+            comment: None,
+            hash: None,
+            comment_hash: None,
+            texture_hash: None,
+            priority_speaker: None,
+            recording: None,
+            temporary_access_tokens: Vec::new(),
+            listening_channel_add: Vec::new(),
+            listening_channel_remove: Vec::new(),
+            listening_volume_adjustment: Vec::new(),
+        }
+    }
+}
+
 impl Into<crate::mumble_proto::UserState> for UserState {
     fn into(self) -> crate::mumble_proto::UserState {
         crate::mumble_proto::UserState {
-            session: Some(u32::from(self.session)),
+            session: self.session.map(|s| u32::from(s)),
             actor: self.actor.map(|a| u32::from(a)),
             name: self.name,
             user_id: self.user_id,
