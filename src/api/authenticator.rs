@@ -13,8 +13,8 @@ pub enum AuthenticationRejection {
 
 #[derive(Debug)]
 pub struct AuthenticateResult {
-    pub user_id: u32,
-    pub username: String,
+    pub user_id: Option<u32>,
+    pub display_name: Option<String>,
     pub groups: Vec<String>,
 }
 
@@ -33,7 +33,7 @@ pub trait Authenticator: Send + Sync + 'static {
     async fn authenticate(
         &self,
         username: &str,
-        password: &str,
+        password: Option<&str>,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Result<AuthenticateResult, AuthenticationRejection>;
 }

@@ -16,14 +16,13 @@ use crate::{
         client_local_state::ClientLocalState,
         client_session_identifier::ClientSessionIdentifier,
         client_stats::ClientStats,
-        crypt::{CryptState, CryptoMode},
+        crypt::CryptState,
         options::ClientOptions,
-        states::ConnectionState,
         udp_state::UdpState,
         user_info::{UserInfo, UserInfoExtended},
     },
     errors::{ReadProtoMessageError, WriteProtoMessageError},
-    messages::{encoder::Ping, Message, ReadMessageExt, WriteMessageExt},
+    messages::{Message, ReadMessageExt, WriteMessageExt},
     protocol_version::ProtocolVersion,
 };
 
@@ -100,7 +99,7 @@ impl Client {
             stats: RwLock::new(ClientStats::default()),
             certificate_hash,
             user_info: RwLock::new(UserInfo::default()),
-            user_info_extended: Mutex::new(None),
+            user_info_extended: Mutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
             local_state: RwLock::new(Some(ClientLocalState::new())),
             global_state: RwLock::new(ClientGlobalState::new()),
@@ -109,8 +108,7 @@ impl Client {
     }
 
     pub async fn is_registered(&self) -> bool {
-        let state = self.global_state.read().await;
-        state.get_user_id().is_some()
+        self.user_info.read().await.is_registered()
     }
 
     pub fn has_certificate(&self) -> bool {
@@ -118,8 +116,7 @@ impl Client {
     }
 
     pub async fn get_groups_clone(&self) -> HashSet<String> {
-        let user_info = self.user_info.read().await;
-        user_info.get_groups().clone()
+        self.user_info.read().await.get_groups().clone()
     }
 
     pub async fn has_group(&self, group: &str) -> bool {
@@ -165,7 +162,7 @@ impl Client {
     }
 
     pub async fn get_user_id(&self) -> Option<u32> {
-        self.global_state.read().await.get_user_id()
+        self.user_info.read().await.get_user_id()
     }
 
     // pub fn get_display_name(&self) -> Option<String> {
@@ -241,9 +238,7 @@ impl Client {
     //     }
     // }
 
-    pub async fn crypt_state(
-        &self,
-    ) -> MutexGuard<'_, Option<CryptState>> {
+    pub async fn crypt_state(&self) -> MutexGuard<'_, Option<CryptState>> {
         self.crypt_state.lock().await
     }
 
@@ -288,22 +283,23 @@ impl Client {
         global_state_guard.set_os_version(os_version);
     }
 
-    pub async fn read_global_state(
-        &self,
-    ) -> tokio::sync::RwLockReadGuard<'_, ClientGlobalState> {
+    pub async fn read_global_state(&self) -> tokio::sync::RwLockReadGuard<'_, ClientGlobalState> {
         self.global_state.read().await
     }
 
-    pub async fn write_global_state(
-        &self,
-    ) -> RwLockWriteGuard<'_, ClientGlobalState> {
+    pub async fn write_global_state(&self) -> RwLockWriteGuard<'_, ClientGlobalState> {
         self.global_state.write().await
     }
 
-    pub async fn user_info_extended(
-        &self,
-    ) -> MutexGuard<'_, Option<UserInfoExtended>> {
-        self.user_info_extended.lock().await
+    pub async fn write_user_info(&self) -> RwLockWriteGuard<'_, UserInfo> {
+        self.user_info.write().await
     }
 
+    pub async fn user_info_extended(&self) -> MappedMutexGuard<'_, UserInfoExtended> {
+        let user_info_extended = self.user_info_extended.lock().await;
+        if user_info_extended.is_none() {
+            panic!("Accessing user_info_extended of non-local user");
+        }
+        MutexGuard::map(user_info_extended, |opt| opt.as_mut().unwrap())
+    }
 }

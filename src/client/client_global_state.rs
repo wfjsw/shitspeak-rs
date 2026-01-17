@@ -3,8 +3,6 @@ use std::collections::HashSet;
 use crate::{client::user_version::UserVersion, protocol_version::ProtocolVersion};
 
 pub struct ClientGlobalState {
-    user_id: Option<u32>,
-    
     protocol_version: Option<ProtocolVersion>, 
     release: Option<String>,
     os: Option<String>,
@@ -18,8 +16,6 @@ pub struct ClientGlobalState {
 impl ClientGlobalState {
     pub fn new() -> Self {
         ClientGlobalState {
-            user_id: None,
-
             protocol_version: None,
             release: None,
             os: None,
@@ -29,14 +25,6 @@ impl ClientGlobalState {
             last_active_timestamp: None,
             listening_channel_id: HashSet::new(),
         }
-    }
-
-    pub fn get_user_id(&self) -> Option<u32> {
-        self.user_id
-    }
-
-    pub fn set_user_id(&mut self, user_id: Option<u32>) {
-        self.user_id = user_id;
     }
 
     pub fn set_current_channel_id(&mut self, channel_id: u32) {
