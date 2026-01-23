@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_writer(non_blocking).init();
 
     let config = Config::load();
-    let server = Server::new(config).await?;
-    server.run().await?;
+    // let server = Server::new(config, /* authenticator */).await?;
+    // server.run().await?;
     Ok(())
 }
