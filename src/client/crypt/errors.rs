@@ -6,6 +6,9 @@ pub enum CryptError {
     DataTooShort,
     TagMismatch,
     InvalidKeySize,
+    UnexpectedTag,
+    DestinationBufferTooSmall,
+    UnsupportedMode,
 }
 
 impl From<aws_lc_rs::error::Unspecified> for CryptError {
@@ -22,6 +25,9 @@ impl std::fmt::Display for CryptError {
             CryptError::DataTooShort => write!(f, "Data too short"),
             CryptError::TagMismatch => write!(f, "Tag mismatch"),
             CryptError::InvalidKeySize => write!(f, "Invalid key size"),
+            CryptError::UnexpectedTag => write!(f, "Unexpected tag"),
+            CryptError::DestinationBufferTooSmall => write!(f, "Destination buffer too small"),
+            CryptError::UnsupportedMode => write!(f, "Unsupported crypto mode"),
         }
     }
 }

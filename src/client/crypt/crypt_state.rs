@@ -35,7 +35,7 @@ impl CryptState {
     pub fn generate(mode: &str, rng: &dyn SecureRandom) -> Result<Self, CryptError> {
         let mode = match mode {
             "OCB2-AES128" => Box::new(Ocb2::new(rng)?) as Box<dyn CryptoMode>,
-            _ => panic!("Unsupported crypto mode"),
+            _ => return Err(CryptError::UnsupportedMode),
         };
 
         let nonce_size = mode.nonce_size();
@@ -71,7 +71,7 @@ impl CryptState {
             "OCB2-AES128" => Box::new(Ocb2::from_key(
                 key.try_into().map_err(|_| CryptError::InvalidKeySize)?,
             )?) as Box<dyn CryptoMode>,
-            _ => panic!("Unsupported crypto mode"),
+            _ => return Err(CryptError::UnsupportedMode),
         };
 
         if encrypt_iv.len() != mode.nonce_size() || decrypt_iv.len() != mode.nonce_size() {
@@ -93,6 +93,122 @@ impl CryptState {
             decrypt_history: [0u8; DECRYPT_HISTORY_SIZE],
             mode,
         })
+    }
+
+    pub fn overhead(&self) -> usize {
+        1 + self.mode.overhead()
+    }
+
+    pub fn encrypt(&mut self, dest: &mut [u8], data: &[u8]) -> Result<(), CryptError> {
+        // increase IV
+        for byte in self.encrypt_iv.iter_mut().rev() {
+            *byte = byte.wrapping_add(1);
+            if *byte != 0 {
+                break;
+            }
+        }
+
+        if dest.len() < data.len() + self.overhead() {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+
+        self.mode.encrypt(&mut dest[0..], data, &self.encrypt_iv)?;
+        dest[0] = self.encrypt_iv[0];
+
+        Ok(())
+    }
+
+    pub fn decrypt(&mut self, dest: &mut Vec<u8>, data: &[u8]) -> Result<(), CryptError> {
+        if data.len() < self.overhead() {
+            return Err(CryptError::DataTooShort);
+        }
+        
+        let plain_len = data.len() - self.overhead();
+        dest.reserve_exact(plain_len);
+
+        let incoming_iv_byte = data[0];
+        let known_iv_byte = self.decrypt_iv[0];
+        let mut restore = false;
+
+        let iv_backup = self.decrypt_iv.clone();
+
+        if known_iv_byte.wrapping_add(1) == incoming_iv_byte {
+            // in order as expected
+            if incoming_iv_byte > known_iv_byte {
+                self.decrypt_iv[0] = incoming_iv_byte;
+            } else if incoming_iv_byte < known_iv_byte {
+                // wraparound
+                self.decrypt_iv[0] = incoming_iv_byte;
+                for byte in self.decrypt_iv.iter_mut().skip(1) {
+                    *byte = byte.wrapping_add(1);
+                    if *byte != 0 {
+                        break;
+                    }
+                }
+            } else {
+                unreachable!()
+            }
+        } else {
+            // out of order or repeating
+
+            let diff = incoming_iv_byte.wrapping_sub(known_iv_byte) as i8;
+            if diff > -30 && diff < 0 {
+                self.late = self.late.saturating_add(1);
+                self.lost = self.lost.saturating_sub(1);
+                self.decrypt_iv[0] = incoming_iv_byte;
+                restore = true;
+                if incoming_iv_byte < known_iv_byte {
+                    // late packet, but no wraparound
+                } else if incoming_iv_byte > known_iv_byte {
+                    // Last was 0x02, here comes 0xff from last round
+                    for byte in self.decrypt_iv.iter_mut().skip(1) {
+                        let old_byte = *byte;
+                        *byte = byte.wrapping_sub(1);
+                        if old_byte != 0 {
+                            break;
+                        }
+                    }
+                } else {
+                    unreachable!();
+                }
+            } else if diff > 0 {
+                if incoming_iv_byte > known_iv_byte {
+                    self.lost = self.lost.wrapping_add(incoming_iv_byte as u32 - known_iv_byte as u32 - 1);
+                    self.decrypt_iv[0] = incoming_iv_byte;
+                } else if incoming_iv_byte < known_iv_byte {
+                    self.lost = self.lost.wrapping_add(256 - known_iv_byte as u32 + incoming_iv_byte as u32 - 1);
+                    self.decrypt_iv[0] = incoming_iv_byte;
+                    for byte in self.decrypt_iv.iter_mut().skip(1) {
+                        *byte = byte.wrapping_add(1);
+                        if *byte != 0 {
+                            break;
+                        }
+                    }
+                } else {
+                    unreachable!();
+                }
+            } else {
+                unreachable!();
+            }
+        
+            if self.decrypt_history[self.decrypt_iv[0] as usize] == self.decrypt_iv[1] {
+                // restore the IV
+                self.decrypt_iv.copy_from_slice(&iv_backup);
+
+                return Err(CryptError::UnexpectedTag);
+            }
+        }
+
+        let decrypt_result = self.mode.decrypt(dest, &data[1..], &self.decrypt_iv);
+
+        if let Err(e) = decrypt_result {
+            self.decrypt_iv.copy_from_slice(&iv_backup);
+            return Err(e);
+        }
+
+        // if 
+
+        Ok(())
     }
 
     pub fn update_from_ping_message(&mut self, ping_message: &Ping) {

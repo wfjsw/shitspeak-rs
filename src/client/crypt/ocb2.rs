@@ -1,4 +1,7 @@
-use aws_lc_rs::{cipher::{AES_128, DecryptingKey, EncryptingKey, UnboundCipherKey}, rand::{self, SecureRandom}};
+use aws_lc_rs::{
+    cipher::{DecryptingKey, EncryptingKey, UnboundCipherKey, AES_128},
+    rand::{self, SecureRandom},
+};
 
 use crate::client::crypt::{errors::CryptError, CryptoMode};
 
@@ -37,13 +40,16 @@ impl CryptoMode for Ocb2 {
         3
     }
 
-    fn encrypt(&self, data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, CryptError> {
+    fn encrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError> {
+        let cleartext_len = data.len();
+
         if nonce.len() != self.nonce_size() {
             return Err(CryptError::InvalidNonceSize);
         }
 
-        // output buffer
-        let mut out = Vec::<u8>::with_capacity(data.len() + self.overhead());
+        if dest.len() < cleartext_len + self.overhead() {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
 
         // delta = E(nonce)
         let mut delta = [0u8; BLOCK_SIZE];
@@ -54,13 +60,15 @@ impl CryptoMode for Ocb2 {
 
         let mut tmp = [0u8; BLOCK_SIZE];
         let mut pad = [0u8; BLOCK_SIZE];
-        let mut tag_block = [0u8; BLOCK_SIZE];
 
-        let mut pos = 0usize;
-        let mut remaining = data.len();
+        let tag_size = self.overhead();
+        let dest_ciphertext = &mut dest[tag_size..];
 
         // Process all full blocks except the final block
-        while remaining > BLOCK_SIZE {
+        for pos in (0..cleartext_len)
+            .step_by(BLOCK_SIZE)
+            .take_while(|&p| p + BLOCK_SIZE < cleartext_len)
+        {
             times2(&mut delta);
 
             tmp.copy_from_slice(&data[pos..pos + BLOCK_SIZE]);
@@ -70,13 +78,13 @@ impl CryptoMode for Ocb2 {
 
             let mut out_block = [0u8; BLOCK_SIZE];
             xor_into(&mut out_block, &delta, &tmp);
-            out.extend_from_slice(&out_block);
+            dest_ciphertext[pos..pos + BLOCK_SIZE].copy_from_slice(&out_block);
 
             xor(&mut checksum, &data[pos..pos + BLOCK_SIZE]);
-
-            pos += BLOCK_SIZE;
-            remaining -= BLOCK_SIZE;
         }
+
+        let last_pos = cleartext_len.saturating_sub(1) / BLOCK_SIZE * BLOCK_SIZE;
+        let remaining = cleartext_len - last_pos;
 
         // Final (partial or zero-length) block
         times2(&mut delta);
@@ -90,30 +98,28 @@ impl CryptoMode for Ocb2 {
         self.encrypt_key.encrypt(&mut pad)?;
 
         if remaining > 0 {
-            tmp[..remaining].copy_from_slice(&data[pos..pos + remaining]);
+            tmp[..remaining].copy_from_slice(&data[last_pos..last_pos + remaining]);
         }
+
         tmp[remaining..].copy_from_slice(&pad[remaining..]);
 
         xor(&mut checksum, &tmp);
+        xor_into(
+            &mut dest_ciphertext[last_pos..last_pos + remaining],
+            &pad,
+            &tmp,
+        );
 
-        // ciphertext fragment: pad XOR tmp (only `remaining` bytes)
-        for i in 0..remaining {
-            out.push(pad[i] ^ tmp[i]);
-        }
+        times3(&mut delta);
+        xor(&mut delta, &checksum);
+        self.encrypt_key.encrypt(&mut delta)?;
 
-        // finalize tag: tag = E((3*delta) xor checksum)
-        let mut delta2 = delta;
-        times2(&mut delta2);
-        for i in 0..BLOCK_SIZE {
-            tag_block[i] = delta[i] ^ delta2[i] ^ checksum[i];
-        }
-        self.encrypt_key.encrypt(&mut tag_block)?;
+        dest[..tag_size].copy_from_slice(&delta[..tag_size]);
 
-        out.extend_from_slice(&tag_block[..self.overhead()]);
-        Ok(out)
+        Ok(())
     }
 
-    fn decrypt(&self, data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, CryptError> {
+    fn decrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptError::InvalidNonceSize);
         }
@@ -123,9 +129,10 @@ impl CryptoMode for Ocb2 {
         }
 
         let tag_len = self.overhead();
-        let ct_len = data.len() - tag_len;
+        let ciphertext_len = data.len() - tag_len;
 
-        let mut plain = vec![0u8; ct_len];
+        let tag = &data[..tag_len];
+        let ciphertext = &data[tag_len..];
 
         // prepare
         let mut checksum = [0u8; BLOCK_SIZE];
@@ -137,36 +144,31 @@ impl CryptoMode for Ocb2 {
         let mut pad = [0u8; BLOCK_SIZE];
         let mut calc_tag = [0u8; BLOCK_SIZE];
 
-        let mut off = 0usize;
-        let mut remain = ct_len;
-
         // process full blocks
-        while remain > BLOCK_SIZE {
+        for off in (0..ciphertext_len)
+            .step_by(BLOCK_SIZE)
+            .take_while(|&p| p + BLOCK_SIZE < ciphertext_len)
+        {
             times2(&mut delta);
-
             // tmp = delta xor ciphertext_block
-            xor_into(&mut tmp, &delta, &data[off..off + BLOCK_SIZE]);
-
+            xor_into(&mut tmp, &delta, &ciphertext[off..off + BLOCK_SIZE]);
             // decrypt tmp in-place
             self.decrypt_key
                 .decrypt(&mut tmp, aws_lc_rs::cipher::DecryptionContext::None)?;
-
             // plain_block = delta xor tmp
-            let mut out_block = [0u8; BLOCK_SIZE];
-            xor_into(&mut out_block, &delta, &tmp);
-            plain[off..off + BLOCK_SIZE].copy_from_slice(&out_block);
-
+            xor(&mut tmp, &delta);
+            dest[off..off + BLOCK_SIZE].copy_from_slice(&tmp);
             // checksum ^= plain_block
-            xor(&mut checksum, &plain[off..off + BLOCK_SIZE]);
-
-            off += BLOCK_SIZE;
-            remain -= BLOCK_SIZE;
+            xor(&mut checksum, &tmp);
         }
+
+        let last_pos = ciphertext_len.saturating_sub(1) / BLOCK_SIZE * BLOCK_SIZE;
+        let remaining = ciphertext_len - last_pos;
 
         // final partial block
         times2(&mut delta);
         tmp.fill(0);
-        let num_bits = (remain * 8) as u16;
+        let num_bits = (remaining * 8) as u16;
         tmp[BLOCK_SIZE - 2] = ((num_bits >> 8) & 0xff) as u8;
         tmp[BLOCK_SIZE - 1] = (num_bits & 0xff) as u8;
         xor(&mut tmp, &delta);
@@ -174,9 +176,11 @@ impl CryptoMode for Ocb2 {
         pad.copy_from_slice(&tmp);
         self.encrypt_key.encrypt(&mut pad)?;
 
-        // tmp = ciphertext fragment (in first `remain` bytes)
+        // tmp = ciphertext fragment (in first `remaining` bytes)
         tmp.fill(0);
-        let _ = (&mut tmp[..remain]).copy_from_slice(&data[off..off + remain]);
+        if remaining > 0 {
+            tmp[..remaining].copy_from_slice(&ciphertext[last_pos..last_pos + remaining]);
+        }
 
         // tmp = tmp xor pad
         xor(&mut tmp, &pad);
@@ -185,23 +189,19 @@ impl CryptoMode for Ocb2 {
         xor(&mut checksum, &tmp);
 
         // write plaintext fragment
-        plain[off..off + remain].copy_from_slice(&tmp[..remain]);
+        dest[last_pos..last_pos + remaining].copy_from_slice(&tmp[..remaining]);
 
         // finalize tag: E((3*delta) xor checksum)
-        let mut delta2 = delta;
-        times2(&mut delta2);
-        for i in 0..BLOCK_SIZE {
-            calc_tag[i] = delta[i] ^ delta2[i] ^ checksum[i];
-        }
-        self.encrypt_key.encrypt(&mut calc_tag)?;
+        times3(&mut delta);
+        xor(&mut delta, &checksum);
+        self.encrypt_key.encrypt(&mut delta)?;
 
         // constant-time compare of computed tag prefix with provided tag
-        let provided_tag = &data[ct_len..];
-        if !consttime_eq(&calc_tag[..tag_len], provided_tag) {
+        if !consttime_eq(&delta[..tag_len], tag) {
             return Err(CryptError::TagMismatch);
         }
 
-        Ok(plain)
+        Ok(())
     }
 }
 
@@ -399,11 +399,14 @@ mod tests {
             let expected_ct = must_decode_hex(v.ciphertext);
             let expected_tag = must_decode_hex(v.tag);
 
-            let out = ocb.encrypt(&plain, &nonce).expect("encrypt failed");
+            let mut out = vec![0u8; plain.len() + ocb.overhead()];
+
+            ocb.encrypt(&mut out, &plain, &nonce)
+                .expect("encrypt failed");
 
             // split ciphertext and tag
-            let ct = &out[..plain.len()];
-            let tag = &out[plain.len()..];
+            let ct = &out[ocb.overhead()..];
+            let tag = &out[..ocb.overhead()];
 
             assert_eq!(
                 ct,
@@ -421,11 +424,13 @@ mod tests {
             );
 
             // decrypt
-            let mut combined = Vec::with_capacity(out.len());
-            combined.extend_from_slice(ct);
-            combined.extend_from_slice(tag);
+            let mut combined = vec![0u8; out.len()];
+            combined[..ocb.overhead()].copy_from_slice(tag);
+            combined[ocb.overhead()..].copy_from_slice(ct);
 
-            let dec = ocb.decrypt(&combined, &nonce).expect("decrypt failed");
+            let mut dec = vec![0u8; plain.len()];
+            ocb.decrypt(&mut dec, &combined, &nonce)
+                .expect("decrypt failed");
             assert_eq!(dec, plain, "decrypted plaintext mismatch for {}", v._name);
         }
     }

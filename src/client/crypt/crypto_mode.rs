@@ -5,6 +5,6 @@ pub trait CryptoMode: Send + Sync {
     fn key_size(&self) -> usize;
     fn overhead(&self) -> usize;
 
-    fn encrypt(&self, data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, CryptError>;
-    fn decrypt(&self, data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, CryptError>;
+    fn encrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError>;
+    fn decrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError>;
 }
