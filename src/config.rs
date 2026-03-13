@@ -15,6 +15,8 @@ pub struct Config {
     pub send_build_info: bool,
     pub send_os_info: bool,
     pub allowed_proxies: Vec<String>,
+    pub min_client_version: u64,
+    pub max_users: u64,
 }
 
 impl Config {

@@ -81,9 +81,9 @@ pub async fn handle_authenticate(
     }
 
     // TODO: cert required option
-    if !sender.has_certificate() {
-        return Err(RejectType::NoCertificate.into());
-    }
+    // if !sender.has_certificate() {
+    //     return Err(RejectType::NoCertificate.into());
+    // }
 
     // TODO: required user groups
 

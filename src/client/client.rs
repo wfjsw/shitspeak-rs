@@ -242,6 +242,14 @@ impl Client {
         self.crypt_state.lock().await
     }
 
+    pub async fn create_crypt_state(&self, mode: &str) -> Result<(), ()> {
+        let state = self.crypt_state.lock().await;
+        // FIXME: store RNG elsewhere
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        state.replace(CryptState::generate(mode, &rng)?);
+        Ok(())
+    }
+
     pub async fn write_stats(&self) -> RwLockWriteGuard<'_, ClientStats> {
         self.stats.write().await
     }

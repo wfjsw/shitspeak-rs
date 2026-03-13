@@ -30,6 +30,8 @@ pub struct Server {
     send_build_info: bool,
     send_os_info: bool,
     allowed_proxies: Vec<AnyIpCidr>,
+    min_client_version: u64,
+    max_users: u64,
 
     tcp_listener: tokio::net::TcpListener,
     tls_acceptor: TlsAcceptor,
@@ -77,6 +79,8 @@ impl Server {
             send_version: config.send_version,
             send_build_info: config.send_build_info,
             send_os_info: config.send_os_info,
+            min_client_version: config.min_client_version,
+            max_users: config.max_users,
             tcp_listener,
             tls_acceptor,
             udp_socket,
@@ -157,5 +161,13 @@ impl Server {
 
     pub fn get_clients(&self) -> &ClientRepository {
         &self.clients
+    }
+
+    pub fn get_min_client_version(&self) -> u64 {
+        self.min_client_version
+    }
+
+    pub fn get_max_users(&self) -> u64 {
+        self.max_users
     }
 }
