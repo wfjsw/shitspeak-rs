@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::Deserialize;
 use config::{Config as ConfigCrate, Environment, File};
 
@@ -17,7 +19,40 @@ pub struct Config {
     pub allowed_proxies: Vec<String>,
     pub min_client_version: u64,
     pub max_users: u64,
+
+    // ── Mumble standard server config ──────────────────────────────────────
+    #[serde(default)]
+    pub welcome_text: Option<String>,
+    #[serde(default = "default_max_bandwidth")]
+    pub max_bandwidth: u32,
+    #[serde(default = "default_true")]
+    pub allow_html: bool,
+    #[serde(default = "default_max_text_message_length")]
+    pub max_text_message_length: u32,
+    #[serde(default = "default_max_image_message_length")]
+    pub max_image_message_length: u32,
+    #[serde(default)]
+    pub default_channel: u32,
+    #[serde(default)]
+    pub cert_required: bool,
+
+    // ── Listener volume broadcast (mumble 1.4.0+) ──────────────────────────
+    /// When `true`, listener volume adjustments are broadcast in `UserState`
+    /// to all v1.4.0+ clients.  When `false`, sent only to the owning session.
+    #[serde(default = "default_true")]
+    pub broadcast_listener_volume_adjustments: bool,
+
+    // ── Blob / persistence ─────────────────────────────────────────────────
+    /// Directory used for WAL, snapshot, and blob storage.
+    /// `None` = in-memory only (no persistence).
+    #[serde(default)]
+    pub blob_storage_dir: Option<PathBuf>,
 }
+
+fn default_max_bandwidth() -> u32 { 72_000 }
+fn default_true() -> bool { true }
+fn default_max_text_message_length() -> u32 { 5_000 }
+fn default_max_image_message_length() -> u32 { 131_072 }
 
 impl Config {
     pub fn load() -> Self {
@@ -30,3 +65,4 @@ impl Config {
             .unwrap()
     }
 }
+

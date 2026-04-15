@@ -161,4 +161,80 @@ impl ClientRepository {
         self.clients.read().await.get(&id).cloned()
     }
 
+    // ── Broadcast helpers ─────────────────────────────────────────────────
+
+    /// Send `message` to every connected client.
+    pub async fn broadcast_all(&self, message: &crate::messages::Message) {
+        let clients = self.clients.read().await;
+        for client in clients.values() {
+            if let Err(e) = client.write_proto_message(message).await {
+                tracing::warn!("broadcast_all write error: {e}");
+            }
+        }
+    }
+
+    /// Send `message` to every client except `exclude`.
+    pub async fn broadcast_except(
+        &self,
+        exclude: ClientSessionIdentifier,
+        message: &crate::messages::Message,
+    ) {
+        let clients = self.clients.read().await;
+        for (id, client) in clients.iter() {
+            if *id == exclude {
+                continue;
+            }
+            if let Err(e) = client.write_proto_message(message).await {
+                tracing::warn!("broadcast_except write error: {e}");
+            }
+        }
+    }
+
+    /// Send a batch of messages to every client except `exclude`, using a
+    /// single write per client.
+    pub async fn broadcast_batch_except(
+        &self,
+        exclude: ClientSessionIdentifier,
+        messages: &[crate::messages::Message],
+    ) {
+        let clients = self.clients.read().await;
+        for (id, client) in clients.iter() {
+            if *id == exclude {
+                continue;
+            }
+            if let Err(e) = client.write_proto_message_batch(messages).await {
+                tracing::warn!("broadcast_batch_except write error: {e}");
+            }
+        }
+    }
+
+    /// Return a snapshot of all currently-connected clients (including unauthenticated).
+    pub async fn get_all_clients(&self) -> Vec<Arc<Box<Client>>> {
+        self.clients.read().await.values().cloned().collect()
+    }
+
+    /// Send `message` to a single client identified by `id`.
+    /// Returns `true` if the client was found and the write succeeded.
+    pub async fn send_to(
+        &self,
+        id: ClientSessionIdentifier,
+        message: &crate::messages::Message,
+    ) -> bool {
+        let client = {
+            let clients = self.clients.read().await;
+            clients.get(&id).cloned()
+        };
+        match client {
+            Some(c) => {
+                if let Err(e) = c.write_proto_message(message).await {
+                    tracing::warn!("send_to {id:?} write error: {e}");
+                    false
+                } else {
+                    true
+                }
+            }
+            None => false,
+        }
+    }
+
 }

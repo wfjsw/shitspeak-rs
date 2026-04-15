@@ -96,6 +96,10 @@ impl UserInfo {
         self.display_name.as_deref().expect("Unexpected empty username; Accessing before initialization?")
     }
 
+    pub fn get_display_name_opt(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
     pub fn set_display_name(&mut self, display_name: Option<String>) {
         self.display_name = display_name;
     }

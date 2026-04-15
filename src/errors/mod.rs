@@ -8,6 +8,7 @@ mod handle_incoming_connection_error;
 mod auth_rejection;
 mod message_handler_error;
 mod message_type_not_for_incoming;
+mod channel_repo_error;
 
 pub use proxy_protocol_header_too_large::ProxyProtocolHeaderTooLargeError;
 pub use message_length_exceeded::MessageLengthExceededError;
@@ -19,3 +20,4 @@ pub use handle_incoming_connection_error::HandleIncomingConnectionError;
 pub use auth_rejection::AuthRejection;
 pub use message_handler_error::MessageHandlerError;
 pub use message_type_not_for_incoming::MessageTypeNotForIncoming;
+pub use channel_repo_error::ChannelRepoError;

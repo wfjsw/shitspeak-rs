@@ -1,18 +1,27 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
+use crate::acl::ACL;
+
+/// A single Mumble channel.
+///
+/// `description_hash` holds the 40-character lowercase SHA-1 hex of the
+/// channel description blob.  The raw text is stored only in
+/// `ChannelBlobStore` and never kept in memory here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
-    id: u32,
-    name: String,
-    position: i32,
-    max_users: u32,
-    parent_id: Option<u32>,
-    inherit_acl: bool,
-    link: Option<u32>,
-    description_blob: Option<String>,
-}
-
-pub struct Channels {
-    channel_list: HashMap<u32, Channel>
+    pub id: u32,
+    pub name: String,
+    pub position: i32,
+    pub max_users: u32,
+    pub parent_id: Option<u32>,
+    pub inherit_acl: bool,
+    /// Linked channel IDs (bidirectional; both sides are stored).
+    pub links: HashSet<u32>,
+    /// SHA-1 hex of description blob; `None` = no description.
+    pub description_hash: Option<String>,
+    pub acls: Vec<ACL>,
 }
 
 impl Channel {
@@ -23,8 +32,6 @@ impl Channel {
         max_users: u32,
         parent_id: Option<u32>,
         inherit_acl: bool,
-        link: Option<u32>,
-        description_blob: Option<String>,
     ) -> Self {
         Channel {
             id,
@@ -33,18 +40,18 @@ impl Channel {
             max_users,
             parent_id,
             inherit_acl,
-            link,
-            description_blob,
+            links: HashSet::new(),
+            description_hash: None,
+            acls: Vec::new(),
         }
     }
 
     pub fn has_description(&self) -> bool {
-        match &self.description_blob {
-            Some(desc) => !desc.is_empty(),
-            None => false,
-        }
+        self.description_hash.as_ref().map_or(false, |h| !h.is_empty())
     }
 
+    /// Bit-31 of the ID marks a channel as temporary (created by a client
+    /// via `MakeTempChannel`).
     pub fn is_temporary(&self) -> bool {
         (self.id & 0x8000_0000u32) != 0
     }
@@ -52,24 +59,18 @@ impl Channel {
     pub fn is_root(&self) -> bool {
         self.parent_id.is_none()
     }
-
 }
 
-impl Channels {
-    pub fn get_channel(&self, channel_id: u32) -> Option<&Channel> {
-        self.channel_list.get(&channel_id)
-    }
-
-    pub fn get_parent(&self, channel: &Channel) -> Option<&Channel> {
-        match channel.parent_id {
-            Some(parent_id) => self.channel_list.get(&parent_id),
-            None => None,
-        }
-    }
-
-    pub fn get_children(&self, channel: &Channel) -> Vec<&Channel> {
-        self.channel_list.values()
-            .filter(|c| c.parent_id == Some(channel.id))
-            .collect()
-    }
+/// A lightweight patch used by `ChannelRepository` WAL entries to describe
+/// which fields of an existing channel changed.  `None` means "unchanged".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPatch {
+    pub name: Option<String>,
+    pub position: Option<i32>,
+    pub max_users: Option<u32>,
+    /// `Some(None)` = clear description; `Some(Some(hash))` = set new hash.
+    pub description_hash: Option<Option<String>>,
+    /// `Some(None)` = make root; `Some(Some(id))` = reparent.
+    pub parent_id: Option<Option<u32>>,
 }
+

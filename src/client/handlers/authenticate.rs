@@ -3,9 +3,12 @@ use std::sync::Arc;
 use crate::{
     api::{AuthenticateAuxiliaryData, AuthenticationRejection},
     client::{Client, user_info::Credential},
-    errors::{AuthRejection, MessageHandlerError},
-    messages::encoder::Authenticate,
-    mumble_proto::reject::RejectType,
+    errors::MessageHandlerError,
+    messages::{Message, WriteMessageExt, encoder::Authenticate},
+    mumble_proto::{
+        CodecVersion, ServerConfig, ServerSync,
+        reject::RejectType,
+    },
     server::Server,
 };
 
@@ -14,20 +17,32 @@ pub async fn handle_authenticate(
     sender: &Arc<Box<Client>>,
     msg: Authenticate,
 ) -> Result<(), MessageHandlerError> {
-    // Handle the authentication logic here
-
+    // ── Token-update path ─────────────────────────────────────────────────
+    // An already-authenticated client can send Authenticate again to update
+    // its access tokens.
     if sender.is_authenticated().await {
-        // Set access tokens. Clients can set their access tokens any time
-        // by sending an Authenticate message with he contents of their new
-        // access token list.
         sender.set_tokens(msg.tokens.into_iter().collect()).await;
         return Ok(());
     }
 
-    // Did we get a username?
+    // ── Username required ─────────────────────────────────────────────────
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
     let password = msg.password;
 
+    // ── Max-users check ───────────────────────────────────────────────────
+    {
+        let n = server.clients.get_all_clients().await.len() as u64;
+        if n >= server.get_max_users() {
+            return Err(RejectType::ServerFull.into());
+        }
+    }
+
+    // ── Certificate required ──────────────────────────────────────────────
+    if server.get_cert_required() && !sender.has_certificate() {
+        return Err(RejectType::NoCertificate.into());
+    }
+
+    // ── Authenticate ──────────────────────────────────────────────────────
     let certificate_hash = sender.get_certificate_hash().map(|hash| hash.to_vec());
     let session_id = sender.get_session_id();
     let ip_address = sender.get_real_ip_address();
@@ -41,9 +56,8 @@ pub async fn handle_authenticate(
         )
     };
 
-    // authenticate
-    let authenticator = server.get_authenticator();
-    let auth_result = authenticator
+    let auth_result = server
+        .get_authenticator()
         .authenticate(
             &username,
             password.as_deref(),
@@ -60,7 +74,7 @@ pub async fn handle_authenticate(
         .await;
 
     let result = match auth_result {
-        Ok(result) => result,
+        Ok(r) => r,
         Err(AuthenticationRejection::NoSuchUser) => return Err(RejectType::InvalidUsername.into()),
         Err(AuthenticationRejection::WrongPassword) => return Err(RejectType::WrongUserPw.into()),
         Err(AuthenticationRejection::RetryLater) => {
@@ -68,25 +82,179 @@ pub async fn handle_authenticate(
         }
     };
 
+    // ── Required groups check ─────────────────────────────────────────────
+    // (No required groups configured yet; placeholder for future config key.)
+
+    // ── Store identity on client ──────────────────────────────────────────
     {
         let mut user_info = sender.write_user_info().await;
         user_info.set_user_id(result.user_id);
         user_info.set_display_name(result.display_name);
         user_info.set_groups(result.groups.into_iter().collect());
     }
-
     {
-        let mut user_info_extended = sender.user_info_extended().await;
-        user_info_extended.set_credential(Credential::new(username, password));
+        let mut ext = sender.user_info_extended().await;
+        ext.set_credential(Credential::new(username, password));
+    }
+    // Store texture/comment URLs provided by auth server.
+    {
+        let mut gs = sender.write_global_state().await;
+        gs.set_texture_blob(result.texture_url, None);
+        gs.set_comment_blob(result.comment_url, None);
     }
 
-    // TODO: cert required option
-    // if !sender.has_certificate() {
-    //     return Err(RejectType::NoCertificate.into());
-    // }
+    // ── Set access tokens from the authenticate message ───────────────────
+    sender.set_tokens(msg.tokens.into_iter().collect()).await;
 
-    // TODO: required user groups
+    // ── Generate crypt state and send CryptSetup ──────────────────────────
+    sender
+        .create_crypt_state("OCB2-AES128")
+        .await
+        .map_err(|_| RejectType::AuthenticatorFail)?;
 
+    let crypt_setup_msg: Message = {
+        use crate::mumble_proto::CryptSetup;
+        let crypt = sender.crypt_state().await;
+        let state = crypt.as_ref().expect("crypt state just created");
+        Message::CryptSetup(CryptSetup {
+            key: state.key().map(|k| k.to_vec()),
+            client_nonce: Some(state.encrypt_iv().to_vec()),
+            server_nonce: Some(state.decrypt_iv().to_vec()),
+        })
+    };
+
+    // ── Build the full burst of messages to send to the new client ────────
+    //
+    // All of the following are sent to the joining client in a single batch
+    // write to avoid per-message syscall overhead:
+    //
+    //   1. CryptSetup
+    //   2. ChannelState × N  (BFS channel tree)
+    //   3. UserState × M     (all currently authenticated clients)
+    //   4. UserState (self)
+    //   5. ServerSync
+    //   6. ServerConfig
+    //   7. CodecVersion
+    //
+    // This matches the Mumble server's auth-complete sequence.
+
+    let mut burst: Vec<Message> = Vec::new();
+
+    // 1. CryptSetup
+    burst.push(crypt_setup_msg);
+
+    // 2. Channel tree — BFS from root
+    {
+        let all_channels = server.channels.get_all().await;
+        // BFS ordering: root first, then children in order
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(0u32); // root channel id
+        // Map id -> channel for quick lookup
+        let ch_map: std::collections::HashMap<u32, _> =
+            all_channels.into_iter().map(|c| (c.id, c)).collect();
+
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = queue.pop_front() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let Some(ch) = ch_map.get(&id) else { continue };
+            let links: Vec<u32> = ch.links.iter().copied().collect();
+            burst.push(Message::ChannelState(crate::mumble_proto::ChannelState {
+                channel_id: Some(ch.id),
+                parent: ch.parent_id,
+                name: Some(ch.name.clone()),
+                links: links.clone(),
+                description: None,
+                links_add: Vec::new(),
+                links_remove: Vec::new(),
+                temporary: Some(ch.is_temporary()),
+                position: Some(ch.position),
+                description_hash: ch
+                    .description_hash
+                    .as_ref()
+                    .and_then(|h| hex::decode(h).ok()),
+                max_users: Some(ch.max_users),
+                is_enter_restricted: None,
+                can_enter: None,
+            }));
+            // Enqueue children
+            for child in ch_map.values().filter(|c| c.parent_id == Some(id)) {
+                queue.push_back(child.id);
+            }
+        }
+    }
+
+    // 3. UserState for every currently authenticated client (excluding self)
+    {
+        let all_clients = server.clients.get_all_clients().await;
+        for client in &all_clients {
+            if client.get_session_id() == session_id {
+                continue;
+            }
+            if !client.is_authenticated().await {
+                continue;
+            }
+            let us: Message = client.build_user_state_for_broadcast().await.into();
+            burst.push(us);
+        }
+    }
+
+    // 4. UserState for self
+    {
+        let self_us: Message = sender.build_user_state_for_broadcast().await.into();
+        burst.push(self_us);
+    }
+
+    // 5. ServerSync
+    {
+        // Effective root permissions for the new user: full for now (TODO: ACL eval)
+        let root_perm = 0x0000_FFFF_u32;
+        burst.push(Message::ServerSync(ServerSync {
+            session: Some(u32::from(session_id)),
+            max_bandwidth: Some(server.get_max_bandwidth()),
+            welcome_text: server.get_welcome_text().map(|s| s.to_owned()),
+            permissions: Some(root_perm.into()),
+        }));
+    }
+
+    // 6. ServerConfig
+    {
+        burst.push(Message::ServerConfig(ServerConfig {
+            max_bandwidth: Some(server.get_max_bandwidth()),
+            welcome_text: server.get_welcome_text().map(|s| s.to_owned()),
+            allow_html: Some(server.get_allow_html()),
+            message_length: Some(server.get_max_text_message_length()),
+            image_message_length: Some(server.get_max_image_message_length()),
+            max_users: Some(server.get_max_users() as u32),
+            recording_allowed: None,
+        }));
+    }
+
+    // 7. CodecVersion — advertise Opus-only (OCB2-AES128 encrypted voice)
+    {
+        burst.push(Message::CodecVersion(CodecVersion {
+            alpha: -2147483637, // CELT alpha version (unused, but required by clients)
+            beta: 0,
+            prefer_alpha: false,
+            opus: Some(true),
+        }));
+    }
+
+    // ── Send the burst to the joining client in one shot ──────────────────
+    sender.write_proto_message_batch(&burst).await?;
+
+    // ── Mark as authenticated ─────────────────────────────────────────────
+    sender.set_authenticated(true).await;
+
+    // ── Broadcast the new user's state to all existing clients ────────────
+    {
+        let new_user_state: Message = sender.build_user_state_for_broadcast().await.into();
+        server
+            .clients
+            .broadcast_except(session_id, &new_user_state)
+            .await;
+    }
 
     Ok(())
 }

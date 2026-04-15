@@ -21,6 +21,10 @@ impl CryptSetup {
     pub fn is_client_request_resync(&self) -> bool {
         self.client_nonce.is_none()
     }
+
+    pub fn client_nonce(&self) -> Option<&[u8]> {
+        self.client_nonce.as_deref()
+    }
 }
 
 impl Default for CryptSetup {

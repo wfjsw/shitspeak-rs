@@ -1,6 +1,8 @@
 use crate::{config::Config, server::Server};
 
 mod acl;
+mod blob_store;
+mod channel_repository;
 mod channels;
 mod client;
 mod client_repository;
@@ -26,6 +28,28 @@ mod mumble_udp {
     include!(concat!(env!("OUT_DIR"), "/mumble_udp.rs"));
 }
 
+/// Minimal no-op authenticator used when no external auth backend is wired up.
+struct NoopAuthenticator;
+
+#[async_trait::async_trait]
+impl api::Authenticator for NoopAuthenticator {
+    async fn authenticate(
+        &self,
+        username: &str,
+        _password: Option<&str>,
+        _auxiliary_data: &api::AuthenticateAuxiliaryData,
+    ) -> Result<api::AuthenticateResult, api::AuthenticationRejection> {
+        // Accept everyone with no user ID (guests only).
+        Ok(api::AuthenticateResult {
+            user_id: None,
+            display_name: Some(username.to_owned()),
+            groups: Vec::new(),
+            texture_url: None,
+            comment_url: None,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_appender = tracing_appender::rolling::daily("log", "server.log");
@@ -33,7 +57,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_writer(non_blocking).init();
 
     let config = Config::load();
-    // let server = Server::new(config, /* authenticator */).await?;
-    // server.run().await?;
+    let server = Server::new(config, NoopAuthenticator).await?;
+
+    // Graceful shutdown: wait for Ctrl-C while the server runs.
+    tokio::select! {
+        result = server.run() => {
+            if let Err(e) = result {
+                tracing::error!("Server exited with error: {e}");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received Ctrl-C, shutting down.");
+        }
+    }
+
     Ok(())
 }

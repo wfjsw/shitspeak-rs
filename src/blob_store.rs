@@ -1,0 +1,249 @@
+//! Blob storage implementations.
+//!
+//! Two stores are provided:
+//!
+//! * [`ChannelBlobStore`] — persistent, content-addressed storage for channel
+//!   description blobs.  Disk is authoritative; blobs survive restarts.
+//!   SHA-1 keyed, 2-char subdirectory sharding (same layout as git objects).
+//!
+//! * [`SessionBlobStore`] — persistent URL-keyed cache for user textures and
+//!   comments.  Blobs are fetched from the URL supplied by the auth server,
+//!   stored on disk indefinitely (no eviction), and keyed by SHA-1 of the
+//!   content.  Full HTTP-fetch implementation is deferred; all methods
+//!   currently return `None`/`Ok(())` stubs that compile and satisfy callers.
+
+use std::io;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
+use bytes::Bytes;
+use tokio::fs;
+use tokio::io::AsyncWriteExt as _;
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+/// Compute the lowercase SHA-1 hex of `data`.
+pub fn sha1_hex(data: &[u8]) -> String {
+    hex::encode(digest(&SHA1_FOR_LEGACY_USE_ONLY, data).as_ref())
+}
+
+/// Derive the on-disk path for a blob key inside `root`.
+///
+/// Layout: `<root>/<2-char-prefix>/<remaining-38-chars>`
+/// (same sharding as git objects to avoid large flat directories)
+fn blob_path(root: &Path, key: &str) -> PathBuf {
+    debug_assert!(key.len() == 40, "blob key must be a 40-char SHA-1 hex string");
+    let (prefix, rest) = key.split_at(2);
+    root.join(prefix).join(rest)
+}
+
+// ─── ChannelBlobStore ─────────────────────────────────────────────────────────
+
+/// Persistent primary storage for channel description blobs.
+///
+/// The store is content-addressed: the key is the lowercase SHA-1 hex of the
+/// stored bytes.  Puts are idempotent — if the blob already exists the write
+/// is skipped.
+pub struct ChannelBlobStore {
+    root: PathBuf,
+}
+
+impl ChannelBlobStore {
+    /// Create (or open) a blob store rooted at `dir/blobs`.
+    pub async fn open(dir: &Path) -> io::Result<Self> {
+        let root = dir.join("blobs");
+        fs::create_dir_all(&root).await?;
+        Ok(Self { root })
+    }
+
+    /// Store `data` and return its SHA-1 key.  No-op if the blob already
+    /// exists (idempotent).
+    pub async fn put(&self, data: &[u8]) -> io::Result<String> {
+        let key = sha1_hex(data);
+        let path = blob_path(&self.root, &key);
+
+        if self.exists(&key).await {
+            return Ok(key);
+        }
+
+        // Atomic write: tmp → rename.
+        let tmp = path.with_extension("tmp");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .await?;
+        file.write_all(data).await?;
+        file.sync_data().await?;
+        drop(file);
+        fs::rename(&tmp, &path).await?;
+
+        Ok(key)
+    }
+
+    /// Read a blob by key, returning `None` if it does not exist.
+    pub async fn get(&self, key: &str) -> io::Result<Option<Bytes>> {
+        let path = blob_path(&self.root, key);
+        match fs::read(&path).await {
+            Ok(data) => Ok(Some(Bytes::from(data))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Delete a blob by key.  Silent if missing.
+    pub async fn delete(&self, key: &str) -> io::Result<()> {
+        let path = blob_path(&self.root, key);
+        match fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Return `true` if the blob exists.
+    pub async fn exists(&self, key: &str) -> bool {
+        let path = blob_path(&self.root, key);
+        fs::metadata(&path).await.is_ok()
+    }
+
+    // ── S2S readiness stubs ──────────────────────────────────────────────
+
+    /// Push a blob to a peer node over S2S.  Not yet implemented.
+    #[allow(unused_variables)]
+    pub async fn replicate_to(&self, _peer_addr: SocketAddr, _key: &str) {
+        // TODO: S2S replication
+    }
+
+    /// Pull a blob from a peer node over S2S.  Not yet implemented.
+    #[allow(unused_variables)]
+    pub async fn fetch_from_peer(&self, _peer_addr: SocketAddr, _key: &str) -> Option<Bytes> {
+        // TODO: S2S replication
+        None
+    }
+}
+
+// ─── SessionBlobStore ────────────────────────────────────────────────────────
+
+/// Persistent URL-keyed cache for user textures and comments.
+///
+/// Blobs are fetched from the URL supplied by the auth server on first use,
+/// then stored on disk indefinitely keyed by SHA-1 of their content.  The
+/// store survives restarts (no wipe-on-start).  There is no eviction policy;
+/// the operator manages disk space externally.
+///
+/// During S2S, both the blob hash and the source URL are propagated to peer
+/// nodes.  A peer that lacks the blob fetches it directly from the same URL;
+/// nodes never pull blobs from each other.
+///
+pub struct SessionBlobStore {
+    root: PathBuf,
+    http_client: reqwest::Client,
+}
+
+impl SessionBlobStore {
+    /// Open (or create) a session blob store rooted at `dir/session_blobs`.
+    /// The directory is created if it does not exist; existing blobs are left
+    /// in place (no restart wipe).
+    pub async fn open(dir: &Path) -> io::Result<Self> {
+        let root = dir.join("session_blobs");
+        fs::create_dir_all(&root).await?;
+        Ok(Self {
+            root,
+            http_client: reqwest::Client::new(),
+        })
+    }
+
+    /// Fetch a blob by SHA-1 key from the local cache.  On a cache miss,
+    /// fetches from `source_url` and caches the result.
+    pub async fn get(&self, key: &str, source_url: &str) -> Option<Bytes> {
+        let path = blob_path(&self.root, key);
+
+        if let Ok(bytes) = fs::read(&path).await {
+            return Some(Bytes::from(bytes));
+        }
+
+        let response = match self.http_client.get(source_url).send().await {
+            Ok(resp) if resp.status().is_success() => resp,
+            Ok(resp) => {
+                tracing::warn!("SessionBlobStore fetch failed with status {} for {}", resp.status(), source_url);
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!("SessionBlobStore fetch error for {}: {}", source_url, err);
+                return None;
+            }
+        };
+
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!("SessionBlobStore read body error for {}: {}", source_url, err);
+                return None;
+            }
+        };
+
+        let fetched_key = sha1_hex(&bytes);
+        if fetched_key != key {
+            tracing::warn!(
+                "SessionBlobStore hash mismatch for {}: expected {}, got {}",
+                source_url,
+                key,
+                fetched_key
+            );
+            return None;
+        }
+
+        if self.put(key, &bytes).await.is_err() {
+            return None;
+        }
+
+        Some(bytes)
+    }
+
+    /// Store `data` in the local disk cache under the given `key`.
+    /// Returns the SHA-1 key on success.
+    pub async fn put(&self, key: &str, data: &[u8]) -> io::Result<String> {
+        let computed = sha1_hex(data);
+        if computed != key {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "blob key does not match data hash",
+            ));
+        }
+
+        let path = blob_path(&self.root, key);
+        if fs::metadata(&path).await.is_ok() {
+            return Ok(key.to_owned());
+        }
+
+        let tmp = path.with_extension("tmp");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .await?;
+        file.write_all(data).await?;
+        file.sync_data().await?;
+        drop(file);
+        fs::rename(&tmp, &path).await?;
+
+        Ok(key.to_owned())
+    }
+
+    /// Check whether the local cache contains the blob for `key`.
+    pub async fn exists(&self, key: &str) -> bool {
+        let path = blob_path(&self.root, key);
+        fs::metadata(path).await.is_ok()
+    }
+}

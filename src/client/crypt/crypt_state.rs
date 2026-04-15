@@ -99,6 +99,27 @@ impl CryptState {
         1 + self.mode.overhead()
     }
 
+    /// Return the encryption nonce (IV).
+    pub fn encrypt_iv(&self) -> &[u8] {
+        &self.encrypt_iv
+    }
+
+    /// Return the decryption nonce (IV).
+    pub fn decrypt_iv(&self) -> &[u8] {
+        &self.decrypt_iv
+    }
+
+    /// Overwrite the decrypt IV (used for client-requested resync).
+    pub fn set_decrypt_iv(&mut self, iv: &[u8]) {
+        self.decrypt_iv = iv.to_vec();
+        self.resync = self.resync.wrapping_add(1);
+    }
+
+    /// Return the key (if available from the crypto mode).
+    pub fn key(&self) -> Option<&[u8]> {
+        self.mode.key()
+    }
+
     pub fn encrypt(&mut self, dest: &mut [u8], data: &[u8]) -> Result<(), CryptError> {
         // increase IV
         for byte in self.encrypt_iv.iter_mut().rev() {

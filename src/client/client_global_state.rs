@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{client::user_version::UserVersion, protocol_version::ProtocolVersion};
+use crate::protocol_version::ProtocolVersion;
 
 pub struct ClientGlobalState {
     protocol_version: Option<ProtocolVersion>, 
@@ -11,6 +11,20 @@ pub struct ClientGlobalState {
     current_channel_id: u32,
     last_active_timestamp: Option<std::time::Instant>,
     listening_channel_id: HashSet<u32>,
+
+
+    // ── Texture blob ───────────────────────────────────────────────────────
+    /// URL supplied by the auth server at login; propagated over S2S.
+    texture_url: Option<String>,
+    /// SHA-1 hex of the texture blob in `SessionBlobStore`; also propagated
+    /// over S2S so peer nodes can check their local cache.
+    texture_hash: Option<String>,
+
+    // ── Comment blob ───────────────────────────────────────────────────────
+    /// URL supplied by the auth server at login; propagated over S2S.
+    comment_url: Option<String>,
+    /// SHA-1 hex of the comment blob in `SessionBlobStore`.
+    comment_hash: Option<String>,
 }
 
 impl ClientGlobalState {
@@ -24,6 +38,11 @@ impl ClientGlobalState {
             current_channel_id: 0,
             last_active_timestamp: None,
             listening_channel_id: HashSet::new(),
+
+            texture_url: None,
+            texture_hash: None,
+            comment_url: None,
+            comment_hash: None,
         }
     }
 
@@ -108,6 +127,42 @@ impl ClientGlobalState {
             Some(v) => Some(v.chars().take(60).collect()),
             None => None,
         }
+    }
+
+    pub fn get_texture_url(&self) -> Option<&str> {
+        self.texture_url.as_deref()
+    }
+
+    pub fn get_texture_hash(&self) -> Option<&str> {
+        self.texture_hash.as_deref()
+    }
+
+    pub fn set_texture_blob(&mut self, url: Option<String>, hash: Option<String>) {
+        self.texture_url = url;
+        self.texture_hash = hash;
+    }
+
+    pub fn clear_texture_blob(&mut self) {
+        self.texture_url = None;
+        self.texture_hash = None;
+    }
+
+    pub fn get_comment_url(&self) -> Option<&str> {
+        self.comment_url.as_deref()
+    }
+
+    pub fn get_comment_hash(&self) -> Option<&str> {
+        self.comment_hash.as_deref()
+    }
+
+    pub fn set_comment_blob(&mut self, url: Option<String>, hash: Option<String>) {
+        self.comment_url = url;
+        self.comment_hash = hash;
+    }
+
+    pub fn clear_comment_blob(&mut self) {
+        self.comment_url = None;
+        self.comment_hash = None;
     }
 }
 

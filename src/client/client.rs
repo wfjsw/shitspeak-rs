@@ -22,7 +22,7 @@ use crate::{
         user_info::{UserInfo, UserInfoExtended},
     },
     errors::{ReadProtoMessageError, WriteProtoMessageError},
-    messages::{Message, ReadMessageExt, WriteMessageExt},
+    messages::{Message, ReadMessageExt, WriteMessageExt, encoder as msg_encoder},
     protocol_version::ProtocolVersion,
 };
 
@@ -194,19 +194,38 @@ impl Client {
             .map_or(false, |certs| !certs.is_empty())
     }
 
-    pub fn disconnect(&self) {}
+    pub fn disconnect(&self) {
+        todo!();
+    }
 
     pub async fn read_proto_message(&self) -> Result<Message, ReadProtoMessageError> {
         let mut guard = self.connection.lock().await;
         guard.read_proto_message().await
     }
 
+    // TODO: instead of a straight write, this should be actually queued and batched so to reduce
+    // the number of syscalls and TLS record overhead, when there is a burst of messages to send. 
+    // When doing it, we should also ensure that messages are not delayed too much. 
+    // That may requires some careful engineering.
     pub async fn write_proto_message(
         &self,
         message: &Message,
     ) -> Result<(), WriteProtoMessageError> {
         let mut guard = self.connection.lock().await;
         guard.write_proto_message(message).await
+    }
+
+    /// Send multiple messages in a single syscall burst.
+    ///
+    /// Serialises all messages into one contiguous buffer and issues a single
+    /// `write_all`, avoiding the per-message syscall overhead that would
+    /// accumulate when sending channel trees or user-state bursts.
+    pub async fn write_proto_message_batch(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
+        let mut guard = self.connection.lock().await;
+        guard.write_proto_message_batch(messages).await
     }
 
     pub async fn set_tokens(&self, tokens: HashSet<String>) {
@@ -242,11 +261,15 @@ impl Client {
         self.crypt_state.lock().await
     }
 
-    pub async fn create_crypt_state(&self, mode: &str) -> Result<(), ()> {
-        let state = self.crypt_state.lock().await;
+    pub async fn create_crypt_state(
+        &self,
+        mode: &str,
+    ) -> Result<(), crate::client::crypt::CryptError> {
+        let mut state = self.crypt_state.lock().await;
         // FIXME: store RNG elsewhere
+        // This RNG should be global to the entire program, preferably.
         let rng = aws_lc_rs::rand::SystemRandom::new();
-        state.replace(CryptState::generate(mode, &rng)?);
+        *state = Some(CryptState::generate(mode, &rng)?);
         Ok(())
     }
 
@@ -267,6 +290,14 @@ impl Client {
         let local_state_guard = self.local_state.read().await;
         match &*local_state_guard {
             Some(state) => state.is_authenticated(),
+            None => panic!("Accessing local state on remote user"),
+        }
+    }
+
+    pub async fn set_authenticated(&self, value: bool) {
+        let mut local_state_guard = self.local_state.write().await;
+        match &mut *local_state_guard {
+            Some(state) => state.set_authenticated(value),
             None => panic!("Accessing local state on remote user"),
         }
     }
@@ -301,6 +332,46 @@ impl Client {
 
     pub async fn write_user_info(&self) -> RwLockWriteGuard<'_, UserInfo> {
         self.user_info.write().await
+    }
+
+    /// Build a `UserState` snapshot of this client suitable for broadcasting
+    /// to other clients (i.e. everything a peer needs to know about this user).
+    pub async fn build_user_state_for_broadcast(&self) -> msg_encoder::UserState {
+        let user_info = self.user_info.read().await;
+        let global_state = self.global_state.read().await;
+
+        let comment_hash_bytes = global_state
+            .get_comment_hash()
+            .and_then(|h| hex::decode(h).ok());
+        let texture_hash_bytes = global_state
+            .get_texture_hash()
+            .and_then(|h| hex::decode(h).ok());
+
+        msg_encoder::UserState {
+            session: Some(self.session_id),
+            actor: None,
+            name: user_info.get_display_name_opt().map(|s| s.to_owned()),
+            user_id: user_info.get_user_id(),
+            channel_id: Some(global_state.get_current_channel_id()),
+            mute: None,
+            deaf: None,
+            suppress: None,
+            self_mute: None,
+            self_deaf: None,
+            texture: None,
+            plugin_context: None,
+            plugin_identity: None,
+            comment: None,
+            hash: self.certificate_hash.as_ref().map(|h| hex::encode(h)),
+            comment_hash: comment_hash_bytes,
+            texture_hash: texture_hash_bytes,
+            priority_speaker: None,
+            recording: None,
+            temporary_access_tokens: Vec::new(),
+            listening_channel_add: Vec::new(),
+            listening_channel_remove: Vec::new(),
+            listening_volume_adjustment: Vec::new(),
+        }
     }
 
     pub async fn user_info_extended(&self) -> MappedMutexGuard<'_, UserInfoExtended> {

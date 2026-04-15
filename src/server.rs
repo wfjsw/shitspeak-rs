@@ -8,6 +8,8 @@ use rustls::version::{TLS12, TLS13};
 use tokio_rustls::TlsAcceptor;
 
 use crate::api::Authenticator;
+use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
+use crate::channel_repository::ChannelRepository;
 use crate::client::AsyncMessageHandlerExt;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{
@@ -26,22 +28,22 @@ pub struct Server {
     node_identifier: NodeIdentifier,
 
     // Config
-    send_version: bool,
-    send_build_info: bool,
-    send_os_info: bool,
+    config: Config,
+
     allowed_proxies: Vec<AnyIpCidr>,
-    min_client_version: u64,
-    max_users: u64,
 
     tcp_listener: tokio::net::TcpListener,
     tls_acceptor: TlsAcceptor,
     udp_socket: tokio::net::UdpSocket,
 
-    clients: ClientRepository,
+    pub clients: ClientRepository,
+    pub channels: Arc<ChannelRepository>,
+    pub channel_blobs: Arc<ChannelBlobStore>,
+    pub session_blobs: Arc<SessionBlobStore>,
 
-    codec_info: CodecInfo,
+    pub codec_info: CodecInfo,
 
-    authenticator: Box<dyn Authenticator>,
+    pub authenticator: Box<dyn Authenticator>,
 }
 
 impl Server {
@@ -59,8 +61,8 @@ impl Server {
             .collect::<Result<Vec<_>, _>>()?;
 
         let certificate =
-            CertificateDer::pem_file_iter(config.cert_path)?.collect::<Result<Vec<_>, _>>()?;
-        let private_key = PrivateKeyDer::from_pem_file(config.key_path)?;
+            CertificateDer::pem_file_iter(&config.cert_path)?.collect::<Result<Vec<_>, _>>()?;
+        let private_key = PrivateKeyDer::from_pem_file(&config.key_path)?;
 
         let tcp_listener = tokio::net::TcpListener::bind(&listen_address).await?;
         let udp_socket = tokio::net::UdpSocket::bind(&listen_address).await?;
@@ -73,25 +75,45 @@ impl Server {
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
+        // ── Channel repository & blob stores ─────────────────────────────
+        let node_id = config.node_id;
+        let (channels, channel_blobs, session_blobs) =
+            match &config.blob_storage_dir {
+                Some(dir) => {
+                    let ch_repo = ChannelRepository::open(node_id, dir).await?;
+                    let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
+                    let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
+                    (ch_repo, ch_blobs, s_blobs)
+                }
+                None => {
+                    // In-memory mode: use a temp dir for blob stores so the
+                    // code paths are uniform; blobs won't survive restarts.
+                    let tmp = std::env::temp_dir().join("shitspeak-blobs");
+                    let ch_repo = ChannelRepository::new_in_memory(node_id);
+                    let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
+                    let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
+                    (ch_repo, ch_blobs, s_blobs)
+                }
+            };
+
         Ok(Arc::new(Box::new(Server {
-            node_identifier: config.node_id,
+            node_identifier: node_id,
             allowed_proxies,
-            send_version: config.send_version,
-            send_build_info: config.send_build_info,
-            send_os_info: config.send_os_info,
-            min_client_version: config.min_client_version,
-            max_users: config.max_users,
             tcp_listener,
             tls_acceptor,
             udp_socket,
-            clients: ClientRepository::new(config.node_id),
+            clients: ClientRepository::new(node_id),
+            channels,
+            channel_blobs,
+            session_blobs,
             codec_info: CodecInfo::default(),
             authenticator: Box::new(authenticator),
+            config,
         })))
     }
 
     pub async fn run(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Server is running on {}", self.tcp_listener.local_addr()?);
+        tracing::info!("Server is running on {}", self.tcp_listener.local_addr()?);
         loop {
             let (tcp_stream, remote_addr) = self.tcp_listener.accept().await?;
             let server = Arc::clone(self);
@@ -100,7 +122,7 @@ impl Server {
                     .handle_incoming_connection(tcp_stream, remote_addr)
                     .await
                 {
-                    eprintln!("Error handling connection: {}", e);
+                    tracing::warn!("Error handling connection: {}", e);
                 }
             });
         }
@@ -131,8 +153,12 @@ impl Server {
         // Send server version
         tls_stream
             .write_proto_message(
-                &Version::for_server(self.send_version, self.send_build_info, self.send_os_info)
-                    .into(),
+                &Version::for_server(
+                    self.config.send_version,
+                    self.config.send_build_info,
+                    self.config.send_os_info,
+                )
+                .into(),
             )
             .await?;
 
@@ -164,10 +190,34 @@ impl Server {
     }
 
     pub fn get_min_client_version(&self) -> u64 {
-        self.min_client_version
+        self.config.min_client_version
     }
 
     pub fn get_max_users(&self) -> u64 {
-        self.max_users
+        self.config.max_users
+    }
+
+    pub fn get_cert_required(&self) -> bool {
+        self.config.cert_required
+    }
+
+    pub fn get_max_bandwidth(&self) -> u32 {
+        self.config.max_bandwidth
+    }
+
+    pub fn get_welcome_text(&self) -> Option<&str> {
+        self.config.welcome_text.as_deref()
+    }
+
+    pub fn get_allow_html(&self) -> bool {
+        self.config.allow_html
+    }
+
+    pub fn get_max_text_message_length(&self) -> u32 {
+        self.config.max_text_message_length
+    }
+
+    pub fn get_max_image_message_length(&self) -> u32 {
+        self.config.max_image_message_length
     }
 }

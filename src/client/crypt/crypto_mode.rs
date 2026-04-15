@@ -7,4 +7,6 @@ pub trait CryptoMode: Send + Sync {
 
     fn encrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError>;
     fn decrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError>;
+
+    fn key(&self) -> Option<&[u8]>;
 }

@@ -22,6 +22,10 @@ impl ClientLocalState {
     pub fn is_authenticated(&self) -> bool {
         self.authenticated
     }
+
+    pub fn set_authenticated(&mut self, value: bool) {
+        self.authenticated = value;
+    }
 }
 
 impl Default for ClientLocalState {

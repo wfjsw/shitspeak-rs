@@ -8,6 +8,7 @@ use crate::client::crypt::{errors::CryptError, CryptoMode};
 const BLOCK_SIZE: usize = 16;
 
 pub struct Ocb2 {
+    key: Vec<u8>,
     encrypt_key: EncryptingKey,
     decrypt_key: DecryptingKey,
 }
@@ -15,6 +16,7 @@ pub struct Ocb2 {
 impl Ocb2 {
     pub fn from_key(key: [u8; BLOCK_SIZE]) -> Result<Self, CryptError> {
         Ok(Ocb2 {
+            key: key.to_vec(),
             encrypt_key: EncryptingKey::ecb(UnboundCipherKey::new(&AES_128, &key)?)?,
             decrypt_key: DecryptingKey::ecb(UnboundCipherKey::new(&AES_128, &key)?)?,
         })
@@ -38,6 +40,10 @@ impl CryptoMode for Ocb2 {
 
     fn overhead(&self) -> usize {
         3
+    }
+
+    fn key(&self) -> Option<&[u8]> {
+        Some(&self.key)
     }
 
     fn encrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError> {

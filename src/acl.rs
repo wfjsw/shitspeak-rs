@@ -1,21 +1,23 @@
 use enumflags2::{bitflags, BitFlags};
+use serde::{Deserialize, Serialize};
 
 use crate::client::group::{is_member_in_group, ClientMembershipQuery};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ACL {
-    user_id: Option<i32>,
-    group: Option<String>,
+    pub user_id: Option<i32>,
+    pub group: Option<String>,
 
-    apply_here: bool,
-    apply_subs: bool,
+    pub apply_here: bool,
+    pub apply_subs: bool,
 
-    allow: BitFlags<ACLPermissions>,
-    deny: BitFlags<ACLPermissions>,
+    pub allow: BitFlags<ACLPermissions>,
+    pub deny: BitFlags<ACLPermissions>,
 }
 
 #[bitflags]
 #[repr(u32)]
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ACLPermissions {
     // None        = 0x0,
     Write = 0x1,
@@ -83,5 +85,11 @@ impl ACL {
             ),
             None => false,
         }
+    }
+}
+
+impl Default for ACL {
+    fn default() -> Self {
+        Self::new()
     }
 }
