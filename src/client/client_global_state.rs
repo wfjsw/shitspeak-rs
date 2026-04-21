@@ -4,9 +4,6 @@ use crate::protocol_version::ProtocolVersion;
 
 pub struct ClientGlobalState {
     protocol_version: Option<ProtocolVersion>, 
-    release: Option<String>,
-    os: Option<String>,
-    os_version: Option<String>,
 
     current_channel_id: u32,
     last_active_timestamp: Option<std::time::Instant>,
@@ -30,15 +27,18 @@ pub struct ClientGlobalState {
     // ── Comment blob ───────────────────────────────────────────────────────
     comment_url: Option<String>,
     comment_hash: Option<String>,
+
+    // ── User identity ─────────────────────────────────────────────────────
+    user_id: Option<u32>,
+    groups: HashSet<String>,
+    tokens: HashSet<String>,
+    display_name: Option<String>,
 }
 
 impl ClientGlobalState {
     pub fn new() -> Self {
         ClientGlobalState {
             protocol_version: None,
-            release: None,
-            os: None,
-            os_version: None,
 
             current_channel_id: 0,
             last_active_timestamp: None,
@@ -58,6 +58,11 @@ impl ClientGlobalState {
             texture_hash: None,
             comment_url: None,
             comment_hash: None,
+
+            user_id: None,
+            groups: HashSet::new(),
+            tokens: HashSet::new(),
+            display_name: None,
         }
     }
 
@@ -96,51 +101,6 @@ impl ClientGlobalState {
         self.protocol_version = match version {
             None => Some(ProtocolVersion::new(1, 2, 0)),
             Some(v) => Some(v),
-        }
-    }
-
-    pub fn get_release(&self) -> Option<&str> {
-        self.release.as_deref()
-    }
-
-    pub fn set_release(&mut self, release: Option<String>) {
-        if release.is_none() && self.release.is_some() {
-            return;
-        }
-
-        self.release = match release {
-            Some(r) => Some(r.chars().take(100).collect()),
-            None => None,
-        }
-    }
-
-    pub fn get_os_name(&self) -> Option<&str> {
-        self.os.as_deref()
-    }
-
-    pub fn set_os(&mut self, os: Option<String>) {
-        if os.is_none() && self.os.is_some() {
-            return;
-        }
-
-        self.os = match os {
-            Some(o) => Some(o.chars().take(40).collect()),
-            None => None,
-        }
-    }
-
-    pub fn get_os_version(&self) -> Option<&str> {
-        self.os_version.as_deref()
-    }
-
-    pub fn set_os_version(&mut self, os_version: Option<String>) {
-        if os_version.is_none() && self.os_version.is_some() {
-            return;
-        }
-
-        self.os_version = match os_version {
-            Some(v) => Some(v.chars().take(60).collect()),
-            None => None,
         }
     }
 
@@ -208,6 +168,77 @@ impl ClientGlobalState {
 
     pub fn get_plugin_identity(&self) -> &str { &self.plugin_identity }
     pub fn set_plugin_identity(&mut self, id: String) { self.plugin_identity = id; }
+
+    // ── User identity getters & setters ──────────────────────────────────
+
+    pub fn get_user_id(&self) -> Option<u32> {
+        self.user_id
+    }
+
+    pub fn set_user_id(&mut self, user_id: Option<u32>) {
+        self.user_id = user_id;
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.user_id.is_some()
+    }
+
+    pub fn get_groups(&self) -> &HashSet<String> {
+        &self.groups
+    }
+
+    pub fn get_groups_mut(&mut self) -> &mut HashSet<String> {
+        &mut self.groups
+    }
+
+    pub fn has_group(&self, group: &str) -> bool {
+        self.groups.contains(&group.to_string())
+    }
+
+    pub fn add_group(&mut self, group: String) {
+        self.groups.insert(group);
+    }
+
+    pub fn del_group(&mut self, group: &str) {
+        self.groups.remove(&group.to_string());
+    }
+
+    pub fn set_groups(&mut self, groups: HashSet<String>) {
+        self.groups = groups;
+    }
+
+    pub fn get_tokens(&self) -> &HashSet<String> {
+        &self.tokens
+    }
+
+    pub fn add_token(&mut self, token: String) {
+        self.tokens.insert(token);
+    }
+
+    pub fn del_token(&mut self, token: &str) {
+        self.tokens.remove(token);
+    }
+
+    pub fn set_tokens(&mut self, tokens: HashSet<String>) {
+        self.tokens = tokens;
+    }
+
+    // TODO: case insensitive
+    pub fn has_token(&self, token: &str) -> bool {
+        self.tokens.contains(&token.to_string())
+    }
+
+    pub fn get_display_name(&self) -> &str {
+        self.display_name.as_deref().expect("Unexpected empty username; Accessing before initialization?")
+    }
+
+    pub fn get_display_name_opt(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    pub fn set_display_name(&mut self, display_name: Option<String>) {
+        self.display_name = display_name;
+    }
 }
 
 impl Default for ClientGlobalState {

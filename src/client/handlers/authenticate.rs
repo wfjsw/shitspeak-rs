@@ -48,11 +48,13 @@ pub async fn handle_authenticate(
     let ip_address = sender.get_real_ip_address();
     let (version, client_name, os_name, os_version) = {
         let global_state = sender.read_global_state().await;
+        let local_state = sender.read_local_state().await;
+        let local = local_state.as_ref().expect("Local state missing during authenticate");
         (
             global_state.get_protocol_version(),
-            global_state.get_release().map(|s| s.to_owned()),
-            global_state.get_os_name().map(|s| s.to_owned()),
-            global_state.get_os_version().map(|s| s.to_owned()),
+            local.get_release().map(|s| s.to_owned()),
+            local.get_os_name().map(|s| s.to_owned()),
+            local.get_os_version().map(|s| s.to_owned()),
         )
     };
 
@@ -87,20 +89,16 @@ pub async fn handle_authenticate(
 
     // ── Store identity on client ──────────────────────────────────────────
     {
-        let mut user_info = sender.write_user_info().await;
-        user_info.set_user_id(result.user_id);
-        user_info.set_display_name(result.display_name);
-        user_info.set_groups(result.groups.into_iter().collect());
+        let mut gs = sender.write_global_state().await;
+        gs.set_user_id(result.user_id);
+        gs.set_display_name(result.display_name);
+        gs.set_groups(result.groups.into_iter().collect());
+        gs.set_texture_blob(result.texture_url, None);
+        gs.set_comment_blob(result.comment_url, None);
     }
     {
         let mut ext = sender.user_info_extended().await;
         ext.set_credential(Credential::new(username, password));
-    }
-    // Store texture/comment URLs provided by auth server.
-    {
-        let mut gs = sender.write_global_state().await;
-        gs.set_texture_blob(result.texture_url, None);
-        gs.set_comment_blob(result.comment_url, None);
     }
 
     // ── Set access tokens from the authenticate message ───────────────────

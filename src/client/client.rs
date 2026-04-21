@@ -19,7 +19,7 @@ use crate::{
         crypt::CryptState,
         options::ClientOptions,
         udp_state::UdpState,
-        user_info::{UserInfo, UserInfoExtended},
+        user_info::UserInfoExtended,
     },
     errors::{ReadProtoMessageError, WriteProtoMessageError},
     messages::{Message, ReadMessageExt, WriteMessageExt, encoder as msg_encoder},
@@ -43,10 +43,7 @@ pub struct Client {
     udp_state: Option<Mutex<UdpState>>,
     stats: RwLock<ClientStats>,
 
-    // Might be a registered user, might not
-    // Basic user info are synchronized.
     certificate_hash: Option<Vec<u8>>,
-    user_info: RwLock<UserInfo>,
     user_info_extended: Mutex<Option<UserInfoExtended>>,
 
     options: RwLock<ClientOptions>,
@@ -98,7 +95,6 @@ impl Client {
             udp_state: None,
             stats: RwLock::new(ClientStats::default()),
             certificate_hash,
-            user_info: RwLock::new(UserInfo::default()),
             user_info_extended: Mutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
             local_state: RwLock::new(Some(ClientLocalState::new())),
@@ -108,7 +104,7 @@ impl Client {
     }
 
     pub async fn is_registered(&self) -> bool {
-        self.user_info.read().await.is_registered()
+        self.global_state.read().await.is_registered()
     }
 
     pub fn has_certificate(&self) -> bool {
@@ -116,12 +112,12 @@ impl Client {
     }
 
     pub async fn get_groups_clone(&self) -> HashSet<String> {
-        self.user_info.read().await.get_groups().clone()
+        self.global_state.read().await.get_groups().clone()
     }
 
     pub async fn has_group(&self, group: &str) -> bool {
-        let user_info = self.user_info.read().await;
-        user_info.has_group(group)
+        let gs = self.global_state.read().await;
+        gs.has_group(group)
     }
 
     pub fn get_certificate_hash(&self) -> Option<&[u8]> {
@@ -141,13 +137,13 @@ impl Client {
     }
 
     pub async fn get_tokens_clone(&self) -> HashSet<String> {
-        let user_info = self.user_info.read().await;
-        user_info.get_tokens().clone()
+        let gs = self.global_state.read().await;
+        gs.get_tokens().clone()
     }
 
     pub async fn has_token(&self, token: &str) -> bool {
-        let user_info = self.user_info.read().await;
-        user_info.has_token(token)
+        let gs = self.global_state.read().await;
+        gs.has_token(token)
     }
 
     pub async fn get_current_channel_id(&self) -> u32 {
@@ -162,7 +158,7 @@ impl Client {
     }
 
     pub async fn get_user_id(&self) -> Option<u32> {
-        self.user_info.read().await.get_user_id()
+        self.global_state.read().await.get_user_id()
     }
 
     // pub fn get_display_name(&self) -> Option<String> {
@@ -233,8 +229,8 @@ impl Client {
     }
 
     pub async fn set_tokens(&self, tokens: HashSet<String>) {
-        let mut user_info = self.user_info.write().await;
-        user_info.set_tokens(tokens);
+        let mut gs = self.global_state.write().await;
+        gs.set_tokens(tokens);
     }
 
     pub async fn get_last_ping(&self) -> DateTime<Utc> {
@@ -319,18 +315,24 @@ impl Client {
     }
 
     pub async fn set_release(&self, release: Option<String>) {
-        let mut global_state_guard = self.global_state.write().await;
-        global_state_guard.set_release(release);
+        let mut local_state_guard = self.local_state.write().await;
+        if let Some(ref mut state) = *local_state_guard {
+            state.set_release(release);
+        }
     }
 
     pub async fn set_os(&self, os: Option<String>) {
-        let mut global_state_guard = self.global_state.write().await;
-        global_state_guard.set_os(os);
+        let mut local_state_guard = self.local_state.write().await;
+        if let Some(ref mut state) = *local_state_guard {
+            state.set_os(os);
+        }
     }
 
     pub async fn set_os_version(&self, os_version: Option<String>) {
-        let mut global_state_guard = self.global_state.write().await;
-        global_state_guard.set_os_version(os_version);
+        let mut local_state_guard = self.local_state.write().await;
+        if let Some(ref mut state) = *local_state_guard {
+            state.set_os_version(os_version);
+        }
     }
 
     pub async fn read_global_state(&self) -> tokio::sync::RwLockReadGuard<'_, ClientGlobalState> {
@@ -349,14 +351,9 @@ impl Client {
         self.global_state.write().await
     }
 
-    pub async fn write_user_info(&self) -> RwLockWriteGuard<'_, UserInfo> {
-        self.user_info.write().await
-    }
-
     /// Build a `UserState` snapshot of this client suitable for broadcasting
     /// to other clients (i.e. everything a peer needs to know about this user).
     pub async fn build_user_state_for_broadcast(&self) -> msg_encoder::UserState {
-        let user_info = self.user_info.read().await;
         let gs = self.global_state.read().await;
 
         let comment_hash_bytes = gs.get_comment_hash().and_then(|h| hex::decode(h).ok());
@@ -365,8 +362,8 @@ impl Client {
         msg_encoder::UserState {
             session: Some(self.session_id),
             actor: None,
-            name: user_info.get_display_name_opt().map(|s| s.to_owned()),
-            user_id: user_info.get_user_id(),
+            name: gs.get_display_name_opt().map(|s| s.to_owned()),
+            user_id: gs.get_user_id(),
             channel_id: Some(gs.get_current_channel_id()),
             mute: Some(gs.is_muted()),
             deaf: Some(gs.is_deafened()),

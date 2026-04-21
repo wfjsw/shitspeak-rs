@@ -33,6 +33,8 @@ pub async fn handle_user_stats(
 
     let stats = target.write_stats().await;
     let gs = target.read_global_state().await;
+    let local_state = target.read_local_state().await;
+    let local = local_state.as_ref();
 
     let now = chrono::Utc::now();
     let login_time = target.get_login_time();
@@ -43,9 +45,9 @@ pub async fn handle_user_stats(
         crate::mumble_proto::Version {
             version_v1: Some(v_u64 as u32),
             version_v2: Some(v_u64),
-            release: gs.get_release().map(|s| s.to_owned()),
-            os: gs.get_os_name().map(|s| s.to_owned()),
-            os_version: gs.get_os_version().map(|s| s.to_owned()),
+            release: local.and_then(|l| l.get_release().map(|s| s.to_owned())),
+            os: local.and_then(|l| l.get_os_name().map(|s| s.to_owned())),
+            os_version: local.and_then(|l| l.get_os_version().map(|s| s.to_owned())),
         }
     });
 

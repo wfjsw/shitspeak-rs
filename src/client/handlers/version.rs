@@ -12,9 +12,14 @@ pub async fn handle_version(
     {
         let mut global_state_writer = sender.write_global_state().await;
         global_state_writer.set_protocol_version(msg.version);
-        global_state_writer.set_release(msg.release);
-        global_state_writer.set_os(msg.os);
-        global_state_writer.set_os_version(msg.os_version);
+    }
+    {
+        let mut local_state_writer = sender.write_local_state().await;
+        if let Some(ref mut state) = *local_state_writer {
+            state.set_release(msg.release);
+            state.set_os(msg.os);
+            state.set_os_version(msg.os_version);
+        }
     }
 
     // Store Opus support flag from the authenticate message (set during auth).
