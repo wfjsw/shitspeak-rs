@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
+use crate::client_repository::ClientRepository;
 use crate::protocol_version::ProtocolVersion;
 
 // ─── Macros ──────────────────────────────────────────────────────────────────
@@ -201,4 +202,114 @@ pub struct ClientStateLogEntry {
     pub timestamp: i64,
     #[serde(flatten)]
     pub op: ClientStateOperation,
+}
+
+impl ClientStateLogEntry {
+    /// Convert this log entry into the protobuf `Message` that should be
+    /// sent to a subscriber.
+    ///
+    /// * `AddClient` → `UserState` snapshot of the new client
+    /// * `RemoveClient` → `UserRemove` message
+    /// * `UpdateGlobalState` → `UserState` delta (only changed fields)
+    pub async fn to_message(
+        &self,
+        repo: &ClientRepository,
+    ) -> Option<crate::messages::Message> {
+        match &self.op {
+            ClientStateOperation::AddClient { session_id, .. } => {
+                let client = repo.get_client(*session_id).await?;
+                let us: crate::messages::encoder::UserState =
+                    client.build_user_state_for_broadcast().await;
+                Some(crate::messages::Message::UserState(us.into()))
+            }
+            ClientStateOperation::RemoveClient { session_id } => {
+                Some(crate::messages::Message::UserRemove(
+                    crate::mumble_proto::UserRemove {
+                        session: u32::from(*session_id),
+                        actor: None,
+                        reason: None,
+                        ban: Some(false),
+                    },
+                ))
+            }
+            ClientStateOperation::UpdateGlobalState { session_id, delta } => {
+                if delta.is_empty() {
+                    return None;
+                }
+                let mut us = crate::mumble_proto::UserState {
+                    session: Some(u32::from(*session_id)),
+                    actor: None,
+                    name: None,
+                    user_id: None,
+                    channel_id: None,
+                    mute: None,
+                    deaf: None,
+                    suppress: None,
+                    self_mute: None,
+                    self_deaf: None,
+                    texture: None,
+                    plugin_context: None,
+                    plugin_identity: None,
+                    comment: None,
+                    hash: None,
+                    comment_hash: None,
+                    texture_hash: None,
+                    priority_speaker: None,
+                    recording: None,
+                    temporary_access_tokens: Vec::new(),
+                    listening_channel_add: Vec::new(),
+                    listening_channel_remove: Vec::new(),
+                    listening_volume_adjustment: Vec::new(),
+                };
+
+                if let Some(ref v) = delta.display_name {
+                    us.name = v.clone();
+                }
+                if let Some(ref v) = delta.user_id {
+                    us.user_id = *v;
+                }
+                if let Some(v) = delta.current_channel_id {
+                    us.channel_id = Some(v);
+                }
+                if let Some(v) = delta.mute {
+                    us.mute = Some(v);
+                }
+                if let Some(v) = delta.deaf {
+                    us.deaf = Some(v);
+                }
+                if let Some(v) = delta.suppress {
+                    us.suppress = Some(v);
+                }
+                if let Some(v) = delta.self_mute {
+                    us.self_mute = Some(v);
+                }
+                if let Some(v) = delta.self_deaf {
+                    us.self_deaf = Some(v);
+                }
+                if let Some(v) = delta.priority_speaker {
+                    us.priority_speaker = Some(v);
+                }
+                if let Some(v) = delta.recording {
+                    us.recording = Some(v);
+                }
+                if let Some(ref v) = delta.plugin_context {
+                    us.plugin_context = Some(v.clone());
+                }
+                if let Some(ref v) = delta.plugin_identity {
+                    us.plugin_identity = Some(v.clone());
+                }
+                if let Some(ref v) = delta.texture_hash {
+                    us.texture_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
+                }
+                if let Some(ref v) = delta.comment_hash {
+                    us.comment_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
+                }
+                if let Some(ref v) = delta.listening_channel_id {
+                    us.listening_channel_add = v.iter().copied().collect();
+                }
+
+                Some(crate::messages::Message::UserState(us))
+            }
+        }
+    }
 }

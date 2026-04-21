@@ -115,19 +115,33 @@ impl ClientRepository {
             client_by_host_guard.insert(tcp_address.ip(), set);
         }
 
-        // ── Log the operation ───────────────────────────────────────────
+        // NOTE: AddClient log entry is deferred until the client
+        // authenticates.  See `publish_client()`.
+
+        client
+    }
+
+    /// Emit the `AddClient` log entry for a client that has completed
+    /// authentication.  Sets the `published` flag so that future
+    /// `remove_client` calls will emit a corresponding `RemoveClient`.
+    pub async fn publish_client(&self, id: ClientSessionIdentifier) {
+        let client = match self.clients.read().await.get(&id).cloned() {
+            Some(c) => c,
+            None => return,
+        };
+
+        client.set_published(true);
+
         let entry = self.make_entry(ClientStateOperation::AddClient {
-            session_id: client_identifier,
-            real_ip: real_ip_address,
-            tcp_addr: tcp_address,
-            udp_addr: udp_address,
-            local_addr: local_address,
+            session_id: id,
+            real_ip: client.get_real_ip_address(),
+            tcp_addr: client.get_tcp_address(),
+            udp_addr: client.get_udp_address(),
+            local_addr: client.get_tcp_address(),
             cert_hash: client.get_certificate_hash().map(|h| h.to_vec()),
             login_time: client.get_login_time(),
         });
         self.commit(entry).await;
-
-        client
     }
 
     pub async fn add_remote_client(&self, id: ClientSessionIdentifier, client: Arc<Box<Client>>) {
@@ -181,15 +195,19 @@ impl ClientRepository {
                 free_ids_guard.insert(id.local_session_id);
             }
 
-            // ── Log the operation ───────────────────────────────────────
-            let entry = self.make_entry(ClientStateOperation::RemoveClient {
-                session_id: id,
-            });
+            // ── Log the operation (only if client was published) ────────
+            let was_published = client.is_published();
             drop(clients_guard);
             drop(client_by_udp_address_guard);
             drop(client_by_host_guard);
             drop(free_ids_guard);
-            self.commit(entry).await;
+
+            if was_published {
+                let entry = self.make_entry(ClientStateOperation::RemoveClient {
+                    session_id: id,
+                });
+                self.commit(entry).await;
+            }
 
             Some(client)
         } else {
@@ -211,6 +229,13 @@ impl ClientRepository {
             .copied()
             .collect();
 
+        // Collect published status before removing from map
+        let published: Vec<bool> = ids_to_remove
+            .iter()
+            .filter_map(|id| clients.get(id))
+            .map(|c| c.is_published())
+            .collect();
+
         for id in &ids_to_remove {
             clients.remove(id);
             free_ids.insert(id.get_local_session_id());
@@ -218,12 +243,14 @@ impl ClientRepository {
         drop(clients);
         drop(free_ids);
 
-        // ── Log each removal ────────────────────────────────────────────
-        for id in ids_to_remove {
-            let entry = self.make_entry(ClientStateOperation::RemoveClient {
-                session_id: id,
-            });
-            self.commit(entry).await;
+        // ── Log each removal (only if client was published) ─────────────
+        for (id, was_published) in ids_to_remove.iter().zip(published.iter()) {
+            if *was_published {
+                let entry = self.make_entry(ClientStateOperation::RemoveClient {
+                    session_id: *id,
+                });
+                self.commit(entry).await;
+            }
         }
     }
 

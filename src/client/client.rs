@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use chrono::{DateTime, Utc};
@@ -53,6 +54,11 @@ pub struct Client {
     local_state: RwLock<Option<ClientLocalState>>,
     global_state: RwLock<ClientGlobalState>,
     crypt_state: Mutex<Option<CryptState>>,
+
+    /// Whether this client has been published to the log (i.e. `AddClient`
+    /// has been emitted).  Only published clients generate `RemoveClient`
+    /// log entries on disconnect.
+    published: AtomicBool,
 }
 
 impl Client {
@@ -102,6 +108,7 @@ impl Client {
             local_state: RwLock::new(Some(ClientLocalState::new())),
             global_state: RwLock::new(ClientGlobalState::new()),
             crypt_state: Mutex::new(None),
+            published: AtomicBool::new(false),
         })
     }
 
@@ -111,6 +118,14 @@ impl Client {
 
     pub fn has_certificate(&self) -> bool {
         self.certificate_hash.is_some()
+    }
+
+    pub fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+
+    pub fn set_published(&self, value: bool) {
+        self.published.store(value, Ordering::Release);
     }
 
     pub async fn get_groups_clone(&self) -> HashSet<String> {

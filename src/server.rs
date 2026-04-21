@@ -13,7 +13,6 @@ use tokio_rustls::TlsAcceptor;
 use crate::api::Authenticator;
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::channel_repository::ChannelRepository;
-use crate::client::state_log::ClientStateOperation;
 use crate::client::AsyncMessageHandlerExt;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{
@@ -392,9 +391,48 @@ impl Server {
 
         let client_session_id = client.get_session_id();
 
-        // Subscribe to the client state log so this connection can construct
-        // its own UserState / UserRemove messages from log entries.
+        // ── Phase A: Pre-authentication ─────────────────────────────────
+        // Process messages without a log subscription.  The client is
+        // invisible to other subscribers until `publish_client()` is called.
+        loop {
+            match client.read_and_handle_message(self).await {
+                Ok(_) => {
+                    if client.is_authenticated().await {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    self.clients.remove_client(client_session_id).await;
+                    return Ok(());
+                }
+            }
+        }
+
+        // ── Phase B: Post-authentication ────────────────────────────────
+        // Record the version at the snapshot point, publish the client,
+        // then start the log subscription and catch up on any mutations
+        // that happened during burst construction.
+
+        let snapshot_version = self.clients.current_version();
+        self.clients.publish_client(client_session_id).await;
+
         let mut log_rx = self.clients.subscribe();
+
+        // Replay any log entries emitted between the snapshot and now.
+        {
+            let missed = self.clients.get_log_since(snapshot_version).await;
+            for entry in &missed {
+                if entry.op.session_id() == Some(client_session_id) {
+                    continue;
+                }
+                if let Some(msg) = entry.to_message(&self.clients).await {
+                    if client.write_proto_message(&msg).await.is_err() {
+                        self.clients.remove_client(client_session_id).await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
 
         loop {
             tokio::select! {
@@ -419,7 +457,7 @@ impl Server {
                                 continue;
                             }
                             // Convert the log entry to a protobuf message and send it.
-                            if let Some(msg) = log_entry_to_message(&entry, &self.clients).await {
+                            if let Some(msg) = entry.to_message(&self.clients).await {
                                 if client.write_proto_message(&msg).await.is_err() {
                                     return Ok(());
                                 }
@@ -573,116 +611,6 @@ impl Server {
             });
             drop(codec);
             self.clients.broadcast_all(&msg).await;
-        }
-    }
-}
-
-// ─── Log-entry → protobuf message conversion ────────────────────────────────
-
-/// Convert a `ClientStateLogEntry` into the appropriate protobuf `Message`
-/// that should be sent to a subscriber.
-///
-/// * `AddClient` → `UserState` snapshot of the new client
-/// * `RemoveClient` → `UserRemove` message
-/// * `UpdateGlobalState` → `UserState` delta (only changed fields)
-async fn log_entry_to_message(
-    entry: &crate::client::state_log::ClientStateLogEntry,
-    repo: &ClientRepository,
-) -> Option<Message> {
-    match &entry.op {
-        ClientStateOperation::AddClient { session_id, .. } => {
-            let client = repo.get_client(*session_id).await?;
-            let us: crate::messages::encoder::UserState =
-                client.build_user_state_for_broadcast().await;
-            Some(Message::UserState(us.into()))
-        }
-        ClientStateOperation::RemoveClient { session_id } => {
-            Some(Message::UserRemove(crate::mumble_proto::UserRemove {
-                session: u32::from(*session_id),
-                actor: None,
-                reason: None,
-                ban: Some(false),
-            }))
-        }
-        ClientStateOperation::UpdateGlobalState { session_id, delta } => {
-            if delta.is_empty() {
-                return None;
-            }
-            let mut us = crate::mumble_proto::UserState {
-                session: Some(u32::from(*session_id)),
-                actor: None,
-                name: None,
-                user_id: None,
-                channel_id: None,
-                mute: None,
-                deaf: None,
-                suppress: None,
-                self_mute: None,
-                self_deaf: None,
-                texture: None,
-                plugin_context: None,
-                plugin_identity: None,
-                comment: None,
-                hash: None,
-                comment_hash: None,
-                texture_hash: None,
-                priority_speaker: None,
-                recording: None,
-                temporary_access_tokens: Vec::new(),
-                listening_channel_add: Vec::new(),
-                listening_channel_remove: Vec::new(),
-                listening_volume_adjustment: Vec::new(),
-            };
-
-            if let Some(ref v) = delta.display_name {
-                us.name = v.clone();
-            }
-            if let Some(ref v) = delta.user_id {
-                us.user_id = *v;
-            }
-            if let Some(v) = delta.current_channel_id {
-                us.channel_id = Some(v);
-            }
-            if let Some(v) = delta.mute {
-                us.mute = Some(v);
-            }
-            if let Some(v) = delta.deaf {
-                us.deaf = Some(v);
-            }
-            if let Some(v) = delta.suppress {
-                us.suppress = Some(v);
-            }
-            if let Some(v) = delta.self_mute {
-                us.self_mute = Some(v);
-            }
-            if let Some(v) = delta.self_deaf {
-                us.self_deaf = Some(v);
-            }
-            if let Some(v) = delta.priority_speaker {
-                us.priority_speaker = Some(v);
-            }
-            if let Some(v) = delta.recording {
-                us.recording = Some(v);
-            }
-            if let Some(ref v) = delta.plugin_context {
-                us.plugin_context = Some(v.clone());
-            }
-            if let Some(ref v) = delta.plugin_identity {
-                us.plugin_identity = Some(v.clone());
-            }
-            if let Some(ref v) = delta.texture_hash {
-                us.texture_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
-            }
-            if let Some(ref v) = delta.comment_hash {
-                us.comment_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
-            }
-            if let Some(ref v) = delta.listening_channel_id {
-                // Compute add/remove relative to previous state.
-                // For simplicity, send the full set as adds (clients will reconcile).
-                us.listening_channel_add = v.iter().copied().collect();
-            }
-
-            Some(Message::UserState(us))
         }
     }
 }
