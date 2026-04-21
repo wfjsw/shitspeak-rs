@@ -17,10 +17,12 @@ use crate::{
         client_session_identifier::ClientSessionIdentifier,
         client_stats::ClientStats,
         crypt::CryptState,
+        global_state_guard::GlobalStateWriteGuard,
         options::ClientOptions,
         udp_state::UdpState,
         user_info::UserInfoExtended,
     },
+    client_repository::ClientRepository,
     errors::{ReadProtoMessageError, WriteProtoMessageError},
     messages::{Message, ReadMessageExt, WriteMessageExt, encoder as msg_encoder},
     protocol_version::ProtocolVersion,
@@ -150,11 +152,9 @@ impl Client {
         self.global_state.read().await.get_current_channel_id()
     }
 
-    pub async fn set_current_channel_id(&self, channel_id: u32) {
-        self.global_state
-            .write()
-            .await
-            .set_current_channel_id(channel_id);
+    pub async fn set_current_channel_id(&self, channel_id: u32, repo: &ClientRepository) {
+        let mut gs = self.write_global_state(repo).await;
+        gs.set_current_channel_id(channel_id);
     }
 
     pub async fn get_user_id(&self) -> Option<u32> {
@@ -228,8 +228,8 @@ impl Client {
         guard.write_proto_message_batch(messages).await
     }
 
-    pub async fn set_tokens(&self, tokens: HashSet<String>) {
-        let mut gs = self.global_state.write().await;
+    pub async fn set_tokens(&self, tokens: HashSet<String>, repo: &ClientRepository) {
+        let mut gs = self.write_global_state(repo).await;
         gs.set_tokens(tokens);
     }
 
@@ -309,9 +309,9 @@ impl Client {
         }
     }
 
-    pub async fn set_protocol_version(&self, version: Option<ProtocolVersion>) {
-        let mut global_state_guard = self.global_state.write().await;
-        global_state_guard.set_protocol_version(version);
+    pub async fn set_protocol_version(&self, version: Option<ProtocolVersion>, repo: &ClientRepository) {
+        let mut gs = self.write_global_state(repo).await;
+        gs.set_protocol_version(version);
     }
 
     pub async fn set_release(&self, release: Option<String>) {
@@ -347,7 +347,24 @@ impl Client {
         self.local_state.write().await
     }
 
-    pub async fn write_global_state(&self) -> RwLockWriteGuard<'_, ClientGlobalState> {
+    /// Acquire a transactional write guard for `ClientGlobalState`.
+    ///
+    /// Mutations made through the guard are batched: when the guard is dropped
+    /// (or `commit()` is called explicitly), a `ClientGlobalStateDelta` is
+    /// computed, a `ClientStateLogEntry` is created, and the global version
+    /// is bumped by exactly 1.
+    pub async fn write_global_state<'a>(
+        &'a self,
+        repo: &'a ClientRepository,
+    ) -> GlobalStateWriteGuard<'a> {
+        let inner = self.global_state.write().await;
+        GlobalStateWriteGuard::new(inner, repo, self.session_id)
+    }
+
+    /// Direct (non-transactional) write access to `ClientGlobalState`.
+    /// Only for internal use (e.g. `apply_remote_operation`).
+    /// Callers should prefer `write_global_state(repo)` for normal mutations.
+    pub async fn write_global_state_direct(&self) -> RwLockWriteGuard<'_, ClientGlobalState> {
         self.global_state.write().await
     }
 

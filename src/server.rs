@@ -13,14 +13,14 @@ use tokio_rustls::TlsAcceptor;
 use crate::api::Authenticator;
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::channel_repository::ChannelRepository;
+use crate::client::state_log::ClientStateOperation;
 use crate::client::AsyncMessageHandlerExt;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{
-    HandleIncomingConnectionError, MessageHandlerError, MessageTypeNotForIncoming,
-    ReadProtoMessageError,
+    HandleIncomingConnectionError,
 };
 use crate::messages::encoder::Version;
-use crate::messages::WriteMessageExt;
+use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
 use crate::{
     client_repository::ClientRepository, codec_info::CodecInfo, config::Config,
@@ -139,7 +139,12 @@ impl Server {
             shutdown_rx.clone(),
         );
         let udp_process = Self::spawn_udp_process(Arc::clone(self), udp_out, shutdown_rx.clone());
-        let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx);
+        let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx.clone());
+        let idle_reaper = Self::spawn_idle_reaper(
+            Arc::clone(self),
+            self.config.client_idle_timeout_secs,
+            shutdown_rx,
+        );
 
         // Wait for any task to finish (error) or for the shutdown signal
         // to be dropped by the caller (main.rs drops shutdown_tx on Ctrl-C).
@@ -147,6 +152,7 @@ impl Server {
             result = udp_drain => { let _ = result; }
             result = udp_process => { let _ = result; }
             result = tcp_accept => { let _ = result; }
+            result = idle_reaper => { let _ = result; }
             _ = shutdown_tx.closed() => {
                 tracing::info!("Shutdown signal received.");
             }
@@ -309,6 +315,42 @@ impl Server {
         })
     }
 
+    /// Spawn a periodic task that disconnects clients who haven't sent a
+    /// ping within `timeout_secs`.
+    fn spawn_idle_reaper(
+        server: Arc<Box<Self>>,
+        timeout_secs: u64,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let interval = std::time::Duration::from_secs((timeout_secs / 2).max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = shutdown.changed() => break,
+                }
+
+                let now = chrono::Utc::now();
+                let timeout = chrono::Duration::seconds(timeout_secs as i64);
+                let clients = server.clients.get_all_clients().await;
+
+                for client in &clients {
+                    let last_ping = client.get_last_ping().await;
+                    if now - last_ping > timeout {
+                        let sid = client.get_session_id();
+                        tracing::info!(
+                            "Disconnecting idle client {:?} (last ping: {}, timeout: {}s)",
+                            sid,
+                            last_ping,
+                            timeout_secs,
+                        );
+                        server.clients.remove_client(sid).await;
+                    }
+                }
+            }
+        })
+    }
+
     pub async fn handle_incoming_connection(
         self: &Arc<Box<Self>>,
         tcp_stream: tokio::net::TcpStream,
@@ -348,11 +390,55 @@ impl Server {
             .allocate_local_client(real_ip, remote_addr, None, local_addr, tls_stream)
             .await;
 
+        let client_session_id = client.get_session_id();
+
+        // Subscribe to the client state log so this connection can construct
+        // its own UserState / UserRemove messages from log entries.
+        let mut log_rx = self.clients.subscribe();
+
         loop {
-            // Handle incoming messages from the client
-            match client.read_and_handle_message(self).await {
-                Ok(_) => {}
-                Err(_) => {}
+            tokio::select! {
+                // ── Incoming message from this client ────────────────────
+                result = client.read_and_handle_message(self) => {
+                    match result {
+                        Ok(_) => {}
+                        Err(_) => {
+                            // On error, remove the client and break the loop.
+                            self.clients.remove_client(client_session_id).await;
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // ── State change notification from the log ───────────────
+                result = log_rx.recv() => {
+                    match result {
+                        Ok(entry) => {
+                            // Don't echo own changes back.
+                            if entry.op.session_id() == Some(client_session_id) {
+                                continue;
+                            }
+                            // Convert the log entry to a protobuf message and send it.
+                            if let Some(msg) = log_entry_to_message(&entry, &self.clients).await {
+                                if client.write_proto_message(&msg).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                "Client {:?} lagged behind by {} log entries; disconnecting",
+                                client_session_id,
+                                n,
+                            );
+                            self.clients.remove_client(client_session_id).await;
+                            return Ok(());
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
     }
@@ -487,6 +573,116 @@ impl Server {
             });
             drop(codec);
             self.clients.broadcast_all(&msg).await;
+        }
+    }
+}
+
+// ─── Log-entry → protobuf message conversion ────────────────────────────────
+
+/// Convert a `ClientStateLogEntry` into the appropriate protobuf `Message`
+/// that should be sent to a subscriber.
+///
+/// * `AddClient` → `UserState` snapshot of the new client
+/// * `RemoveClient` → `UserRemove` message
+/// * `UpdateGlobalState` → `UserState` delta (only changed fields)
+async fn log_entry_to_message(
+    entry: &crate::client::state_log::ClientStateLogEntry,
+    repo: &ClientRepository,
+) -> Option<Message> {
+    match &entry.op {
+        ClientStateOperation::AddClient { session_id, .. } => {
+            let client = repo.get_client(*session_id).await?;
+            let us: crate::messages::encoder::UserState =
+                client.build_user_state_for_broadcast().await;
+            Some(Message::UserState(us.into()))
+        }
+        ClientStateOperation::RemoveClient { session_id } => {
+            Some(Message::UserRemove(crate::mumble_proto::UserRemove {
+                session: u32::from(*session_id),
+                actor: None,
+                reason: None,
+                ban: Some(false),
+            }))
+        }
+        ClientStateOperation::UpdateGlobalState { session_id, delta } => {
+            if delta.is_empty() {
+                return None;
+            }
+            let mut us = crate::mumble_proto::UserState {
+                session: Some(u32::from(*session_id)),
+                actor: None,
+                name: None,
+                user_id: None,
+                channel_id: None,
+                mute: None,
+                deaf: None,
+                suppress: None,
+                self_mute: None,
+                self_deaf: None,
+                texture: None,
+                plugin_context: None,
+                plugin_identity: None,
+                comment: None,
+                hash: None,
+                comment_hash: None,
+                texture_hash: None,
+                priority_speaker: None,
+                recording: None,
+                temporary_access_tokens: Vec::new(),
+                listening_channel_add: Vec::new(),
+                listening_channel_remove: Vec::new(),
+                listening_volume_adjustment: Vec::new(),
+            };
+
+            if let Some(ref v) = delta.display_name {
+                us.name = v.clone();
+            }
+            if let Some(ref v) = delta.user_id {
+                us.user_id = *v;
+            }
+            if let Some(v) = delta.current_channel_id {
+                us.channel_id = Some(v);
+            }
+            if let Some(v) = delta.mute {
+                us.mute = Some(v);
+            }
+            if let Some(v) = delta.deaf {
+                us.deaf = Some(v);
+            }
+            if let Some(v) = delta.suppress {
+                us.suppress = Some(v);
+            }
+            if let Some(v) = delta.self_mute {
+                us.self_mute = Some(v);
+            }
+            if let Some(v) = delta.self_deaf {
+                us.self_deaf = Some(v);
+            }
+            if let Some(v) = delta.priority_speaker {
+                us.priority_speaker = Some(v);
+            }
+            if let Some(v) = delta.recording {
+                us.recording = Some(v);
+            }
+            if let Some(ref v) = delta.plugin_context {
+                us.plugin_context = Some(v.clone());
+            }
+            if let Some(ref v) = delta.plugin_identity {
+                us.plugin_identity = Some(v.clone());
+            }
+            if let Some(ref v) = delta.texture_hash {
+                us.texture_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
+            }
+            if let Some(ref v) = delta.comment_hash {
+                us.comment_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
+            }
+            if let Some(ref v) = delta.listening_channel_id {
+                // Compute add/remove relative to previous state.
+                // For simplicity, send the full set as adds (clients will reconcile).
+                us.listening_channel_add = v.iter().copied().collect();
+            }
+
+            Some(Message::UserState(us))
         }
     }
 }

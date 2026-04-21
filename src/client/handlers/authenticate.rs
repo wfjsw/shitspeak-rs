@@ -17,11 +17,13 @@ pub async fn handle_authenticate(
     sender: &Arc<Box<Client>>,
     msg: Authenticate,
 ) -> Result<(), MessageHandlerError> {
+    let repo = server.get_clients();
+
     // ── Token-update path ─────────────────────────────────────────────────
     // An already-authenticated client can send Authenticate again to update
     // its access tokens.
     if sender.is_authenticated().await {
-        sender.set_tokens(msg.tokens.into_iter().collect()).await;
+        sender.set_tokens(msg.tokens.into_iter().collect(), repo).await;
         return Ok(());
     }
 
@@ -87,22 +89,21 @@ pub async fn handle_authenticate(
     // ── Required groups check ─────────────────────────────────────────────
     // (No required groups configured yet; placeholder for future config key.)
 
-    // ── Store identity on client ──────────────────────────────────────────
+    // ── Store identity on client (single transaction) ─────────────────────
     {
-        let mut gs = sender.write_global_state().await;
+        let mut gs = sender.write_global_state(repo).await;
         gs.set_user_id(result.user_id);
         gs.set_display_name(result.display_name);
         gs.set_groups(result.groups.into_iter().collect());
         gs.set_texture_blob(result.texture_url, None);
         gs.set_comment_blob(result.comment_url, None);
+        // Set access tokens within the same guard
+        gs.set_tokens(msg.tokens.into_iter().collect());
     }
     {
         let mut ext = sender.user_info_extended().await;
         ext.set_credential(Credential::new(username, password));
     }
-
-    // ── Set access tokens from the authenticate message ───────────────────
-    sender.set_tokens(msg.tokens.into_iter().collect()).await;
 
     // ── Generate crypt state and send CryptSetup ──────────────────────────
     sender
@@ -129,7 +130,7 @@ pub async fn handle_authenticate(
         } else {
             0 // fall back to root
         };
-        sender.set_current_channel_id(target_ch).await;
+        sender.set_current_channel_id(target_ch, repo).await;
     }
 
     // ── Build the full burst of messages to send to the new client ────────
@@ -264,14 +265,9 @@ pub async fn handle_authenticate(
         }
     }
 
-    // ── Broadcast the new user's state to all existing clients ────────────
-    {
-        let new_user_state: Message = sender.build_user_state_for_broadcast().await.into();
-        server
-            .get_clients()
-            .broadcast_except(session_id, &new_user_state)
-            .await;
-    }
+    // The AddClient log entry (emitted by allocate_local_client) will drive
+    // the UserState broadcast to all existing per-client subscribers.
+    // No need to broadcast manually here.
 
     Ok(())
 }

@@ -3,8 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
-    mumble_proto::{PermissionDenied, UserRemove, permission_denied::DenyType},
+    mumble_proto::UserRemove,
     server::Server,
 };
 
@@ -42,14 +41,9 @@ pub async fn handle_user_remove(
         );
     }
 
-    // Broadcast UserRemove to all so clients remove the user from their list
-    let broadcast = Message::UserRemove(UserRemove {
-        session: target_raw,
-        actor: Some(u32::from(sender.get_session_id())),
-        reason: msg.reason.clone(),
-        ban: Some(is_ban),
-    });
-    server.get_clients().broadcast_all(&broadcast).await;
+    // The RemoveClient log entry (emitted by remove_client below) will
+    // drive the UserRemove broadcast to all per-client subscribers.
+    // No need to broadcast manually.
 
     // Disconnect the target (TODO: actual TCP disconnect)
     // For now we just remove from the client list; disconnect() is a todo!()

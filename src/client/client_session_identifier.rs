@@ -1,8 +1,10 @@
 use std::convert::TryFrom;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{constants::{MAX_LOCAL_SESSION_ID, MAX_NODE_ID}, types::NodeIdentifier};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClientSessionIdentifier {
     /// 12-bit field (0 ..= 0xFFF)
     pub node_id: NodeIdentifier,

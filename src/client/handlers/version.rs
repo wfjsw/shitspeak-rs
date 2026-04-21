@@ -10,7 +10,8 @@ pub async fn handle_version(
     msg: Version,
 ) -> Result<(), MessageHandlerError> {
     {
-        let mut global_state_writer = sender.write_global_state().await;
+        let repo = server.get_clients();
+        let mut global_state_writer = sender.write_global_state(repo).await;
         global_state_writer.set_protocol_version(msg.version);
     }
     {

@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 aws-lc-rs = "1.15.2"
 bytes = "1.11.0"
-chrono = "0.4.41"
+chrono = { version = "0.4.41", features = ["serde"] }
 cidr = "0.3.2"
 config = "0.15.19"
 enumflags2 = { version = "0.7.12", features = ["serde"] }

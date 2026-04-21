@@ -35,18 +35,13 @@ pub async fn handle_channel_remove(
         .and_then(|ch| ch.parent_id)
         .unwrap_or(0);
 
-    let all_clients = server.get_clients().get_all_clients().await;
+    let repo = server.get_clients();
+    let all_clients = repo.get_all_clients().await;
     for client in &all_clients {
         if client.get_current_channel_id().await == channel_id {
-            client.set_current_channel_id(parent_id).await;
-            let move_msg: Message = {
-                use crate::messages::encoder::UserState;
-                let mut us = UserState::default();
-                us.session = Some(client.get_session_id());
-                us.channel_id = Some(parent_id);
-                us.into()
-            };
-            server.get_clients().broadcast_all(&move_msg).await;
+            client.set_current_channel_id(parent_id, repo).await;
+            // The channel move is now logged via the transactional guard;
+            // per-client subscribers will pick up the UserState delta.
         }
     }
 

@@ -589,6 +589,10 @@ impl ChannelRepository {
 
     fn make_op(&self, op: ChannelOp) -> ChannelOperation {
         let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+        debug_assert!(
+            version < u64::MAX - 1_000_000,
+            "ChannelRepository version counter approaching u64::MAX — likely a bug"
+        );
         ChannelOperation {
             version,
             node_id: self.node_id,

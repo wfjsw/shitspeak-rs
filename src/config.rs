@@ -63,6 +63,12 @@ pub struct Config {
     /// cost of memory.  Default: 2048 (~2 MB of buffered packets).
     #[serde(default = "default_udp_channel_size")]
     pub udp_channel_size: usize,
+
+    // ── Idle timeout ──────────────────────────────────────────────────────
+    /// Seconds of inactivity (no ping) before a client is disconnected.
+    /// Default: 30.
+    #[serde(default = "default_idle_timeout")]
+    pub client_idle_timeout_secs: u64,
 }
 
 fn default_max_bandwidth() -> u32 { 72_000 }
@@ -70,6 +76,7 @@ fn default_true() -> bool { true }
 fn default_max_text_message_length() -> u32 { 5_000 }
 fn default_max_image_message_length() -> u32 { 131_072 }
 fn default_udp_channel_size() -> usize { 2048 }
+fn default_idle_timeout() -> u64 { 30 }
 
 impl Config {
     pub fn load() -> Self {

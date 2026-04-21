@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::protocol_version::ProtocolVersion;
 
+#[derive(Debug, Clone)]
 pub struct ClientGlobalState {
     protocol_version: Option<ProtocolVersion>, 
 
