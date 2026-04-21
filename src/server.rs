@@ -2,7 +2,10 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
 use cidr::AnyIpCidr;
+use prost::Message as _;
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
 use rustls::version::{TLS12, TLS13};
 use tokio_rustls::TlsAcceptor;
@@ -34,20 +37,23 @@ pub struct Server {
 
     tcp_listener: tokio::net::TcpListener,
     tls_acceptor: TlsAcceptor,
-    udp_socket: tokio::net::UdpSocket,
+    udp_socket: Arc<tokio::net::UdpSocket>,
 
-    pub clients: ClientRepository,
-    pub channels: Arc<ChannelRepository>,
-    pub channel_blobs: Arc<ChannelBlobStore>,
-    pub session_blobs: Arc<SessionBlobStore>,
+    clients: ClientRepository,
+    channels: Arc<ChannelRepository>,
+    channel_blobs: Arc<ChannelBlobStore>,
+    session_blobs: Arc<SessionBlobStore>,
 
-    pub codec_info: CodecInfo,
+    codec_info: Mutex<CodecInfo>,
 
-    pub authenticator: Box<dyn Authenticator>,
+    authenticator: Box<dyn Authenticator>,
 }
 
 impl Server {
-    pub async fn new<A: Authenticator>(config: Config, authenticator: A) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
+    pub async fn new<A: Authenticator>(
+        config: Config,
+        authenticator: A,
+    ) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
         let listen_address = config
             .listen
             .to_socket_addrs()?
@@ -65,7 +71,7 @@ impl Server {
         let private_key = PrivateKeyDer::from_pem_file(&config.key_path)?;
 
         let tcp_listener = tokio::net::TcpListener::bind(&listen_address).await?;
-        let udp_socket = tokio::net::UdpSocket::bind(&listen_address).await?;
+        let udp_socket = Arc::new(tokio::net::UdpSocket::bind(&listen_address).await?);
 
         let client_cert_verifier = Arc::new(ClientCertificateVerifier::new());
 
@@ -77,24 +83,23 @@ impl Server {
 
         // ── Channel repository & blob stores ─────────────────────────────
         let node_id = config.node_id;
-        let (channels, channel_blobs, session_blobs) =
-            match &config.blob_storage_dir {
-                Some(dir) => {
-                    let ch_repo = ChannelRepository::open(node_id, dir).await?;
-                    let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
-                    let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
-                    (ch_repo, ch_blobs, s_blobs)
-                }
-                None => {
-                    // In-memory mode: use a temp dir for blob stores so the
-                    // code paths are uniform; blobs won't survive restarts.
-                    let tmp = std::env::temp_dir().join("shitspeak-blobs");
-                    let ch_repo = ChannelRepository::new_in_memory(node_id);
-                    let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
-                    let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
-                    (ch_repo, ch_blobs, s_blobs)
-                }
-            };
+        let (channels, channel_blobs, session_blobs) = match &config.blob_storage_dir {
+            Some(dir) => {
+                let ch_repo = ChannelRepository::open(node_id, dir).await?;
+                let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
+                let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
+                (ch_repo, ch_blobs, s_blobs)
+            }
+            None => {
+                // In-memory mode: use a temp dir for blob stores so the
+                // code paths are uniform; blobs won't survive restarts.
+                let tmp = std::env::temp_dir().join("shitspeak-blobs");
+                let ch_repo = ChannelRepository::new_in_memory(node_id);
+                let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
+                let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
+                (ch_repo, ch_blobs, s_blobs)
+            }
+        };
 
         Ok(Arc::new(Box::new(Server {
             node_identifier: node_id,
@@ -106,26 +111,171 @@ impl Server {
             channels,
             channel_blobs,
             session_blobs,
-            codec_info: CodecInfo::default(),
+            codec_info: Mutex::new(CodecInfo::default()),
             authenticator: Box::new(authenticator),
             config,
         })))
     }
 
-    pub async fn run(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(
+        self: &Arc<Box<Self>>,
+        shutdown_tx: tokio::sync::watch::Sender<()>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Server is running on {}", self.tcp_listener.local_addr()?);
-        loop {
-            let (tcp_stream, remote_addr) = self.tcp_listener.accept().await?;
-            let server = Arc::clone(self);
-            tokio::spawn(async move {
-                if let Err(e) = server
-                    .handle_incoming_connection(tcp_stream, remote_addr)
-                    .await
-                {
-                    tracing::warn!("Error handling connection: {}", e);
-                }
-            });
+
+        let shutdown_rx = shutdown_tx.subscribe();
+
+        // Bounded channel shared between UDP drain and processing tasks.
+        let (udp_in, udp_out) = tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(
+            self.config.udp_channel_size,
+        );
+
+        let udp_drain = Self::spawn_udp_drain(
+            Arc::clone(&self.udp_socket),
+            udp_in,
+            self.config.udp_voice_enabled,
+            shutdown_rx.clone(),
+        );
+        let udp_process = Self::spawn_udp_process(Arc::clone(self), udp_out, shutdown_rx.clone());
+        let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx);
+
+        // Wait for any task to finish (error) or for the shutdown signal
+        // to be dropped by the caller (main.rs drops shutdown_tx on Ctrl-C).
+        tokio::select! {
+            result = udp_drain => { let _ = result; }
+            result = udp_process => { let _ = result; }
+            result = tcp_accept => { let _ = result; }
+            _ = shutdown_tx.closed() => {
+                tracing::info!("Shutdown signal received.");
+            }
         }
+
+        Ok(())
+    }
+
+    /// Spawn the UDP drain task: receive packets as fast as possible and
+    /// push them into the channel.
+    fn spawn_udp_drain(
+        socket: Arc<tokio::net::UdpSocket>,
+        tx: tokio::sync::mpsc::Sender<(Vec<u8>, std::net::SocketAddr)>,
+        voice_enabled: bool,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let (len, src_addr) = tokio::select! {
+                    result = socket.recv_from(&mut buf) => match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("UDP recv error: {e}");
+                            continue;
+                        }
+                    },
+                    _ = shutdown.changed() => break,
+                };
+                if !voice_enabled {
+                    continue;
+                }
+                let packet = buf[..len].to_vec();
+                if tx.send((packet, src_addr)).await.is_err() {
+                    break; // channel closed — shutting down
+                }
+            }
+        })
+    }
+
+    /// Spawn the UDP processing task: decrypt, parse, and route voice
+    /// packets from the channel.
+    fn spawn_udp_process(
+        server: Arc<Box<Self>>,
+        mut rx: tokio::sync::mpsc::Receiver<(Vec<u8>, std::net::SocketAddr)>,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let (packet, src_addr) = tokio::select! {
+                    msg = rx.recv() => match msg {
+                        Some(m) => m,
+                        None => break,
+                    },
+                    _ = shutdown.changed() => break,
+                };
+                // Try to match by known UDP address first
+                let client = match server.clients.get_client_by_udp_address(&src_addr).await {
+                    Some(c) => Some(c),
+                    None => {
+                        let candidates = server.clients.get_clients_by_ip(&src_addr.ip()).await;
+                        let mut matched = None;
+                        for c in &candidates {
+                            let mut crypt = c.crypt_state().await;
+                            if let Some(ref mut state) = *crypt {
+                                let mut decrypted = Vec::new();
+                                if state.decrypt(&mut decrypted, &packet).is_ok() {
+                                    matched = Some(c.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        matched
+                    }
+                };
+
+                let Some(client) = client else { continue };
+                if !client.is_authenticated().await {
+                    continue;
+                };
+
+                let decrypted = {
+                    let mut crypt = client.crypt_state().await;
+                    let mut dec = Vec::new();
+                    match crypt.as_mut() {
+                        Some(state) => match state.decrypt(&mut dec, &packet) {
+                            Ok(()) => dec,
+                            Err(_) => continue,
+                        },
+                        None => continue,
+                    }
+                };
+
+                let audio = match crate::mumble_udp::Audio::decode(&*decrypted) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+
+                crate::voice::route_voice(&server, &client, &audio, true).await;
+            }
+        })
+    }
+
+    /// Spawn the TCP accept loop.
+    fn spawn_tcp_accept(
+        server: Arc<Box<Self>>,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let (tcp_stream, remote_addr) = tokio::select! {
+                    result = server.tcp_listener.accept() => match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("TCP accept error: {e}");
+                            continue;
+                        }
+                    },
+                    _ = shutdown.changed() => break,
+                };
+                let conn_server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    if let Err(e) = conn_server
+                        .handle_incoming_connection(tcp_stream, remote_addr)
+                        .await
+                    {
+                        tracing::warn!("Error handling connection: {}", e);
+                    }
+                });
+            }
+        })
     }
 
     pub async fn handle_incoming_connection(
@@ -189,6 +339,26 @@ impl Server {
         &self.clients
     }
 
+    pub fn get_channels(&self) -> &Arc<ChannelRepository> {
+        &self.channels
+    }
+
+    pub fn get_channel_blobs(&self) -> &Arc<ChannelBlobStore> {
+        &self.channel_blobs
+    }
+
+    pub fn get_session_blobs(&self) -> &Arc<SessionBlobStore> {
+        &self.session_blobs
+    }
+
+    pub fn get_udp_socket(&self) -> &Arc<tokio::net::UdpSocket> {
+        &self.udp_socket
+    }
+
+    pub async fn get_codec_info(&self) -> tokio::sync::MutexGuard<'_, CodecInfo> {
+        self.codec_info.lock().await
+    }
+
     pub fn get_min_client_version(&self) -> u64 {
         self.config.min_client_version
     }
@@ -219,5 +389,55 @@ impl Server {
 
     pub fn get_max_image_message_length(&self) -> u32 {
         self.config.max_image_message_length
+    }
+
+    pub fn get_default_channel(&self) -> u32 {
+        self.config.default_channel
+    }
+
+    // ── Codec negotiation ────────────────────────────────────────────────
+
+    /// Re-evaluate codec selection across all authenticated clients and
+    /// broadcast `CodecVersion` if the selection changed.
+    pub async fn recheck_codec_versions(self: &Arc<Box<Self>>) {
+        let all_clients = self.clients.get_all_clients().await;
+
+        let mut alpha_count = 0usize;
+        let mut beta_count = 0usize;
+        let mut prefer_alpha_count = 0usize;
+        let mut opus_count = 0usize;
+        let total = all_clients.len();
+
+        for client in &all_clients {
+            if !client.is_authenticated().await {
+                continue;
+            }
+            let local = client.read_local_state().await;
+            if let Some(ref state) = *local {
+                if state.supports_opus() {
+                    opus_count += 1;
+                }
+            }
+        }
+
+        let mut codec = self.codec_info.lock().await;
+        let changed = codec.recheck(
+            alpha_count,
+            beta_count,
+            prefer_alpha_count,
+            opus_count,
+            total,
+        );
+
+        if changed {
+            let msg = crate::messages::Message::CodecVersion(crate::mumble_proto::CodecVersion {
+                alpha: codec.alpha_codec(),
+                beta: codec.beta_codec(),
+                prefer_alpha: codec.prefer_alpha_codec(),
+                opus: Some(codec.opus()),
+            });
+            drop(codec);
+            self.clients.broadcast_all(&msg).await;
+        }
     }
 }

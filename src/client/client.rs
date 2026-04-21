@@ -186,6 +186,10 @@ impl Client {
     pub fn get_real_ip_address(&self) -> IpAddr {
         self.real_ip_address
     }
+
+    pub fn get_login_time(&self) -> DateTime<Utc> {
+        self.login_time
+    }
     // FIXME: not sure if it is verified or just exists
     pub async fn is_verified(&self) -> bool {
         let guard = self.connection.lock().await;
@@ -261,6 +265,13 @@ impl Client {
         self.crypt_state.lock().await
     }
 
+    pub async fn udp_state(&self) -> MutexGuard<'_, UdpState> {
+        match &self.udp_state {
+            Some(m) => m.lock().await,
+            None => panic!("UDP state not initialized"),
+        }
+    }
+
     pub async fn create_crypt_state(
         &self,
         mode: &str,
@@ -326,6 +337,14 @@ impl Client {
         self.global_state.read().await
     }
 
+    pub async fn read_local_state(&self) -> tokio::sync::RwLockReadGuard<'_, Option<ClientLocalState>> {
+        self.local_state.read().await
+    }
+
+    pub async fn write_local_state(&self) -> RwLockWriteGuard<'_, Option<ClientLocalState>> {
+        self.local_state.write().await
+    }
+
     pub async fn write_global_state(&self) -> RwLockWriteGuard<'_, ClientGlobalState> {
         self.global_state.write().await
     }
@@ -338,37 +357,33 @@ impl Client {
     /// to other clients (i.e. everything a peer needs to know about this user).
     pub async fn build_user_state_for_broadcast(&self) -> msg_encoder::UserState {
         let user_info = self.user_info.read().await;
-        let global_state = self.global_state.read().await;
+        let gs = self.global_state.read().await;
 
-        let comment_hash_bytes = global_state
-            .get_comment_hash()
-            .and_then(|h| hex::decode(h).ok());
-        let texture_hash_bytes = global_state
-            .get_texture_hash()
-            .and_then(|h| hex::decode(h).ok());
+        let comment_hash_bytes = gs.get_comment_hash().and_then(|h| hex::decode(h).ok());
+        let texture_hash_bytes = gs.get_texture_hash().and_then(|h| hex::decode(h).ok());
 
         msg_encoder::UserState {
             session: Some(self.session_id),
             actor: None,
             name: user_info.get_display_name_opt().map(|s| s.to_owned()),
             user_id: user_info.get_user_id(),
-            channel_id: Some(global_state.get_current_channel_id()),
-            mute: None,
-            deaf: None,
-            suppress: None,
-            self_mute: None,
-            self_deaf: None,
+            channel_id: Some(gs.get_current_channel_id()),
+            mute: Some(gs.is_muted()),
+            deaf: Some(gs.is_deafened()),
+            suppress: Some(gs.is_suppressed()),
+            self_mute: Some(gs.is_self_muted()),
+            self_deaf: Some(gs.is_self_deafened()),
             texture: None,
-            plugin_context: None,
-            plugin_identity: None,
+            plugin_context: if gs.get_plugin_context().is_empty() { None } else { Some(gs.get_plugin_context().to_vec()) },
+            plugin_identity: if gs.get_plugin_identity().is_empty() { None } else { Some(gs.get_plugin_identity().to_owned()) },
             comment: None,
             hash: self.certificate_hash.as_ref().map(|h| hex::encode(h)),
             comment_hash: comment_hash_bytes,
             texture_hash: texture_hash_bytes,
-            priority_speaker: None,
-            recording: None,
+            priority_speaker: Some(gs.is_priority_speaker()),
+            recording: Some(gs.is_recording()),
             temporary_access_tokens: Vec::new(),
-            listening_channel_add: Vec::new(),
+            listening_channel_add: gs.get_listening_channel_id().iter().copied().collect(),
             listening_channel_remove: Vec::new(),
             listening_volume_adjustment: Vec::new(),
         }

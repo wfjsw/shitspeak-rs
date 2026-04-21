@@ -12,18 +12,23 @@ pub struct ClientGlobalState {
     last_active_timestamp: Option<std::time::Instant>,
     listening_channel_id: HashSet<u32>,
 
+    // ── Voice / moderation state ───────────────────────────────────────────
+    mute: bool,
+    deaf: bool,
+    suppress: bool,
+    self_mute: bool,
+    self_deaf: bool,
+    priority_speaker: bool,
+    recording: bool,
+    plugin_context: Vec<u8>,
+    plugin_identity: String,
 
     // ── Texture blob ───────────────────────────────────────────────────────
-    /// URL supplied by the auth server at login; propagated over S2S.
     texture_url: Option<String>,
-    /// SHA-1 hex of the texture blob in `SessionBlobStore`; also propagated
-    /// over S2S so peer nodes can check their local cache.
     texture_hash: Option<String>,
 
     // ── Comment blob ───────────────────────────────────────────────────────
-    /// URL supplied by the auth server at login; propagated over S2S.
     comment_url: Option<String>,
-    /// SHA-1 hex of the comment blob in `SessionBlobStore`.
     comment_hash: Option<String>,
 }
 
@@ -38,6 +43,16 @@ impl ClientGlobalState {
             current_channel_id: 0,
             last_active_timestamp: None,
             listening_channel_id: HashSet::new(),
+
+            mute: false,
+            deaf: false,
+            suppress: false,
+            self_mute: false,
+            self_deaf: false,
+            priority_speaker: false,
+            recording: false,
+            plugin_context: Vec::new(),
+            plugin_identity: String::new(),
 
             texture_url: None,
             texture_hash: None,
@@ -58,12 +73,12 @@ impl ClientGlobalState {
         &self.listening_channel_id
     }
 
-    pub fn listen_channel(&mut self, channel_id: u32) {
-        self.listening_channel_id.insert(channel_id);
+    pub fn listen_channel(&mut self, channel_id: u32) -> bool {
+        self.listening_channel_id.insert(channel_id)
     }
     
-    pub fn unlisten_channel(&mut self, channel_id: u32) {
-        self.listening_channel_id.remove(&channel_id);
+    pub fn unlisten_channel(&mut self, channel_id: u32) -> bool {
+        self.listening_channel_id.remove(&channel_id)
     }
 
     pub fn is_listening_channel(&self, channel_id: u32) -> bool {
@@ -164,6 +179,35 @@ impl ClientGlobalState {
         self.comment_url = None;
         self.comment_hash = None;
     }
+
+    // ── Voice / moderation getters & setters ─────────────────────────────
+
+    pub fn is_muted(&self) -> bool { self.mute }
+    pub fn set_mute(&mut self, v: bool) { self.mute = v; }
+
+    pub fn is_deafened(&self) -> bool { self.deaf }
+    pub fn set_deaf(&mut self, v: bool) { self.deaf = v; }
+
+    pub fn is_suppressed(&self) -> bool { self.suppress }
+    pub fn set_suppress(&mut self, v: bool) { self.suppress = v; }
+
+    pub fn is_self_muted(&self) -> bool { self.self_mute }
+    pub fn set_self_mute(&mut self, v: bool) { self.self_mute = v; }
+
+    pub fn is_self_deafened(&self) -> bool { self.self_deaf }
+    pub fn set_self_deaf(&mut self, v: bool) { self.self_deaf = v; }
+
+    pub fn is_priority_speaker(&self) -> bool { self.priority_speaker }
+    pub fn set_priority_speaker(&mut self, v: bool) { self.priority_speaker = v; }
+
+    pub fn is_recording(&self) -> bool { self.recording }
+    pub fn set_recording(&mut self, v: bool) { self.recording = v; }
+
+    pub fn get_plugin_context(&self) -> &[u8] { &self.plugin_context }
+    pub fn set_plugin_context(&mut self, ctx: Vec<u8>) { self.plugin_context = ctx; }
+
+    pub fn get_plugin_identity(&self) -> &str { &self.plugin_identity }
+    pub fn set_plugin_identity(&mut self, id: String) { self.plugin_identity = id; }
 }
 
 impl Default for ClientGlobalState {

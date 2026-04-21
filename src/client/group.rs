@@ -29,14 +29,14 @@ enum MatchType<'a> {
 }
 
 pub struct ClientMembershipQuery<'a> {
-    groups: &'a [&'a str],
-    authenticated: bool,
-    access_tokens: &'a [&'a str],
-    cert_hash: Option<&'a [u8]>,
-    has_verified_cert_chain: bool,
-    ip_address: Option<IpAddr>,
-    asn: Option<u32>,
-    country_code: Option<&'a str>,
+    pub groups: &'a [&'a str],
+    pub authenticated: bool,
+    pub access_tokens: &'a [&'a str],
+    pub cert_hash: Option<&'a [u8]>,
+    pub has_verified_cert_chain: bool,
+    pub ip_address: Option<IpAddr>,
+    pub asn: Option<u32>,
+    pub country_code: Option<&'a str>,
 }
 
 pub fn is_member_in_group(

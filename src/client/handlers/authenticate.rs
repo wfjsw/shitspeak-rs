@@ -31,7 +31,7 @@ pub async fn handle_authenticate(
 
     // ── Max-users check ───────────────────────────────────────────────────
     {
-        let n = server.clients.get_all_clients().await.len() as u64;
+        let n = server.get_clients().get_all_clients().await.len() as u64;
         if n >= server.get_max_users() {
             return Err(RejectType::ServerFull.into());
         }
@@ -123,6 +123,17 @@ pub async fn handle_authenticate(
         })
     };
 
+    // ── Place user in the default channel ────────────────────────────────
+    {
+        let default_ch = server.get_default_channel();
+        let target_ch = if server.get_channels().get_channel(default_ch).await.is_some() {
+            default_ch
+        } else {
+            0 // fall back to root
+        };
+        sender.set_current_channel_id(target_ch).await;
+    }
+
     // ── Build the full burst of messages to send to the new client ────────
     //
     // All of the following are sent to the joining client in a single batch
@@ -145,7 +156,7 @@ pub async fn handle_authenticate(
 
     // 2. Channel tree — BFS from root
     {
-        let all_channels = server.channels.get_all().await;
+        let all_channels = server.get_channels().get_all().await;
         // BFS ordering: root first, then children in order
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(0u32); // root channel id
@@ -187,7 +198,7 @@ pub async fn handle_authenticate(
 
     // 3. UserState for every currently authenticated client (excluding self)
     {
-        let all_clients = server.clients.get_all_clients().await;
+        let all_clients = server.get_clients().get_all_clients().await;
         for client in &all_clients {
             if client.get_session_id() == session_id {
                 continue;
@@ -247,11 +258,19 @@ pub async fn handle_authenticate(
     // ── Mark as authenticated ─────────────────────────────────────────────
     sender.set_authenticated(true).await;
 
+    // Store Opus support flag for codec negotiation
+    {
+        let mut local = sender.write_local_state().await;
+        if let Some(ref mut state) = *local {
+            state.set_supports_opus(msg.opus.unwrap_or(false));
+        }
+    }
+
     // ── Broadcast the new user's state to all existing clients ────────────
     {
         let new_user_state: Message = sender.build_user_state_for_broadcast().await.into();
         server
-            .clients
+            .get_clients()
             .broadcast_except(session_id, &new_user_state)
             .await;
     }

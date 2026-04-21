@@ -14,3 +14,24 @@ pub struct UdpState {
 
     voice_targets: HashMap<u32, VoiceTarget>,
 }
+
+impl UdpState {
+    pub fn new(crypto_provider: Box<dyn CryptoProvider>) -> Self {
+        UdpState {
+            udp_enabled: false,
+            last_resync: Utc::now(),
+            crypto_provider,
+            celt_versions: Vec::new(),
+            opus: true,
+            voice_targets: HashMap::new(),
+        }
+    }
+
+    pub fn voice_target_mut(&mut self, id: u32) -> &mut VoiceTarget {
+        self.voice_targets.entry(id).or_insert_with(VoiceTarget::new)
+    }
+
+    pub fn voice_target(&self, id: u32) -> Option<&VoiceTarget> {
+        self.voice_targets.get(&id)
+    }
+}

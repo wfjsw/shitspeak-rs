@@ -255,6 +255,24 @@ impl ChannelRepository {
 
     // ── Mutation API ──────────────────────────────────────────────────────
 
+    /// Allocate a fresh channel ID.  Temporary channels get bit-31 set.
+    pub async fn next_channel_id(&self, temporary: bool) -> u32 {
+        let channels = self.channels.read().await;
+        // Find the highest non-temporary ID and increment.
+        let max_id = channels
+            .keys()
+            .filter(|id| **id & 0x8000_0000 == 0)
+            .max()
+            .copied()
+            .unwrap_or(0);
+        let base = max_id + 1;
+        if temporary {
+            base | 0x8000_0000
+        } else {
+            base
+        }
+    }
+
     pub async fn create_channel(
         self: &Arc<Self>,
         mut channel: Channel,

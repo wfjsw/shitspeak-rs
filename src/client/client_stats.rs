@@ -54,4 +54,11 @@ impl ClientStats {
             self.tcp_ping_var = tcp_ping_var;
         }
     }
+
+    pub fn udp_ping_avg(&self) -> f32 { self.udp_ping_avg }
+    pub fn udp_ping_var(&self) -> f32 { self.udp_ping_var }
+    pub fn udp_packets(&self) -> u32 { self.udp_packets }
+    pub fn tcp_ping_avg(&self) -> f32 { self.tcp_ping_avg }
+    pub fn tcp_ping_var(&self) -> f32 { self.tcp_ping_var }
+    pub fn tcp_packets(&self) -> u32 { self.tcp_packets }
 }

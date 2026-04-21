@@ -161,6 +161,23 @@ impl ClientRepository {
         self.clients.read().await.get(&id).cloned()
     }
 
+    /// Look up a client by their UDP socket address.
+    pub async fn get_client_by_udp_address(&self, addr: &SocketAddr) -> Option<Arc<Box<Client>>> {
+        let by_udp = self.clients_by_udp_address.read().await;
+        let id = by_udp.get(addr)?;
+        self.clients.read().await.get(id).cloned()
+    }
+
+    /// Look up clients sharing the same IP (for UDP packet matching fallback).
+    pub async fn get_clients_by_ip(&self, ip: &IpAddr) -> Vec<Arc<Box<Client>>> {
+        let by_host = self.clients_by_host.read().await;
+        let clients = self.clients.read().await;
+        match by_host.get(ip) {
+            Some(ids) => ids.iter().filter_map(|id| clients.get(id).cloned()).collect(),
+            None => Vec::new(),
+        }
+    }
+
     // ── Broadcast helpers ─────────────────────────────────────────────────
 
     /// Send `message` to every connected client.

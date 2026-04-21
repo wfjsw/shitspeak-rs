@@ -47,12 +47,25 @@ pub struct Config {
     /// `None` = in-memory only (no persistence).
     #[serde(default)]
     pub blob_storage_dir: Option<PathBuf>,
+
+    // ── UDP voice ──────────────────────────────────────────────────────────
+    /// Whether to accept UDP voice packets.  When `false`, the UDP drain
+    /// loop still runs (for ping/latency) but voice packets are silently
+    /// dropped.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub udp_voice_enabled: bool,
+    /// Capacity of the bounded channel between the UDP drain task and the
+    /// processing task.  Larger values tolerate processing bursts at the
+    /// cost of memory.  Default: 2048 (~2 MB of buffered packets).
+    #[serde(default = "default_udp_channel_size")]
+    pub udp_channel_size: usize,
 }
 
 fn default_max_bandwidth() -> u32 { 72_000 }
 fn default_true() -> bool { true }
 fn default_max_text_message_length() -> u32 { 5_000 }
 fn default_max_image_message_length() -> u32 { 131_072 }
+fn default_udp_channel_size() -> usize { 2048 }
 
 impl Config {
     pub fn load() -> Self {

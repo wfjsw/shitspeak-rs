@@ -93,3 +93,59 @@ impl Default for ACL {
         Self::new()
     }
 }
+
+/// Evaluate the effective permissions for a user on a given channel.
+///
+/// Walks the channel tree from `channel_id` up to the root, applying ACLs
+/// at each level.  `inherit_acl` controls whether parent ACLs are considered.
+/// Returns the effective permission bitmask.
+pub fn evaluate_permission(
+    channel: &crate::channels::Channel,
+    ancestors: &[crate::channels::Channel],
+    user_id: Option<u32>,
+    client: &ClientMembershipQuery,
+    current_channel_id: u32,
+) -> BitFlags<ACLPermissions> {
+    let mut allowed = BitFlags::empty();
+    let mut denied = BitFlags::empty();
+
+    // Apply ACLs from the target channel first, then walk up ancestors
+    let mut chain: Vec<&crate::channels::Channel> = vec![channel];
+    for a in ancestors {
+        chain.push(a);
+    }
+
+    for ch in &chain {
+        for acl in &ch.acls {
+            if !acl.apply_here {
+                continue;
+            }
+
+            let matches = if let Some(uid) = acl.user_id {
+                // User-specific ACL: match by user_id
+                user_id.map_or(false, |u| u as i32 == uid)
+            } else {
+                // Group ACL
+                acl.match_group(
+                    current_channel_id,
+                    Some(ch.id),
+                    &[], // join_passwords — not available here
+                    client,
+                )
+            };
+
+            if matches {
+                allowed |= acl.allow;
+                denied |= acl.deny;
+            }
+        }
+
+        // Stop if this channel doesn't inherit from parent
+        if !ch.inherit_acl {
+            break;
+        }
+    }
+
+    // Deny takes precedence over allow
+    allowed & !denied
+}

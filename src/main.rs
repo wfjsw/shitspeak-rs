@@ -13,6 +13,7 @@ mod geoip;
 mod messages;
 mod server;
 mod types;
+mod voice;
 mod voice_crypto;
 mod client_certificate_verifier;
 mod proxy_protocol;
@@ -59,9 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load();
     let server = Server::new(config, NoopAuthenticator).await?;
 
+    // Shutdown signal: dropping the sender notifies all spawned tasks.
+    let (shutdown_tx, _) = tokio::sync::watch::channel(());
+
     // Graceful shutdown: wait for Ctrl-C while the server runs.
     tokio::select! {
-        result = server.run() => {
+        result = server.run(shutdown_tx) => {
             if let Err(e) = result {
                 tracing::error!("Server exited with error: {e}");
             }

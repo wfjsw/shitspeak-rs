@@ -15,15 +15,11 @@ pub async fn handle_version(
         global_state_writer.set_release(msg.release);
         global_state_writer.set_os(msg.os);
         global_state_writer.set_os_version(msg.os_version);
-
-        // TODO: set crypto mode
-        // sender.crypt_state().await.as_mut().map(|state| {
-        //     state.set_protocol_version(msg.version);
-        //     state.set_release(msg.release.clone());
-        //     state.set_os(msg.os.clone());
-        //     state.set_os_version(msg.os_version.clone());
-        // });
     }
-    
+
+    // Store Opus support flag from the authenticate message (set during auth).
+    // The Version message itself doesn't carry codec info — that's in Authenticate.
+    // We track it here as a no-op; the actual flag is set in handle_authenticate.
+
     Ok(())
 }
