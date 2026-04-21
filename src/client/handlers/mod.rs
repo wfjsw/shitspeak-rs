@@ -46,8 +46,8 @@ use crate::{
 
 /// Handle a TCP-tunneled voice packet.
 ///
-/// The `data` is the raw protobuf-encoded `Audio` message.  We decode it,
-/// stamp the sender session, and pass it to `route_voice()`.
+/// The `data` is the raw voice packet bytes (legacy or protobuf format).
+/// We decode it and pass it to `route_voice()`.
 async fn handle_udp_tunnel(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<crate::client::Client>>,
@@ -57,7 +57,7 @@ async fn handle_udp_tunnel(
         return Ok(());
     }
 
-    let audio = match crate::mumble_udp::Audio::decode(&*data) {
+    let audio = match crate::voice::codec::decode_audio_packet(&data) {
         Ok(a) => a,
         Err(_) => return Ok(()),
     };

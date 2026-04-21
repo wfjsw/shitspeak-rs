@@ -54,6 +54,10 @@ pub struct Config {
     /// dropped.  Default: `true`.
     #[serde(default = "default_true")]
     pub udp_voice_enabled: bool,
+    /// Whether to respond to UDP ping packets with server information
+    /// (version, user count, max users, bandwidth).  Default: `true`.
+    #[serde(default = "default_true")]
+    pub udp_ping_enabled: bool,
     /// Capacity of the bounded channel between the UDP drain task and the
     /// processing task.  Larger values tolerate processing bursts at the
     /// cost of memory.  Default: 2048 (~2 MB of buffered packets).

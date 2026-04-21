@@ -134,6 +134,8 @@ impl Server {
             Arc::clone(&self.udp_socket),
             udp_in,
             self.config.udp_voice_enabled,
+            self.config.udp_ping_enabled,
+            Arc::clone(self),
             shutdown_rx.clone(),
         );
         let udp_process = Self::spawn_udp_process(Arc::clone(self), udp_out, shutdown_rx.clone());
@@ -154,11 +156,14 @@ impl Server {
     }
 
     /// Spawn the UDP drain task: receive packets as fast as possible and
-    /// push them into the channel.
+    /// push voice packets into the channel.  Ping packets are handled
+    /// directly (responded to immediately).
     fn spawn_udp_drain(
         socket: Arc<tokio::net::UdpSocket>,
         tx: tokio::sync::mpsc::Sender<(Vec<u8>, std::net::SocketAddr)>,
         voice_enabled: bool,
+        ping_enabled: bool,
+        server: Arc<Box<Self>>,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -174,10 +179,24 @@ impl Server {
                     },
                     _ = shutdown.changed() => break,
                 };
+
+                let packet = &buf[..len];
+
+                // Check for ping packets first — handle directly.
+                if ping_enabled {
+                    if let Ok(crate::voice::codec::UdpPacket::Ping(ping)) =
+                        crate::voice::codec::decode_udp_packet(packet)
+                    {
+                        let reply = Self::build_ping_response(&server, &ping).await;
+                        let _ = socket.send_to(&reply, src_addr).await;
+                        continue;
+                    }
+                }
+
                 if !voice_enabled {
                     continue;
                 }
-                let packet = buf[..len].to_vec();
+                let packet = packet.to_vec();
                 if tx.send((packet, src_addr)).await.is_err() {
                     break; // channel closed — shutting down
                 }
@@ -238,12 +257,24 @@ impl Server {
                     }
                 };
 
-                let audio = match crate::mumble_udp::Audio::decode(&*decrypted) {
+                let decoded_audio = match crate::voice::codec::decode_audio_packet(&decrypted) {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
 
-                crate::voice::route_voice(&server, &client, &audio, true).await;
+                // Validate that the sender_session in the packet matches the
+                // client we identified via UDP address / crypto.  An attacker
+                // could spoof the session ID otherwise.
+                if decoded_audio.sender_session != u32::from(client.get_session_id()) {
+                    tracing::debug!(
+                        "UDP session mismatch: packet claims {}, client is {:?}",
+                        decoded_audio.sender_session,
+                        client.get_session_id(),
+                    );
+                    continue;
+                }
+
+                crate::voice::route_voice(&server, &client, &decoded_audio, true).await;
             }
         })
     }
@@ -393,6 +424,24 @@ impl Server {
 
     pub fn get_default_channel(&self) -> u32 {
         self.config.default_channel
+    }
+
+    
+    // ── UDP ping ─────────────────────────────────────────────────────────
+
+    /// Build a ping response with current server information.
+    async fn build_ping_response(
+        server: &Arc<Box<Self>>,
+        ping: &crate::voice::codec::PingRequest,
+    ) -> Vec<u8> {
+        let response = crate::voice::codec::PingResponse {
+            timestamp: ping.timestamp,
+            server_version: crate::constants::APP_PROTO_VER.into(),
+            user_count: server.clients.get_all_clients().await.len() as u32,
+            max_user_count: server.config.max_users as u32,
+            max_bandwidth_per_user: server.config.max_bandwidth,
+        };
+        crate::voice::codec::encode_ping_response(&response, ping.format)
     }
 
     // ── Codec negotiation ────────────────────────────────────────────────
