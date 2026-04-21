@@ -417,6 +417,7 @@ impl Server {
         self.clients.publish_client(client_session_id).await;
 
         let mut log_rx = self.clients.subscribe();
+        let mut channel_rx = self.channels.subscribe();
 
         // Replay any log entries emitted between the snapshot and now.
         {
@@ -448,7 +449,7 @@ impl Server {
                     }
                 }
 
-                // ── State change notification from the log ───────────────
+                // ── Client state change notification ─────────────────────
                 result = log_rx.recv() => {
                     match result {
                         Ok(entry) => {
@@ -456,7 +457,6 @@ impl Server {
                             if entry.op.session_id() == Some(client_session_id) {
                                 continue;
                             }
-                            // Convert the log entry to a protobuf message and send it.
                             if let Some(msg) = entry.to_message(&self.clients).await {
                                 if client.write_proto_message(&msg).await.is_err() {
                                     return Ok(());
@@ -465,7 +465,37 @@ impl Server {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(
-                                "Client {:?} lagged behind by {} log entries; disconnecting",
+                                "Client {:?} lagged behind by {} client log entries; disconnecting",
+                                client_session_id,
+                                n,
+                            );
+                            self.clients.remove_client(client_session_id).await;
+                            return Ok(());
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // ── Channel state change notification ────────────────────
+                result = channel_rx.recv() => {
+                    match result {
+                        Ok(op) => {
+                            let channels_map: std::collections::HashMap<u32, _> =
+                                self.channels.get_all().await
+                                    .into_iter()
+                                    .map(|c| (c.id, c))
+                                    .collect();
+                            if let Some(msg) = op.to_message(&channels_map) {
+                                if client.write_proto_message(&msg).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                "Client {:?} lagged behind by {} channel log entries; disconnecting",
                                 client_session_id,
                                 n,
                             );

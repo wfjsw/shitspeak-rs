@@ -55,6 +55,68 @@ pub struct ChannelOperation {
     pub op: ChannelOp,
 }
 
+impl ChannelOperation {
+    /// Convert this log entry into the protobuf `Message` that should be
+    /// sent to a subscriber.
+    pub fn to_message(&self, channels: &HashMap<u32, Channel>) -> Option<crate::messages::Message> {
+        match &self.op {
+            ChannelOp::CreateChannel { channel } => {
+                Some(channel_to_proto(channel, &[], &[]))
+            }
+            ChannelOp::UpdateChannel { id, .. } => {
+                let ch = channels.get(id)?;
+                let links: Vec<u32> = ch.links.iter().copied().collect();
+                Some(channel_to_proto(ch, &links, &[]))
+            }
+            ChannelOp::DeleteChannel { id } => {
+                Some(crate::messages::Message::ChannelRemove(
+                    crate::mumble_proto::ChannelRemove { channel_id: *id },
+                ))
+            }
+            ChannelOp::AddLink { a, b } => {
+                let ch = channels.get(a)?;
+                let links: Vec<u32> = ch.links.iter().copied().collect();
+                Some(channel_to_proto(ch, &links, &[*b]))
+            }
+            ChannelOp::RemoveLink { a, b } => {
+                let ch = channels.get(a)?;
+                let links: Vec<u32> = ch.links.iter().copied().collect();
+                Some(channel_to_proto(ch, &links, &[*b]))
+            }
+            ChannelOp::SetAcls { .. } => {
+                // ACL changes produce PermissionQuery messages, not ChannelState.
+                None
+            }
+        }
+    }
+}
+
+/// Build a `ChannelState` protobuf message from a `Channel`.
+fn channel_to_proto(
+    ch: &Channel,
+    links: &[u32],
+    links_add: &[u32],
+) -> crate::messages::Message {
+    crate::messages::Message::ChannelState(crate::mumble_proto::ChannelState {
+        channel_id: Some(ch.id),
+        parent: ch.parent_id,
+        name: Some(ch.name.clone()),
+        links: links.to_vec(),
+        description: None,
+        links_add: links_add.to_vec(),
+        links_remove: Vec::new(),
+        temporary: Some(ch.is_temporary()),
+        position: Some(ch.position),
+        description_hash: ch
+            .description_hash
+            .as_ref()
+            .and_then(|h| hex::decode(h).ok()),
+        max_users: Some(ch.max_users),
+        is_enter_restricted: None,
+        can_enter: None,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ChannelOp {

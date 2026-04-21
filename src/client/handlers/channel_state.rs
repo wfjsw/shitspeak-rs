@@ -71,23 +71,8 @@ pub async fn handle_channel_state(
                 }
             };
 
-            // Broadcast new channel to all clients
-            let broadcast = Message::ChannelState(crate::mumble_proto::ChannelState {
-                channel_id: Some(created.id),
-                parent: created.parent_id,
-                name: Some(created.name.clone()),
-                links: Vec::new(),
-                description: None,
-                links_add: Vec::new(),
-                links_remove: Vec::new(),
-                temporary: Some(created.is_temporary()),
-                position: Some(created.position),
-                description_hash: created.description_hash.as_ref().and_then(|h| hex::decode(h).ok()),
-                max_users: Some(created.max_users),
-                is_enter_restricted: None,
-                can_enter: None,
-            });
-            server.get_clients().broadcast_all(&broadcast).await;
+            // Channel creation is logged and broadcast via ChannelRepository::commit().
+            // Per-client subscribers will pick up the ChannelState delta.
         }
 
         Some(channel_id) => {
@@ -117,27 +102,8 @@ pub async fn handle_channel_state(
                 return Ok(());
             }
 
-            // Fetch updated state and broadcast
-            let Some(updated) = server.get_channels().get_channel(channel_id).await else {
-                return Ok(());
-            };
-            let links: Vec<u32> = updated.links.iter().copied().collect();
-            let broadcast = Message::ChannelState(crate::mumble_proto::ChannelState {
-                channel_id: Some(updated.id),
-                parent: updated.parent_id,
-                name: Some(updated.name.clone()),
-                links,
-                description: None,
-                links_add: msg.links_add,
-                links_remove: msg.links_remove,
-                temporary: Some(updated.is_temporary()),
-                position: Some(updated.position),
-                description_hash: updated.description_hash.as_ref().and_then(|h| hex::decode(h).ok()),
-                max_users: Some(updated.max_users),
-                is_enter_restricted: None,
-                can_enter: None,
-            });
-            server.get_clients().broadcast_all(&broadcast).await;
+            // Channel update is logged and broadcast via ChannelRepository::commit().
+            // Per-client subscribers will pick up the ChannelState delta.
         }
     }
 

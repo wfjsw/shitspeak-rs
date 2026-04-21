@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::Message,
     mumble_proto::ChannelRemove,
     server::Server,
 };
@@ -50,11 +49,8 @@ pub async fn handle_channel_remove(
         return Ok(());
     }
 
-    // Broadcast removal
-    let broadcast = Message::ChannelRemove(ChannelRemove {
-        channel_id,
-    });
-    server.get_clients().broadcast_all(&broadcast).await;
+    // Channel deletion is logged and broadcast via ChannelRepository::commit().
+    // Per-client subscribers will pick up the ChannelRemove message.
 
     Ok(())
 }
