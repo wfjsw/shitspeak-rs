@@ -5,8 +5,9 @@
 //! version number.  These entries are broadcast to per-client subscribers
 //! so each client can construct its own update messages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -202,6 +203,15 @@ pub struct ClientStateLogEntry {
     pub timestamp: i64,
     #[serde(flatten)]
     pub op: ClientStateOperation,
+}
+
+/// Broadcast payload: a log entry plus the current version vector so
+/// subscribers can detect when they're fully caught up.
+#[derive(Debug, Clone)]
+pub struct ClientStateBroadcastPayload {
+    pub entry: Arc<ClientStateLogEntry>,
+    /// Current version for every known node (local + remote).
+    pub versions: HashMap<u16, u64>,
 }
 
 impl ClientStateLogEntry {

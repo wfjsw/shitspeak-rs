@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -137,7 +138,13 @@ impl Server {
             Arc::clone(self),
             shutdown_rx.clone(),
         );
-        let udp_process = Self::spawn_udp_process(Arc::clone(self), udp_out, shutdown_rx.clone());
+        let udp_process = Self::spawn_udp_process(
+            Arc::clone(self),
+            Arc::clone(&self.udp_socket),
+            udp_out,
+            self.config.udp_ping_enabled,
+            shutdown_rx.clone(),
+        );
         let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx.clone());
         let idle_reaper = Self::spawn_idle_reaper(
             Arc::clone(self),
@@ -173,6 +180,7 @@ impl Server {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
+            tracing::info!("UDP drain started, listening on {}", socket.local_addr().unwrap_or_else(|_| std::net::SocketAddr::from(([0,0,0,0], 0))));
             loop {
                 let (len, src_addr) = tokio::select! {
                     result = socket.recv_from(&mut buf) => match result {
@@ -186,19 +194,9 @@ impl Server {
                 };
 
                 let packet = &buf[..len];
+                tracing::trace!("UDP received {} bytes from {}", len, src_addr);
 
-                // Check for ping packets first — handle directly.
-                if ping_enabled {
-                    if let Ok(crate::voice::codec::UdpPacket::Ping(ping)) =
-                        crate::voice::codec::decode_udp_packet(packet)
-                    {
-                        let reply = Self::build_ping_response(&server, &ping).await;
-                        let _ = socket.send_to(&reply, src_addr).await;
-                        continue;
-                    }
-                }
-
-                if !voice_enabled {
+                if !voice_enabled && !ping_enabled {
                     continue;
                 }
                 let packet = packet.to_vec();
@@ -206,14 +204,17 @@ impl Server {
                     break; // channel closed — shutting down
                 }
             }
+            tracing::info!("UDP drain stopped");
         })
     }
 
     /// Spawn the UDP processing task: decrypt, parse, and route voice
-    /// packets from the channel.
+    /// packets from the channel.  Ping packets are handled directly.
     fn spawn_udp_process(
         server: Arc<Box<Self>>,
+        socket: Arc<tokio::net::UdpSocket>,
         mut rx: tokio::sync::mpsc::Receiver<(Vec<u8>, std::net::SocketAddr)>,
+        ping_enabled: bool,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -262,24 +263,39 @@ impl Server {
                     }
                 };
 
-                let decoded_audio = match crate::voice::codec::decode_audio_packet(&decrypted) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
+                // After decryption, check if this is a ping or audio packet.
+                match crate::voice::codec::decode_udp_packet(&decrypted) {
+                    Ok(crate::voice::codec::UdpPacket::Ping(ping)) => {
+                        if ping_enabled {
+                            tracing::debug!("UDP ping from {}: timestamp={}", src_addr, ping.timestamp);
+                            let reply = Self::build_ping_response(&server, &ping).await;
+                            match socket.send_to(&reply, src_addr).await {
+                                Ok(sent) => tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent),
+                                Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(crate::voice::codec::UdpPacket::Audio(decoded_audio)) => {
+                        // Validate that the sender_session in the packet matches the
+                        // client we identified via UDP address / crypto.  An attacker
+                        // could spoof the session ID otherwise.
+                        if decoded_audio.sender_session != u32::from(client.get_session_id()) {
+                            tracing::debug!(
+                                "UDP session mismatch: packet claims {}, client is {:?}",
+                                decoded_audio.sender_session,
+                                client.get_session_id(),
+                            );
+                            continue;
+                        }
 
-                // Validate that the sender_session in the packet matches the
-                // client we identified via UDP address / crypto.  An attacker
-                // could spoof the session ID otherwise.
-                if decoded_audio.sender_session != u32::from(client.get_session_id()) {
-                    tracing::debug!(
-                        "UDP session mismatch: packet claims {}, client is {:?}",
-                        decoded_audio.sender_session,
-                        client.get_session_id(),
-                    );
-                    continue;
+                        crate::voice::route_voice(&server, &client, &decoded_audio, true).await;
+                    }
+                    Err(e) => {
+                        tracing::trace!("UDP packet decode failed from {}: {e}", src_addr);
+                        continue;
+                    }
                 }
-
-                crate::voice::route_voice(&server, &client, &decoded_audio, true).await;
             }
         })
     }
@@ -391,124 +407,125 @@ impl Server {
 
         let client_session_id = client.get_session_id();
 
-        // ── Phase A: Pre-authentication ─────────────────────────────────
-        // Process messages without a log subscription.  The client is
-        // invisible to other subscribers until `publish_client()` is called.
-        loop {
-            match client.read_and_handle_message(self).await {
-                Ok(_) => {
-                    if client.is_authenticated().await {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    self.clients.remove_client(client_session_id).await;
-                    return Ok(());
-                }
-            }
-        }
+        // Subscriptions start as None — they're activated after auth.
+        let mut client_log_rx: Option<tokio::sync::broadcast::Receiver<_>> = None;
+        let mut channel_log_rx: Option<tokio::sync::broadcast::Receiver<_>> = None;
 
-        // ── Phase B: Post-authentication ────────────────────────────────
-        // Record the version at the snapshot point, publish the client,
-        // then start the log subscription and catch up on any mutations
-        // that happened during burst construction.
+        // Run the connection loop.  On any unrecoverable error, clean up
+        // the client and return the error to the caller.
+        let result: Result<(), HandleIncomingConnectionError> = async {
+            loop {
+                tokio::select! {
+                    // ── Incoming message from this client ────────────────────
+                    result = client.read_proto_message() => {
+                        match result {
+                            Ok(message) => {
+                                client.handle_message(self, message).await
+                                    .map_err(|_| HandleIncomingConnectionError::MessageHandlerFailed)?;
 
-        let snapshot_version = self.clients.current_version();
-        self.clients.publish_client(client_session_id).await;
+                                // Transition to post-auth: publish and subscribe.
+                                if client.is_authenticated().await && client_log_rx.is_none() {
+                                    let channel_snapshot_version = self.channels.current_version();
+                                    client.set_last_channel_version(channel_snapshot_version).await;
 
-        let mut log_rx = self.clients.subscribe();
-        let mut channel_rx = self.channels.subscribe();
+                                    self.clients.publish_client(client_session_id).await;
 
-        // Replay any log entries emitted between the snapshot and now.
-        {
-            let missed = self.clients.get_log_since(snapshot_version).await;
-            for entry in &missed {
-                if entry.op.session_id() == Some(client_session_id) {
-                    continue;
-                }
-                if let Some(msg) = entry.to_message(&self.clients).await {
-                    if client.write_proto_message(&msg).await.is_err() {
-                        self.clients.remove_client(client_session_id).await;
-                        return Ok(());
-                    }
-                }
-            }
-        }
+                                    client_log_rx = Some(self.clients.subscribe());
+                                    channel_log_rx = Some(self.channels.subscribe());
 
-        loop {
-            tokio::select! {
-                // ── Incoming message from this client ────────────────────
-                result = client.read_and_handle_message(self) => {
-                    match result {
-                        Ok(_) => {}
-                        Err(_) => {
-                            // On error, remove the client and break the loop.
-                            self.clients.remove_client(client_session_id).await;
-                            return Ok(());
-                        }
-                    }
-                }
-
-                // ── Client state change notification ─────────────────────
-                result = log_rx.recv() => {
-                    match result {
-                        Ok(entry) => {
-                            // Don't echo own changes back.
-                            if entry.op.session_id() == Some(client_session_id) {
-                                continue;
-                            }
-                            if let Some(msg) = entry.to_message(&self.clients).await {
-                                if client.write_proto_message(&msg).await.is_err() {
-                                    return Ok(());
+                                    let last_seen = client.get_last_client_versions().await;
+                                    let (missed, new_versions) = self.clients.replay_since(&last_seen).await
+                                        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+                                    for msg in &missed {
+                                        client.write_proto_message(msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
+                                    client.update_last_client_versions(&new_versions).await;
                                 }
                             }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                "Client {:?} lagged behind by {} client log entries; disconnecting",
-                                client_session_id,
-                                n,
-                            );
-                            self.clients.remove_client(client_session_id).await;
-                            return Ok(());
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Ok(());
+                            Err(_) => return Err(HandleIncomingConnectionError::MessageHandlerFailed),
                         }
                     }
-                }
 
-                // ── Channel state change notification ────────────────────
-                result = channel_rx.recv() => {
-                    match result {
-                        Ok(op) => {
-                            let channels_map: std::collections::HashMap<u32, _> =
-                                self.channels.get_all().await
-                                    .into_iter()
-                                    .map(|c| (c.id, c))
-                                    .collect();
-                            if let Some(msg) = op.to_message(&channels_map) {
-                                if client.write_proto_message(&msg).await.is_err() {
-                                    return Ok(());
+                    // ── Client state change notification ─────────────────────
+                    result = recv_optional(client_log_rx.as_mut()), if client_log_rx.is_some() => {
+                        match result {
+                            Some(Ok(broadcast)) => {
+                                tracing::trace!("Received client log broadcast: {:?}", broadcast);
+
+                                let entry = &broadcast.entry;
+                                // if entry.op.session_id() == Some(client_session_id) {
+                                //     continue;
+                                // }
+                                let last_seen = client.get_last_client_versions().await;
+                                let last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
+                                if entry.version > last_for_node + 1 {
+                                    let (missed, new_versions) = self.clients.replay_since(&last_seen).await
+                                        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+                                    for msg in &missed {
+                                        client.write_proto_message(msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
+                                    client.update_last_client_versions(&new_versions).await;
                                 }
+                                if let Some(msg) = entry.to_message(&self.clients).await {
+                                    client.write_proto_message(&msg).await
+                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                }
+                                client.update_last_client_versions(&broadcast.versions).await;
                             }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                                let last_seen = client.get_last_client_versions().await;
+                                let (missed, new_versions) = self.clients.replay_since(&last_seen).await
+                                    .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+                                for msg in &missed {
+                                    client.write_proto_message(msg).await
+                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                }
+                                client.update_last_client_versions(&new_versions).await;
+                            }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                                return Ok(());
+                            }
+                            None => {} // not subscribed yet
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                "Client {:?} lagged behind by {} channel log entries; disconnecting",
-                                client_session_id,
-                                n,
-                            );
-                            self.clients.remove_client(client_session_id).await;
-                            return Ok(());
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Ok(());
+                    }
+
+                    // ── Channel state change notification ────────────────────
+                    result = recv_optional(channel_log_rx.as_mut()), if channel_log_rx.is_some() => {
+                        match result {
+                            Some(Ok(op)) => {
+                                let last = client.get_last_channel_version().await;
+                                replay_channel_log_gap(
+                                    &client, &self.channels, client_session_id, last, op.version,
+                                ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
+                                if let Some(msg) = op.to_message() {
+                                    client.write_proto_message(&msg).await
+                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                }
+                                client.set_last_channel_version(op.version).await;
+                            }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                                let last = client.get_last_channel_version().await;
+                                replay_channel_log_gap(
+                                    &client, &self.channels, client_session_id, last, u64::MAX,
+                                ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
+                            }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                                return Ok(());
+                            }
+                            None => {} // not subscribed yet
                         }
                     }
                 }
             }
+        }.await;
+
+        // Single cleanup point: remove the client on any error.
+        if result.is_err() {
+            self.clients.remove_client(client_session_id).await;
         }
+        result
     }
 
     pub async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -590,7 +607,7 @@ impl Server {
     ) -> Vec<u8> {
         let response = crate::voice::codec::PingResponse {
             timestamp: ping.timestamp,
-            server_version: crate::constants::APP_PROTO_VER.into(),
+            server_version: crate::constants::APP_PROTO_VER,
             user_count: server.clients.get_all_clients().await.len() as u32,
             max_user_count: server.config.max_users as u32,
             max_bandwidth_per_user: server.config.max_bandwidth,
@@ -642,5 +659,114 @@ impl Server {
             drop(codec);
             self.clients.broadcast_all(&msg).await;
         }
+    }
+}
+
+// ─── Log gap replay helpers ─────────────────────────────────────────────────
+
+/// Replay missed client-state log entries for `node_id` between `last` and
+/// `current` (exclusive).  If `current == u64::MAX`, replays everything
+/// after `last`.
+///
+/// Returns `Err(())` if the gap is unrecoverable (log pruned).
+async fn replay_client_log_gap(
+    client: &Arc<Box<crate::client::Client>>,
+    repo: &crate::client_repository::ClientRepository,
+    session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
+    node_id: u16,
+    last: u64,
+    current: u64,
+) -> Result<(), ()> {
+    if current <= last + 1 {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "Client {:?} missed client log entries: node={} last={} current={}",
+        session_id, node_id, last, current,
+    );
+
+    let missed = repo.get_log_since(last).await;
+    if missed.is_empty() && last > 0 {
+        tracing::error!(
+            "Client {:?} client log gap unrecoverable (node={}, last={})",
+            session_id, node_id, last,
+        );
+        return Err(());
+    }
+
+    for entry in &missed {
+        if entry.version >= current {
+            break;
+        }
+        if entry.op.session_id() == Some(session_id) {
+            continue;
+        }
+        if let Some(msg) = entry.to_message(repo).await {
+            if client.write_proto_message(&msg).await.is_err() {
+                return Err(());
+            }
+        }
+        let mut ver = HashMap::new();
+        ver.insert(entry.node_id, entry.version);
+        client.update_last_client_versions(&ver).await;
+    }
+
+    Ok(())
+}
+
+/// Replay missed channel-state log entries between `last` and `current`
+/// (exclusive).  If `current == u64::MAX`, replays everything after `last`.
+///
+/// Returns `Err(())` if the gap is unrecoverable (log pruned).
+async fn replay_channel_log_gap(
+    client: &Arc<Box<crate::client::Client>>,
+    channels: &Arc<crate::channel_repository::ChannelRepository>,
+    session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
+    last: u64,
+    current: u64,
+) -> Result<(), ()> {
+    if current <= last + 1 {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "Client {:?} missed channel log entries: last={} current={}",
+        session_id, last, current,
+    );
+
+    let missed = channels.get_log_since(last).await;
+    if missed.is_empty() && last > 0 {
+        tracing::error!(
+            "Client {:?} channel log gap unrecoverable (last={})",
+            session_id, last,
+        );
+        return Err(());
+    }
+
+    for entry in &missed {
+        if entry.version >= current {
+            break;
+        }
+        if let Some(msg) = entry.to_message() {
+            if client.write_proto_message(&msg).await.is_err() {
+                return Err(());
+            }
+        }
+        client.set_last_channel_version(entry.version).await;
+    }
+
+    Ok(())
+}
+
+/// Helper for `tokio::select!` with an `Option<Receiver>`.
+/// Returns `None` if the receiver is `None` (not subscribed yet),
+/// otherwise awaits the next message.
+async fn recv_optional<T: Clone>(
+    rx: Option<&mut tokio::sync::broadcast::Receiver<T>>,
+) -> Option<Result<T, tokio::sync::broadcast::error::RecvError>> {
+    match rx {
+        Some(rx) => Some(rx.recv().await),
+        None => std::future::pending().await,
     }
 }

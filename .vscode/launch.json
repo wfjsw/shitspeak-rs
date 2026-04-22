@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug ShitSpeak Server",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=shitspeak-rs"
+                ]
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "trace",
+                "RUST_BACKTRACE": "1"
+            },
+            "sourceMap": {
+                "/rustc/*": "${env:HOME}/.rustup/toolchains/${env:RUSTUP_TOOLCHAIN}/lib/rustlib/src/rust"
+            },
+            "preLaunchTask": "generate-test-certs"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug ShitSpeak Server (no cert gen)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=shitspeak-rs"
+                ]
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "trace"
+            }
+        }
+    ]
+}

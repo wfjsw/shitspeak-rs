@@ -17,6 +17,7 @@ pub async fn handle_user_remove(
     }
 
     let target_raw = msg.session;
+    tracing::debug!(session = u32::from(sender.get_session_id()), target = target_raw, ban = msg.ban, reason = msg.reason, "UserRemove handler");
     if target_raw == 0 {
         return Ok(());
     }

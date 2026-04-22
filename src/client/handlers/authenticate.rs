@@ -18,11 +18,14 @@ pub async fn handle_authenticate(
     msg: Authenticate,
 ) -> Result<(), MessageHandlerError> {
     let repo = server.get_clients();
+    let session = sender.get_session_id();
+    tracing::debug!(session = u32::from(session), username = msg.username, has_password = msg.password.is_some(), tokens = msg.tokens.len(), "Authenticate handler");
 
     // ── Token-update path ─────────────────────────────────────────────────
     // An already-authenticated client can send Authenticate again to update
     // its access tokens.
     if sender.is_authenticated().await {
+        tracing::debug!(session = u32::from(session), "Authenticate: token update for already-authenticated client");
         sender.set_tokens(msg.tokens.into_iter().collect(), repo).await;
         return Ok(());
     }
@@ -31,9 +34,13 @@ pub async fn handle_authenticate(
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
     let password = msg.password;
 
+    // ── Snapshot all clients + versions (used for max-users, UserState
+    //     broadcast, and last-seen version tracking) ────────────────────────
+    let (all_clients, all_versions) = server.get_clients().snapshot_with_versions().await;
+
     // ── Max-users check ───────────────────────────────────────────────────
     {
-        let n = server.get_clients().get_all_clients().await.len() as u64;
+        let n = all_clients.len() as u64;
         if n >= server.get_max_users() {
             return Err(RejectType::ServerFull.into());
         }
@@ -197,7 +204,6 @@ pub async fn handle_authenticate(
 
     // 3. UserState for every currently authenticated client (excluding self)
     {
-        let all_clients = server.get_clients().get_all_clients().await;
         for client in &all_clients {
             if client.get_session_id() == session_id {
                 continue;
@@ -231,8 +237,8 @@ pub async fn handle_authenticate(
     // 6. ServerConfig
     {
         burst.push(Message::ServerConfig(ServerConfig {
-            max_bandwidth: Some(server.get_max_bandwidth()),
-            welcome_text: server.get_welcome_text().map(|s| s.to_owned()),
+            max_bandwidth: None,
+            welcome_text: None,
             allow_html: Some(server.get_allow_html()),
             message_length: Some(server.get_max_text_message_length()),
             image_message_length: Some(server.get_max_image_message_length()),
@@ -256,6 +262,9 @@ pub async fn handle_authenticate(
 
     // ── Mark as authenticated ─────────────────────────────────────────────
     sender.set_authenticated(true).await;
+
+    // ── Record last-seen versions so the client doesn't replay old entries ─
+    sender.update_last_client_versions(&all_versions).await;
 
     // Store Opus support flag for codec negotiation
     {

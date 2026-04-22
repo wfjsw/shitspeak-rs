@@ -1,1 +1,8 @@
 /target
+# Generated test certificates
+cert.pem
+key.pem
+cert.cer
+cert.pfx
+# Logs
+log/

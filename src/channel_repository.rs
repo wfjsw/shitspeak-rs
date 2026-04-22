@@ -57,16 +57,15 @@ pub struct ChannelOperation {
 
 impl ChannelOperation {
     /// Convert this log entry into the protobuf `Message` that should be
-    /// sent to a subscriber.
-    pub fn to_message(&self, channels: &HashMap<u32, Channel>) -> Option<crate::messages::Message> {
+    /// sent to a subscriber.  Only changed/delta fields are populated;
+    /// Mumble clients merge deltas with their existing state.
+    pub fn to_message(&self) -> Option<crate::messages::Message> {
         match &self.op {
             ChannelOp::CreateChannel { channel } => {
-                Some(channel_to_proto(channel, &[], &[]))
+                Some(channel_to_proto_full(channel))
             }
-            ChannelOp::UpdateChannel { id, .. } => {
-                let ch = channels.get(id)?;
-                let links: Vec<u32> = ch.links.iter().copied().collect();
-                Some(channel_to_proto(ch, &links, &[]))
+            ChannelOp::UpdateChannel { id, patch } => {
+                Some(channel_to_proto_delta(*id, patch))
             }
             ChannelOp::DeleteChannel { id } => {
                 Some(crate::messages::Message::ChannelRemove(
@@ -74,14 +73,22 @@ impl ChannelOperation {
                 ))
             }
             ChannelOp::AddLink { a, b } => {
-                let ch = channels.get(a)?;
-                let links: Vec<u32> = ch.links.iter().copied().collect();
-                Some(channel_to_proto(ch, &links, &[*b]))
+                Some(crate::messages::Message::ChannelState(
+                    crate::mumble_proto::ChannelState {
+                        channel_id: Some(*a),
+                        links_add: vec![*b],
+                        ..Default::default()
+                    },
+                ))
             }
             ChannelOp::RemoveLink { a, b } => {
-                let ch = channels.get(a)?;
-                let links: Vec<u32> = ch.links.iter().copied().collect();
-                Some(channel_to_proto(ch, &links, &[*b]))
+                Some(crate::messages::Message::ChannelState(
+                    crate::mumble_proto::ChannelState {
+                        channel_id: Some(*a),
+                        links_remove: vec![*b],
+                        ..Default::default()
+                    },
+                ))
             }
             ChannelOp::SetAcls { .. } => {
                 // ACL changes produce PermissionQuery messages, not ChannelState.
@@ -91,20 +98,14 @@ impl ChannelOperation {
     }
 }
 
-/// Build a `ChannelState` protobuf message from a `Channel`.
-fn channel_to_proto(
-    ch: &Channel,
-    links: &[u32],
-    links_add: &[u32],
-) -> crate::messages::Message {
+/// Build a full `ChannelState` protobuf message (for CreateChannel).
+fn channel_to_proto_full(ch: &Channel) -> crate::messages::Message {
+    let links: Vec<u32> = ch.links.iter().copied().collect();
     crate::messages::Message::ChannelState(crate::mumble_proto::ChannelState {
         channel_id: Some(ch.id),
         parent: ch.parent_id,
         name: Some(ch.name.clone()),
-        links: links.to_vec(),
-        description: None,
-        links_add: links_add.to_vec(),
-        links_remove: Vec::new(),
+        links,
         temporary: Some(ch.is_temporary()),
         position: Some(ch.position),
         description_hash: ch
@@ -112,8 +113,22 @@ fn channel_to_proto(
             .as_ref()
             .and_then(|h| hex::decode(h).ok()),
         max_users: Some(ch.max_users),
-        is_enter_restricted: None,
-        can_enter: None,
+        ..Default::default()
+    })
+}
+
+/// Build a delta `ChannelState` protobuf message (for UpdateChannel).
+fn channel_to_proto_delta(id: u32, patch: &ChannelPatch) -> crate::messages::Message {
+    crate::messages::Message::ChannelState(crate::mumble_proto::ChannelState {
+        channel_id: Some(id),
+        parent: patch.parent_id.unwrap_or(None),
+        name: patch.name.clone(),
+        position: patch.position,
+        max_users: patch.max_users,
+        description_hash: patch.description_hash.as_ref().and_then(|h| {
+            h.as_ref().and_then(|h| hex::decode(h).ok())
+        }),
+        ..Default::default()
     })
 }
 

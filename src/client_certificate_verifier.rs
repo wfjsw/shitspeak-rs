@@ -42,7 +42,17 @@ impl ClientCertVerifier for ClientCertificateVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![]
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
     }
 
     // Provided methods
@@ -55,6 +65,6 @@ impl ClientCertVerifier for ClientCertificateVerifier {
     }
 
     fn requires_raw_public_keys(&self) -> bool { 
-        true
+        false
     }
 }

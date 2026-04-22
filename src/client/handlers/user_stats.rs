@@ -17,6 +17,8 @@ pub async fn handle_user_stats(
         return Ok(());
     }
 
+    tracing::debug!(session = u32::from(sender.get_session_id()), target = msg.session, stats_only = msg.stats_only, "UserStats handler");
+
     // If the client is requesting stats for a specific session, look it up.
     // Otherwise, return stats for the sender.
     let target = match msg.session {

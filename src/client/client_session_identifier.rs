@@ -1,5 +1,4 @@
-use std::convert::TryFrom;
-
+use std::{convert::TryFrom, fmt::Display};
 use serde::{Deserialize, Serialize};
 
 use crate::{constants::{MAX_LOCAL_SESSION_ID, MAX_NODE_ID}, types::NodeIdentifier};
@@ -18,6 +17,12 @@ pub enum ClientSessionIdentifierError {
     NodeIdOutOfRange,
     #[error("local_session_id out of range (must be <= 0xFFFFF)")]
     LocalSessionIdOutOfRange,
+}
+
+impl Display for ClientSessionIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClientSessionIdentifier(node_id={}, local_session_id={})", self.node_id, self.local_session_id)
+    }
 }
 
 impl ClientSessionIdentifier {

@@ -167,7 +167,9 @@ impl CryptState {
                     }
                 }
             } else {
-                unreachable!()
+                // unexpected identical IV byte — treat as unexpected/replay
+                self.decrypt_iv.copy_from_slice(&iv_backup);
+                return Err(CryptError::UnexpectedTag);
             }
         } else {
             // out of order or repeating
@@ -190,7 +192,8 @@ impl CryptState {
                         }
                     }
                 } else {
-                    unreachable!();
+                    self.decrypt_iv.copy_from_slice(&iv_backup);
+                    return Err(CryptError::UnexpectedTag);
                 }
             } else if diff > 0 {
                 if incoming_iv_byte > known_iv_byte {
@@ -206,10 +209,13 @@ impl CryptState {
                         }
                     }
                 } else {
-                    unreachable!();
+                    self.decrypt_iv.copy_from_slice(&iv_backup);
+                    return Err(CryptError::UnexpectedTag);
                 }
             } else {
-                unreachable!();
+                // diff == 0: duplicate/replay packet
+                self.decrypt_iv.copy_from_slice(&iv_backup);
+                return Err(CryptError::UnexpectedTag);
             }
         
             if self.decrypt_history[self.decrypt_iv[0] as usize] == self.decrypt_iv[1] {

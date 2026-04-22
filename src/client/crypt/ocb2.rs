@@ -137,6 +137,10 @@ impl CryptoMode for Ocb2 {
         let tag_len = self.overhead();
         let ciphertext_len = data.len() - tag_len;
 
+        if dest.len() < ciphertext_len {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+
         let tag = &data[..tag_len];
         let ciphertext = &data[tag_len..];
 

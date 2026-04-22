@@ -1,0 +1,31 @@
+# ShitSpeak server configuration for local testing
+
+node_id = 1
+listen = "0.0.0.0:64738"
+opus_threshold = 100
+register_name = "ShitSpeak Test"
+cert_path = "cert.pem"
+key_path = "key.pem"
+send_version = true
+send_build_info = true
+send_os_info = true
+allowed_proxies = []
+min_client_version = 0
+max_users = 100
+
+# Mumble standard
+welcome_text = "Welcome to ShitSpeak test server!"
+max_bandwidth = 72000
+allow_html = true
+max_text_message_length = 5000
+max_image_message_length = 131072
+default_channel = 0
+cert_required = false
+
+# UDP
+udp_voice_enabled = true
+udp_ping_enabled = true
+udp_channel_size = 2048
+
+# Idle timeout (seconds)
+client_idle_timeout_secs = 30

@@ -13,6 +13,9 @@ pub async fn handle_crypt_setup(
     sender: &Arc<Box<Client>>,
     msg: CryptSetup,
 ) -> Result<(), MessageHandlerError> {
+    let session = sender.get_session_id();
+    tracing::debug!(session = u32::from(session), is_resync = msg.is_client_request_resync(), has_client_nonce = msg.client_nonce().is_some(), "CryptSetup handler");
+
     // A CryptSetup message from the client has two meanings:
     //
     //  1. client_nonce present  → client is requesting a decrypt IV resync

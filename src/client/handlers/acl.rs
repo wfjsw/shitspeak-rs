@@ -19,6 +19,7 @@ pub async fn handle_acl(
     }
 
     let channel_id = msg.channel_id;
+    tracing::debug!(session = u32::from(sender.get_session_id()), channel_id, query = msg.query, num_acls = msg.acls.len(), "ACL handler");
 
     // Verify channel exists
     if server.get_channels().get_channel(channel_id).await.is_none() {

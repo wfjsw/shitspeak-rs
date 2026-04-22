@@ -17,6 +17,7 @@ pub async fn handle_channel_remove(
     }
 
     let channel_id = msg.channel_id;
+    tracing::debug!(session = u32::from(sender.get_session_id()), channel_id, "ChannelRemove handler");
     if channel_id == 0 {
         return Ok(());
     }

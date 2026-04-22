@@ -18,6 +18,7 @@ pub async fn handle_text_message(
     }
 
     let sender_session = u32::from(sender.get_session_id());
+    tracing::debug!(session = sender_session, channels = ?msg.channel_id, trees = ?msg.tree_id, targets = ?msg.session, "TextMessage handler");
 
     // Relay as-is but stamp the actor session.
     let relay = Message::TextMessage(TextMessage {

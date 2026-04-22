@@ -9,6 +9,7 @@ pub async fn handle_version(
     sender: &Arc<Box<Client>>,
     msg: Version,
 ) -> Result<(), MessageHandlerError> {
+    tracing::debug!(session = u32::from(sender.get_session_id()), version = ?msg.version, release = msg.release, os = msg.os, "Version handler");
     {
         let repo = server.get_clients();
         let mut global_state_writer = sender.write_global_state(repo).await;

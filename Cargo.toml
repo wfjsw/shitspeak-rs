@@ -26,7 +26,7 @@ tokio = { version = "1.45.0", features = ["full"] }
 tokio-rustls = "0.26.4"
 tracing = "0.1"
 tracing-appender = { version = "0.2.4", features = ["parking_lot"] }
-tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde"] }
+tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde", "env-filter"] }
 
 # local proc-macro to derive message helpers
 message_macro = { path = "src/messages/macros" }
@@ -36,3 +36,6 @@ async-trait = "0.1.89"
 [build-dependencies]
 chrono = "0.4.41"
 prost-build = "0.13.5"
+
+[dev-dependencies]
+rcgen = "0.13"

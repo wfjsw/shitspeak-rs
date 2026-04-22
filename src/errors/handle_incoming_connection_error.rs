@@ -6,6 +6,14 @@ pub enum HandleIncomingConnectionError {
     ReadProtoMessageError(ReadProtoMessageError),
     WriteProtoMessageError(WriteProtoMessageError),
     GetProxyProtocolRealIpError(GetProxyProtocolRealIpError),
+    /// The client's log gap is unrecoverable (log pruned past last-seen version).
+    ClientLogGapUnrecoverable,
+    /// The client's channel log gap is unrecoverable.
+    ChannelLogGapUnrecoverable,
+    /// Failed to write a message to the client (connection lost).
+    ClientWriteFailed(WriteProtoMessageError),
+    /// The client's message handler returned an error.
+    MessageHandlerFailed,
 }
 
 impl From<std::io::Error> for HandleIncomingConnectionError {
@@ -44,6 +52,18 @@ impl std::fmt::Display for HandleIncomingConnectionError {
             }
             HandleIncomingConnectionError::GetProxyProtocolRealIpError(err) => {
                 write!(f, "Get proxy protocol real IP error: {}", err)
+            }
+            HandleIncomingConnectionError::ClientLogGapUnrecoverable => {
+                write!(f, "Client log gap unrecoverable (log pruned)")
+            }
+            HandleIncomingConnectionError::ChannelLogGapUnrecoverable => {
+                write!(f, "Channel log gap unrecoverable (log pruned)")
+            }
+            HandleIncomingConnectionError::ClientWriteFailed(err) => {
+                write!(f, "Client write failed: {}", err)
+            }
+            HandleIncomingConnectionError::MessageHandlerFailed => {
+                write!(f, "Client message handler failed")
             }
         }
     }

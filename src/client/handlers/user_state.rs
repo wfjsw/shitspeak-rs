@@ -21,6 +21,7 @@ pub async fn handle_user_state(
     }
 
     let sender_id = sender.get_session_id();
+    tracing::debug!(session = u32::from(sender_id), self_mute = msg.self_mute, self_deaf = msg.self_deaf, mute = msg.mute, deaf = msg.deaf, channel_id = msg.channel_id, "UserState handler");
     let repo = server.get_clients();
 
     // Determine whether this is a self-update or a moderator action.

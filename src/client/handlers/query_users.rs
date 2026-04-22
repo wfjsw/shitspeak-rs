@@ -17,6 +17,8 @@ pub async fn handle_query_users(
         return Ok(());
     }
 
+    tracing::debug!(session = u32::from(sender.get_session_id()), ids = ?msg.ids, names = ?msg.names, "QueryUsers handler");
+
     let authenticator = server.get_authenticator();
 
     // If specific IDs are requested, look them up.

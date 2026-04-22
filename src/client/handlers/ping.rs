@@ -10,6 +10,7 @@ pub async fn handle_ping(
     sender: &Arc<Box<Client>>,
     msg: Ping,
 ) -> Result<(), MessageHandlerError> {
+    tracing::trace!(session = u32::from(sender.get_session_id()), timestamp = msg.timestamp, "Ping handler");
     // Handle the ping message logic here
     sender.reset_last_ping().await;
     

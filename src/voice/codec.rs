@@ -19,6 +19,8 @@
 //! first two bytes (the second byte is always 0 for protobuf Audio/Ping).
 //! Legacy packets have a single type byte followed by varint-encoded fields.
 
+use std::fmt::Display;
+
 use prost::Message as _;
 
 /// The decoded result of a UDP voice packet.
@@ -46,6 +48,15 @@ pub struct DecodedAudio {
 pub enum PacketFormat {
     Legacy,
     Protobuf,
+}
+
+impl Display for PacketFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PacketFormat::Legacy => write!(f, "legacy"),
+            PacketFormat::Protobuf => write!(f, "protobuf"),
+        }
+    }
 }
 
 /// Errors that can occur during UDP packet decoding.
@@ -80,18 +91,22 @@ pub struct PingRequest {
 }
 
 /// Decode any UDP packet, returning either Audio or Ping.
+///
+/// Tries protobuf format first (detected by `data[1] == 0x00` for 2+ byte
+/// packets).  If protobuf decode fails, falls back to legacy format.
 pub fn decode_udp_packet(data: &[u8]) -> Result<UdpPacket, DecodeError> {
     if data.is_empty() {
         return Err(DecodeError::TooShort);
     }
 
     // Protobuf detection: first two bytes are (type << 8) | 0.
+    // Only attempt if the second byte is exactly 0x00.
     if data.len() >= 2 && data[1] == 0x00 {
-        return match data[0] {
-            0x00 => Ok(UdpPacket::Audio(decode_audio_protobuf(&data[2..])?)),
-            0x01 => Ok(UdpPacket::Ping(decode_ping_protobuf(&data[2..])?)),
-            _ => Err(DecodeError::NotVoice),
-        };
+        if let Ok(packet) = try_decode_protobuf(data) {
+            return Ok(packet);
+        }
+        // Protobuf detection was a false positive (legacy packet whose
+        // second byte happened to be 0x00).  Fall through to legacy.
     }
 
     // Legacy format: first byte is the message type.
@@ -101,6 +116,15 @@ pub fn decode_udp_packet(data: &[u8]) -> Result<UdpPacket, DecodeError> {
         0x03 => Ok(UdpPacket::Audio(decode_audio_legacy(&data[1..], "CELTBeta")?)),
         0x04 => Ok(UdpPacket::Audio(decode_audio_legacy(&data[1..], "Opus")?)),
         0x01 => Ok(UdpPacket::Ping(decode_ping_legacy(&data[1..])?)),
+        _ => Err(DecodeError::NotVoice),
+    }
+}
+
+/// Try to decode as protobuf.  Returns `Err` if it's not actually protobuf.
+fn try_decode_protobuf(data: &[u8]) -> Result<UdpPacket, DecodeError> {
+    match data[0] {
+        0x00 => Ok(UdpPacket::Audio(decode_audio_protobuf(&data[2..])?)),
+        0x01 => Ok(UdpPacket::Ping(decode_ping_protobuf(&data[2..])?)),
         _ => Err(DecodeError::NotVoice),
     }
 }
@@ -342,7 +366,7 @@ fn decode_ping_legacy(data: &[u8]) -> Result<PingRequest, DecodeError> {
 /// Server information included in ping responses.
 pub struct PingResponse {
     pub timestamp: u64,
-    pub server_version: u64,
+    pub server_version: crate::protocol_version::ProtocolVersion,
     pub user_count: u32,
     pub max_user_count: u32,
     pub max_bandwidth_per_user: u32,
@@ -350,6 +374,15 @@ pub struct PingResponse {
 
 /// Encode a ping response in the same format as the request.
 pub fn encode_ping_response(response: &PingResponse, format: PacketFormat) -> Vec<u8> {
+    tracing::debug!(
+        "Encoding ping response: format={}, timestamp={}, version={}, users={}/{}",
+        format,
+        response.timestamp,
+        response.server_version.to_string(),
+        response.user_count,
+        response.max_user_count,
+    );
+
     match format {
         PacketFormat::Protobuf => encode_ping_protobuf(response),
         PacketFormat::Legacy => encode_ping_legacy(response),
@@ -359,8 +392,8 @@ pub fn encode_ping_response(response: &PingResponse, format: PacketFormat) -> Ve
 fn encode_ping_protobuf(response: &PingResponse) -> Vec<u8> {
     let msg = crate::mumble_udp::Ping {
         timestamp: response.timestamp,
-        request_extended_information: false,
-        server_version_v2: response.server_version,
+        request_extended_information: true,
+        server_version_v2: response.server_version.into(),
         user_count: response.user_count,
         max_user_count: response.max_user_count,
         max_bandwidth_per_user: response.max_bandwidth_per_user,
@@ -379,7 +412,7 @@ fn encode_ping_legacy(response: &PingResponse) -> Vec<u8> {
     write_varint(&mut buf, response.timestamp);
     // Legacy extended info: version (4 bytes BE), users (4 bytes BE),
     // max users (4 bytes BE), max bandwidth (4 bytes BE)
-    let version = response.server_version as u32;
+    let version: u32 = response.server_version.into();
     buf.extend_from_slice(&version.to_be_bytes());
     buf.extend_from_slice(&response.user_count.to_be_bytes());
     buf.extend_from_slice(&response.max_user_count.to_be_bytes());

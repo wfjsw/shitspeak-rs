@@ -18,6 +18,9 @@ pub async fn handle_channel_state(
         return Ok(());
     }
 
+    let session = sender.get_session_id();
+    tracing::debug!(session = u32::from(session), channel_id = msg.channel_id, parent = msg.parent, name = msg.name, "ChannelState handler");
+
     // channel_id absent → create new channel
     // channel_id present → update existing channel
 

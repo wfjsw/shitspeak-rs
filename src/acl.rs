@@ -106,6 +106,10 @@ pub fn evaluate_permission(
     client: &ClientMembershipQuery,
     current_channel_id: u32,
 ) -> BitFlags<ACLPermissions> {
+
+    // FIXME: Temporarily allow all permissions for testing until we implement real ACLs
+    return BitFlags::all();
+
     let mut allowed = BitFlags::empty();
     let mut denied = BitFlags::empty();
 

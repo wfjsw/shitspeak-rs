@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -59,6 +59,14 @@ pub struct Client {
     /// has been emitted).  Only published clients generate `RemoveClient`
     /// log entries on disconnect.
     published: AtomicBool,
+
+    /// The last client-state log version this connection has seen,
+    /// indexed by node_id.  Used to detect gaps and replay missed entries.
+    last_client_version: Mutex<HashMap<u16, u64>>,
+    /// The last channel-state log version this connection has seen.
+    /// Channels are fully serialized across the cluster, so a single
+    /// version counter suffices.
+    last_channel_version: Mutex<u64>,
 }
 
 impl Client {
@@ -109,6 +117,8 @@ impl Client {
             global_state: RwLock::new(ClientGlobalState::new()),
             crypt_state: Mutex::new(None),
             published: AtomicBool::new(false),
+            last_client_version: Mutex::new(HashMap::new()),
+            last_channel_version: Mutex::new(0),
         })
     }
 
@@ -126,6 +136,31 @@ impl Client {
 
     pub fn set_published(&self, value: bool) {
         self.published.store(value, Ordering::Release);
+    }
+
+    /// Get a clone of the full per-node last-seen version map.
+    pub async fn get_last_client_versions(&self) -> HashMap<u16, u64> {
+        self.last_client_version.lock().await.clone()
+    }
+
+    /// Merge the given per-node version map into the client's last-seen
+    /// trackers.  Each entry is updated to `max(existing, new)`.
+    pub async fn update_last_client_versions(&self, versions: &HashMap<u16, u64>) {
+        let mut map = self.last_client_version.lock().await;
+        for (&node_id, &version) in versions {
+            let entry = map.entry(node_id).or_insert(0);
+            *entry = (*entry).max(version);
+        }
+    }
+
+    /// Get the last channel-state version seen.
+    pub async fn get_last_channel_version(&self) -> u64 {
+        *self.last_channel_version.lock().await
+    }
+
+    /// Record a channel-state version seen.
+    pub async fn set_last_channel_version(&self, version: u64) {
+        *self.last_channel_version.lock().await = version;
     }
 
     pub async fn get_groups_clone(&self) -> HashSet<String> {

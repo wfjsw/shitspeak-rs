@@ -17,6 +17,8 @@ pub async fn handle_ban_list(
         return Ok(());
     }
 
+    tracing::debug!(session = u32::from(sender.get_session_id()), query = msg.query, num_bans = msg.bans.len(), "BanList handler");
+
     // TODO: require Ban permission on root channel
 
     if msg.query.unwrap_or(false) {

@@ -59,13 +59,12 @@ impl<'a> GlobalStateWriteGuard<'a> {
         if delta.is_empty() {
             return self.repo.current_version();
         }
-        let entry = self.repo.make_entry(ClientStateOperation::UpdateGlobalState {
+        self.repo.commit_operation_sync(ClientStateOperation::UpdateGlobalState {
             session_id: self.session_id,
             delta,
         });
-        let version = entry.version;
-        self.repo.commit_sync(entry);
-        version
+        // Return the new version (best-effort: peek after commit)
+        self.repo.current_version()
     }
 
     /// Roll back the changes without logging.
@@ -100,11 +99,10 @@ impl<'a> Drop for GlobalStateWriteGuard<'a> {
             if delta.is_empty() {
                 return;
             }
-            let entry = self.repo.make_entry(ClientStateOperation::UpdateGlobalState {
+            self.repo.commit_operation_sync(ClientStateOperation::UpdateGlobalState {
                 session_id: self.session_id,
                 delta,
             });
-            self.repo.commit_sync(entry);
         }
     }
 }

@@ -17,6 +17,8 @@ pub async fn handle_user_list(
         return Ok(());
     }
 
+    tracing::debug!(session = u32::from(sender.get_session_id()), num_users = msg.users.len(), "UserList handler");
+
     if msg.users.is_empty() {
         // Query mode: return registered user list
         let authenticator = server.get_authenticator();

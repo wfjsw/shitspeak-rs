@@ -17,6 +17,8 @@ pub async fn handle_request_blob(
         return Ok(());
     }
 
+    tracing::debug!(session = u32::from(sender.get_session_id()), textures = msg.session_texture.len(), comments = msg.session_comment.len(), "RequestBlob handler");
+
     // ── Session textures ─────────────────────────────────────────────────
     for session_raw in &msg.session_texture {
         let session_id =
