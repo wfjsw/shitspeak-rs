@@ -39,7 +39,7 @@ pub async fn handle_channel_remove(
     let all_clients = repo.get_all_clients().await;
     for client in &all_clients {
         if client.get_current_channel_id().await == channel_id {
-            client.set_current_channel_id(parent_id, repo).await;
+            client.set_current_channel_id(parent_id, repo, server.get_channels().current_version()).await;
             // The channel move is now logged via the transactional guard;
             // per-client subscribers will pick up the UserState delta.
         }

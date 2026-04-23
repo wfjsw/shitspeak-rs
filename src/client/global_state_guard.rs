@@ -29,6 +29,9 @@ pub struct GlobalStateWriteGuard<'a> {
     session_id: ClientSessionIdentifier,
     /// The session that initiated this mutation.
     sender_session_id: Option<ClientSessionIdentifier>,
+    /// The channel version at the time this guard was acquired.
+    /// `Some(v)` means this mutation depends on channel state ≥ v.
+    channel_version_dep: Option<u64>,
     /// Whether the guard has already been committed (or rolled back).
     committed: bool,
 }
@@ -39,6 +42,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
         repo: &'a ClientRepository,
         session_id: ClientSessionIdentifier,
         sender_session_id: Option<ClientSessionIdentifier>,
+        channel_version_dep: Option<u64>,
     ) -> Self {
         inner.begin_delta_recording();
         Self {
@@ -46,6 +50,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
             repo,
             session_id,
             sender_session_id,
+            channel_version_dep,
             committed: false,
         }
     }
@@ -61,11 +66,14 @@ impl<'a> GlobalStateWriteGuard<'a> {
         if delta.is_empty() {
             return self.repo.current_version();
         }
-        self.repo.commit_operation_sync(ClientStateOperation::UpdateGlobalState {
-            session_id: self.session_id,
-            sender_session_id: self.sender_session_id,
-            delta,
-        });
+        self.repo.commit_operation_sync(
+            ClientStateOperation::UpdateGlobalState {
+                session_id: self.session_id,
+                sender_session_id: self.sender_session_id,
+                delta,
+            },
+            self.channel_version_dep,
+        );
         // Return the new version (best-effort: peek after commit)
         self.repo.current_version()
     }
@@ -103,11 +111,14 @@ impl<'a> Drop for GlobalStateWriteGuard<'a> {
             if delta.is_empty() {
                 return;
             }
-            self.repo.commit_operation_sync(ClientStateOperation::UpdateGlobalState {
-                session_id: self.session_id,
-                sender_session_id: self.sender_session_id,
-                delta,
-            });
+            self.repo.commit_operation_sync(
+                ClientStateOperation::UpdateGlobalState {
+                    session_id: self.session_id,
+                    sender_session_id: self.sender_session_id,
+                    delta,
+                },
+                self.channel_version_dep,
+            );
         }
     }
 }

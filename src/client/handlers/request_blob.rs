@@ -16,7 +16,12 @@ pub async fn handle_request_blob(
         return Ok(());
     }
 
-    tracing::debug!(session = u32::from(sender.get_session_id()), textures = msg.session_texture.len(), comments = msg.session_comment.len(), "RequestBlob handler");
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        textures = msg.session_texture.len(),
+        comments = msg.session_comment.len(),
+        "RequestBlob handler"
+    );
 
     // ── Session textures ─────────────────────────────────────────────────
     for session_raw in &msg.session_texture {
@@ -25,10 +30,15 @@ pub async fn handle_request_blob(
         let Some(client) = server.get_clients().get_client(session_id).await else {
             continue;
         };
-        let gs = client.read_global_state().await;
-        let texture_hash = gs.get_texture_hash().map(|h| hex::decode(h).unwrap_or_default());
-        let texture_url = gs.get_texture_url().map(|s| s.to_owned());
-        drop(gs);
+
+        let (texture_hash, texture_url) = {
+            let gs = client.read_global_state().await;
+            let texture_hash = gs
+                .get_texture_hash()
+                .map(|h| hex::decode(h).unwrap_or_default());
+            let texture_url = gs.get_texture_url().map(|s| s.to_owned());
+            (texture_hash, texture_url)
+        };
 
         // Fetch blob from store if we have a hash
         let texture_data = match texture_hash.as_ref() {
@@ -43,7 +53,11 @@ pub async fn handle_request_blob(
         };
 
         let reply: Message = crate::messages::encoder::UserState {
-            session: Some(crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw)),
+            session: Some(
+                crate::client::client_session_identifier::ClientSessionIdentifier::from(
+                    *session_raw,
+                ),
+            ),
             actor: None,
             name: None,
             user_id: None,
@@ -66,7 +80,8 @@ pub async fn handle_request_blob(
             listening_channel_add: Vec::new(),
             listening_channel_remove: Vec::new(),
             listening_volume_adjustment: Vec::new(),
-        }.into();
+        }
+        .into();
         sender.write_proto_message(&reply).await?;
     }
 
@@ -77,10 +92,15 @@ pub async fn handle_request_blob(
         let Some(client) = server.get_clients().get_client(session_id).await else {
             continue;
         };
-        let gs = client.read_global_state().await;
-        let comment_hash = gs.get_comment_hash().map(|h| hex::decode(h).unwrap_or_default());
-        let comment_url = gs.get_comment_url().map(|s| s.to_owned());
-        drop(gs);
+
+        let (comment_hash, comment_url) = {
+            let gs = client.read_global_state().await;
+            let comment_hash = gs
+                .get_comment_hash()
+                .map(|h| hex::decode(h).unwrap_or_default());
+            let comment_url = gs.get_comment_url().map(|s| s.to_owned());
+            (comment_hash, comment_url)
+        };
 
         let comment_data = match comment_hash.as_ref() {
             Some(hash) => {
@@ -94,7 +114,11 @@ pub async fn handle_request_blob(
         };
 
         let reply: Message = crate::messages::encoder::UserState {
-            session: Some(crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw)),
+            session: Some(
+                crate::client::client_session_identifier::ClientSessionIdentifier::from(
+                    *session_raw,
+                ),
+            ),
             actor: None,
             name: None,
             user_id: None,
@@ -107,7 +131,9 @@ pub async fn handle_request_blob(
             texture: None,
             plugin_context: None,
             plugin_identity: None,
-            comment: comment_data.as_ref().and_then(|b| String::from_utf8(b.to_vec()).ok()),
+            comment: comment_data
+                .as_ref()
+                .and_then(|b| String::from_utf8(b.to_vec()).ok()),
             hash: None,
             comment_hash: comment_hash.clone(),
             texture_hash: None,
@@ -117,7 +143,8 @@ pub async fn handle_request_blob(
             listening_channel_add: Vec::new(),
             listening_channel_remove: Vec::new(),
             listening_volume_adjustment: Vec::new(),
-        }.into();
+        }
+        .into();
         sender.write_proto_message(&reply).await?;
     }
 
@@ -136,7 +163,9 @@ pub async fn handle_request_blob(
             parent: ch.parent_id,
             name: Some(ch.name.clone()),
             links: ch.links.iter().copied().collect(),
-            description: desc_data.as_ref().and_then(|b| String::from_utf8(b.to_vec()).ok()),
+            description: desc_data
+                .as_ref()
+                .and_then(|b| String::from_utf8(b.to_vec()).ok()),
             links_add: Vec::new(),
             links_remove: Vec::new(),
             temporary: Some(ch.is_temporary()),
@@ -148,7 +177,8 @@ pub async fn handle_request_blob(
             max_users: Some(ch.max_users),
             is_enter_restricted: None,
             can_enter: None,
-        }.into();
+        }
+        .into();
         sender.write_proto_message(&reply).await?;
     }
 

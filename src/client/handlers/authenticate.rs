@@ -136,7 +136,7 @@ pub async fn handle_authenticate(
         } else {
             0 // fall back to root
         };
-        sender.set_current_channel_id(target_ch, repo).await;
+        sender.set_current_channel_id(target_ch, repo, server.get_channels().current_version()).await;
     }
 
     // ── Build the full burst of messages to send to the new client ────────

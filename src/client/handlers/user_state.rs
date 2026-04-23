@@ -40,7 +40,14 @@ pub async fn handle_user_state(
 
     // ── Acquire a single transactional guard for all mutations ─────────
     // All changes in this handler are batched into one version bump.
-    let mut gs = target.write_global_state_as(repo, Some(sender_id)).await;
+    // Channel-dependent operations (move, mute/deaf by moderator) need the
+    // current channel version as a causal dependency.
+    let channel_version_dep = if msg.channel_id.is_some() || !is_self {
+        Some(server.get_channels().current_version())
+    } else {
+        None
+    };
+    let mut gs = target.write_global_state_as(repo, Some(sender_id), channel_version_dep).await;
 
     // ── Self-mute / self-deaf (only target can set their own) ─────────────
     if is_self {
@@ -114,7 +121,6 @@ pub async fn handle_user_state(
         if current != new_channel_id {
             // Verify the channel exists
             if new_channel_id != 0 && server.get_channels().get_channel(new_channel_id).await.is_none() {
-                drop(gs); // release guard before returning error
                 return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                     r#type: Some(DenyType::ChannelName as i32),
                     session: Some(u32::from(sender_id)),

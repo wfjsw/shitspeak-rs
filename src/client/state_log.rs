@@ -171,6 +171,10 @@ pub struct ClientStateLogEntry {
     pub node_id: u16,
     /// Unix timestamp (seconds since epoch) when the operation was created.
     pub timestamp: i64,
+    /// If `Some(v)`, this entry depends on channel state at version `v` or
+    /// later.  Remote nodes must ensure their channel log is caught up to
+    /// at least this version before applying this entry.
+    pub channel_version_dep: Option<u64>,
     #[serde(flatten)]
     pub op: ClientStateOperation,
 }

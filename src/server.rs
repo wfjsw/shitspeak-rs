@@ -41,7 +41,7 @@ pub struct Server {
     tls_acceptor: TlsAcceptor,
     udp_socket: Arc<tokio::net::UdpSocket>,
 
-    clients: ClientRepository,
+    clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
@@ -103,20 +103,26 @@ impl Server {
             }
         };
 
-        Ok(Arc::new(Box::new(Server {
+        let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
             allowed_proxies,
             tcp_listener,
             tls_acceptor,
             udp_socket,
-            clients: ClientRepository::new(node_id),
+            clients: Arc::new(ClientRepository::new(node_id)),
             channels,
             channel_blobs,
             session_blobs,
             codec_info: Mutex::new(CodecInfo::default()),
             authenticator: Box::new(authenticator),
             config,
-        })))
+        }));
+
+        // Wire cross-repo causal notification: ChannelRepository notifies
+        // ClientRepository to drain pending ops after remote channel ops.
+        server.channels.set_client_repo(server.clients.clone()).await;
+
+        Ok(server)
     }
 
     pub async fn run(
@@ -492,51 +498,9 @@ impl Server {
                         }
                     }
 
-                    // ── Client state change notification ─────────────────────
-                    result = recv_optional(client_log_rx.as_mut()), if client_log_rx.is_some() => {
-                        match result {
-                            Some(Ok(broadcast)) => {
-                                tracing::trace!("Received client log broadcast: {:?}", broadcast);
-
-                                let entry = &broadcast.entry;
-                                // if entry.op.session_id() == Some(client_session_id) {
-                                //     continue;
-                                // }
-                                let last_seen = client.get_last_client_versions().await;
-                                let last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
-                                if entry.version > last_for_node + 1 {
-                                    let (missed, new_versions) = self.clients.replay_since(&last_seen).await
-                                        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
-                                    for msg in &missed {
-                                        client.write_proto_message(msg).await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    }
-                                    client.update_last_client_versions(&new_versions).await;
-                                }
-                                if let Some(msg) = entry.to_message(&self.clients).await {
-                                    client.write_proto_message(&msg).await
-                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                }
-                                client.update_last_client_versions(&broadcast.versions).await;
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-                                let last_seen = client.get_last_client_versions().await;
-                                let (missed, new_versions) = self.clients.replay_since(&last_seen).await
-                                    .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
-                                for msg in &missed {
-                                    client.write_proto_message(msg).await
-                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                }
-                                client.update_last_client_versions(&new_versions).await;
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                                return Ok(());
-                            }
-                            None => {} // not subscribed yet
-                        }
-                    }
-
                     // ── Channel state change notification ────────────────────
+                    // Must come BEFORE client_log_rx in select! to ensure
+                    // channel updates are delivered before client state updates.
                     result = recv_optional(channel_log_rx.as_mut()), if channel_log_rx.is_some() => {
                         match result {
                             Some(Ok(op)) => {
@@ -555,6 +519,59 @@ impl Server {
                                 replay_channel_log_gap(
                                     &client, &self.channels, client_session_id, last, u64::MAX,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
+                            }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                                return Ok(());
+                            }
+                            None => {} // not subscribed yet
+                        }
+                    }
+
+                    // ── Client state change notification ─────────────────────
+                    result = recv_optional(client_log_rx.as_mut()), if client_log_rx.is_some() => {
+                        match result {
+                            Some(Ok(broadcast)) => {
+                                tracing::trace!("Received client log broadcast: {:?}", broadcast);
+
+                                let entry = &broadcast.entry;
+                                let last_seen = client.get_last_client_versions().await;
+                                let last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
+                                if entry.version > last_for_node + 1 {
+                                    let (missed, new_versions) = self.clients.replay_since(&last_seen).await
+                                        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+                                    for msg in &missed {
+                                        client.write_proto_message(msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
+                                    client.update_last_client_versions(&new_versions).await;
+                                }
+
+                                // If this entry has a channel version dependency,
+                                // catch up the client's channel view to that dep first.
+                                if let Some(dep) = entry.channel_version_dep {
+                                    let last_ch = client.get_last_channel_version().await;
+                                    if last_ch < dep {
+                                        replay_channel_log_gap(
+                                            &client, &self.channels, client_session_id, last_ch, dep + 1,
+                                        ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
+                                    }
+                                }
+
+                                if let Some(msg) = entry.to_message(&self.clients).await {
+                                    client.write_proto_message(&msg).await
+                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                }
+                                client.update_last_client_versions(&broadcast.versions).await;
+                            }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                                let last_seen = client.get_last_client_versions().await;
+                                let (missed, new_versions) = self.clients.replay_since(&last_seen).await
+                                    .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+                                for msg in &missed {
+                                    client.write_proto_message(msg).await
+                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                }
+                                client.update_last_client_versions(&new_versions).await;
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                                 return Ok(());
@@ -582,7 +599,7 @@ impl Server {
         self.authenticator.as_ref()
     }
 
-    pub fn get_clients(&self) -> &ClientRepository {
+    pub fn get_clients(&self) -> &Arc<ClientRepository> {
         &self.clients
     }
 
@@ -695,13 +712,19 @@ impl Server {
         );
 
         if changed {
-            let msg: crate::messages::Message = crate::messages::encoder::CodecVersion {
-                alpha: codec.alpha_codec(),
-                beta: codec.beta_codec(),
-                prefer_alpha: codec.prefer_alpha_codec(),
-                opus: Some(codec.opus()),
-            }.into();
-            drop(codec);
+            let msg = {
+                let alpha = codec.alpha_codec();
+                let beta = codec.beta_codec();
+                let prefer_alpha = codec.prefer_alpha_codec();
+                let opus = codec.opus();
+                drop(codec);
+                crate::messages::encoder::CodecVersion {
+                    alpha,
+                    beta,
+                    prefer_alpha,
+                    opus: Some(opus),
+                }.into()
+            };
             self.clients.broadcast_all(&msg).await;
         }
     }

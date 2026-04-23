@@ -33,7 +33,10 @@ pub fn sha1_hex(data: &[u8]) -> String {
 /// Layout: `<root>/<2-char-prefix>/<remaining-38-chars>`
 /// (same sharding as git objects to avoid large flat directories)
 fn blob_path(root: &Path, key: &str) -> PathBuf {
-    debug_assert!(key.len() == 40, "blob key must be a 40-char SHA-1 hex string");
+    debug_assert!(
+        key.len() == 40,
+        "blob key must be a 40-char SHA-1 hex string"
+    );
     let (prefix, rest) = key.split_at(2);
     root.join(prefix).join(rest)
 }
@@ -72,15 +75,17 @@ impl ChannelBlobStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .await?;
-        file.write_all(data).await?;
-        file.sync_data().await?;
-        drop(file);
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .await?;
+            file.write_all(data).await?;
+            file.sync_data().await?;
+        }
+
         fs::rename(&tmp, &path).await?;
 
         Ok(key)
@@ -171,7 +176,11 @@ impl SessionBlobStore {
         let response = match self.http_client.get(source_url).send().await {
             Ok(resp) if resp.status().is_success() => resp,
             Ok(resp) => {
-                tracing::warn!("SessionBlobStore fetch failed with status {} for {}", resp.status(), source_url);
+                tracing::warn!(
+                    "SessionBlobStore fetch failed with status {} for {}",
+                    resp.status(),
+                    source_url
+                );
                 return None;
             }
             Err(err) => {
@@ -183,7 +192,11 @@ impl SessionBlobStore {
         let bytes = match response.bytes().await {
             Ok(b) => b,
             Err(err) => {
-                tracing::warn!("SessionBlobStore read body error for {}: {}", source_url, err);
+                tracing::warn!(
+                    "SessionBlobStore read body error for {}: {}",
+                    source_url,
+                    err
+                );
                 return None;
             }
         };
@@ -227,15 +240,17 @@ impl SessionBlobStore {
             fs::create_dir_all(parent).await?;
         }
 
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .await?;
-        file.write_all(data).await?;
-        file.sync_data().await?;
-        drop(file);
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .await?;
+            file.write_all(data).await?;
+            file.sync_data().await?;
+        }
+
         fs::rename(&tmp, &path).await?;
 
         Ok(key.to_owned())

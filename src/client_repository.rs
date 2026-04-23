@@ -4,14 +4,15 @@ use std::{
     sync::Arc,
 };
 
-use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::net::TcpStream;
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_rustls::server::TlsStream;
 
 use crate::{
     client::{
-        Client, client_session_identifier::ClientSessionIdentifier,
+        client_session_identifier::ClientSessionIdentifier,
         state_log::{ClientStateBroadcastPayload, ClientStateLogEntry, ClientStateOperation},
+        Client,
     },
     constants::MAX_LOCAL_SESSION_ID,
 };
@@ -56,6 +57,13 @@ pub struct ClientRegister {
     /// Monotonic version counter per node (local + all remotes).
     /// The local node's version is stored under `local_node_id`.
     versions: HashMap<u16, u64>,
+
+    // ── Causal consistency ─────────────────────────────────────────────
+    /// Remote client log entries waiting for channel state to catch up.
+    /// Each entry is stored with its precomputed effective dep.
+    pending_remote_ops: VecDeque<(Arc<ClientStateLogEntry>, u64)>,
+    /// The effective dep of the last entry in `pending_remote_ops` (0 if empty).
+    last_pending_effective_dep: u64,
 }
 
 impl ClientRegister {
@@ -64,23 +72,27 @@ impl ClientRegister {
         if id.node_id == 0 {
             // FIXME: node_id 0 is ambiguous — need local_node_id context.
             // For now, fall through to local then remote.
-            self.local_clients.get(id)
+            self.local_clients
+                .get(id)
                 .or_else(|| self.remote_clients.values().find_map(|m| m.get(id)))
         } else {
-            self.local_clients.get(id)
+            self.local_clients
+                .get(id)
                 .or_else(|| self.remote_clients.get(&id.node_id).and_then(|m| m.get(id)))
         }
     }
 
     /// Iterate over all clients (local + remote).
     fn all_clients(&self) -> impl Iterator<Item = &Arc<Box<Client>>> {
-        self.local_clients.values()
+        self.local_clients
+            .values()
             .chain(self.remote_clients.values().flat_map(|m| m.values()))
     }
 
     /// Iterate over all client entries (local + remote).
     fn all_entries(&self) -> impl Iterator<Item = (&ClientSessionIdentifier, &Arc<Box<Client>>)> {
-        self.local_clients.iter()
+        self.local_clients
+            .iter()
             .chain(self.remote_clients.values().flat_map(|m| m.iter()))
             .map(|(k, v)| (k, v))
     }
@@ -97,6 +109,8 @@ impl ClientRepository {
                 remote_clients: HashMap::new(),
                 remote_logs: HashMap::new(),
                 versions: HashMap::new(),
+                pending_remote_ops: VecDeque::new(),
+                last_pending_effective_dep: 0,
             }),
             clients_by_host: RwLock::new(HashMap::new()),
             clients_by_udp_address: RwLock::new(HashMap::new()),
@@ -149,14 +163,15 @@ impl ClientRepository {
             local_address,
             connection,
         );
-        
+
         let client = Arc::new(client);
 
-        register.local_clients.insert(client_identifier, Arc::clone(&client));
+        register
+            .local_clients
+            .insert(client_identifier, Arc::clone(&client));
 
         if let Some(udp_address) = udp_address {
-            client_by_udp_address_guard
-                .insert(udp_address, client_identifier);
+            client_by_udp_address_guard.insert(udp_address, client_identifier);
         }
 
         if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
@@ -184,15 +199,19 @@ impl ClientRepository {
 
         client.set_published(true);
 
-        self.commit_operation(ClientStateOperation::AddClient {
-            session_id: id,
-            real_ip: client.get_real_ip_address(),
-            tcp_addr: client.get_tcp_address(),
-            udp_addr: client.get_udp_address(),
-            local_addr: client.get_tcp_address(),
-            cert_hash: client.get_certificate_hash().map(|h| h.to_vec()),
-            login_time: client.get_login_time(),
-        }).await;
+        self.commit_operation(
+            ClientStateOperation::AddClient {
+                session_id: id,
+                real_ip: client.get_real_ip_address(),
+                tcp_addr: client.get_tcp_address(),
+                udp_addr: client.get_udp_address(),
+                local_addr: client.get_tcp_address(),
+                cert_hash: client.get_certificate_hash().map(|h| h.to_vec()),
+                login_time: client.get_login_time(),
+            },
+            None,
+        )
+        .await;
     }
 
     pub async fn add_remote_client(&self, id: ClientSessionIdentifier, client: Arc<Box<Client>>) {
@@ -210,7 +229,8 @@ impl ClientRepository {
 
         {
             let mut register = self.register.write().await;
-            register.remote_clients
+            register
+                .remote_clients
                 .entry(node_id)
                 .or_default()
                 .insert(id, client);
@@ -220,71 +240,70 @@ impl ClientRepository {
         }
 
         // ── Log the operation ───────────────────────────────────────────
-        self.commit_operation(ClientStateOperation::AddClient {
-            session_id: id,
-            real_ip,
-            tcp_addr,
-            udp_addr,
-            local_addr: tcp_addr, // remote clients don't have a separate local addr
-            cert_hash,
-            login_time,
-        }).await;
+        self.commit_operation(
+            ClientStateOperation::AddClient {
+                session_id: id,
+                real_ip,
+                tcp_addr,
+                udp_addr,
+                local_addr: tcp_addr, // remote clients don't have a separate local addr
+                cert_hash,
+                login_time,
+            },
+            None,
+        )
+        .await;
     }
 
     pub async fn remove_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
-        let mut register = self.register.write().await;
-        let mut client_by_udp_address_guard = self.clients_by_udp_address.write().await;
-        let mut client_by_host_guard = self.clients_by_host.write().await;
-        let mut free_ids_guard = self.free_ids.lock().await;
+        let client = {
+            let mut register = self.register.write().await;
+            let mut client_by_udp_address_guard = self.clients_by_udp_address.write().await;
+            let mut client_by_host_guard = self.clients_by_host.write().await;
+            let mut free_ids_guard = self.free_ids.lock().await;
 
-        // Try local first, then remote
-        let client = if let Some(c) = register.local_clients.remove(&id) {
-            c
-        } else if let Some(remote_map) = register.remote_clients.get_mut(&id.node_id) {
-            match remote_map.remove(&id) {
-                Some(c) => {
-                    // Clean up empty remote node entries
-                    if remote_map.is_empty() {
-                        register.remote_clients.remove(&id.node_id);
-                        register.versions.remove(&id.node_id);
-                        register.remote_logs.remove(&id.node_id);
+            // Try local first, then remote
+            let client = if let Some(c) = register.local_clients.remove(&id) {
+                c
+            } else if let Some(remote_map) = register.remote_clients.get_mut(&id.node_id) {
+                match remote_map.remove(&id) {
+                    Some(c) => {
+                        // Clean up empty remote node entries
+                        if remote_map.is_empty() {
+                            register.remote_clients.remove(&id.node_id);
+                            register.versions.remove(&id.node_id);
+                            register.remote_logs.remove(&id.node_id);
+                        }
+                        c
                     }
-                    c
+                    None => return None,
                 }
-                None => return None,
+            } else {
+                return None;
+            };
+
+            if client.get_node_id() == self.local_node_id {
+                if let Some(udp_address) = client.get_udp_address() {
+                    client_by_udp_address_guard.remove(&udp_address);
+                }
+
+                let tcp_address = client.get_tcp_address();
+
+                if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
+                    set.remove(&id);
+                    if set.is_empty() {
+                        client_by_host_guard.remove(&tcp_address.ip());
+                    }
+                }
+
+                free_ids_guard.insert(id.local_session_id);
             }
-        } else {
-            return None;
+            client
         };
 
-        if client.get_node_id() == self.local_node_id {
-            if let Some(udp_address) = client.get_udp_address() {
-                client_by_udp_address_guard.remove(&udp_address);
-            }
-
-            let tcp_address = client.get_tcp_address();
-
-            if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
-                set.remove(&id);
-                if set.is_empty() {
-                    client_by_host_guard.remove(&tcp_address.ip());
-                }
-            }
-
-            free_ids_guard.insert(id.local_session_id);
-        }
-
-        // ── Log the operation (only if client was published) ────────
-        let was_published = client.is_published();
-        drop(register);
-        drop(client_by_udp_address_guard);
-        drop(client_by_host_guard);
-        drop(free_ids_guard);
-
-        if was_published {
-            self.commit_operation(ClientStateOperation::RemoveClient {
-                session_id: id,
-            }).await;
+        if client.is_published() {
+            self.commit_operation(ClientStateOperation::RemoveClient { session_id: id }, None)
+                .await;
         }
 
         Some(client)
@@ -295,35 +314,37 @@ impl ClientRepository {
             panic!("Not supposed to clear clients from the local node");
         }
 
-        let mut register = self.register.write().await;
-        let mut free_ids = self.free_ids.lock().await;
+        let (ids_to_remove, published): (Vec<ClientSessionIdentifier>, Vec<bool>) = {
+            let mut register = self.register.write().await;
+            let mut free_ids = self.free_ids.lock().await;
 
-        // Collect published status before removing from map
-        let (ids_to_remove, published): (Vec<ClientSessionIdentifier>, Vec<bool>) = match register.remote_clients.get(&node_id) {
-            Some(remote_map) => {
-                let ids: Vec<ClientSessionIdentifier> = remote_map.keys().copied().collect();
-                let pub_flags: Vec<bool> = ids.iter()
-                    .filter_map(|id| remote_map.get(id))
-                    .map(|c| c.is_published())
-                    .collect();
-                (ids, pub_flags)
-            }
-            None => return,
+            // Collect published status before removing from map
+            let result = match register.remote_clients.get(&node_id) {
+                Some(remote_map) => {
+                    let ids: Vec<ClientSessionIdentifier> = remote_map.keys().copied().collect();
+                    let pub_flags: Vec<bool> = ids
+                        .iter()
+                        .filter_map(|id| remote_map.get(id))
+                        .map(|c| c.is_published())
+                        .collect();
+                    (ids, pub_flags)
+                }
+                None => return,
+            };
+
+            // Remove the entire remote node entry
+            register.remote_clients.remove(&node_id);
+            register.versions.remove(&node_id);
+            register.remote_logs.remove(&node_id);
+
+            result
         };
-
-        // Remove the entire remote node entry
-        register.remote_clients.remove(&node_id);
-        register.versions.remove(&node_id);
-        register.remote_logs.remove(&node_id);
-        drop(register);
-        drop(free_ids);
 
         // ── Log each removal (only if client was published) ─────────────
         for (id, was_published) in ids_to_remove.iter().zip(published.iter()) {
             if *was_published {
-                self.commit_operation(ClientStateOperation::RemoveClient {
-                    session_id: *id,
-                }).await;
+                self.commit_operation(ClientStateOperation::RemoveClient { session_id: *id }, None)
+                    .await;
             }
         }
     }
@@ -344,7 +365,10 @@ impl ClientRepository {
         let by_host = self.clients_by_host.read().await;
         let register = self.register.read().await;
         match by_host.get(ip) {
-            Some(ids) => ids.iter().filter_map(|id| register.get(id).cloned()).collect(),
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| register.get(id).cloned())
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -403,7 +427,12 @@ impl ClientRepository {
 
     pub async fn len(&self) -> usize {
         let register = self.register.read().await;
-        register.local_clients.len() + register.remote_clients.values().map(|m| m.len()).sum::<usize>()
+        register.local_clients.len()
+            + register
+                .remote_clients
+                .values()
+                .map(|m| m.len())
+                .sum::<usize>()
     }
 
     /// Return a snapshot of all clients along with the current version
@@ -442,7 +471,8 @@ impl ClientRepository {
                 Some(oldest) if oldest.version > local_since => {
                     tracing::error!(
                         "Local log pruned past requested version: oldest={} requested={}",
-                        oldest.version, local_since,
+                        oldest.version,
+                        local_since,
                     );
                     return Err(());
                 }
@@ -533,7 +563,8 @@ impl ClientRepository {
 
     /// Return the current local version.
     pub fn current_version(&self) -> u64 {
-        self.register.try_read()
+        self.register
+            .try_read()
             .map(|r| r.versions.get(&self.local_node_id).copied().unwrap_or(0))
             .unwrap_or(0)
     }
@@ -562,9 +593,14 @@ impl ClientRepository {
     /// re-appended to the log or re-broadcast (the remote node already did
     /// that).  Idempotent: if `op.version ≤ current_version` the op is
     /// silently dropped.
+    ///
+    /// `current_channel_version` is the local channel repository's current
+    /// version.  If the op has a `channel_version_dep` that exceeds this,
+    /// it is buffered in `pending_remote_ops` until the channel catches up.
     pub async fn apply_remote_operation(
         &self,
         op: Arc<ClientStateLogEntry>,
+        current_channel_version: u64,
     ) -> Result<(), ()> {
         let mut register = self.register.write().await;
         let remote_node = op.node_id;
@@ -575,10 +611,63 @@ impl ClientRepository {
             return Ok(());
         }
 
+        // Compute effective dep using the monotonic rule
+        let own_dep = op.channel_version_dep.unwrap_or(0);
+        let effective_dep = own_dep.max(register.last_pending_effective_dep);
+
+        if effective_dep > current_channel_version {
+            // Buffer for later — channel state isn't caught up yet
+            tracing::debug!(
+                "Buffering remote client op v{} (node {}) — waiting for channel v{} (have v{})",
+                op.version,
+                remote_node,
+                effective_dep,
+                current_channel_version,
+            );
+            register.last_pending_effective_dep = effective_dep;
+            register.pending_remote_ops.push_back((op, effective_dep));
+            return Ok(());
+        }
+
+        // Apply immediately
+        Self::apply_op_inner(&mut register, &op, remote_node).await;
+        Ok(())
+    }
+
+    /// Drain pending remote ops whose effective dep ≤ `channel_version`.
+    /// Called after each channel op is applied.
+    pub async fn drain_pending_ops(&self, channel_version: u64) {
+        let mut register = self.register.write().await;
+        while let Some((op, effective_dep)) = register.pending_remote_ops.front() {
+            if *effective_dep > channel_version {
+                break;
+            }
+            let (op, _) = register.pending_remote_ops.pop_front().unwrap();
+            let remote_node = op.node_id;
+            tracing::debug!(
+                "Draining buffered remote client op v{} (node {}) at channel v{}",
+                op.version,
+                remote_node,
+                channel_version,
+            );
+            Self::apply_op_inner(&mut register, &op, remote_node).await;
+        }
+        // Update last_pending_effective_dep from the new front (or 0 if empty)
+        register.last_pending_effective_dep = register
+            .pending_remote_ops
+            .front()
+            .map(|(_, d)| *d)
+            .unwrap_or(0);
+    }
+
+    /// Apply a single remote op to the register (no version/buffer checks).
+    async fn apply_op_inner(
+        register: &mut ClientRegister,
+        op: &ClientStateLogEntry,
+        remote_node: u16,
+    ) {
         match &op.op {
             ClientStateOperation::AddClient { session_id, .. } => {
-                // Remote add — we don't have the actual Client object yet.
-                // This is a stub; full S2S will construct a remote Client.
                 tracing::debug!("remote AddClient {session_id:?} v{}", op.version);
             }
             ClientStateOperation::RemoveClient { session_id } => {
@@ -605,7 +694,6 @@ impl ClientRepository {
         }
 
         register.versions.insert(remote_node, op.version);
-        Ok(())
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -614,13 +702,21 @@ impl ClientRepository {
     /// buffer, broadcast to subscribers, trim old entries.
     ///
     /// Acquires the register write lock internally.
-    pub(crate) async fn commit_operation(&self, op: ClientStateOperation) {
-        self.commit_operation_sync(op);
+    pub(crate) async fn commit_operation(
+        &self,
+        op: ClientStateOperation,
+        channel_version_dep: Option<u64>,
+    ) {
+        self.commit_operation_sync(op, channel_version_dep);
     }
 
     /// Synchronous version of `commit_operation`.  Safe to call from
     /// `Drop` impls (uses `try_write`).
-    pub(crate) fn commit_operation_sync(&self, op: ClientStateOperation) {
+    pub(crate) fn commit_operation_sync(
+        &self,
+        op: ClientStateOperation,
+        channel_version_dep: Option<u64>,
+    ) {
         let broadcast = {
             let mut register = match self.register.try_write() {
                 Ok(r) => r,
@@ -639,6 +735,7 @@ impl ClientRepository {
                 version,
                 node_id: self.local_node_id,
                 timestamp: chrono::Utc::now().timestamp_millis(),
+                channel_version_dep,
                 op,
             });
 
@@ -656,7 +753,6 @@ impl ClientRepository {
         // Broadcast to subscribers (ignore NoSubscribers / Full errors)
         let _ = self.tx.send(broadcast);
     }
-
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -711,25 +807,33 @@ pub(crate) fn apply_delta_to_global_state(
         gs.set_plugin_identity(v.clone());
     }
     if let Some(ref v) = delta.texture_url {
-        let hash = delta.texture_hash.as_ref().cloned().unwrap_or_else(|| {
-            gs.get_texture_hash().map(|s| s.to_owned())
-        });
+        let hash = delta
+            .texture_hash
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| gs.get_texture_hash().map(|s| s.to_owned()));
         gs.set_texture_blob(v.clone(), hash);
     } else if let Some(ref v) = delta.texture_hash {
-        let url = delta.texture_url.as_ref().cloned().unwrap_or_else(|| {
-            gs.get_texture_url().map(|s| s.to_owned())
-        });
+        let url = delta
+            .texture_url
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| gs.get_texture_url().map(|s| s.to_owned()));
         gs.set_texture_blob(url, v.clone());
     }
     if let Some(ref v) = delta.comment_url {
-        let hash = delta.comment_hash.as_ref().cloned().unwrap_or_else(|| {
-            gs.get_comment_hash().map(|s| s.to_owned())
-        });
+        let hash = delta
+            .comment_hash
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| gs.get_comment_hash().map(|s| s.to_owned()));
         gs.set_comment_blob(v.clone(), hash);
     } else if let Some(ref v) = delta.comment_hash {
-        let url = delta.comment_url.as_ref().cloned().unwrap_or_else(|| {
-            gs.get_comment_url().map(|s| s.to_owned())
-        });
+        let url = delta
+            .comment_url
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| gs.get_comment_url().map(|s| s.to_owned()));
         gs.set_comment_blob(url, v.clone());
     }
     if let Some(ref v) = delta.user_id {

@@ -202,8 +202,8 @@ impl Client {
         self.global_state.read().await.get_current_channel_id()
     }
 
-    pub async fn set_current_channel_id(&self, channel_id: u32, repo: &ClientRepository) {
-        let mut gs = self.write_global_state(repo).await;
+    pub async fn set_current_channel_id(&self, channel_id: u32, repo: &ClientRepository, channel_version: u64) {
+        let mut gs = self.write_global_state_as(repo, Some(self.session_id), Some(channel_version)).await;
         gs.set_current_channel_id(channel_id);
     }
 
@@ -407,18 +407,23 @@ impl Client {
         &'a self,
         repo: &'a ClientRepository,
     ) -> GlobalStateWriteGuard<'a> {
-        self.write_global_state_as(repo, Some(self.session_id)).await
+        self.write_global_state_as(repo, Some(self.session_id), None).await
     }
 
     /// Acquire a transactional write guard for `ClientGlobalState` while
-    /// explicitly recording who initiated the mutation.
+    /// explicitly recording who initiated the mutation and the channel
+    /// version dependency.
+    ///
+    /// `channel_version_dep`: `Some(v)` means this mutation depends on
+    /// channel state at version `v` or later. `None` means no dependency.
     pub async fn write_global_state_as<'a>(
         &'a self,
         repo: &'a ClientRepository,
         sender_session_id: Option<ClientSessionIdentifier>,
+        channel_version_dep: Option<u64>,
     ) -> GlobalStateWriteGuard<'a> {
         let inner = self.global_state.write().await;
-        GlobalStateWriteGuard::new(inner, repo, self.session_id, sender_session_id)
+        GlobalStateWriteGuard::new(inner, repo, self.session_id, sender_session_id, channel_version_dep)
     }
 
     /// Direct (non-transactional) write access to `ClientGlobalState`.

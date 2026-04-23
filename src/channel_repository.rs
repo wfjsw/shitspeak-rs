@@ -39,8 +39,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::acl::ACLPermissions;
-use crate::channels::{Channel, ChannelPatch};
 use crate::acl::ACL;
+use crate::channels::{Channel, ChannelPatch};
 use crate::errors::ChannelRepoError;
 
 // ─── WAL types ────────────────────────────────────────────────────────────────
@@ -61,29 +61,27 @@ impl ChannelOperation {
     /// Mumble clients merge deltas with their existing state.
     pub fn to_message(&self) -> Option<crate::messages::Message> {
         match &self.op {
-            ChannelOp::CreateChannel { channel } => {
-                Some(channel_to_proto_full(channel))
-            }
-            ChannelOp::UpdateChannel { id, patch } => {
-                Some(channel_to_proto_delta(*id, patch))
-            }
+            ChannelOp::CreateChannel { channel } => Some(channel_to_proto_full(channel)),
+            ChannelOp::UpdateChannel { id, patch } => Some(channel_to_proto_delta(*id, patch)),
             ChannelOp::DeleteChannel { id } => {
                 Some(crate::messages::encoder::ChannelRemove { channel_id: *id }.into())
             }
-            ChannelOp::AddLink { a, b } => {
-                Some(crate::messages::encoder::ChannelState {
+            ChannelOp::AddLink { a, b } => Some(
+                crate::messages::encoder::ChannelState {
                     channel_id: Some(*a),
                     links_add: vec![*b],
                     ..Default::default()
-                }.into())
-            }
-            ChannelOp::RemoveLink { a, b } => {
-                Some(crate::messages::encoder::ChannelState {
+                }
+                .into(),
+            ),
+            ChannelOp::RemoveLink { a, b } => Some(
+                crate::messages::encoder::ChannelState {
                     channel_id: Some(*a),
                     links_remove: vec![*b],
                     ..Default::default()
-                }.into())
-            }
+                }
+                .into(),
+            ),
             ChannelOp::SetAcls { .. } => {
                 // ACL changes produce PermissionQuery messages, not ChannelState.
                 None
@@ -108,7 +106,8 @@ fn channel_to_proto_full(ch: &Channel) -> crate::messages::Message {
             .and_then(|h| hex::decode(h).ok()),
         max_users: Some(ch.max_users),
         ..Default::default()
-    }.into()
+    }
+    .into()
 }
 
 /// Build a delta `ChannelState` encoder message (for UpdateChannel).
@@ -119,21 +118,36 @@ fn channel_to_proto_delta(id: u32, patch: &ChannelPatch) -> crate::messages::Mes
         name: patch.name.clone(),
         position: patch.position,
         max_users: patch.max_users,
-        description_hash: patch.description_hash.as_ref().and_then(|h| {
-            h.as_ref().and_then(|h| hex::decode(h).ok())
-        }),
+        description_hash: patch
+            .description_hash
+            .as_ref()
+            .and_then(|h| h.as_ref().and_then(|h| hex::decode(h).ok())),
         ..Default::default()
-    }.into()
+    }
+    .into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ChannelOp {
-    CreateChannel { channel: Channel },
-    UpdateChannel { id: u32, patch: ChannelPatch },
-    DeleteChannel { id: u32 },
-    AddLink { a: u32, b: u32 },
-    RemoveLink { a: u32, b: u32 },
+    CreateChannel {
+        channel: Channel,
+    },
+    UpdateChannel {
+        id: u32,
+        patch: ChannelPatch,
+    },
+    DeleteChannel {
+        id: u32,
+    },
+    AddLink {
+        a: u32,
+        b: u32,
+    },
+    RemoveLink {
+        a: u32,
+        b: u32,
+    },
     SetAcls {
         channel_id: u32,
         inherit_acl: bool,
@@ -168,6 +182,9 @@ pub struct ChannelRepository {
     wal_file: Option<Mutex<tokio::fs::File>>,
     /// Broadcast channel for S2S subscribers.
     tx: broadcast::Sender<Arc<ChannelOperation>>,
+    /// Optional reference to `ClientRepository` for draining pending ops
+    /// after remote channel ops are applied.
+    client_repo: Mutex<Option<Arc<crate::client_repository::ClientRepository>>>,
 }
 
 // ─── public API ───────────────────────────────────────────────────────────────
@@ -192,6 +209,7 @@ impl ChannelRepository {
             storage_dir: None,
             wal_file: None,
             tx,
+            client_repo: Mutex::new(None),
         })
     }
 
@@ -211,12 +229,11 @@ impl ChannelRepository {
         // ── 1. Load snapshot ─────────────────────────────────────────────
         let (mut channels, mut base_version) = match tokio::fs::read(&snapshot_path).await {
             Ok(data) => {
-                let snap: Snapshot = serde_json::from_slice(&data).map_err(|e| {
-                    ChannelRepoError::WalCorrupt {
+                let snap: Snapshot =
+                    serde_json::from_slice(&data).map_err(|e| ChannelRepoError::WalCorrupt {
                         line: 0,
                         reason: format!("snapshot corrupt: {e}"),
-                    }
-                })?;
+                    })?;
                 let map: HashMap<u32, Channel> =
                     snap.channels.into_iter().map(|c| (c.id, c)).collect();
                 (map, snap.version)
@@ -283,6 +300,7 @@ impl ChannelRepository {
             storage_dir: Some(storage_dir.to_owned()),
             wal_file: Some(Mutex::new(wal_file)),
             tx,
+            client_repo: Mutex::new(None),
         }))
     }
 
@@ -319,9 +337,13 @@ impl ChannelRepository {
         let mut result = Vec::new();
         let mut current_id = channel_id;
         loop {
-            let Some(ch) = channels.get(&current_id) else { break };
+            let Some(ch) = channels.get(&current_id) else {
+                break;
+            };
             let Some(pid) = ch.parent_id else { break };
-            let Some(parent) = channels.get(&pid) else { break };
+            let Some(parent) = channels.get(&pid) else {
+                break;
+            };
             result.push(parent.clone());
             current_id = pid;
         }
@@ -352,25 +374,28 @@ impl ChannelRepository {
         self: &Arc<Self>,
         mut channel: Channel,
     ) -> Result<Channel, ChannelRepoError> {
-        let mut channels = self.channels.write().await;
+        {
+            let mut channels = self.channels.write().await;
 
-        // Validate parent exists
-        if let Some(pid) = channel.parent_id {
-            if !channels.contains_key(&pid) && pid != 0 {
-                return Err(ChannelRepoError::ParentNotFound(pid));
+            // Validate parent exists
+            if let Some(pid) = channel.parent_id {
+                if !channels.contains_key(&pid) && pid != 0 {
+                    return Err(ChannelRepoError::ParentNotFound(pid));
+                }
             }
-        }
 
-        // Validate name uniqueness within parent
-        if channels.values().any(|c| {
-            c.parent_id == channel.parent_id && c.name == channel.name && c.id != channel.id
-        }) {
-            return Err(ChannelRepoError::NameConflict(channel.name.clone()));
-        }
+            // Validate name uniqueness within parent
+            if channels.values().any(|c| {
+                c.parent_id == channel.parent_id && c.name == channel.name && c.id != channel.id
+            }) {
+                return Err(ChannelRepoError::NameConflict(channel.name.clone()));
+            }
 
-        let op = self.make_op(ChannelOp::CreateChannel { channel: channel.clone() });
-        channels.insert(channel.id, channel.clone());
-        drop(channels);
+            let op = self.make_op(ChannelOp::CreateChannel {
+                channel: channel.clone(),
+            });
+            channels.insert(channel.id, channel.clone());
+        }
 
         self.commit(op).await?;
         Ok(channel)
@@ -402,20 +427,24 @@ impl ChannelRepository {
 
         // Validate new name uniqueness
         if let Some(ref new_name) = patch.name {
-            let target_parent = patch
-                .parent_id
-                .unwrap_or_else(|| channels[&id].parent_id);
-            if channels.values().any(|c| {
-                c.parent_id == target_parent && &c.name == new_name && c.id != id
-            }) {
+            let target_parent = patch.parent_id.unwrap_or_else(|| channels[&id].parent_id);
+            if channels
+                .values()
+                .any(|c| c.parent_id == target_parent && &c.name == new_name && c.id != id)
+            {
                 return Err(ChannelRepoError::NameConflict(new_name.clone()));
             }
         }
 
-        let op = self.make_op(ChannelOp::UpdateChannel { id, patch: patch.clone() });
-        apply_patch(channels.get_mut(&id).unwrap(), &patch);
-        let updated = channels[&id].clone();
-        drop(channels);
+        let (op, updated) = {
+            let op = self.make_op(ChannelOp::UpdateChannel {
+                id,
+                patch: patch.clone(),
+            });
+            apply_patch(channels.get_mut(&id).unwrap(), &patch);
+            let updated = channels[&id].clone();
+            (op, updated)
+        };
 
         self.invalidate_acl_cache_for_channel(id).await;
         self.commit(op).await?;
@@ -424,69 +453,62 @@ impl ChannelRepository {
 
     /// Delete a channel and all its descendants.  Users should be moved to
     /// the parent by the caller before invoking this.
-    pub async fn delete_channel(
-        self: &Arc<Self>,
-        id: u32,
-    ) -> Result<Vec<u32>, ChannelRepoError> {
+    pub async fn delete_channel(self: &Arc<Self>, id: u32) -> Result<Vec<u32>, ChannelRepoError> {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
-        let mut channels = self.channels.write().await;
-        if !channels.contains_key(&id) {
-            return Err(ChannelRepoError::NotFound(id));
-        }
+        let to_delete = {
+            let mut channels = self.channels.write().await;
+            if !channels.contains_key(&id) {
+                return Err(ChannelRepoError::NotFound(id));
+            }
 
-        // Collect all descendants (BFS)
-        let to_delete = collect_subtree(&channels, id);
+            // Collect all descendants (BFS)
+            let to_delete = collect_subtree(&channels, id);
 
-        for del_id in &to_delete {
-            channels.remove(del_id);
-        }
-        drop(channels);
+            for del_id in &to_delete {
+                channels.remove(del_id);
+            }
 
+            to_delete
+        };
         let op = self.make_op(ChannelOp::DeleteChannel { id });
         self.invalidate_acl_cache_for_channel(id).await;
         self.commit(op).await?;
         Ok(to_delete)
     }
 
-    pub async fn add_link(
-        self: &Arc<Self>,
-        a: u32,
-        b: u32,
-    ) -> Result<(), ChannelRepoError> {
+    pub async fn add_link(self: &Arc<Self>, a: u32, b: u32) -> Result<(), ChannelRepoError> {
         if a == b {
             return Ok(()); // no-op; callers should reject same-channel links
         }
-        let mut channels = self.channels.write().await;
-        if !channels.contains_key(&a) {
-            return Err(ChannelRepoError::NotFound(a));
+        {
+            let mut channels = self.channels.write().await;
+            if !channels.contains_key(&a) {
+                return Err(ChannelRepoError::NotFound(a));
+            }
+            if !channels.contains_key(&b) {
+                return Err(ChannelRepoError::NotFound(b));
+            }
+            channels.get_mut(&a).unwrap().links.insert(b);
+            channels.get_mut(&b).unwrap().links.insert(a);
         }
-        if !channels.contains_key(&b) {
-            return Err(ChannelRepoError::NotFound(b));
-        }
-        channels.get_mut(&a).unwrap().links.insert(b);
-        channels.get_mut(&b).unwrap().links.insert(a);
-        drop(channels);
 
         let op = self.make_op(ChannelOp::AddLink { a, b });
         self.commit(op).await?;
         Ok(())
     }
 
-    pub async fn remove_link(
-        self: &Arc<Self>,
-        a: u32,
-        b: u32,
-    ) -> Result<(), ChannelRepoError> {
-        let mut channels = self.channels.write().await;
-        if let Some(ch) = channels.get_mut(&a) {
-            ch.links.remove(&b);
+    pub async fn remove_link(self: &Arc<Self>, a: u32, b: u32) -> Result<(), ChannelRepoError> {
+        {
+            let mut channels = self.channels.write().await;
+            if let Some(ch) = channels.get_mut(&a) {
+                ch.links.remove(&b);
+            }
+            if let Some(ch) = channels.get_mut(&b) {
+                ch.links.remove(&a);
+            }
         }
-        if let Some(ch) = channels.get_mut(&b) {
-            ch.links.remove(&a);
-        }
-        drop(channels);
 
         let op = self.make_op(ChannelOp::RemoveLink { a, b });
         self.commit(op).await?;
@@ -499,13 +521,14 @@ impl ChannelRepository {
         inherit_acl: bool,
         acls: Vec<ACL>,
     ) -> Result<(), ChannelRepoError> {
-        let mut channels = self.channels.write().await;
-        let ch = channels
-            .get_mut(&channel_id)
-            .ok_or(ChannelRepoError::NotFound(channel_id))?;
-        ch.inherit_acl = inherit_acl;
-        ch.acls = acls.clone();
-        drop(channels);
+        {
+            let mut channels = self.channels.write().await;
+            let ch = channels
+                .get_mut(&channel_id)
+                .ok_or(ChannelRepoError::NotFound(channel_id))?;
+            ch.inherit_acl = inherit_acl;
+            ch.acls = acls.clone();
+        }
 
         let op = self.make_op(ChannelOp::SetAcls {
             channel_id,
@@ -579,11 +602,9 @@ impl ChannelRepository {
             node_id: self.node_id,
             channels,
         };
-        let json = serde_json::to_vec(&snap).map_err(|e| {
-            ChannelRepoError::WalCorrupt {
-                line: 0,
-                reason: format!("snapshot serialisation error: {e}"),
-            }
+        let json = serde_json::to_vec(&snap).map_err(|e| ChannelRepoError::WalCorrupt {
+            line: 0,
+            reason: format!("snapshot serialisation error: {e}"),
         })?;
 
         // Write snapshot atomically
@@ -654,10 +675,28 @@ impl ChannelRepository {
         if op.version <= self.version.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut channels = self.channels.write().await;
-        apply_op_to_map(&mut channels, &op.op);
-        self.version.fetch_max(op.version, Ordering::AcqRel);
+        let new_version = {
+            let mut channels = self.channels.write().await;
+            apply_op_to_map(&mut channels, &op.op);
+            let new_version = op.version;
+            self.version.fetch_max(new_version, Ordering::AcqRel);
+            new_version
+        };
+
+        // Notify ClientRepository to drain pending ops whose dep is now satisfied
+        if let Some(ref client_repo) = *self.client_repo.lock().await {
+            client_repo.drain_pending_ops(new_version).await;
+        }
+
         Ok(())
+    }
+
+    /// Set the `ClientRepository` reference for cross-repo causal notification.
+    pub async fn set_client_repo(
+        &self,
+        client_repo: Arc<crate::client_repository::ClientRepository>,
+    ) {
+        *self.client_repo.lock().await = Some(client_repo);
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -681,12 +720,11 @@ impl ChannelRepository {
 
         // Append to WAL if persistence is enabled
         if let Some(ref wal_mutex) = self.wal_file {
-            let mut line = serde_json::to_string(&*op).map_err(|e| {
-                ChannelRepoError::WalCorrupt {
+            let mut line =
+                serde_json::to_string(&*op).map_err(|e| ChannelRepoError::WalCorrupt {
                     line: 0,
                     reason: format!("WAL serialisation error: {e}"),
-                }
-            })?;
+                })?;
             line.push('\n');
             let mut wal = wal_mutex.lock().await;
             wal.write_all(line.as_bytes()).await?;
