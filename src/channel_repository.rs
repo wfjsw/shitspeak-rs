@@ -178,9 +178,13 @@ impl ChannelRepository {
     /// Create an in-memory repository (no persistence).
     pub fn new_in_memory(node_id: u16) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
+        let mut channels = HashMap::new();
+        // Ensure root channel exists
+        let root = Channel::new(0, "Root".to_owned(), 0, 0, None, false);
+        channels.insert(0, root);
         Arc::new(Self {
             node_id,
-            channels: RwLock::new(HashMap::new()),
+            channels: RwLock::new(channels),
             version: AtomicU64::new(0),
             log: RwLock::new(std::collections::VecDeque::new()),
             log_max_entries: 10_000,

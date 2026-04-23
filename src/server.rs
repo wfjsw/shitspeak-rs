@@ -23,7 +23,7 @@ use crate::errors::{
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
-use crate::voice::codec::decode_ping_protobuf;
+use crate::voice::ping::decode_ping_protobuf;
 use crate::{
     client_repository::ClientRepository, codec_info::CodecInfo, config::Config,
     types::NodeIdentifier,
@@ -204,7 +204,7 @@ impl Server {
                 tracing::trace!("UDP received {} bytes from {}", len, src_addr);
 
                 if ping_enabled {
-                    match crate::voice::codec::try_decode_ping(packet).await {
+                    match crate::voice::ping::try_decode_ping(packet).await {
                         Ok(ping) => {
                             tracing::debug!("UDP ping from {}: timestamp={}, format={}", src_addr, ping.timestamp, ping.format);
                             let reply = match Self::build_ping_response(&server, &ping).await {
@@ -648,16 +648,16 @@ impl Server {
     /// Build a ping response with current server information.
     async fn build_ping_response(
         server: &Arc<Box<Self>>,
-        ping: &crate::voice::codec::PingRequest,
+        ping: &crate::voice::ping::PingRequest,
     ) -> Result<Bytes, EncodeError> {
-        let response = crate::voice::codec::PingResponse {
+        let response = crate::voice::ping::PingResponse {
             timestamp: ping.timestamp,
             server_version: crate::constants::APP_PROTO_VER,
             user_count: server.clients.len().await.clamp(0, u32::MAX.try_into().unwrap()) as u32,
             max_user_count: Some(server.config.max_users.clamp(0, u32::MAX.into()) as u32),
             max_bandwidth_per_user: server.config.max_bandwidth,
         };
-        crate::voice::codec::encode_ping_response(&response, ping.format)
+        crate::voice::ping::encode_ping_response(&response, ping.format)
     }
 
     // ── Codec negotiation ────────────────────────────────────────────────

@@ -7,6 +7,7 @@
 //! single-syscall flush.  On other platforms, per-packet `send_to` is used.
 
 pub mod codec;
+pub mod ping;
 mod routing;
 pub mod udp_batch;
 
