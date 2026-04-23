@@ -60,6 +60,8 @@ macro_rules! diff_option {
     };
 }
 
+
+
 // ─── ClientGlobalStateDelta ───────────────────────────────────────────────────
 
 /// A mirror of `ClientGlobalState` where every field is `Option<T>`.
@@ -69,7 +71,8 @@ pub struct ClientGlobalStateDelta {
     pub protocol_version: Option<Option<ProtocolVersion>>,
 
     pub current_channel_id: Option<u32>,
-    pub listening_channel_id: Option<HashSet<u32>>,
+    pub listening_channel_add: Option<HashSet<u32>>,
+    pub listening_channel_remove: Option<HashSet<u32>>,
 
     // Voice / moderation
     pub mute: Option<bool>,
@@ -102,7 +105,8 @@ impl ClientGlobalStateDelta {
     pub fn is_empty(&self) -> bool {
         !(self.protocol_version.is_some()
             || self.current_channel_id.is_some()
-            || self.listening_channel_id.is_some()
+            || self.listening_channel_add.is_some()
+            || self.listening_channel_remove.is_some()
             || self.mute.is_some()
             || self.deaf.is_some()
             || self.suppress.is_some()
@@ -122,41 +126,6 @@ impl ClientGlobalStateDelta {
             || self.display_name.is_some())
     }
 
-    /// Compute the delta between `old` and `new` — only fields that differ
-    /// are set to `Some(new_value)`.
-    pub fn from_diff(
-        old: &super::client_global_state::ClientGlobalState,
-        new: &super::client_global_state::ClientGlobalState,
-    ) -> Self {
-        let mut d = ClientGlobalStateDelta::default();
-
-        diff_plain!(d, old, new, protocol_version, get_protocol_version);
-        diff_plain!(d, old, new, current_channel_id, get_current_channel_id);
-        diff_clone!(d, old, new, listening_channel_id, get_listening_channel_id);
-
-        diff_plain!(d, old, new, mute, is_muted);
-        diff_plain!(d, old, new, deaf, is_deafened);
-        diff_plain!(d, old, new, suppress, is_suppressed);
-        diff_plain!(d, old, new, self_mute, is_self_muted);
-        diff_plain!(d, old, new, self_deaf, is_self_deafened);
-        diff_plain!(d, old, new, priority_speaker, is_priority_speaker);
-        diff_plain!(d, old, new, recording, is_recording);
-
-        diff_to_vec!(d, old, new, plugin_context, get_plugin_context);
-        diff_to_owned!(d, old, new, plugin_identity, get_plugin_identity);
-
-        diff_option!(d, old, new, texture_url, get_texture_url);
-        diff_option!(d, old, new, texture_hash, get_texture_hash);
-        diff_option!(d, old, new, comment_url, get_comment_url);
-        diff_option!(d, old, new, comment_hash, get_comment_hash);
-
-        diff_plain!(d, old, new, user_id, get_user_id);
-        diff_clone!(d, old, new, groups, get_groups);
-        diff_clone!(d, old, new, tokens, get_tokens);
-        diff_option!(d, old, new, display_name, get_display_name_opt);
-
-        d
-    }
 }
 
 // ─── ClientStateOperation ────────────────────────────────────────────────────
@@ -178,6 +147,7 @@ pub enum ClientStateOperation {
     },
     UpdateGlobalState {
         session_id: ClientSessionIdentifier,
+        sender_session_id: Option<ClientSessionIdentifier>,
         delta: ClientGlobalStateDelta,
     },
 }
@@ -242,13 +212,17 @@ impl ClientStateLogEntry {
                     },
                 ))
             }
-            ClientStateOperation::UpdateGlobalState { session_id, delta } => {
+            ClientStateOperation::UpdateGlobalState {
+                session_id,
+                sender_session_id,
+                delta,
+            } => {
                 if delta.is_empty() {
                     return None;
                 }
                 let mut us = crate::mumble_proto::UserState {
                     session: Some(u32::from(*session_id)),
-                    actor: None,
+                    actor: sender_session_id.map(|f| u32::from(f)),
                     name: None,
                     user_id: None,
                     channel_id: None,
@@ -314,8 +288,11 @@ impl ClientStateLogEntry {
                 if let Some(ref v) = delta.comment_hash {
                     us.comment_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
                 }
-                if let Some(ref v) = delta.listening_channel_id {
+                if let Some(ref v) = delta.listening_channel_add {
                     us.listening_channel_add = v.iter().copied().collect();
+                }
+                if let Some(ref v) = delta.listening_channel_remove {
+                    us.listening_channel_remove = v.iter().copied().collect();
                 }
 
                 Some(crate::messages::Message::UserState(us))

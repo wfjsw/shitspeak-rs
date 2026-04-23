@@ -41,7 +41,7 @@ pub async fn handle_user_state(
 
     // ── Acquire a single transactional guard for all mutations ─────────
     // All changes in this handler are batched into one version bump.
-    let mut gs = target.write_global_state(repo).await;
+    let mut gs = target.write_global_state_as(repo, Some(sender_id)).await;
 
     // ── Self-mute / self-deaf (only target can set their own) ─────────────
     if is_self {
@@ -70,22 +70,33 @@ pub async fn handle_user_state(
         if let Some(mute) = msg.mute {
             if gs.is_muted() != mute {
                 gs.set_mute(mute);
+                // Implicitly clear deaf when unmuting
+                if !mute {
+                    gs.set_deaf(false);
+                }
             }
         }
         if let Some(deaf) = msg.deaf {
             if gs.is_deafened() != deaf {
                 gs.set_deaf(deaf);
+                // Implicitly mute when deafening
+                if deaf && !gs.is_muted() {
+                    gs.set_mute(true);
+                }
             }
         }
+
         if let Some(suppress) = msg.suppress {
             if gs.is_suppressed() != suppress {
                 gs.set_suppress(suppress);
             }
         }
-        if let Some(priority_speaker) = msg.priority_speaker {
-            if gs.is_priority_speaker() != priority_speaker {
-                gs.set_priority_speaker(priority_speaker);
-            }
+    }
+
+
+    if let Some(priority_speaker) = msg.priority_speaker {
+        if gs.is_priority_speaker() != priority_speaker {
+            gs.set_priority_speaker(priority_speaker);
         }
     }
 
@@ -103,9 +114,9 @@ pub async fn handle_user_state(
         let current = gs.get_current_channel_id();
         if current != new_channel_id {
             // Verify the channel exists
-            if server.get_channels().get_channel(new_channel_id).await.is_none() {
+            if new_channel_id != 0 && server.get_channels().get_channel(new_channel_id).await.is_none() {
                 let deny = Message::PermissionDenied(PermissionDenied {
-                    r#type: Some(DenyType::MissingCertificate as i32),
+                    r#type: Some(DenyType::ChannelName as i32),
                     session: Some(u32::from(sender_id)),
                     channel_id: Some(new_channel_id),
                     reason: Some(format!("Channel {} does not exist", new_channel_id)),

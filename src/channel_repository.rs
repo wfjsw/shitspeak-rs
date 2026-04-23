@@ -358,7 +358,7 @@ impl ChannelRepository {
 
         // Validate parent exists
         if let Some(pid) = channel.parent_id {
-            if !channels.contains_key(&pid) {
+            if !channels.contains_key(&pid) && pid != 0 {
                 return Err(ChannelRepoError::ParentNotFound(pid));
             }
         }

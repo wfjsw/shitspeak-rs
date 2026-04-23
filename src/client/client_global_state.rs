@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::protocol_version::ProtocolVersion;
+use crate::client::state_log::ClientGlobalStateDelta;
 
 #[derive(Debug, Clone)]
 pub struct ClientGlobalState {
@@ -34,6 +35,9 @@ pub struct ClientGlobalState {
     groups: HashSet<String>,
     tokens: HashSet<String>,
     display_name: Option<String>,
+
+    delta_recording: bool,
+    pending_delta: ClientGlobalStateDelta,
 }
 
 impl ClientGlobalState {
@@ -64,11 +68,35 @@ impl ClientGlobalState {
             groups: HashSet::new(),
             tokens: HashSet::new(),
             display_name: None,
+
+            delta_recording: false,
+            pending_delta: ClientGlobalStateDelta::default(),
         }
     }
 
+    pub(crate) fn begin_delta_recording(&mut self) {
+        self.delta_recording = true;
+        self.pending_delta = ClientGlobalStateDelta::default();
+    }
+
+    pub(crate) fn finish_delta_recording(&mut self) -> ClientGlobalStateDelta {
+        self.delta_recording = false;
+        std::mem::take(&mut self.pending_delta)
+    }
+
+    pub(crate) fn cancel_delta_recording(&mut self) {
+        self.delta_recording = false;
+        self.pending_delta = ClientGlobalStateDelta::default();
+    }
+
     pub fn set_current_channel_id(&mut self, channel_id: u32) {
+        if self.current_channel_id == channel_id {
+            return;
+        }
         self.current_channel_id = channel_id;
+        if self.delta_recording {
+            self.pending_delta.current_channel_id = Some(channel_id);
+        }
     }
 
     pub fn get_current_channel_id(&self) -> u32 {
@@ -80,11 +108,45 @@ impl ClientGlobalState {
     }
 
     pub fn listen_channel(&mut self, channel_id: u32) -> bool {
-        self.listening_channel_id.insert(channel_id)
+        let changed = self.listening_channel_id.insert(channel_id);
+        if changed && self.delta_recording {
+            let removes = self
+                .pending_delta
+                .listening_channel_remove
+                .get_or_insert_with(HashSet::new);
+            removes.remove(&channel_id);
+            if removes.is_empty() {
+                self.pending_delta.listening_channel_remove = None;
+            }
+
+            let adds = self
+                .pending_delta
+                .listening_channel_add
+                .get_or_insert_with(HashSet::new);
+            adds.insert(channel_id);
+        }
+        changed
     }
     
     pub fn unlisten_channel(&mut self, channel_id: u32) -> bool {
-        self.listening_channel_id.remove(&channel_id)
+        let changed = self.listening_channel_id.remove(&channel_id);
+        if changed && self.delta_recording {
+            let adds = self
+                .pending_delta
+                .listening_channel_add
+                .get_or_insert_with(HashSet::new);
+            adds.remove(&channel_id);
+            if adds.is_empty() {
+                self.pending_delta.listening_channel_add = None;
+            }
+
+            let removes = self
+                .pending_delta
+                .listening_channel_remove
+                .get_or_insert_with(HashSet::new);
+            removes.insert(channel_id);
+        }
+        changed
     }
 
     pub fn is_listening_channel(&self, channel_id: u32) -> bool {
@@ -99,9 +161,13 @@ impl ClientGlobalState {
         if self.protocol_version.is_some() {
             return;
         }
-        self.protocol_version = match version {
+        let new_version = match version {
             None => Some(ProtocolVersion::new(1, 2, 0)),
             Some(v) => Some(v),
+        };
+        self.protocol_version = new_version.clone();
+        if self.delta_recording {
+            self.pending_delta.protocol_version = Some(new_version);
         }
     }
 
@@ -114,8 +180,21 @@ impl ClientGlobalState {
     }
 
     pub fn set_texture_blob(&mut self, url: Option<String>, hash: Option<String>) {
+        if self.texture_url == url && self.texture_hash == hash {
+            return;
+        }
+        let old_url = self.texture_url.clone();
+        let old_hash = self.texture_hash.clone();
         self.texture_url = url;
         self.texture_hash = hash;
+        if self.delta_recording {
+            if self.texture_url != old_url {
+                self.pending_delta.texture_url = Some(self.texture_url.clone());
+            }
+            if self.texture_hash != old_hash {
+                self.pending_delta.texture_hash = Some(self.texture_hash.clone());
+            }
+        }
     }
 
     pub fn clear_texture_blob(&mut self) {
@@ -132,8 +211,21 @@ impl ClientGlobalState {
     }
 
     pub fn set_comment_blob(&mut self, url: Option<String>, hash: Option<String>) {
+        if self.comment_url == url && self.comment_hash == hash {
+            return;
+        }
+        let old_url = self.comment_url.clone();
+        let old_hash = self.comment_hash.clone();
         self.comment_url = url;
         self.comment_hash = hash;
+        if self.delta_recording {
+            if self.comment_url != old_url {
+                self.pending_delta.comment_url = Some(self.comment_url.clone());
+            }
+            if self.comment_hash != old_hash {
+                self.pending_delta.comment_hash = Some(self.comment_hash.clone());
+            }
+        }
     }
 
     pub fn clear_comment_blob(&mut self) {
@@ -144,31 +236,103 @@ impl ClientGlobalState {
     // ── Voice / moderation getters & setters ─────────────────────────────
 
     pub fn is_muted(&self) -> bool { self.mute }
-    pub fn set_mute(&mut self, v: bool) { self.mute = v; }
+    pub fn set_mute(&mut self, v: bool) {
+        if self.mute == v {
+            return;
+        }
+        self.mute = v;
+        if self.delta_recording {
+            self.pending_delta.mute = Some(v);
+        }
+    }
 
     pub fn is_deafened(&self) -> bool { self.deaf }
-    pub fn set_deaf(&mut self, v: bool) { self.deaf = v; }
+    pub fn set_deaf(&mut self, v: bool) {
+        if self.deaf == v {
+            return;
+        }
+        self.deaf = v;
+        if self.delta_recording {
+            self.pending_delta.deaf = Some(v);
+        }
+    }
 
     pub fn is_suppressed(&self) -> bool { self.suppress }
-    pub fn set_suppress(&mut self, v: bool) { self.suppress = v; }
+    pub fn set_suppress(&mut self, v: bool) {
+        if self.suppress == v {
+            return;
+        }
+        self.suppress = v;
+        if self.delta_recording {
+            self.pending_delta.suppress = Some(v);
+        }
+    }
 
     pub fn is_self_muted(&self) -> bool { self.self_mute }
-    pub fn set_self_mute(&mut self, v: bool) { self.self_mute = v; }
+    pub fn set_self_mute(&mut self, v: bool) {
+        if self.self_mute == v {
+            return;
+        }
+        self.self_mute = v;
+        if self.delta_recording {
+            self.pending_delta.self_mute = Some(v);
+        }
+    }
 
     pub fn is_self_deafened(&self) -> bool { self.self_deaf }
-    pub fn set_self_deaf(&mut self, v: bool) { self.self_deaf = v; }
+    pub fn set_self_deaf(&mut self, v: bool) {
+        if self.self_deaf == v {
+            return;
+        }
+        self.self_deaf = v;
+        if self.delta_recording {
+            self.pending_delta.self_deaf = Some(v);
+        }
+    }
 
     pub fn is_priority_speaker(&self) -> bool { self.priority_speaker }
-    pub fn set_priority_speaker(&mut self, v: bool) { self.priority_speaker = v; }
+    pub fn set_priority_speaker(&mut self, v: bool) {
+        if self.priority_speaker == v {
+            return;
+        }
+        self.priority_speaker = v;
+        if self.delta_recording {
+            self.pending_delta.priority_speaker = Some(v);
+        }
+    }
 
     pub fn is_recording(&self) -> bool { self.recording }
-    pub fn set_recording(&mut self, v: bool) { self.recording = v; }
+    pub fn set_recording(&mut self, v: bool) {
+        if self.recording == v {
+            return;
+        }
+        self.recording = v;
+        if self.delta_recording {
+            self.pending_delta.recording = Some(v);
+        }
+    }
 
     pub fn get_plugin_context(&self) -> &[u8] { &self.plugin_context }
-    pub fn set_plugin_context(&mut self, ctx: Vec<u8>) { self.plugin_context = ctx; }
+    pub fn set_plugin_context(&mut self, ctx: Vec<u8>) {
+        if self.plugin_context == ctx {
+            return;
+        }
+        self.plugin_context = ctx;
+        if self.delta_recording {
+            self.pending_delta.plugin_context = Some(self.plugin_context.clone());
+        }
+    }
 
     pub fn get_plugin_identity(&self) -> &str { &self.plugin_identity }
-    pub fn set_plugin_identity(&mut self, id: String) { self.plugin_identity = id; }
+    pub fn set_plugin_identity(&mut self, id: String) {
+        if self.plugin_identity == id {
+            return;
+        }
+        self.plugin_identity = id;
+        if self.delta_recording {
+            self.pending_delta.plugin_identity = Some(self.plugin_identity.clone());
+        }
+    }
 
     // ── User identity getters & setters ──────────────────────────────────
 
@@ -177,7 +341,13 @@ impl ClientGlobalState {
     }
 
     pub fn set_user_id(&mut self, user_id: Option<u32>) {
+        if self.user_id == user_id {
+            return;
+        }
         self.user_id = user_id;
+        if self.delta_recording {
+            self.pending_delta.user_id = Some(user_id);
+        }
     }
 
     pub fn is_registered(&self) -> bool {
@@ -197,15 +367,25 @@ impl ClientGlobalState {
     }
 
     pub fn add_group(&mut self, group: String) {
-        self.groups.insert(group);
+        if self.groups.insert(group) && self.delta_recording {
+            self.pending_delta.groups = Some(self.groups.clone());
+        }
     }
 
     pub fn del_group(&mut self, group: &str) {
-        self.groups.remove(&group.to_string());
+        if self.groups.remove(&group.to_string()) && self.delta_recording {
+            self.pending_delta.groups = Some(self.groups.clone());
+        }
     }
 
     pub fn set_groups(&mut self, groups: HashSet<String>) {
+        if self.groups == groups {
+            return;
+        }
         self.groups = groups;
+        if self.delta_recording {
+            self.pending_delta.groups = Some(self.groups.clone());
+        }
     }
 
     pub fn get_tokens(&self) -> &HashSet<String> {
@@ -213,15 +393,25 @@ impl ClientGlobalState {
     }
 
     pub fn add_token(&mut self, token: String) {
-        self.tokens.insert(token);
+        if self.tokens.insert(token) && self.delta_recording {
+            self.pending_delta.tokens = Some(self.tokens.clone());
+        }
     }
 
     pub fn del_token(&mut self, token: &str) {
-        self.tokens.remove(token);
+        if self.tokens.remove(token) && self.delta_recording {
+            self.pending_delta.tokens = Some(self.tokens.clone());
+        }
     }
 
     pub fn set_tokens(&mut self, tokens: HashSet<String>) {
+        if self.tokens == tokens {
+            return;
+        }
         self.tokens = tokens;
+        if self.delta_recording {
+            self.pending_delta.tokens = Some(self.tokens.clone());
+        }
     }
 
     // TODO: case insensitive
@@ -238,7 +428,13 @@ impl ClientGlobalState {
     }
 
     pub fn set_display_name(&mut self, display_name: Option<String>) {
+        if self.display_name == display_name {
+            return;
+        }
         self.display_name = display_name;
+        if self.delta_recording {
+            self.pending_delta.display_name = Some(self.display_name.clone());
+        }
     }
 }
 

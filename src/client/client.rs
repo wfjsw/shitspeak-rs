@@ -407,8 +407,18 @@ impl Client {
         &'a self,
         repo: &'a ClientRepository,
     ) -> GlobalStateWriteGuard<'a> {
+        self.write_global_state_as(repo, Some(self.session_id)).await
+    }
+
+    /// Acquire a transactional write guard for `ClientGlobalState` while
+    /// explicitly recording who initiated the mutation.
+    pub async fn write_global_state_as<'a>(
+        &'a self,
+        repo: &'a ClientRepository,
+        sender_session_id: Option<ClientSessionIdentifier>,
+    ) -> GlobalStateWriteGuard<'a> {
         let inner = self.global_state.write().await;
-        GlobalStateWriteGuard::new(inner, repo, self.session_id)
+        GlobalStateWriteGuard::new(inner, repo, self.session_id, sender_session_id)
     }
 
     /// Direct (non-transactional) write access to `ClientGlobalState`.
@@ -420,6 +430,7 @@ impl Client {
 
     /// Build a `UserState` snapshot of this client suitable for broadcasting
     /// to other clients (i.e. everything a peer needs to know about this user).
+    /// Not suitable for continuous update of clients state.
     pub async fn build_user_state_for_broadcast(&self) -> msg_encoder::UserState {
         let gs = self.global_state.read().await;
 
@@ -432,11 +443,11 @@ impl Client {
             name: gs.get_display_name_opt().map(|s| s.to_owned()),
             user_id: gs.get_user_id(),
             channel_id: Some(gs.get_current_channel_id()),
-            mute: Some(gs.is_muted()),
-            deaf: Some(gs.is_deafened()),
-            suppress: Some(gs.is_suppressed()),
-            self_mute: Some(gs.is_self_muted()),
-            self_deaf: Some(gs.is_self_deafened()),
+            mute: if gs.is_muted() { Some(true) } else { None },
+            deaf: if gs.is_deafened() { Some(true) } else { None },
+            suppress: if gs.is_suppressed() { Some(true) } else { None },
+            self_mute: if gs.is_self_muted() { Some(true) } else { None },
+            self_deaf: if gs.is_self_deafened() { Some(true) } else { None },
             texture: None,
             plugin_context: if gs.get_plugin_context().is_empty() { None } else { Some(gs.get_plugin_context().to_vec()) },
             plugin_identity: if gs.get_plugin_identity().is_empty() { None } else { Some(gs.get_plugin_identity().to_owned()) },
@@ -444,8 +455,8 @@ impl Client {
             hash: self.certificate_hash.as_ref().map(|h| hex::encode(h)),
             comment_hash: comment_hash_bytes,
             texture_hash: texture_hash_bytes,
-            priority_speaker: Some(gs.is_priority_speaker()),
-            recording: Some(gs.is_recording()),
+            priority_speaker: if gs.is_priority_speaker() { Some(true) } else { None },
+            recording: if gs.is_recording() { Some(true) } else { None },
             temporary_access_tokens: Vec::new(),
             listening_channel_add: gs.get_listening_channel_id().iter().copied().collect(),
             listening_channel_remove: Vec::new(),

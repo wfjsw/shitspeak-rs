@@ -3,6 +3,7 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use cidr::AnyIpCidr;
@@ -22,6 +23,7 @@ use crate::errors::{
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
+use crate::voice::codec::decode_ping_protobuf;
 use crate::{
     client_repository::ClientRepository, codec_info::CodecInfo, config::Config,
     types::NodeIdentifier,
@@ -193,15 +195,46 @@ impl Server {
                     _ = shutdown.changed() => break,
                 };
 
+                if len <= 1 {
+                    // Empty packages or packages consisting only of the header byte are invalid
+                    continue;
+                }
+
                 let packet = &buf[..len];
                 tracing::trace!("UDP received {} bytes from {}", len, src_addr);
 
-                if !voice_enabled && !ping_enabled {
-                    continue;
+                if ping_enabled {
+                    match crate::voice::codec::try_decode_ping(packet).await {
+                        Ok(ping) => {
+                            tracing::debug!("UDP ping from {}: timestamp={}, format={}", src_addr, ping.timestamp, ping.format);
+                            let reply = Self::build_ping_response(&server, &ping).await;
+                            match socket.send_to(&reply, src_addr).await {
+                                Ok(sent) => tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent),
+                                Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
+                            }
+                            continue;
+                        }
+                        Err(crate::voice::codec::DecodeError::NotPing) => {
+                            // Not a ping packet, continue with normal processing
+                        }
+                        Err(e) => {
+                            tracing::trace!("UDP packet decode failed from {}: {e}", src_addr);
+                            continue;
+                        }
+                    }
                 }
-                let packet = packet.to_vec();
-                if tx.send((packet, src_addr)).await.is_err() {
-                    break; // channel closed — shutting down
+
+                if voice_enabled {
+                    let packet = packet.to_vec();
+                    match tx.try_send((packet, src_addr)) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!("UDP processing channel is full, dropping packet from {}", src_addr);
+                        }
+                        Err(e) => {
+                            tracing::warn!("UDP processing channel error for {}: {e}", src_addr);
+                        }
+                    }
                 }
             }
             tracing::info!("UDP drain stopped");
@@ -264,7 +297,7 @@ impl Server {
                 };
 
                 // After decryption, check if this is a ping or audio packet.
-                match crate::voice::codec::decode_udp_packet(&decrypted) {
+                match crate::voice::codec::decode_udp_packet(&decrypted).await {
                     Ok(crate::voice::codec::UdpPacket::Ping(ping)) => {
                         if ping_enabled {
                             tracing::debug!("UDP ping from {}: timestamp={}", src_addr, ping.timestamp);
@@ -604,12 +637,12 @@ impl Server {
     async fn build_ping_response(
         server: &Arc<Box<Self>>,
         ping: &crate::voice::codec::PingRequest,
-    ) -> Vec<u8> {
+    ) -> Bytes {
         let response = crate::voice::codec::PingResponse {
             timestamp: ping.timestamp,
             server_version: crate::constants::APP_PROTO_VER,
-            user_count: server.clients.get_all_clients().await.len() as u32,
-            max_user_count: server.config.max_users as u32,
+            user_count: server.clients.len().await.clamp(0, u32::MAX.try_into().unwrap()) as u32,
+            max_user_count: Some(server.config.max_users.clamp(0, u32::MAX.into()) as u32),
             max_bandwidth_per_user: server.config.max_bandwidth,
         };
         crate::voice::codec::encode_ping_response(&response, ping.format)

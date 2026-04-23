@@ -401,6 +401,11 @@ impl ClientRepository {
         self.register.read().await.all_clients().cloned().collect()
     }
 
+    pub async fn len(&self) -> usize {
+        let register = self.register.read().await;
+        register.local_clients.len() + register.remote_clients.values().map(|m| m.len()).sum::<usize>()
+    }
+
     /// Return a snapshot of all clients along with the current version
     /// for every known node (local + remote).
     ///
@@ -586,7 +591,11 @@ impl ClientRepository {
                     }
                 }
             }
-            ClientStateOperation::UpdateGlobalState { session_id, delta } => {
+            ClientStateOperation::UpdateGlobalState {
+                session_id,
+                sender_session_id: _,
+                delta,
+            } => {
                 let client = register.get(session_id).cloned();
                 if let Some(client) = client {
                     let mut gs = client.write_global_state_direct().await;
@@ -629,7 +638,7 @@ impl ClientRepository {
             let entry = Arc::new(ClientStateLogEntry {
                 version,
                 node_id: self.local_node_id,
-                timestamp: chrono::Utc::now().timestamp(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
                 op,
             });
 
@@ -664,14 +673,14 @@ pub(crate) fn apply_delta_to_global_state(
     if let Some(v) = delta.current_channel_id {
         gs.set_current_channel_id(v);
     }
-    if let Some(ref v) = delta.listening_channel_id {
-        // Rebuild listening set: clear and re-add
-        let current: Vec<u32> = gs.get_listening_channel_id().iter().copied().collect();
-        for ch in &current {
-            gs.unlisten_channel(*ch);
-        }
+    if let Some(ref v) = delta.listening_channel_add {
         for ch in v {
             gs.listen_channel(*ch);
+        }
+    }
+    if let Some(ref v) = delta.listening_channel_remove {
+        for ch in v {
+            gs.unlisten_channel(*ch);
         }
     }
     if let Some(v) = delta.mute {
