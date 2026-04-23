@@ -374,7 +374,7 @@ impl ChannelRepository {
         self: &Arc<Self>,
         mut channel: Channel,
     ) -> Result<Channel, ChannelRepoError> {
-        {
+        let op = {
             let mut channels = self.channels.write().await;
 
             // Validate parent exists
@@ -395,7 +395,8 @@ impl ChannelRepository {
                 channel: channel.clone(),
             });
             channels.insert(channel.id, channel.clone());
-        }
+            op
+        };
 
         self.commit(op).await?;
         Ok(channel)
@@ -702,23 +703,37 @@ impl ChannelRepository {
     // ── Internal helpers ──────────────────────────────────────────────────
 
     fn make_op(&self, op: ChannelOp) -> ChannelOperation {
-        let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
-        debug_assert!(
-            version < u64::MAX - 1_000_000,
-            "ChannelRepository version counter approaching u64::MAX — likely a bug"
-        );
         ChannelOperation {
-            version,
+            version: 0, // assigned by commit()
             node_id: self.node_id,
             timestamp: chrono::Utc::now().timestamp(),
             op,
         }
     }
 
-    async fn commit(&self, op: ChannelOperation) -> Result<(), ChannelRepoError> {
-        let op = Arc::new(op);
+    async fn commit(&self, mut op: ChannelOperation) -> Result<(), ChannelRepoError> {
+        // Assign version and append to log atomically under the log lock,
+        // matching ClientRepository's approach.  The channels lock is
+        // released before commit() is called, but version+log ordering is
+        // guaranteed by the log lock.
+        let op = {
+            let mut log = self.log.write().await;
+            let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+            debug_assert!(
+                version < u64::MAX - 1_000_000,
+                "ChannelRepository version counter approaching u64::MAX — likely a bug"
+            );
+            op.version = version;
+            let op = Arc::new(op);
+            log.push_back(Arc::clone(&op));
+            while log.len() > self.log_max_entries {
+                log.pop_front();
+            }
+            op
+        };
 
-        // Append to WAL if persistence is enabled
+        // Append to WAL if persistence is enabled (outside log lock —
+        // WAL I/O shouldn't block log readers)
         if let Some(ref wal_mutex) = self.wal_file {
             let mut line =
                 serde_json::to_string(&*op).map_err(|e| ChannelRepoError::WalCorrupt {
@@ -729,15 +744,6 @@ impl ChannelRepository {
             let mut wal = wal_mutex.lock().await;
             wal.write_all(line.as_bytes()).await?;
             wal.sync_data().await?;
-        }
-
-        // Maintain in-memory log
-        {
-            let mut log = self.log.write().await;
-            log.push_back(Arc::clone(&op));
-            while log.len() > self.log_max_entries {
-                log.pop_front();
-            }
         }
 
         // Notify S2S subscribers (ignore error when no receivers)
