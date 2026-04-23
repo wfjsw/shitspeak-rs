@@ -22,7 +22,7 @@
 use std::fmt::Display;
 
 use bytes::{BufMut as _, Bytes, BytesMut};
-use prost::Message as _;
+use prost::{EncodeError, Message as _};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The decoded result of a UDP voice packet.
@@ -342,10 +342,10 @@ fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
 // ── Ping decode / encode ──────────────────────────────────────────────────
 
 pub async fn try_decode_ping(data: &[u8]) -> Result<PingRequest, DecodeError> {
-    // let header = data.get(0).ok_or(DecodeError::TooShort)?;
-    // if *header == 0x1u8 {
-    //     return decode_ping_protobuf(&data[1..]).await;
-    // }
+    let header = data.get(0).ok_or(DecodeError::TooShort)?;
+    if *header == 0x1u8 {
+        return decode_ping_protobuf(&data[1..]).await;
+    }
 
     if data.len() == 12 {
         return decode_ping_legacy(&data).await;
@@ -402,7 +402,7 @@ pub struct PingResponse {
 }
 
 /// Encode a ping response in the same format as the request.
-pub fn encode_ping_response(response: &PingResponse, format: PacketFormat) -> Bytes {
+pub fn encode_ping_response(response: &PingResponse, format: PacketFormat) -> Result<Bytes, EncodeError> {
     tracing::debug!(
         "Encoding ping response: format={}, timestamp={}, version={}, users={}/{}, max_bandwidth={}",
         format,
@@ -413,27 +413,25 @@ pub fn encode_ping_response(response: &PingResponse, format: PacketFormat) -> By
         response.max_bandwidth_per_user,
     );
 
-    match format {
-        PacketFormat::Protobuf => encode_ping_protobuf(response),
+    Ok(match format {
+        PacketFormat::Protobuf => encode_ping_protobuf(response)?,
         PacketFormat::Legacy => encode_ping_legacy(response),
-    }
+    })
 }
 
-fn encode_ping_protobuf(response: &PingResponse) -> Bytes {
+fn encode_ping_protobuf(response: &PingResponse) -> Result<Bytes, EncodeError> {
     let msg = crate::mumble_udp::Ping {
         timestamp: response.timestamp,
-        request_extended_information: true,
+        request_extended_information: false,
         server_version_v2: response.server_version.into(),
         user_count: response.user_count,
         max_user_count: response.max_user_count.unwrap_or(u32::MAX),
         max_bandwidth_per_user: response.max_bandwidth_per_user,
     };
-    let proto_bytes = msg.encode_to_vec();
-    let mut buf = BytesMut::with_capacity(2 + proto_bytes.len());
+    let mut buf = BytesMut::with_capacity(1 + msg.encoded_len());
     buf.put_u8(0x01); // type = Ping
-    buf.put_u8(0x00); // protobuf discriminator
-    buf.extend_from_slice(&proto_bytes);
-    buf.freeze()
+    msg.encode(&mut buf)?;
+    Ok(buf.freeze())
 }
 
 fn encode_ping_legacy(response: &PingResponse) -> Bytes {

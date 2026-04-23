@@ -7,7 +7,7 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use cidr::AnyIpCidr;
-use prost::Message as _;
+use prost::{EncodeError, Message as _};
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
 use rustls::version::{TLS12, TLS13};
 use tokio_rustls::TlsAcceptor;
@@ -207,7 +207,13 @@ impl Server {
                     match crate::voice::codec::try_decode_ping(packet).await {
                         Ok(ping) => {
                             tracing::debug!("UDP ping from {}: timestamp={}, format={}", src_addr, ping.timestamp, ping.format);
-                            let reply = Self::build_ping_response(&server, &ping).await;
+                            let reply = match Self::build_ping_response(&server, &ping).await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::warn!("Failed to build UDP ping response for {}: {e}", src_addr);
+                                    continue;
+                                }
+                            };
                             match socket.send_to(&reply, src_addr).await {
                                 Ok(sent) => tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent),
                                 Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
@@ -301,7 +307,13 @@ impl Server {
                     Ok(crate::voice::codec::UdpPacket::Ping(ping)) => {
                         if ping_enabled {
                             tracing::debug!("UDP ping from {}: timestamp={}", src_addr, ping.timestamp);
-                            let reply = Self::build_ping_response(&server, &ping).await;
+                            let reply = match Self::build_ping_response(&server, &ping).await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::warn!("Failed to build UDP ping response for {}: {e}", src_addr);
+                                    continue;
+                                }
+                            };
                             match socket.send_to(&reply, src_addr).await {
                                 Ok(sent) => tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent),
                                 Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
@@ -637,7 +649,7 @@ impl Server {
     async fn build_ping_response(
         server: &Arc<Box<Self>>,
         ping: &crate::voice::codec::PingRequest,
-    ) -> Bytes {
+    ) -> Result<Bytes, EncodeError> {
         let response = crate::voice::codec::PingResponse {
             timestamp: ping.timestamp,
             server_version: crate::constants::APP_PROTO_VER,
