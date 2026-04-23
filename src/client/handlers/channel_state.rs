@@ -4,8 +4,8 @@ use crate::{
     channels::{Channel, ChannelPatch},
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
-    mumble_proto::{ChannelState, PermissionDenied, permission_denied::DenyType},
+    messages::encoder::ChannelState,
+    mumble_proto::{PermissionDenied, permission_denied::DenyType},
     server::Server,
 };
 
@@ -31,15 +31,14 @@ pub async fn handle_channel_state(
             let name = match msg.name {
                 Some(n) if !n.is_empty() => n,
                 _ => {
-                    sender.write_proto_message(&Message::PermissionDenied(PermissionDenied {
+                    return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                         r#type: Some(DenyType::ChannelName as i32),
                         session: Some(u32::from(sender.get_session_id())),
                         channel_id: None,
                         reason: Some("Channel name is required".to_owned()),
                         name: None,
                         permission: None,
-                    })).await?;
-                    return Ok(());
+                    }));
                 }
             };
 
@@ -62,15 +61,14 @@ pub async fn handle_channel_state(
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::warn!("create_channel failed: {:?}", e);
-                    sender.write_proto_message(&Message::PermissionDenied(PermissionDenied {
+                    return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                         r#type: Some(DenyType::Text as i32),
                         session: Some(u32::from(sender.get_session_id())),
                         channel_id: None,
                         reason: Some(format!("Failed to create channel: {:?}", e)),
                         name: None,
                         permission: None,
-                    })).await?;
-                    return Ok(());
+                    }));
                 }
             };
 

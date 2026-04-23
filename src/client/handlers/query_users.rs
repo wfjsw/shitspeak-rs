@@ -3,8 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
-    mumble_proto::QueryUsers,
+    messages::{encoder::QueryUsers, Message, WriteMessageExt},
     server::Server,
 };
 
@@ -47,7 +46,7 @@ pub async fn handle_query_users(
         }
     }
 
-    let reply = Message::QueryUsers(QueryUsers { ids, names });
+    let reply: Message = QueryUsers { ids, names }.into();
     sender.write_proto_message(&reply).await?;
     Ok(())
 }

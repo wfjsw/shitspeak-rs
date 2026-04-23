@@ -3,8 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::Message,
-    mumble_proto::TextMessage,
+    messages::{encoder::TextMessage, Message},
     server::Server,
 };
 
@@ -21,13 +20,13 @@ pub async fn handle_text_message(
     tracing::debug!(session = sender_session, channels = ?msg.channel_id, trees = ?msg.tree_id, targets = ?msg.session, "TextMessage handler");
 
     // Relay as-is but stamp the actor session.
-    let relay = Message::TextMessage(TextMessage {
+    let relay: Message = TextMessage {
         actor: Some(sender_session),
         session: msg.session.clone(),
         channel_id: msg.channel_id.clone(),
         tree_id: msg.tree_id.clone(),
         message: msg.message.clone(),
-    });
+    }.into();
 
     // Direct messages: send to each target session
     for target_session in &msg.session {

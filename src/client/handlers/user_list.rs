@@ -3,8 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
-    mumble_proto::UserList,
+    messages::{encoder::UserList, Message, WriteMessageExt},
     server::Server,
 };
 
@@ -34,7 +33,7 @@ pub async fn handle_user_list(
             })
             .collect();
 
-        let reply = Message::UserList(UserList { users });
+        let reply: Message = UserList { users }.into();
         sender.write_proto_message(&reply).await?;
     } else {
         // Update mode: rename or unregister users

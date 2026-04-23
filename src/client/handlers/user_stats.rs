@@ -3,8 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
-    mumble_proto::UserStats,
+    messages::{encoder::UserStats, Message, WriteMessageExt},
     server::Server,
 };
 
@@ -44,16 +43,15 @@ pub async fn handle_user_stats(
 
     let version = gs.get_protocol_version().map(|v| {
         let v_u64: u64 = v.into();
-        crate::mumble_proto::Version {
-            version_v1: Some(v_u64 as u32),
-            version_v2: Some(v_u64),
+        crate::messages::encoder::Version {
+            version: Some(crate::protocol_version::ProtocolVersion::from(v_u64)),
             release: local.and_then(|l| l.get_release().map(|s| s.to_owned())),
             os: local.and_then(|l| l.get_os_name().map(|s| s.to_owned())),
             os_version: local.and_then(|l| l.get_os_version().map(|s| s.to_owned())),
-        }
+        }.into()
     });
 
-    let reply = Message::UserStats(UserStats {
+    let reply: Message = UserStats {
         session: Some(u32::from(target.get_session_id())),
         stats_only: msg.stats_only,
         certificates: Vec::new(), // TODO: TLS cert chain
@@ -73,8 +71,7 @@ pub async fn handle_user_stats(
         idlesecs: Some(0), // TODO: idle tracking
         strong_certificate: Some(sender.has_certificate()),
         opus: Some(true),
-        rolling_stats: None,
-    });
+    }.into();
 
     sender.write_proto_message(&reply).await?;
     Ok(())

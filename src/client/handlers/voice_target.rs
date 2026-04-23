@@ -3,14 +3,14 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    mumble_proto::VoiceTarget as ProtoVoiceTarget,
+    messages::encoder::VoiceTarget,
     server::Server,
 };
 
 pub async fn handle_voice_target(
     _server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
-    msg: ProtoVoiceTarget,
+    msg: VoiceTarget,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
         return Ok(());

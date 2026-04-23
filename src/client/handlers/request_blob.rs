@@ -3,8 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
-    mumble_proto::RequestBlob,
+    messages::{encoder::RequestBlob, Message, WriteMessageExt},
     server::Server,
 };
 
@@ -43,8 +42,8 @@ pub async fn handle_request_blob(
             None => None,
         };
 
-        let reply = Message::UserState(crate::mumble_proto::UserState {
-            session: Some(*session_raw),
+        let reply: Message = crate::messages::encoder::UserState {
+            session: Some(crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw)),
             actor: None,
             name: None,
             user_id: None,
@@ -59,7 +58,7 @@ pub async fn handle_request_blob(
             plugin_identity: None,
             comment: None,
             hash: None,
-            comment_hash: None,
+            comment_hash: texture_hash.clone(),
             texture_hash: texture_hash.clone(),
             priority_speaker: None,
             recording: None,
@@ -67,7 +66,7 @@ pub async fn handle_request_blob(
             listening_channel_add: Vec::new(),
             listening_channel_remove: Vec::new(),
             listening_volume_adjustment: Vec::new(),
-        });
+        }.into();
         sender.write_proto_message(&reply).await?;
     }
 
@@ -94,8 +93,8 @@ pub async fn handle_request_blob(
             None => None,
         };
 
-        let reply = Message::UserState(crate::mumble_proto::UserState {
-            session: Some(*session_raw),
+        let reply: Message = crate::messages::encoder::UserState {
+            session: Some(crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw)),
             actor: None,
             name: None,
             user_id: None,
@@ -118,7 +117,7 @@ pub async fn handle_request_blob(
             listening_channel_add: Vec::new(),
             listening_channel_remove: Vec::new(),
             listening_volume_adjustment: Vec::new(),
-        });
+        }.into();
         sender.write_proto_message(&reply).await?;
     }
 
@@ -132,7 +131,7 @@ pub async fn handle_request_blob(
             None => None,
         };
 
-        let reply = Message::ChannelState(crate::mumble_proto::ChannelState {
+        let reply: Message = crate::messages::encoder::ChannelState {
             channel_id: Some(ch.id),
             parent: ch.parent_id,
             name: Some(ch.name.clone()),
@@ -149,7 +148,7 @@ pub async fn handle_request_blob(
             max_users: Some(ch.max_users),
             is_enter_restricted: None,
             can_enter: None,
-        });
+        }.into();
         sender.write_proto_message(&reply).await?;
     }
 

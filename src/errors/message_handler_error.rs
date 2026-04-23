@@ -13,6 +13,9 @@ pub enum MessageHandlerError {
     ReadProtoMessageError(ReadProtoMessageError),
     MessageTypeNotForIncoming(MessageTypeNotForIncoming),
     MessageProtocolError(MessageProtocolError),
+    /// A handler wants to send a PermissionDenied message back to the client.
+    /// The caller (handle_message) is responsible for writing it.
+    PermissionDenied(crate::mumble_proto::PermissionDenied),
 }
 
 impl From<WriteProtoMessageError> for MessageHandlerError {
@@ -51,6 +54,12 @@ impl From<MessageProtocolError> for MessageHandlerError {
     }
 }
 
+impl From<crate::mumble_proto::PermissionDenied> for MessageHandlerError {
+    fn from(err: crate::mumble_proto::PermissionDenied) -> Self {
+        MessageHandlerError::PermissionDenied(err)
+    }
+}
+
 impl std::fmt::Display for MessageHandlerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -66,6 +75,9 @@ impl std::fmt::Display for MessageHandlerError {
             }
             MessageHandlerError::MessageProtocolError(e) => {
                 write!(f, "Message protocol error: {}", e)
+            }
+            MessageHandlerError::PermissionDenied(deny) => {
+                write!(f, "Permission denied: {:?}", deny.reason)
             }
         }
     }

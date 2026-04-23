@@ -18,6 +18,18 @@ impl From<crate::mumble_proto::CryptSetup> for CryptSetup {
 }
 
 impl CryptSetup {
+    pub fn new(
+        key: Option<Vec<u8>>,
+        client_nonce: Option<Vec<u8>>,
+        server_nonce: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            key,
+            client_nonce,
+            server_nonce,
+        }
+    }
+
     pub fn is_client_request_resync(&self) -> bool {
         self.client_nonce.is_none()
     }

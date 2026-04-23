@@ -119,14 +119,13 @@ pub async fn handle_authenticate(
         .map_err(|_| RejectType::AuthenticatorFail)?;
 
     let crypt_setup_msg: Message = {
-        use crate::mumble_proto::CryptSetup;
         let crypt = sender.crypt_state().await;
         let state = crypt.as_ref().expect("crypt state just created");
-        Message::CryptSetup(CryptSetup {
-            key: state.key().map(|k| k.to_vec()),
-            client_nonce: Some(state.encrypt_iv().to_vec()),
-            server_nonce: Some(state.decrypt_iv().to_vec()),
-        })
+        crate::messages::encoder::CryptSetup::new(
+            state.key().map(|k| k.to_vec()),
+            Some(state.encrypt_iv().to_vec()),
+            Some(state.decrypt_iv().to_vec()),
+        ).into()
     };
 
     // ── Place user in the default channel ────────────────────────────────
@@ -177,7 +176,7 @@ pub async fn handle_authenticate(
             }
             let Some(ch) = ch_map.get(&id) else { continue };
             let links: Vec<u32> = ch.links.iter().copied().collect();
-            burst.push(Message::ChannelState(crate::mumble_proto::ChannelState {
+            burst.push(crate::messages::encoder::ChannelState {
                 channel_id: Some(ch.id),
                 parent: ch.parent_id,
                 name: Some(ch.name.clone()),
@@ -194,7 +193,7 @@ pub async fn handle_authenticate(
                 max_users: Some(ch.max_users),
                 is_enter_restricted: None,
                 can_enter: None,
-            }));
+            }.into());
             // Enqueue children
             for child in ch_map.values().filter(|c| c.parent_id == Some(id)) {
                 queue.push_back(child.id);

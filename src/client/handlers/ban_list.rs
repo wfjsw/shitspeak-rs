@@ -3,8 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
-    mumble_proto::BanList,
+    messages::{encoder::BanList, Message, WriteMessageExt},
     server::Server,
 };
 
@@ -23,10 +22,10 @@ pub async fn handle_ban_list(
 
     if msg.query.unwrap_or(false) {
         // Query mode: return current ban list (empty for now — no ban storage yet)
-        let reply = Message::BanList(BanList {
+        let reply: Message = BanList {
             bans: Vec::new(),
             query: Some(false),
-        });
+        }.into();
         sender.write_proto_message(&reply).await?;
     } else {
         // Update mode: replace ban list with provided entries

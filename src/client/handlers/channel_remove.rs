@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    mumble_proto::ChannelRemove,
+    messages::encoder::ChannelRemove,
     server::Server,
 };
 

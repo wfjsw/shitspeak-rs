@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
     mumble_proto::{
         PermissionDenied,
         permission_denied::DenyType,
@@ -115,17 +114,15 @@ pub async fn handle_user_state(
         if current != new_channel_id {
             // Verify the channel exists
             if new_channel_id != 0 && server.get_channels().get_channel(new_channel_id).await.is_none() {
-                let deny = Message::PermissionDenied(PermissionDenied {
+                drop(gs); // release guard before returning error
+                return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                     r#type: Some(DenyType::ChannelName as i32),
                     session: Some(u32::from(sender_id)),
                     channel_id: Some(new_channel_id),
                     reason: Some(format!("Channel {} does not exist", new_channel_id)),
                     name: None,
                     permission: None,
-                });
-                drop(gs); // release guard before async write
-                sender.write_proto_message(&deny).await?;
-                return Ok(());
+                }));
             }
             gs.set_current_channel_id(new_channel_id);
         }

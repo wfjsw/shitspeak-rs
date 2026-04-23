@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::mumble_proto::CryptSetup as ProtoCryptSetup;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
@@ -33,14 +32,13 @@ pub async fn handle_crypt_setup(
             .map_err(|_| crate::mumble_proto::reject::RejectType::AuthenticatorFail)?;
 
         let reply: Message = {
-            use crate::mumble_proto::CryptSetup as ProtoCryptSetup;
             let crypt = sender.crypt_state().await;
             let state = crypt.as_ref().expect("crypt state just created");
-            Message::CryptSetup(ProtoCryptSetup {
-                key: state.key().map(|k| k.to_vec()),
-                client_nonce: Some(state.encrypt_iv().to_vec()),
-                server_nonce: Some(state.decrypt_iv().to_vec()),
-            })
+            CryptSetup::new(
+                state.key().map(|k| k.to_vec()),
+                Some(state.encrypt_iv().to_vec()),
+                Some(state.decrypt_iv().to_vec()),
+            ).into()
         };
 
         sender.write_proto_message(&reply).await?;
@@ -57,11 +55,11 @@ pub async fn handle_crypt_setup(
                 .as_ref()
                 .map(|s| s.encrypt_iv().to_vec())
                 .unwrap_or_default();
-            Message::CryptSetup(ProtoCryptSetup {
-                key: None,
-                client_nonce: None,
-                server_nonce: Some(encrypt_iv),
-            })
+            CryptSetup::new(
+                None,
+                None,
+                Some(encrypt_iv),
+            ).into()
         };
         // Drop the crypt lock before the async write
         sender.write_proto_message(&reply).await?;

@@ -203,14 +203,12 @@ impl ClientStateLogEntry {
                 Some(crate::messages::Message::UserState(us.into()))
             }
             ClientStateOperation::RemoveClient { session_id } => {
-                Some(crate::messages::Message::UserRemove(
-                    crate::mumble_proto::UserRemove {
-                        session: u32::from(*session_id),
-                        actor: None,
-                        reason: None,
-                        ban: Some(false),
-                    },
-                ))
+                Some(crate::messages::encoder::UserRemove {
+                    session: u32::from(*session_id),
+                    actor: None,
+                    reason: None,
+                    ban: Some(false),
+                }.into())
             }
             ClientStateOperation::UpdateGlobalState {
                 session_id,

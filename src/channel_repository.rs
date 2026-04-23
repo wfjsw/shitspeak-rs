@@ -68,27 +68,21 @@ impl ChannelOperation {
                 Some(channel_to_proto_delta(*id, patch))
             }
             ChannelOp::DeleteChannel { id } => {
-                Some(crate::messages::Message::ChannelRemove(
-                    crate::mumble_proto::ChannelRemove { channel_id: *id },
-                ))
+                Some(crate::messages::encoder::ChannelRemove { channel_id: *id }.into())
             }
             ChannelOp::AddLink { a, b } => {
-                Some(crate::messages::Message::ChannelState(
-                    crate::mumble_proto::ChannelState {
-                        channel_id: Some(*a),
-                        links_add: vec![*b],
-                        ..Default::default()
-                    },
-                ))
+                Some(crate::messages::encoder::ChannelState {
+                    channel_id: Some(*a),
+                    links_add: vec![*b],
+                    ..Default::default()
+                }.into())
             }
             ChannelOp::RemoveLink { a, b } => {
-                Some(crate::messages::Message::ChannelState(
-                    crate::mumble_proto::ChannelState {
-                        channel_id: Some(*a),
-                        links_remove: vec![*b],
-                        ..Default::default()
-                    },
-                ))
+                Some(crate::messages::encoder::ChannelState {
+                    channel_id: Some(*a),
+                    links_remove: vec![*b],
+                    ..Default::default()
+                }.into())
             }
             ChannelOp::SetAcls { .. } => {
                 // ACL changes produce PermissionQuery messages, not ChannelState.
@@ -98,10 +92,10 @@ impl ChannelOperation {
     }
 }
 
-/// Build a full `ChannelState` protobuf message (for CreateChannel).
+/// Build a full `ChannelState` encoder message (for CreateChannel).
 fn channel_to_proto_full(ch: &Channel) -> crate::messages::Message {
     let links: Vec<u32> = ch.links.iter().copied().collect();
-    crate::messages::Message::ChannelState(crate::mumble_proto::ChannelState {
+    crate::messages::encoder::ChannelState {
         channel_id: Some(ch.id),
         parent: ch.parent_id,
         name: Some(ch.name.clone()),
@@ -114,12 +108,12 @@ fn channel_to_proto_full(ch: &Channel) -> crate::messages::Message {
             .and_then(|h| hex::decode(h).ok()),
         max_users: Some(ch.max_users),
         ..Default::default()
-    })
+    }.into()
 }
 
-/// Build a delta `ChannelState` protobuf message (for UpdateChannel).
+/// Build a delta `ChannelState` encoder message (for UpdateChannel).
 fn channel_to_proto_delta(id: u32, patch: &ChannelPatch) -> crate::messages::Message {
-    crate::messages::Message::ChannelState(crate::mumble_proto::ChannelState {
+    crate::messages::encoder::ChannelState {
         channel_id: Some(id),
         parent: patch.parent_id.unwrap_or(None),
         name: patch.name.clone(),
@@ -129,7 +123,7 @@ fn channel_to_proto_delta(id: u32, patch: &ChannelPatch) -> crate::messages::Mes
             h.as_ref().and_then(|h| hex::decode(h).ok())
         }),
         ..Default::default()
-    })
+    }.into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

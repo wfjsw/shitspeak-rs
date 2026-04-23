@@ -695,12 +695,12 @@ impl Server {
         );
 
         if changed {
-            let msg = crate::messages::Message::CodecVersion(crate::mumble_proto::CodecVersion {
+            let msg: crate::messages::Message = crate::messages::encoder::CodecVersion {
                 alpha: codec.alpha_codec(),
                 beta: codec.beta_codec(),
                 prefer_alpha: codec.prefer_alpha_codec(),
                 opus: Some(codec.opus()),
-            });
+            }.into();
             drop(codec);
             self.clients.broadcast_all(&msg).await;
         }

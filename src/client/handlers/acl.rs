@@ -4,15 +4,14 @@ use crate::{
     acl::ACL,
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt},
-    mumble_proto::Acl as ProtoAcl,
+    messages::{encoder::Acl as EncoderAcl, Message, WriteMessageExt},
     server::Server,
 };
 
 pub async fn handle_acl(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
-    msg: ProtoAcl,
+    msg: EncoderAcl,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
         return Ok(());
@@ -50,9 +49,9 @@ pub async fn handle_acl(
                     deny: Some(acl.deny.bits()),
                 };
                 // Collect into a per-channel ACL message
-                match acls.iter_mut().find(|a: &&mut ProtoAcl| a.channel_id == ch.id) {
+                match acls.iter_mut().find(|a: &&mut EncoderAcl| a.channel_id == ch.id) {
                     Some(existing) => existing.acls.push(proto_acl),
-                    None => acls.push(ProtoAcl {
+                    None => acls.push(EncoderAcl {
                         channel_id: ch.id,
                         inherit_acls: Some(ch.inherit_acl),
                         groups: Vec::new(),
@@ -69,7 +68,7 @@ pub async fn handle_acl(
 
         // Send back the ACL list
         for acl_msg in acls {
-            sender.write_proto_message(&Message::ACL(acl_msg)).await?;
+            sender.write_proto_message(&Message::ACL(acl_msg.into())).await?;
         }
     } else {
         // ── Update mode: apply new ACLs ──────────────────────────────────
@@ -108,11 +107,11 @@ pub async fn handle_acl(
             if affected {
                 // Recompute and send permissions
                 let perms = compute_permissions_for_client(server, client, client_ch).await;
-                let reply = Message::PermissionQuery(crate::mumble_proto::PermissionQuery {
+                let reply: Message = crate::messages::encoder::PermissionQuery {
                     channel_id: Some(client_ch),
                     permissions: Some(perms.bits()),
                     flush: Some(false),
-                });
+                }.into();
                 let _ = client.write_proto_message(&reply).await;
             }
         }

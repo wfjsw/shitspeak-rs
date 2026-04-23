@@ -87,7 +87,7 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
         message: Message,
     ) -> Result<(), MessageHandlerError> {
         let session = u32::from(self.get_session_id());
-        match message {
+        let result = match message {
             Message::Version(version) => {
                 tracing::debug!(session, "handling Version");
                 handle_version(server, self, version.into()).await
@@ -119,15 +119,15 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             }
             Message::ChannelRemove(channel_remove) => {
                 tracing::debug!(session, channel_id = channel_remove.channel_id, "handling ChannelRemove");
-                handle_channel_remove(server, self, channel_remove).await
+                handle_channel_remove(server, self, channel_remove.into()).await
             }
             Message::ChannelState(channel_state) => {
                 tracing::debug!(session, channel_id = channel_state.channel_id, "handling ChannelState");
-                handle_channel_state(server, self, channel_state).await
+                handle_channel_state(server, self, channel_state.into()).await
             }
             Message::UserRemove(user_remove) => {
                 tracing::debug!(session, target = user_remove.session, "handling UserRemove");
-                handle_user_remove(server, self, user_remove).await
+                handle_user_remove(server, self, user_remove.into()).await
             }
             Message::UserState(user_state) => {
                 tracing::debug!(session, target = user_state.session, "handling UserState");
@@ -140,11 +140,11 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             }
             Message::BanList(ban_list) => {
                 tracing::debug!(session, query = ban_list.query, "handling BanList");
-                handle_ban_list(server, self, ban_list).await
+                handle_ban_list(server, self, ban_list.into()).await
             }
             Message::TextMessage(text_message) => {
                 tracing::debug!(session, channels = ?text_message.channel_id, trees = ?text_message.tree_id, "handling TextMessage");
-                handle_text_message(server, self, text_message).await
+                handle_text_message(server, self, text_message.into()).await
             }
             Message::PermissionDenied(_) => {
                 tracing::debug!(session, "rejecting incoming PermissionDenied");
@@ -152,11 +152,11 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             }
             Message::ACL(acl) => {
                 tracing::debug!(session, channel_id = acl.channel_id, query = acl.query, "handling ACL");
-                handle_acl(server, self, acl).await
+                handle_acl(server, self, acl.into()).await
             }
             Message::QueryUsers(query_users) => {
                 tracing::debug!(session, ids = ?query_users.ids, names = ?query_users.names, "handling QueryUsers");
-                handle_query_users(server, self, query_users).await
+                handle_query_users(server, self, query_users.into()).await
             }
             Message::CryptSetup(crypt_setup) => {
                 tracing::debug!(session, "handling CryptSetup");
@@ -172,15 +172,15 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             }
             Message::UserList(user_list) => {
                 tracing::debug!(session, num_users = user_list.users.len(), "handling UserList");
-                handle_user_list(server, self, user_list).await
+                handle_user_list(server, self, user_list.into()).await
             }
             Message::VoiceTarget(voice_target) => {
                 tracing::debug!(session, target_id = voice_target.id, "handling VoiceTarget");
-                handle_voice_target(server, self, voice_target).await
+                handle_voice_target(server, self, voice_target.into()).await
             }
             Message::PermissionQuery(permission_query) => {
                 tracing::debug!(session, channel_id = permission_query.channel_id, "handling PermissionQuery");
-                handle_permission_query(server, self, permission_query).await
+                handle_permission_query(server, self, permission_query.into()).await
             }
             Message::CodecVersion(_) => {
                 tracing::debug!(session, "rejecting incoming CodecVersion");
@@ -188,11 +188,11 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             }
             Message::UserStats(user_stats) => {
                 tracing::debug!(session, target = user_stats.session, "handling UserStats");
-                handle_user_stats(server, self, user_stats).await
+                handle_user_stats(server, self, user_stats.into()).await
             }
             Message::RequestBlob(request_blob) => {
                 tracing::debug!(session, textures = request_blob.session_texture.len(), comments = request_blob.session_comment.len(), "handling RequestBlob");
-                handle_request_blob(server, self, request_blob).await
+                handle_request_blob(server, self, request_blob.into()).await
             }
             Message::ServerConfig(_) => {
                 tracing::debug!(session, "rejecting incoming ServerConfig");
@@ -202,6 +202,18 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 tracing::debug!(session, "rejecting incoming SuggestConfig");
                 Err(MessageTypeNotForIncoming::new(message).into())
             }
+        };
+
+        // Triage the result: PermissionDenied errors are sent back to the
+        // client as a PermissionDenied message; all other errors propagate.
+        match result {
+            Err(MessageHandlerError::PermissionDenied(deny)) => {
+                use crate::messages::WriteMessageExt;
+                self.write_proto_message(&crate::messages::Message::PermissionDenied(deny))
+                    .await?;
+                Ok(())
+            }
+            other => other,
         }
     }
 }
