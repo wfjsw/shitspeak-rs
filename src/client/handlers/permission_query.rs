@@ -20,7 +20,7 @@ pub async fn handle_permission_query(
     
     if let Some(channel_id) = msg.channel_id {
         // Compute effective permissions using the ACL system
-        let perms = super::acl::compute_permissions_for_client(server, sender, channel_id).await;
+        let perms = crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
 
         tracing::debug!(session = u32::from(sender.get_session_id()), channel_id, permissions = perms.bits(), "Computed permissions for PermissionQuery");
 

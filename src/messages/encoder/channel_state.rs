@@ -20,6 +20,21 @@ pub struct ChannelState {
     pub can_enter: Option<bool>,
 }
 
+impl ChannelState {
+    /// Fill `is_enter_restricted` and `can_enter` from the channel's ACLs
+    /// and the given effective permissions.  Call this when
+    /// `send_permission_info` is enabled.
+    pub fn with_permission_info(mut self, channel: &crate::channels::Channel, perms: enumflags2::BitFlags<crate::acl::ACLPermissions>) -> Self {
+        use crate::acl::ACLPermissions;
+        self.is_enter_restricted = Some(
+            crate::acl::channel_has_restriction(channel, ACLPermissions::Traverse)
+                || crate::acl::channel_has_restriction(channel, ACLPermissions::Enter),
+        );
+        self.can_enter = Some(perms.contains(ACLPermissions::Enter));
+        self
+    }
+}
+
 impl From<crate::mumble_proto::ChannelState> for ChannelState {
     fn from(proto: crate::mumble_proto::ChannelState) -> Self {
         Self {

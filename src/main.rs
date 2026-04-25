@@ -4,6 +4,7 @@
 use crate::{config::Config, server::Server};
 
 mod acl;
+mod ban_repository;
 mod blob_store;
 mod channel_repository;
 mod channels;
@@ -11,7 +12,9 @@ mod client;
 mod client_repository;
 mod codec_info;
 mod config;
+mod config_watcher;
 mod constants;
+mod context_action;
 mod geoip;
 mod messages;
 mod server;
@@ -21,6 +24,7 @@ mod voice_crypto;
 mod client_certificate_verifier;
 mod proxy_protocol;
 mod protocol_version;
+mod register;
 mod errors;
 mod api;
 
@@ -44,10 +48,16 @@ impl api::Authenticator for NoopAuthenticator {
         _auxiliary_data: &api::AuthenticateAuxiliaryData,
     ) -> Result<api::AuthenticateResult, api::AuthenticationRejection> {
         // Accept everyone with no user ID (guests only).
+        // Users with username "admin" get the "admin" group for superuser privileges.
+        let groups = if username == "admin" {
+            vec!["admin".to_owned()]
+        } else {
+            Vec::new()
+        };
         Ok(api::AuthenticateResult {
             user_id: None,
             display_name: Some(username.to_owned()),
-            groups: Vec::new(),
+            groups,
             texture_url: None,
             comment_url: None,
         })
@@ -65,7 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = Server::new(config, NoopAuthenticator).await?;
 
     // Shutdown signal: dropping the sender notifies all spawned tasks.
-    let (shutdown_tx, _) = tokio::sync::watch::channel(());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+    // Spawn the hot config reload watcher.
+    let _watcher = config_watcher::spawn_config_watcher(server.clone(), shutdown_rx);
 
     // Graceful shutdown: wait for Ctrl-C while the server runs.
     tokio::select! {

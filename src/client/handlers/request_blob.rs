@@ -158,7 +158,7 @@ pub async fn handle_request_blob(
             None => None,
         };
 
-        let reply: Message = crate::messages::encoder::ChannelState {
+        let mut cs = crate::messages::encoder::ChannelState {
             channel_id: Some(ch.id),
             parent: ch.parent_id,
             name: Some(ch.name.clone()),
@@ -177,8 +177,12 @@ pub async fn handle_request_blob(
             max_users: Some(ch.max_users),
             is_enter_restricted: None,
             can_enter: None,
+        };
+        if server.get_send_permission_info() {
+            let perms = crate::client::acl::compute_permissions_for_client(server, sender, ch.id).await;
+            cs = cs.with_permission_info(&ch, perms);
         }
-        .into();
+        let reply: Message = cs.into();
         sender.write_proto_message(&reply).await?;
     }
 

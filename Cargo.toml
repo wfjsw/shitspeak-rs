@@ -9,6 +9,7 @@ bytes = "1.11.0"
 chrono = { version = "0.4.41", features = ["serde"] }
 cidr = "0.3.2"
 config = "0.15.19"
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 enumflags2 = { version = "0.7.12", features = ["serde"] }
 hex = "0.4.3"
 maxminddb = { version = "0.26.0", features = ["mmap", "simdutf8"] }
@@ -32,6 +33,7 @@ tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde", "
 message_macro = { path = "src/messages/macros" }
 os_info = "3.14.0"
 async-trait = "0.1.89"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [build-dependencies]
 chrono = "0.4.41"
@@ -39,3 +41,8 @@ prost-build = "0.13.5"
 
 [dev-dependencies]
 rcgen = "0.13"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "acl"
+harness = false

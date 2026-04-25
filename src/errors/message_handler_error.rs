@@ -2,8 +2,7 @@ use crate::{
     errors::{
         AuthRejection, MessageTypeNotForIncoming, ReadProtoMessageError, WriteProtoMessageError,
     },
-    messages::errors::MessageProtocolError,
-    mumble_proto::reject::RejectType,
+    messages::{encoder::{PermissionDenied, RejectType}, errors::MessageProtocolError},
 };
 
 #[derive(Debug)]
@@ -15,7 +14,7 @@ pub enum MessageHandlerError {
     MessageProtocolError(MessageProtocolError),
     /// A handler wants to send a PermissionDenied message back to the client.
     /// The caller (handle_message) is responsible for writing it.
-    PermissionDenied(crate::mumble_proto::PermissionDenied),
+    PermissionDenied(PermissionDenied),
 }
 
 impl From<WriteProtoMessageError> for MessageHandlerError {
@@ -54,8 +53,8 @@ impl From<MessageProtocolError> for MessageHandlerError {
     }
 }
 
-impl From<crate::mumble_proto::PermissionDenied> for MessageHandlerError {
-    fn from(err: crate::mumble_proto::PermissionDenied) -> Self {
+impl From<PermissionDenied> for MessageHandlerError {
+    fn from(err: PermissionDenied) -> Self {
         MessageHandlerError::PermissionDenied(err)
     }
 }

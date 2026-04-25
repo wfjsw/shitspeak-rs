@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
+    acl::ACLPermissions,
     client::Client,
     errors::MessageHandlerError,
-    mumble_proto::{
-        PermissionDenied,
-        permission_denied::DenyType,
-    },
+    messages::encoder::{DenyType, PermissionDenied},
     server::Server,
 };
 
@@ -26,7 +24,6 @@ pub async fn handle_user_state(
     // Determine whether this is a self-update or a moderator action.
     let target = match msg.session {
         Some(session_id) if session_id != sender_id => {
-            // Acting on another user — TODO: check MuteDeafen / Move permissions.
             match repo.get_client(session_id).await {
                 Some(c) => c,
                 None => return Ok(()), // target gone, ignore
@@ -37,6 +34,75 @@ pub async fn handle_user_state(
 
     let target_id = target.get_session_id();
     let is_self = target_id == sender_id;
+
+    // ── ACL: Channel move ────────────────────────────────────────────────
+    // Check permissions before acquiring the guard, so we can return early.
+    if let Some(new_channel_id) = msg.channel_id {
+        let current = target.get_current_channel_id().await;
+        if current != new_channel_id && new_channel_id != 0 {
+            let dst_chan = server.get_channels().get_channel(new_channel_id).await;
+            if dst_chan.is_none() {
+                return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                    r#type: DenyType::ChannelName,
+                    session: u32::from(sender_id),
+                    channel_id: Some(new_channel_id),
+                    reason: Some(format!("Channel {} does not exist", new_channel_id)),
+                    name: None,
+                    permission: None,
+                }));
+            }
+
+            if is_self {
+                // Moving self: need Enter on destination
+                let perms = crate::client::acl::compute_permissions_for_client(server, &target, new_channel_id).await;
+                if !perms.contains(ACLPermissions::Enter) {
+                    return Err(MessageHandlerError::PermissionDenied(
+                        PermissionDenied::for_permission(u32::from(target_id), Some(new_channel_id), ACLPermissions::Enter),
+                    ));
+                }
+            } else {
+                // Moving others: need Move on target's current channel
+                let src_ch = target.get_current_channel_id().await;
+                let src_perms = crate::client::acl::compute_permissions_for_client(server, sender, src_ch).await;
+                if !src_perms.contains(ACLPermissions::Move) {
+                    return Err(MessageHandlerError::PermissionDenied(
+                        PermissionDenied::for_permission(u32::from(sender_id), Some(src_ch), ACLPermissions::Move),
+                    ));
+                }
+                // If target lacks Enter on destination, actor needs Move on destination too
+                let dst_perms = crate::client::acl::compute_permissions_for_client(server, &target, new_channel_id).await;
+                if !dst_perms.contains(ACLPermissions::Enter) {
+                    let actor_dst = crate::client::acl::compute_permissions_for_client(server, sender, new_channel_id).await;
+                    if !actor_dst.contains(ACLPermissions::Move) {
+                        return Err(MessageHandlerError::PermissionDenied(
+                            PermissionDenied::for_permission(u32::from(sender_id), Some(new_channel_id), ACLPermissions::Move),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── ACL: Mute/deaf/suppress/priority_speaker (moderator actions) ──────
+    if !is_self && (msg.mute.is_some() || msg.deaf.is_some() || msg.suppress.is_some() || msg.priority_speaker.is_some()) {
+        let target_ch = target.get_current_channel_id().await;
+        let perms = crate::client::acl::compute_permissions_for_client(server, sender, target_ch).await;
+        if !perms.contains(ACLPermissions::MuteDeafen) {
+            return Err(MessageHandlerError::PermissionDenied(
+                PermissionDenied::for_permission(u32::from(sender_id), Some(target_ch), ACLPermissions::MuteDeafen),
+            ));
+        }
+    }
+
+    // ── ACL: Listening channel add ────────────────────────────────────────
+    for ch_id in &msg.listening_channel_add {
+        let perms = crate::client::acl::compute_permissions_for_client(server, sender, *ch_id).await;
+        if !perms.contains(ACLPermissions::Listen) {
+            return Err(MessageHandlerError::PermissionDenied(
+                PermissionDenied::for_permission(u32::from(sender_id), Some(*ch_id), ACLPermissions::Listen),
+            ));
+        }
+    }
 
     // ── Acquire a single transactional guard for all mutations ─────────
     // All changes in this handler are batched into one version bump.
@@ -122,8 +188,8 @@ pub async fn handle_user_state(
             // Verify the channel exists
             if new_channel_id != 0 && server.get_channels().get_channel(new_channel_id).await.is_none() {
                 return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
-                    r#type: Some(DenyType::ChannelName as i32),
-                    session: Some(u32::from(sender_id)),
+                    r#type: DenyType::ChannelName,
+                    session: u32::from(sender_id),
                     channel_id: Some(new_channel_id),
                     reason: Some(format!("Channel {} does not exist", new_channel_id)),
                     name: None,

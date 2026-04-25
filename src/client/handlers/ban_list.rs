@@ -1,6 +1,8 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::{
+    ban_repository::BanEntry,
     client::Client,
     errors::MessageHandlerError,
     messages::{encoder::BanList, Message, WriteMessageExt},
@@ -21,15 +23,43 @@ pub async fn handle_ban_list(
     // TODO: require Ban permission on root channel
 
     if msg.query.unwrap_or(false) {
-        // Query mode: return current ban list (empty for now — no ban storage yet)
+        // Query mode: return current ban list
+        let active = server.get_bans().get_active_bans().await;
+        let bans: Vec<crate::mumble_proto::ban_list::BanEntry> = active
+            .into_iter()
+            .map(|b| crate::mumble_proto::ban_list::BanEntry {
+                address: b.address.to_string().into_bytes(),
+                mask: b.mask as u32,
+                name: b.name.clone(),
+                hash: b.hash.clone(),
+                reason: b.reason.clone(),
+                start: Some(b.start.to_string()),
+                duration: Some(b.duration as u32),
+            })
+            .collect();
         let reply: Message = BanList {
-            bans: Vec::new(),
+            bans,
             query: Some(false),
         }.into();
         sender.write_proto_message(&reply).await?;
     } else {
         // Update mode: replace ban list with provided entries
-        // TODO: persist ban list
+        let entries: Vec<BanEntry> = msg.bans.iter().map(|b| {
+            let addr_str = String::from_utf8_lossy(&b.address);
+            BanEntry {
+                address: addr_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0])),
+                mask: b.mask as u8,
+                name: b.name.clone(),
+                hash: b.hash.clone(),
+                reason: b.reason.clone(),
+                start: b.start.as_ref().and_then(|s| s.parse().ok()).unwrap_or(chrono::Utc::now().timestamp()),
+                duration: b.duration.unwrap_or(0) as u64,
+            }
+        }).collect();
+
+        if let Err(e) = server.get_bans().set_bans(entries).await {
+            tracing::warn!("Failed to persist ban list: {e}");
+        }
         tracing::info!(
             "Ban list update from session {:?} with {} entries",
             sender.get_session_id(),

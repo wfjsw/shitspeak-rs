@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::CryptSetup, Message, WriteMessageExt},
+    messages::{encoder::{CryptSetup, RejectType}, Message, WriteMessageExt},
     server::Server,
 };
 
@@ -29,7 +29,7 @@ pub async fn handle_crypt_setup(
         sender
             .create_crypt_state("OCB2-AES128")
             .await
-            .map_err(|_| crate::mumble_proto::reject::RejectType::AuthenticatorFail)?;
+            .map_err(|_| RejectType::AuthenticatorFail)?;
 
         let reply: Message = {
             let crypt = sender.crypt_state().await;

@@ -1,4 +1,4 @@
-use crate::mumble_proto::{Reject, reject::RejectType};
+use crate::messages::encoder::RejectType;
 
 #[derive(Debug, Clone)]
 pub struct AuthRejection {
@@ -33,11 +33,11 @@ impl std::fmt::Display for AuthRejection {
 
 impl std::error::Error for AuthRejection {}
 
-impl Into<Reject> for AuthRejection {
-    fn into(self) -> Reject {
-        Reject {
+impl Into<crate::messages::encoder::Reject> for AuthRejection {
+    fn into(self) -> crate::messages::encoder::Reject {
+        crate::messages::encoder::Reject {
+            r#type: Some(self.rejection_type),
             reason: self.reason,
-            r#type: Some(self.rejection_type.into()),
         }
     }
 }

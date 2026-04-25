@@ -11,6 +11,21 @@ pub struct Config {
     pub listen: String,
     pub opus_threshold: u16,
     pub register_name: String,
+
+    // ── Public server registration ────────────────────────────────────────
+    /// Password for authenticating with the public server registry.
+    #[serde(default)]
+    pub register_password: Option<String>,
+    /// URL of the public server registry.
+    #[serde(default)]
+    pub register_url: Option<String>,
+    /// Hostname (or IP) that the registry should advertise for this server.
+    /// If empty, the server's listen address is used.
+    #[serde(default)]
+    pub register_hostname: Option<String>,
+    /// Geographic location string (e.g. "New York, USA") for the registry.
+    #[serde(default)]
+    pub register_location: Option<String>,
     pub cert_path: String,
     pub key_path: String,
     pub send_version: bool,
@@ -69,6 +84,18 @@ pub struct Config {
     /// Default: 30.
     #[serde(default = "default_idle_timeout")]
     pub client_idle_timeout_secs: u64,
+
+    // ── Access control ────────────────────────────────────────────────────
+    /// Groups required to connect.  If empty, all authenticated users are
+    /// allowed.  If non-empty, a user must belong to at least one of these
+    /// groups to pass authentication.
+    #[serde(default)]
+    pub required_groups: Vec<String>,
+
+    /// When `true`, `ChannelState` messages include `is_enter_restricted`
+    /// and `can_enter` fields computed from ACLs.  Default: `false`.
+    #[serde(default)]
+    pub send_permission_info: bool,
 }
 
 fn default_max_bandwidth() -> u32 { 72_000 }
@@ -80,13 +107,28 @@ fn default_idle_timeout() -> u64 { 30 }
 
 impl Config {
     pub fn load() -> Self {
+        Self::build_config()
+            .try_deserialize()
+            .expect("Failed to load config.toml")
+    }
+
+    /// Reload config from disk. Returns `Ok(Some(new_config))` if the file
+    /// was read successfully, `Ok(None)` if the file doesn't exist, or an
+    /// error if deserialization fails.
+    pub fn reload() -> Result<Option<Self>, config::ConfigError> {
+        // Check if the file actually exists before trying to deserialize
+        if !std::path::Path::new("config.toml").exists() {
+            return Ok(None);
+        }
+        Self::build_config().try_deserialize().map(Some)
+    }
+
+    fn build_config() -> ConfigCrate {
         ConfigCrate::builder()
             .add_source(File::with_name("config"))
             .add_source(Environment::with_prefix("SHITSPEAK").separator("_"))
             .build()
-            .unwrap()
-            .try_deserialize()
-            .unwrap()
+            .expect("Failed to build config sources")
     }
 }
 

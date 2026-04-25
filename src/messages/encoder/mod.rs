@@ -23,6 +23,7 @@ mod server_sync;
 mod context_action;
 mod context_action_modify;
 mod permission_denied;
+mod reject_type;
 
 pub use version::*;
 pub use ping::*;
@@ -49,3 +50,4 @@ pub use server_sync::*;
 pub use context_action::*;
 pub use context_action_modify::*;
 pub use permission_denied::*;
+pub use reject_type::*;

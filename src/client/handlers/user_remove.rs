@@ -33,9 +33,23 @@ pub async fn handle_user_remove(
     let reason = msg.reason.clone().unwrap_or_default();
 
     if is_ban {
-        // TODO: add to ban list
+        let entry = crate::ban_repository::BanEntry {
+            address: target.get_real_ip_address(),
+            mask: if target.get_real_ip_address().is_ipv4() { 32 } else { 128 },
+            name: {
+                let gs = target.read_global_state().await;
+                gs.get_display_name_opt().map(|s| s.to_owned())
+            },
+            hash: target.get_certificate_hash().map(|h| hex::encode(h)),
+            reason: if reason.is_empty() { None } else { Some(reason.clone()) },
+            start: chrono::Utc::now().timestamp(),
+            duration: 0, // permanent
+        };
+        if let Err(e) = server.get_bans().add_ban(entry).await {
+            tracing::warn!("Failed to persist ban: {e}");
+        }
         tracing::info!(
-            "Ban requested for session {:?} by {:?}: {}",
+            "Ban added for session {:?} by {:?}: {}",
             target_session,
             sender.get_session_id(),
             reason

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use tokio::sync::Mutex;
@@ -18,7 +18,7 @@ use crate::channel_repository::ChannelRepository;
 use crate::client::AsyncMessageHandlerExt;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{
-    HandleIncomingConnectionError,
+    HandleIncomingConnectionError, ReadProtoMessageError,
 };
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
@@ -32,8 +32,8 @@ use crate::{
 pub struct Server {
     node_identifier: NodeIdentifier,
 
-    // Config
-    config: Config,
+    // Shared config — can be hot-reloaded at runtime
+    config: Arc<RwLock<Config>>,
 
     allowed_proxies: Vec<AnyIpCidr>,
 
@@ -45,10 +45,14 @@ pub struct Server {
     channels: Arc<ChannelRepository>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
+    bans: Arc<crate::ban_repository::BanRepository>,
 
     codec_info: Mutex<CodecInfo>,
 
     authenticator: Box<dyn Authenticator>,
+
+    /// Registry of server-defined context menu actions.
+    context_actions: Arc<crate::context_action::ContextActionRegistry>,
 }
 
 impl Server {
@@ -85,12 +89,13 @@ impl Server {
 
         // ── Channel repository & blob stores ─────────────────────────────
         let node_id = config.node_id;
-        let (channels, channel_blobs, session_blobs) = match &config.blob_storage_dir {
+        let (channels, channel_blobs, session_blobs, bans) = match &config.blob_storage_dir {
             Some(dir) => {
                 let ch_repo = ChannelRepository::open(node_id, dir).await?;
                 let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
-                (ch_repo, ch_blobs, s_blobs)
+                let ban_repo = crate::ban_repository::BanRepository::open(node_id, dir).await?;
+                (ch_repo, ch_blobs, s_blobs, ban_repo)
             }
             None => {
                 // In-memory mode: use a temp dir for blob stores so the
@@ -99,9 +104,12 @@ impl Server {
                 let ch_repo = ChannelRepository::new_in_memory(node_id);
                 let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
-                (ch_repo, ch_blobs, s_blobs)
+                let ban_repo = crate::ban_repository::BanRepository::new_in_memory(node_id);
+                (ch_repo, ch_blobs, s_blobs, ban_repo)
             }
         };
+
+        let config = Arc::new(RwLock::new(config));
 
         let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
@@ -113,9 +121,11 @@ impl Server {
             channels,
             channel_blobs,
             session_blobs,
+            bans,
             codec_info: Mutex::new(CodecInfo::default()),
             authenticator: Box::new(authenticator),
             config,
+            context_actions: Arc::new(crate::context_action::ContextActionRegistry::new()),
         }));
 
         // Wire cross-repo causal notification: ChannelRepository notifies
@@ -123,6 +133,11 @@ impl Server {
         server.channels.set_client_repo(server.clients.clone()).await;
 
         Ok(server)
+    }
+
+    /// Read the current config (acquires a read lock).
+    pub fn read_config(&self) -> std::sync::RwLockReadGuard<'_, Config> {
+        self.config.read().expect("Config RwLock poisoned")
     }
 
     pub async fn run(
@@ -133,16 +148,22 @@ impl Server {
 
         let shutdown_rx = shutdown_tx.subscribe();
 
+        // Snapshot startup-only config values (cannot be hot-reloaded).
+        let udp_channel_size = self.read_config().udp_channel_size;
+        let udp_voice_enabled = self.read_config().udp_voice_enabled;
+        let udp_ping_enabled = self.read_config().udp_ping_enabled;
+        let idle_timeout_secs = self.read_config().client_idle_timeout_secs;
+
         // Bounded channel shared between UDP drain and processing tasks.
         let (udp_in, udp_out) = tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(
-            self.config.udp_channel_size,
+            udp_channel_size,
         );
 
         let udp_drain = Self::spawn_udp_drain(
             Arc::clone(&self.udp_socket),
             udp_in,
-            self.config.udp_voice_enabled,
-            self.config.udp_ping_enabled,
+            udp_voice_enabled,
+            udp_ping_enabled,
             Arc::clone(self),
             shutdown_rx.clone(),
         );
@@ -150,15 +171,19 @@ impl Server {
             Arc::clone(self),
             Arc::clone(&self.udp_socket),
             udp_out,
-            self.config.udp_ping_enabled,
+            udp_ping_enabled,
             shutdown_rx.clone(),
         );
         let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx.clone());
         let idle_reaper = Self::spawn_idle_reaper(
             Arc::clone(self),
-            self.config.client_idle_timeout_secs,
-            shutdown_rx,
+            idle_timeout_secs,
+            shutdown_rx.clone(),
         );
+
+        // Public server registration (periodic HTTP POST to registry)
+        let register_task =
+            crate::register::spawn_register_task(Arc::clone(self), shutdown_rx);
 
         // Wait for any task to finish (error) or for the shutdown signal
         // to be dropped by the caller (main.rs drops shutdown_tx on Ctrl-C).
@@ -167,6 +192,7 @@ impl Server {
             result = udp_process => { let _ = result; }
             result = tcp_accept => { let _ = result; }
             result = idle_reaper => { let _ = result; }
+            result = register_task => { let _ = result; }
             _ = shutdown_tx.closed() => {
                 tracing::info!("Shutdown signal received.");
             }
@@ -439,16 +465,17 @@ impl Server {
         let tls_acceptor = self.tls_acceptor.clone();
         let mut tls_stream = tls_acceptor.accept(tcp_stream).await?;
 
-        // Send server version
-        tls_stream
-            .write_proto_message(
-                &Version::for_server(
-                    self.config.send_version,
-                    self.config.send_build_info,
-                    self.config.send_os_info,
-                )
-                .into(),
+        // Send server version (these are startup-only, read once)
+        let version = {
+            let cfg = self.read_config();
+            Version::for_server(
+                cfg.send_version,
+                cfg.send_build_info,
+                cfg.send_os_info,
             )
+        }; // cfg dropped here
+        tls_stream
+            .write_proto_message(&version.into())
             .await?;
 
         let client = self
@@ -494,6 +521,14 @@ impl Server {
                                     client.update_last_client_versions(&new_versions).await;
                                 }
                             }
+                            Err(crate::errors::ReadProtoMessageError::UnknownMessageType(err)) => {
+                                tracing::warn!(
+                                    "Client {:?} sent unknown message type {} — ignoring",
+                                    client_session_id,
+                                    err.message_type,
+                                );
+                                // Gracefully ignore unknown message types
+                            }
                             Err(_) => return Err(HandleIncomingConnectionError::MessageHandlerFailed),
                         }
                     }
@@ -508,7 +543,21 @@ impl Server {
                                 replay_channel_log_gap(
                                     &client, &self.channels, client_session_id, last, op.version,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
-                                if let Some(msg) = op.to_message() {
+                                if let Some(mut msg) = op.to_message() {
+                                    // Add permission info to ChannelState messages if configured
+                                    if self.read_config().send_permission_info {
+                                        if let crate::messages::Message::ChannelState(ref cs_proto) = msg {
+                                            if let Some(ch_id) = cs_proto.channel_id {
+                                                if let Some(ch) = self.channels.get_channel(ch_id).await {
+                                                    let perms = crate::client::acl::compute_permissions_for_client(
+                                                        self, &client, ch_id,
+                                                    ).await;
+                                                    let encoder_cs: crate::messages::encoder::ChannelState = cs_proto.clone().into();
+                                                    msg = encoder_cs.with_permission_info(&ch, perms).into();
+                                                }
+                                            }
+                                        }
+                                    }
                                     client.write_proto_message(&msg).await
                                         .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                 }
@@ -590,13 +639,83 @@ impl Server {
         result
     }
 
-    pub async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // self.config = Config::load();
-        Ok(())
+    /// Attempt to reload config from disk.  On success, atomically swaps
+    /// the shared config and logs the changed keys.  Returns an error only
+    /// if the config file is malformed (the old config stays in place).
+    pub fn reload_config(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match Config::reload() {
+            Ok(Some(new_config)) => {
+                let mut current = self.config.write().expect("Config RwLock poisoned");
+                // Log notable changes
+                if current.welcome_text != new_config.welcome_text {
+                    tracing::info!("config reload: welcome_text changed");
+                }
+                if current.max_bandwidth != new_config.max_bandwidth {
+                    tracing::info!(
+                        "config reload: max_bandwidth {} -> {}",
+                        current.max_bandwidth,
+                        new_config.max_bandwidth
+                    );
+                }
+                if current.max_users != new_config.max_users {
+                    tracing::info!(
+                        "config reload: max_users {} -> {}",
+                        current.max_users,
+                        new_config.max_users
+                    );
+                }
+                if current.udp_voice_enabled != new_config.udp_voice_enabled {
+                    tracing::info!(
+                        "config reload: udp_voice_enabled {} -> {}",
+                        current.udp_voice_enabled,
+                        new_config.udp_voice_enabled
+                    );
+                }
+                if current.udp_ping_enabled != new_config.udp_ping_enabled {
+                    tracing::info!(
+                        "config reload: udp_ping_enabled {} -> {}",
+                        current.udp_ping_enabled,
+                        new_config.udp_ping_enabled
+                    );
+                }
+                if current.client_idle_timeout_secs != new_config.client_idle_timeout_secs {
+                    tracing::info!(
+                        "config reload: client_idle_timeout_secs {} -> {}",
+                        current.client_idle_timeout_secs,
+                        new_config.client_idle_timeout_secs
+                    );
+                }
+                if current.required_groups != new_config.required_groups {
+                    tracing::info!("config reload: required_groups changed");
+                }
+                if current.send_permission_info != new_config.send_permission_info {
+                    tracing::info!(
+                        "config reload: send_permission_info {} -> {}",
+                        current.send_permission_info,
+                        new_config.send_permission_info
+                    );
+                }
+                *current = new_config;
+                tracing::info!("config reload: successfully applied new configuration");
+                Ok(())
+            }
+            Ok(None) => {
+                tracing::warn!("config reload: config.toml not found, keeping current config");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("config reload: failed to parse config.toml: {e}");
+                Err(Box::new(e))
+            }
+        }
     }
 
     pub fn get_authenticator(&self) -> &dyn Authenticator {
         self.authenticator.as_ref()
+    }
+
+    pub fn get_bans(&self) -> &Arc<crate::ban_repository::BanRepository> {
+        &self.bans
     }
 
     pub fn get_clients(&self) -> &Arc<ClientRepository> {
@@ -624,41 +743,52 @@ impl Server {
     }
 
     pub fn get_min_client_version(&self) -> u64 {
-        self.config.min_client_version
+        self.read_config().min_client_version
     }
 
     pub fn get_max_users(&self) -> u64 {
-        self.config.max_users
+        self.read_config().max_users
     }
 
     pub fn get_cert_required(&self) -> bool {
-        self.config.cert_required
+        self.read_config().cert_required
+    }
+
+    pub fn get_required_groups(&self) -> Vec<String> {
+        self.read_config().required_groups.clone()
+    }
+
+    pub fn get_send_permission_info(&self) -> bool {
+        self.read_config().send_permission_info
     }
 
     pub fn get_max_bandwidth(&self) -> u32 {
-        self.config.max_bandwidth
+        self.read_config().max_bandwidth
     }
 
-    pub fn get_welcome_text(&self) -> Option<&str> {
-        self.config.welcome_text.as_deref()
+    pub fn get_welcome_text(&self) -> Option<String> {
+        self.read_config().welcome_text.clone()
     }
 
     pub fn get_allow_html(&self) -> bool {
-        self.config.allow_html
+        self.read_config().allow_html
     }
 
     pub fn get_max_text_message_length(&self) -> u32 {
-        self.config.max_text_message_length
+        self.read_config().max_text_message_length
     }
 
     pub fn get_max_image_message_length(&self) -> u32 {
-        self.config.max_image_message_length
+        self.read_config().max_image_message_length
     }
 
     pub fn get_default_channel(&self) -> u32 {
-        self.config.default_channel
+        self.read_config().default_channel
     }
-
+    /// Access the context action registry.
+    pub fn context_actions(&self) -> &Arc<crate::context_action::ContextActionRegistry> {
+        &self.context_actions
+    }
     
     // ── UDP ping ─────────────────────────────────────────────────────────
 
@@ -667,12 +797,17 @@ impl Server {
         server: &Arc<Box<Self>>,
         ping: &crate::voice::ping::PingRequest,
     ) -> Result<Bytes, EncodeError> {
+        // Snapshot config values before any .await (RwLockReadGuard is !Send)
+        let (max_users, max_bandwidth) = {
+            let cfg = server.read_config();
+            (cfg.max_users, cfg.max_bandwidth)
+        };
         let response = crate::voice::ping::PingResponse {
             timestamp: ping.timestamp,
             server_version: crate::constants::APP_PROTO_VER,
             user_count: server.clients.len().await.clamp(0, u32::MAX.try_into().unwrap()) as u32,
-            max_user_count: Some(server.config.max_users.clamp(0, u32::MAX.into()) as u32),
-            max_bandwidth_per_user: server.config.max_bandwidth,
+            max_user_count: Some(max_users.clamp(0, u32::MAX.into()) as u32),
+            max_bandwidth_per_user: max_bandwidth,
         };
         crate::voice::ping::encode_ping_response(&response, ping.format)
     }
@@ -702,22 +837,25 @@ impl Server {
             }
         }
 
-        let mut codec = self.codec_info.lock().await;
-        let changed = codec.recheck(
-            alpha_count,
-            beta_count,
-            prefer_alpha_count,
-            opus_count,
-            total,
-        );
+        let changed = {
+            let mut codec = self.codec_info.lock().await;
+            codec.recheck(
+                alpha_count,
+                beta_count,
+                prefer_alpha_count,
+                opus_count,
+                total,
+            )
+        };
 
         if changed {
             let msg = {
+                let codec = self.codec_info.lock().await;
                 let alpha = codec.alpha_codec();
                 let beta = codec.beta_codec();
                 let prefer_alpha = codec.prefer_alpha_codec();
                 let opus = codec.opus();
-                drop(codec);
+                // codec lock released here — block scope ends
                 crate::messages::encoder::CodecVersion {
                     alpha,
                     beta,

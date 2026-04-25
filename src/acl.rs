@@ -57,7 +57,7 @@ impl ACL {
         self.user_id.is_some()
     }
 
-    pub fn is_channel_acl(&self) -> bool {
+    pub fn is_group_acl(&self) -> bool {
         self.user_id.is_none()
     }
 
@@ -108,7 +108,7 @@ pub fn evaluate_permission(
 ) -> BitFlags<ACLPermissions> {
 
     // FIXME: Temporarily allow all permissions for testing until we implement real ACLs
-    return BitFlags::all();
+    // return BitFlags::all();
 
     let mut allowed = BitFlags::empty();
     let mut denied = BitFlags::empty();
@@ -152,4 +152,10 @@ pub fn evaluate_permission(
 
     // Deny takes precedence over allow
     allowed & !denied
+}
+
+/// Check whether a channel has any deny rules on the given permission.
+/// Used to compute `is_enter_restricted` for `ChannelState` messages.
+pub fn channel_has_restriction(channel: &crate::channels::Channel, perm: ACLPermissions) -> bool {
+    return channel.acls.iter().any(|acl| acl.deny.contains(perm) || acl.deny.contains(ACLPermissions::Traverse));
 }

@@ -11,6 +11,7 @@ pub mod client_global_state;
 pub mod client_session_identifier;
 pub mod state_log;
 pub mod global_state_guard;
+pub(crate) mod acl;
 mod handlers;
 pub mod client_local_state;
 mod crypt;

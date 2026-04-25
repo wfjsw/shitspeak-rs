@@ -4,6 +4,14 @@ node_id = 1
 listen = "0.0.0.0:64738"
 opus_threshold = 100
 register_name = "ShitSpeak Test"
+
+# ── Public server registration ──────────────────────────────────────────
+# Uncomment and fill in to register this server with the public Mumble
+# server list.  All three fields are required for registration to activate.
+# register_password = "your-registry-password"
+# register_url = "https://publist-registration.mumble.info/v1/register"
+# register_hostname = "my-server.example.com"
+# register_location = "New York, USA"
 cert_path = "cert.pem"
 key_path = "key.pem"
 send_version = true
@@ -29,3 +37,6 @@ udp_channel_size = 2048
 
 # Idle timeout (seconds)
 client_idle_timeout_secs = 30
+
+# Persistence
+blob_storage_dir = "data"

@@ -320,6 +320,11 @@ impl ChannelRepository {
         self.channels.read().await.values().cloned().collect()
     }
 
+    /// Return the total number of channels.
+    pub async fn len(&self) -> usize {
+        self.channels.read().await.len()
+    }
+
     pub async fn get_children(&self, parent_id: u32) -> Vec<Channel> {
         self.channels
             .read()
@@ -348,6 +353,27 @@ impl ChannelRepository {
             current_id = pid;
         }
         result
+    }
+
+    /// Return both a channel and its ancestor chain in a single lock
+    /// acquisition.  Avoids the double-lock pattern in ACL evaluation.
+    pub async fn get_channel_with_ancestors(&self, channel_id: u32) -> (Option<Channel>, Vec<Channel>) {
+        let channels = self.channels.read().await;
+        let channel = channels.get(&channel_id).cloned();
+        let mut ancestors = Vec::new();
+        let mut current_id = channel_id;
+        loop {
+            let Some(ch) = channels.get(&current_id) else {
+                break;
+            };
+            let Some(pid) = ch.parent_id else { break };
+            let Some(parent) = channels.get(&pid) else {
+                break;
+            };
+            ancestors.push(parent.clone());
+            current_id = pid;
+        }
+        (channel, ancestors)
     }
 
     // ── Mutation API ──────────────────────────────────────────────────────
@@ -609,29 +635,31 @@ impl ChannelRepository {
         })?;
 
         // Write snapshot atomically
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&snapshot_tmp)
-            .await?;
-        file.write_all(&json).await?;
-        file.sync_data().await?;
-        drop(file);
+        {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&snapshot_tmp)
+                .await?;
+            file.write_all(&json).await?;
+            file.sync_data().await?;
+        } // file closed here
         tokio::fs::rename(&snapshot_tmp, &snapshot_path).await?;
 
         // Atomically truncate WAL by writing an empty replacement file
         if let Some(ref wal_mutex) = self.wal_file {
             let mut wal = wal_mutex.lock().await;
             // Write empty staging file
-            let mut tmp_file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&wal_tmp)
-                .await?;
-            tmp_file.sync_data().await?;
-            drop(tmp_file);
+            {
+                let mut tmp_file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&wal_tmp)
+                    .await?;
+                tmp_file.sync_data().await?;
+            } // tmp_file closed here
             tokio::fs::rename(&wal_tmp, &wal_path).await?;
             // Reopen the (now empty) WAL for appending
             *wal = tokio::fs::OpenOptions::new()

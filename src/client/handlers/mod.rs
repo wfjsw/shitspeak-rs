@@ -3,6 +3,7 @@ mod authenticate;
 mod ban_list;
 mod channel_remove;
 mod channel_state;
+mod context_action;
 mod crypt_setup;
 mod permission_query;
 mod ping;
@@ -25,6 +26,7 @@ use authenticate::handle_authenticate;
 use ban_list::handle_ban_list;
 use channel_remove::handle_channel_remove;
 use channel_state::handle_channel_state;
+use context_action::handle_context_action;
 use crypt_setup::handle_crypt_setup;
 use permission_query::handle_permission_query;
 use ping::handle_ping;
@@ -166,9 +168,9 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 tracing::debug!(session, "handling ContextActionModify (no-op)");
                 Ok(())
             }
-            Message::ContextAction(_) => {
-                tracing::debug!(session, "handling ContextAction (no-op)");
-                Ok(())
+            Message::ContextAction(context_action) => {
+                tracing::debug!(session, action = %context_action.action, "handling ContextAction");
+                handle_context_action(server, self, context_action.into()).await
             }
             Message::UserList(user_list) => {
                 tracing::debug!(session, num_users = user_list.users.len(), "handling UserList");
@@ -209,8 +211,8 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
         match result {
             Err(MessageHandlerError::PermissionDenied(deny)) => {
                 use crate::messages::WriteMessageExt;
-                self.write_proto_message(&crate::messages::Message::PermissionDenied(deny))
-                    .await?;
+                let msg: crate::messages::Message = deny.into();
+                self.write_proto_message(&msg).await?;
                 Ok(())
             }
             other => other,

@@ -351,6 +351,17 @@ impl Client {
         }
     }
 
+    /// Returns `true` if this client has superuser privileges.
+    ///
+    /// A client is a superuser if they are authenticated and belong to the
+    /// `admin` group.
+    pub async fn is_superuser(&self) -> bool {
+        if !self.is_authenticated().await {
+            return false;
+        }
+        self.has_group("admin").await
+    }
+
     pub async fn set_authenticated(&self, value: bool) {
         let mut local_state_guard = self.local_state.write().await;
         match &mut *local_state_guard {

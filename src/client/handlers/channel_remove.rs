@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
+    acl::ACLPermissions,
     client::Client,
     errors::MessageHandlerError,
-    messages::encoder::ChannelRemove,
+    messages::encoder::{ChannelRemove, DenyType, PermissionDenied},
     server::Server,
 };
 
@@ -19,12 +20,27 @@ pub async fn handle_channel_remove(
     let channel_id = msg.channel_id;
     tracing::debug!(session = u32::from(sender.get_session_id()), channel_id, "ChannelRemove handler");
     if channel_id == 0 {
-        return Ok(());
+        return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+            r#type: DenyType::Permission,
+            session: u32::from(sender.get_session_id()),
+            channel_id: Some(0),
+            reason: Some("Cannot delete the root channel".to_owned()),
+            name: None,
+            permission: None,
+        }));
     }
 
     // Verify channel exists
     if server.get_channels().get_channel(channel_id).await.is_none() {
         return Ok(());
+    }
+
+    // ACL: need Write on the channel to remove it
+    let perms = crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
+    if !perms.contains(ACLPermissions::Write) {
+        return Err(MessageHandlerError::PermissionDenied(
+            PermissionDenied::for_permission(u32::from(sender.get_session_id()), Some(channel_id), ACLPermissions::Write),
+        ));
     }
 
     // Move any users in this channel to its parent (or root)

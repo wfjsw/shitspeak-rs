@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "cargo metadata": true,
+        "cargo check": true,
+        "cargo test": true,
+        "cargo doc": true
+    }
+}

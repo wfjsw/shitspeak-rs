@@ -222,9 +222,9 @@ impl ClientStateLogEntry {
                 if delta.is_empty() {
                     return None;
                 }
-                let mut us = crate::mumble_proto::UserState {
-                    session: Some(u32::from(*session_id)),
-                    actor: sender_session_id.map(|f| u32::from(f)),
+                let mut us = crate::messages::encoder::UserState {
+                    session: Some(*session_id),
+                    actor: *sender_session_id,
                     name: None,
                     user_id: None,
                     channel_id: None,
@@ -297,7 +297,7 @@ impl ClientStateLogEntry {
                     us.listening_channel_remove = v.iter().copied().collect();
                 }
 
-                Some(crate::messages::Message::UserState(us))
+                Some(us.into())
             }
         }
     }

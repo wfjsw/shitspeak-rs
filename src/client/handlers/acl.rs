@@ -4,7 +4,7 @@ use crate::{
     acl::ACL,
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::Acl as EncoderAcl, Message, WriteMessageExt},
+    messages::{encoder::{Acl as EncoderAcl, ChanAcl}, Message, WriteMessageExt},
     server::Server,
 };
 
@@ -39,14 +39,14 @@ pub async fn handle_acl(
 
         for ch in &chain {
             for acl in &ch.acls {
-                let proto_acl = crate::mumble_proto::acl::ChanAcl {
-                    apply_here: Some(acl.apply_here),
-                    apply_subs: Some(acl.apply_subs),
-                    inherited: Some(ch.id != channel_id),
+                let proto_acl = ChanAcl {
+                    apply_here: acl.apply_here,
+                    apply_subs: acl.apply_subs,
+                    inherited: ch.id != channel_id,
                     user_id: acl.user_id.map(|uid| uid as u32),
                     group: acl.group.clone(),
-                    grant: Some(acl.allow.bits()),
-                    deny: Some(acl.deny.bits()),
+                    grant: acl.allow.bits(),
+                    deny: acl.deny.bits(),
                 };
                 // Collect into a per-channel ACL message
                 match acls.iter_mut().find(|a: &&mut EncoderAcl| a.channel_id == ch.id) {
@@ -79,10 +79,10 @@ pub async fn handle_acl(
             new_acls.push(ACL {
                 user_id: proto_acl.user_id.map(|uid| uid as i32),
                 group: proto_acl.group.clone(),
-                apply_here: proto_acl.apply_here.unwrap_or(true),
-                apply_subs: proto_acl.apply_subs.unwrap_or(false),
-                allow: enumflags2::BitFlags::from_bits_truncate(proto_acl.grant.unwrap_or(0)),
-                deny: enumflags2::BitFlags::from_bits_truncate(proto_acl.deny.unwrap_or(0)),
+                apply_here: proto_acl.apply_here,
+                apply_subs: proto_acl.apply_subs,
+                allow: enumflags2::BitFlags::from_bits_truncate(proto_acl.grant),
+                deny: enumflags2::BitFlags::from_bits_truncate(proto_acl.deny),
             });
         }
 
@@ -106,7 +106,7 @@ pub async fn handle_acl(
                 || ancestors.iter().any(|a| a.id == channel_id);
             if affected {
                 // Recompute and send permissions
-                let perms = compute_permissions_for_client(server, client, client_ch).await;
+                let perms = crate::client::acl::compute_permissions_for_client(server, client, client_ch).await;
                 let reply: Message = crate::messages::encoder::PermissionQuery {
                     channel_id: Some(client_ch),
                     permissions: Some(perms.bits()),
@@ -118,42 +118,5 @@ pub async fn handle_acl(
     }
 
     Ok(())
-}
-
-/// Compute effective permissions for a client on a given channel.
-pub(crate) async fn compute_permissions_for_client(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    channel_id: u32,
-) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
-    let Some(channel) = server.get_channels().get_channel(channel_id).await else {
-        return enumflags2::BitFlags::empty();
-    };
-    let ancestors = server.get_channels().get_ancestors(channel_id).await;
-
-    let user_id = client.get_user_id().await;
-    let groups: Vec<String> = client.get_groups_clone().await.into_iter().collect();
-    let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
-    let tokens: Vec<String> = client.get_tokens_clone().await.into_iter().collect();
-    let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-
-    let membership = crate::client::group::ClientMembershipQuery {
-        groups: &group_refs,
-        authenticated: client.is_authenticated().await,
-        access_tokens: &token_refs,
-        cert_hash: client.get_certificate_hash(),
-        has_verified_cert_chain: client.has_certificate(),
-        ip_address: Some(client.get_real_ip_address()),
-        asn: None,
-        country_code: None,
-    };
-
-    crate::acl::evaluate_permission(
-        &channel,
-        &ancestors,
-        user_id,
-        &membership,
-        channel_id,
-    )
 }
 
