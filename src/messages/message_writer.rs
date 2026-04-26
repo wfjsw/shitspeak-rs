@@ -1,4 +1,5 @@
 use crate::{errors::WriteProtoMessageError, messages::Message};
+use bytes::BytesMut;
 
 pub trait WriteMessageExt {
     async fn write_proto_message(&mut self, message: &Message) -> Result<(), WriteProtoMessageError>;
@@ -19,7 +20,7 @@ impl<T: tokio::io::AsyncWriteExt + Unpin> WriteMessageExt for T {
         let proto_tag = message.proto_tag();
         let length = message.encoded_len();
         // Encode header + payload into one buffer to minimise syscalls.
-        let mut buf = Vec::with_capacity(6 + length);
+        let mut buf = BytesMut::with_capacity(6 + length);
         buf.extend_from_slice(&proto_tag.to_be_bytes());
         buf.extend_from_slice(&(length as u32).to_be_bytes());
         message.to_proto(&mut buf)?;
@@ -38,7 +39,7 @@ impl<T: tokio::io::AsyncWriteExt + Unpin> WriteMessageExt for T {
             .map(|m| 6 + m.encoded_len())
             .sum();
 
-        let mut buf: Vec<u8> = Vec::with_capacity(total);
+        let mut buf = BytesMut::with_capacity(total);
 
         for msg in messages {
             buf.extend_from_slice(&msg.proto_tag().to_be_bytes());

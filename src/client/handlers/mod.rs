@@ -19,6 +19,7 @@ mod voice_target;
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use prost::Message as _;
 
 use acl::handle_acl;
@@ -53,7 +54,7 @@ use crate::{
 async fn handle_udp_tunnel(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<crate::client::Client>>,
-    data: Vec<u8>,
+    data: Bytes,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
         return Err(MessageHandlerError::protocol_violation(

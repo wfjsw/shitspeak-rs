@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -34,12 +35,12 @@ macro_rules! diff_clone {
         }
     };
 }
-/// Like `diff_clone` but calls `.to_vec()` instead of `.clone()` — for
-/// getters that return `&[u8]` when the delta field is `Vec<u8>`.
+/// Like `diff_clone` but copies into `Bytes` — for
+/// getters that return `&[u8]` when the delta field is `Bytes`.
 macro_rules! diff_to_vec {
     ($d:ident, $old:ident, $new:ident, $field:ident, $getter:ident) => {
         if $old.$getter() != $new.$getter() {
-            $d.$field = Some($new.$getter().to_vec());
+            $d.$field = Some(Bytes::copy_from_slice($new.$getter()));
         }
     };
 }
@@ -82,7 +83,7 @@ pub struct ClientGlobalStateDelta {
     pub self_deaf: Option<bool>,
     pub priority_speaker: Option<bool>,
     pub recording: Option<bool>,
-    pub plugin_context: Option<Vec<u8>>,
+    pub plugin_context: Option<Bytes>,
     pub plugin_identity: Option<String>,
 
     // Texture blob
@@ -139,7 +140,7 @@ pub enum ClientStateOperation {
         tcp_addr: SocketAddr,
         udp_addr: Option<SocketAddr>,
         local_addr: SocketAddr,
-        cert_hash: Option<Vec<u8>>,
+        cert_hash: Option<Bytes>,
         login_time: DateTime<Utc>,
     },
     RemoveClient {
@@ -285,10 +286,14 @@ impl ClientStateLogEntry {
                     us.plugin_identity = Some(v.clone());
                 }
                 if let Some(ref v) = delta.texture_hash {
-                    us.texture_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
+                    us.texture_hash = v
+                        .as_ref()
+                        .and_then(|h| hex::decode(h).ok().map(Bytes::from));
                 }
                 if let Some(ref v) = delta.comment_hash {
-                    us.comment_hash = v.as_ref().and_then(|h| hex::decode(h).ok());
+                    us.comment_hash = v
+                        .as_ref()
+                        .and_then(|h| hex::decode(h).ok().map(Bytes::from));
                 }
                 if let Some(ref v) = delta.listening_channel_add {
                     us.listening_channel_add = v.iter().copied().collect();

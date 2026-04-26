@@ -1,4 +1,5 @@
 use crate::{errors::{MessageLengthExceededError, ReadProtoMessageError}, messages::Message};
+use bytes::{Bytes, BytesMut};
 pub trait ReadMessageExt {
     async fn read_proto_message(&mut self) -> Result<Message, ReadProtoMessageError>;
 }
@@ -6,7 +7,7 @@ pub trait ReadMessageExt {
 
 impl<T: tokio::io::AsyncReadExt + Unpin> ReadMessageExt for T {
     async fn read_proto_message(&mut self) -> Result<Message, ReadProtoMessageError> {
-        const MAX_MESSAGE_LENGTH: usize = 8 * 1024 * 1024;
+            const MAX_MESSAGE_LENGTH: usize = 8 * 1024 * 1024;
 
         let message_type = self.read_u16().await?;
         let message_length = self.read_u32().await? as usize;
@@ -15,9 +16,9 @@ impl<T: tokio::io::AsyncReadExt + Unpin> ReadMessageExt for T {
             return Err(MessageLengthExceededError::new(MAX_MESSAGE_LENGTH, message_length).into());
         }
 
-        let mut buffer = vec![0u8; message_length];
+        let mut buffer = BytesMut::with_capacity(message_length);
         self.read_exact(&mut buffer).await?;
 
-        Ok(Message::from_proto(message_type, buffer)?)
+        Ok(Message::from_proto(message_type, buffer.freeze())?)
     }
 }

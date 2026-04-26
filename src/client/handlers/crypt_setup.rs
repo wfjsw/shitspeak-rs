@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::{
     client::Client,
     errors::MessageHandlerError,
@@ -35,9 +37,9 @@ pub async fn handle_crypt_setup(
             let crypt = sender.crypt_state().await;
             let state = crypt.as_ref().expect("crypt state just created");
             CryptSetup::new(
-                state.key().map(|k| k.to_vec()),
-                Some(state.encrypt_iv().to_vec()),
-                Some(state.decrypt_iv().to_vec()),
+                state.key().map(Bytes::copy_from_slice),
+                Some(Bytes::copy_from_slice(state.encrypt_iv())),
+                Some(Bytes::copy_from_slice(state.decrypt_iv())),
             ).into()
         };
 
@@ -58,7 +60,7 @@ pub async fn handle_crypt_setup(
             CryptSetup::new(
                 None,
                 None,
-                Some(encrypt_iv),
+                Some(Bytes::from(encrypt_iv)),
             ).into()
         };
         // Drop the crypt lock before the async write

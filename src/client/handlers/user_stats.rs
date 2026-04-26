@@ -67,7 +67,7 @@ pub async fn handle_user_stats(
         tcp_ping_var: Some(stats.tcp_ping_var()),
         version,
         celt_versions: Vec::new(),
-        address: Some(sender.get_real_ip_address().to_string().into_bytes()),
+        address: Some(sender.get_real_ip_address()),
         bandwidth: Some(0), // TODO: bandwidth tracking
         onlinesecs: Some(onlinesecs),
         idlesecs: Some(0), // TODO: idle tracking

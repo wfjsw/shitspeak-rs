@@ -1,4 +1,5 @@
 use aws_lc_rs::rand::SecureRandom;
+use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 
 use crate::{
@@ -9,8 +10,8 @@ use crate::{
 const DECRYPT_HISTORY_SIZE: usize = 0x100;
 
 pub struct CryptState {
-    encrypt_iv: Vec<u8>,
-    decrypt_iv: Vec<u8>,
+    encrypt_iv: BytesMut,
+    decrypt_iv: BytesMut,
 
     last_good_time: DateTime<Utc>,
 
@@ -45,8 +46,8 @@ impl CryptState {
         rng.fill(&mut decrypt_iv)?;
 
         Ok(CryptState {
-            encrypt_iv,
-            decrypt_iv,
+            encrypt_iv: BytesMut::from(encrypt_iv.as_slice()),
+            decrypt_iv: BytesMut::from(decrypt_iv.as_slice()),
             last_good_time: Utc::now(),
             good: 0,
             late: 0,
@@ -79,8 +80,8 @@ impl CryptState {
         }
 
         Ok(CryptState {
-            encrypt_iv: encrypt_iv.to_vec(),
-            decrypt_iv: decrypt_iv.to_vec(),
+            encrypt_iv: BytesMut::from(encrypt_iv),
+            decrypt_iv: BytesMut::from(decrypt_iv),
             last_good_time: Utc::now(),
             good: 0,
             late: 0,
@@ -111,7 +112,7 @@ impl CryptState {
 
     /// Overwrite the decrypt IV (used for client-requested resync).
     pub fn set_decrypt_iv(&mut self, iv: &[u8]) {
-        self.decrypt_iv = iv.to_vec();
+        self.decrypt_iv = BytesMut::from(iv);
         self.resync = self.resync.wrapping_add(1);
     }
 
@@ -139,19 +140,19 @@ impl CryptState {
         Ok(())
     }
 
-    pub fn decrypt(&mut self, dest: &mut Vec<u8>, data: &[u8]) -> Result<(), CryptError> {
+    pub fn decrypt(&mut self, dest: &mut BytesMut, data: &[u8]) -> Result<(), CryptError> {
         if data.len() < self.overhead() {
             return Err(CryptError::DataTooShort);
         }
         
         let plain_len = data.len() - self.overhead();
-        dest.reserve_exact(plain_len);
+        dest.resize(plain_len, 0);
 
         let incoming_iv_byte = data[0];
         let known_iv_byte = self.decrypt_iv[0];
         let mut restore = false;
 
-        let iv_backup = self.decrypt_iv.clone();
+        let iv_backup = self.decrypt_iv.to_vec();
 
         if known_iv_byte.wrapping_add(1) == incoming_iv_byte {
             // in order as expected

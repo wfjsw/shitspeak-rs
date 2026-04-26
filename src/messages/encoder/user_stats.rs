@@ -1,10 +1,12 @@
 use crate::messages::Message;
+use bytes::Bytes;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone)]
 pub struct UserStats {
     pub session: Option<u32>,
     pub stats_only: Option<bool>,
-    pub certificates: Vec<Vec<u8>>,
+    pub certificates: Vec<Bytes>,
     pub from_client: Option<crate::mumble_proto::user_stats::Stats>,
     pub from_server: Option<crate::mumble_proto::user_stats::Stats>,
     pub udp_packets: Option<u32>,
@@ -15,7 +17,7 @@ pub struct UserStats {
     pub tcp_ping_var: Option<f32>,
     pub version: Option<crate::mumble_proto::Version>,
     pub celt_versions: Vec<i32>,
-    pub address: Option<Vec<u8>>,
+    pub address: Option<IpAddr>,
     pub bandwidth: Option<u32>,
     pub onlinesecs: Option<u32>,
     pub idlesecs: Option<u32>,
@@ -28,7 +30,7 @@ impl From<crate::mumble_proto::UserStats> for UserStats {
         Self {
             session: proto.session,
             stats_only: proto.stats_only,
-            certificates: proto.certificates,
+            certificates: proto.certificates.into_iter().map(Bytes::from).collect(),
             from_client: proto.from_client,
             from_server: proto.from_server,
             udp_packets: proto.udp_packets,
@@ -39,7 +41,9 @@ impl From<crate::mumble_proto::UserStats> for UserStats {
             tcp_ping_var: proto.tcp_ping_var,
             version: proto.version,
             celt_versions: proto.celt_versions,
-            address: proto.address,
+            address: proto
+                .address
+                .and_then(|raw| decode_ip_bytes(raw.as_slice())),
             bandwidth: proto.bandwidth,
             onlinesecs: proto.onlinesecs,
             idlesecs: proto.idlesecs,
@@ -80,7 +84,7 @@ impl Into<crate::mumble_proto::UserStats> for UserStats {
         crate::mumble_proto::UserStats {
             session: self.session,
             stats_only: self.stats_only,
-            certificates: self.certificates,
+            certificates: self.certificates.into_iter().map(|b| b.to_vec()).collect(),
             from_client: self.from_client,
             from_server: self.from_server,
             udp_packets: self.udp_packets,
@@ -91,7 +95,7 @@ impl Into<crate::mumble_proto::UserStats> for UserStats {
             tcp_ping_var: self.tcp_ping_var,
             version: self.version,
             celt_versions: self.celt_versions,
-            address: self.address,
+            address: self.address.map(encode_ip_bytes),
             bandwidth: self.bandwidth,
             onlinesecs: self.onlinesecs,
             idlesecs: self.idlesecs,
@@ -99,6 +103,27 @@ impl Into<crate::mumble_proto::UserStats> for UserStats {
             opus: self.opus,
             rolling_stats: None,
         }
+    }
+}
+
+fn decode_ip_bytes(raw: &[u8]) -> Option<IpAddr> {
+    match raw.len() {
+        4 => {
+            let addr: [u8; 4] = raw.try_into().ok()?;
+            Some(IpAddr::V4(Ipv4Addr::from(addr)))
+        }
+        16 => {
+            let addr: [u8; 16] = raw.try_into().ok()?;
+            Some(IpAddr::V6(Ipv6Addr::from(addr)))
+        }
+        _ => None,
+    }
+}
+
+fn encode_ip_bytes(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
     }
 }
 

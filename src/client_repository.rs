@@ -206,7 +206,7 @@ impl ClientRepository {
                 tcp_addr: client.get_tcp_address(),
                 udp_addr: client.get_udp_address(),
                 local_addr: client.get_tcp_address(),
-                cert_hash: client.get_certificate_hash().map(|h| h.to_vec()),
+                cert_hash: client.get_certificate_hash().map(bytes::Bytes::copy_from_slice),
                 login_time: client.get_login_time(),
             },
             None,
@@ -224,7 +224,9 @@ impl ClientRepository {
         let real_ip = client.get_real_ip_address();
         let tcp_addr = client.get_tcp_address();
         let udp_addr = client.get_udp_address();
-        let cert_hash = client.get_certificate_hash().map(|h| h.to_vec());
+        let cert_hash = client
+            .get_certificate_hash()
+            .map(bytes::Bytes::copy_from_slice);
         let login_time = client.get_login_time();
 
         {

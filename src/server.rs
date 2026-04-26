@@ -3,7 +3,7 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 
 use cidr::AnyIpCidr;
@@ -157,7 +157,7 @@ impl Server {
         let idle_timeout_secs = self.read_config().client_idle_timeout_secs;
 
         // Bounded channel shared between UDP drain and processing tasks.
-        let (udp_in, udp_out) = tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(
+        let (udp_in, udp_out) = tokio::sync::mpsc::channel::<(Bytes, std::net::SocketAddr)>(
             udp_channel_size,
         );
 
@@ -209,7 +209,7 @@ impl Server {
     /// directly (responded to immediately).
     fn spawn_udp_drain(
         socket: Arc<tokio::net::UdpSocket>,
-        tx: tokio::sync::mpsc::Sender<(Vec<u8>, std::net::SocketAddr)>,
+        tx: tokio::sync::mpsc::Sender<(Bytes, std::net::SocketAddr)>,
         voice_enabled: bool,
         ping_enabled: bool,
         server: Arc<Box<Self>>,
@@ -266,7 +266,7 @@ impl Server {
                 }
 
                 if voice_enabled {
-                    let packet = packet.to_vec();
+                    let packet = Bytes::copy_from_slice(packet);
                     match tx.try_send((packet, src_addr)) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -287,7 +287,7 @@ impl Server {
     fn spawn_udp_process(
         server: Arc<Box<Self>>,
         socket: Arc<tokio::net::UdpSocket>,
-        mut rx: tokio::sync::mpsc::Receiver<(Vec<u8>, std::net::SocketAddr)>,
+        mut rx: tokio::sync::mpsc::Receiver<(Bytes, std::net::SocketAddr)>,
         ping_enabled: bool,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
@@ -303,7 +303,7 @@ impl Server {
                 // Try to match by known UDP address first, then host-based
                 // candidate probing. On host probing we keep the successful
                 // plaintext so we do not decrypt the same packet twice.
-                let mut decrypted_from_match: Option<Vec<u8>> = None;
+                let mut decrypted_from_match: Option<BytesMut> = None;
                 let mut matched_via_ip_fallback = false;
                 let client = match server.clients.get_client_by_udp_address(&src_addr).await {
                     Some(c) => Some(c),
@@ -313,7 +313,7 @@ impl Server {
                         for c in &candidates {
                             let mut crypt = c.crypt_state().await;
                             if let Some(ref mut state) = *crypt {
-                                let mut decrypted = Vec::new();
+                                let mut decrypted = BytesMut::new();
                                 if state.decrypt(&mut decrypted, &packet).is_ok() {
                                     matched = Some(c.clone());
                                     decrypted_from_match = Some(decrypted);
@@ -342,7 +342,7 @@ impl Server {
                     dec
                 } else {
                     let mut crypt = client.crypt_state().await;
-                    let mut dec = Vec::new();
+                    let mut dec = BytesMut::new();
                     match crypt.as_mut() {
                         Some(state) => match state.decrypt(&mut dec, &packet) {
                             Ok(()) => dec,

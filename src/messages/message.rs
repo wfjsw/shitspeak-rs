@@ -1,4 +1,5 @@
 use prost::Message as _;
+use bytes::Bytes;
 
 use crate::{mumble_proto::*};
 
@@ -8,7 +9,7 @@ use message_macro::MessageConversion;
 #[derive(Debug, Clone, MessageConversion)]
 pub enum Message {
     Version(Version),
-    UDPTunnel(Vec<u8>),
+    UDPTunnel(Bytes),
     Authenticate(Authenticate),
     Ping(Ping),
     Reject(Reject),

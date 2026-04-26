@@ -5,6 +5,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use bytes::Bytes;
 use parking_lot::{MappedMutexGuard as ParkingMappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
 use tokio::{
     net::TcpStream,
@@ -47,7 +48,7 @@ pub struct Client {
     udp_state: Option<AsyncMutex<UdpState>>,
     stats: RwLock<ClientStats>,
 
-    certificate_hash: Option<Vec<u8>>,
+    certificate_hash: Option<Bytes>,
     user_info_extended: ParkingMutex<Option<UserInfoExtended>>,
 
     options: RwLock<ClientOptions>,
@@ -84,14 +85,13 @@ impl Client {
             match tls_connection.peer_certificates() {
                 Some([cert, ..]) => {
                     // Compute the hash of the peer certificate
-                    Some(
+                    Some(Bytes::copy_from_slice(
                         aws_lc_rs::digest::digest(
                             &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
                             cert.as_ref(),
                         )
-                        .as_ref()
-                        .to_vec(),
-                    )
+                        .as_ref(),
+                    ))
                 }
                 _ => None,
             }
@@ -448,8 +448,12 @@ impl Client {
     pub async fn build_user_state_for_broadcast(&self) -> msg_encoder::UserState {
         let gs = self.global_state.read().await;
 
-        let comment_hash_bytes = gs.get_comment_hash().and_then(|h| hex::decode(h).ok());
-        let texture_hash_bytes = gs.get_texture_hash().and_then(|h| hex::decode(h).ok());
+        let comment_hash_bytes = gs
+            .get_comment_hash()
+            .and_then(|h| hex::decode(h).ok().map(Bytes::from));
+        let texture_hash_bytes = gs
+            .get_texture_hash()
+            .and_then(|h| hex::decode(h).ok().map(Bytes::from));
 
         msg_encoder::UserState {
             session: Some(self.session_id),
@@ -463,7 +467,7 @@ impl Client {
             self_mute: if gs.is_self_muted() { Some(true) } else { None },
             self_deaf: if gs.is_self_deafened() { Some(true) } else { None },
             texture: None,
-            plugin_context: if gs.get_plugin_context().is_empty() { None } else { Some(gs.get_plugin_context().to_vec()) },
+            plugin_context: if gs.get_plugin_context().is_empty() { None } else { Some(Bytes::copy_from_slice(gs.get_plugin_context())) },
             plugin_identity: if gs.get_plugin_identity().is_empty() { None } else { Some(gs.get_plugin_identity().to_owned()) },
             comment: None,
             hash: self.certificate_hash.as_ref().map(|h| hex::encode(h)),

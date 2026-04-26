@@ -1,5 +1,7 @@
 use std::{net::IpAddr, str::FromStr};
 
+use bytes::Bytes;
+
 use cidr::{AnyIpCidr};
 
 enum IPMaskType<'a> {
@@ -20,7 +22,7 @@ enum MatchType<'a> {
     All,
     Authenticated,
     HasVerifiedCertificateChain,
-    CertificateHash(Vec<u8>),
+    CertificateHash(Bytes),
     InChannel(u32),
     OutOfChannel(u32),
     ClientGroup(&'a str),
@@ -63,7 +65,7 @@ pub fn is_member_in_group(
         Some(MatchType::HasVerifiedCertificateChain) => client.has_verified_cert_chain,
         Some(MatchType::CertificateHash(expected_hash)) => {
             match client.cert_hash {
-                Some(actual_hash) => actual_hash == expected_hash.as_slice(),
+                Some(actual_hash) => actual_hash == expected_hash.as_ref(),
                 None => false,
             }
         },
@@ -174,7 +176,7 @@ fn evaluate_group_string_match_type<'a>(group: &'a str, current_channel_id: u32,
                 let expected_certificate_hash = hex::decode(&group_name_slice[1..]);
 
                 break match expected_certificate_hash {
-                    Ok(hash) => Some(MatchType::CertificateHash(hash)),
+                    Ok(hash) => Some(MatchType::CertificateHash(Bytes::from(hash))),
                     Err(_) => None,
                 };
             }

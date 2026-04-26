@@ -96,7 +96,7 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
                     });
 
                     to_proto_vec_arms.push(quote! {
-                        #name::#var_ident(msg) => Ok((msg.encode_to_vec())),
+                        #name::#var_ident(msg) => Ok(bytes::Bytes::from(msg.encode_to_vec())),
                     });
 
                     // generate `impl From<Inner> for Enum` for convenience
@@ -115,7 +115,7 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl #name {
-            pub fn from_proto(message_type: u16, buffer: Vec<u8>) -> Result<#name, crate::errors::FromProtoToMessageError> {
+            pub fn from_proto(message_type: u16, buffer: bytes::Bytes) -> Result<#name, crate::errors::FromProtoToMessageError> {
                 match message_type {
                     #(#from_arms)*
                     t => Err(crate::errors::UnknownMessageTypeError::new(t).into()),
@@ -140,7 +140,7 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
                 }
             }
 
-            pub fn to_proto_vec(&self) -> Result<Vec<u8>, prost::EncodeError> {
+            pub fn to_proto_vec(&self) -> Result<bytes::Bytes, prost::EncodeError> {
                 match self {
                     #(#to_proto_vec_arms)*
                 }

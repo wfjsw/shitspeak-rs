@@ -1,5 +1,7 @@
 use std::collections::{HashSet};
 
+use bytes::Bytes;
+
 pub struct SessionStates {
     channel_id: u32,
     self_mute: bool,
@@ -9,7 +11,7 @@ pub struct SessionStates {
     suppress: bool,
     priority_speaker: bool,
     recording: bool,
-    plugin_context: Vec<u8>,
+    plugin_context: Bytes,
     plugin_identity: String,
     listening_channel_id: HashSet<u32>,
 }

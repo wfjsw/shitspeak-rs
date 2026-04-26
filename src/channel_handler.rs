@@ -148,7 +148,7 @@ pub async fn build_channel_state_message(
         description_hash: channel
             .description_hash
             .as_ref()
-            .and_then(|h| hex::decode(h).ok()),
+            .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from)),
         max_users: Some(channel.max_users),
         is_enter_restricted: None,
         can_enter: None,

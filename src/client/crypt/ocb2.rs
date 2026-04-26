@@ -2,13 +2,14 @@ use aws_lc_rs::{
     cipher::{DecryptingKey, EncryptingKey, UnboundCipherKey, AES_128},
     rand::{self, SecureRandom},
 };
+use bytes::Bytes;
 
 use crate::client::crypt::{errors::CryptError, CryptoMode};
 
 const BLOCK_SIZE: usize = 16;
 
 pub struct Ocb2 {
-    key: Vec<u8>,
+    key: Bytes,
     encrypt_key: EncryptingKey,
     decrypt_key: DecryptingKey,
 }
@@ -16,7 +17,7 @@ pub struct Ocb2 {
 impl Ocb2 {
     pub fn from_key(key: [u8; BLOCK_SIZE]) -> Result<Self, CryptError> {
         Ok(Ocb2 {
-            key: key.to_vec(),
+            key: Bytes::copy_from_slice(&key),
             encrypt_key: EncryptingKey::ecb(UnboundCipherKey::new(&AES_128, &key)?)?,
             decrypt_key: DecryptingKey::ecb(UnboundCipherKey::new(&AES_128, &key)?)?,
         })
@@ -43,7 +44,7 @@ impl CryptoMode for Ocb2 {
     }
 
     fn key(&self) -> Option<&[u8]> {
-        Some(&self.key)
+        Some(self.key.as_ref())
     }
 
     fn encrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError> {
@@ -295,8 +296,8 @@ mod tests {
     use super::*;
     use hex::decode;
 
-    fn must_decode_hex(s: &str) -> Vec<u8> {
-        decode(s).expect("invalid hex")
+    fn must_decode_hex(s: &str) -> Bytes {
+        Bytes::from(decode(s).expect("invalid hex"))
     }
 
     struct OcbVector {

@@ -163,7 +163,7 @@ async fn flush_voice_batch(
                 if state.encrypt(&mut buf, &raw).is_ok() {
                     batch.push(QueuedDatagram {
                         addr: udp_addr,
-                        data: buf,
+                        data: bytes::Bytes::from(buf),
                     });
                 }
             }

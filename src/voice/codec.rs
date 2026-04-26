@@ -21,6 +21,7 @@
 
 use std::fmt::Display;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message as _;
 
 /// The decoded result of a UDP voice packet.
@@ -33,7 +34,7 @@ pub struct DecodedAudio {
     /// Frame number (sequence).
     pub frame_number: u64,
     /// Opus-encoded audio payload.
-    pub opus_data: Vec<u8>,
+    pub opus_data: Bytes,
     /// Optional positional data [x, y, z].
     pub positional_data: Vec<f32>,
     /// Volume adjustment factor (1.0 = no adjustment).
@@ -190,7 +191,7 @@ fn decode_audio_protobuf(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
         target,
         sender_session: audio.sender_session,
         frame_number: audio.frame_number,
-        opus_data: audio.opus_data,
+        opus_data: Bytes::from(audio.opus_data),
         positional_data: audio.positional_data,
         volume_adjustment: audio.volume_adjustment,
         is_terminator: audio.is_terminator,
@@ -237,7 +238,7 @@ fn decode_audio_legacy_inner(
     data: &[u8],
     target: u32,
     has_sender_session: bool,
-) -> Option<(u32, u64, Vec<u8>, Vec<f32>, bool)> {
+) -> Option<(u32, u64, Bytes, Vec<f32>, bool)> {
     let mut pos = 1usize;
 
     let sender_session = if has_sender_session {
@@ -264,7 +265,7 @@ fn decode_audio_legacy_inner(
         if pos + payload_size > data.len() {
             return None;
         }
-        let payload = data[pos..pos + payload_size].to_vec();
+        let payload = Bytes::copy_from_slice(&data[pos..pos + payload_size]);
         pos += payload_size;
         (payload, is_terminator)
     };
@@ -306,7 +307,7 @@ fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
 /// Encode audio data into a UDP packet using the specified format.
 ///
 /// Returns the raw bytes ready to send via UDP.
-pub fn encode_audio_packet(audio: &DecodedAudio, format: PacketFormat) -> Vec<u8> {
+pub fn encode_audio_packet(audio: &DecodedAudio, format: PacketFormat) -> Bytes {
     match format {
         PacketFormat::Protobuf => encode_audio_protobuf(audio),
         PacketFormat::Legacy => encode_audio_legacy(audio),
@@ -314,24 +315,24 @@ pub fn encode_audio_packet(audio: &DecodedAudio, format: PacketFormat) -> Vec<u8
 }
 
 /// Encode as protobuf Audio message with 2-byte header.
-fn encode_audio_protobuf(audio: &DecodedAudio) -> Vec<u8> {
+fn encode_audio_protobuf(audio: &DecodedAudio) -> Bytes {
     use crate::mumble_udp::{Audio, audio};
 
     let msg = Audio {
         header: Some(audio::Header::Target(audio.target)),
         sender_session: audio.sender_session,
         frame_number: audio.frame_number,
-        opus_data: audio.opus_data.clone(),
+        opus_data: audio.opus_data.to_vec(),
         positional_data: audio.positional_data.clone(),
         volume_adjustment: audio.volume_adjustment,
         is_terminator: audio.is_terminator,
     };
 
     let proto_bytes = msg.encode_to_vec();
-    let mut buf = Vec::with_capacity(1 + proto_bytes.len());
-    buf.push(0x00); // type = Audio
+    let mut buf = BytesMut::with_capacity(1 + proto_bytes.len());
+    buf.put_u8(0x00); // type = Audio
     buf.extend_from_slice(&proto_bytes);
-    buf
+    buf.freeze()
 }
 
 /// Encode as legacy voice packet.
@@ -344,13 +345,13 @@ fn encode_audio_protobuf(audio: &DecodedAudio) -> Vec<u8> {
 ///   varint session
 ///   varint sequence number
 ///   opus payload
-fn encode_audio_legacy(audio: &DecodedAudio) -> Vec<u8> {
-    let mut buf = Vec::new();
+fn encode_audio_legacy(audio: &DecodedAudio) -> Bytes {
+    let mut buf = BytesMut::new();
     if audio.target >= (1 << 5) {
-        return Vec::new();
+        return Bytes::new();
     }
     let header = (0x04u8 << 5) | ((audio.target as u8) & 0x1f); // VoiceOpus + target
-    buf.push(header);
+    buf.put_u8(header);
 
     // Server->client legacy packets include sender session.
     write_varint(&mut buf, audio.sender_session as u64);
@@ -372,18 +373,18 @@ fn encode_audio_legacy(audio: &DecodedAudio) -> Vec<u8> {
         }
     }
 
-    buf
+    buf.freeze()
 }
 
-/// Write a u64 as a varint into a Vec.
-fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
+/// Write a u64 as a varint into a mutable byte buffer.
+fn write_varint(buf: &mut BytesMut, mut value: u64) {
     loop {
         let mut byte = (value & 0x7F) as u8;
         value >>= 7;
         if value != 0 {
             byte |= 0x80;
         }
-        buf.push(byte);
+        buf.put_u8(byte);
         if value == 0 {
             break;
         }
@@ -402,7 +403,7 @@ mod tests {
             target: 0,
             sender_session: 42,
             frame_number: 100,
-            opus_data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            opus_data: Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]),
             positional_data: vec![1.0, 2.0, 3.0],
             volume_adjustment: 0.8,
             is_terminator: false,
@@ -427,7 +428,7 @@ mod tests {
             target: 0,
             sender_session: 7,
             frame_number: 42,
-            opus_data: vec![0x01, 0x02, 0x03],
+            opus_data: Bytes::from_static(&[0x01, 0x02, 0x03]),
             positional_data: Vec::new(),
             volume_adjustment: 1.0,
             is_terminator: false,
@@ -452,7 +453,7 @@ mod tests {
             target: 31,
             sender_session: 5,
             frame_number: 1,
-            opus_data: vec![0xAA],
+            opus_data: Bytes::from_static(&[0xAA]),
             positional_data: Vec::new(),
             volume_adjustment: 1.0,
             is_terminator: false,
@@ -476,7 +477,7 @@ mod tests {
             target: 0,
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x00],
+            opus_data: Bytes::from_static(&[0x00]),
             positional_data: Vec::new(),
             volume_adjustment: 1.0,
             is_terminator: false,
@@ -493,7 +494,7 @@ mod tests {
             target: 0,
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x00],
+            opus_data: Bytes::from_static(&[0x00]),
             positional_data: Vec::new(),
             volume_adjustment: 1.0,
             is_terminator: false,

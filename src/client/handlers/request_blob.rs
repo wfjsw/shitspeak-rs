@@ -69,13 +69,13 @@ pub async fn handle_request_blob(
             suppress: None,
             self_mute: None,
             self_deaf: None,
-            texture: texture_data.as_ref().map(|b| b.to_vec()),
+            texture: texture_data.clone(),
             plugin_context: None,
             plugin_identity: None,
             comment: None,
             hash: None,
-            comment_hash: texture_hash.clone(),
-            texture_hash: texture_hash.clone(),
+            comment_hash: texture_hash.clone().map(bytes::Bytes::from),
+            texture_hash: texture_hash.clone().map(bytes::Bytes::from),
             priority_speaker: None,
             recording: None,
             temporary_access_tokens: Vec::new(),
@@ -137,7 +137,7 @@ pub async fn handle_request_blob(
                 .as_ref()
                 .and_then(|b| String::from_utf8(b.to_vec()).ok()),
             hash: None,
-            comment_hash: comment_hash.clone(),
+            comment_hash: comment_hash.clone().map(bytes::Bytes::from),
             texture_hash: None,
             priority_speaker: None,
             recording: None,
@@ -175,7 +175,7 @@ pub async fn handle_request_blob(
             description_hash: ch
                 .description_hash
                 .as_ref()
-                .and_then(|h| hex::decode(h).ok()),
+                .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from)),
             max_users: Some(ch.max_users),
             is_enter_restricted: None,
             can_enter: None,

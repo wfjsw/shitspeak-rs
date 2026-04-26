@@ -1,4 +1,5 @@
 use crate::messages::Message;
+use bytes::Bytes;
 
 /// Encoder for `ChannelState` protobuf messages.
 ///
@@ -14,7 +15,7 @@ pub struct ChannelState {
     pub links_remove: Vec<u32>,
     pub temporary: Option<bool>,
     pub position: Option<i32>,
-    pub description_hash: Option<Vec<u8>>,
+    pub description_hash: Option<Bytes>,
     pub max_users: Option<u32>,
     pub is_enter_restricted: Option<bool>,
     pub can_enter: Option<bool>,
@@ -47,7 +48,7 @@ impl From<crate::mumble_proto::ChannelState> for ChannelState {
             links_remove: proto.links_remove,
             temporary: proto.temporary,
             position: proto.position,
-            description_hash: proto.description_hash,
+            description_hash: proto.description_hash.map(Bytes::from),
             max_users: proto.max_users,
             is_enter_restricted: proto.is_enter_restricted,
             can_enter: proto.can_enter,
@@ -87,7 +88,7 @@ impl Into<crate::mumble_proto::ChannelState> for ChannelState {
             links_remove: self.links_remove,
             temporary: self.temporary,
             position: self.position,
-            description_hash: self.description_hash,
+            description_hash: self.description_hash.map(|b| b.to_vec()),
             max_users: self.max_users,
             is_enter_restricted: self.is_enter_restricted,
             can_enter: self.can_enter,

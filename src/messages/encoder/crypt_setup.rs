@@ -1,27 +1,28 @@
 use crate::messages::{Message};
+use bytes::Bytes;
 
 #[derive(Debug, Clone)]
 pub struct CryptSetup {
-    key: Option<Vec<u8>>,
-    client_nonce: Option<Vec<u8>>,
-    server_nonce: Option<Vec<u8>>,
+    key: Option<Bytes>,
+    client_nonce: Option<Bytes>,
+    server_nonce: Option<Bytes>,
 }
 
 impl From<crate::mumble_proto::CryptSetup> for CryptSetup {
     fn from(proto: crate::mumble_proto::CryptSetup) -> Self {
         Self {
-            key: proto.key,
-            client_nonce: proto.client_nonce,
-            server_nonce: proto.server_nonce,
+            key: proto.key.map(Bytes::from),
+            client_nonce: proto.client_nonce.map(Bytes::from),
+            server_nonce: proto.server_nonce.map(Bytes::from),
         }
     }
 }
 
 impl CryptSetup {
     pub fn new(
-        key: Option<Vec<u8>>,
-        client_nonce: Option<Vec<u8>>,
-        server_nonce: Option<Vec<u8>>,
+        key: Option<Bytes>,
+        client_nonce: Option<Bytes>,
+        server_nonce: Option<Bytes>,
     ) -> Self {
         Self {
             key,
@@ -52,9 +53,9 @@ impl Default for CryptSetup {
 impl Into<crate::mumble_proto::CryptSetup> for CryptSetup {
     fn into(self) -> crate::mumble_proto::CryptSetup {
         crate::mumble_proto::CryptSetup {
-            key: self.key,
-            client_nonce: self.client_nonce,
-            server_nonce: self.server_nonce,
+            key: self.key.map(|b| b.to_vec()),
+            client_nonce: self.client_nonce.map(|b| b.to_vec()),
+            server_nonce: self.server_nonce.map(|b| b.to_vec()),
         }
     }
 }

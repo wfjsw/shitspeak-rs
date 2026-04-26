@@ -6,12 +6,14 @@
 //! frequent).  On non-Linux platforms we fall back to a simple loop of
 //! `send_to` calls.
 
+use bytes::Bytes;
+
 /// A single datagram queued for batched transmission.
 pub struct QueuedDatagram {
     /// Destination socket address.
     pub addr: std::net::SocketAddr,
     /// Encrypted payload.
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 /// Send all queued datagrams through `socket`.

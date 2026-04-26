@@ -99,7 +99,10 @@ impl ChannelOperation {
                     description_hash: patch
                         .description_hash
                         .as_ref()
-                        .and_then(|h| h.as_ref().and_then(|h| hex::decode(h).ok())),
+                        .and_then(|h| {
+                            h.as_ref()
+                                .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from))
+                        }),
                     links_add: links_add.clone(),
                     links_remove: links_remove.clone(),
                     ..Default::default()
@@ -147,7 +150,7 @@ fn channel_to_proto_full(ch: &Channel) -> crate::messages::Message {
         description_hash: ch
             .description_hash
             .as_ref()
-            .and_then(|h| hex::decode(h).ok()),
+            .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from)),
         max_users: Some(ch.max_users),
         ..Default::default()
     }
@@ -165,7 +168,10 @@ fn channel_to_proto_delta(id: u32, patch: &ChannelPatch) -> crate::messages::Mes
         description_hash: patch
             .description_hash
             .as_ref()
-            .and_then(|h| h.as_ref().and_then(|h| hex::decode(h).ok())),
+            .and_then(|h| {
+                h.as_ref()
+                    .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from))
+            }),
         ..Default::default()
     }
     .into()

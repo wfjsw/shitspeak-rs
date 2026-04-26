@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use bytes::Bytes;
+
 use crate::protocol_version::ProtocolVersion;
 use crate::client::state_log::ClientGlobalStateDelta;
 
@@ -19,7 +21,7 @@ pub struct ClientGlobalState {
     self_deaf: bool,
     priority_speaker: bool,
     recording: bool,
-    plugin_context: Vec<u8>,
+    plugin_context: Bytes,
     plugin_identity: String,
 
     // ── Texture blob ───────────────────────────────────────────────────────
@@ -56,7 +58,7 @@ impl ClientGlobalState {
             self_deaf: false,
             priority_speaker: false,
             recording: false,
-            plugin_context: Vec::new(),
+            plugin_context: Bytes::new(),
             plugin_identity: String::new(),
 
             texture_url: None,
@@ -313,7 +315,7 @@ impl ClientGlobalState {
     }
 
     pub fn get_plugin_context(&self) -> &[u8] { &self.plugin_context }
-    pub fn set_plugin_context(&mut self, ctx: Vec<u8>) {
+    pub fn set_plugin_context(&mut self, ctx: Bytes) {
         if self.plugin_context == ctx {
             return;
         }
