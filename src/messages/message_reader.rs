@@ -1,5 +1,5 @@
 use crate::{errors::{MessageLengthExceededError, ReadProtoMessageError}, messages::Message};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 pub trait ReadMessageExt {
     async fn read_proto_message(&mut self) -> Result<Message, ReadProtoMessageError>;
 }

@@ -145,6 +145,13 @@ async fn flush_voice_batch(
         let mut batch: Vec<QueuedDatagram> = Vec::with_capacity(targets.len());
 
         for (client, audio) in targets {
+            if client.prefers_tcp_tunnel() {
+                let raw = codec::encode_audio_packet(audio, audio.format);
+                let message = crate::messages::Message::UDPTunnel(raw);
+                let _ = client.write_proto_message(&message).await;
+                continue;
+            }
+
             let udp_addr = match client.get_udp_address() {
                 Some(a) => a,
                 None => {

@@ -62,6 +62,11 @@ pub struct Client {
     /// log entries on disconnect.
     published: AtomicBool,
 
+    /// If true, send voice through TCP `UDPTunnel` instead of UDP.
+    /// This is toggled when tunneled voice is received and reset once
+    /// a valid UDP voice packet is seen again.
+    prefer_tcp_tunnel: AtomicBool,
+
     /// The last client-state log version this connection has seen,
     /// indexed by node_id.  Used to detect gaps and replay missed entries.
     last_client_version: ParkingMutex<HashMap<u16, u64>>,
@@ -118,6 +123,7 @@ impl Client {
             global_state: RwLock::new(ClientGlobalState::new()),
             crypt_state: AsyncMutex::new(None),
             published: AtomicBool::new(false),
+            prefer_tcp_tunnel: AtomicBool::new(false),
             last_client_version: ParkingMutex::new(HashMap::new()),
             last_channel_version: ParkingMutex::new(0),
         })
@@ -137,6 +143,14 @@ impl Client {
 
     pub fn set_published(&self, value: bool) {
         self.published.store(value, Ordering::Release);
+    }
+
+    pub fn set_prefer_tcp_tunnel(&self, value: bool) {
+        self.prefer_tcp_tunnel.store(value, Ordering::Release);
+    }
+
+    pub fn prefers_tcp_tunnel(&self) -> bool {
+        self.prefer_tcp_tunnel.load(Ordering::Acquire)
     }
 
     /// Get a clone of the full per-node last-seen version map.

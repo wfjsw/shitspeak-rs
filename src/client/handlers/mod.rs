@@ -62,6 +62,10 @@ async fn handle_udp_tunnel(
         ));
     }
 
+    // Match Mumble/shitspeak behavior: a tunneled voice packet means
+    // this client currently prefers TCP transport for voice.
+    sender.set_prefer_tcp_tunnel(true);
+
     let audio = match crate::voice::codec::decode_audio_packet(&data) {
         Ok(a) => a,
         Err(e) => {

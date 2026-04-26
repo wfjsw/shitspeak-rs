@@ -19,6 +19,15 @@ fn is_vec_u8(ty: &Type) -> bool {
     false
 }
 
+fn is_bytes(ty: &Type) -> bool {
+    if let Type::Path(p) = ty {
+        if let Some(seg) = p.path.segments.last() {
+            return seg.ident == "Bytes";
+        }
+    }
+    false
+}
+
 #[proc_macro_derive(MessageConversion)]
 pub fn message_conversion(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -46,6 +55,38 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
                 if is_vec_u8(ty) {
                     // treat as raw bytes
                     from_arms.push(quote! {
+                        #discr => Ok(#name::#var_ident(buffer.to_vec())),
+                    });
+
+                    proto_tag_arms.push(quote! {
+                        #name::#var_ident(_) => #discr,
+                    });
+
+                    encoded_len_arms.push(quote! {
+                        #name::#var_ident(data) => data.len(),
+                    });
+
+                    to_proto_arms.push(quote! {
+                        #name::#var_ident(data) => {
+                            buf.put_slice(data.as_ref());
+                            Ok(())
+                        },
+                    });
+
+                    to_proto_vec_arms.push(quote! {
+                        #name::#var_ident(data) => Ok(bytes::Bytes::from(data.clone())),
+                    });
+
+                    from_impls.push(quote! {
+                        impl From<#ty> for #name {
+                            fn from(value: #ty) -> Self {
+                                #name::#var_ident(value)
+                            }
+                        }
+                    });
+                } else if is_bytes(ty) {
+                    // treat as raw bytes
+                    from_arms.push(quote! {
                         #discr => Ok(#name::#var_ident(buffer)),
                     });
 
@@ -59,13 +100,13 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
 
                     to_proto_arms.push(quote! {
                         #name::#var_ident(data) => {
-                            buf.put_slice(data);
+                            buf.put_slice(data.as_ref());
                             Ok(())
                         },
                     });
 
                     to_proto_vec_arms.push(quote! {
-                        #name::#var_ident(data) => Ok((data.clone())),
+                        #name::#var_ident(data) => Ok(data.clone()),
                     });
 
                     from_impls.push(quote! {

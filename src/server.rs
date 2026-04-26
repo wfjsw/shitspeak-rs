@@ -331,6 +331,9 @@ impl Server {
                     continue;
                 };
 
+                // A valid UDP voice packet indicates UDP path is working.
+                client.set_prefer_tcp_tunnel(false);
+
                 if matched_via_ip_fallback {
                     server
                         .clients
