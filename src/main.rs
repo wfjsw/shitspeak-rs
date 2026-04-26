@@ -4,29 +4,31 @@
 use crate::{config::Config, server::Server};
 
 mod acl;
+mod api;
 mod ban_repository;
 mod blob_store;
+mod channel_handler;
 mod channel_repository;
 mod channels;
 mod client;
+mod client_certificate_verifier;
 mod client_repository;
 mod codec_info;
 mod config;
 mod config_watcher;
 mod constants;
 mod context_action;
+mod errors;
 mod geoip;
 mod messages;
+mod protocol_version;
+mod proxy_protocol;
+mod register;
 mod server;
 mod types;
+mod utils;
 mod voice;
 mod voice_crypto;
-mod client_certificate_verifier;
-mod proxy_protocol;
-mod protocol_version;
-mod register;
-mod errors;
-mod api;
 
 mod mumble_proto {
     include!(concat!(env!("OUT_DIR"), "/mumble_proto.rs"));

@@ -11,3 +11,7 @@
 - This means `get_log_since()` returns empty after restart, causing `replay_channel_log_gap` to fail for reconnecting clients with non-zero `last_channel_version`.
 - Mitigated by the fact that reconnecting clients get a full channel tree during auth and their `last_channel_version` is reset.
 - If full WAL replay support is needed, the log should be populated from WAL entries during `open()`.
+
+## Snapshot not generating automatically
+- `ChannelRepository::save_snapshot()` existed but had no call sites, so `channels.snapshot.json` was never created during normal operation.
+- **Fix**: `commit()` now triggers periodic compaction in persisted mode every 256 committed channel operations (`CHANNEL_SNAPSHOT_EVERY_OPS`), logging a warning if compaction fails without failing the mutation commit.

@@ -14,7 +14,9 @@ pub async fn handle_channel_remove(
     msg: ChannelRemove,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "ChannelRemove message received before authentication",
+        ));
     }
 
     let channel_id = msg.channel_id;
@@ -24,7 +26,7 @@ pub async fn handle_channel_remove(
             r#type: DenyType::Permission,
             session: u32::from(sender.get_session_id()),
             channel_id: Some(0),
-            reason: Some("Cannot delete the root channel".to_owned()),
+            reason: Some("Cannot delete the root channel".into()),
             name: None,
             permission: None,
         }));

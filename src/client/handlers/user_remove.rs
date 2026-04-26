@@ -13,7 +13,9 @@ pub async fn handle_user_remove(
     msg: UserRemove,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "UserRemove message received before authentication",
+        ));
     }
 
     let target_raw = msg.session;

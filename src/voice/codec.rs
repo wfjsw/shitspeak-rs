@@ -9,15 +9,15 @@
 //! |----------------------------|-----------|----------------------------|
 //! | `0x00`                     | Protobuf  | Audio message              |
 //! | `0x01`                     | Protobuf  | Ping message               |
-//! | `0x00` (legacy)            | Legacy    | VoiceCELTAlpha             |
-//! | `0x01` (legacy)            | Legacy    | Ping                       |
-//! | `0x02` (legacy)            | Legacy    | VoiceSpeex                 |
-//! | `0x03` (legacy)            | Legacy    | VoiceCELTBeta              |
-//! | `0x04` (legacy)            | Legacy    | VoiceOpus                  |
+//! | `(header >> 5) == 0`       | Legacy    | VoiceCELTAlpha             |
+//! | `(header >> 5) == 1`       | Legacy    | Ping                       |
+//! | `(header >> 5) == 2`       | Legacy    | VoiceSpeex                 |
+//! | `(header >> 5) == 3`       | Legacy    | VoiceCELTBeta              |
+//! | `(header >> 5) == 4`       | Legacy    | VoiceOpus                  |
 //!
-//! Protobuf packets are distinguished by having `(type << 8) | 0` as the
-//! first two bytes (the second byte is always 0 for protobuf Audio/Ping).
-//! Legacy packets have a single type byte followed by varint-encoded fields.
+//! Protobuf UDP messages use a one-byte message type prefix.
+//! Legacy voice packets encode type in the 3 MSBs and target/context
+//! in the 5 LSBs of the first header byte.
 
 use std::fmt::Display;
 
@@ -90,23 +90,36 @@ pub async fn decode_udp_packet(data: &[u8]) -> Result<UdpPacket, DecodeError> {
         return Err(DecodeError::TooShort);
     }
 
-    // Protobuf detection: first two bytes are (type << 8) | 0.
-    // Only attempt if the second byte is exactly 0x00.
-    if data.len() >= 2 && data[1] == 0x00 {
+    // Protobuf ping has an unambiguous one-byte type header.
+    if data[0] == 0x01 {
         if let Ok(packet) = try_decode_protobuf(data).await {
             return Ok(packet);
         }
-        // Protobuf detection was a false positive (legacy packet whose
-        // second byte happened to be 0x00).  Fall through to legacy.
     }
 
-    // Legacy format: first byte is the message type.
-    match data[0] {
-        0x00 => Ok(UdpPacket::Audio(decode_audio_legacy(&data[1..], "CELTAlpha")?)),
-        0x02 => Ok(UdpPacket::Audio(decode_audio_legacy(&data[1..], "Speex")?)),
-        0x03 => Ok(UdpPacket::Audio(decode_audio_legacy(&data[1..], "CELTBeta")?)),
-        0x04 => Ok(UdpPacket::Audio(decode_audio_legacy(&data[1..], "Opus")?)),
-        0x01 => Ok(UdpPacket::Ping(super::ping::decode_ping_legacy(&data[1..]).await?)),
+    // Legacy pings can appear without header (12/24 bytes).
+    if (data.len() == 12 || data.len() == 24)
+        && super::ping::decode_ping_legacy(data).await.is_ok()
+    {
+        return Ok(UdpPacket::Ping(super::ping::decode_ping_legacy(data).await?));
+    }
+
+    // Protobuf audio (0x00) overlaps legacy CELTAlpha (type bits 000).
+    // Try protobuf first and fall back to legacy if parse fails.
+    if data[0] == 0x00 {
+        if let Ok(packet) = try_decode_protobuf(data).await {
+            return Ok(packet);
+        }
+    }
+
+    // Legacy format: message type in top 3 bits of first header byte.
+    let legacy_type = (data[0] >> 5) & 0x07;
+    match legacy_type {
+        0 => Ok(UdpPacket::Audio(decode_audio_legacy(data, "CELTAlpha")?)),
+        1 => Ok(UdpPacket::Ping(super::ping::decode_ping_legacy(&data[1..]).await?)),
+        2 => Ok(UdpPacket::Audio(decode_audio_legacy(data, "Speex")?)),
+        3 => Ok(UdpPacket::Audio(decode_audio_legacy(data, "CELTBeta")?)),
+        4 => Ok(UdpPacket::Audio(decode_audio_legacy(data, "Opus")?)),
         _ => Err(DecodeError::NotVoice),
     }
 }
@@ -114,8 +127,8 @@ pub async fn decode_udp_packet(data: &[u8]) -> Result<UdpPacket, DecodeError> {
 /// Try to decode as protobuf.  Returns `Err` if it's not actually protobuf.
 async fn try_decode_protobuf(data: &[u8]) -> Result<UdpPacket, DecodeError> {
     match data[0] {
-        0x00 => Ok(UdpPacket::Audio(decode_audio_protobuf(&data[2..])?)),
-        0x01 => Ok(UdpPacket::Ping(super::ping::decode_ping_protobuf(&data[2..]).await?)),
+        0x00 => Ok(UdpPacket::Audio(decode_audio_protobuf(&data[1..])?)),
+        0x01 => Ok(UdpPacket::Ping(super::ping::decode_ping_protobuf(&data[1..]).await?)),
         _ => Err(DecodeError::NotVoice),
     }
 }
@@ -140,25 +153,26 @@ pub fn decode_audio_packet(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
         return Err(DecodeError::TooShort);
     }
 
-    // Protobuf detection: first two bytes are (type << 8) | 0.
-    // Type 0 = Audio. The second byte being 0 is the key discriminator
-    // because legacy VoiceCELTAlpha also has first byte 0 but the second
-    // byte would be a varint (non-zero for any real target).
-    if data.len() >= 2 && data[1] == 0x00 && (data[0] == 0x00 || data[0] == 0x01) {
-        if data[0] == 0x00 {
-            return decode_audio_protobuf(&data[2..]);
-        }
-        // data[0] == 0x01 is a protobuf Ping — not voice
+    // Protobuf ping is not voice.
+    if data[0] == 0x01 {
         return Err(DecodeError::NotVoice);
     }
 
-    // Legacy format: first byte is the message type.
-    match data[0] {
-        0x00 => decode_audio_legacy(&data[1..], "CELTAlpha"),
-        0x02 => decode_audio_legacy(&data[1..], "Speex"),
-        0x03 => decode_audio_legacy(&data[1..], "CELTBeta"),
-        0x04 => decode_audio_legacy(&data[1..], "Opus"),
-        0x01 => Err(DecodeError::NotVoice), // legacy Ping
+    // Protobuf audio (0x00) overlaps with legacy CELTAlpha type bits.
+    if data[0] == 0x00 {
+        if let Ok(audio) = decode_audio_protobuf(&data[1..]) {
+            return Ok(audio);
+        }
+    }
+
+    // Legacy format: message type in top 3 bits of first header byte.
+    let legacy_type = (data[0] >> 5) & 0x07;
+    match legacy_type {
+        0 => decode_audio_legacy(data, "CELTAlpha"),
+        1 => Err(DecodeError::NotVoice),
+        2 => decode_audio_legacy(data, "Speex"),
+        3 => decode_audio_legacy(data, "CELTBeta"),
+        4 => decode_audio_legacy(data, "Opus"),
         _ => Err(DecodeError::NotVoice),
     }
 }
@@ -186,57 +200,90 @@ fn decode_audio_protobuf(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
 
 /// Decode a legacy-format voice packet.
 ///
-/// Legacy format (after the type byte):
-///   varint target
+/// Legacy format:
+///   header byte: type in top 3 bits, target in low 5 bits
+///   varint sender_session (server->client only)
 ///   If target == 0x1F (loopback):
 ///     varint position_count
-///     varint session
-///     varint sequence number
-///   Else:
-///     varint session
-///     varint sequence number
+///   varint sequence number
+///   for Opus: varint payload_size_with_terminator_flag, then payload bytes
 ///   remaining bytes = opus/celt/speex payload
 fn decode_audio_legacy(data: &[u8], _codec: &str) -> Result<DecodedAudio, DecodeError> {
-    if data.is_empty() {
+    if data.len() < 2 {
         return Err(DecodeError::TooShort);
     }
 
-    let mut pos = 0;
+    let target = (data[0] & 0x1f) as u32;
 
-    // Read varint: target
-    let (target, n) = read_varint(&data[pos..]).ok_or(DecodeError::LegacyDecode)?;
-    pos += n;
-
-    let (sender_session, frame_number) = if target == 0x1F {
-        // Loopback: skip position_count, then session, then seq
-        let (_pos_count, n1) = read_varint(&data[pos..]).ok_or(DecodeError::LegacyDecode)?;
-        pos += n1;
-        let (session, n2) = read_varint(&data[pos..]).ok_or(DecodeError::LegacyDecode)?;
-        pos += n2;
-        let (seq, n3) = read_varint(&data[pos..]).ok_or(DecodeError::LegacyDecode)?;
-        pos += n3;
-        (session, seq)
-    } else {
-        // Normal: second varint is session, third is sequence
-        let (session, n1) = read_varint(&data[pos..]).ok_or(DecodeError::LegacyDecode)?;
-        pos += n1;
-        let (seq, n2) = read_varint(&data[pos..]).ok_or(DecodeError::LegacyDecode)?;
-        pos += n2;
-        (session, seq)
-    };
-
-    let opus_data = data[pos..].to_vec();
+    // Try server-side packet shape first (client->server: no sender_session).
+    // Fall back to server->client shape if needed.
+    let parsed = decode_audio_legacy_inner(data, target, false)
+        .or_else(|| decode_audio_legacy_inner(data, target, true))
+        .ok_or(DecodeError::LegacyDecode)?;
 
     Ok(DecodedAudio {
-        target: target as u32,
-        sender_session: sender_session as u32,
-        frame_number,
-        opus_data,
-        positional_data: Vec::new(),
+        target,
+        sender_session: parsed.0,
+        frame_number: parsed.1,
+        opus_data: parsed.2,
+        positional_data: parsed.3,
         volume_adjustment: 1.0,
-        is_terminator: false,
+        is_terminator: parsed.4,
         format: PacketFormat::Legacy,
     })
+}
+
+fn decode_audio_legacy_inner(
+    data: &[u8],
+    target: u32,
+    has_sender_session: bool,
+) -> Option<(u32, u64, Vec<u8>, Vec<f32>, bool)> {
+    let mut pos = 1usize;
+
+    let sender_session = if has_sender_session {
+        let (session, n) = read_varint(&data[pos..])?;
+        pos += n;
+        session as u32
+    } else {
+        0
+    };
+
+    if target == 0x1F {
+        let (_position_count, n) = read_varint(&data[pos..])?;
+        pos += n;
+    }
+
+    let (frame_number, n) = read_varint(&data[pos..])?;
+    pos += n;
+
+    let (opus_data, is_terminator) = {
+        let (size_flag, n) = read_varint(&data[pos..])?;
+        pos += n;
+        let payload_size = (size_flag & 0x1FFF) as usize;
+        let is_terminator = (size_flag & 0x2000) != 0;
+        if pos + payload_size > data.len() {
+            return None;
+        }
+        let payload = data[pos..pos + payload_size].to_vec();
+        pos += payload_size;
+        (payload, is_terminator)
+    };
+
+    let positional_data = if data.len() == pos {
+        Vec::new()
+    } else if data.len() == pos + 12 {
+        let mut out = Vec::with_capacity(3);
+        for i in 0..3 {
+            let start = pos + i * 4;
+            let bytes: [u8; 4] = data[start..start + 4].try_into().ok()?;
+            out.push(f32::from_le_bytes(bytes));
+        }
+        out
+    } else {
+        return None;
+    };
+
+    Some((sender_session, frame_number, opus_data, positional_data, is_terminator))
 }
 
 /// Read a varint from bytes. Returns `(value, bytes_consumed)`.
@@ -281,9 +328,8 @@ fn encode_audio_protobuf(audio: &DecodedAudio) -> Vec<u8> {
     };
 
     let proto_bytes = msg.encode_to_vec();
-    let mut buf = Vec::with_capacity(2 + proto_bytes.len());
+    let mut buf = Vec::with_capacity(1 + proto_bytes.len());
     buf.push(0x00); // type = Audio
-    buf.push(0x00); // protobuf discriminator
     buf.extend_from_slice(&proto_bytes);
     buf
 }
@@ -300,14 +346,32 @@ fn encode_audio_protobuf(audio: &DecodedAudio) -> Vec<u8> {
 ///   opus payload
 fn encode_audio_legacy(audio: &DecodedAudio) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.push(0x04); // VoiceOpus
-    write_varint(&mut buf, audio.target as u64);
+    if audio.target >= (1 << 5) {
+        return Vec::new();
+    }
+    let header = (0x04u8 << 5) | ((audio.target as u8) & 0x1f); // VoiceOpus + target
+    buf.push(header);
+
+    // Server->client legacy packets include sender session.
+    write_varint(&mut buf, audio.sender_session as u64);
+
     if audio.target == 0x1F {
         write_varint(&mut buf, audio.positional_data.len() as u64 / 3);
     }
-    write_varint(&mut buf, audio.sender_session as u64);
     write_varint(&mut buf, audio.frame_number);
+
+    let size_flag = (audio.opus_data.len() as u64 & 0x1FFF)
+        | if audio.is_terminator { 0x2000 } else { 0 };
+    write_varint(&mut buf, size_flag);
+
     buf.extend_from_slice(&audio.opus_data);
+
+    if audio.positional_data.len() == 3 {
+        for f in &audio.positional_data {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+
     buf
 }
 
@@ -450,11 +514,11 @@ mod tests {
     #[test]
     fn ping_not_voice() {
         // Protobuf ping: [0x01, 0x00, ...]
-        let ping = vec![0x01, 0x00, 0x00];
+        let ping = vec![0x01, 0x00];
         assert!(matches!(decode_audio_packet(&ping), Err(DecodeError::NotVoice)));
 
-        // Legacy ping: [0x01, ...]
-        let legacy_ping = vec![0x01, 0x00];
+        // Legacy ping: type in top 3 bits => 0x20
+        let legacy_ping = vec![0x20, 0x00];
         assert!(matches!(decode_audio_packet(&legacy_ping), Err(DecodeError::NotVoice)));
     }
 

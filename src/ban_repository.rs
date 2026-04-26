@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 // ─── Ban entry ───────────────────────────────────────────────────────────────
 
@@ -174,7 +175,7 @@ impl BanRepository {
     /// Return all non-expired ban entries.
     pub async fn get_active_bans(&self) -> Vec<BanEntry> {
         let now = chrono::Utc::now().timestamp();
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT address, mask, name, hash, reason, start, duration
@@ -204,7 +205,7 @@ impl BanRepository {
     /// Check whether an IP address is banned.
     pub async fn is_banned(&self, addr: IpAddr) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock();
 
         // Get all non-expired bans and check CIDR matching in Rust.
         // For very large ban lists, we could push CIDR matching into SQL
@@ -242,7 +243,7 @@ impl BanRepository {
     /// Replace the entire ban list.
     pub async fn set_bans(self: &Arc<Self>, entries: Vec<BanEntry>) -> Result<(), io::Error> {
         let op = {
-            let conn = self.conn.lock().await;
+            let conn = self.conn.lock();
             conn.execute("DELETE FROM bans", [])
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -278,7 +279,7 @@ impl BanRepository {
     /// Add a single ban entry.
     pub async fn add_ban(self: &Arc<Self>, entry: BanEntry) -> Result<(), io::Error> {
         let op = {
-            let conn = self.conn.lock().await;
+            let conn = self.conn.lock();
             conn.execute(
                 "INSERT OR REPLACE INTO bans (address, mask, name, hash, reason, start, duration)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -306,7 +307,7 @@ impl BanRepository {
         mask: u8,
     ) -> Result<(), io::Error> {
         let op = {
-            let conn = self.conn.lock().await;
+            let conn = self.conn.lock();
             conn.execute(
                 "DELETE FROM bans WHERE address = ?1 AND mask = ?2",
                 params![address.to_string(), mask],
@@ -327,7 +328,7 @@ impl BanRepository {
 
     /// Return all log entries with `version > since_version`.
     pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<BanOperation>> {
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT version, node_id, timestamp, op_type, op_data
@@ -366,7 +367,7 @@ impl BanRepository {
         if op.version <= self.version.load(Ordering::Acquire) {
             return;
         }
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock();
         apply_op_to_db(&conn, &op.op).ok();
         // Record the operation in the log
         let op_data =
@@ -395,7 +396,7 @@ impl BanRepository {
     /// Acquires the connection lock internally.
     async fn commit(&self, op: BanOperation) -> Result<(), io::Error> {
         let op = {
-            let conn = self.conn.lock().await;
+            let conn = self.conn.lock();
             self.commit_locked(&conn, op)?
         };
         let _ = self.tx.send(op);

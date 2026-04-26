@@ -15,14 +15,18 @@ pub(crate) async fn compute_permissions_for_client(
     client: &Arc<Box<Client>>,
     channel_id: u32,
 ) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
+    let session = u32::from(client.get_session_id());
+
     // Superuser bypasses all ACL checks
     if client.is_superuser().await {
+        tracing::trace!(session, channel_id, "ACL compute bypassed for superuser");
         return enumflags2::BitFlags::all();
     }
 
     // Single lock acquisition for channel + ancestors
     let (channel, ancestors) = server.get_channels().get_channel_with_ancestors(channel_id).await;
     let Some(channel) = channel else {
+        tracing::trace!(session, channel_id, "ACL compute found no channel");
         return enumflags2::BitFlags::empty();
     };
 
@@ -34,7 +38,7 @@ pub(crate) async fn compute_permissions_for_client(
 
     let membership = crate::client::group::ClientMembershipQuery {
         groups: &group_refs,
-        authenticated: client.is_authenticated().await,
+        authenticated: user_id.is_some(),
         access_tokens: &token_refs,
         cert_hash: client.get_certificate_hash(),
         has_verified_cert_chain: client.has_certificate(),
@@ -43,11 +47,32 @@ pub(crate) async fn compute_permissions_for_client(
         country_code: None,
     };
 
-    crate::acl::evaluate_permission(
+    tracing::trace!(
+        session,
+        channel_id,
+        user_id,
+        authenticated = membership.authenticated,
+        groups = ?group_refs,
+        tokens = ?token_refs,
+        ancestors = ancestors.len(),
+        "Computing ACL permissions"
+    );
+
+    let permissions = crate::acl::evaluate_permission(
         &channel,
         &ancestors,
         user_id,
         &membership,
         channel_id,
-    )
+    );
+
+    tracing::trace!(
+        session,
+        channel_id,
+        user_id,
+        permissions = ?permissions,
+        "Computed ACL permissions"
+    );
+
+    permissions
 }

@@ -15,11 +15,21 @@ pub async fn handle_channel_state(
     msg: ChannelState,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "ChannelState message received before authentication",
+        ));
     }
 
     let session = sender.get_session_id();
-    tracing::debug!(session = u32::from(session), channel_id = msg.channel_id, parent = msg.parent, name = msg.name, "ChannelState handler");
+    tracing::debug!(
+        session = u32::from(session),
+        channel_id = msg.channel_id,
+        parent = msg.parent,
+        name = msg.name,
+        "ChannelState handler"
+    );
+
+    let channels = server.get_channels();
 
     // channel_id absent → create new channel
     // channel_id present → update existing channel
@@ -35,7 +45,7 @@ pub async fn handle_channel_state(
                         r#type: DenyType::ChannelName,
                         session: u32::from(sender.get_session_id()),
                         channel_id: None,
-                        reason: Some("Channel name is required".to_owned()),
+                        reason: Some("Channel name is required".into()),
                         name: None,
                         permission: None,
                     }));
@@ -43,29 +53,30 @@ pub async fn handle_channel_state(
             };
 
             // ACL: need MakeChannel on parent
-            let parent_perms = crate::client::acl::compute_permissions_for_client(server, sender, parent_id).await;
+            let parent_perms =
+                crate::client::acl::compute_permissions_for_client(server, sender, parent_id).await;
             if !parent_perms.contains(ACLPermissions::MakeChannel) {
                 return Err(MessageHandlerError::PermissionDenied(
-                    PermissionDenied::for_permission(u32::from(session), Some(parent_id), ACLPermissions::MakeChannel),
+                    PermissionDenied::for_permission(
+                        u32::from(session),
+                        Some(parent_id),
+                        ACLPermissions::MakeChannel,
+                    ),
                 ));
             }
 
             let is_temp = msg.temporary.unwrap_or(false);
-            let new_id = server.get_channels().next_channel_id(is_temp).await;
+            let new_id = channels.next_channel_id(is_temp).await;
 
-            let new_ch = Channel {
-                id: new_id,
+            let new_ch = Channel::new(
+                new_id,
                 name,
-                parent_id: Some(parent_id),
-                position: msg.position.unwrap_or(0),
-                max_users: msg.max_users.unwrap_or(0),
-                inherit_acl: true,
-                links: std::collections::HashSet::new(),
-                description_hash: None,
-                acls: Vec::new(),
-            };
+                msg.position.unwrap_or(0),
+                msg.max_users.unwrap_or(0),
+                Some(parent_id),
+            );
 
-            let created = match server.get_channels().create_channel(new_ch).await {
+            let created = match channels.create_channel(new_ch).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::warn!("create_channel failed: {:?}", e);
@@ -73,7 +84,7 @@ pub async fn handle_channel_state(
                         r#type: DenyType::Text,
                         session: u32::from(sender.get_session_id()),
                         channel_id: None,
-                        reason: Some(format!("Failed to create channel: {:?}", e)),
+                        reason: Some(format!("Failed to create channel: {:?}", e).into()),
                         name: None,
                         permission: None,
                     }));
@@ -86,14 +97,16 @@ pub async fn handle_channel_state(
 
         Some(channel_id) => {
             // ── Update existing channel ───────────────────────────────────
-            let channel = match server.get_channels().get_channel(channel_id).await {
+            let channel = match channels.get_channel(channel_id).await {
                 Some(ch) => ch,
                 None => return Ok(()),
             };
 
             // ACL: need Write on the channel for name/description/position changes
             let has_write = {
-                let perms = crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
+                let perms =
+                    crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
+                        .await;
                 perms.contains(ACLPermissions::Write)
             };
 
@@ -104,14 +117,18 @@ pub async fn handle_channel_state(
                         r#type: DenyType::Permission,
                         session: u32::from(session),
                         channel_id: Some(0),
-                        reason: Some("Cannot rename the root channel".to_owned()),
+                        reason: Some("Cannot rename the root channel".into()),
                         name: None,
                         permission: None,
                     }));
                 }
                 if !has_write {
                     return Err(MessageHandlerError::PermissionDenied(
-                        PermissionDenied::for_permission(u32::from(session), Some(channel_id), ACLPermissions::Write),
+                        PermissionDenied::for_permission(
+                            u32::from(session),
+                            Some(channel_id),
+                            ACLPermissions::Write,
+                        ),
                     ));
                 }
             }
@@ -119,14 +136,22 @@ pub async fn handle_channel_state(
             // Description change requires Write
             if msg.description.is_some() && !has_write {
                 return Err(MessageHandlerError::PermissionDenied(
-                    PermissionDenied::for_permission(u32::from(session), Some(channel_id), ACLPermissions::Write),
+                    PermissionDenied::for_permission(
+                        u32::from(session),
+                        Some(channel_id),
+                        ACLPermissions::Write,
+                    ),
                 ));
             }
 
             // Position change requires Write
             if msg.position.is_some() && !has_write {
                 return Err(MessageHandlerError::PermissionDenied(
-                    PermissionDenied::for_permission(u32::from(session), Some(channel_id), ACLPermissions::Write),
+                    PermissionDenied::for_permission(
+                        u32::from(session),
+                        Some(channel_id),
+                        ACLPermissions::Write,
+                    ),
                 ));
             }
 
@@ -135,13 +160,24 @@ pub async fn handle_channel_state(
                 if Some(new_parent) != channel.parent_id {
                     if !has_write {
                         return Err(MessageHandlerError::PermissionDenied(
-                            PermissionDenied::for_permission(u32::from(session), Some(channel_id), ACLPermissions::Write),
+                            PermissionDenied::for_permission(
+                                u32::from(session),
+                                Some(channel_id),
+                                ACLPermissions::Write,
+                            ),
                         ));
                     }
-                    let parent_perms = crate::client::acl::compute_permissions_for_client(server, sender, new_parent).await;
+                    let parent_perms = crate::client::acl::compute_permissions_for_client(
+                        server, sender, new_parent,
+                    )
+                    .await;
                     if !parent_perms.contains(ACLPermissions::MakeChannel) {
                         return Err(MessageHandlerError::PermissionDenied(
-                            PermissionDenied::for_permission(u32::from(session), Some(new_parent), ACLPermissions::MakeChannel),
+                            PermissionDenied::for_permission(
+                                u32::from(session),
+                                Some(new_parent),
+                                ACLPermissions::MakeChannel,
+                            ),
                         ));
                     }
                 }
@@ -149,18 +185,31 @@ pub async fn handle_channel_state(
 
             // Links: need LinkChannel on the channel
             if !msg.links_add.is_empty() || !msg.links_remove.is_empty() {
-                let link_perms = crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
+                let link_perms =
+                    crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
+                        .await;
                 if !link_perms.contains(ACLPermissions::LinkChannel) {
                     return Err(MessageHandlerError::PermissionDenied(
-                        PermissionDenied::for_permission(u32::from(session), Some(channel_id), ACLPermissions::LinkChannel),
+                        PermissionDenied::for_permission(
+                            u32::from(session),
+                            Some(channel_id),
+                            ACLPermissions::LinkChannel,
+                        ),
                     ));
                 }
                 // For link additions, also check LinkChannel on the target
                 for link_add in &msg.links_add {
-                    let target_perms = crate::client::acl::compute_permissions_for_client(server, sender, *link_add).await;
+                    let target_perms = crate::client::acl::compute_permissions_for_client(
+                        server, sender, *link_add,
+                    )
+                    .await;
                     if !target_perms.contains(ACLPermissions::LinkChannel) {
                         return Err(MessageHandlerError::PermissionDenied(
-                            PermissionDenied::for_permission(u32::from(session), Some(*link_add), ACLPermissions::LinkChannel),
+                            PermissionDenied::for_permission(
+                                u32::from(session),
+                                Some(*link_add),
+                                ACLPermissions::LinkChannel,
+                            ),
                         ));
                     }
                 }
@@ -174,20 +223,15 @@ pub async fn handle_channel_state(
                 parent_id: msg.parent.map(|p| Some(p)),
             };
 
-            // Handle link additions/removals
-            for link_add in &msg.links_add {
-                let _ = server.get_channels().add_link(channel_id, *link_add).await;
-            }
-            for link_remove in &msg.links_remove {
-                let _ = server.get_channels().remove_link(channel_id, *link_remove).await;
-            }
-
-            if let Err(e) = server.get_channels().update_channel(channel_id, patch).await {
+            if let Err(e) = channels
+                .edit_channel(channel_id, patch, msg.links_add, msg.links_remove)
+                .await
+            {
                 tracing::warn!("update_channel {channel_id} failed: {:?}", e);
                 return Ok(());
             }
 
-            // Channel update is logged and broadcast via ChannelRepository::commit().
+            // Channel update is logged and broadcast via a single ChannelRepository::commit().
             // Per-client subscribers will pick up the ChannelState delta.
         }
     }

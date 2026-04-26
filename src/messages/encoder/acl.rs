@@ -16,8 +16,8 @@ impl From<crate::mumble_proto::acl::ChanAcl> for ChanAcl {
     fn from(proto: crate::mumble_proto::acl::ChanAcl) -> Self {
         Self {
             apply_here: proto.apply_here.unwrap_or(true),
-            apply_subs: proto.apply_subs.unwrap_or(false),
-            inherited: proto.inherited.unwrap_or(false),
+            apply_subs: proto.apply_subs.unwrap_or(true),
+            inherited: proto.inherited.unwrap_or(true),
             user_id: proto.user_id,
             group: proto.group,
             grant: proto.grant.unwrap_or(0),
@@ -54,7 +54,7 @@ impl From<crate::mumble_proto::Acl> for Acl {
     fn from(proto: crate::mumble_proto::Acl) -> Self {
         Self {
             channel_id: proto.channel_id,
-            inherit_acls: proto.inherit_acls,
+            inherit_acls: Some(proto.inherit_acls.unwrap_or(true)),
             groups: proto.groups,
             acls: proto.acls.into_iter().map(|a| a.into()).collect(),
             query: proto.query,
@@ -66,7 +66,7 @@ impl Default for Acl {
     fn default() -> Self {
         Self {
             channel_id: 0,
-            inherit_acls: None,
+            inherit_acls: Some(true),
             groups: Vec::new(),
             acls: Vec::new(),
             query: None,

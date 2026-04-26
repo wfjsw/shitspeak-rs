@@ -13,7 +13,9 @@ pub async fn handle_permission_query(
     msg: PermissionQuery,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "PermissionQuery message received before authentication",
+        ));
     }
 
     tracing::debug!(session = u32::from(sender.get_session_id()), flush = msg.flush, "PermissionQuery handler");

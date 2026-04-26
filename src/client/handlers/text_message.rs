@@ -13,7 +13,9 @@ pub async fn handle_text_message(
     msg: TextMessage,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "TextMessage message received before authentication",
+        ));
     }
 
     let sender_session = u32::from(sender.get_session_id());

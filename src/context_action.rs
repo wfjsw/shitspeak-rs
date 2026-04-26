@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 
 use crate::messages::encoder::ContextActionModify;
 
@@ -197,9 +197,8 @@ impl ContextActionRegistry {
 
         self.handlers
             .write()
-            .await
             .insert(action, ActionHandler::OneShot(callback));
-        self.definitions.write().await.push(def);
+        self.definitions.write().push(def);
     }
 
     /// Register a toggle action.
@@ -227,14 +226,14 @@ impl ContextActionRegistry {
             },
         };
 
-        self.handlers.write().await.insert(
+        self.handlers.write().insert(
             action,
             ActionHandler::Toggle {
                 callback,
                 state: initial_state,
             },
         );
-        self.definitions.write().await.push(def);
+        self.definitions.write().push(def);
     }
 
     // ── Query ────────────────────────────────────────────────────────
@@ -245,8 +244,8 @@ impl ContextActionRegistry {
     /// These should be sent to a client when it first connects, or
     /// broadcast to all clients when the list changes.
     pub async fn build_modify_list(&self) -> Vec<ContextActionModify> {
-        let definitions = self.definitions.read().await;
-        let handlers = self.handlers.read().await;
+        let definitions = self.definitions.read();
+        let handlers = self.handlers.read();
         let mut out = Vec::with_capacity(definitions.len());
 
         for def in definitions.iter() {
@@ -288,7 +287,8 @@ impl ContextActionRegistry {
     pub async fn dispatch(&self, payload: ContextActionPayload) -> bool {
         // Scope the lock so it's released before any .await below
         let action = {
-            let mut handlers = self.handlers.write().await;
+            let mut handlers = self.handlers.write();
+            let mut handlers = self.handlers.write();
 
             match handlers.get_mut(&payload.action) {
                 Some(ActionHandler::OneShot(cb)) => {
@@ -322,7 +322,7 @@ impl ContextActionRegistry {
     ///
     /// Returns `None` if the action doesn't exist or isn't a toggle.
     pub async fn toggle_state(&self, action: &str) -> Option<bool> {
-        let handlers = self.handlers.read().await;
+        let handlers = self.handlers.read();
         match handlers.get(action) {
             Some(ActionHandler::Toggle { state, .. }) => Some(*state),
             _ => None,
@@ -333,7 +333,7 @@ impl ContextActionRegistry {
     ///
     /// Returns `true` if the state was changed.
     pub async fn set_toggle_state(&self, action: &str, new_state: bool) -> bool {
-        let mut handlers = self.handlers.write().await;
+        let mut handlers = self.handlers.write();
         match handlers.get_mut(action) {
             Some(ActionHandler::Toggle { state, .. }) => {
                 let changed = *state != new_state;

@@ -15,7 +15,9 @@ pub async fn handle_ban_list(
     msg: BanList,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "BanList message received before authentication",
+        ));
     }
 
     tracing::debug!(session = u32::from(sender.get_session_id()), query = msg.query, num_bans = msg.bans.len(), "BanList handler");

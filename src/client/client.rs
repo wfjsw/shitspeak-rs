@@ -5,9 +5,10 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use parking_lot::{MappedMutexGuard as ParkingMappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
 use tokio::{
     net::TcpStream,
-    sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
+    sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard},
 };
 use tokio_rustls::server::TlsStream;
 
@@ -37,23 +38,23 @@ pub struct Client {
     udp_address: Option<SocketAddr>,
     local_address: SocketAddr,
 
-    connection: Mutex<TlsStream<TcpStream>>,
+    connection: AsyncMutex<TlsStream<TcpStream>>,
 
     // Statistics
     login_time: DateTime<Utc>,
-    last_active: Mutex<DateTime<Utc>>,
-    last_ping: Mutex<DateTime<Utc>>,
-    udp_state: Option<Mutex<UdpState>>,
+    last_active: ParkingMutex<DateTime<Utc>>,
+    last_ping: ParkingMutex<DateTime<Utc>>,
+    udp_state: Option<AsyncMutex<UdpState>>,
     stats: RwLock<ClientStats>,
 
     certificate_hash: Option<Vec<u8>>,
-    user_info_extended: Mutex<Option<UserInfoExtended>>,
+    user_info_extended: ParkingMutex<Option<UserInfoExtended>>,
 
     options: RwLock<ClientOptions>,
 
     local_state: RwLock<Option<ClientLocalState>>,
     global_state: RwLock<ClientGlobalState>,
-    crypt_state: Mutex<Option<CryptState>>,
+    crypt_state: AsyncMutex<Option<CryptState>>,
 
     /// Whether this client has been published to the log (i.e. `AddClient`
     /// has been emitted).  Only published clients generate `RemoveClient`
@@ -62,11 +63,11 @@ pub struct Client {
 
     /// The last client-state log version this connection has seen,
     /// indexed by node_id.  Used to detect gaps and replay missed entries.
-    last_client_version: Mutex<HashMap<u16, u64>>,
+    last_client_version: ParkingMutex<HashMap<u16, u64>>,
     /// The last channel-state log version this connection has seen.
     /// Channels are fully serialized across the cluster, so a single
     /// version counter suffices.
-    last_channel_version: Mutex<u64>,
+    last_channel_version: ParkingMutex<u64>,
 }
 
 impl Client {
@@ -104,21 +105,21 @@ impl Client {
             tcp_address,
             udp_address,
             local_address,
-            connection: Mutex::new(connection),
+            connection: AsyncMutex::new(connection),
             login_time: now,
-            last_active: Mutex::new(now),
-            last_ping: Mutex::new(now),
+            last_active: ParkingMutex::new(now),
+            last_ping: ParkingMutex::new(now),
             udp_state: None,
             stats: RwLock::new(ClientStats::default()),
             certificate_hash,
-            user_info_extended: Mutex::new(Some(UserInfoExtended::default())),
+            user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
             local_state: RwLock::new(Some(ClientLocalState::new())),
             global_state: RwLock::new(ClientGlobalState::new()),
-            crypt_state: Mutex::new(None),
+            crypt_state: AsyncMutex::new(None),
             published: AtomicBool::new(false),
-            last_client_version: Mutex::new(HashMap::new()),
-            last_channel_version: Mutex::new(0),
+            last_client_version: ParkingMutex::new(HashMap::new()),
+            last_channel_version: ParkingMutex::new(0),
         })
     }
 
@@ -140,13 +141,13 @@ impl Client {
 
     /// Get a clone of the full per-node last-seen version map.
     pub async fn get_last_client_versions(&self) -> HashMap<u16, u64> {
-        self.last_client_version.lock().await.clone()
+        self.last_client_version.lock().clone()
     }
 
     /// Merge the given per-node version map into the client's last-seen
     /// trackers.  Each entry is updated to `max(existing, new)`.
     pub async fn update_last_client_versions(&self, versions: &HashMap<u16, u64>) {
-        let mut map = self.last_client_version.lock().await;
+        let mut map = self.last_client_version.lock();
         for (&node_id, &version) in versions {
             let entry = map.entry(node_id).or_insert(0);
             *entry = (*entry).max(version);
@@ -155,12 +156,12 @@ impl Client {
 
     /// Get the last channel-state version seen.
     pub async fn get_last_channel_version(&self) -> u64 {
-        *self.last_channel_version.lock().await
+        *self.last_channel_version.lock()
     }
 
     /// Record a channel-state version seen.
     pub async fn set_last_channel_version(&self, version: u64) {
-        *self.last_channel_version.lock().await = version;
+        *self.last_channel_version.lock() = version;
     }
 
     pub async fn get_groups_clone(&self) -> HashSet<String> {
@@ -284,12 +285,12 @@ impl Client {
     }
 
     pub async fn get_last_ping(&self) -> DateTime<Utc> {
-        let last_ping = self.last_ping.lock().await;
+        let last_ping = self.last_ping.lock();
         *last_ping
     }
 
     pub async fn reset_last_ping(&self) {
-        let mut last_ping = self.last_ping.lock().await;
+        let mut last_ping = self.last_ping.lock();
         *last_ping = Utc::now();
     }
 
@@ -307,11 +308,11 @@ impl Client {
     //     }
     // }
 
-    pub async fn crypt_state(&self) -> MutexGuard<'_, Option<CryptState>> {
+    pub async fn crypt_state(&self) -> AsyncMutexGuard<'_, Option<CryptState>> {
         self.crypt_state.lock().await
     }
 
-    pub async fn udp_state(&self) -> MutexGuard<'_, UdpState> {
+    pub async fn udp_state(&self) -> AsyncMutexGuard<'_, UdpState> {
         match &self.udp_state {
             Some(m) => m.lock().await,
             None => panic!("UDP state not initialized"),
@@ -356,9 +357,6 @@ impl Client {
     /// A client is a superuser if they are authenticated and belong to the
     /// `admin` group.
     pub async fn is_superuser(&self) -> bool {
-        if !self.is_authenticated().await {
-            return false;
-        }
         self.has_group("admin").await
     }
 
@@ -480,11 +478,11 @@ impl Client {
         }
     }
 
-    pub async fn user_info_extended(&self) -> MappedMutexGuard<'_, UserInfoExtended> {
-        let user_info_extended = self.user_info_extended.lock().await;
+    pub async fn user_info_extended(&self) -> ParkingMappedMutexGuard<'_, UserInfoExtended> {
+        let user_info_extended = self.user_info_extended.lock();
         if user_info_extended.is_none() {
             panic!("Accessing user_info_extended of non-local user");
         }
-        MutexGuard::map(user_info_extended, |opt| opt.as_mut().unwrap())
+        ParkingMutexGuard::map(user_info_extended, |opt| opt.as_mut().unwrap())
     }
 }

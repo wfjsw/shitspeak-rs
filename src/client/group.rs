@@ -46,7 +46,7 @@ pub fn is_member_in_group(
     join_passwords: &[&str],
     client: &ClientMembershipQuery,
 ) -> bool {
-    let (match_type, invert, use_target_channel) = evaluate_group_string_match_type(group);
+    let (match_type, invert, use_target_channel) = evaluate_group_string_match_type(group, current_channel_id, target_channel_id);
     let channel_id = match use_target_channel {
         true => match target_channel_id {
             Some(id) => id,
@@ -120,7 +120,7 @@ pub fn is_member_in_group(
     }
 }
 
-fn evaluate_group_string_match_type<'a>(group: &'a str) -> (Option<MatchType<'a>>, bool, bool) {
+fn evaluate_group_string_match_type<'a>(group: &'a str, current_channel_id: u32, target_channel_id: Option<u32>) -> (Option<MatchType<'a>>, bool, bool) {
     let mut invert = false;
     let mut use_target_channel = false;
     let mut group_name_slice = group;
@@ -215,7 +215,19 @@ fn evaluate_group_string_match_type<'a>(group: &'a str) -> (Option<MatchType<'a>
                 }
             }
 
-            _ => break Some(MatchType::ClientGroup(group_name_slice)),
+            _ => {
+                // Built-in group names that are not prefix-delimited.
+                let m = match group_name_slice {
+                    "all"    => Some(MatchType::All),
+                    "none"   => Some(MatchType::None),
+                    "auth"   => Some(MatchType::Authenticated),
+                    "strong" => Some(MatchType::HasVerifiedCertificateChain),
+                    "in"     => Some(MatchType::InChannel(target_channel_id.unwrap_or(current_channel_id))),
+                    "out"    => Some(MatchType::OutOfChannel(target_channel_id.unwrap_or(current_channel_id))), 
+                    name     => Some(MatchType::ClientGroup(name)),
+                };
+                break m;
+            }
         }
     };
     (match_type, invert, use_target_channel)

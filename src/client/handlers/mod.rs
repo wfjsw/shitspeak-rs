@@ -56,7 +56,9 @@ async fn handle_udp_tunnel(
     data: Vec<u8>,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "UDPTunnel message received before authentication",
+        ));
     }
 
     let audio = match crate::voice::codec::decode_audio_packet(&data) {
@@ -206,9 +208,26 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             }
         };
 
-        // Triage the result: PermissionDenied errors are sent back to the
-        // client as a PermissionDenied message; all other errors propagate.
+        // Triage the result: auth rejections and permission denials are sent
+        // back to the client immediately; all other errors propagate.
         match result {
+            Err(MessageHandlerError::ProtocolViolation(reason)) => {
+                use crate::messages::WriteMessageExt;
+                tracing::warn!(session, reason = %reason, "Protocol violation");
+                let reject = crate::errors::AuthRejection::new(crate::messages::encoder::RejectType::None)
+                    .because(reason);
+                let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
+                let msg = crate::messages::Message::Reject(reject_msg.into());
+                self.write_proto_message(&msg).await?;
+                Err(MessageHandlerError::AuthRejection(reject))
+            }
+            Err(MessageHandlerError::AuthRejection(reject)) => {
+                use crate::messages::WriteMessageExt;
+                let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
+                let msg = crate::messages::Message::Reject(reject_msg.into());
+                self.write_proto_message(&msg).await?;
+                Err(MessageHandlerError::AuthRejection(reject))
+            }
             Err(MessageHandlerError::PermissionDenied(deny)) => {
                 use crate::messages::WriteMessageExt;
                 let msg: crate::messages::Message = deny.into();

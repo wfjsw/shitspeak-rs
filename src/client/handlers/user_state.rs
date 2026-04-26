@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::collections::HashSet;
 
 use crate::{
     acl::ACLPermissions,
@@ -14,7 +15,9 @@ pub async fn handle_user_state(
     msg: crate::messages::encoder::UserState,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "UserState message received before authentication",
+        ));
     }
 
     let sender_id = sender.get_session_id();
@@ -34,68 +37,92 @@ pub async fn handle_user_state(
 
     let target_id = target.get_session_id();
     let is_self = target_id == sender_id;
+    let target_current_channel_id = target.get_current_channel_id().await;
+    let requested_channel_change = msg
+        .channel_id
+        .filter(|new_channel_id| *new_channel_id != target_current_channel_id);
+
+    let mut actor_source_perms = None;
+    let mut target_destination_perms = None;
 
     // ── ACL: Channel move ────────────────────────────────────────────────
     // Check permissions before acquiring the guard, so we can return early.
-    if let Some(new_channel_id) = msg.channel_id {
-        let current = target.get_current_channel_id().await;
-        if current != new_channel_id && new_channel_id != 0 {
-            let dst_chan = server.get_channels().get_channel(new_channel_id).await;
-            if dst_chan.is_none() {
-                return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
-                    r#type: DenyType::ChannelName,
-                    session: u32::from(sender_id),
-                    channel_id: Some(new_channel_id),
-                    reason: Some(format!("Channel {} does not exist", new_channel_id)),
-                    name: None,
-                    permission: None,
-                }));
+    if let Some(new_channel_id) = requested_channel_change {
+        let dst_chan = server.get_channels().get_channel(new_channel_id).await;
+        if dst_chan.is_none() {
+            return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                r#type: DenyType::ChannelName,
+                session: u32::from(sender_id),
+                channel_id: Some(new_channel_id),
+                reason: Some(format!("Channel {} does not exist", new_channel_id).into()),
+                name: None,
+                permission: None,
+            }));
+        }
+
+        let dst_perms = crate::client::acl::compute_permissions_for_client(server, &target, new_channel_id).await;
+        target_destination_perms = Some(dst_perms);
+
+        if is_self {
+            // Moving self: need Enter on destination.
+            if !dst_perms.contains(ACLPermissions::Enter) {
+                return Err(MessageHandlerError::PermissionDenied(
+                    PermissionDenied::for_permission(u32::from(target_id), Some(new_channel_id), ACLPermissions::Enter),
+                ));
+            }
+        } else {
+            // Moving others: need Move on target's current channel.
+            let src_perms = crate::client::acl::compute_permissions_for_client(server, sender, target_current_channel_id).await;
+            actor_source_perms = Some(src_perms);
+            if !src_perms.contains(ACLPermissions::Move) {
+                return Err(MessageHandlerError::PermissionDenied(
+                    PermissionDenied::for_permission(u32::from(sender_id), Some(target_current_channel_id), ACLPermissions::Move),
+                ));
             }
 
-            if is_self {
-                // Moving self: need Enter on destination
-                let perms = crate::client::acl::compute_permissions_for_client(server, &target, new_channel_id).await;
-                if !perms.contains(ACLPermissions::Enter) {
+            // If target lacks Enter on destination, actor needs Move on destination too.
+            if !dst_perms.contains(ACLPermissions::Enter) {
+                let actor_dst = crate::client::acl::compute_permissions_for_client(server, sender, new_channel_id).await;
+                if !actor_dst.contains(ACLPermissions::Move) {
                     return Err(MessageHandlerError::PermissionDenied(
-                        PermissionDenied::for_permission(u32::from(target_id), Some(new_channel_id), ACLPermissions::Enter),
+                        PermissionDenied::for_permission(u32::from(sender_id), Some(new_channel_id), ACLPermissions::Move),
                     ));
                 }
-            } else {
-                // Moving others: need Move on target's current channel
-                let src_ch = target.get_current_channel_id().await;
-                let src_perms = crate::client::acl::compute_permissions_for_client(server, sender, src_ch).await;
-                if !src_perms.contains(ACLPermissions::Move) {
-                    return Err(MessageHandlerError::PermissionDenied(
-                        PermissionDenied::for_permission(u32::from(sender_id), Some(src_ch), ACLPermissions::Move),
-                    ));
-                }
-                // If target lacks Enter on destination, actor needs Move on destination too
-                let dst_perms = crate::client::acl::compute_permissions_for_client(server, &target, new_channel_id).await;
-                if !dst_perms.contains(ACLPermissions::Enter) {
-                    let actor_dst = crate::client::acl::compute_permissions_for_client(server, sender, new_channel_id).await;
-                    if !actor_dst.contains(ACLPermissions::Move) {
-                        return Err(MessageHandlerError::PermissionDenied(
-                            PermissionDenied::for_permission(u32::from(sender_id), Some(new_channel_id), ACLPermissions::Move),
-                        ));
-                    }
-                }
+            }
+
+            if !src_perms.contains(ACLPermissions::Traverse) {
+                return Err(MessageHandlerError::PermissionDenied(
+                    PermissionDenied::for_permission(u32::from(sender_id), Some(target_current_channel_id), ACLPermissions::Traverse),
+                ));
+            }
+
+            if !dst_perms.contains(ACLPermissions::Traverse) {
+                return Err(MessageHandlerError::PermissionDenied(
+                    PermissionDenied::for_permission(u32::from(target_id), Some(new_channel_id), ACLPermissions::Traverse),
+                ));
             }
         }
     }
 
     // ── ACL: Mute/deaf/suppress/priority_speaker (moderator actions) ──────
     if !is_self && (msg.mute.is_some() || msg.deaf.is_some() || msg.suppress.is_some() || msg.priority_speaker.is_some()) {
-        let target_ch = target.get_current_channel_id().await;
-        let perms = crate::client::acl::compute_permissions_for_client(server, sender, target_ch).await;
+        let perms = match actor_source_perms {
+            Some(perms) => perms,
+            None => crate::client::acl::compute_permissions_for_client(server, sender, target_current_channel_id).await,
+        };
         if !perms.contains(ACLPermissions::MuteDeafen) {
             return Err(MessageHandlerError::PermissionDenied(
-                PermissionDenied::for_permission(u32::from(sender_id), Some(target_ch), ACLPermissions::MuteDeafen),
+                PermissionDenied::for_permission(u32::from(sender_id), Some(target_current_channel_id), ACLPermissions::MuteDeafen),
             ));
         }
     }
 
     // ── ACL: Listening channel add ────────────────────────────────────────
+    let mut checked_listen_channels = HashSet::new();
     for ch_id in &msg.listening_channel_add {
+        if !checked_listen_channels.insert(*ch_id) {
+            continue;
+        }
         let perms = crate::client::acl::compute_permissions_for_client(server, sender, *ch_id).await;
         if !perms.contains(ACLPermissions::Listen) {
             return Err(MessageHandlerError::PermissionDenied(
@@ -147,6 +174,10 @@ pub async fn handle_user_state(
                     gs.set_deaf(false);
                 }
             }
+
+            if gs.is_suppressed() && !mute {
+                gs.set_suppress(false);
+            }
         }
         if let Some(deaf) = msg.deaf {
             if gs.is_deafened() != deaf {
@@ -182,21 +213,11 @@ pub async fn handle_user_state(
     }
 
     // ── Channel move ──────────────────────────────────────────────────────
-    if let Some(new_channel_id) = msg.channel_id {
-        let current = gs.get_current_channel_id();
-        if current != new_channel_id {
-            // Verify the channel exists
-            if new_channel_id != 0 && server.get_channels().get_channel(new_channel_id).await.is_none() {
-                return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
-                    r#type: DenyType::ChannelName,
-                    session: u32::from(sender_id),
-                    channel_id: Some(new_channel_id),
-                    reason: Some(format!("Channel {} does not exist", new_channel_id)),
-                    name: None,
-                    permission: None,
-                }));
-            }
-            gs.set_current_channel_id(new_channel_id);
+    if let Some(new_channel_id) = requested_channel_change {
+        gs.set_current_channel_id(new_channel_id);
+
+        if let Some(dst_perms) = target_destination_perms {
+            gs.set_suppress(!dst_perms.contains(ACLPermissions::Speak));
         }
     }
 

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::{
     errors::{
         AuthRejection, MessageTypeNotForIncoming, ReadProtoMessageError, WriteProtoMessageError,
@@ -8,6 +10,7 @@ use crate::{
 #[derive(Debug)]
 pub enum MessageHandlerError {
     AuthRejection(AuthRejection),
+    ProtocolViolation(Cow<'static, str>),
     WriteProtoMessageError(WriteProtoMessageError),
     ReadProtoMessageError(ReadProtoMessageError),
     MessageTypeNotForIncoming(MessageTypeNotForIncoming),
@@ -59,10 +62,19 @@ impl From<PermissionDenied> for MessageHandlerError {
     }
 }
 
+impl MessageHandlerError {
+    pub fn protocol_violation(reason: impl Into<Cow<'static, str>>) -> Self {
+        MessageHandlerError::ProtocolViolation(reason.into())
+    }
+}
+
 impl std::fmt::Display for MessageHandlerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MessageHandlerError::AuthRejection(e) => write!(f, "Authentication rejected: {}", e),
+            MessageHandlerError::ProtocolViolation(reason) => {
+                write!(f, "Protocol violation: {}", reason)
+            }
             MessageHandlerError::WriteProtoMessageError(e) => {
                 write!(f, "Write proto message error: {}", e)
             }

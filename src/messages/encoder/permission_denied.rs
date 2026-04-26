@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::messages::Message;
 
 /// Deny types for `PermissionDenied` messages.
@@ -46,8 +48,8 @@ pub struct PermissionDenied {
     pub r#type: DenyType,
     pub session: u32,
     pub channel_id: Option<u32>,
-    pub reason: Option<String>,
-    pub name: Option<String>,
+    pub reason: Option<Cow<'static, str>>,
+    pub name: Option<Cow<'static, str>>,
     pub permission: Option<u32>,
 }
 
@@ -101,8 +103,8 @@ impl From<crate::mumble_proto::PermissionDenied> for PermissionDenied {
             r#type: proto.r#type.map_or(DenyType::Text, DenyType::from_proto),
             session: proto.session.unwrap_or(0),
             channel_id: proto.channel_id,
-            reason: proto.reason,
-            name: proto.name,
+            reason: proto.reason.map(Cow::Owned),
+            name: proto.name.map(Cow::Owned),
             permission: proto.permission,
         }
     }
@@ -127,8 +129,8 @@ impl Into<crate::mumble_proto::PermissionDenied> for PermissionDenied {
             r#type: Some(self.r#type as i32),
             session: Some(self.session),
             channel_id: self.channel_id,
-            reason: self.reason,
-            name: self.name,
+            reason: self.reason.map(Cow::into_owned),
+            name: self.name.map(Cow::into_owned),
             permission: self.permission,
         }
     }

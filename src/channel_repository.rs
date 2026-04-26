@@ -30,18 +30,40 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use enumflags2::BitFlags;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
+use scc::HashCache;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 use crate::acl::ACLPermissions;
 use crate::acl::ACL;
 use crate::channels::{Channel, ChannelPatch};
+use crate::config::Config;
 use crate::errors::ChannelRepoError;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelRepoTuning {
+    pub log_max_entries: usize,
+    pub snapshot_every_ops: u64,
+    pub snapshot_every_secs: i64,
+    pub wal_compaction_expire_count: usize,
+}
+
+impl From<&Config> for ChannelRepoTuning {
+    fn from(cfg: &Config) -> Self {
+        Self {
+            log_max_entries: cfg.channel_log_max_entries.max(1),
+            snapshot_every_ops: cfg.channel_snapshot_every_ops.max(1),
+            snapshot_every_secs: cfg.channel_snapshot_every_secs.max(1),
+            wal_compaction_expire_count: cfg.channel_wal_compaction_expire_count,
+        }
+    }
+}
 
 // ─── WAL types ────────────────────────────────────────────────────────────────
 
@@ -62,6 +84,28 @@ impl ChannelOperation {
     pub fn to_message(&self) -> Option<crate::messages::Message> {
         match &self.op {
             ChannelOp::CreateChannel { channel } => Some(channel_to_proto_full(channel)),
+            ChannelOp::EditChannel {
+                id,
+                patch,
+                links_add,
+                links_remove,
+            } => Some(
+                crate::messages::encoder::ChannelState {
+                    channel_id: Some(*id),
+                    parent: patch.parent_id.unwrap_or(None),
+                    name: patch.name.clone(),
+                    position: patch.position,
+                    max_users: patch.max_users,
+                    description_hash: patch
+                        .description_hash
+                        .as_ref()
+                        .and_then(|h| h.as_ref().and_then(|h| hex::decode(h).ok())),
+                    links_add: links_add.clone(),
+                    links_remove: links_remove.clone(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
             ChannelOp::UpdateChannel { id, patch } => Some(channel_to_proto_delta(*id, patch)),
             ChannelOp::DeleteChannel { id } => {
                 Some(crate::messages::encoder::ChannelRemove { channel_id: *id }.into())
@@ -133,6 +177,12 @@ pub enum ChannelOp {
     CreateChannel {
         channel: Channel,
     },
+    EditChannel {
+        id: u32,
+        patch: ChannelPatch,
+        links_add: Vec<u32>,
+        links_remove: Vec<u32>,
+    },
     UpdateChannel {
         id: u32,
         patch: ChannelPatch,
@@ -169,22 +219,30 @@ struct Snapshot {
 
 pub struct ChannelRepository {
     node_id: u16,
-    channels: RwLock<HashMap<u32, Channel>>,
+    channels: ParkingRwLock<HashMap<u32, Channel>>,
     version: AtomicU64,
     /// In-memory log for `get_log_since` and future S2S queries.
-    log: RwLock<std::collections::VecDeque<Arc<ChannelOperation>>>,
+    log: ParkingRwLock<std::collections::VecDeque<Arc<ChannelOperation>>>,
     log_max_entries: usize,
     /// Cached effective permissions: (session_id_u64, channel_id) → perms.
-    acl_cache: RwLock<HashMap<(u64, u32), BitFlags<ACLPermissions>>>,
+    /// Lock-free concurrent cache using scc::HashCache.
+    acl_cache: HashCache<(u64, u32), BitFlags<ACLPermissions>>,
     /// Optional storage directory.
     storage_dir: Option<PathBuf>,
     /// Append-only WAL file handle; `None` when running in-memory.
-    wal_file: Option<Mutex<tokio::fs::File>>,
+    wal_file: Option<AsyncMutex<tokio::fs::File>>,
+    /// Number of valid entries currently present in WAL.
+    wal_entry_count: AtomicUsize,
+    snapshot_every_ops: u64,
+    snapshot_every_secs: i64,
+    wal_compaction_expire_count: usize,
     /// Broadcast channel for S2S subscribers.
     tx: broadcast::Sender<Arc<ChannelOperation>>,
     /// Optional reference to `ClientRepository` for draining pending ops
     /// after remote channel ops are applied.
-    client_repo: Mutex<Option<Arc<crate::client_repository::ClientRepository>>>,
+    client_repo: ParkingMutex<Option<Arc<crate::client_repository::ClientRepository>>>,
+    /// Unix timestamp when the last snapshot compaction succeeded.
+    last_snapshot_at: AtomicI64,
 }
 
 // ─── public API ───────────────────────────────────────────────────────────────
@@ -193,23 +251,28 @@ impl ChannelRepository {
     // ── Construction ──────────────────────────────────────────────────────
 
     /// Create an in-memory repository (no persistence).
-    pub fn new_in_memory(node_id: u16) -> Arc<Self> {
+    pub fn new_in_memory(node_id: u16, tuning: ChannelRepoTuning) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
         let mut channels = HashMap::new();
         // Ensure root channel exists
-        let root = Channel::new(0, "Root".to_owned(), 0, 0, None, false);
+        let root = Channel::new(0, "Root", 0, 0, None);
         channels.insert(0, root);
         Arc::new(Self {
             node_id,
-            channels: RwLock::new(channels),
+            channels: ParkingRwLock::new(channels),
             version: AtomicU64::new(0),
-            log: RwLock::new(std::collections::VecDeque::new()),
-            log_max_entries: 10_000,
-            acl_cache: RwLock::new(HashMap::new()),
+            log: ParkingRwLock::new(std::collections::VecDeque::new()),
+            log_max_entries: tuning.log_max_entries,
+            acl_cache: HashCache::new(),
             storage_dir: None,
             wal_file: None,
+            wal_entry_count: AtomicUsize::new(0),
+            snapshot_every_ops: tuning.snapshot_every_ops,
+            snapshot_every_secs: tuning.snapshot_every_secs,
+            wal_compaction_expire_count: tuning.wal_compaction_expire_count,
             tx,
-            client_repo: Mutex::new(None),
+            client_repo: ParkingMutex::new(None),
+            last_snapshot_at: AtomicI64::new(chrono::Utc::now().timestamp()),
         })
     }
 
@@ -220,7 +283,11 @@ impl ChannelRepository {
     /// 2. Replay `channels.wal.jsonl` entries with `version > snapshot_version`.
     /// 3. Reopen the WAL for appending.
     /// 4. Insert root channel (id=0) if missing.
-    pub async fn open(node_id: u16, storage_dir: &Path) -> Result<Arc<Self>, ChannelRepoError> {
+    pub async fn open(
+        node_id: u16,
+        storage_dir: &Path,
+        tuning: ChannelRepoTuning,
+    ) -> Result<Arc<Self>, ChannelRepoError> {
         tokio::fs::create_dir_all(storage_dir).await?;
 
         let snapshot_path = storage_dir.join("channels.snapshot.json");
@@ -250,6 +317,8 @@ impl ChannelRepository {
         };
 
         let mut max_version = base_version;
+        let mut wal_entry_count: usize = 0;
+        let mut log_entries = std::collections::VecDeque::new();
         for (line_no, line) in wal_contents.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
@@ -266,6 +335,14 @@ impl ChannelRepository {
                     break;
                 }
             };
+            wal_entry_count += 1;
+
+            // Keep an in-memory bounded replay window for S2S catch-up.
+            log_entries.push_back(Arc::new(op.clone()));
+            while log_entries.len() > tuning.log_max_entries {
+                log_entries.pop_front();
+            }
+
             if op.version <= base_version {
                 continue; // already reflected in snapshot
             }
@@ -284,7 +361,7 @@ impl ChannelRepository {
 
         // ── 4. Ensure root channel exists ────────────────────────────────
         if !channels.contains_key(&0) {
-            let root = Channel::new(0, "Root".to_owned(), 0, 0, None, false);
+            let root = Channel::new(0, "Root", 0, 0, None);
             channels.insert(0, root);
         }
 
@@ -292,15 +369,20 @@ impl ChannelRepository {
 
         Ok(Arc::new(Self {
             node_id,
-            channels: RwLock::new(channels),
+            channels: ParkingRwLock::new(channels),
             version: AtomicU64::new(max_version),
-            log: RwLock::new(std::collections::VecDeque::new()),
-            log_max_entries: 10_000,
-            acl_cache: RwLock::new(HashMap::new()),
+            log: ParkingRwLock::new(log_entries),
+            log_max_entries: tuning.log_max_entries,
+            acl_cache: HashCache::new(),
             storage_dir: Some(storage_dir.to_owned()),
-            wal_file: Some(Mutex::new(wal_file)),
+            wal_file: Some(AsyncMutex::new(wal_file)),
+            wal_entry_count: AtomicUsize::new(wal_entry_count),
+            snapshot_every_ops: tuning.snapshot_every_ops,
+            snapshot_every_secs: tuning.snapshot_every_secs,
+            wal_compaction_expire_count: tuning.wal_compaction_expire_count,
             tx,
-            client_repo: Mutex::new(None),
+            client_repo: ParkingMutex::new(None),
+            last_snapshot_at: AtomicI64::new(chrono::Utc::now().timestamp()),
         }))
     }
 
@@ -313,22 +395,21 @@ impl ChannelRepository {
     // ── Read API ──────────────────────────────────────────────────────────
 
     pub async fn get_channel(&self, id: u32) -> Option<Channel> {
-        self.channels.read().await.get(&id).cloned()
+        self.channels.read().get(&id).cloned()
     }
 
     pub async fn get_all(&self) -> Vec<Channel> {
-        self.channels.read().await.values().cloned().collect()
+        self.channels.read().values().cloned().collect()
     }
 
     /// Return the total number of channels.
     pub async fn len(&self) -> usize {
-        self.channels.read().await.len()
+        self.channels.read().len()
     }
 
     pub async fn get_children(&self, parent_id: u32) -> Vec<Channel> {
         self.channels
             .read()
-            .await
             .values()
             .filter(|c| c.parent_id == Some(parent_id))
             .cloned()
@@ -338,7 +419,7 @@ impl ChannelRepository {
     /// Returns the chain of ancestors for `channel_id`, starting from the
     /// immediate parent up to (and including) the root.
     pub async fn get_ancestors(&self, channel_id: u32) -> Vec<Channel> {
-        let channels = self.channels.read().await;
+        let channels = self.channels.read();
         let mut result = Vec::new();
         let mut current_id = channel_id;
         loop {
@@ -358,7 +439,7 @@ impl ChannelRepository {
     /// Return both a channel and its ancestor chain in a single lock
     /// acquisition.  Avoids the double-lock pattern in ACL evaluation.
     pub async fn get_channel_with_ancestors(&self, channel_id: u32) -> (Option<Channel>, Vec<Channel>) {
-        let channels = self.channels.read().await;
+        let channels = self.channels.read();
         let channel = channels.get(&channel_id).cloned();
         let mut ancestors = Vec::new();
         let mut current_id = channel_id;
@@ -380,7 +461,7 @@ impl ChannelRepository {
 
     /// Allocate a fresh channel ID.  Temporary channels get bit-31 set.
     pub async fn next_channel_id(&self, temporary: bool) -> u32 {
-        let channels = self.channels.read().await;
+        let channels = self.channels.read();
         // Find the highest non-temporary ID and increment.
         let max_id = channels
             .keys()
@@ -401,7 +482,7 @@ impl ChannelRepository {
         mut channel: Channel,
     ) -> Result<Channel, ChannelRepoError> {
         let op = {
-            let mut channels = self.channels.write().await;
+            let mut channels = self.channels.write();
 
             // Validate parent exists
             if let Some(pid) = channel.parent_id {
@@ -433,7 +514,7 @@ impl ChannelRepository {
         id: u32,
         patch: ChannelPatch,
     ) -> Result<Channel, ChannelRepoError> {
-        let mut channels = self.channels.write().await;
+        let mut channels = self.channels.write();
 
         if !channels.contains_key(&id) {
             return Err(ChannelRepoError::NotFound(id));
@@ -478,6 +559,82 @@ impl ChannelRepository {
         Ok(updated)
     }
 
+    pub async fn edit_channel(
+        self: &Arc<Self>,
+        id: u32,
+        patch: ChannelPatch,
+        links_add: Vec<u32>,
+        links_remove: Vec<u32>,
+    ) -> Result<Channel, ChannelRepoError> {
+        let updated = {
+            let mut channels = self.channels.write();
+
+            if !channels.contains_key(&id) {
+                return Err(ChannelRepoError::NotFound(id));
+            }
+
+            if let Some(new_parent) = patch.parent_id {
+                if let Some(pid) = new_parent {
+                    if !channels.contains_key(&pid) {
+                        return Err(ChannelRepoError::ParentNotFound(pid));
+                    }
+                    if is_descendant(&channels, pid, id) {
+                        return Err(ChannelRepoError::CannotMoveIntoDescendant);
+                    }
+                }
+            }
+
+            if let Some(ref new_name) = patch.name {
+                let target_parent = patch.parent_id.unwrap_or_else(|| channels[&id].parent_id);
+                if channels
+                    .values()
+                    .any(|c| c.parent_id == target_parent && &c.name == new_name && c.id != id)
+                {
+                    return Err(ChannelRepoError::NameConflict(new_name.clone()));
+                }
+            }
+
+            for &link_add in &links_add {
+                if link_add == id {
+                    continue;
+                }
+                if !channels.contains_key(&link_add) {
+                    return Err(ChannelRepoError::NotFound(link_add));
+                }
+            }
+
+            for &link_add in &links_add {
+                if link_add == id {
+                    continue;
+                }
+                channels.get_mut(&id).unwrap().links.insert(link_add);
+                if let Some(target) = channels.get_mut(&link_add) {
+                    target.links.insert(id);
+                }
+            }
+
+            for &link_remove in &links_remove {
+                channels.get_mut(&id).unwrap().links.remove(&link_remove);
+                if let Some(target) = channels.get_mut(&link_remove) {
+                    target.links.remove(&id);
+                }
+            }
+
+            apply_patch(channels.get_mut(&id).unwrap(), &patch);
+            channels[&id].clone()
+        };
+
+        let op = self.make_op(ChannelOp::EditChannel {
+            id,
+            patch,
+            links_add,
+            links_remove,
+        });
+        self.invalidate_acl_cache_for_channel(id).await;
+        self.commit(op).await?;
+        Ok(updated)
+    }
+
     /// Delete a channel and all its descendants.  Users should be moved to
     /// the parent by the caller before invoking this.
     pub async fn delete_channel(self: &Arc<Self>, id: u32) -> Result<Vec<u32>, ChannelRepoError> {
@@ -485,7 +642,7 @@ impl ChannelRepository {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
         let to_delete = {
-            let mut channels = self.channels.write().await;
+            let mut channels = self.channels.write();
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
             }
@@ -510,7 +667,7 @@ impl ChannelRepository {
             return Ok(()); // no-op; callers should reject same-channel links
         }
         {
-            let mut channels = self.channels.write().await;
+            let mut channels = self.channels.write();
             if !channels.contains_key(&a) {
                 return Err(ChannelRepoError::NotFound(a));
             }
@@ -528,7 +685,7 @@ impl ChannelRepository {
 
     pub async fn remove_link(self: &Arc<Self>, a: u32, b: u32) -> Result<(), ChannelRepoError> {
         {
-            let mut channels = self.channels.write().await;
+            let mut channels = self.channels.write();
             if let Some(ch) = channels.get_mut(&a) {
                 ch.links.remove(&b);
             }
@@ -549,7 +706,7 @@ impl ChannelRepository {
         acls: Vec<ACL>,
     ) -> Result<(), ChannelRepoError> {
         {
-            let mut channels = self.channels.write().await;
+            let mut channels = self.channels.write();
             let ch = channels
                 .get_mut(&channel_id)
                 .ok_or(ChannelRepoError::NotFound(channel_id))?;
@@ -574,11 +731,7 @@ impl ChannelRepository {
         session_id: u64,
         channel_id: u32,
     ) -> Option<BitFlags<ACLPermissions>> {
-        self.acl_cache
-            .read()
-            .await
-            .get(&(session_id, channel_id))
-            .copied()
+        self.acl_cache.get(&(session_id, channel_id)).map(|entry| *entry)
     }
 
     pub async fn cache_permissions(
@@ -587,30 +740,41 @@ impl ChannelRepository {
         channel_id: u32,
         perms: BitFlags<ACLPermissions>,
     ) {
-        self.acl_cache
-            .write()
-            .await
-            .insert((session_id, channel_id), perms);
+        self.acl_cache.put((session_id, channel_id), perms);
     }
 
     pub async fn invalidate_acl_cache_for_channel(&self, channel_id: u32) {
-        self.acl_cache
-            .write()
-            .await
-            .retain(|(_, cid), _| *cid != channel_id);
+        // Collect keys to remove (can't modify during iteration)
+        let mut keys_to_remove = Vec::new();
+        self.acl_cache.scan(|k, _| {
+            if k.1 == channel_id {
+                keys_to_remove.push(*k);
+            }
+        });
+        // Remove collected keys
+        for key in keys_to_remove {
+            self.acl_cache.remove(&key);
+        }
     }
 
     pub async fn invalidate_acl_cache_for_user(&self, session_id: u64) {
-        self.acl_cache
-            .write()
-            .await
-            .retain(|(sid, _), _| *sid != session_id);
+        // Collect keys to remove (can't modify during iteration)
+        let mut keys_to_remove = Vec::new();
+        self.acl_cache.scan(|k, _| {
+            if k.0 == session_id {
+                keys_to_remove.push(*k);
+            }
+        });
+        // Remove collected keys
+        for key in keys_to_remove {
+            self.acl_cache.remove(&key);
+        }
     }
 
     // ── Snapshot / compaction ─────────────────────────────────────────────
 
-    /// Write a snapshot to disk and atomically replace the WAL with an empty
-    /// file.  This is the compaction step.
+    /// Write a snapshot to disk and lazily compact WAL by expiring the
+    /// configured number of oldest entries per compaction pass.
     pub async fn save_snapshot(&self) -> Result<(), ChannelRepoError> {
         let Some(ref dir) = self.storage_dir else {
             return Ok(());
@@ -621,7 +785,7 @@ impl ChannelRepository {
         let wal_tmp = dir.join("channels.wal.jsonl.tmp");
 
         let version = self.version.load(Ordering::Acquire);
-        let channels: Vec<Channel> = self.channels.read().await.values().cloned().collect();
+        let channels: Vec<Channel> = self.channels.read().values().cloned().collect();
 
         let snap = Snapshot {
             version,
@@ -647,27 +811,64 @@ impl ChannelRepository {
         } // file closed here
         tokio::fs::rename(&snapshot_tmp, &snapshot_path).await?;
 
-        // Atomically truncate WAL by writing an empty replacement file
-        if let Some(ref wal_mutex) = self.wal_file {
-            let mut wal = wal_mutex.lock().await;
-            // Write empty staging file
-            {
-                let mut tmp_file = tokio::fs::OpenOptions::new()
-                    .write(true)
+        // Compact WAL only when it has grown past the replay window.
+        let wal_count = self.wal_entry_count.load(Ordering::Acquire);
+        let wal_needs_compaction = wal_count > self.log_max_entries;
+        if wal_needs_compaction {
+            if let Some(ref wal_mutex) = self.wal_file {
+                let mut wal = wal_mutex.lock().await;
+
+                // Expire oldest entries in a best-effort, resource-friendly way.
+                // We stream the existing WAL line-by-line and skip the first N lines.
+                let expire_n = self
+                    .wal_compaction_expire_count
+                    .max(1)
+                    .min(wal_count.saturating_sub(self.log_max_entries).max(1));
+
+                wal.sync_data().await?;
+
+                let src = tokio::fs::OpenOptions::new().read(true).open(&wal_path).await?;
+                let mut reader = tokio::io::BufReader::new(src).lines();
+                let mut skipped = 0usize;
+                let mut kept = 0usize;
+
+                {
+                    let mut tmp_file = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&wal_tmp)
+                        .await?;
+
+                    while let Some(line) = reader.next_line().await? {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if skipped < expire_n {
+                            skipped += 1;
+                            continue;
+                        }
+                        tmp_file.write_all(line.as_bytes()).await?;
+                        tmp_file.write_all(b"\n").await?;
+                        kept += 1;
+                    }
+
+                    tmp_file.sync_data().await?;
+                }
+
+                tokio::fs::rename(&wal_tmp, &wal_path).await?;
+                *wal = tokio::fs::OpenOptions::new()
                     .create(true)
-                    .truncate(true)
-                    .open(&wal_tmp)
+                    .append(true)
+                    .open(&wal_path)
                     .await?;
-                tmp_file.sync_data().await?;
-            } // tmp_file closed here
-            tokio::fs::rename(&wal_tmp, &wal_path).await?;
-            // Reopen the (now empty) WAL for appending
-            *wal = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&wal_path)
-                .await?;
+                self.wal_entry_count.store(kept, Ordering::Release);
+            }
         }
+
+        self.last_snapshot_at
+            .store(chrono::Utc::now().timestamp(), Ordering::Release);
 
         Ok(())
     }
@@ -684,7 +885,6 @@ impl ChannelRepository {
     pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<ChannelOperation>> {
         self.log
             .read()
-            .await
             .iter()
             .filter(|op| op.version > since_version)
             .cloned()
@@ -705,7 +905,7 @@ impl ChannelRepository {
             return Ok(());
         }
         let new_version = {
-            let mut channels = self.channels.write().await;
+            let mut channels = self.channels.write();
             apply_op_to_map(&mut channels, &op.op);
             let new_version = op.version;
             self.version.fetch_max(new_version, Ordering::AcqRel);
@@ -713,7 +913,8 @@ impl ChannelRepository {
         };
 
         // Notify ClientRepository to drain pending ops whose dep is now satisfied
-        if let Some(ref client_repo) = *self.client_repo.lock().await {
+        let client_repo = self.client_repo.lock().clone();
+        if let Some(client_repo) = client_repo {
             client_repo.drain_pending_ops(new_version).await;
         }
 
@@ -725,7 +926,7 @@ impl ChannelRepository {
         &self,
         client_repo: Arc<crate::client_repository::ClientRepository>,
     ) {
-        *self.client_repo.lock().await = Some(client_repo);
+        *self.client_repo.lock() = Some(client_repo);
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -745,7 +946,7 @@ impl ChannelRepository {
         // released before commit() is called, but version+log ordering is
         // guaranteed by the log lock.
         let op = {
-            let mut log = self.log.write().await;
+            let mut log = self.log.write();
             let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
             debug_assert!(
                 version < u64::MAX - 1_000_000,
@@ -772,10 +973,26 @@ impl ChannelRepository {
             let mut wal = wal_mutex.lock().await;
             wal.write_all(line.as_bytes()).await?;
             wal.sync_data().await?;
+            self.wal_entry_count.fetch_add(1, Ordering::AcqRel);
         }
+
+        let committed_version = op.version;
 
         // Notify S2S subscribers (ignore error when no receivers)
         let _ = self.tx.send(op);
+
+        // Periodically compact WAL into a snapshot in persisted mode.
+        // Trigger on either operation count or elapsed-time threshold.
+        // Keep commit success independent from compaction; WAL durability already succeeded.
+        let now = chrono::Utc::now().timestamp();
+        let last_snapshot = self.last_snapshot_at.load(Ordering::Acquire);
+        let ops_due = committed_version % self.snapshot_every_ops == 0;
+        let time_due = now.saturating_sub(last_snapshot) >= self.snapshot_every_secs;
+        if self.storage_dir.is_some() && (ops_due || time_due) {
+            if let Err(e) = self.save_snapshot().await {
+                tracing::warn!("channel snapshot compaction failed: {e}");
+            }
+        }
 
         Ok(())
     }
@@ -788,6 +1005,35 @@ fn apply_op_to_map(channels: &mut HashMap<u32, Channel>, op: &ChannelOp) {
     match op {
         ChannelOp::CreateChannel { channel } => {
             channels.insert(channel.id, channel.clone());
+        }
+        ChannelOp::EditChannel {
+            id,
+            patch,
+            links_add,
+            links_remove,
+        } => {
+            for link_add in links_add {
+                if *link_add == *id {
+                    continue;
+                }
+                if let Some(ch) = channels.get_mut(id) {
+                    ch.links.insert(*link_add);
+                }
+                if let Some(target) = channels.get_mut(link_add) {
+                    target.links.insert(*id);
+                }
+            }
+            for link_remove in links_remove {
+                if let Some(ch) = channels.get_mut(id) {
+                    ch.links.remove(link_remove);
+                }
+                if let Some(target) = channels.get_mut(link_remove) {
+                    target.links.remove(id);
+                }
+            }
+            if let Some(ch) = channels.get_mut(id) {
+                apply_patch(ch, patch);
+            }
         }
         ChannelOp::UpdateChannel { id, patch } => {
             if let Some(ch) = channels.get_mut(id) {

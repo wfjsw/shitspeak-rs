@@ -29,7 +29,7 @@ pub fn release() -> String {
     let app_name = app_name();
     let app_version = app_version();
     let short_sha = &COMMIT_HASH[..7];
-    let build_date = BUILD_DATE;
+    let build_date = &BUILD_DATE[..19];
 
     format!("{} {} ({}) [{}]", app_name, app_version, short_sha, build_date)
 }

@@ -7,6 +7,7 @@ pub mod acl;
 pub mod api;
 pub mod ban_repository;
 pub mod blob_store;
+pub mod channel_handler;
 pub mod channel_repository;
 pub mod channels;
 pub mod client;
@@ -24,6 +25,7 @@ pub mod proxy_protocol;
 pub mod register;
 pub mod server;
 pub mod types;
+pub mod utils;
 pub mod voice;
 pub mod voice_crypto;
 

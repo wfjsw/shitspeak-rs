@@ -1,4 +1,4 @@
-use crate::{errors::{ReadProtoMessageError, WriteProtoMessageError}, proxy_protocol::GetProxyProtocolRealIpError};
+use crate::{errors::{AuthRejection, ReadProtoMessageError, WriteProtoMessageError}, proxy_protocol::GetProxyProtocolRealIpError};
 
 #[derive(Debug)]
 pub enum HandleIncomingConnectionError {
@@ -12,6 +12,8 @@ pub enum HandleIncomingConnectionError {
     ChannelLogGapUnrecoverable,
     /// Failed to write a message to the client (connection lost).
     ClientWriteFailed(WriteProtoMessageError),
+    /// Authentication was rejected after the server sent a Reject message.
+    AuthRejected(AuthRejection),
     /// The client's message handler returned an error.
     MessageHandlerFailed,
 }
@@ -61,6 +63,9 @@ impl std::fmt::Display for HandleIncomingConnectionError {
             }
             HandleIncomingConnectionError::ClientWriteFailed(err) => {
                 write!(f, "Client write failed: {}", err)
+            }
+            HandleIncomingConnectionError::AuthRejected(err) => {
+                write!(f, "Client authentication rejected: {}", err)
             }
             HandleIncomingConnectionError::MessageHandlerFailed => {
                 write!(f, "Client message handler failed")

@@ -13,7 +13,9 @@ pub async fn handle_request_blob(
     msg: RequestBlob,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "RequestBlob message received before authentication",
+        ));
     }
 
     tracing::debug!(

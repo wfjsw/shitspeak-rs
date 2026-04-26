@@ -6,3 +6,4 @@ cert.cer
 cert.pfx
 # Logs
 log/
+data/

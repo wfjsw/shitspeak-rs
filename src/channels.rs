@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,19 +27,18 @@ pub struct Channel {
 impl Channel {
     pub fn new(
         id: u32,
-        name: String,
+        name: impl Into<String>,
         position: i32,
         max_users: u32,
         parent_id: Option<u32>,
-        inherit_acl: bool,
     ) -> Self {
         Channel {
             id,
-            name,
+            name: name.into(),
             position,
             max_users,
             parent_id,
-            inherit_acl,
+            inherit_acl: true,
             links: HashSet::new(),
             description_hash: None,
             acls: Vec::new(),

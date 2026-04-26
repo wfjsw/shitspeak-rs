@@ -13,7 +13,9 @@ pub async fn handle_user_stats(
     msg: UserStats,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "UserStats message received before authentication",
+        ));
     }
 
     tracing::debug!(session = u32::from(sender.get_session_id()), target = msg.session, stats_only = msg.stats_only, "UserStats handler");

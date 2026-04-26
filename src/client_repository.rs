@@ -4,8 +4,9 @@ use std::{
     sync::Arc,
 };
 
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, RwLock as AsyncRwLock};
 use tokio_rustls::server::TlsStream;
 
 use crate::{
@@ -17,24 +18,22 @@ use crate::{
     constants::MAX_LOCAL_SESSION_ID,
 };
 
-/// Maximum number of log entries to retain in the in-memory ring buffer.
-const LOG_MAX_ENTRIES: usize = 10_000;
-
 pub struct ClientRepository {
     local_node_id: u16,
+    log_max_entries: usize,
 
     /// All client state, the version counter, and the log ring buffer
     /// are protected by a single `RwLock` so that reads (lookups, log
     /// queries) don't contend with each other, but mutations are
     /// serialised.
-    register: RwLock<ClientRegister>,
+    register: AsyncRwLock<ClientRegister>,
 
-    clients_by_host: RwLock<HashMap<IpAddr, HashSet<ClientSessionIdentifier>>>,
-    clients_by_udp_address: RwLock<HashMap<SocketAddr, ClientSessionIdentifier>>,
+    clients_by_host: ParkingRwLock<HashMap<IpAddr, HashSet<ClientSessionIdentifier>>>,
+    clients_by_udp_address: ParkingRwLock<HashMap<SocketAddr, ClientSessionIdentifier>>,
 
     // The pointer only store local_session_id part
-    allocation_pointer: Mutex<u32>,
-    free_ids: Mutex<HashSet<u32>>,
+    allocation_pointer: ParkingMutex<u32>,
+    free_ids: ParkingMutex<HashSet<u32>>,
 
     /// Broadcast channel for per-client subscribers and future S2S peers.
     tx: broadcast::Sender<Arc<ClientStateBroadcastPayload>>,
@@ -99,11 +98,12 @@ impl ClientRegister {
 }
 
 impl ClientRepository {
-    pub fn new(local_node_id: u16) -> Self {
+    pub fn new(local_node_id: u16, log_max_entries: usize) -> Self {
         let (tx, _) = broadcast::channel(1024);
         ClientRepository {
             local_node_id,
-            register: RwLock::new(ClientRegister {
+            log_max_entries: log_max_entries.max(1),
+            register: AsyncRwLock::new(ClientRegister {
                 local_clients: HashMap::new(),
                 local_log: VecDeque::new(),
                 remote_clients: HashMap::new(),
@@ -112,10 +112,10 @@ impl ClientRepository {
                 pending_remote_ops: VecDeque::new(),
                 last_pending_effective_dep: 0,
             }),
-            clients_by_host: RwLock::new(HashMap::new()),
-            clients_by_udp_address: RwLock::new(HashMap::new()),
-            allocation_pointer: Mutex::new(0),
-            free_ids: Mutex::new(HashSet::new()),
+            clients_by_host: ParkingRwLock::new(HashMap::new()),
+            clients_by_udp_address: ParkingRwLock::new(HashMap::new()),
+            allocation_pointer: ParkingMutex::new(0),
+            free_ids: ParkingMutex::new(HashSet::new()),
             tx,
         }
     }
@@ -134,16 +134,16 @@ impl ClientRepository {
         connection: TlsStream<TcpStream>,
     ) -> Arc<Box<Client>> {
         let mut register = self.register.write().await;
-        let mut client_by_udp_address_guard = self.clients_by_udp_address.write().await;
-        let mut client_by_host_guard = self.clients_by_host.write().await;
-        let mut free_ids_guard = self.free_ids.lock().await;
+        let mut client_by_udp_address_guard = self.clients_by_udp_address.write();
+        let mut client_by_host_guard = self.clients_by_host.write();
+        let mut free_ids_guard = self.free_ids.lock();
 
         let id = {
             if let Some(free_id) = free_ids_guard.iter().next().copied() {
                 free_ids_guard.remove(&free_id);
                 free_id
             } else {
-                let mut allocation_pointer = self.allocation_pointer.lock().await;
+                let mut allocation_pointer = self.allocation_pointer.lock();
                 let id = *allocation_pointer;
 
                 if id > MAX_LOCAL_SESSION_ID {
@@ -258,9 +258,9 @@ impl ClientRepository {
     pub async fn remove_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
         let client = {
             let mut register = self.register.write().await;
-            let mut client_by_udp_address_guard = self.clients_by_udp_address.write().await;
-            let mut client_by_host_guard = self.clients_by_host.write().await;
-            let mut free_ids_guard = self.free_ids.lock().await;
+            let mut client_by_udp_address_guard = self.clients_by_udp_address.write();
+            let mut client_by_host_guard = self.clients_by_host.write();
+            let mut free_ids_guard = self.free_ids.lock();
 
             // Try local first, then remote
             let client = if let Some(c) = register.local_clients.remove(&id) {
@@ -316,7 +316,7 @@ impl ClientRepository {
 
         let (ids_to_remove, published): (Vec<ClientSessionIdentifier>, Vec<bool>) = {
             let mut register = self.register.write().await;
-            let mut free_ids = self.free_ids.lock().await;
+            let mut free_ids = self.free_ids.lock();
 
             // Collect published status before removing from map
             let result = match register.remote_clients.get(&node_id) {
@@ -355,22 +355,42 @@ impl ClientRepository {
 
     /// Look up a client by their UDP socket address.
     pub async fn get_client_by_udp_address(&self, addr: &SocketAddr) -> Option<Arc<Box<Client>>> {
-        let by_udp = self.clients_by_udp_address.read().await;
-        let id = by_udp.get(addr)?;
-        self.register.read().await.get(id).cloned()
+        let id = {
+            let by_udp = self.clients_by_udp_address.read();
+            *by_udp.get(addr)?
+        };
+        self.register.read().await.get(&id).cloned()
+    }
+
+    /// Bind/update the UDP address for a client session for fast future lookup.
+    pub async fn bind_client_udp_address(
+        &self,
+        id: ClientSessionIdentifier,
+        addr: SocketAddr,
+    ) {
+        let mut by_udp = self.clients_by_udp_address.write();
+        // Remove stale mappings for this session to keep map one-to-one.
+        let stale: Vec<SocketAddr> = by_udp
+            .iter()
+            .filter_map(|(k, v)| if *v == id { Some(*k) } else { None })
+            .collect();
+        for old in stale {
+            by_udp.remove(&old);
+        }
+        by_udp.insert(addr, id);
     }
 
     /// Look up clients sharing the same IP (for UDP packet matching fallback).
     pub async fn get_clients_by_ip(&self, ip: &IpAddr) -> Vec<Arc<Box<Client>>> {
-        let by_host = self.clients_by_host.read().await;
+        let ids = {
+            let by_host = self.clients_by_host.read();
+            match by_host.get(ip) {
+                Some(ids) => ids.iter().copied().collect::<Vec<_>>(),
+                None => return Vec::new(),
+            }
+        };
         let register = self.register.read().await;
-        match by_host.get(ip) {
-            Some(ids) => ids
-                .iter()
-                .filter_map(|id| register.get(id).cloned())
-                .collect(),
-            None => Vec::new(),
-        }
+        ids.iter().filter_map(|id| register.get(id).cloned()).collect()
     }
 
     // ── Broadcast helpers ─────────────────────────────────────────────────
@@ -723,6 +743,22 @@ impl ClientRepository {
                 Err(_) => return, // deadlock avoidance in Drop contexts
             };
 
+            // Suppress log entries and broadcasts for UpdateGlobalState on
+            // unpublished clients.  The in-memory write has already happened;
+            // the subsequent AddClient (from publish_client) will snapshot the
+            // full current state.  This prevents unauthenticated clients from
+            // appearing to other users before auth completes.
+            if let ClientStateOperation::UpdateGlobalState { session_id, .. } = &op {
+                let is_published = register
+                    .local_clients
+                    .get(session_id)
+                    .map(|c| c.is_published())
+                    .unwrap_or(false);
+                if !is_published {
+                    return;
+                }
+            }
+
             let cur = register.versions.entry(self.local_node_id).or_insert(0);
             *cur += 1;
             let version = *cur;
@@ -740,7 +776,7 @@ impl ClientRepository {
             });
 
             register.local_log.push_back(Arc::clone(&entry));
-            while register.local_log.len() > LOG_MAX_ENTRIES {
+            while register.local_log.len() > self.log_max_entries {
                 register.local_log.pop_front();
             }
 

@@ -34,6 +34,8 @@ message_macro = { path = "src/messages/macros" }
 os_info = "3.14.0"
 async-trait = "0.1.89"
 rusqlite = { version = "0.31", features = ["bundled"] }
+parking_lot = { version = "0.12.5", features = ["arc_lock", "hardware-lock-elision", "owning_ref", "send_guard", "serde"] }
+scc = "2.0"
 
 [build-dependencies]
 chrono = "0.4.41"

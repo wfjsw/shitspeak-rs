@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use crate::{
     api::{AuthenticateAuxiliaryData, AuthenticationRejection},
+    channel_handler::build_channel_state_message,
     client::{Client, user_info::Credential},
-    errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt, encoder::{Authenticate, CodecVersion, RejectType, ServerConfig, ServerSync}},
+    errors::{AuthRejection, MessageHandlerError},
+    messages::{Message, WriteMessageExt, encoder::{Authenticate, ChannelState, CodecVersion, RejectType, ServerConfig, ServerSync}},
     server::Server,
 };
 
@@ -96,16 +97,10 @@ pub async fn handle_authenticate(
             let user_groups = result.groups.iter().map(|s| s.as_str()).collect::<std::collections::HashSet<_>>();
             let has_required = required.iter().any(|g| user_groups.contains(g.as_str()));
             if !has_required {
-                return Err(MessageHandlerError::PermissionDenied(
-                    crate::messages::encoder::PermissionDenied {
-                        r#type: crate::messages::encoder::DenyType::Permission,
-                        session: u32::from(session),
-                        channel_id: None,
-                        reason: Some("Missing required group membership".to_owned()),
-                        name: None,
-                        permission: None,
-                    },
-                ));
+                tracing::trace!(session = u32::from(session), "Authenticate built outbound Reject payload");
+                return Err(AuthRejection::new(RejectType::None)
+                    .because("Missing required group membership")
+                    .into());
             }
         }
     }
@@ -131,24 +126,22 @@ pub async fn handle_authenticate(
     if !sender.is_superuser().await {
         let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
         if !root_perms.contains(crate::acl::ACLPermissions::Traverse) {
-            return Err(MessageHandlerError::PermissionDenied(
-                crate::messages::encoder::PermissionDenied {
-                    r#type: crate::messages::encoder::DenyType::Permission,
-                    session: u32::from(session),
-                    channel_id: Some(0),
-                    reason: Some("No traverse permission on root channel".to_owned()),
-                    name: None,
-                    permission: Some(crate::acl::ACLPermissions::Traverse as u32),
-                },
-            ));
+            tracing::trace!(session = u32::from(session), "Authenticate built outbound Reject payload");
+            return Err(AuthRejection::new(RejectType::None)
+                .because("No traverse permission on root channel")
+                .into());
         }
     }
 
     // ── Generate crypt state and send CryptSetup ──────────────────────────
-    sender
+    if let Err(e) = sender
         .create_crypt_state("OCB2-AES128")
-        .await
-        .map_err(|_| RejectType::AuthenticatorFail)?;
+        .await {
+        tracing::error!(session = u32::from(session), error = %e, "Failed to create crypt state");
+        return Err(AuthRejection::new(RejectType::None)
+            .because("Failed to create crypt state")
+            .into());
+    }
 
     let crypt_setup_msg: Message = {
         let crypt = sender.crypt_state().await;
@@ -187,9 +180,13 @@ pub async fn handle_authenticate(
     // This matches the Mumble server's auth-complete sequence.
 
     let mut burst: Vec<Message> = Vec::new();
+    let mut push_burst = |message: Message| {
+        tracing::trace!(session = u32::from(session_id), message = %message, "Authenticate built outbound message");
+        burst.push(message);
+    };
 
     // 1. CryptSetup
-    burst.push(crypt_setup_msg);
+    push_burst(crypt_setup_msg);
 
     // 2. Channel tree — BFS from root
     {
@@ -207,30 +204,8 @@ pub async fn handle_authenticate(
                 continue;
             }
             let Some(ch) = ch_map.get(&id) else { continue };
-            let links: Vec<u32> = ch.links.iter().copied().collect();
-            let mut cs = crate::messages::encoder::ChannelState {
-                channel_id: Some(ch.id),
-                parent: ch.parent_id,
-                name: Some(ch.name.clone()),
-                links: links.clone(),
-                description: None,
-                links_add: Vec::new(),
-                links_remove: Vec::new(),
-                temporary: Some(ch.is_temporary()),
-                position: Some(ch.position),
-                description_hash: ch
-                    .description_hash
-                    .as_ref()
-                    .and_then(|h| hex::decode(h).ok()),
-                max_users: Some(ch.max_users),
-                is_enter_restricted: None,
-                can_enter: None,
-            };
-            if server.get_send_permission_info() {
-                let perms = crate::client::acl::compute_permissions_for_client(server, sender, ch.id).await;
-                cs = cs.with_permission_info(ch, perms);
-            }
-            burst.push(cs.into());
+            let cs = build_channel_state_message(server, sender, ch).await;
+            push_burst(cs.into());
             // Enqueue children
             for child in ch_map.values().filter(|c| c.parent_id == Some(id)) {
                 queue.push_back(child.id);
@@ -248,21 +223,21 @@ pub async fn handle_authenticate(
                 continue;
             }
             let us: Message = client.build_user_state_for_broadcast().await.into();
-            burst.push(us);
+            push_burst(us);
         }
     }
 
     // 4. UserState for self
     {
         let self_us: Message = sender.build_user_state_for_broadcast().await.into();
-        burst.push(self_us);
+        push_burst(self_us);
     }
 
     // 5. ServerSync
     {
         // Effective root permissions for the new user: full for now (TODO: ACL eval)
         let root_perm = 0x0000_FFFF_u32;
-        burst.push(Message::ServerSync(ServerSync {
+        push_burst(Message::ServerSync(ServerSync {
             session: Some(u32::from(session_id)),
             max_bandwidth: Some(server.get_max_bandwidth()),
             welcome_text: server.get_welcome_text(),
@@ -272,7 +247,7 @@ pub async fn handle_authenticate(
 
     // 6. ServerConfig
     {
-        burst.push(Message::ServerConfig(ServerConfig {
+        push_burst(Message::ServerConfig(ServerConfig {
             max_bandwidth: None,
             welcome_text: None,
             allow_html: Some(server.get_allow_html()),
@@ -284,7 +259,7 @@ pub async fn handle_authenticate(
 
     // 7. CodecVersion — advertise Opus-only (OCB2-AES128 encrypted voice)
     {
-        burst.push(Message::CodecVersion(CodecVersion {
+        push_burst(Message::CodecVersion(CodecVersion {
             alpha: -2147483637, // CELT alpha version (unused, but required by clients)
             beta: 0,
             prefer_alpha: false,

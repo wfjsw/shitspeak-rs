@@ -62,6 +62,22 @@ pub struct Config {
     /// `None` = in-memory only (no persistence).
     #[serde(default)]
     pub blob_storage_dir: Option<PathBuf>,
+    /// Max channel log entries kept in memory for replay/S2S.
+    #[serde(default = "default_channel_log_max_entries")]
+    pub channel_log_max_entries: usize,
+    /// Max client log entries kept in memory for replay/S2S.
+    #[serde(default = "default_client_log_max_entries")]
+    pub client_log_max_entries: usize,
+    /// Snapshot cadence based on committed channel operations.
+    #[serde(default = "default_channel_snapshot_every_ops")]
+    pub channel_snapshot_every_ops: u64,
+    /// Snapshot cadence based on elapsed seconds.
+    #[serde(default = "default_channel_snapshot_every_secs")]
+    pub channel_snapshot_every_secs: i64,
+    /// Number of oldest WAL log lines to expire on each compaction pass.
+    /// Compaction is best-effort and may keep more data to reduce churn.
+    #[serde(default = "default_channel_wal_compaction_expire_count")]
+    pub channel_wal_compaction_expire_count: usize,
 
     // ── UDP voice ──────────────────────────────────────────────────────────
     /// Whether to accept UDP voice packets.  When `false`, the UDP drain
@@ -104,6 +120,11 @@ fn default_max_text_message_length() -> u32 { 5_000 }
 fn default_max_image_message_length() -> u32 { 131_072 }
 fn default_udp_channel_size() -> usize { 2048 }
 fn default_idle_timeout() -> u64 { 30 }
+fn default_channel_log_max_entries() -> usize { 10_000 }
+fn default_client_log_max_entries() -> usize { 10_000 }
+fn default_channel_snapshot_every_ops() -> u64 { 10 }
+fn default_channel_snapshot_every_secs() -> i64 { 60 }
+fn default_channel_wal_compaction_expire_count() -> usize { 2_000 }
 
 impl Config {
     pub fn load() -> Self {

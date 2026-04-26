@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 
 use cidr::AnyIpCidr;
 use prost::{EncodeError, Message as _};
@@ -14,7 +14,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::api::Authenticator;
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
-use crate::channel_repository::ChannelRepository;
+use crate::channel_repository::{ChannelRepoTuning, ChannelRepository};
 use crate::client::AsyncMessageHandlerExt;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{
@@ -89,9 +89,11 @@ impl Server {
 
         // ── Channel repository & blob stores ─────────────────────────────
         let node_id = config.node_id;
+        let client_log_max_entries = config.client_log_max_entries;
+        let channel_repo_tuning = ChannelRepoTuning::from(&config);
         let (channels, channel_blobs, session_blobs, bans) = match &config.blob_storage_dir {
             Some(dir) => {
-                let ch_repo = ChannelRepository::open(node_id, dir).await?;
+                let ch_repo = ChannelRepository::open(node_id, dir, channel_repo_tuning).await?;
                 let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
                 let ban_repo = crate::ban_repository::BanRepository::open(node_id, dir).await?;
@@ -101,7 +103,7 @@ impl Server {
                 // In-memory mode: use a temp dir for blob stores so the
                 // code paths are uniform; blobs won't survive restarts.
                 let tmp = std::env::temp_dir().join("shitspeak-blobs");
-                let ch_repo = ChannelRepository::new_in_memory(node_id);
+                let ch_repo = ChannelRepository::new_in_memory(node_id, channel_repo_tuning);
                 let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
                 let ban_repo = crate::ban_repository::BanRepository::new_in_memory(node_id);
@@ -117,7 +119,7 @@ impl Server {
             tcp_listener,
             tls_acceptor,
             udp_socket,
-            clients: Arc::new(ClientRepository::new(node_id)),
+            clients: Arc::new(ClientRepository::new(node_id, client_log_max_entries)),
             channels,
             channel_blobs,
             session_blobs,
@@ -181,8 +183,10 @@ impl Server {
             shutdown_rx.clone(),
         );
 
-        // Public server registration (periodic HTTP POST to registry)
-        let register_task =
+        // Public server registration (periodic HTTP POST to registry).
+        // This task is optional and may exit early when registration is disabled;
+        // it must never terminate the main server loop.
+        let _register_task =
             crate::register::spawn_register_task(Arc::clone(self), shutdown_rx);
 
         // Wait for any task to finish (error) or for the shutdown signal
@@ -192,7 +196,6 @@ impl Server {
             result = udp_process => { let _ = result; }
             result = tcp_accept => { let _ = result; }
             result = idle_reaper => { let _ = result; }
-            result = register_task => { let _ = result; }
             _ = shutdown_tx.closed() => {
                 tracing::info!("Shutdown signal received.");
             }
@@ -297,7 +300,11 @@ impl Server {
                     },
                     _ = shutdown.changed() => break,
                 };
-                // Try to match by known UDP address first
+                // Try to match by known UDP address first, then host-based
+                // candidate probing. On host probing we keep the successful
+                // plaintext so we do not decrypt the same packet twice.
+                let mut decrypted_from_match: Option<Vec<u8>> = None;
+                let mut matched_via_ip_fallback = false;
                 let client = match server.clients.get_client_by_udp_address(&src_addr).await {
                     Some(c) => Some(c),
                     None => {
@@ -309,6 +316,8 @@ impl Server {
                                 let mut decrypted = Vec::new();
                                 if state.decrypt(&mut decrypted, &packet).is_ok() {
                                     matched = Some(c.clone());
+                                    decrypted_from_match = Some(decrypted);
+                                    matched_via_ip_fallback = true;
                                     break;
                                 }
                             }
@@ -322,7 +331,16 @@ impl Server {
                     continue;
                 };
 
-                let decrypted = {
+                if matched_via_ip_fallback {
+                    server
+                        .clients
+                        .bind_client_udp_address(client.get_session_id(), src_addr)
+                        .await;
+                }
+
+                let decrypted = if let Some(dec) = decrypted_from_match {
+                    dec
+                } else {
                     let mut crypt = client.crypt_state().await;
                     let mut dec = Vec::new();
                     match crypt.as_mut() {
@@ -353,18 +371,21 @@ impl Server {
                         }
                         continue;
                     }
-                    Ok(crate::voice::codec::UdpPacket::Audio(decoded_audio)) => {
-                        // Validate that the sender_session in the packet matches the
-                        // client we identified via UDP address / crypto.  An attacker
-                        // could spoof the session ID otherwise.
-                        if decoded_audio.sender_session != u32::from(client.get_session_id()) {
-                            tracing::debug!(
-                                "UDP session mismatch: packet claims {}, client is {:?}",
+                    Ok(crate::voice::codec::UdpPacket::Audio(mut decoded_audio)) => {
+                        let actual_session = u32::from(client.get_session_id());
+                        if decoded_audio.sender_session != 0
+                            && decoded_audio.sender_session != actual_session
+                        {
+                            tracing::trace!(
+                                "UDP sender_session mismatch from {}: packet={}, matched={}",
+                                src_addr,
                                 decoded_audio.sender_session,
-                                client.get_session_id(),
+                                actual_session,
                             );
-                            continue;
                         }
+                        // Trust authenticated client identity derived from
+                        // endpoint+crypto match, not packet self-asserted session.
+                        decoded_audio.sender_session = actual_session;
 
                         crate::voice::route_voice(&server, &client, &decoded_audio, true).await;
                     }
@@ -498,8 +519,16 @@ impl Server {
                     result = client.read_proto_message() => {
                         match result {
                             Ok(message) => {
-                                client.handle_message(self, message).await
-                                    .map_err(|_| HandleIncomingConnectionError::MessageHandlerFailed)?;
+                                match client.handle_message(self, message).await {
+                                    Ok(()) => {}
+                                    Err(crate::errors::MessageHandlerError::AuthRejection(rejection)) => {
+                                        tracing::info!(session = u32::from(client_session_id), reason = rejection.reason(), "closing connection after auth rejection");
+                                        return Err(HandleIncomingConnectionError::AuthRejected(rejection));
+                                    }
+                                    Err(_) => {
+                                        return Err(HandleIncomingConnectionError::MessageHandlerFailed);
+                                    }
+                                }
 
                                 // Transition to post-auth: publish and subscribe.
                                 if client.is_authenticated().await && client_log_rx.is_none() {
@@ -541,23 +570,12 @@ impl Server {
                             Some(Ok(op)) => {
                                 let last = client.get_last_channel_version().await;
                                 replay_channel_log_gap(
-                                    &client, &self.channels, client_session_id, last, op.version,
+                                    self, &client, &self.channels, client_session_id, last, op.version,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
-                                if let Some(mut msg) = op.to_message() {
-                                    // Add permission info to ChannelState messages if configured
-                                    if self.read_config().send_permission_info {
-                                        if let crate::messages::Message::ChannelState(ref cs_proto) = msg {
-                                            if let Some(ch_id) = cs_proto.channel_id {
-                                                if let Some(ch) = self.channels.get_channel(ch_id).await {
-                                                    let perms = crate::client::acl::compute_permissions_for_client(
-                                                        self, &client, ch_id,
-                                                    ).await;
-                                                    let encoder_cs: crate::messages::encoder::ChannelState = cs_proto.clone().into();
-                                                    msg = encoder_cs.with_permission_info(&ch, perms).into();
-                                                }
-                                            }
-                                        }
-                                    }
+
+                                // Use unified message conversion function
+                                let messages = convert_channel_operation_to_messages(self, &client, &op, &self.channels).await;
+                                for msg in messages {
                                     client.write_proto_message(&msg).await
                                         .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                 }
@@ -566,7 +584,7 @@ impl Server {
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                                 let last = client.get_last_channel_version().await;
                                 replay_channel_log_gap(
-                                    &client, &self.channels, client_session_id, last, u64::MAX,
+                                    self, &client, &self.channels, client_session_id, last, u64::MAX,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -601,7 +619,7 @@ impl Server {
                                     let last_ch = client.get_last_channel_version().await;
                                     if last_ch < dep {
                                         replay_channel_log_gap(
-                                            &client, &self.channels, client_session_id, last_ch, dep + 1,
+                                            self, &client, &self.channels, client_session_id, last_ch, dep + 1,
                                         ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
                                     }
                                 }
@@ -738,8 +756,8 @@ impl Server {
         &self.udp_socket
     }
 
-    pub async fn get_codec_info(&self) -> tokio::sync::MutexGuard<'_, CodecInfo> {
-        self.codec_info.lock().await
+    pub fn get_codec_info(&self) -> parking_lot::MutexGuard<'_, CodecInfo> {
+        self.codec_info.lock()
     }
 
     pub fn get_min_client_version(&self) -> u64 {
@@ -838,7 +856,7 @@ impl Server {
         }
 
         let changed = {
-            let mut codec = self.codec_info.lock().await;
+            let mut codec = self.codec_info.lock();
             codec.recheck(
                 alpha_count,
                 beta_count,
@@ -850,7 +868,7 @@ impl Server {
 
         if changed {
             let msg = {
-                let codec = self.codec_info.lock().await;
+                let codec = self.codec_info.lock();
                 let alpha = codec.alpha_codec();
                 let beta = codec.beta_codec();
                 let prefer_alpha = codec.prefer_alpha_codec();
@@ -867,6 +885,12 @@ impl Server {
         }
     }
 }
+
+use crate::channel_handler::{
+    apply_permission_info_to_channel_state, convert_channel_operation_to_messages,
+    replay_channel_log_gap,
+};
+use crate::utils::recv_optional;
 
 // ─── Log gap replay helpers ─────────────────────────────────────────────────
 
@@ -921,58 +945,3 @@ async fn replay_client_log_gap(
     Ok(())
 }
 
-/// Replay missed channel-state log entries between `last` and `current`
-/// (exclusive).  If `current == u64::MAX`, replays everything after `last`.
-///
-/// Returns `Err(())` if the gap is unrecoverable (log pruned).
-async fn replay_channel_log_gap(
-    client: &Arc<Box<crate::client::Client>>,
-    channels: &Arc<crate::channel_repository::ChannelRepository>,
-    session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
-    last: u64,
-    current: u64,
-) -> Result<(), ()> {
-    if current <= last + 1 {
-        return Ok(());
-    }
-
-    tracing::warn!(
-        "Client {:?} missed channel log entries: last={} current={}",
-        session_id, last, current,
-    );
-
-    let missed = channels.get_log_since(last).await;
-    if missed.is_empty() && last > 0 {
-        tracing::error!(
-            "Client {:?} channel log gap unrecoverable (last={})",
-            session_id, last,
-        );
-        return Err(());
-    }
-
-    for entry in &missed {
-        if entry.version >= current {
-            break;
-        }
-        if let Some(msg) = entry.to_message() {
-            if client.write_proto_message(&msg).await.is_err() {
-                return Err(());
-            }
-        }
-        client.set_last_channel_version(entry.version).await;
-    }
-
-    Ok(())
-}
-
-/// Helper for `tokio::select!` with an `Option<Receiver>`.
-/// Returns `None` if the receiver is `None` (not subscribed yet),
-/// otherwise awaits the next message.
-async fn recv_optional<T: Clone>(
-    rx: Option<&mut tokio::sync::broadcast::Receiver<T>>,
-) -> Option<Result<T, tokio::sync::broadcast::error::RecvError>> {
-    match rx {
-        Some(rx) => Some(rx.recv().await),
-        None => std::future::pending().await,
-    }
-}

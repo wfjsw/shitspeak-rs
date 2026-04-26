@@ -94,6 +94,32 @@ impl Default for ACL {
     }
 }
 
+fn implicit_root_acl() -> ACL {
+    ACL {
+        user_id: None,
+        group: Some("all".to_owned()),
+        apply_here: true,
+        apply_subs: true,
+        allow: ACLPermissions::Traverse
+            | ACLPermissions::Enter
+            | ACLPermissions::Speak
+            | ACLPermissions::Whisper
+            | ACLPermissions::TextMessage
+            | ACLPermissions::Listen,
+        deny: ACLPermissions::Write
+            | ACLPermissions::MuteDeafen
+            | ACLPermissions::Move
+            | ACLPermissions::MakeChannel
+            | ACLPermissions::LinkChannel
+            | ACLPermissions::TempChannel
+            | ACLPermissions::Kick
+            | ACLPermissions::Ban
+            | ACLPermissions::Register
+            | ACLPermissions::SelfRegister
+            | ACLPermissions::ResetUserContent,
+    }
+}
+
 /// Evaluate the effective permissions for a user on a given channel.
 ///
 /// Walks the channel tree from `channel_id` up to the root, applying ACLs
@@ -120,8 +146,16 @@ pub fn evaluate_permission(
     }
 
     for ch in &chain {
+        let applies_to_target_channel = ch.id == channel.id;
+
         for acl in &ch.acls {
-            if !acl.apply_here {
+            let applies = if applies_to_target_channel {
+                acl.apply_here
+            } else {
+                acl.apply_subs
+            };
+
+            if !applies {
                 continue;
             }
 
@@ -141,6 +175,20 @@ pub fn evaluate_permission(
             if matches {
                 allowed |= acl.allow;
                 denied |= acl.deny;
+            }
+        }
+
+        if ch.id == 0 {
+            let implicit_root = implicit_root_acl();
+            let applies = if applies_to_target_channel {
+                implicit_root.apply_here
+            } else {
+                implicit_root.apply_subs
+            };
+
+            if applies && implicit_root.match_group(current_channel_id, Some(ch.id), &[], client) {
+                allowed |= implicit_root.allow;
+                denied |= implicit_root.deny;
             }
         }
 

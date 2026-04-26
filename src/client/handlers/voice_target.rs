@@ -13,7 +13,9 @@ pub async fn handle_voice_target(
     msg: VoiceTarget,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "VoiceTarget message received before authentication",
+        ));
     }
 
     let target_id = msg.id.unwrap_or(0);

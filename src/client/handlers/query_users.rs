@@ -13,7 +13,9 @@ pub async fn handle_query_users(
     msg: QueryUsers,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated().await {
-        return Ok(());
+        return Err(MessageHandlerError::protocol_violation(
+            "QueryUsers message received before authentication",
+        ));
     }
 
     tracing::debug!(session = u32::from(sender.get_session_id()), ids = ?msg.ids, names = ?msg.names, "QueryUsers handler");
