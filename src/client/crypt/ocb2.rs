@@ -402,7 +402,7 @@ mod tests {
     fn test_encrypt_decrypt_vectors() {
         for v in VECTORS {
             let key_bytes = must_decode_hex(v.key);
-            let key_arr: [u8; BLOCK_SIZE] = key_bytes.as_slice().try_into().unwrap();
+            let key_arr: [u8; BLOCK_SIZE] = key_bytes.as_ref().try_into().unwrap();
             let ocb = Ocb2::from_key(key_arr).unwrap();
 
             let nonce = must_decode_hex(v.nonce);
@@ -421,7 +421,7 @@ mod tests {
 
             assert_eq!(
                 ct,
-                expected_ct.as_slice(),
+                expected_ct.as_ref(),
                 "ciphertext mismatch for {}",
                 v._name
             );

@@ -23,6 +23,7 @@ pub mod messages;
 pub mod protocol_version;
 pub mod proxy_protocol;
 pub mod register;
+pub mod s2s;
 pub mod server;
 pub mod types;
 pub mod utils;

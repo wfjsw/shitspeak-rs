@@ -26,6 +26,7 @@ use crate::proxy_protocol::get_proxy_protocol_real_ip;
 use crate::voice::ping::decode_ping_protobuf;
 use crate::{
     client_repository::ClientRepository, codec_info::CodecInfo, config::Config,
+    s2s::S2SManager,
     types::NodeIdentifier,
 };
 
@@ -53,6 +54,8 @@ pub struct Server {
 
     /// Registry of server-defined context menu actions.
     context_actions: Arc<crate::context_action::ContextActionRegistry>,
+
+    s2s_manager: Arc<S2SManager>,
 }
 
 impl Server {
@@ -112,6 +115,9 @@ impl Server {
         };
 
         let config = Arc::new(RwLock::new(config));
+        let s2s_manager = Arc::new(S2SManager::initialize(
+            &config.read().expect("Config RwLock poisoned"),
+        ));
 
         let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
@@ -128,6 +134,7 @@ impl Server {
             authenticator: Box::new(authenticator),
             config,
             context_actions: Arc::new(crate::context_action::ContextActionRegistry::new()),
+            s2s_manager,
         }));
 
         // Wire cross-repo causal notification: ChannelRepository notifies
@@ -147,6 +154,7 @@ impl Server {
         shutdown_tx: tokio::sync::watch::Sender<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Server is running on {}", self.tcp_listener.local_addr()?);
+        self.s2s_manager.log_startup_summary();
 
         let shutdown_rx = shutdown_tx.subscribe();
 
@@ -182,6 +190,7 @@ impl Server {
             idle_timeout_secs,
             shutdown_rx.clone(),
         );
+        let _s2s_task = Arc::clone(&self.s2s_manager).spawn_runtime_task(shutdown_rx.clone());
 
         // Public server registration (periodic HTTP POST to registry).
         // This task is optional and may exit early when registration is disabled;

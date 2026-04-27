@@ -24,6 +24,7 @@ mod messages;
 mod protocol_version;
 mod proxy_protocol;
 mod register;
+mod s2s;
 mod server;
 mod types;
 mod utils;

@@ -918,6 +918,8 @@ impl ChannelRepository {
             new_version
         };
 
+        self.invalidate_acl_cache_for_op(&op.op).await;
+
         // Notify ClientRepository to drain pending ops whose dep is now satisfied
         let client_repo = self.client_repo.lock().clone();
         if let Some(client_repo) = client_repo {
@@ -925,6 +927,25 @@ impl ChannelRepository {
         }
 
         Ok(())
+    }
+
+    /// Apply an already-versioned operation and persist it through the
+    /// repository's native WAL/snapshot pipeline.
+    pub async fn apply_committed_operation(
+        self: &Arc<Self>,
+        op: ChannelOperation,
+    ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
+        if op.version <= self.version.load(Ordering::Acquire) {
+            return Ok(Arc::new(op));
+        }
+
+        {
+            let mut channels = self.channels.write();
+            apply_op_to_map(&mut channels, &op.op);
+        }
+
+        self.invalidate_acl_cache_for_op(&op.op).await;
+        self.commit_assigned_operation(op).await
     }
 
     /// Set the `ClientRepository` reference for cross-repo causal notification.
@@ -946,19 +967,13 @@ impl ChannelRepository {
         }
     }
 
-    async fn commit(&self, mut op: ChannelOperation) -> Result<(), ChannelRepoError> {
-        // Assign version and append to log atomically under the log lock,
-        // matching ClientRepository's approach.  The channels lock is
-        // released before commit() is called, but version+log ordering is
-        // guaranteed by the log lock.
+    async fn commit_assigned_operation(
+        &self,
+        op: ChannelOperation,
+    ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
         let op = {
             let mut log = self.log.write();
-            let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
-            debug_assert!(
-                version < u64::MAX - 1_000_000,
-                "ChannelRepository version counter approaching u64::MAX — likely a bug"
-            );
-            op.version = version;
+            self.version.fetch_max(op.version, Ordering::AcqRel);
             let op = Arc::new(op);
             log.push_back(Arc::clone(&op));
             while log.len() > self.log_max_entries {
@@ -967,8 +982,6 @@ impl ChannelRepository {
             op
         };
 
-        // Append to WAL if persistence is enabled (outside log lock —
-        // WAL I/O shouldn't block log readers)
         if let Some(ref wal_mutex) = self.wal_file {
             let mut line =
                 serde_json::to_string(&*op).map_err(|e| ChannelRepoError::WalCorrupt {
@@ -983,13 +996,8 @@ impl ChannelRepository {
         }
 
         let committed_version = op.version;
+        let _ = self.tx.send(Arc::clone(&op));
 
-        // Notify S2S subscribers (ignore error when no receivers)
-        let _ = self.tx.send(op);
-
-        // Periodically compact WAL into a snapshot in persisted mode.
-        // Trigger on either operation count or elapsed-time threshold.
-        // Keep commit success independent from compaction; WAL durability already succeeded.
         let now = chrono::Utc::now().timestamp();
         let last_snapshot = self.last_snapshot_at.load(Ordering::Acquire);
         let ops_due = committed_version % self.snapshot_every_ops == 0;
@@ -1000,7 +1008,38 @@ impl ChannelRepository {
             }
         }
 
+        Ok(op)
+    }
+
+    async fn commit(&self, mut op: ChannelOperation) -> Result<(), ChannelRepoError> {
+        let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+        debug_assert!(
+            version < u64::MAX - 1_000_000,
+            "ChannelRepository version counter approaching u64::MAX — likely a bug"
+        );
+        op.version = version;
+        let _ = self.commit_assigned_operation(op).await?;
         Ok(())
+    }
+
+    async fn invalidate_acl_cache_for_op(&self, op: &ChannelOp) {
+        match op {
+            ChannelOp::CreateChannel { channel } => {
+                self.invalidate_acl_cache_for_channel(channel.id).await;
+            }
+            ChannelOp::EditChannel { id, .. }
+            | ChannelOp::UpdateChannel { id, .. }
+            | ChannelOp::DeleteChannel { id } => {
+                self.invalidate_acl_cache_for_channel(*id).await;
+            }
+            ChannelOp::AddLink { a, b } | ChannelOp::RemoveLink { a, b } => {
+                self.invalidate_acl_cache_for_channel(*a).await;
+                self.invalidate_acl_cache_for_channel(*b).await;
+            }
+            ChannelOp::SetAcls { channel_id, .. } => {
+                self.invalidate_acl_cache_for_channel(*channel_id).await;
+            }
+        }
     }
 }
 

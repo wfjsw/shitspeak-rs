@@ -534,7 +534,7 @@ mod tests {
     fn varint_roundtrip() {
         let test_values = [0u64, 1, 127, 128, 255, 256, 0xFFFF, 0xFFFFFFFF];
         for &val in &test_values {
-            let mut buf = Vec::new();
+            let mut buf = BytesMut::new();
             write_varint(&mut buf, val);
             let (decoded, n) = read_varint(&buf).expect("read varint");
             assert_eq!(decoded, val, "varint roundtrip for {val}");

@@ -28,6 +28,7 @@ tokio-rustls = "0.26.4"
 tracing = "0.1"
 tracing-appender = { version = "0.2.4", features = ["parking_lot"] }
 tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde", "env-filter"] }
+x509-parser = "0.16.0"
 
 # local proc-macro to derive message helpers
 message_macro = { path = "src/messages/macros" }
@@ -42,7 +43,7 @@ chrono = "0.4.41"
 prost-build = "0.13.5"
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["x509-parser", "pem"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

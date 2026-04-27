@@ -6,6 +6,65 @@ use config::{Config as ConfigCrate, Environment, File};
 use crate::constants::MAX_NODE_ID;
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct S2sConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bootstrap_nodes: Vec<String>,
+    #[serde(default)]
+    pub quic_listen: Option<String>,
+    #[serde(default)]
+    pub tcp_listen: Option<String>,
+    #[serde(default = "default_s2s_cert_path")]
+    pub cert_path: String,
+    #[serde(default = "default_s2s_key_path")]
+    pub key_path: String,
+    #[serde(default = "default_s2s_ca_cert_path")]
+    pub ca_cert_path: String,
+    #[serde(default = "default_s2s_node_id_extension_oid")]
+    pub node_id_extension_oid: String,
+    #[serde(default = "default_true")]
+    pub require_node_id_extension: bool,
+    #[serde(default = "default_s2s_probe_interval_ms")]
+    pub probe_interval_ms: u64,
+    #[serde(default = "default_s2s_probe_timeout_ms")]
+    pub probe_timeout_ms: u64,
+    #[serde(default = "default_s2s_suspect_timeout_ms")]
+    pub suspect_timeout_ms: u64,
+    #[serde(default = "default_s2s_dead_timeout_ms")]
+    pub dead_timeout_ms: u64,
+    #[serde(default = "default_s2s_anti_entropy_interval_ms")]
+    pub anti_entropy_interval_ms: u64,
+    #[serde(default = "default_s2s_full_digest_interval_ms")]
+    pub full_digest_interval_ms: u64,
+    #[serde(default = "default_s2s_quality_stale_after_ms")]
+    pub quality_stale_after_ms: u64,
+}
+
+impl Default for S2sConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bootstrap_nodes: Vec::new(),
+            quic_listen: None,
+            tcp_listen: None,
+            cert_path: default_s2s_cert_path(),
+            key_path: default_s2s_key_path(),
+            ca_cert_path: default_s2s_ca_cert_path(),
+            node_id_extension_oid: default_s2s_node_id_extension_oid(),
+            require_node_id_extension: default_true(),
+            probe_interval_ms: default_s2s_probe_interval_ms(),
+            probe_timeout_ms: default_s2s_probe_timeout_ms(),
+            suspect_timeout_ms: default_s2s_suspect_timeout_ms(),
+            dead_timeout_ms: default_s2s_dead_timeout_ms(),
+            anti_entropy_interval_ms: default_s2s_anti_entropy_interval_ms(),
+            full_digest_interval_ms: default_s2s_full_digest_interval_ms(),
+            quality_stale_after_ms: default_s2s_quality_stale_after_ms(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub node_id: u16,
     pub listen: String,
@@ -112,6 +171,10 @@ pub struct Config {
     /// and `can_enter` fields computed from ACLs.  Default: `false`.
     #[serde(default)]
     pub send_permission_info: bool,
+
+    // ── S2S cluster bootstrap ───────────────────────────────────────────
+    #[serde(default)]
+    pub s2s: S2sConfig,
 }
 
 fn default_max_bandwidth() -> u32 { 72_000 }
@@ -125,6 +188,17 @@ fn default_client_log_max_entries() -> usize { 10_000 }
 fn default_channel_snapshot_every_ops() -> u64 { 10 }
 fn default_channel_snapshot_every_secs() -> i64 { 60 }
 fn default_channel_wal_compaction_expire_count() -> usize { 2_000 }
+fn default_s2s_cert_path() -> String { "s2s-cert.pem".to_owned() }
+fn default_s2s_key_path() -> String { "s2s-key.pem".to_owned() }
+fn default_s2s_ca_cert_path() -> String { "s2s-ca-cert.pem".to_owned() }
+fn default_s2s_node_id_extension_oid() -> String { "1.3.6.1.4.1.55555.1.1".to_owned() }
+fn default_s2s_probe_interval_ms() -> u64 { 1_000 }
+fn default_s2s_probe_timeout_ms() -> u64 { 700 }
+fn default_s2s_suspect_timeout_ms() -> u64 { 3_000 }
+fn default_s2s_dead_timeout_ms() -> u64 { 7_000 }
+fn default_s2s_anti_entropy_interval_ms() -> u64 { 1_000 }
+fn default_s2s_full_digest_interval_ms() -> u64 { 10_000 }
+fn default_s2s_quality_stale_after_ms() -> u64 { 15_000 }
 
 impl Config {
     pub fn load() -> Self {
