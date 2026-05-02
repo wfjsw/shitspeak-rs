@@ -1,56 +1,21 @@
 //! Thin wrappers around the prost-generated `s2s_overlay_proto` types.
 //!
-//! Exposes encode/decode helpers and conversions between the generated
-//! enums and the public Rust enums so the rest of the overlay never has to
-//! touch the proto types directly.
+//! Exposes encode/decode helpers and conversions between wire types and the
+//! domain types the rest of the overlay uses.
 
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
 use prost::Message as _;
 
-use crate::s2s::transport::{PeerAddress, TransportKind};
+use crate::s2s::transport::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
 use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 pub use crate::s2s_overlay_proto::{
-    overlay_message::Body as OverlayBody, GossipDigest, GossipUpdate, OverlayMessage, SwimAck,
-    SwimPing, SwimPingReq,
+    overlay_message::Body as OverlayBody, AddressEntry, DigestEntry, Hello, HelloAck, LinkAdvert,
+    LinkStateAdvert, LsaFlood, LsdbSync, LsdbSyncResp, OverlayData, OverlayMessage,
 };
-
-/// Public Rust mirror of `pb::MemberStatus`. Kept in [`super::membership`].
-pub use super::membership::view::MemberStatus;
-
-impl From<MemberStatus> for pb::MemberStatus {
-    fn from(v: MemberStatus) -> Self {
-        match v {
-            MemberStatus::Alive => pb::MemberStatus::Alive,
-            MemberStatus::Suspect => pb::MemberStatus::Suspect,
-            MemberStatus::Dead => pb::MemberStatus::Dead,
-            MemberStatus::Left => pb::MemberStatus::Left,
-        }
-    }
-}
-
-impl From<pb::MemberStatus> for MemberStatus {
-    fn from(v: pb::MemberStatus) -> Self {
-        match v {
-            pb::MemberStatus::Alive => MemberStatus::Alive,
-            pb::MemberStatus::Suspect => MemberStatus::Suspect,
-            pb::MemberStatus::Dead => MemberStatus::Dead,
-            pb::MemberStatus::Left => MemberStatus::Left,
-        }
-    }
-}
-
-impl TryFrom<i32> for MemberStatus {
-    type Error = i32;
-    fn try_from(value: i32) -> Result<Self, i32> {
-        pb::MemberStatus::try_from(value)
-            .map(MemberStatus::from)
-            .map_err(|_| value)
-    }
-}
 
 /// Encode an `OverlayMessage` to a fresh `Bytes` ready for `transport.send(...)`.
 pub fn encode_message(msg: &OverlayMessage) -> Result<Bytes, prost::EncodeError> {
@@ -62,6 +27,11 @@ pub fn encode_message(msg: &OverlayMessage) -> Result<Bytes, prost::EncodeError>
 /// Decode an `OverlayMessage` from the wire bytes.
 pub fn decode_message(src: &[u8]) -> Result<OverlayMessage, prost::DecodeError> {
     OverlayMessage::decode(src)
+}
+
+/// Construct an `OverlayMessage` carrying the supplied body.
+pub fn wrap(body: OverlayBody) -> OverlayMessage {
+    OverlayMessage { body: Some(body) }
 }
 
 /// Encode a `PeerAddress` into the wire form used in `AddressEntry`.
@@ -79,28 +49,31 @@ pub fn address_from_pb(entry: &pb::AddressEntry) -> Option<PeerAddress> {
     Some(PeerAddress::new(addr, transport))
 }
 
-fn kind_to_u32(k: TransportKind) -> u32 {
-    match k {
-        TransportKind::Tcp => 0,
-        TransportKind::Kcp => 1,
-        TransportKind::Quic => 2,
-        TransportKind::Udp => 3,
-    }
+#[inline]
+pub fn kind_to_u32(k: TransportKind) -> u32 {
+    super::config::kind_to_idx(k)
 }
 
-fn u32_to_kind(v: u32) -> Option<TransportKind> {
-    match v {
-        0 => Some(TransportKind::Tcp),
-        1 => Some(TransportKind::Kcp),
-        2 => Some(TransportKind::Quic),
-        3 => Some(TransportKind::Udp),
-        _ => None,
-    }
+#[inline]
+pub fn u32_to_kind(v: u32) -> Option<TransportKind> {
+    super::config::idx_to_kind(v)
 }
 
-/// Construct an `OverlayMessage` carrying the supplied body.
-pub fn wrap(body: OverlayBody) -> OverlayMessage {
-    OverlayMessage { body: Some(body) }
+/// Bitmask of every transport kind for which the peer is reachable.
+pub fn transports_to_mask(kinds: &[TransportKind]) -> u32 {
+    kinds.iter().fold(0u32, |acc, k| acc | super::config::transport_bit(*k))
+}
+
+pub fn mask_to_transports(mask: u32) -> Vec<TransportKind> {
+    let mut out = Vec::new();
+    for i in 0..4 {
+        if mask & (1u32 << i) != 0 {
+            if let Some(k) = super::config::idx_to_kind(i) {
+                out.push(k);
+            }
+        }
+    }
+    out
 }
 
 /// Convert a domain `NodeIdentifier` to the `u32` field on the wire.
@@ -120,22 +93,42 @@ pub fn node_from_wire(v: u32) -> Option<NodeIdentifier> {
     }
 }
 
+/// Convert a `ServiceLevel` to its u32 wire value.
+#[inline]
+pub fn level_to_wire(l: ServiceLevel) -> u32 {
+    l as u32
+}
+
+#[inline]
+pub fn level_from_wire(v: u32) -> Option<ServiceLevel> {
+    match v {
+        0 => Some(ServiceLevel::Reliable),
+        1 => Some(ServiceLevel::ReliableLowLatency),
+        2 => Some(ServiceLevel::BestEffort),
+        _ => None,
+    }
+}
+
+#[inline]
+pub fn class_to_wire(c: MessageClass) -> u32 {
+    match c {
+        MessageClass::HighPriority => 0,
+        MessageClass::Regular => 1,
+    }
+}
+
+#[inline]
+pub fn class_from_wire(v: u32) -> Option<MessageClass> {
+    match v {
+        0 => Some(MessageClass::HighPriority),
+        1 => Some(MessageClass::Regular),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn enum_conversions_total() {
-        for s in [
-            MemberStatus::Alive,
-            MemberStatus::Suspect,
-            MemberStatus::Dead,
-            MemberStatus::Left,
-        ] {
-            let i = pb::MemberStatus::from(s) as i32;
-            assert_eq!(MemberStatus::try_from(i).unwrap(), s);
-        }
-    }
 
     #[test]
     fn address_roundtrip() {
@@ -147,21 +140,45 @@ mod tests {
 
     #[test]
     fn message_roundtrip() {
-        let msg = wrap(OverlayBody::SwimPing(SwimPing {
+        let msg = wrap(OverlayBody::Hello(Hello {
             src_node: 7,
-            src_incarnation: 12345,
+            src_boot_epoch: 12345,
             nonce: 99,
-            piggyback: vec![],
+            ts_send_us: 0,
         }));
         let bytes = encode_message(&msg).unwrap();
         let decoded = decode_message(&bytes).unwrap();
         match decoded.body {
-            Some(OverlayBody::SwimPing(p)) => {
-                assert_eq!(p.src_node, 7);
-                assert_eq!(p.src_incarnation, 12345);
-                assert_eq!(p.nonce, 99);
+            Some(OverlayBody::Hello(h)) => {
+                assert_eq!(h.src_node, 7);
+                assert_eq!(h.src_boot_epoch, 12345);
+                assert_eq!(h.nonce, 99);
             }
             other => panic!("unexpected body: {other:?}"),
         }
+    }
+
+    #[test]
+    fn level_class_roundtrip() {
+        for l in [
+            ServiceLevel::Reliable,
+            ServiceLevel::ReliableLowLatency,
+            ServiceLevel::BestEffort,
+        ] {
+            assert_eq!(level_from_wire(level_to_wire(l)).unwrap(), l);
+        }
+        for c in [MessageClass::HighPriority, MessageClass::Regular] {
+            assert_eq!(class_from_wire(class_to_wire(c)).unwrap(), c);
+        }
+    }
+
+    #[test]
+    fn transport_mask_roundtrip() {
+        let kinds = [TransportKind::Tcp, TransportKind::Quic];
+        let mask = transports_to_mask(&kinds);
+        let back = mask_to_transports(mask);
+        assert!(back.contains(&TransportKind::Tcp));
+        assert!(back.contains(&TransportKind::Quic));
+        assert!(!back.contains(&TransportKind::Kcp));
     }
 }

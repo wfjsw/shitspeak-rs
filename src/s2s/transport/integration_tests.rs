@@ -5,81 +5,23 @@
 //! transports follow the same shape; only TCP is covered here so the test
 //! surface stays compact.
 
-use std::fs::File;
-use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Once;
 use std::time::Duration;
 
 use bytes::Bytes;
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
-use tempfile::TempDir;
 use tokio::time::timeout;
 
 use super::config::TransportConfig;
 use super::manager::{ConnectionManager, Inbound};
 use super::service_level::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
-
-fn install_provider_once() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
+use crate::s2s::testing::{
+    install_provider_once, loopback, mint_pki, pick_free_port, pick_free_udp_port, Pki,
+};
 
 /// Serializes tests in this file so concurrent `pick_free_port` calls can't
 /// hand the same OS-ephemeral port to two managers before either binds it.
 /// On Windows that race surfaces as `WSAEADDRINUSE` (10048).
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// One CA + N node certs.
-struct Pki {
-    _dir: TempDir,
-    ca_path: PathBuf,
-    nodes: Vec<(PathBuf, PathBuf)>, // (cert, key)
-}
-
-fn mint_pki(node_cns: &[u16]) -> Pki {
-    let dir = TempDir::new().unwrap();
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::new(vec!["s2s-test-ca".into()]).unwrap();
-    let mut ca_dn = DistinguishedName::new();
-    ca_dn.push(DnType::CommonName, "s2s-test-ca");
-    ca_params.distinguished_name = ca_dn;
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca_cert: Certificate = ca_params.self_signed(&ca_key).unwrap();
-
-    let ca_path = dir.path().join("ca.pem");
-    File::create(&ca_path)
-        .unwrap()
-        .write_all(ca_cert.pem().as_bytes())
-        .unwrap();
-
-    let mut nodes = Vec::new();
-    for cn in node_cns {
-        let node_key = KeyPair::generate().unwrap();
-        let mut p = CertificateParams::new(vec![format!("node-{cn}")]).unwrap();
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, cn.to_string());
-        p.distinguished_name = dn;
-        let node_cert = p.signed_by(&node_key, &ca_cert, &ca_key).unwrap();
-
-        let cert_path = dir.path().join(format!("cert-{cn}.pem"));
-        let key_path = dir.path().join(format!("key-{cn}.pem"));
-        File::create(&cert_path)
-            .unwrap()
-            .write_all(node_cert.pem().as_bytes())
-            .unwrap();
-        File::create(&key_path)
-            .unwrap()
-            .write_all(node_key.serialize_pem().as_bytes())
-            .unwrap();
-        nodes.push((cert_path, key_path));
-    }
-
-    Pki { _dir: dir, ca_path, nodes }
-}
 
 fn config_for(pki: &Pki, node_idx: usize, tcp: SocketAddr) -> TransportConfig {
     let (cert, key) = &pki.nodes[node_idx];
@@ -104,24 +46,6 @@ fn config_with_udp(pki: &Pki, node_idx: usize, udp: SocketAddr) -> TransportConf
         .with_bandwidth_probe_interval(Duration::from_secs(60)) // off for these tests
         .with_bandwidth_probe_size(0)
         .with_udp_mtu(1400)
-}
-
-fn loopback(port: u16) -> SocketAddr {
-    format!("127.0.0.1:{port}").parse().unwrap()
-}
-
-async fn pick_free_port() -> u16 {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
-async fn pick_free_udp_port() -> u16 {
-    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let p = s.local_addr().unwrap().port();
-    drop(s);
-    p
 }
 
 #[tokio::test]

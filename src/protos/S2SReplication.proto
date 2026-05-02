@@ -1,0 +1,160 @@
+syntax = "proto3";
+package s2s_replication;
+
+// Outer envelope for replications. Carried as the `payload` of an
+// overlay `OverlayData` frame with `service_tag = 1`.
+message ReplicationMessage {
+  string topic = 1;            // "channels" | "bans" | "clients" (free-form)
+  oneof body {
+    StrictMessage strict = 2;
+    OwnerMessage  owner  = 3;
+  }
+}
+
+// ------- Strict (Tempo) -------
+
+message StrictMessage {
+  oneof body {
+    StrictPropose        propose         = 1;
+    StrictProposeAck     propose_ack     = 2;
+    StrictCommit         commit          = 3;
+    StrictClockTick      clock_tick      = 4;
+    StrictCatchupReq     catchup_req     = 5;
+    StrictCatchupResp    catchup_resp    = 6;
+    StrictRecoveryReq    recovery_req    = 7;
+    StrictRecoveryAck    recovery_ack    = 8;
+    StrictRecoveryCommit recovery_commit = 9;
+  }
+}
+
+message StrictPropose {
+  uint32 coord_node = 1;
+  uint64 op_id_hi   = 2;   // 128-bit op id, hi||lo
+  uint64 op_id_lo   = 3;
+  uint64 ts_propose = 4;
+  bytes  op_msgpack = 5;
+  uint64 src_clock  = 6;   // sender's clock at send time (piggyback)
+}
+
+message StrictProposeAck {
+  uint32 ack_node   = 1;
+  uint32 coord_node = 2;
+  uint64 op_id_hi   = 3;
+  uint64 op_id_lo   = 4;
+  uint64 ts_local   = 5;   // ack-side clock after advance
+  uint64 src_clock  = 6;
+}
+
+message StrictCommit {
+  uint32 coord_node = 1;
+  uint64 op_id_hi   = 2;
+  uint64 op_id_lo   = 3;
+  uint64 ts_final   = 4;
+  bytes  op_msgpack = 5;
+  uint64 src_clock  = 6;
+}
+
+message StrictClockTick {
+  uint32 src_node  = 1;
+  uint64 src_clock = 2;
+}
+
+message StrictCatchupReq {
+  uint32 src_node      = 1;
+  uint64 since_version = 2;
+  uint64 chunk_token   = 3;   // 0 = first chunk; >0 = continuation
+}
+
+message StrictCatchupResp {
+  uint64 snapshot_version       = 1;
+  bytes  snapshot_msgpack       = 2;
+  repeated CatchupOp ops        = 3;
+  bool   has_more               = 4;
+  uint64 next_chunk_token       = 5;
+  bool   too_old_use_snapshot   = 6;
+}
+
+message CatchupOp {
+  uint64 version    = 1;
+  bytes  op_msgpack = 2;
+}
+
+// Tempo slow-path: coordinator-failure recovery (two-phase Paxos per op_id).
+
+// Phase 1 — Prepare. Sent by a deterministic takeover when a coord is
+// suspected dead, asking every replica to promise no future ballot < this
+// one and to report any state for op_id they hold.
+message StrictRecoveryReq {
+  uint32 takeover_node = 1;
+  uint64 ballot        = 2;       // (takeover_node << 32) | attempt_counter
+  uint32 coord_node    = 3;       // failed coordinator's id
+  uint64 op_id_hi      = 4;
+  uint64 op_id_lo      = 5;
+  uint64 src_clock     = 6;
+}
+
+// Phase 1 reply.
+message StrictRecoveryAck {
+  uint32 ack_node           = 1;
+  uint64 ballot             = 2;
+  uint32 coord_node         = 3;
+  uint64 op_id_hi           = 4;
+  uint64 op_id_lo           = 5;
+  bool   promised           = 6;  // false = ack_node already promised >= ballot
+  bool   has_committed      = 7;
+  uint64 committed_ts_final = 8;  // valid iff has_committed
+  bool   has_op             = 9;  // true iff ack_node holds a pending Propose
+  uint64 ts_local           = 10; // 0 if !has_op
+  bytes  op_msgpack         = 11; // empty if !has_op
+  uint64 src_clock          = 12;
+}
+
+// Phase 2 — Accept-and-Commit. Once the takeover has a recovery quorum of
+// promises, it picks ts_final + op_msgpack and broadcasts this. Replicas
+// accept iff `ballot >= recovery_promises[op_id]`.
+message StrictRecoveryCommit {
+  uint32 takeover_node = 1;
+  uint64 ballot        = 2;
+  uint32 coord_node    = 3;
+  uint64 op_id_hi      = 4;
+  uint64 op_id_lo      = 5;
+  uint64 ts_final      = 6;
+  bytes  op_msgpack    = 7;
+  uint64 src_clock     = 8;
+}
+
+// ------- Owner-scoped -------
+
+message OwnerMessage {
+  oneof body {
+    OwnerOp           op           = 1;
+    OwnerCatchupReq   catchup_req  = 2;
+    OwnerCatchupResp  catchup_resp = 3;
+  }
+}
+
+message OwnerOp {
+  uint32 origin_node    = 1;
+  uint64 origin_epoch   = 2;   // origin's overlay boot_epoch
+  uint64 origin_version = 3;
+  bytes  op_msgpack     = 4;
+}
+
+message OwnerCatchupReq {
+  uint32 origin_node    = 1;
+  uint32 src_node       = 2;
+  uint64 known_epoch    = 3;
+  uint64 since_version  = 4;
+  uint64 chunk_token    = 5;
+}
+
+message OwnerCatchupResp {
+  uint32 origin_node            = 1;
+  uint64 origin_epoch           = 2;
+  uint64 snapshot_version       = 3;
+  bytes  snapshot_msgpack       = 4;
+  repeated CatchupOp ops        = 5;
+  bool   has_more               = 6;
+  uint64 next_chunk_token       = 7;
+  bool   too_old_use_snapshot   = 8;
+}

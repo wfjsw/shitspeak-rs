@@ -47,6 +47,10 @@ mod s2s_overlay_proto {
     include!(concat!(env!("OUT_DIR"), "/s2s_overlay.rs"));
 }
 
+mod s2s_replication_proto {
+    include!(concat!(env!("OUT_DIR"), "/s2s_replication.rs"));
+}
+
 /// Minimal no-op authenticator used when no external auth backend is wired up.
 struct NoopAuthenticator;
 

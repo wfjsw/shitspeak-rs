@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::s2s::transport::{SendError, TransportError};
+use crate::types::NodeIdentifier;
 
 #[derive(Debug, Error)]
 pub enum OverlayError {
@@ -28,4 +29,11 @@ pub enum OverlayError {
     Config(String),
     #[error("manager has been shut down")]
     Shutdown,
+    #[error("no route to {dst} at level {level:?}")]
+    NoRoute {
+        dst: NodeIdentifier,
+        level: crate::s2s::transport::ServiceLevel,
+    },
+    #[error("no service handler is registered for tag {tag}")]
+    ServiceNotRegistered { tag: u32 },
 }

@@ -6,6 +6,7 @@ fn main() -> Result<()> {
             "src/protos/MumbleUDP.proto",
             "src/protos/S2STransport.proto",
             "src/protos/S2SOverlay.proto",
+            "src/protos/S2SReplication.proto",
         ],
         &["src/"],
     )?;

@@ -47,6 +47,8 @@ webrtc-dtls = "0.12"
 webrtc-util = "0.11"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
 rand = { version = "0.8", features = ["small_rng"] }
+arc-swap = "1"
+rmp-serde = "1"
 
 [build-dependencies]
 chrono = "0.4.41"
@@ -56,6 +58,7 @@ prost-build = "0.13.5"
 rcgen = { version = "0.13", features = ["x509-parser", "pem"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+tracing-test = "0.2"
 
 [[bench]]
 name = "acl"

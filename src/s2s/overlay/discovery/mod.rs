@@ -1,8 +1,12 @@
 //! Bootstrap and runtime peer-set persistence.
 //!
-//! At start, [`bootstrap`] populates the local membership table with the
-//! merge of operator-supplied seeds and any persisted peer file. The
-//! [`spawn_persister`] task periodically (and at most once per
+//! At start, [`bootstrap`] primes the L1 transport's address book with
+//! the merge of operator-supplied seeds and any persisted peer file.
+//! In Phase 2 we no longer pre-install seeds into the membership table —
+//! membership is derived from the LSDB, so a peer becomes "Alive" when
+//! its LSA arrives, and that arrives once a direct L1 stream is up.
+//!
+//! The [`spawn_persister`] task periodically (and at most once per
 //! `peer_persistence_interval`) writes the current peer set back to disk.
 
 pub mod persistence;
@@ -22,20 +26,14 @@ use super::config::OverlayConfig;
 use super::membership::MembershipTable;
 
 /// Run all start-time discovery work: load persisted peers (if any),
-/// merge with config seeds, install into membership table, and prime the
-/// transport's address book.
-pub fn bootstrap(
-    cfg: &OverlayConfig,
-    table: &MembershipTable,
-    transport: &ConnectionManager,
-) {
+/// merge with config seeds, and prime the L1 transport's address book.
+pub fn bootstrap(cfg: &OverlayConfig, transport: &ConnectionManager) {
     let mut seeded_from_disk = 0usize;
     if let Some(dir) = cfg.persistence_dir() {
         match persistence::load(dir) {
             Ok(persisted) => {
                 seeded_from_disk = persisted.len();
                 for (node, addrs) in persisted {
-                    table.install_seed(node, addrs.clone());
                     for a in addrs {
                         let t = transport.clone();
                         tokio::spawn(async move {
@@ -51,7 +49,6 @@ pub fn bootstrap(
     }
 
     for seed in cfg.seed_peers() {
-        table.install_seed(seed.node_id(), seed.addresses().to_vec());
         for a in seed.addresses() {
             let t = transport.clone();
             let node = seed.node_id();
@@ -68,8 +65,8 @@ pub fn bootstrap(
     );
 }
 
-/// Spawn the debounced persister. Calls to [`PersistTrigger::ping`] schedule
-/// a write that runs at most once per `peer_persistence_interval`.
+/// Spawn the debounced persister. The persister writes the alive
+/// membership view to disk every `interval` after a `trigger` fires.
 pub fn spawn_persister(
     persistence_dir: PathBuf,
     interval: Duration,
@@ -86,8 +83,6 @@ pub fn spawn_persister(
                 }
                 _ = trigger.notified() => {}
             }
-            // Debounce: wait `interval` before writing, but if more triggers
-            // pile up during the wait, collapse them into one write.
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = sleep(interval) => {}
@@ -112,6 +107,4 @@ fn persist_now(
     persistence::save(persistence_dir, &peers)
 }
 
-/// Notify handle that the membership table has changed and should be
-/// rewritten to disk on the next debounce window.
 pub type PersistTrigger = Arc<Notify>;
