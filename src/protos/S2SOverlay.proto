@@ -1,0 +1,72 @@
+syntax = "proto3";
+package s2s_overlay;
+
+// Outermost overlay envelope. Carried as the `payload` of a transport
+// `Frame`. Higher layers never see this directly — the overlay decodes,
+// dispatches by `body` variant, and forwards application data via its
+// own inbound channels.
+message OverlayMessage {
+  oneof body {
+    SwimPing      swim_ping = 1;
+    SwimAck       swim_ack = 2;
+    SwimPingReq   swim_ping_req = 3;
+    GossipDigest  gossip = 4;       // explicit pull / push of the full digest
+    // LinkState     link_state = 5; // Phase 2
+    // OverlayData   data = 6;       // Phase 2
+  }
+}
+
+// SWIM direct probe.
+message SwimPing {
+  uint32 src_node = 1;
+  uint64 src_incarnation = 2;
+  uint64 nonce = 3;
+  repeated GossipUpdate piggyback = 4;
+}
+
+// Reply to a SwimPing.
+message SwimAck {
+  uint32 src_node = 1;
+  uint64 src_incarnation = 2;
+  uint64 nonce = 3;
+  repeated GossipUpdate piggyback = 4;
+}
+
+// Indirect probe: ask the recipient to ping `target_node` and forward
+// any ack back.
+message SwimPingReq {
+  uint32 src_node = 1;
+  uint32 target_node = 2;
+  uint64 nonce = 3;
+}
+
+enum MemberStatus {
+  ALIVE = 0;
+  SUSPECT = 1;
+  DEAD = 2;
+  LEFT = 3;
+}
+
+// One membership update riding either as a pings/ack piggyback or in a
+// full GossipDigest exchange.
+message GossipUpdate {
+  uint32 node = 1;
+  uint64 incarnation = 2;
+  MemberStatus status = 3;
+  repeated AddressEntry addresses = 4;
+}
+
+// One (address, transport) tuple used by the address book. The address is
+// stored as the SocketAddr text form; the transport is the integer value
+// of `s2s::transport::TransportKind`.
+message AddressEntry {
+  string addr = 1;
+  uint32 transport = 2;  // 0=Tcp, 1=Kcp, 2=Quic, 3=Udp
+}
+
+// Full digest of known membership state. Used for explicit pull/push (e.g.
+// after partition heal). Not used in normal steady-state — gossip flows
+// piggybacked on SWIM probes.
+message GossipDigest {
+  repeated GossipUpdate updates = 1;
+}

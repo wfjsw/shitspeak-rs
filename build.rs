@@ -1,6 +1,14 @@
 use std::{io::Result, process::Command};
 fn main() -> Result<()> {
-    prost_build::compile_protos(&["src/protos/Mumble.proto", "src/protos/MumbleUDP.proto"], &["src/"])?;
+    prost_build::compile_protos(
+        &[
+            "src/protos/Mumble.proto",
+            "src/protos/MumbleUDP.proto",
+            "src/protos/S2STransport.proto",
+            "src/protos/S2SOverlay.proto",
+        ],
+        &["src/"],
+    )?;
     
     if let Ok(output) =Command::new("git").args(&["rev-parse", "HEAD"]).output() {
         let git_hash = String::from_utf8(output.stdout).unwrap();

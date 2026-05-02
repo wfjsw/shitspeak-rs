@@ -37,6 +37,16 @@ async-trait = "0.1.89"
 rusqlite = { version = "0.31", features = ["bundled"] }
 parking_lot = { version = "0.12.5", features = ["arc_lock", "hardware-lock-elision", "owning_ref", "send_guard", "serde"] }
 scc = "2.0"
+quinn = "0.11"
+tokio_kcp = "0.9"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+webrtc-dtls = "0.12"
+webrtc-util = "0.11"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
+rand = { version = "0.8", features = ["small_rng"] }
 
 [build-dependencies]
 chrono = "0.4.41"
@@ -45,6 +55,7 @@ prost-build = "0.13.5"
 [dev-dependencies]
 rcgen = { version = "0.13", features = ["x509-parser", "pem"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [[bench]]
 name = "acl"

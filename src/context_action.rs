@@ -288,7 +288,6 @@ impl ContextActionRegistry {
         // Scope the lock so it's released before any .await below
         let action = {
             let mut handlers = self.handlers.write();
-            let mut handlers = self.handlers.write();
 
             match handlers.get_mut(&payload.action) {
                 Some(ActionHandler::OneShot(cb)) => {

@@ -7,3 +7,4 @@ cert.pfx
 # Logs
 log/
 data/
+.claude/settings.local.json

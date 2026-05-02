@@ -1,14 +1,21 @@
-mod identity;
-mod core;
-mod integration;
-mod manager;
+pub mod overlay;
+pub mod transport;
 
-pub use core::{
-    consensus as core_consensus,
-    overlay as core_overlay,
-    replication as core_replication,
-    transport as core_transport,
-    NodeId,
-};
-pub use integration::{S2SOrchestrator, VoiceStreamAdapter};
-pub use manager::{S2SEnabledState, S2SManager, S2SState};
+// Temporary placeholder so the legacy `Server` (src/server.rs) still compiles
+// while the s2s subsystem is being rebuilt layer-by-layer on top of the new
+// `transport` module. Will be replaced with a real manager wired to
+// ConnectionManager + overlay + replication in subsequent work.
+pub struct S2SManager;
+
+impl S2SManager {
+    pub fn initialize(_config: &crate::config::Config) -> Self {
+        Self
+    }
+    pub fn log_startup_summary(&self) {}
+    pub fn spawn_runtime_task(
+        self: std::sync::Arc<Self>,
+        _shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {})
+    }
+}

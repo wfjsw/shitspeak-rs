@@ -39,6 +39,14 @@ mod mumble_udp {
     include!(concat!(env!("OUT_DIR"), "/mumble_udp.rs"));
 }
 
+mod s2s_transport_proto {
+    include!(concat!(env!("OUT_DIR"), "/s2s_transport.rs"));
+}
+
+mod s2s_overlay_proto {
+    include!(concat!(env!("OUT_DIR"), "/s2s_overlay.rs"));
+}
+
 /// Minimal no-op authenticator used when no external auth backend is wired up.
 struct NoopAuthenticator;
 

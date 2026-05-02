@@ -37,3 +37,11 @@ pub mod mumble_proto {
 pub mod mumble_udp {
     include!(concat!(env!("OUT_DIR"), "/mumble_udp.rs"));
 }
+
+pub mod s2s_transport_proto {
+    include!(concat!(env!("OUT_DIR"), "/s2s_transport.rs"));
+}
+
+pub mod s2s_overlay_proto {
+    include!(concat!(env!("OUT_DIR"), "/s2s_overlay.rs"));
+}
