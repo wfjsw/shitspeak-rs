@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::Deserialize;
+
 /// Knobs for [`super::ConnectionManager::start`]. All listeners are optional —
 /// at least one must be set or [`super::ConfigError::NoListener`] is returned.
 #[derive(Debug, Clone)]
@@ -37,6 +39,19 @@ pub struct TransportConfig {
 
     max_frame_bytes: usize,
     udp_mtu: usize,
+
+    // ── Per-link metrics smoothing ──
+    /// EWMA coefficient for the latency estimate.
+    latency_ewma_alpha: f64,
+    /// EWMA coefficient for the jitter estimate (RFC 3550 uses 1/16).
+    jitter_ewma_alpha: f64,
+    /// EWMA coefficient for the active-probe throughput estimate.
+    throughput_ewma_alpha: f64,
+
+    /// Cap on in-flight pings remembered per stream/UDP session. Older
+    /// entries are dropped when the buffer fills, preventing unbounded
+    /// memory if pongs are lost.
+    max_pending_pings: usize,
 }
 
 impl TransportConfig {
@@ -61,6 +76,10 @@ impl TransportConfig {
             outbound_capacity: 256,
             max_frame_bytes: 1 << 20,
             udp_mtu: 1200,
+            latency_ewma_alpha: 0.2,
+            jitter_ewma_alpha: 1.0 / 16.0,
+            throughput_ewma_alpha: 0.3,
+            max_pending_pings: 64,
         }
     }
 
@@ -140,6 +159,22 @@ impl TransportConfig {
 
     pub fn udp_mtu(&self) -> usize {
         self.udp_mtu
+    }
+
+    pub fn latency_ewma_alpha(&self) -> f64 {
+        self.latency_ewma_alpha
+    }
+
+    pub fn jitter_ewma_alpha(&self) -> f64 {
+        self.jitter_ewma_alpha
+    }
+
+    pub fn throughput_ewma_alpha(&self) -> f64 {
+        self.throughput_ewma_alpha
+    }
+
+    pub fn max_pending_pings(&self) -> usize {
+        self.max_pending_pings
     }
 
     // --- Chainable setters ---
@@ -223,4 +258,66 @@ impl TransportConfig {
         self.udp_mtu = n;
         self
     }
+
+    pub fn with_latency_ewma_alpha(mut self, v: f64) -> Self {
+        self.latency_ewma_alpha = v;
+        self
+    }
+
+    pub fn with_jitter_ewma_alpha(mut self, v: f64) -> Self {
+        self.jitter_ewma_alpha = v;
+        self
+    }
+
+    pub fn with_throughput_ewma_alpha(mut self, v: f64) -> Self {
+        self.throughput_ewma_alpha = v;
+        self
+    }
+
+    pub fn with_max_pending_pings(mut self, n: usize) -> Self {
+        self.max_pending_pings = n;
+        self
+    }
 }
+
+/// TOML-deserializable shadow of the per-link metrics smoothing & ping-cap
+/// knobs. Only the new tunables are surfaced here; other [`TransportConfig`]
+/// fields (listen addrs, PKI paths, queue sizes, etc.) stay Rust-builder-
+/// only for now.
+#[derive(Deserialize, Debug, Clone)]
+pub struct TransportTuning {
+    #[serde(default = "default_latency_ewma_alpha")]
+    pub latency_ewma_alpha: f64,
+    #[serde(default = "default_jitter_ewma_alpha")]
+    pub jitter_ewma_alpha: f64,
+    #[serde(default = "default_throughput_ewma_alpha")]
+    pub throughput_ewma_alpha: f64,
+    #[serde(default = "default_max_pending_pings")]
+    pub max_pending_pings: usize,
+}
+
+impl Default for TransportTuning {
+    fn default() -> Self {
+        Self {
+            latency_ewma_alpha: default_latency_ewma_alpha(),
+            jitter_ewma_alpha: default_jitter_ewma_alpha(),
+            throughput_ewma_alpha: default_throughput_ewma_alpha(),
+            max_pending_pings: default_max_pending_pings(),
+        }
+    }
+}
+
+impl TransportTuning {
+    /// Apply the tunables on top of an existing `TransportConfig`.
+    pub fn apply(&self, cfg: TransportConfig) -> TransportConfig {
+        cfg.with_latency_ewma_alpha(self.latency_ewma_alpha)
+            .with_jitter_ewma_alpha(self.jitter_ewma_alpha)
+            .with_throughput_ewma_alpha(self.throughput_ewma_alpha)
+            .with_max_pending_pings(self.max_pending_pings)
+    }
+}
+
+fn default_latency_ewma_alpha() -> f64 { 0.2 }
+fn default_jitter_ewma_alpha() -> f64 { 1.0 / 16.0 }
+fn default_throughput_ewma_alpha() -> f64 { 0.3 }
+fn default_max_pending_pings() -> usize { 64 }

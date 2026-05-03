@@ -368,6 +368,7 @@ impl OwnerReplicable for CountingOwnerRepo {
 #[cfg(test)]
 mod e2e_tests {
     use super::*;
+    use super::super::config::ReplicationConfig;
     use super::super::owner::runtime::OwnerRuntime;
     use super::super::proto::{
         OwnerBody, OwnerCatchupReq, OwnerOp, StrictBody, StrictCommit, StrictPropose,
@@ -377,6 +378,10 @@ mod e2e_tests {
     use std::time::Duration;
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
+
+    fn default_cfg() -> Arc<ReplicationConfig> {
+        Arc::new(ReplicationConfig::default())
+    }
 
     /// 1-node strict cluster: propose immediately self-acks, commits,
     /// delivers, applies. End-to-end.
@@ -391,6 +396,7 @@ mod e2e_tests {
             "channels".into(),
             net.clone() as Arc<dyn StrictNet>,
             CancellationToken::new(),
+            default_cfg(),
         );
         rt.start();
 
@@ -418,6 +424,7 @@ mod e2e_tests {
             "channels".into(),
             net.clone() as Arc<dyn StrictNet>,
             CancellationToken::new(),
+            default_cfg(),
         );
         // No start(): we want fully synchronous control.
 
@@ -463,6 +470,7 @@ mod e2e_tests {
             "clients".into(),
             net.clone() as Arc<dyn OwnerNet>,
             CancellationToken::new(),
+            default_cfg(),
         );
         let v = rt.clone().propose_local(42u64).await.unwrap();
         assert_eq!(v, 1);
@@ -483,6 +491,7 @@ mod e2e_tests {
             "clients".into(),
             net.clone() as Arc<dyn OwnerNet>,
             CancellationToken::new(),
+            default_cfg(),
         );
         // First sight of origin 2 with a gap at v5.
         rt.recv_op(
@@ -525,6 +534,7 @@ mod e2e_tests {
             "clients".into(),
             net.clone() as Arc<dyn OwnerNet>,
             CancellationToken::new(),
+            default_cfg(),
         );
 
         // Pre-seed knowledge that origin 2 was at (epoch=10, ver=4).
@@ -564,6 +574,7 @@ mod e2e_tests {
             "clients".into(),
             net.clone() as Arc<dyn OwnerNet>,
             CancellationToken::new(),
+            default_cfg(),
         );
 
         // Pre-buffer ops at the old epoch.

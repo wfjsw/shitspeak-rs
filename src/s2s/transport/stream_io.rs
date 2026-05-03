@@ -38,10 +38,6 @@ use super::frame::{build_frame, stream_codec, FrameType};
 use super::manager::InboundDispatch;
 use super::service_level::{MessageClass, ServiceLevel, TransportKind};
 
-/// Cap on how many in-flight pings we remember. Older entries are dropped
-/// when the buffer fills, preventing unbounded memory if pongs are lost.
-const MAX_PENDING_PINGS: usize = 64;
-
 /// Tunables for a single stream pump. Cloned per stream.
 #[derive(Clone)]
 pub(crate) struct StreamPumpConfig {
@@ -53,6 +49,10 @@ pub(crate) struct StreamPumpConfig {
     ping_interval: Duration,
     bandwidth_probe_interval: Duration,
     bandwidth_probe_size: usize,
+    /// Cap on how many in-flight pings we remember. Older entries are
+    /// dropped when the buffer fills, preventing unbounded memory if pongs
+    /// are lost.
+    max_pending_pings: usize,
 }
 
 impl StreamPumpConfig {
@@ -66,6 +66,7 @@ impl StreamPumpConfig {
         ping_interval: Duration,
         bandwidth_probe_interval: Duration,
         bandwidth_probe_size: usize,
+        max_pending_pings: usize,
     ) -> Self {
         Self {
             local_node,
@@ -76,6 +77,7 @@ impl StreamPumpConfig {
             ping_interval,
             bandwidth_probe_interval,
             bandwidth_probe_size,
+            max_pending_pings,
         }
     }
 }
@@ -104,14 +106,18 @@ where
 /// In-flight ping bookkeeping.
 struct PendingPings {
     inner: VecDeque<(u64, usize)>, // (ts_us, encoded sent bytes)
+    cap: usize,
 }
 
 impl PendingPings {
-    fn new() -> Self {
-        Self { inner: VecDeque::with_capacity(MAX_PENDING_PINGS) }
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: VecDeque::with_capacity(cap),
+            cap,
+        }
     }
     fn insert(&mut self, ts_us: u64, sent: usize) {
-        if self.inner.len() >= MAX_PENDING_PINGS {
+        if self.inner.len() >= self.cap {
             self.inner.pop_front();
         }
         self.inner.push_back((ts_us, sent));
@@ -171,7 +177,7 @@ async fn run_pump<S>(
     } else {
         MaybeInterval::Disabled
     };
-    let mut pending = PendingPings::new();
+    let mut pending = PendingPings::new(cfg.max_pending_pings);
     let level_for_metrics = cfg.transport.service_level();
 
     loop {

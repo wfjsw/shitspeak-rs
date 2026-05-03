@@ -154,6 +154,7 @@ pub(crate) fn install_stream_session<S>(
         inner.cfg().ping_interval(),
         inner.cfg().bandwidth_probe_interval(),
         inner.cfg().bandwidth_probe_size(),
+        inner.cfg().max_pending_pings(),
     );
     let active = spawn_stream_pump(stream, cfg, peer.clone(), inner.inbound().clone());
     if let Err(rejected) = peer.try_install_stream(inner.self_id(), is_dialer, active) {

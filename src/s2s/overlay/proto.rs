@@ -94,9 +94,20 @@ pub fn node_from_wire(v: u32) -> Option<NodeIdentifier> {
 }
 
 /// Convert a `ServiceLevel` to its u32 wire value.
+///
+/// The wire encoding is stable and independent of the enum's
+/// discriminant numbering: `0=Reliable, 1=RLL, 2=BestEffort`. This
+/// avoids breaking on-the-wire compatibility if the enum is reordered
+/// (which it has been: KCP/QUIC's `ReliableLowLatency` is now the
+/// strongest tier numerically, but the wire still uses `0` for plain
+/// `Reliable` so older peers don't misinterpret levels).
 #[inline]
 pub fn level_to_wire(l: ServiceLevel) -> u32 {
-    l as u32
+    match l {
+        ServiceLevel::Reliable => 0,
+        ServiceLevel::ReliableLowLatency => 1,
+        ServiceLevel::BestEffort => 2,
+    }
 }
 
 #[inline]

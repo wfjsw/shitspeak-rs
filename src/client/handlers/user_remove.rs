@@ -25,6 +25,40 @@ pub async fn handle_user_remove(
     }
     let target_session =
         crate::client::client_session_identifier::ClientSessionIdentifier::from(target_raw);
+    let local_node_id = server.get_clients().local_node_id();
+
+    // Cross-owner kick/ban: dispatch the intent to the owner. Same
+    // fire-and-forget contract as `handle_user_state`. Bans get
+    // persisted on the owner's node (where the target lives) and
+    // propagate via the `BanRepository`'s strict replication; the
+    // RemoveClient log entry, in turn, broadcasts UserRemove to all
+    // subscribers via owner-scoped replication.
+    if target_session.get_node_id() != local_node_id {
+        if let Some(app) = server.s2s_manager().application() {
+            let patch = crate::s2s::application::proto::UserRemovePatch {
+                reason: msg.reason.clone().map(Into::into),
+                ban: msg.ban.unwrap_or(false),
+            };
+            if let Err(e) = app
+                .moderation()
+                .dispatch_user_remove(sender.get_session_id(), target_session, patch)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    target = target_raw,
+                    "moderation dispatch_user_remove failed",
+                );
+            }
+        } else {
+            tracing::trace!(
+                target = target_raw,
+                "cross-owner UserRemove dropped: ApplicationLayer not attached",
+            );
+        }
+        return Ok(());
+    }
+
     let target = match server.get_clients().get_client(target_session).await {
         Some(c) => c,
         None => return Ok(()),

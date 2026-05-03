@@ -2,9 +2,10 @@
 //!
 //! The wire chunking strategy is intentionally stateless on the server
 //! side: each request carries `since_version`; the server returns up to
-//! `MAX_CATCHUP_OPS` ops with `has_more` set when more are available.
-//! The client iterates by re-issuing requests with `since_version =
-//! repo.current_version()` until `has_more = false`.
+//! [`crate::s2s::replications::ReplicationConfig::strict_max_catchup_ops`]
+//! ops with `has_more` set when more are available. The client iterates by
+//! re-issuing requests with `since_version = repo.current_version()` until
+//! `has_more = false`.
 
 use rand::seq::SliceRandom;
 use tracing::warn;
@@ -12,7 +13,7 @@ use tracing::warn;
 use super::super::proto::{
     CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp,
 };
-use super::runtime::{StrictRuntime, MAX_CATCHUP_OPS};
+use super::runtime::StrictRuntime;
 use super::{LogSlice, StrictReplicable};
 use crate::types::NodeIdentifier;
 
@@ -41,7 +42,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     };
 
     let total = effective_ops.len();
-    let take = total.min(MAX_CATCHUP_OPS);
+    let take = total.min(rt.cfg.strict_max_catchup_ops());
     let mut catchup_ops: Vec<CatchupOp> = Vec::with_capacity(take);
     for (v, op) in effective_ops.iter().take(take) {
         match rmp_serde::to_vec(op) {

@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::types::NodeIdentifier;
 
-use super::metrics::PeerMetrics;
+use super::metrics::{MetricsTuning, PeerMetrics};
 use super::service_level::{MessageClass, PeerAddress, TransportKind};
 
 /// One outbound frame, addressed to a specific stream.
@@ -134,6 +134,7 @@ impl PeerState {
         backoff_initial: Duration,
         backoff_cap: Duration,
         bandwidth_window: Duration,
+        metrics_tuning: MetricsTuning,
     ) -> Arc<Self> {
         Arc::new(Self {
             node_id,
@@ -141,7 +142,7 @@ impl PeerState {
             streams: Mutex::new(HashMap::new()),
             udp_seen_at: Mutex::new(None),
             udp_addr: Mutex::new(None),
-            metrics: Arc::new(PeerMetrics::new(bandwidth_window)),
+            metrics: Arc::new(PeerMetrics::new(bandwidth_window, metrics_tuning)),
             backoff: Mutex::new(BackoffState::new(backoff_initial, backoff_cap)),
             outbound_seq: AtomicU32::new(0),
             connecting: AtomicBool::new(false),

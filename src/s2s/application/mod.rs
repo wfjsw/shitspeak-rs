@@ -1,0 +1,102 @@
+//! Application-layer (L3) services on top of the L2 [overlay].
+//!
+//! Two services live here, each registered against a distinct overlay
+//! `service_tag`:
+//!
+//! * **Moderation** ([`MODERATION_SERVICE_TAG`] = 2) — fire-and-forget
+//!   RPC that ships a moderator's intent from the originating node to
+//!   the owner of the target client. The owner applies the mutation
+//!   through its existing `GlobalStateWriteGuard` path; the resulting
+//!   delta propagates back to every node via owner-scoped replication
+//!   (handled at L3 by [`crate::s2s::replications`]).
+//!
+//! * **Voice** ([`VOICE_SERVICE_TAG`] = 3) — broadcast (default) or
+//!   targeted (opt-in) cross-node fan-out of voice frames. Receivers
+//!   never decode the audio payload; they reorder by `(sender, epoch)`
+//!   and hand the bytes straight to local per-client encryption +
+//!   send. Reorder caps and deadlines are operator-tunable.
+//!
+//! ## Lifecycle
+//!
+//! [`ApplicationLayer::new`] registers both `ServiceInbound` handlers
+//! against the overlay's `ServiceRegistry` and spawns the per-service
+//! dispatch tasks. [`ApplicationLayer::shutdown`] cancels every task
+//! via the shared cancellation token and unregisters both tags.
+//!
+//! [overlay]: crate::s2s::overlay
+
+pub mod config;
+pub mod error;
+pub mod moderation;
+pub mod proto;
+pub mod voice;
+
+#[cfg(test)]
+mod integration_tests;
+
+use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
+
+use crate::s2s::overlay::OverlayNetwork;
+
+pub use config::{ApplicationConfig, DeliveryStrategy, VoiceConfig};
+pub use error::ApplicationError;
+pub use moderation::ModerationService;
+pub use proto::{MODERATION_SERVICE_TAG, VOICE_SERVICE_TAG};
+pub use voice::VoiceService;
+
+/// Public entry-point for the L3 application layer. Cheap to clone —
+/// internally an `Arc`.
+#[derive(Clone)]
+pub struct ApplicationLayer {
+    inner: Arc<ApplicationInner>,
+}
+
+struct ApplicationInner {
+    overlay: OverlayNetwork,
+    moderation: Arc<ModerationService>,
+    voice: Arc<VoiceService>,
+    shutdown: CancellationToken,
+}
+
+impl ApplicationLayer {
+    /// Build the application layer on top of an already-started overlay.
+    /// Spawns per-service dispatch tasks and registers the L3 handlers.
+    pub fn new(overlay: OverlayNetwork, cfg: ApplicationConfig) -> Arc<Self> {
+        let shutdown = CancellationToken::new();
+        let moderation =
+            ModerationService::new(overlay.clone(), shutdown.child_token());
+        let voice = VoiceService::new(
+            overlay.clone(),
+            cfg.voice.clone(),
+            shutdown.child_token(),
+        );
+
+        overlay.register_service(MODERATION_SERVICE_TAG, moderation.inbound_handler());
+        overlay.register_service(VOICE_SERVICE_TAG, voice.inbound_handler());
+
+        let inner = Arc::new(ApplicationInner {
+            overlay,
+            moderation,
+            voice,
+            shutdown,
+        });
+        Arc::new(Self { inner })
+    }
+
+    pub fn moderation(&self) -> &Arc<ModerationService> {
+        &self.inner.moderation
+    }
+
+    pub fn voice(&self) -> &Arc<VoiceService> {
+        &self.inner.voice
+    }
+
+    /// Cancel all background tasks and unregister the L3 handlers.
+    pub async fn shutdown(&self) {
+        self.inner.shutdown.cancel();
+        self.inner.overlay.unregister_service(MODERATION_SERVICE_TAG);
+        self.inner.overlay.unregister_service(VOICE_SERVICE_TAG);
+    }
+}

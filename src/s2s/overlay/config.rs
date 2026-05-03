@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use crate::s2s::transport::{PeerAddress, TransportKind};
 use crate::types::NodeIdentifier;
 
@@ -75,6 +77,11 @@ pub struct OverlayConfig {
     // ── Cost-change re-emit thresholds ──
     cost_rerun_rtt_pct: f64,        // re-emit when RTT shifts >= this fraction
     cost_rerun_throughput_pct: f64, // re-emit when throughput shifts >= this fraction
+
+    // ── LSDB sync chunking ──
+    /// Max LSAs per `LsdbSyncResp` frame. The responder splits a delta
+    /// across multiple frames when it exceeds this cap.
+    lsdb_sync_max_response_lsas: usize,
 }
 
 impl OverlayConfig {
@@ -103,6 +110,8 @@ impl OverlayConfig {
 
             cost_rerun_rtt_pct: 0.25,
             cost_rerun_throughput_pct: 0.50,
+
+            lsdb_sync_max_response_lsas: 256,
         }
     }
 
@@ -158,6 +167,10 @@ impl OverlayConfig {
     }
     pub fn cost_rerun_throughput_pct(&self) -> f64 {
         self.cost_rerun_throughput_pct
+    }
+
+    pub fn lsdb_sync_max_response_lsas(&self) -> usize {
+        self.lsdb_sync_max_response_lsas
     }
 
     // ── Builder setters ──
@@ -218,6 +231,11 @@ impl OverlayConfig {
         self.best_effort_transports_mask = m;
         self
     }
+
+    pub fn with_lsdb_sync_max_response_lsas(mut self, n: usize) -> Self {
+        self.lsdb_sync_max_response_lsas = n;
+        self
+    }
 }
 
 /// Bootstrap peer entry from operator config. The node id is required so the
@@ -242,3 +260,31 @@ impl SeedPeer {
         &self.addresses
     }
 }
+
+/// TOML-deserializable shadow of [`OverlayConfig`]. Only the tunables
+/// surfaced from the operator config live here; other [`OverlayConfig`]
+/// fields (timers, transport masks, etc.) stay Rust-builder-only for now.
+#[derive(Deserialize, Debug, Clone)]
+pub struct OverlayTuning {
+    /// Max LSAs per `LsdbSyncResp` frame.
+    #[serde(default = "default_lsdb_sync_max_response_lsas")]
+    pub lsdb_sync_max_response_lsas: usize,
+}
+
+impl Default for OverlayTuning {
+    fn default() -> Self {
+        Self {
+            lsdb_sync_max_response_lsas: default_lsdb_sync_max_response_lsas(),
+        }
+    }
+}
+
+impl OverlayTuning {
+    /// Apply the tunables on top of an `OverlayConfig` built from the
+    /// existing seed-peer / persistence-dir machinery.
+    pub fn apply(&self, cfg: OverlayConfig) -> OverlayConfig {
+        cfg.with_lsdb_sync_max_response_lsas(self.lsdb_sync_max_response_lsas)
+    }
+}
+
+fn default_lsdb_sync_max_response_lsas() -> usize { 256 }

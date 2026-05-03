@@ -38,8 +38,6 @@ use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
 use super::super::service_level::{MessageClass, ServiceLevel, TransportKind};
 use super::Endpoint;
 
-const MAX_PENDING_PINGS: usize = 64;
-
 /// UDP+DTLS endpoint. Owns the loaded `NodeIdentity` (used to build server
 /// and client DTLS configs) and the listen address.
 pub(crate) struct UdpEndpoint {
@@ -184,8 +182,9 @@ fn spawn_dtls_pump(
     let (tx, rx) = mpsc::channel::<OutboundFrame>(inner.cfg().outbound_capacity());
     let closed = CancellationToken::new();
 
-    let pending: Arc<parking_lot::Mutex<PendingPings>> =
-        Arc::new(parking_lot::Mutex::new(PendingPings::new()));
+    let pending: Arc<parking_lot::Mutex<PendingPings>> = Arc::new(parking_lot::Mutex::new(
+        PendingPings::new(inner.cfg().max_pending_pings()),
+    ));
 
     {
         let conn = conn.clone();
@@ -429,18 +428,19 @@ async fn handle_frame(
     Ok(())
 }
 
-#[derive(Default)]
 struct PendingPings {
     inner: VecDeque<(u64, usize)>,
+    cap: usize,
 }
 impl PendingPings {
-    fn new() -> Self {
+    fn new(cap: usize) -> Self {
         Self {
-            inner: VecDeque::with_capacity(MAX_PENDING_PINGS),
+            inner: VecDeque::with_capacity(cap),
+            cap,
         }
     }
     fn insert(&mut self, ts: u64, sent: usize) {
-        if self.inner.len() >= MAX_PENDING_PINGS {
+        if self.inner.len() >= self.cap {
             self.inner.pop_front();
         }
         self.inner.push_back((ts, sent));

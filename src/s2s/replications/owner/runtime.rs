@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
+use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::proto::{
     self as repl_proto, OwnerBody, OwnerCatchupReq, OwnerOp, REPLICATION_SERVICE_TAG,
@@ -25,9 +26,6 @@ use super::OwnerReplicable;
 use crate::s2s::overlay::{MembershipEvent, OverlayNetwork};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
-
-pub(crate) const CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const MAX_CATCHUP_OPS: usize = 256;
 
 #[async_trait]
 pub(crate) trait OwnerNet: Send + Sync + 'static {
@@ -216,10 +214,15 @@ impl OwnerState {
     }
 
     /// Should we issue a catchup for `origin`? Suppresses duplicates within
-    /// `CATCHUP_TIMEOUT`.
-    pub fn arm_catchup(&mut self, origin: NodeIdentifier, now: Instant) -> bool {
+    /// `catchup_timeout`.
+    pub fn arm_catchup(
+        &mut self,
+        origin: NodeIdentifier,
+        now: Instant,
+        catchup_timeout: Duration,
+    ) -> bool {
         match self.catchup_in_flight.get(&origin) {
-            Some(t) if now.duration_since(*t) < CATCHUP_TIMEOUT => false,
+            Some(t) if now.duration_since(*t) < catchup_timeout => false,
             _ => {
                 self.catchup_in_flight.insert(origin, now);
                 true
@@ -251,6 +254,7 @@ pub(crate) struct OwnerRuntime<R: OwnerReplicable> {
     pub state: Mutex<OwnerState>,
     pub local_counter: AtomicU64,
     pub shutdown: CancellationToken,
+    pub cfg: Arc<ReplicationConfig>,
 }
 
 impl<R: OwnerReplicable> OwnerRuntime<R> {
@@ -261,6 +265,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         topic: String,
         net: Arc<dyn OwnerNet>,
         shutdown: CancellationToken,
+        cfg: Arc<ReplicationConfig>,
     ) -> Arc<Self> {
         // Seed local_counter from the repo's existing local_version (so a
         // restart with state already loaded continues monotonically).
@@ -274,6 +279,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             state: Mutex::new(OwnerState::new()),
             local_counter: AtomicU64::new(initial),
             shutdown,
+            cfg,
         })
     }
 
@@ -359,7 +365,12 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                                 op.origin_version,
                                 Bytes::from(op.op_msgpack),
                             );
-                            was_empty && s.arm_catchup(origin, Instant::now())
+                            was_empty
+                                && s.arm_catchup(
+                                    origin,
+                                    Instant::now(),
+                                    self.cfg.owner_catchup_timeout(),
+                                )
                         };
                         if arm {
                             self.send_catchup_req(origin, new_epoch).await;
@@ -384,7 +395,12 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                         .unwrap_or(op.origin_epoch);
                     let was_empty =
                         s.buffer_op(origin, op.origin_version, Bytes::from(op.op_msgpack));
-                    let arm = was_empty && s.arm_catchup(origin, Instant::now());
+                    let arm = was_empty
+                        && s.arm_catchup(
+                            origin,
+                            Instant::now(),
+                            self.cfg.owner_catchup_timeout(),
+                        );
                     (arm, known_epoch)
                 };
                 if arm {
@@ -622,19 +638,21 @@ mod tests {
 
     #[test]
     fn arm_catchup_suppresses_within_timeout() {
+        let timeout = ReplicationConfig::default().owner_catchup_timeout();
         let mut s = OwnerState::new();
         let t0 = Instant::now();
-        assert!(s.arm_catchup(7, t0));
-        assert!(!s.arm_catchup(7, t0));
+        assert!(s.arm_catchup(7, t0, timeout));
+        assert!(!s.arm_catchup(7, t0, timeout));
         // Way later — re-arm.
-        assert!(s.arm_catchup(7, t0 + CATCHUP_TIMEOUT + Duration::from_secs(1)));
+        assert!(s.arm_catchup(7, t0 + timeout + Duration::from_secs(1), timeout));
     }
 
     #[test]
     fn wipe_origin_clears_pending_and_catchup_state() {
+        let timeout = ReplicationConfig::default().owner_catchup_timeout();
         let mut s = OwnerState::new();
         s.buffer_op(7, 6, Bytes::from_static(b"a"));
-        s.arm_catchup(7, Instant::now());
+        s.arm_catchup(7, Instant::now(), timeout);
         s.wipe_origin(7);
         assert!(s.pending_buffers.get(&7).is_none());
         assert!(s.catchup_in_flight.get(&7).is_none());

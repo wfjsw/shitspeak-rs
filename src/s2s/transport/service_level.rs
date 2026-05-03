@@ -4,14 +4,16 @@ use crate::types::NodeIdentifier;
 
 /// Reliability tier requested by the caller (or provided by a transport).
 ///
-/// Numerically lower = stronger guarantees. A transport whose level value is
-/// `<=` the requested level satisfies the request, so `Reliable` (TCP) can
-/// serve a `BestEffort` send when nothing better is up.
+/// Numerically lower = stronger guarantees. KCP/QUIC are reliable *and*
+/// low-latency, so `ReliableLowLatency` ranks above plain `Reliable` (TCP).
+/// A transport whose level value is `<=` the requested level satisfies the
+/// request, so `ReliableLowLatency` can serve a `Reliable` send (and either
+/// can serve `BestEffort`) when nothing exact is up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum ServiceLevel {
-    Reliable = 0,
-    ReliableLowLatency = 1,
+    ReliableLowLatency = 0,
+    Reliable = 1,
     BestEffort = 2,
 }
 
@@ -107,10 +109,15 @@ mod tests {
                 assert_eq!(provider.satisfies(requested), expected);
             }
         }
-        // Spot check: Reliable can serve everything; BestEffort only itself.
-        assert!(Reliable.satisfies(BestEffort));
+        // Spot check: ReliableLowLatency (KCP/QUIC) is strongest and can
+        // serve any request; Reliable (TCP) can serve itself or weaker;
+        // BestEffort can only serve BestEffort.
+        assert!(ReliableLowLatency.satisfies(Reliable));
         assert!(ReliableLowLatency.satisfies(BestEffort));
+        assert!(Reliable.satisfies(BestEffort));
+        assert!(!Reliable.satisfies(ReliableLowLatency));
         assert!(!BestEffort.satisfies(Reliable));
+        assert!(!BestEffort.satisfies(ReliableLowLatency));
     }
 
     #[test]

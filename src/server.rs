@@ -768,6 +768,10 @@ impl Server {
         &self.udp_socket
     }
 
+    pub fn s2s_manager(&self) -> &Arc<S2SManager> {
+        &self.s2s_manager
+    }
+
     pub fn get_codec_info(&self) -> parking_lot::MutexGuard<'_, CodecInfo> {
         self.codec_info.lock()
     }

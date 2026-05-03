@@ -9,7 +9,7 @@ use tracing::warn;
 use super::super::proto::{
     CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp,
 };
-use super::runtime::{OwnerRuntime, MAX_CATCHUP_OPS};
+use super::runtime::OwnerRuntime;
 use super::{LogSlice, OwnerReplicable};
 use crate::types::NodeIdentifier;
 
@@ -74,7 +74,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
     };
 
     let total = effective_ops.len();
-    let take = total.min(MAX_CATCHUP_OPS);
+    let take = total.min(rt.cfg.owner_max_catchup_ops());
     let mut catchup_ops: Vec<CatchupOp> = Vec::with_capacity(take);
     for (v, op) in effective_ops.iter().take(take) {
         match rmp_serde::to_vec(op) {
@@ -199,7 +199,11 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         // out-of-order ops arriving meanwhile.
         {
             let mut s = rt.state.lock();
-            s.arm_catchup(origin, std::time::Instant::now());
+            s.arm_catchup(
+                origin,
+                std::time::Instant::now(),
+                rt.cfg.owner_catchup_timeout(),
+            );
         }
         let _ = rt
             .net

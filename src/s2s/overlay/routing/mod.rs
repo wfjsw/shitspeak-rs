@@ -36,10 +36,19 @@ impl RoutingTables {
         }
     }
 
-    /// Look up the next hop. Falls back to a stricter (more reliable)
-    /// level if the requested level has no entry. Order of fallback is
-    /// `BestEffort -> RLL -> Reliable`. Never falls back in the looser
-    /// direction.
+    /// Look up the next hop. Falls back to whichever other level can
+    /// satisfy the request without losing the *reliability* property:
+    ///
+    /// * `BestEffort` → fall back to `Reliable`, then `ReliableLowLatency`.
+    ///   (Either is strictly better.)
+    /// * `Reliable` → fall back to `ReliableLowLatency` (KCP/QUIC are
+    ///   reliable too). NEVER falls back to `BestEffort` — that would
+    ///   silently downgrade a reliable request to one that may drop.
+    /// * `ReliableLowLatency` → fall back to `Reliable` (plain TCP).
+    ///   Loses the low-latency guarantee but preserves reliability.
+    ///   Operators who deploy KCP/QUIC alongside TCP get the latency
+    ///   benefit; clusters without KCP/QUIC still get their RLL traffic
+    ///   delivered.
     pub fn lookup(
         &self,
         dst: NodeIdentifier,
@@ -50,12 +59,12 @@ impl RoutingTables {
         }
         match level {
             ServiceLevel::BestEffort => self
-                .reliable_low_latency
+                .reliable
                 .get(&dst)
                 .copied()
-                .or_else(|| self.reliable.get(&dst).copied()),
+                .or_else(|| self.reliable_low_latency.get(&dst).copied()),
+            ServiceLevel::Reliable => self.reliable_low_latency.get(&dst).copied(),
             ServiceLevel::ReliableLowLatency => self.reliable.get(&dst).copied(),
-            ServiceLevel::Reliable => None,
         }
     }
 }

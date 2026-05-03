@@ -10,8 +10,8 @@
 //!
 //! In both cases the responder builds `LsdbSyncResp { delta }` containing
 //! only the LSAs strictly newer than what the requester reports. Chunked
-//! at `MAX_RESPONSE_LSAS` per frame so a single response can fan into
-//! several `LsdbSyncResp`s.
+//! at [`OverlayConfig::lsdb_sync_max_response_lsas`] per frame so a single
+//! response can fan into several `LsdbSyncResp`s.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,8 +34,6 @@ use super::super::proto::{
     encode_message, node_from_wire, node_to_wire, wrap, OverlayBody,
 };
 use super::store::{AdmissionResult, LinkStateDb, LsaEntry, OriginVersion};
-
-const MAX_RESPONSE_LSAS: usize = 256;
 
 /// Send an `LsdbSync` request to `dst`. `have` is our digest; pass `&[]`
 /// for a full pull.
@@ -76,6 +74,7 @@ pub async fn handle_request(
     transport: &ConnectionManager,
     sender: NodeIdentifier,
     req: pb::LsdbSync,
+    max_response_lsas: usize,
 ) {
     let mut peer_digest: HashMap<NodeIdentifier, OriginVersion> = HashMap::new();
     for d in &req.have {
@@ -94,7 +93,7 @@ pub async fn handle_request(
         trace!(peer=%sender, "lsdb sync: nothing to send");
         return;
     }
-    for chunk in delta.chunks(MAX_RESPONSE_LSAS) {
+    for chunk in delta.chunks(max_response_lsas.max(1)) {
         let body = OverlayBody::LsdbSyncResp(pb::LsdbSyncResp {
             delta: chunk.iter().map(|e| e.to_pb()).collect(),
         });

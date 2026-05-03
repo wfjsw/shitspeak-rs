@@ -3,72 +3,37 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use config::{Config as ConfigCrate, Environment, File};
 
-use crate::constants::MAX_NODE_ID;
+use crate::s2s::application::ApplicationConfig;
+use crate::s2s::overlay::OverlayTuning;
+use crate::s2s::replications::ReplicationTuning;
+use crate::s2s::transport::TransportTuning;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 pub struct S2sConfig {
+    /// L3 application-layer tunables (moderation + voice). Lives under
+    /// `[s2s.application.*]` in TOML.
     #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub bootstrap_nodes: Vec<String>,
-    #[serde(default)]
-    pub quic_listen: Option<String>,
-    #[serde(default)]
-    pub tcp_listen: Option<String>,
-    #[serde(default = "default_s2s_cert_path")]
-    pub cert_path: String,
-    #[serde(default = "default_s2s_key_path")]
-    pub key_path: String,
-    #[serde(default = "default_s2s_ca_cert_path")]
-    pub ca_cert_path: String,
-    #[serde(default = "default_s2s_node_id_extension_oid")]
-    pub node_id_extension_oid: String,
-    #[serde(default = "default_true")]
-    pub require_node_id_extension: bool,
-    #[serde(default = "default_s2s_probe_interval_ms")]
-    pub probe_interval_ms: u64,
-    #[serde(default = "default_s2s_probe_timeout_ms")]
-    pub probe_timeout_ms: u64,
-    #[serde(default = "default_s2s_suspect_timeout_ms")]
-    pub suspect_timeout_ms: u64,
-    #[serde(default = "default_s2s_dead_timeout_ms")]
-    pub dead_timeout_ms: u64,
-    #[serde(default = "default_s2s_anti_entropy_interval_ms")]
-    pub anti_entropy_interval_ms: u64,
-    #[serde(default = "default_s2s_full_digest_interval_ms")]
-    pub full_digest_interval_ms: u64,
-    #[serde(default = "default_s2s_quality_stale_after_ms")]
-    pub quality_stale_after_ms: u64,
-}
+    pub application: ApplicationConfig,
 
-impl Default for S2sConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bootstrap_nodes: Vec::new(),
-            quic_listen: None,
-            tcp_listen: None,
-            cert_path: default_s2s_cert_path(),
-            key_path: default_s2s_key_path(),
-            ca_cert_path: default_s2s_ca_cert_path(),
-            node_id_extension_oid: default_s2s_node_id_extension_oid(),
-            require_node_id_extension: default_true(),
-            probe_interval_ms: default_s2s_probe_interval_ms(),
-            probe_timeout_ms: default_s2s_probe_timeout_ms(),
-            suspect_timeout_ms: default_s2s_suspect_timeout_ms(),
-            dead_timeout_ms: default_s2s_dead_timeout_ms(),
-            anti_entropy_interval_ms: default_s2s_anti_entropy_interval_ms(),
-            full_digest_interval_ms: default_s2s_full_digest_interval_ms(),
-            quality_stale_after_ms: default_s2s_quality_stale_after_ms(),
-        }
-    }
+    /// L1 transport-layer metrics smoothing + ping-cap tunables. Lives
+    /// under `[s2s.transport.*]` in TOML.
+    #[serde(default)]
+    pub transport: TransportTuning,
+
+    /// L2 overlay-layer tunables. Lives under `[s2s.overlay.*]` in TOML.
+    #[serde(default)]
+    pub overlay: OverlayTuning,
+
+    /// L3 replications-layer tunables (Tempo + owner-mode). Lives under
+    /// `[s2s.replications.*]` in TOML.
+    #[serde(default)]
+    pub replications: ReplicationTuning,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub node_id: u16,
     pub listen: String,
-    pub opus_threshold: u16,
     pub register_name: String,
 
     // ── Public server registration ────────────────────────────────────────
@@ -109,12 +74,6 @@ pub struct Config {
     pub default_channel: u32,
     #[serde(default)]
     pub cert_required: bool,
-
-    // ── Listener volume broadcast (mumble 1.4.0+) ──────────────────────────
-    /// When `true`, listener volume adjustments are broadcast in `UserState`
-    /// to all v1.4.0+ clients.  When `false`, sent only to the owning session.
-    #[serde(default = "default_true")]
-    pub broadcast_listener_volume_adjustments: bool,
 
     // ── Blob / persistence ─────────────────────────────────────────────────
     /// Directory used for WAL, snapshot, and blob storage.
@@ -188,17 +147,6 @@ fn default_client_log_max_entries() -> usize { 10_000 }
 fn default_channel_snapshot_every_ops() -> u64 { 10 }
 fn default_channel_snapshot_every_secs() -> i64 { 60 }
 fn default_channel_wal_compaction_expire_count() -> usize { 2_000 }
-fn default_s2s_cert_path() -> String { "s2s-cert.pem".to_owned() }
-fn default_s2s_key_path() -> String { "s2s-key.pem".to_owned() }
-fn default_s2s_ca_cert_path() -> String { "s2s-ca-cert.pem".to_owned() }
-fn default_s2s_node_id_extension_oid() -> String { "1.3.6.1.4.1.55555.1.1".to_owned() }
-fn default_s2s_probe_interval_ms() -> u64 { 1_000 }
-fn default_s2s_probe_timeout_ms() -> u64 { 700 }
-fn default_s2s_suspect_timeout_ms() -> u64 { 3_000 }
-fn default_s2s_dead_timeout_ms() -> u64 { 7_000 }
-fn default_s2s_anti_entropy_interval_ms() -> u64 { 1_000 }
-fn default_s2s_full_digest_interval_ms() -> u64 { 10_000 }
-fn default_s2s_quality_stale_after_ms() -> u64 { 15_000 }
 
 impl Config {
     pub fn load() -> Self {
@@ -224,6 +172,29 @@ impl Config {
             .add_source(Environment::with_prefix("SHITSPEAK").separator("_"))
             .build()
             .expect("Failed to build config sources")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensure the checked-in `config.toml` parses cleanly under the current
+    /// schema, including the new `[s2s.transport]`, `[s2s.overlay]`, and
+    /// `[s2s.replications]` sections.
+    #[test]
+    fn live_config_toml_parses() {
+        let raw = std::fs::read_to_string("config.toml").expect("config.toml missing");
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(&raw, ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        // Spot-check a value from each new block.
+        assert!(cfg.s2s.transport.latency_ewma_alpha > 0.0);
+        assert!(cfg.s2s.overlay.lsdb_sync_max_response_lsas >= 1);
+        assert!(cfg.s2s.replications.propose_ttl_ms >= cfg.s2s.replications.delivery_tick_interval_ms);
     }
 }
 

@@ -7,6 +7,7 @@ fn main() -> Result<()> {
             "src/protos/S2STransport.proto",
             "src/protos/S2SOverlay.proto",
             "src/protos/S2SReplication.proto",
+            "src/protos/S2SApplication.proto",
         ],
         &["src/"],
     )?;

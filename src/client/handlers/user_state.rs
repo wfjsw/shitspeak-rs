@@ -23,8 +23,56 @@ pub async fn handle_user_state(
     let sender_id = sender.get_session_id();
     tracing::debug!(session = u32::from(sender_id), self_mute = msg.self_mute, self_deaf = msg.self_deaf, mute = msg.mute, deaf = msg.deaf, channel_id = msg.channel_id, "UserState handler");
     let repo = server.get_clients();
+    let local_node_id = repo.local_node_id();
 
-    // Determine whether this is a self-update or a moderator action.
+    // Cross-owner moderation: target lives on a different node. Wrap
+    // the moderator-driven fields in a `ModerationEnvelope` and ship
+    // it to the owner. Fire-and-forget: success propagates back via
+    // owner-scoped replication of `ClientGlobalState`.
+    //
+    // ACL evaluation: today this branch defers validation to the
+    // owner (via `expected_from_channel = None` until we add a way to
+    // look up replicated remote-client state on the originator). The
+    // owner's apply path still enforces permissions; we just don't
+    // short-circuit `PermissionDenied` on the originator yet.
+    if let Some(target_session_id) = msg.session {
+        if target_session_id != sender_id
+            && target_session_id.get_node_id() != local_node_id
+        {
+            if let Some(app) = server.s2s_manager().application() {
+                let patch = crate::s2s::application::proto::UserStatePatch {
+                    channel_id: msg.channel_id,
+                    mute: msg.mute,
+                    deaf: msg.deaf,
+                    suppress: msg.suppress,
+                    priority_speaker: msg.priority_speaker,
+                    listening_channel_add: msg.listening_channel_add.clone(),
+                    listening_channel_remove: msg.listening_channel_remove.clone(),
+                    expected_from_channel: None,
+                };
+                if let Err(e) = app
+                    .moderation()
+                    .dispatch_user_state(sender_id, target_session_id, patch)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        target = u32::from(target_session_id),
+                        "moderation dispatch_user_state failed",
+                    );
+                }
+            } else {
+                tracing::trace!(
+                    target = u32::from(target_session_id),
+                    "cross-owner UserState dropped: ApplicationLayer not attached",
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    // Determine whether this is a self-update or a moderator action
+    // against a *locally-owned* target.
     let target = match msg.session {
         Some(session_id) if session_id != sender_id => {
             match repo.get_client(session_id).await {

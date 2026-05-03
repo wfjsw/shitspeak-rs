@@ -24,6 +24,7 @@
 //! a documented guarantee. If cross-topic isolation becomes a
 //! bottleneck, switch to per-topic mpsc + drain task.
 
+pub mod config;
 pub mod error;
 pub mod owner;
 pub mod proto;
@@ -48,6 +49,7 @@ use crate::s2s::overlay::{
 };
 use crate::types::NodeIdentifier;
 
+pub use config::{ReplicationConfig, ReplicationTuning};
 pub use error::ReplicationError;
 pub use owner::{OwnerHandle, OwnerReplicable};
 pub use proto::REPLICATION_SERVICE_TAG;
@@ -75,13 +77,21 @@ struct ManagerInner {
     shutdown: CancellationToken,
     strict_net: Arc<dyn StrictNet>,
     owner_net: Arc<dyn OwnerNet>,
+    cfg: Arc<ReplicationConfig>,
 }
 
 impl ReplicationManager {
+    /// Build a replication manager bound to the supplied overlay with the
+    /// default [`ReplicationConfig`]. See [`Self::with_config`] to override
+    /// the tunables.
+    pub fn new(overlay: OverlayNetwork) -> Arc<Self> {
+        Self::with_config(overlay, ReplicationConfig::default())
+    }
+
     /// Build a replication manager bound to the supplied overlay. Spawns
     /// the central inbound dispatch task and the membership-event fan-out
     /// task; registers the L3 service handler.
-    pub fn new(overlay: OverlayNetwork) -> Arc<Self> {
+    pub fn with_config(overlay: OverlayNetwork, cfg: ReplicationConfig) -> Arc<Self> {
         let self_id = overlay.local_node_id();
         let self_epoch = overlay.local_boot_epoch();
         let strict_topics: Arc<SccMap<String, Arc<dyn ErasedStrictRuntime>>> =
@@ -98,6 +108,7 @@ impl ReplicationManager {
             overlay: overlay.clone(),
         });
 
+        let cfg = Arc::new(cfg);
         let inner = Arc::new(ManagerInner {
             overlay: overlay.clone(),
             self_id,
@@ -108,6 +119,7 @@ impl ReplicationManager {
             shutdown: shutdown.clone(),
             strict_net,
             owner_net,
+            cfg,
         });
 
         // Register the L3 service handler. The overlay calls `handle`
@@ -174,6 +186,7 @@ impl ReplicationManager {
             topic.clone(),
             self.inner.strict_net.clone(),
             self.inner.shutdown.child_token(),
+            self.inner.cfg.clone(),
         );
         runtime.start();
         let erased: Arc<dyn ErasedStrictRuntime> = runtime.clone();
@@ -198,6 +211,7 @@ impl ReplicationManager {
             topic.clone(),
             self.inner.owner_net.clone(),
             self.inner.shutdown.child_token(),
+            self.inner.cfg.clone(),
         );
         let erased: Arc<dyn ErasedOwnerRuntime> = runtime.clone();
         let _ = self.inner.owner_topics.insert(topic, erased);

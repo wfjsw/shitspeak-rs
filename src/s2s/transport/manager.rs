@@ -22,7 +22,7 @@ use super::endpoint::{
 };
 use super::error::{ConfigError, SendError, TransportError};
 use super::identity::NodeIdentity;
-use super::metrics::{assemble_snapshot, MetricsSnapshot};
+use super::metrics::{assemble_snapshot, MetricsSnapshot, MetricsTuning};
 use super::service_level::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
 use super::tls::build_tls_configs;
 
@@ -177,6 +177,11 @@ impl ManagerInner {
             self.cfg.backoff_initial(),
             self.cfg.backoff_cap(),
             self.cfg.bandwidth_window(),
+            MetricsTuning {
+                latency_alpha: self.cfg.latency_ewma_alpha(),
+                jitter_alpha: self.cfg.jitter_ewma_alpha(),
+                throughput_alpha: self.cfg.throughput_ewma_alpha(),
+            },
         );
         match self.peers.entry(id) {
             scc::hash_map::Entry::Occupied(e) => e.get().clone(),
@@ -357,27 +362,46 @@ impl ConnectionManager {
     }
 }
 
-/// Pick a transport kind for `level`: prefer an exact-flavor match, then
-/// fall back to a stronger kind. Only considers transports with a live
-/// session (DTLS handshake completed for UDP, TLS for TCP/KCP, QUIC).
+/// Pick a transport kind for `level`. Acceptance rules mirror the
+/// overlay routing fallback (`crate::s2s::overlay::routing`):
+///
+/// * `BestEffort` accepts anything.
+/// * `Reliable` accepts any reliable transport (TCP, KCP, QUIC) — not
+///   UDP, since UDP can drop.
+/// * `ReliableLowLatency` accepts KCP and QUIC (the strict guarantee)
+///   *and* falls back to TCP when neither is live. The latency
+///   guarantee is lost in that case but reliability is preserved —
+///   acceptable for non-realtime traffic like moderation.
+///
+/// Among accepted transports, exact-level matches win; the rest are
+/// ordered by stronger-first then a stable kind tiebreaker.
 fn pick_transport(peer: &PeerState, level: ServiceLevel) -> Option<TransportKind> {
     let mut candidates: Vec<TransportKind> = peer
         .live_kinds()
         .into_iter()
-        .filter(|k| k.service_level().satisfies(level))
+        .filter(|k| accepts(*k, level))
         .collect();
     if candidates.is_empty() {
         return None;
     }
 
-    // Prefer transports whose service-level == requested. Then sort by
-    // service_level numeric (lower = stronger), then a stable kind order.
     candidates.sort_by_key(|k| {
         let provided = k.service_level();
         let exact_first = if provided == level { 0 } else { 1 };
         (exact_first, provided as u8, kind_order(*k))
     });
     candidates.first().copied()
+}
+
+fn accepts(kind: TransportKind, requested: ServiceLevel) -> bool {
+    let provided = kind.service_level();
+    match requested {
+        ServiceLevel::BestEffort => true,
+        ServiceLevel::Reliable | ServiceLevel::ReliableLowLatency => {
+            // Both reliable tiers accept any reliable transport.
+            provided != ServiceLevel::BestEffort
+        }
+    }
 }
 
 fn kind_order(k: TransportKind) -> u8 {

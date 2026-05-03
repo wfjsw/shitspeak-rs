@@ -1,0 +1,67 @@
+syntax = "proto3";
+package s2s_application;
+
+// Outer envelopes for the L3 application layer. Two service tags are
+// reserved on the overlay's `ServiceRegistry`:
+//   tag = 2 → ModerationEnvelope (sent to a single owner node)
+//   tag = 3 → VoiceFrame (broadcast / multicast / unicast per delivery mode)
+
+// ── Moderation ────────────────────────────────────────────────────────────
+
+// Fire-and-forget moderation command shipped from the originating node
+// (where the moderator's connection lives) to the owner node of the
+// target client. Successful application propagates back via owner-scoped
+// replication of `ClientGlobalState`; no reply is sent on this channel.
+message ModerationEnvelope {
+  uint32 actor_session  = 1;   // composite ClientSessionIdentifier
+  uint32 target_session = 2;   // composite ClientSessionIdentifier
+  uint64 issued_at_ms   = 3;   // wall-clock at originator; tracing only
+  oneof command {
+    UserStatePatch  user_state  = 4;
+    UserRemovePatch user_remove = 5;
+  }
+}
+
+// Subset of UserState fields that represent a moderator-driven mutation
+// of a remote client's state. Fields are optional; only present fields
+// are applied. Self-only fields (self_mute, recording, plugin_*, etc.)
+// are intentionally absent — those never need cross-node routing.
+message UserStatePatch {
+  optional uint32 channel_id           = 1;
+  optional bool   mute                 = 2;
+  optional bool   deaf                 = 3;
+  optional bool   suppress             = 4;
+  optional bool   priority_speaker     = 5;
+  repeated uint32 listening_channel_add    = 6;
+  repeated uint32 listening_channel_remove = 7;
+  // Sanity check: originator's view of the target's current channel at
+  // the time of dispatch. Owner drops the command if its current view
+  // disagrees (stale moderator UI raced with a self-move).
+  optional uint32 expected_from_channel = 8;
+}
+
+message UserRemovePatch {
+  optional string reason = 1;
+  bool   ban             = 2;
+}
+
+// ── Voice ─────────────────────────────────────────────────────────────────
+
+// Cross-node voice frame. The receiver does not decode `payload` — it is
+// already an encoded UDP audio body (legacy or protobuf format) that the
+// receiver hands directly to its local fan-out for per-recipient
+// encryption. Codec-agnostic at this layer.
+message VoiceFrame {
+  uint32 sender_session = 1;   // composite ClientSessionIdentifier
+  uint64 sender_epoch   = 2;   // sender's overlay boot_epoch; receiver
+                                // resets per-sender reorder state when it
+                                // sees a strictly greater epoch.
+  uint64 s2s_seq        = 3;   // monotonic per (sender_session, sender_epoch);
+                                // independent of the in-payload Mumble
+                                // frame_number.
+  uint32 target_kind    = 4;   // mirrors AudioContext: 0=NORMAL, 1=SHOUT,
+                                // 2=WHISPER, 3=LISTEN
+  bool   is_terminator  = 5;   // last frame of an utterance; receiver
+                                // flushes its reorder pending immediately.
+  bytes  payload        = 6;   // encoded UDP audio body, codec-agnostic
+}

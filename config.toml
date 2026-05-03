@@ -2,7 +2,6 @@
 
 node_id = 1
 listen = "0.0.0.0:64738"
-opus_threshold = 100
 register_name = "ShitSpeak Test"
 
 # ── Public server registration ──────────────────────────────────────────
@@ -47,32 +46,55 @@ channel_snapshot_every_secs = 60
 channel_wal_compaction_expire_count = 2000
 
 # S2S (server-to-server)
-[s2s]
-enabled = false
-bootstrap_nodes = []
+# ── L1 transport tunables ─────────────────────────────────────────────
+# Per-link metrics smoothing (EWMA coefficients) and ping-cap.
+[s2s.transport]
+# Smoothing coefficient for the latency EWMA.
+latency_ewma_alpha = 0.2
+# Smoothing coefficient for the jitter EWMA (RFC 3550 uses 1/16).
+jitter_ewma_alpha = 0.0625
+# Smoothing coefficient for the active-probe throughput EWMA.
+throughput_ewma_alpha = 0.3
+# Cap on in-flight pings remembered per stream/UDP session.
+max_pending_pings = 64
 
-# Optional listeners for future overlay transports
-quic_listen = "0.0.0.0:64740"
-tcp_listen = "0.0.0.0:64741"
+# ── L2 overlay tunables ───────────────────────────────────────────────
+[s2s.overlay]
+# Max LSAs per `LsdbSyncResp` frame. Larger = fewer round trips on a
+# big diff but bigger response packets.
+lsdb_sync_max_response_lsas = 256
 
-# S2S PKI (separate from mumble cert_path/key_path)
-cert_path = "s2s-cert.pem"
-key_path = "s2s-key.pem"
-ca_cert_path = "s2s-ca-cert.pem"
+# ── L3 replications tunables ──────────────────────────────────────────
+[s2s.replications]
+# Strict (Tempo) clock-tick scaling. Used when the LSDB has no measured
+# edges yet (cold start, single-node cluster).
+fallback_clock_tick_ms = 250
+# Floor on the dynamic tick interval. Even on very fast networks we
+# don't want to flood the cluster with ticks.
+min_clock_tick_ms = 100
+# Ceiling on the dynamic tick interval. Even on very slow networks we
+# don't want a single silent peer to stall delivery for too long.
+max_clock_tick_ms = 5000
 
-# If extension is missing/invalid, server still starts but S2S is disabled.
-require_node_id_extension = true
-node_id_extension_oid = "1.3.6.1.4.1.55555.1.1"
+# Strict delivery loop / GC.
+delivery_tick_interval_ms = 50
+# Per-proposal timeout. After this the propose future fails with
+# `ProposeTimeout`.
+propose_ttl_ms = 10000
+# Cap on concurrent in-flight proposals from this node.
+propose_semaphore_size = 32
+# Cap on `CatchupOp`s returned per `StrictCatchupResp` chunk.
+strict_max_catchup_ops = 256
+# Pending propose entries are GC'd after this period. Must be longer
+# than `propose_ttl_ms` so a proposer's caller-visible timeout fires
+# before the remote-side state evaporates.
+pending_propose_ttl_ms = 20000
+# Recovery in-progress state is dropped after this many milliseconds
+# without a quorum of acks.
+recovery_ttl_ms = 10000
 
-# Membership probe timers (milliseconds)
-probe_interval_ms = 1000
-probe_timeout_ms = 700
-suspect_timeout_ms = 3000
-dead_timeout_ms = 7000
-
-# Presence repair and digest intervals (milliseconds)
-anti_entropy_interval_ms = 1000
-full_digest_interval_ms = 10000
-
-# Route selection constraints
-quality_stale_after_ms = 15000
+# Owner-mode catchup.
+# Suppress duplicate per-origin catchup requests within this window.
+owner_catchup_timeout_ms = 5000
+# Cap on `CatchupOp`s returned per `OwnerCatchupResp` chunk.
+owner_max_catchup_ops = 256

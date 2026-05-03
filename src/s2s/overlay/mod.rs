@@ -45,7 +45,7 @@ use tokio::sync::broadcast;
 use crate::s2s::transport::{ConnectionManager, Inbound, MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
-pub use config::{OverlayConfig, SeedPeer, TransportMask};
+pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use error::OverlayError;
 pub use membership::{MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{OverlayInboundMessage, ServiceInbound};

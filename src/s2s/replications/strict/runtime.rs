@@ -19,6 +19,7 @@ use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
+use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::proto::{
     self as repl_proto, CatchupOp, ReplBody, ReplicationMessage, StrictBody, StrictCatchupReq,
@@ -31,38 +32,18 @@ use crate::s2s::overlay::{MembershipEvent, OverlayNetwork};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
-// ---------- Constants ----------
+// ---------- Tunables ----------
 
-/// Used when the LSDB has no measured edges yet (cold start, single-node
-/// cluster). Picked to match the historical static default so behavior is
-/// unchanged in that regime.
-pub(crate) const FALLBACK_CLOCK_TICK: Duration = Duration::from_millis(250);
-/// Floor on the dynamic tick interval. Even on very fast networks we
-/// don't want to flood the cluster with ticks.
-pub(crate) const MIN_CLOCK_TICK: Duration = Duration::from_millis(100);
-/// Ceiling on the dynamic tick interval. Even on very slow networks we
-/// don't want a single silent peer to stall delivery for too long.
-pub(crate) const MAX_CLOCK_TICK: Duration = Duration::from_secs(5);
-
-pub(crate) const DELIVERY_TICK_INTERVAL: Duration = Duration::from_millis(50);
-pub(crate) const PROPOSE_TTL: Duration = Duration::from_secs(10);
-pub(crate) const PROPOSE_SEMAPHORE_SIZE: usize = 32;
-pub(crate) const MAX_CATCHUP_OPS: usize = 256;
-/// Pending propose entries are GC'd after this period. Must be longer than
-/// [`PROPOSE_TTL`] so a proposer's caller-visible timeout fires before the
-/// remote-side state evaporates.
-pub(crate) const PENDING_PROPOSE_TTL: Duration = Duration::from_secs(20);
-/// Recovery in-progress state is dropped after this many seconds without a
-/// quorum of acks. Picked to match `PROPOSE_TTL` so a hung recovery doesn't
-/// outlast the proposer's caller.
-pub(crate) const RECOVERY_TTL: Duration = Duration::from_secs(10);
-
-/// Compute p95 of a slice of edge RTTs, clamped to `[MIN_CLOCK_TICK,
-/// MAX_CLOCK_TICK]`. Empty input → `FALLBACK_CLOCK_TICK`. Uses
-/// nearest-rank: idx = `ceil(0.95 * n) - 1`.
-pub(crate) fn p95_clock_tick_interval(samples: &[Duration]) -> Duration {
+/// Compute p95 of a slice of edge RTTs, clamped to
+/// `[cfg.min_clock_tick(), cfg.max_clock_tick()]`. Empty input
+/// → `cfg.fallback_clock_tick()`. Uses nearest-rank:
+/// idx = `ceil(0.95 * n) - 1`.
+pub(crate) fn p95_clock_tick_interval(
+    samples: &[Duration],
+    cfg: &ReplicationConfig,
+) -> Duration {
     if samples.is_empty() {
-        return FALLBACK_CLOCK_TICK;
+        return cfg.fallback_clock_tick();
     }
     let mut buf: Vec<Duration> = samples.to_vec();
     buf.sort_unstable();
@@ -70,7 +51,7 @@ pub(crate) fn p95_clock_tick_interval(samples: &[Duration]) -> Duration {
     // ceil(0.95 * n) - 1, with saturating subtraction for n=1.
     let idx_one_based = ((n as f64) * 0.95).ceil() as usize;
     let idx = idx_one_based.saturating_sub(1).min(n - 1);
-    buf[idx].clamp(MIN_CLOCK_TICK, MAX_CLOCK_TICK)
+    buf[idx].clamp(cfg.min_clock_tick(), cfg.max_clock_tick())
 }
 
 // ---------- OpId ----------
@@ -435,12 +416,16 @@ impl StrictState {
         self.committed_ts_final.retain(|_, ts_final| *ts_final >= dhw);
     }
 
-    /// Drop pending_proposes entries older than [`PENDING_PROPOSE_TTL`].
+    /// Drop pending_proposes entries older than `pending_propose_ttl`.
     /// Returns the dropped op-ids for logging.
-    pub fn gc_stale_pending_proposes(&mut self, now: Instant) -> Vec<OpId> {
+    pub fn gc_stale_pending_proposes(
+        &mut self,
+        now: Instant,
+        pending_propose_ttl: Duration,
+    ) -> Vec<OpId> {
         let mut dropped = Vec::new();
         self.pending_proposes.retain(|op_id, p| {
-            let stale = now.duration_since(p.seen_at) >= PENDING_PROPOSE_TTL;
+            let stale = now.duration_since(p.seen_at) >= pending_propose_ttl;
             if stale {
                 dropped.push(*op_id);
             }
@@ -449,10 +434,11 @@ impl StrictState {
         dropped
     }
 
-    /// Garbage-collect proposals stuck longer than `PROPOSE_TTL`.
+    /// Garbage-collect proposals stuck longer than `propose_ttl`.
     pub fn gc_stale_proposals(
         &mut self,
         now: Instant,
+        propose_ttl: Duration,
     ) -> Vec<oneshot::Sender<Result<u64, ReplicationError>>> {
         let mut to_fire = Vec::new();
         let mut to_remove = Vec::new();
@@ -460,7 +446,7 @@ impl StrictState {
             if p.committed {
                 continue;
             }
-            if now.duration_since(p.started_at) >= PROPOSE_TTL {
+            if now.duration_since(p.started_at) >= propose_ttl {
                 if let Some(w) = p.waker.take() {
                     to_fire.push(w);
                 }
@@ -542,6 +528,7 @@ pub(crate) struct StrictRuntime<R: StrictReplicable> {
     /// async work (recovery) from `&self` callbacks like `on_membership`.
     pub weak_self: Mutex<Option<Weak<Self>>>,
     pub shutdown: CancellationToken,
+    pub cfg: Arc<ReplicationConfig>,
 }
 
 impl<R: StrictReplicable> StrictRuntime<R> {
@@ -552,7 +539,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         topic: String,
         net: Arc<dyn StrictNet>,
         shutdown: CancellationToken,
+        cfg: Arc<ReplicationConfig>,
     ) -> Arc<Self> {
+        let propose_semaphore = Arc::new(Semaphore::new(cfg.propose_semaphore_size()));
         let arc = Arc::new(Self {
             repo,
             self_id,
@@ -561,12 +550,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             net,
             state: Mutex::new(StrictState::new()),
             deliver_signal: Notify::new(),
-            propose_semaphore: Arc::new(Semaphore::new(PROPOSE_SEMAPHORE_SIZE)),
+            propose_semaphore,
             next_op_counter: AtomicU64::new(1),
             recovery_attempt_counter: AtomicU64::new(1),
             recoveries: Mutex::new(HashMap::new()),
             weak_self: Mutex::new(None),
             shutdown,
+            cfg,
         });
         *arc.weak_self.lock() = Some(Arc::downgrade(&arc));
         arc
@@ -1231,7 +1221,7 @@ fn spawn_delivery_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
         let Some(rt) = weak.upgrade() else {
             return;
         };
-        let mut ticker = tokio::time::interval(DELIVERY_TICK_INTERVAL);
+        let mut ticker = tokio::time::interval(rt.cfg.delivery_tick_interval());
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -1278,12 +1268,13 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
 
 fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     let now = Instant::now();
+    let propose_ttl = rt.cfg.propose_ttl();
     let wakers = {
         let mut s = rt.state.lock();
-        s.gc_stale_proposals(now)
+        s.gc_stale_proposals(now, propose_ttl)
     };
     for w in wakers {
-        let _ = w.send(Err(ReplicationError::ProposeTimeout(PROPOSE_TTL)));
+        let _ = w.send(Err(ReplicationError::ProposeTimeout(propose_ttl)));
     }
     // Recovery-related GC: drop ancient pending Proposes (we're past the
     // window where any takeover would still be useful), drop committed
@@ -1291,12 +1282,13 @@ fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     // hung in-progress recoveries that never reached quorum.
     {
         let mut s = rt.state.lock();
-        let _dropped = s.gc_stale_pending_proposes(now);
+        let _dropped = s.gc_stale_pending_proposes(now, rt.cfg.pending_propose_ttl());
         s.gc_committed_ts_final();
     }
     {
         let mut recoveries = rt.recoveries.lock();
-        recoveries.retain(|_, rec| now.duration_since(rec.started_at) < RECOVERY_TTL);
+        let recovery_ttl = rt.cfg.recovery_ttl();
+        recoveries.retain(|_, rec| now.duration_since(rec.started_at) < recovery_ttl);
     }
 }
 
@@ -1312,7 +1304,7 @@ fn spawn_clock_tick_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             // measurements drift with network conditions, and we don't
             // want to pin to whatever the cluster looked like at start.
             let samples = rt.net.edge_rtt_snapshot();
-            let interval = p95_clock_tick_interval(&samples);
+            let interval = p95_clock_tick_interval(&samples, &rt.cfg);
             tokio::select! {
                 _ = rt.shutdown.cancelled() => return,
                 _ = tokio::time::sleep(interval) => {}
@@ -1386,51 +1378,56 @@ mod tests {
 
     #[test]
     fn p95_clock_tick_returns_fallback_when_empty() {
-        assert_eq!(p95_clock_tick_interval(&[]), FALLBACK_CLOCK_TICK);
+        let cfg = ReplicationConfig::default();
+        assert_eq!(p95_clock_tick_interval(&[], &cfg), cfg.fallback_clock_tick());
     }
 
     #[test]
     fn p95_clock_tick_picks_correct_index_via_nearest_rank() {
+        let cfg = ReplicationConfig::default();
         // n=20, p=0.95: idx_one_based = ceil(19.0) = 19, idx = 18.
         // Samples 50..=1000ms by 50: samples[18] = 950ms.
         let samples: Vec<Duration> = (1..=20).map(|i| Duration::from_millis(i * 50)).collect();
-        let p95 = p95_clock_tick_interval(&samples);
+        let p95 = p95_clock_tick_interval(&samples, &cfg);
         assert_eq!(p95, Duration::from_millis(950));
         // n=100, samples 1..=100ms: idx_one_based = 95, idx = 94.
-        // samples[94] = 95ms, clamped up to MIN_CLOCK_TICK.
+        // samples[94] = 95ms, clamped up to min_clock_tick().
         let samples: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
-        let p95 = p95_clock_tick_interval(&samples);
-        assert_eq!(p95, MIN_CLOCK_TICK);
+        let p95 = p95_clock_tick_interval(&samples, &cfg);
+        assert_eq!(p95, cfg.min_clock_tick());
     }
 
     #[test]
     fn p95_clock_tick_clamps_to_min() {
-        // All samples below MIN_CLOCK_TICK ⇒ result clamped up.
+        let cfg = ReplicationConfig::default();
+        // All samples below min_clock_tick() ⇒ result clamped up.
         let samples = vec![Duration::from_millis(5); 10];
-        assert_eq!(p95_clock_tick_interval(&samples), MIN_CLOCK_TICK);
+        assert_eq!(p95_clock_tick_interval(&samples, &cfg), cfg.min_clock_tick());
     }
 
     #[test]
     fn p95_clock_tick_clamps_to_max() {
-        // All samples above MAX_CLOCK_TICK ⇒ result clamped down.
+        let cfg = ReplicationConfig::default();
+        // All samples above max_clock_tick() ⇒ result clamped down.
         let samples = vec![Duration::from_secs(30); 10];
-        assert_eq!(p95_clock_tick_interval(&samples), MAX_CLOCK_TICK);
+        assert_eq!(p95_clock_tick_interval(&samples, &cfg), cfg.max_clock_tick());
     }
 
     #[test]
     fn p95_clock_tick_ignores_single_outlier_above_p95_index() {
+        let cfg = ReplicationConfig::default();
         // 19 fast edges + 1 slow outlier. n=20, idx = 18.
         // After sort, samples[18] is the last fast edge, samples[19] is the
         // outlier. The outlier sits at p100, NOT p95 — so p95 == 150ms.
         let mut samples: Vec<Duration> = vec![Duration::from_millis(150); 19];
         samples.push(Duration::from_secs(2));
-        let p95 = p95_clock_tick_interval(&samples);
+        let p95 = p95_clock_tick_interval(&samples, &cfg);
         assert_eq!(p95, Duration::from_millis(150));
 
         // 39 fast edges + 1 outlier (n=40). idx = 37, still in the fast block.
         let mut samples: Vec<Duration> = vec![Duration::from_millis(150); 39];
         samples.push(Duration::from_secs(2));
-        let p95 = p95_clock_tick_interval(&samples);
+        let p95 = p95_clock_tick_interval(&samples, &cfg);
         assert_eq!(p95, Duration::from_millis(150));
     }
 
@@ -1595,13 +1592,14 @@ mod tests {
 
     #[test]
     fn gc_stale_proposals_fires_after_ttl() {
+        let cfg = ReplicationConfig::default();
         let mut s = StrictState::new();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let (tx, _rx) = oneshot::channel();
         let mut target = HashSet::new();
         target.insert(10);
         let op_id: OpId = (3, 3);
-        let stale = Instant::now() - PROPOSE_TTL - Duration::from_secs(1);
+        let stale = Instant::now() - cfg.propose_ttl() - Duration::from_secs(1);
         s.proposals.insert(
             op_id,
             Proposal {
@@ -1615,7 +1613,7 @@ mod tests {
                 _permit: permit,
             },
         );
-        let wakers = s.gc_stale_proposals(Instant::now());
+        let wakers = s.gc_stale_proposals(Instant::now(), cfg.propose_ttl());
         assert_eq!(wakers.len(), 1);
         assert!(s.proposals.is_empty());
     }
@@ -1680,12 +1678,13 @@ mod tests {
 
     #[test]
     fn gc_stale_pending_proposes_drops_old_entries() {
+        let cfg = ReplicationConfig::default();
         let mut s = StrictState::new();
-        let stale_at = Instant::now() - PENDING_PROPOSE_TTL - Duration::from_secs(1);
+        let stale_at = Instant::now() - cfg.pending_propose_ttl() - Duration::from_secs(1);
         let fresh_at = Instant::now();
         s.record_pending_propose((1, 1), 5, Bytes::new(), 1, stale_at);
         s.record_pending_propose((2, 2), 5, Bytes::new(), 2, fresh_at);
-        let dropped = s.gc_stale_pending_proposes(Instant::now());
+        let dropped = s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl());
         assert_eq!(dropped, vec![(1, 1)]);
         assert_eq!(s.pending_proposes.len(), 1);
         assert!(s.pending_proposes.contains_key(&(2, 2)));

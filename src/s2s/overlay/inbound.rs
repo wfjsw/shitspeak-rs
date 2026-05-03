@@ -50,6 +50,7 @@ pub(crate) struct DispatcherCtx {
     pub transport: crate::s2s::transport::ConnectionManager,
     pub self_id: crate::types::NodeIdentifier,
     pub shutdown: tokio_util::sync::CancellationToken,
+    pub cfg: super::config::OverlayConfig,
 }
 
 /// Spawn one dispatcher task per priority queue. They run independently
@@ -102,7 +103,14 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
             handle_flood(&ctx.lsdb, &ctx.monitor, &ctx.transport, from, f).await
         }
         OverlayBody::LsdbSync(req) => {
-            handle_sync_request(&ctx.lsdb, &ctx.transport, from, req).await
+            handle_sync_request(
+                &ctx.lsdb,
+                &ctx.transport,
+                from,
+                req,
+                ctx.cfg.lsdb_sync_max_response_lsas(),
+            )
+            .await
         }
         OverlayBody::LsdbSyncResp(resp) => handle_sync_response(&ctx.lsdb, resp),
         OverlayBody::Data(data) => {

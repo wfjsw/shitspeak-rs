@@ -179,6 +179,7 @@ impl OverlayInner {
             transport: self.transport.clone(),
             self_id: self.self_id,
             shutdown: self.shutdown.clone(),
+            cfg: self.cfg.clone(),
         });
         super::inbound::spawn_dispatcher(dctx, inbound);
 

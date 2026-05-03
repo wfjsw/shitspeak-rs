@@ -22,7 +22,7 @@ mod tls;
 #[cfg(test)]
 mod integration_tests;
 
-pub use config::TransportConfig;
+pub use config::{TransportConfig, TransportTuning};
 pub use error::{ConfigError, SendError, TransportError};
 pub use manager::{ConnectionManager, Inbound, InboundMessage};
 pub use metrics::{LinkMetrics, MetricsSnapshot};

@@ -10,6 +10,10 @@ use crate::{
 use super::codec::{self, DecodedAudio, PacketFormat};
 use super::udp_batch::{self, QueuedDatagram};
 
+/// `target_kind` value used in the S2S envelope for normal channel
+/// speech. Mirrors the Mumble `AudioContext::NORMAL` numbering.
+const S2S_TARGET_NORMAL: u32 = 0;
+
 /// Route an incoming voice packet to its intended recipients.
 ///
 /// `sender` is the client that originated the audio.
@@ -49,9 +53,16 @@ pub async fn route_voice(
     // Collect (client, audio) pairs for batched sending
     let mut targets: Vec<(Arc<Box<Client>>, DecodedAudio)> = Vec::new();
 
+    // Pre-encoded payload for cross-node delivery (NORMAL channel speech
+    // only). Built up front while `outgoing` is still owned. Receivers
+    // decode and re-target per local recipient, so we encode with the
+    // speaker's chosen format and `target = 0`.
+    let mut s2s_payload: Option<bytes::Bytes> = None;
+
     let all_clients = server.get_clients().get_all_clients().await;
 
     if target == 0 {
+        s2s_payload = Some(codec::encode_audio_packet(&outgoing, audio.format));
         // ── Normal speech: send to all channel members ───────────────────
         for client in &all_clients {
             if client.get_session_id() == sender_id {
@@ -121,8 +132,35 @@ pub async fn route_voice(
         }
     }
 
-    // ── Flush all targets ────────────────────────────────────────────────
+    // ── Flush all targets locally ────────────────────────────────────────
     flush_voice_batch(server, &targets, is_udp).await;
+
+    // ── Cross-node delivery (NORMAL channel speech only for now) ─────────
+    // Whisper/shout cross-node delivery requires shipping the resolved
+    // recipient set in the envelope; deferred to a later phase. Local
+    // delivery for whisper above is unaffected.
+    //
+    // `send_for_channel` routes via the configured `delivery_strategy`:
+    // broadcast (default) or targeted multicast using the recipient
+    // index. Targeted falls back to broadcast when the index has no
+    // entry for the channel (cold start, sparse cluster).
+    if let Some(payload) = s2s_payload {
+        if let Some(app) = server.s2s_manager().application() {
+            let voice = app.voice().clone();
+            let _ = S2S_TARGET_NORMAL; // currently encoded inside send_for_channel
+            let result = voice
+                .send_for_channel(
+                    u32::from(sender_id),
+                    sender_channel,
+                    audio.is_terminator,
+                    payload,
+                )
+                .await;
+            if let Err(e) = result {
+                tracing::trace!(error=%e, "voice s2s send failed");
+            }
+        }
+    }
 }
 
 /// Encrypt and send voice packets to all targets.

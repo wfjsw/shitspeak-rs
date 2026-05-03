@@ -12,12 +12,28 @@ use crate::types::NodeIdentifier;
 
 use super::service_level::{ServiceLevel, TransportKind};
 
-/// Smoothing coefficient for the latency EWMA.
-const LATENCY_ALPHA: f64 = 0.2;
-/// Smoothing coefficient for the jitter EWMA (matches RFC 3550 1/16).
-const JITTER_ALPHA: f64 = 1.0 / 16.0;
-/// Smoothing coefficient for the active-probe throughput EWMA.
-const THROUGHPUT_ALPHA: f64 = 0.3;
+/// EWMA smoothing coefficients for [`PeerMetrics`]. Values are configured
+/// in [`super::config::TransportConfig`]; the [`Default`] impl mirrors
+/// the historical hard-coded constants.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricsTuning {
+    /// Smoothing coefficient for the latency EWMA.
+    pub latency_alpha: f64,
+    /// Smoothing coefficient for the jitter EWMA (RFC 3550 uses 1/16).
+    pub jitter_alpha: f64,
+    /// Smoothing coefficient for the active-probe throughput EWMA.
+    pub throughput_alpha: f64,
+}
+
+impl Default for MetricsTuning {
+    fn default() -> Self {
+        Self {
+            latency_alpha: 0.2,
+            jitter_alpha: 1.0 / 16.0,
+            throughput_alpha: 0.3,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LinkMetrics {
@@ -168,11 +184,16 @@ impl LinkInner {
 pub struct PeerMetrics {
     inner: Mutex<HashMap<TransportKind, LinkInner>>,
     window: Duration,
+    tuning: MetricsTuning,
 }
 
 impl PeerMetrics {
-    pub fn new(window: Duration) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), window }
+    pub fn new(window: Duration, tuning: MetricsTuning) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            window,
+            tuning,
+        }
     }
 
     pub fn record_rtt(&self, transport: TransportKind, rtt: Duration) {
@@ -183,11 +204,11 @@ impl PeerMetrics {
         entry.last_update = Some(Instant::now());
         entry.rtt_us = Some(match entry.rtt_us {
             None => sample,
-            Some(prev) => prev + LATENCY_ALPHA * (sample - prev),
+            Some(prev) => prev + self.tuning.latency_alpha * (sample - prev),
         });
         if let Some(prev_sample) = entry.last_rtt_sample_us {
             let delta = (sample - prev_sample).abs();
-            entry.jitter_us += JITTER_ALPHA * (delta - entry.jitter_us);
+            entry.jitter_us += self.tuning.jitter_alpha * (delta - entry.jitter_us);
         }
         entry.last_rtt_sample_us = Some(sample);
     }
@@ -218,7 +239,7 @@ impl PeerMetrics {
         let entry = g.entry(transport).or_insert_with(|| LinkInner::new(self.window));
         entry.probe_throughput_bps = Some(match entry.probe_throughput_bps {
             None => bps,
-            Some(prev) => prev + THROUGHPUT_ALPHA * (bps - prev),
+            Some(prev) => prev + self.tuning.throughput_alpha * (bps - prev),
         });
         entry.probe_samples += 1;
     }
@@ -293,7 +314,7 @@ mod tests {
 
     #[test]
     fn ewma_smoothing() {
-        let m = PeerMetrics::new(Duration::from_secs(5));
+        let m = PeerMetrics::new(Duration::from_secs(5), MetricsTuning::default());
         for us in [10_000, 12_000, 11_000, 13_000, 10_500] {
             m.record_rtt(TransportKind::Tcp, Duration::from_micros(us as u64));
         }
@@ -307,25 +328,27 @@ mod tests {
 
     #[test]
     fn best_transport_picks_lowest_rtt() {
-        let m = PeerMetrics::new(Duration::from_secs(5));
+        let m = PeerMetrics::new(Duration::from_secs(5), MetricsTuning::default());
         m.record_rtt(TransportKind::Tcp, Duration::from_millis(50));
         m.record_rtt(TransportKind::Quic, Duration::from_millis(20));
         m.record_rtt(TransportKind::Udp, Duration::from_millis(15));
 
         // For best-effort, all three qualify; lowest RTT wins.
         assert_eq!(m.best_transport_for(ServiceLevel::BestEffort), Some(TransportKind::Udp));
-        // For RLL, only TCP and QUIC qualify (UDP is BE only); QUIC wins.
+        // For RLL (the strongest tier), only QUIC qualifies in this setup
+        // (TCP is plain Reliable, UDP is BestEffort).
         assert_eq!(
             m.best_transport_for(ServiceLevel::ReliableLowLatency),
             Some(TransportKind::Quic)
         );
-        // For Reliable, only TCP qualifies.
-        assert_eq!(m.best_transport_for(ServiceLevel::Reliable), Some(TransportKind::Tcp));
+        // For Reliable, both TCP and QUIC qualify (QUIC is strictly stronger);
+        // QUIC wins on lowest RTT.
+        assert_eq!(m.best_transport_for(ServiceLevel::Reliable), Some(TransportKind::Quic));
     }
 
     #[test]
     fn probe_throughput_smooths() {
-        let m = PeerMetrics::new(Duration::from_secs(5));
+        let m = PeerMetrics::new(Duration::from_secs(5), MetricsTuning::default());
         // 8 KB round trip in 1 ms = 8 MB/s.
         m.record_probe(TransportKind::Tcp, 8192, Duration::from_millis(1));
         m.record_probe(TransportKind::Tcp, 8192, Duration::from_millis(1));
@@ -339,7 +362,7 @@ mod tests {
 
     #[test]
     fn estimated_throughput_takes_max() {
-        let m = PeerMetrics::new(Duration::from_secs(60));
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
         m.record_sent(TransportKind::Tcp, 100); // tiny actual flow
         m.record_probe(TransportKind::Tcp, 8192, Duration::from_millis(1)); // probe says 8 MB/s
         let snap = m.snapshot_per_transport();
@@ -350,7 +373,7 @@ mod tests {
 
     #[test]
     fn bandwidth_counters_accumulate() {
-        let m = PeerMetrics::new(Duration::from_secs(60));
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
         m.record_sent(TransportKind::Tcp, 1024);
         m.record_recv(TransportKind::Tcp, 512);
         let snap = m.snapshot_per_transport();

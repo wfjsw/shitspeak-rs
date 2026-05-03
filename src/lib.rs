@@ -49,3 +49,7 @@ pub mod s2s_overlay_proto {
 pub mod s2s_replication_proto {
     include!(concat!(env!("OUT_DIR"), "/s2s_replication.rs"));
 }
+
+pub mod s2s_application_proto {
+    include!(concat!(env!("OUT_DIR"), "/s2s_application.rs"));
+}
