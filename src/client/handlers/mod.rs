@@ -50,13 +50,13 @@ use crate::{
 /// Handle a TCP-tunneled voice packet.
 ///
 /// The `data` is the raw voice packet bytes (legacy or protobuf format).
-/// We decode it and pass it to `route_voice()`.
+/// We decode it and push it to the per-user voice routing queue.
 async fn handle_udp_tunnel(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<crate::client::Client>>,
     data: Bytes,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "UDPTunnel message received before authentication",
         ));
@@ -75,7 +75,7 @@ async fn handle_udp_tunnel(
     };
 
     tracing::trace!(session = u32::from(sender.get_session_id()), target = audio.target, frame = audio.frame_number, len = audio.opus_data.len(), "UDPTunnel: routing voice");
-    crate::voice::route_voice(server, sender, &audio, false).await;
+    sender.push_voice_routing(audio, false);
     Ok(())
 }
 

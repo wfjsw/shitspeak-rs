@@ -30,16 +30,15 @@ pub async fn handle_crypt_setup(
         // Full re-key
         sender
             .create_crypt_state("OCB2-AES128")
-            .await
             .map_err(|_| RejectType::AuthenticatorFail)?;
 
         let reply: Message = {
-            let crypt = sender.crypt_state().await;
+            let crypt = sender.crypt_state();
             let state = crypt.as_ref().expect("crypt state just created");
             CryptSetup::new(
                 state.key().map(Bytes::copy_from_slice),
-                Some(Bytes::copy_from_slice(state.encrypt_iv())),
                 Some(Bytes::copy_from_slice(state.decrypt_iv())),
+                Some(Bytes::copy_from_slice(state.encrypt_iv())),
             ).into()
         };
 
@@ -47,7 +46,7 @@ pub async fn handle_crypt_setup(
     } else if let Some(client_nonce) = msg.client_nonce().map(|n| n.to_vec()) {
         // Decrypt IV resync — adopt the client's nonce
         let reply: Message = {
-            let mut crypt = sender.crypt_state().await;
+            let mut crypt = sender.crypt_state();
             if let Some(state) = crypt.as_mut() {
                 state.set_decrypt_iv(&client_nonce);
             }

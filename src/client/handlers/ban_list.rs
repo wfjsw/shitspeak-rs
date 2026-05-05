@@ -14,7 +14,7 @@ pub async fn handle_ban_list(
     sender: &Arc<Box<Client>>,
     msg: BanList,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "BanList message received before authentication",
         ));

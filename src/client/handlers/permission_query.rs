@@ -12,7 +12,7 @@ pub async fn handle_permission_query(
     sender: &Arc<Box<Client>>,
     msg: PermissionQuery,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "PermissionQuery message received before authentication",
         ));

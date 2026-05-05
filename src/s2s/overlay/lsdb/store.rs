@@ -320,27 +320,28 @@ impl LinkStateDb {
     ///   3. Admission advances the floor in place.
     pub fn admit(&self, lsa: LsaEntry) -> AdmissionResult {
         let origin = lsa.origin;
-        let mut g = self.inner.write();
-        match g.get(&origin) {
-            Some(prev) => {
-                if !is_strictly_newer(lsa.boot_epoch, lsa.seq, prev.boot_epoch, prev.seq) {
-                    return AdmissionResult::Stale;
+        {
+            let mut g = self.inner.write();
+            match g.get(&origin) {
+                Some(prev) => {
+                    if !is_strictly_newer(lsa.boot_epoch, lsa.seq, prev.boot_epoch, prev.seq) {
+                        return AdmissionResult::Stale;
+                    }
                 }
-            }
-            None => {
-                // No live entry — defer to the floor.
-                if let Some(fv) = self.floor.get(origin) {
-                    if !is_strictly_newer(lsa.boot_epoch, lsa.seq, fv.boot_epoch, fv.seq) {
-                        return AdmissionResult::BelowFloor;
+                None => {
+                    // No live entry — defer to the floor.
+                    if let Some(fv) = self.floor.get(origin) {
+                        if !is_strictly_newer(lsa.boot_epoch, lsa.seq, fv.boot_epoch, fv.seq) {
+                            return AdmissionResult::BelowFloor;
+                        }
                     }
                 }
             }
+            // Advance floor under the write lock so any subsequent admit
+            // sees the updated value.
+            self.floor.advance(origin, lsa.boot_epoch, lsa.seq);
+            g.insert(origin, lsa);
         }
-        // Advance floor under the write lock so any subsequent admit
-        // sees the updated value.
-        self.floor.advance(origin, lsa.boot_epoch, lsa.seq);
-        g.insert(origin, lsa);
-        drop(g);
         self.change_signal.notify_waiters();
         AdmissionResult::Accepted
     }
@@ -388,22 +389,23 @@ impl LinkStateDb {
         let now = Instant::now();
         let mut failed = Vec::new();
         let mut tombstone_swept = Vec::new();
-        let mut g = self.inner.write();
-        g.retain(|origin, e| {
-            let age = now.saturating_duration_since(e.ts_local_received);
-            if e.tombstone {
-                if age >= tombstone_in_memory_age {
-                    tombstone_swept.push(*origin);
+        {
+            let mut g = self.inner.write();
+            g.retain(|origin, e| {
+                let age = now.saturating_duration_since(e.ts_local_received);
+                if e.tombstone {
+                    if age >= tombstone_in_memory_age {
+                        tombstone_swept.push(*origin);
+                        return false;
+                    }
+                } else if age >= lsa_max_age {
+                    failed.push(*origin);
                     return false;
                 }
-            } else if age >= lsa_max_age {
-                failed.push(*origin);
-                return false;
-            }
-            true
-        });
+                true
+            });
+        }
         if !failed.is_empty() || !tombstone_swept.is_empty() {
-            drop(g);
             self.change_signal.notify_waiters();
         }
         (failed, tombstone_swept)

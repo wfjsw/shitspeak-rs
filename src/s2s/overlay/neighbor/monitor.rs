@@ -172,24 +172,25 @@ impl NeighborMonitor {
     /// boot_epoch tracking and returns `Restarted` if this is a higher
     /// boot_epoch than we'd seen for `from`.
     pub fn record_hello(&self, from: NodeIdentifier, boot_epoch: u64) {
-        let mut g = self.state.lock();
-        let st = g.entry(from).or_insert_with(NeighborState::new);
-        let was_up = st.is_up;
-        let prev_be = st.boot_epoch;
-        if boot_epoch > prev_be {
-            st.boot_epoch = boot_epoch;
-            // Only emit Restarted if we'd seen a *previous* epoch (>0).
-            // First-ever boot_epoch is just initial state.
-            if prev_be > 0 {
-                let _ = self.membership_events.send(MembershipEvent::Restarted(from));
-                debug!(peer=%from, new_epoch=boot_epoch, "neighbor restart detected via hello");
+        let became_up = {
+            let mut g = self.state.lock();
+            let st = g.entry(from).or_insert_with(NeighborState::new);
+            let was_up = st.is_up;
+            let prev_be = st.boot_epoch;
+            if boot_epoch > prev_be {
+                st.boot_epoch = boot_epoch;
+                // Only emit Restarted if we'd seen a *previous* epoch (>0).
+                // First-ever boot_epoch is just initial state.
+                if prev_be > 0 {
+                    let _ = self.membership_events.send(MembershipEvent::Restarted(from));
+                    debug!(peer=%from, new_epoch=boot_epoch, "neighbor restart detected via hello");
+                }
             }
-        }
-        st.last_ack_at = Some(Instant::now());
-        st.miss_count = 0;
-        st.is_up = true;
-        let became_up = !was_up;
-        drop(g);
+            st.last_ack_at = Some(Instant::now());
+            st.miss_count = 0;
+            st.is_up = true;
+            !was_up
+        };
         if became_up {
             debug!(peer=%from, "direct link up");
             self.on_change.notify_one();
@@ -209,28 +210,30 @@ impl NeighborMonitor {
         peer_metrics_target: Option<TransportKind>,
     ) {
         let now = Instant::now();
-        let mut g = self.state.lock();
-        let st = g.entry(from).or_insert_with(NeighborState::new);
-        let was_up = st.is_up;
-        let prev_be = st.boot_epoch;
-        if boot_epoch > prev_be {
-            st.boot_epoch = boot_epoch;
-            if prev_be > 0 {
-                let _ = self.membership_events.send(MembershipEvent::Restarted(from));
+        let (was_up, mut sent_at_instant) = {
+            let mut g = self.state.lock();
+            let st = g.entry(from).or_insert_with(NeighborState::new);
+            let was_up = st.is_up;
+            let prev_be = st.boot_epoch;
+            if boot_epoch > prev_be {
+                st.boot_epoch = boot_epoch;
+                if prev_be > 0 {
+                    let _ = self.membership_events.send(MembershipEvent::Restarted(from));
+                }
             }
-        }
-        st.last_ack_at = Some(now);
-        st.miss_count = 0;
-        st.is_up = true;
-        // RTT calc — prefer the recorded ts_send (echoed) over our own
-        // pending table since either is a valid round-trip measurement.
-        let mut sent_at_instant: Option<Instant> = st.pending.remove(&nonce);
-        // Cap pending table size — drop stale entries occasionally.
-        if st.pending.len() > 32 {
-            let cutoff = now - Duration::from_secs(60);
-            st.pending.retain(|_, t| *t > cutoff);
-        }
-        drop(g);
+            st.last_ack_at = Some(now);
+            st.miss_count = 0;
+            st.is_up = true;
+            // RTT calc — prefer the recorded ts_send (echoed) over our own
+            // pending table since either is a valid round-trip measurement.
+            let sent_at_instant: Option<Instant> = st.pending.remove(&nonce);
+            // Cap pending table size — drop stale entries occasionally.
+            if st.pending.len() > 32 {
+                let cutoff = now - Duration::from_secs(60);
+                st.pending.retain(|_, t| *t > cutoff);
+            }
+            (was_up, sent_at_instant)
+        };
         let rtt = if let Some(t) = sent_at_instant.take() {
             now.saturating_duration_since(t)
         } else {
@@ -262,36 +265,38 @@ impl NeighborMonitor {
         let live_ids: HashSet<NodeIdentifier> = live_peers.iter().map(|(n, _)| *n).collect();
         let now = Instant::now();
         let dead = self.cfg.hello_dead_interval();
-        let mut g = self.state.lock();
-        let mut transitions = Vec::new();
+        let transitions = {
+            let mut g = self.state.lock();
+            let mut transitions = Vec::new();
 
-        // Sweep existing entries.
-        let mut to_remove: Vec<NodeIdentifier> = Vec::new();
-        for (nid, st) in g.iter_mut() {
-            if !live_ids.contains(nid) {
-                if st.is_up {
-                    st.is_up = false;
-                    transitions.push((*nid, false));
-                }
-                // L1 also dropped; eventually purge.
-                if st.last_ack_at.map_or(true, |t| now.duration_since(t) > dead * 4) {
-                    to_remove.push(*nid);
-                }
-                continue;
-            }
-            if let Some(last) = st.last_ack_at {
-                if now.duration_since(last) >= dead {
+            // Sweep existing entries.
+            let mut to_remove: Vec<NodeIdentifier> = Vec::new();
+            for (nid, st) in g.iter_mut() {
+                if !live_ids.contains(nid) {
                     if st.is_up {
                         st.is_up = false;
                         transitions.push((*nid, false));
                     }
+                    // L1 also dropped; eventually purge.
+                    if st.last_ack_at.map_or(true, |t| now.duration_since(t) > dead * 4) {
+                        to_remove.push(*nid);
+                    }
+                    continue;
+                }
+                if let Some(last) = st.last_ack_at {
+                    if now.duration_since(last) >= dead {
+                        if st.is_up {
+                            st.is_up = false;
+                            transitions.push((*nid, false));
+                        }
+                    }
                 }
             }
-        }
-        for n in to_remove {
-            g.remove(&n);
-        }
-        drop(g);
+            for n in to_remove {
+                g.remove(&n);
+            }
+            transitions
+        };
 
         for (n, _) in &transitions {
             debug!(peer=%n, "direct link down (hello dead-interval)");

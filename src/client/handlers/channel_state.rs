@@ -14,7 +14,7 @@ pub async fn handle_channel_state(
     sender: &Arc<Box<Client>>,
     msg: ChannelState,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "ChannelState message received before authentication",
         ));

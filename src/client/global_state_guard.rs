@@ -11,7 +11,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use tokio::sync::RwLockWriteGuard;
+use parking_lot::RwLockWriteGuard;
 
 use crate::client::{
     client_global_state::ClientGlobalState,

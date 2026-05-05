@@ -204,7 +204,7 @@ impl ClientStateLogEntry {
             ClientStateOperation::AddClient { session_id, .. } => {
                 let client = repo.get_client(*session_id).await?;
                 let us: crate::messages::encoder::UserState =
-                    client.build_user_state_for_broadcast().await;
+                    client.build_user_state_for_broadcast();
                 Some(crate::messages::Message::UserState(us.into()))
             }
             ClientStateOperation::RemoveClient { session_id } => {

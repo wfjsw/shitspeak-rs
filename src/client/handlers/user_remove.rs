@@ -12,7 +12,7 @@ pub async fn handle_user_remove(
     sender: &Arc<Box<Client>>,
     msg: UserRemove,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "UserRemove message received before authentication",
         ));
@@ -73,7 +73,7 @@ pub async fn handle_user_remove(
             address: target.get_real_ip_address(),
             mask: if target.get_real_ip_address().is_ipv4() { 32 } else { 128 },
             name: {
-                let gs = target.read_global_state().await;
+                let gs = target.read_global_state();
                 gs.get_display_name_opt().map(|s| s.to_owned())
             },
             hash: target.get_certificate_hash().map(|h| hex::encode(h)),

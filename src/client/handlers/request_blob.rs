@@ -12,7 +12,7 @@ pub async fn handle_request_blob(
     sender: &Arc<Box<Client>>,
     msg: RequestBlob,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "RequestBlob message received before authentication",
         ));
@@ -34,7 +34,7 @@ pub async fn handle_request_blob(
         };
 
         let (texture_hash, texture_url) = {
-            let gs = client.read_global_state().await;
+            let gs = client.read_global_state();
             let texture_hash = gs
                 .get_texture_hash()
                 .map(|h| hex::decode(h).unwrap_or_default());
@@ -96,7 +96,7 @@ pub async fn handle_request_blob(
         };
 
         let (comment_hash, comment_url) = {
-            let gs = client.read_global_state().await;
+            let gs = client.read_global_state();
             let comment_hash = gs
                 .get_comment_hash()
                 .map(|h| hex::decode(h).unwrap_or_default());

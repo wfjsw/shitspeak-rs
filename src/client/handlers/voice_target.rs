@@ -12,7 +12,7 @@ pub async fn handle_voice_target(
     sender: &Arc<Box<Client>>,
     msg: VoiceTarget,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "VoiceTarget message received before authentication",
         ));

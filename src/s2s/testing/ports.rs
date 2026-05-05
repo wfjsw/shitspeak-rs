@@ -14,16 +14,18 @@ pub fn loopback(port: u16) -> SocketAddr {
 /// real listener binding. Tests that spin up multiple managers in parallel
 /// should serialize allocation under a mutex.
 pub async fn pick_free_port() -> u16 {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
+    let p = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
     p
 }
 
 /// Same as `pick_free_port` but for UDP.
 pub async fn pick_free_udp_port() -> u16 {
-    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let p = s.local_addr().unwrap().port();
-    drop(s);
+    let p = {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.local_addr().unwrap().port()
+    };
     p
 }

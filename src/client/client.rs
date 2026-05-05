@@ -6,10 +6,18 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use bytes::Bytes;
-use parking_lot::{MappedMutexGuard as ParkingMappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
+use parking_lot::{
+    MappedMutexGuard as ParkingMappedMutexGuard,
+    Mutex as ParkingMutex,
+    MutexGuard as ParkingMutexGuard,
+    RwLock as ParkingRwLock,
+    RwLockReadGuard as ParkingRwLockReadGuard,
+    RwLockWriteGuard as ParkingRwLockWriteGuard,
+};
 use tokio::{
+    io::{ReadHalf, WriteHalf},
     net::TcpStream,
-    sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard},
+    sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard, mpsc},
 };
 use tokio_rustls::server::TlsStream;
 
@@ -28,8 +36,11 @@ use crate::{
     client_repository::ClientRepository,
     errors::{ReadProtoMessageError, WriteProtoMessageError},
     messages::{Message, ReadMessageExt, WriteMessageExt, encoder as msg_encoder},
+    voice::VoiceRoutingPayload,
     protocol_version::ProtocolVersion,
 };
+
+const VOICE_ROUTING_QUEUE_CAPACITY: usize = 256;
 
 pub struct Client {
     session_id: ClientSessionIdentifier,
@@ -39,7 +50,9 @@ pub struct Client {
     udp_address: Option<SocketAddr>,
     local_address: SocketAddr,
 
-    connection: AsyncMutex<TlsStream<TcpStream>>,
+    connection_rx: AsyncMutex<ReadHalf<TlsStream<TcpStream>>>,
+    connection_tx: AsyncMutex<WriteHalf<TlsStream<TcpStream>>>,
+    is_verified: bool,
 
     // Statistics
     login_time: DateTime<Utc>,
@@ -53,9 +66,11 @@ pub struct Client {
 
     options: RwLock<ClientOptions>,
 
-    local_state: RwLock<Option<ClientLocalState>>,
-    global_state: RwLock<ClientGlobalState>,
-    crypt_state: AsyncMutex<Option<CryptState>>,
+    local_state: ParkingRwLock<Option<ClientLocalState>>,
+    global_state: ParkingRwLock<ClientGlobalState>,
+    crypt_state: ParkingMutex<Option<CryptState>>,
+    voice_routing_tx: mpsc::Sender<VoiceRoutingPayload>,
+    voice_routing_rx: ParkingMutex<Option<mpsc::Receiver<VoiceRoutingPayload>>>,
 
     /// Whether this client has been published to the log (i.e. `AddClient`
     /// has been emitted).  Only published clients generate `RemoveClient`
@@ -85,11 +100,10 @@ impl Client {
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
     ) -> Box<Self> {
-        let certificate_hash = {
+        let (certificate_hash, is_verified) = {
             let (_, tls_connection) = connection.get_ref();
-            match tls_connection.peer_certificates() {
+            let cert_hash = match tls_connection.peer_certificates() {
                 Some([cert, ..]) => {
-                    // Compute the hash of the peer certificate
                     Some(Bytes::copy_from_slice(
                         aws_lc_rs::digest::digest(
                             &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
@@ -99,10 +113,17 @@ impl Client {
                     ))
                 }
                 _ => None,
-            }
+            };
+            let verified = tls_connection.peer_certificates().map_or(false, |c| !c.is_empty());
+            (cert_hash, verified)
         };
 
         let now = Utc::now();
+
+        let (voice_routing_tx, voice_routing_rx) =
+            mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
+
+        let (connection_rx, connection_tx) = tokio::io::split(connection);
 
         Box::new(Client {
             session_id,
@@ -110,7 +131,9 @@ impl Client {
             tcp_address,
             udp_address,
             local_address,
-            connection: AsyncMutex::new(connection),
+            connection_rx: AsyncMutex::new(connection_rx),
+            connection_tx: AsyncMutex::new(connection_tx),
+            is_verified,
             login_time: now,
             last_active: ParkingMutex::new(now),
             last_ping: ParkingMutex::new(now),
@@ -119,9 +142,11 @@ impl Client {
             certificate_hash,
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
-            local_state: RwLock::new(Some(ClientLocalState::new())),
-            global_state: RwLock::new(ClientGlobalState::new()),
-            crypt_state: AsyncMutex::new(None),
+            local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
+            global_state: ParkingRwLock::new(ClientGlobalState::new()),
+            crypt_state: ParkingMutex::new(None),
+            voice_routing_tx,
+            voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             published: AtomicBool::new(false),
             prefer_tcp_tunnel: AtomicBool::new(false),
             last_client_version: ParkingMutex::new(HashMap::new()),
@@ -129,8 +154,8 @@ impl Client {
         })
     }
 
-    pub async fn is_registered(&self) -> bool {
-        self.global_state.read().await.is_registered()
+    pub fn is_registered(&self) -> bool {
+        self.global_state.read().is_registered()
     }
 
     pub fn has_certificate(&self) -> bool {
@@ -178,13 +203,12 @@ impl Client {
         *self.last_channel_version.lock() = version;
     }
 
-    pub async fn get_groups_clone(&self) -> HashSet<String> {
-        self.global_state.read().await.get_groups().clone()
+    pub fn get_groups_clone(&self) -> HashSet<String> {
+        self.global_state.read().get_groups().clone()
     }
 
-    pub async fn has_group(&self, group: &str) -> bool {
-        let gs = self.global_state.read().await;
-        gs.has_group(group)
+    pub fn has_group(&self, group: &str) -> bool {
+        self.global_state.read().has_group(group)
     }
 
     pub fn get_certificate_hash(&self) -> Option<&[u8]> {
@@ -203,27 +227,25 @@ impl Client {
         self.session_id.get_local_session_id()
     }
 
-    pub async fn get_tokens_clone(&self) -> HashSet<String> {
-        let gs = self.global_state.read().await;
-        gs.get_tokens().clone()
+    pub fn get_tokens_clone(&self) -> HashSet<String> {
+        self.global_state.read().get_tokens().clone()
     }
 
-    pub async fn has_token(&self, token: &str) -> bool {
-        let gs = self.global_state.read().await;
-        gs.has_token(token)
+    pub fn has_token(&self, token: &str) -> bool {
+        self.global_state.read().has_token(token)
     }
 
-    pub async fn get_current_channel_id(&self) -> u32 {
-        self.global_state.read().await.get_current_channel_id()
+    pub fn get_current_channel_id(&self) -> u32 {
+        self.global_state.read().get_current_channel_id()
     }
 
-    pub async fn set_current_channel_id(&self, channel_id: u32, repo: &ClientRepository, channel_version: u64) {
-        let mut gs = self.write_global_state_as(repo, Some(self.session_id), Some(channel_version)).await;
+    pub fn set_current_channel_id(&self, channel_id: u32, repo: &ClientRepository, channel_version: u64) {
+        let mut gs = self.write_global_state_as(repo, Some(self.session_id), Some(channel_version));
         gs.set_current_channel_id(channel_id);
     }
 
-    pub async fn get_user_id(&self) -> Option<u32> {
-        self.global_state.read().await.get_user_id()
+    pub fn get_user_id(&self) -> Option<u32> {
+        self.global_state.read().get_user_id()
     }
 
     // pub fn get_display_name(&self) -> Option<String> {
@@ -253,10 +275,7 @@ impl Client {
     }
     // FIXME: not sure if it is verified or just exists
     pub async fn is_verified(&self) -> bool {
-        let guard = self.connection.lock().await;
-        let (_, conn) = guard.get_ref();
-        conn.peer_certificates()
-            .map_or(false, |certs| !certs.is_empty())
+        self.is_verified
     }
 
     pub fn disconnect(&self) {
@@ -264,7 +283,7 @@ impl Client {
     }
 
     pub async fn read_proto_message(&self) -> Result<Message, ReadProtoMessageError> {
-        let mut guard = self.connection.lock().await;
+        let mut guard = self.connection_rx.lock().await;
         guard.read_proto_message().await
     }
 
@@ -276,7 +295,7 @@ impl Client {
         &self,
         message: &Message,
     ) -> Result<(), WriteProtoMessageError> {
-        let mut guard = self.connection.lock().await;
+        let mut guard = self.connection_tx.lock().await;
         guard.write_proto_message(message).await
     }
 
@@ -289,12 +308,12 @@ impl Client {
         &self,
         messages: &[Message],
     ) -> Result<(), WriteProtoMessageError> {
-        let mut guard = self.connection.lock().await;
+        let mut guard = self.connection_tx.lock().await;
         guard.write_proto_message_batch(messages).await
     }
 
-    pub async fn set_tokens(&self, tokens: HashSet<String>, repo: &ClientRepository) {
-        let mut gs = self.write_global_state(repo).await;
+    pub fn set_tokens(&self, tokens: HashSet<String>, repo: &ClientRepository) {
+        let mut gs = self.write_global_state(repo);
         gs.set_tokens(tokens);
     }
 
@@ -322,8 +341,8 @@ impl Client {
     //     }
     // }
 
-    pub async fn crypt_state(&self) -> AsyncMutexGuard<'_, Option<CryptState>> {
-        self.crypt_state.lock().await
+    pub fn crypt_state(&self) -> ParkingMutexGuard<'_, Option<CryptState>> {
+        self.crypt_state.lock()
     }
 
     pub async fn udp_state(&self) -> AsyncMutexGuard<'_, UdpState> {
@@ -333,16 +352,27 @@ impl Client {
         }
     }
 
-    pub async fn create_crypt_state(
+    pub fn create_crypt_state(
         &self,
         mode: &str,
     ) -> Result<(), crate::client::crypt::CryptError> {
-        let mut state = self.crypt_state.lock().await;
-        // FIXME: store RNG elsewhere
-        // This RNG should be global to the entire program, preferably.
+        let mut state = self.crypt_state.lock();
         let rng = aws_lc_rs::rand::SystemRandom::new();
         *state = Some(CryptState::generate(mode, &rng)?);
         Ok(())
+    }
+
+    pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::DecodedAudio, is_udp: bool) {
+        let payload = VoiceRoutingPayload { decoded_audio, is_udp };
+        if self.voice_routing_tx.try_send(payload).is_err() {
+            tracing::trace!(session = u32::from(self.session_id), "voice routing queue full or closed, dropping packet");
+        }
+    }
+
+    /// Take the receiver half of the voice routing queue.  Called once by
+    /// `spawn_voice_routing_task`; returns `None` on any subsequent call.
+    pub fn take_voice_routing_rx(&self) -> Option<mpsc::Receiver<VoiceRoutingPayload>> {
+        self.voice_routing_rx.lock().take()
     }
 
     pub async fn write_stats(&self) -> RwLockWriteGuard<'_, ClientStats> {
@@ -358,8 +388,8 @@ impl Client {
     //     }
     // }
 
-    pub async fn is_authenticated(&self) -> bool {
-        let local_state_guard = self.local_state.read().await;
+    pub fn is_authenticated(&self) -> bool {
+        let local_state_guard = self.local_state.read();
         match &*local_state_guard {
             Some(state) => state.is_authenticated(),
             None => panic!("Accessing local state on remote user"),
@@ -370,54 +400,54 @@ impl Client {
     ///
     /// A client is a superuser if they are authenticated and belong to the
     /// `admin` group.
-    pub async fn is_superuser(&self) -> bool {
-        self.has_group("admin").await
+    pub fn is_superuser(&self) -> bool {
+        self.has_group("admin")
     }
 
-    pub async fn set_authenticated(&self, value: bool) {
-        let mut local_state_guard = self.local_state.write().await;
+    pub fn set_authenticated(&self, value: bool) {
+        let mut local_state_guard = self.local_state.write();
         match &mut *local_state_guard {
             Some(state) => state.set_authenticated(value),
             None => panic!("Accessing local state on remote user"),
         }
     }
 
-    pub async fn set_protocol_version(&self, version: Option<ProtocolVersion>, repo: &ClientRepository) {
-        let mut gs = self.write_global_state(repo).await;
+    pub fn set_protocol_version(&self, version: Option<ProtocolVersion>, repo: &ClientRepository) {
+        let mut gs = self.write_global_state(repo);
         gs.set_protocol_version(version);
     }
 
-    pub async fn set_release(&self, release: Option<String>) {
-        let mut local_state_guard = self.local_state.write().await;
+    pub fn set_release(&self, release: Option<String>) {
+        let mut local_state_guard = self.local_state.write();
         if let Some(ref mut state) = *local_state_guard {
             state.set_release(release);
         }
     }
 
-    pub async fn set_os(&self, os: Option<String>) {
-        let mut local_state_guard = self.local_state.write().await;
+    pub fn set_os(&self, os: Option<String>) {
+        let mut local_state_guard = self.local_state.write();
         if let Some(ref mut state) = *local_state_guard {
             state.set_os(os);
         }
     }
 
-    pub async fn set_os_version(&self, os_version: Option<String>) {
-        let mut local_state_guard = self.local_state.write().await;
+    pub fn set_os_version(&self, os_version: Option<String>) {
+        let mut local_state_guard = self.local_state.write();
         if let Some(ref mut state) = *local_state_guard {
             state.set_os_version(os_version);
         }
     }
 
-    pub async fn read_global_state(&self) -> tokio::sync::RwLockReadGuard<'_, ClientGlobalState> {
-        self.global_state.read().await
+    pub fn read_global_state(&self) -> ParkingRwLockReadGuard<'_, ClientGlobalState> {
+        self.global_state.read()
     }
 
-    pub async fn read_local_state(&self) -> tokio::sync::RwLockReadGuard<'_, Option<ClientLocalState>> {
-        self.local_state.read().await
+    pub fn read_local_state(&self) -> ParkingRwLockReadGuard<'_, Option<ClientLocalState>> {
+        self.local_state.read()
     }
 
-    pub async fn write_local_state(&self) -> RwLockWriteGuard<'_, Option<ClientLocalState>> {
-        self.local_state.write().await
+    pub fn write_local_state(&self) -> ParkingRwLockWriteGuard<'_, Option<ClientLocalState>> {
+        self.local_state.write()
     }
 
     /// Acquire a transactional write guard for `ClientGlobalState`.
@@ -426,11 +456,11 @@ impl Client {
     /// (or `commit()` is called explicitly), a `ClientGlobalStateDelta` is
     /// computed, a `ClientStateLogEntry` is created, and the global version
     /// is bumped by exactly 1.
-    pub async fn write_global_state<'a>(
+    pub fn write_global_state<'a>(
         &'a self,
         repo: &'a ClientRepository,
     ) -> GlobalStateWriteGuard<'a> {
-        self.write_global_state_as(repo, Some(self.session_id), None).await
+        self.write_global_state_as(repo, Some(self.session_id), None)
     }
 
     /// Acquire a transactional write guard for `ClientGlobalState` while
@@ -439,28 +469,28 @@ impl Client {
     ///
     /// `channel_version_dep`: `Some(v)` means this mutation depends on
     /// channel state at version `v` or later. `None` means no dependency.
-    pub async fn write_global_state_as<'a>(
+    pub fn write_global_state_as<'a>(
         &'a self,
         repo: &'a ClientRepository,
         sender_session_id: Option<ClientSessionIdentifier>,
         channel_version_dep: Option<u64>,
     ) -> GlobalStateWriteGuard<'a> {
-        let inner = self.global_state.write().await;
+        let inner = self.global_state.write();
         GlobalStateWriteGuard::new(inner, repo, self.session_id, sender_session_id, channel_version_dep)
     }
 
     /// Direct (non-transactional) write access to `ClientGlobalState`.
     /// Only for internal use (e.g. `apply_remote_operation`).
     /// Callers should prefer `write_global_state(repo)` for normal mutations.
-    pub async fn write_global_state_direct(&self) -> RwLockWriteGuard<'_, ClientGlobalState> {
-        self.global_state.write().await
+    pub fn write_global_state_direct(&self) -> ParkingRwLockWriteGuard<'_, ClientGlobalState> {
+        self.global_state.write()
     }
 
     /// Build a `UserState` snapshot of this client suitable for broadcasting
     /// to other clients (i.e. everything a peer needs to know about this user).
     /// Not suitable for continuous update of clients state.
-    pub async fn build_user_state_for_broadcast(&self) -> msg_encoder::UserState {
-        let gs = self.global_state.read().await;
+    pub fn build_user_state_for_broadcast(&self) -> msg_encoder::UserState {
+        let gs = self.global_state.read();
 
         let comment_hash_bytes = gs
             .get_comment_hash()

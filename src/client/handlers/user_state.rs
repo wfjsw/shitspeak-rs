@@ -14,7 +14,7 @@ pub async fn handle_user_state(
     sender: &Arc<Box<Client>>,
     msg: crate::messages::encoder::UserState,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "UserState message received before authentication",
         ));
@@ -85,7 +85,7 @@ pub async fn handle_user_state(
 
     let target_id = target.get_session_id();
     let is_self = target_id == sender_id;
-    let target_current_channel_id = target.get_current_channel_id().await;
+    let target_current_channel_id = target.get_current_channel_id();
     let requested_channel_change = msg
         .channel_id
         .filter(|new_channel_id| *new_channel_id != target_current_channel_id);
@@ -188,7 +188,7 @@ pub async fn handle_user_state(
     } else {
         None
     };
-    let mut gs = target.write_global_state_as(repo, Some(sender_id), channel_version_dep).await;
+    let mut gs = target.write_global_state_as(repo, Some(sender_id), channel_version_dep);
 
     // ── Self-mute / self-deaf (only target can set their own) ─────────────
     if is_self {

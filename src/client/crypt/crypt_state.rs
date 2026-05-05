@@ -234,7 +234,14 @@ impl CryptState {
             return Err(e);
         }
 
-        // if 
+        self.decrypt_history[self.decrypt_iv[0] as usize] = self.decrypt_iv[1];
+
+        if restore {
+            self.decrypt_iv.copy_from_slice(&iv_backup);
+        }
+
+        self.good = self.good.saturating_add(1);
+        self.last_good_time = Utc::now();
 
         Ok(())
     }

@@ -18,7 +18,7 @@ pub(crate) async fn compute_permissions_for_client(
     let session = u32::from(client.get_session_id());
 
     // Superuser bypasses all ACL checks
-    if client.is_superuser().await {
+    if client.is_superuser() {
         tracing::trace!(session, channel_id, "ACL compute bypassed for superuser");
         return enumflags2::BitFlags::all();
     }
@@ -30,10 +30,10 @@ pub(crate) async fn compute_permissions_for_client(
         return enumflags2::BitFlags::empty();
     };
 
-    let user_id = client.get_user_id().await;
-    let groups: Vec<String> = client.get_groups_clone().await.into_iter().collect();
+    let user_id = client.get_user_id();
+    let groups: Vec<String> = client.get_groups_clone().into_iter().collect();
     let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
-    let tokens: Vec<String> = client.get_tokens_clone().await.into_iter().collect();
+    let tokens: Vec<String> = client.get_tokens_clone().into_iter().collect();
     let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
 
     let membership = crate::client::group::ClientMembershipQuery {

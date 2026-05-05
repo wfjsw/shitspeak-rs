@@ -16,7 +16,7 @@ impl<T: tokio::io::AsyncReadExt + Unpin> ReadMessageExt for T {
             return Err(MessageLengthExceededError::new(MAX_MESSAGE_LENGTH, message_length).into());
         }
 
-        let mut buffer = BytesMut::with_capacity(message_length);
+        let mut buffer = BytesMut::zeroed(message_length);
         self.read_exact(&mut buffer).await?;
 
         Ok(Message::from_proto(message_type, buffer.freeze())?)

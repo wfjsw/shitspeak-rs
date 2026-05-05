@@ -14,7 +14,7 @@ pub async fn handle_user_list(
     sender: &Arc<Box<Client>>,
     msg: UserList,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "UserList message received before authentication",
         ));

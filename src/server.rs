@@ -17,16 +17,13 @@ use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::channel_repository::{ChannelRepoTuning, ChannelRepository};
 use crate::client::AsyncMessageHandlerExt;
 use crate::client_certificate_verifier::ClientCertificateVerifier;
-use crate::errors::{
-    HandleIncomingConnectionError, ReadProtoMessageError,
-};
+use crate::errors::{HandleIncomingConnectionError, ReadProtoMessageError};
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
 use crate::voice::ping::decode_ping_protobuf;
 use crate::{
-    client_repository::ClientRepository, codec_info::CodecInfo, config::Config,
-    s2s::S2SManager,
+    client_repository::ClientRepository, codec_info::CodecInfo, config::Config, s2s::S2SManager,
     types::NodeIdentifier,
 };
 
@@ -139,7 +136,10 @@ impl Server {
 
         // Wire cross-repo causal notification: ChannelRepository notifies
         // ClientRepository to drain pending ops after remote channel ops.
-        server.channels.set_client_repo(server.clients.clone()).await;
+        server
+            .channels
+            .set_client_repo(server.clients.clone())
+            .await;
 
         Ok(server)
     }
@@ -165,16 +165,15 @@ impl Server {
         let idle_timeout_secs = self.read_config().client_idle_timeout_secs;
 
         // Bounded channel shared between UDP drain and processing tasks.
-        let (udp_in, udp_out) = tokio::sync::mpsc::channel::<(Bytes, std::net::SocketAddr)>(
-            udp_channel_size,
-        );
+        let (udp_in, udp_out) =
+            tokio::sync::mpsc::channel::<(Bytes, std::net::SocketAddr)>(udp_channel_size);
 
         let udp_drain = Self::spawn_udp_drain(
+            Arc::clone(self),
             Arc::clone(&self.udp_socket),
             udp_in,
             udp_voice_enabled,
             udp_ping_enabled,
-            Arc::clone(self),
             shutdown_rx.clone(),
         );
         let udp_process = Self::spawn_udp_process(
@@ -185,18 +184,14 @@ impl Server {
             shutdown_rx.clone(),
         );
         let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx.clone());
-        let idle_reaper = Self::spawn_idle_reaper(
-            Arc::clone(self),
-            idle_timeout_secs,
-            shutdown_rx.clone(),
-        );
+        let idle_reaper =
+            Self::spawn_idle_reaper(Arc::clone(self), idle_timeout_secs, shutdown_rx.clone());
         let _s2s_task = Arc::clone(&self.s2s_manager).spawn_runtime_task(shutdown_rx.clone());
 
         // Public server registration (periodic HTTP POST to registry).
         // This task is optional and may exit early when registration is disabled;
         // it must never terminate the main server loop.
-        let _register_task =
-            crate::register::spawn_register_task(Arc::clone(self), shutdown_rx);
+        let _register_task = crate::register::spawn_register_task(Arc::clone(self), shutdown_rx);
 
         // Wait for any task to finish (error) or for the shutdown signal
         // to be dropped by the caller (main.rs drops shutdown_tx on Ctrl-C).
@@ -217,16 +212,21 @@ impl Server {
     /// push voice packets into the channel.  Ping packets are handled
     /// directly (responded to immediately).
     fn spawn_udp_drain(
+        server: Arc<Box<Self>>,
         socket: Arc<tokio::net::UdpSocket>,
         tx: tokio::sync::mpsc::Sender<(Bytes, std::net::SocketAddr)>,
         voice_enabled: bool,
         ping_enabled: bool,
-        server: Arc<Box<Self>>,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
-            tracing::info!("UDP drain started, listening on {}", socket.local_addr().unwrap_or_else(|_| std::net::SocketAddr::from(([0,0,0,0], 0))));
+            tracing::info!(
+                "UDP drain started, listening on {}",
+                socket
+                    .local_addr()
+                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+            );
             loop {
                 let (len, src_addr) = tokio::select! {
                     result = socket.recv_from(&mut buf) => match result {
@@ -250,17 +250,31 @@ impl Server {
                 if ping_enabled {
                     match crate::voice::ping::try_decode_ping(packet).await {
                         Ok(ping) => {
-                            tracing::debug!("UDP ping from {}: timestamp={}, format={}", src_addr, ping.timestamp, ping.format);
+                            tracing::debug!(
+                                "UDP ping from {}: timestamp={}, format={}",
+                                src_addr,
+                                ping.timestamp,
+                                ping.format
+                            );
                             let reply = match Self::build_ping_response(&server, &ping).await {
                                 Ok(r) => r,
                                 Err(e) => {
-                                    tracing::warn!("Failed to build UDP ping response for {}: {e}", src_addr);
+                                    tracing::warn!(
+                                        "Failed to build UDP ping response for {}: {e}",
+                                        src_addr
+                                    );
                                     continue;
                                 }
                             };
                             match socket.send_to(&reply, src_addr).await {
-                                Ok(sent) => tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent),
-                                Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
+                                Ok(sent) => tracing::trace!(
+                                    "UDP ping reply sent to {}: {} bytes",
+                                    src_addr,
+                                    sent
+                                ),
+                                Err(e) => {
+                                    tracing::warn!("UDP ping reply failed to {}: {e}", src_addr)
+                                }
                             }
                             continue;
                         }
@@ -279,7 +293,10 @@ impl Server {
                     match tx.try_send((packet, src_addr)) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!("UDP processing channel is full, dropping packet from {}", src_addr);
+                            tracing::warn!(
+                                "UDP processing channel is full, dropping packet from {}",
+                                src_addr
+                            );
                         }
                         Err(e) => {
                             tracing::warn!("UDP processing channel error for {}: {e}", src_addr);
@@ -309,81 +326,178 @@ impl Server {
                     },
                     _ = shutdown.changed() => break,
                 };
-                // Try to match by known UDP address first, then host-based
-                // candidate probing. On host probing we keep the successful
-                // plaintext so we do not decrypt the same packet twice.
+                // Try address-based match first.  If the cached entry exists but
+                // decrypt fails (stale NAT binding, crypt state re-keyed, etc.)
+                // the binding is removed and we fall through to IP-based candidate
+                // probing so the packet is not silently dropped.
                 let mut decrypted_from_match: Option<BytesMut> = None;
                 let mut matched_via_ip_fallback = false;
-                let client = match server.clients.get_client_by_udp_address(&src_addr).await {
-                    Some(c) => Some(c),
-                    None => {
-                        let candidates = server.clients.get_clients_by_ip(&src_addr.ip()).await;
-                        let mut matched = None;
-                        for c in &candidates {
-                            let mut crypt = c.crypt_state().await;
-                            if let Some(ref mut state) = *crypt {
-                                let mut decrypted = BytesMut::new();
-                                if state.decrypt(&mut decrypted, &packet).is_ok() {
-                                    matched = Some(c.clone());
-                                    decrypted_from_match = Some(decrypted);
-                                    matched_via_ip_fallback = true;
-                                    break;
+
+                let client = {
+                    let address_match = server.clients.get_client_by_udp_address(&src_addr).await;
+                    let mut found = None;
+
+                    if let Some(c) = address_match {
+                        if !c.is_authenticated() {
+                            tracing::trace!(
+                                "UDP client {:?} matched by address is not authenticated, skipping",
+                                c.get_session_id()
+                            );
+                            server.clients.unbind_client_udp_address(&src_addr);
+                        } else {
+                            let decrypt_result: Option<Result<BytesMut, _>> = {
+                                let mut crypt = c.crypt_state();
+                                crypt.as_mut().map(|state| {
+                                    let mut dec = BytesMut::new();
+                                    state.decrypt(&mut dec, &packet).map(|_| dec)
+                                })
+                            };
+
+                            match decrypt_result {
+                                Some(Ok(dec)) => {
+                                    tracing::trace!(
+                                        "UDP client matched by address: {} -> session {:?}",
+                                        src_addr,
+                                        c.get_session_id()
+                                    );
+                                    decrypted_from_match = Some(dec);
+                                    found = Some(c);
+                                }
+                                Some(Err(e)) => {
+                                    tracing::trace!("UDP address-match decrypt failed for {:?} from {}: {:?}, removing stale binding", c.get_session_id(), src_addr, e);
+                                    server.clients.unbind_client_udp_address(&src_addr);
+                                }
+                                None => {
+                                    tracing::trace!("UDP address-matched client {:?} has no crypt state, removing stale binding", c.get_session_id());
+                                    server.clients.unbind_client_udp_address(&src_addr);
                                 }
                             }
                         }
-                        matched
                     }
+
+                    if found.is_none() {
+                        let candidates = server.clients.get_clients_by_ip(&src_addr.ip()).await;
+                        let mut matched = None;
+                        for c in &candidates {
+                            if !c.is_authenticated() {
+                                tracing::trace!("UDP client {:?} is not authenticated, skipping for IP fallback", c.get_session_id());
+                                continue;
+                            }
+
+                            let decrypted = {
+                                let mut crypt = c.crypt_state();
+                                match crypt.as_mut() {
+                                    Some(state) => {
+                                        let mut decrypted = BytesMut::new();
+                                        match state.decrypt(&mut decrypted, &packet) {
+                                            Ok(()) => {
+                                                tracing::trace!("UDP packet from {} successfully decrypted with client {:?} during IP fallback", src_addr, c.get_session_id());
+                                                Some(decrypted)
+                                            }
+                                            Err(e) => {
+                                                tracing::trace!("UDP packet from {} failed to decrypt with client {:?} during IP fallback: {:?}", src_addr, c.get_session_id(), e);
+                                                None
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::trace!("UDP client {:?} has no crypt state yet, skipping for IP fallback", c.get_session_id());
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some(decrypted) = decrypted {
+                                matched = Some(c.clone());
+                                decrypted_from_match = Some(decrypted);
+                                matched_via_ip_fallback = true;
+                                break;
+                            }
+                        }
+
+                        tracing::trace!(
+                            "UDP client {} matched by IP fallback: candidates={}, matched={:?}",
+                            src_addr,
+                            candidates.len(),
+                            matched.as_ref().map(|c| c.get_session_id()),
+                        );
+                        found = matched;
+                    }
+
+                    found
                 };
 
                 let Some(client) = client else { continue };
-                if !client.is_authenticated().await {
-                    continue;
-                };
 
                 // A valid UDP voice packet indicates UDP path is working.
                 client.set_prefer_tcp_tunnel(false);
 
                 if matched_via_ip_fallback {
+                    tracing::trace!(
+                        "Binding UDP address {} to client {:?} after successful IP fallback match",
+                        src_addr,
+                        client.get_session_id()
+                    );
+
                     server
                         .clients
                         .bind_client_udp_address(client.get_session_id(), src_addr)
                         .await;
                 }
 
-                let decrypted = if let Some(dec) = decrypted_from_match {
-                    dec
-                } else {
-                    let mut crypt = client.crypt_state().await;
-                    let mut dec = BytesMut::new();
-                    match crypt.as_mut() {
-                        Some(state) => match state.decrypt(&mut dec, &packet) {
-                            Ok(()) => dec,
-                            Err(_) => continue,
-                        },
-                        None => continue,
-                    }
+                // Packet was already decrypted during client matching.
+                let Some(decrypted) = decrypted_from_match else {
+                    continue;
                 };
 
                 // After decryption, check if this is a ping or audio packet.
                 match crate::voice::codec::decode_udp_packet(&decrypted).await {
                     Ok(crate::voice::codec::UdpPacket::Ping(ping)) => {
-                        if ping_enabled {
-                            tracing::debug!("UDP ping from {}: timestamp={}", src_addr, ping.timestamp);
-                            let reply = match Self::build_ping_response(&server, &ping).await {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    tracing::warn!("Failed to build UDP ping response for {}: {e}", src_addr);
-                                    continue;
-                                }
+                        // A protobuf-format ping from a client whose version is
+                        // still unknown/legacy means the client speaks 1.5+.
+                        // Upgrade now so subsequent audio is encoded correctly.
+                        tracing::trace!(
+                            "UDP ping from {}: timestamp={}, format={}",
+                            src_addr,
+                            ping.timestamp,
+                            ping.format
+                        );
+                        if ping.format == crate::voice::codec::PacketFormat::Protobuf {
+                            let needs_upgrade = {
+                                let gs = client.read_global_state();
+                                !gs.uses_protobuf()
                             };
-                            match socket.send_to(&reply, src_addr).await {
-                                Ok(sent) => tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent),
-                                Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
+                            if needs_upgrade {
+                                let mut gs = client.write_global_state(server.get_clients());
+                                gs.set_protocol_version(Some(
+                                    crate::protocol_version::ProtocolVersion::new(1, 5, 0),
+                                ));
                             }
+                        }
+                        tracing::debug!("UDP ping from {}: timestamp={}", src_addr, ping.timestamp);
+                        let reply = match Self::build_ping_response(&server, &ping).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to build UDP ping response for {}: {e}",
+                                    src_addr
+                                );
+                                continue;
+                            }
+                        };
+                        match socket.send_to(&reply, src_addr).await {
+                            Ok(sent) => tracing::trace!(
+                                "UDP ping reply sent to {}: {} bytes",
+                                src_addr,
+                                sent
+                            ),
+                            Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
                         }
                         continue;
                     }
                     Ok(crate::voice::codec::UdpPacket::Audio(mut decoded_audio)) => {
+                        tracing::trace!(
+                            "UDP audio packet from {}: sender_session={}, frame_number={}, format={:?}, payload_len={}", 
+                            src_addr, decoded_audio.sender_session, decoded_audio.frame_number, decoded_audio.format, decoded_audio.opus_data.len());
                         let actual_session = u32::from(client.get_session_id());
                         if decoded_audio.sender_session != 0
                             && decoded_audio.sender_session != actual_session
@@ -399,7 +513,7 @@ impl Server {
                         // endpoint+crypto match, not packet self-asserted session.
                         decoded_audio.sender_session = actual_session;
 
-                        crate::voice::route_voice(&server, &client, &decoded_audio, true).await;
+                        client.push_voice_routing(decoded_audio, true);
                     }
                     Err(e) => {
                         tracing::trace!("UDP packet decode failed from {}: {e}", src_addr);
@@ -501,15 +615,9 @@ impl Server {
         // Send server version (these are startup-only, read once)
         let version = {
             let cfg = self.read_config();
-            Version::for_server(
-                cfg.send_version,
-                cfg.send_build_info,
-                cfg.send_os_info,
-            )
+            Version::for_server(cfg.send_version, cfg.send_build_info, cfg.send_os_info)
         }; // cfg dropped here
-        tls_stream
-            .write_proto_message(&version.into())
-            .await?;
+        tls_stream.write_proto_message(&version.into()).await?;
 
         let client = self
             .clients
@@ -537,13 +645,13 @@ impl Server {
                                         tracing::info!(session = u32::from(client_session_id), reason = rejection.reason(), "closing connection after auth rejection");
                                         return Err(HandleIncomingConnectionError::AuthRejected(rejection));
                                     }
-                                    Err(_) => {
-                                        return Err(HandleIncomingConnectionError::MessageHandlerFailed);
+                                    Err(err) => {
+                                        return Err(HandleIncomingConnectionError::MessageHandlerFailed(err));
                                     }
                                 }
 
                                 // Transition to post-auth: publish and subscribe.
-                                if client.is_authenticated().await && client_log_rx.is_none() {
+                                if client.is_authenticated() && client_log_rx.is_none() {
                                     let channel_snapshot_version = self.channels.current_version();
                                     client.set_last_channel_version(channel_snapshot_version).await;
 
@@ -570,7 +678,7 @@ impl Server {
                                 );
                                 // Gracefully ignore unknown message types
                             }
-                            Err(_) => return Err(HandleIncomingConnectionError::MessageHandlerFailed),
+                            Err(err) => return Err(HandleIncomingConnectionError::ReadProtoMessageError(err)),
                         }
                     }
 
@@ -823,7 +931,7 @@ impl Server {
     pub fn context_actions(&self) -> &Arc<crate::context_action::ContextActionRegistry> {
         &self.context_actions
     }
-    
+
     // ── UDP ping ─────────────────────────────────────────────────────────
 
     /// Build a ping response with current server information.
@@ -839,7 +947,11 @@ impl Server {
         let response = crate::voice::ping::PingResponse {
             timestamp: ping.timestamp,
             server_version: crate::constants::APP_PROTO_VER,
-            user_count: server.clients.len().await.clamp(0, u32::MAX.try_into().unwrap()) as u32,
+            user_count: server
+                .clients
+                .len()
+                .await
+                .clamp(0, u32::MAX.try_into().unwrap()) as u32,
             max_user_count: Some(max_users.clamp(0, u32::MAX.into()) as u32),
             max_bandwidth_per_user: max_bandwidth,
         };
@@ -860,10 +972,10 @@ impl Server {
         let total = all_clients.len();
 
         for client in &all_clients {
-            if !client.is_authenticated().await {
+            if !client.is_authenticated() {
                 continue;
             }
-            let local = client.read_local_state().await;
+            let local = client.read_local_state();
             if let Some(ref state) = *local {
                 if state.supports_opus() {
                     opus_count += 1;
@@ -895,7 +1007,8 @@ impl Server {
                     beta,
                     prefer_alpha,
                     opus: Some(opus),
-                }.into()
+                }
+                .into()
             };
             self.clients.broadcast_all(&msg).await;
         }
@@ -929,14 +1042,19 @@ async fn replay_client_log_gap(
 
     tracing::warn!(
         "Client {:?} missed client log entries: node={} last={} current={}",
-        session_id, node_id, last, current,
+        session_id,
+        node_id,
+        last,
+        current,
     );
 
     let missed = repo.get_log_since(last).await;
     if missed.is_empty() && last > 0 {
         tracing::error!(
             "Client {:?} client log gap unrecoverable (node={}, last={})",
-            session_id, node_id, last,
+            session_id,
+            node_id,
+            last,
         );
         return Err(());
     }
@@ -960,4 +1078,3 @@ async fn replay_client_log_gap(
 
     Ok(())
 }
-

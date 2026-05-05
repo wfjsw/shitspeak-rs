@@ -12,7 +12,7 @@ pub async fn handle_query_users(
     sender: &Arc<Box<Client>>,
     msg: QueryUsers,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "QueryUsers message received before authentication",
         ));

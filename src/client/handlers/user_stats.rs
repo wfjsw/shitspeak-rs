@@ -12,7 +12,7 @@ pub async fn handle_user_stats(
     sender: &Arc<Box<Client>>,
     msg: UserStats,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "UserStats message received before authentication",
         ));
@@ -35,8 +35,8 @@ pub async fn handle_user_stats(
     };
 
     let stats = target.write_stats().await;
-    let gs = target.read_global_state().await;
-    let local_state = target.read_local_state().await;
+    let gs = target.read_global_state();
+    let local_state = target.read_local_state();
     let local = local_state.as_ref();
 
     let now = chrono::Utc::now();

@@ -8,6 +8,7 @@ use crate::{
 };
 
 use super::codec::{self, DecodedAudio, PacketFormat};
+use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, QueuedDatagram};
 
 /// `target_kind` value used in the S2S envelope for normal channel
@@ -26,17 +27,32 @@ pub async fn route_voice(
     is_udp: bool,
 ) {
     let sender_id = sender.get_session_id();
-    let sender_channel = sender.get_current_channel_id().await;
+    let sender_channel = sender.get_current_channel_id();
 
     // Check if sender is muted/suppressed
     {
-        let gs = sender.read_global_state().await;
+        let gs = sender.read_global_state();
         if gs.is_muted() || gs.is_suppressed() || gs.is_self_muted() {
+            tracing::trace!(
+                session = u32::from(sender_id),
+                muted = gs.is_muted(),
+                suppressed = gs.is_suppressed(),
+                self_muted = gs.is_self_muted(),
+                "not routing voice packet from muted/suppressed client"
+            );
             return;
         }
     }
 
     let target = audio.target;
+
+    tracing::trace!(
+        session = u32::from(sender_id),
+        channel = sender_channel,
+        target,
+        is_udp,
+        "routing voice packet"
+    );
 
     // Build the outgoing audio data (server → client format)
     let outgoing = DecodedAudio {
@@ -62,18 +78,25 @@ pub async fn route_voice(
     let all_clients = server.get_clients().get_all_clients().await;
 
     if target == 0 {
+        tracing::trace!(
+            session = u32::from(sender_id),
+            channel = sender_channel,
+            "routing normal channel speech"
+        );
+
         s2s_payload = Some(codec::encode_audio_packet(&outgoing, audio.format));
         // ── Normal speech: send to all channel members ───────────────────
+        // TODO: optimize
         for client in &all_clients {
             if client.get_session_id() == sender_id {
                 continue;
             }
-            if !client.is_authenticated().await {
+            if !client.is_authenticated() {
                 continue;
             }
-            if client.get_current_channel_id().await != sender_channel {
+            if client.get_current_channel_id() != sender_channel {
                 // Check if this client is listening to the sender's channel
-                let gs = client.read_global_state().await;
+                let gs = client.read_global_state();
                 if !gs.is_listening_channel(sender_channel) {
                     continue;
                 }
@@ -85,8 +108,22 @@ pub async fn route_voice(
             }
             targets.push((client.clone(), outgoing.clone()));
         }
+
+        tracing::trace!(
+            session = u32::from(sender_id),
+            channel = sender_channel,
+            target,
+            count = targets.len(),
+            "resolved recipients for normal channel speech"
+         );
     } else if target == 0x1F {
         // ── Server loopback (target = 31) ────────────────────────────────
+        tracing::trace!(
+            session = u32::from(sender_id),
+            channel = sender_channel,
+            target,
+            "routing server loopback (target=31)"
+         );
         targets.push((sender.clone(), outgoing));
     } else {
         // ── Whisper/shout target ─────────────────────────────────────────
@@ -94,12 +131,19 @@ pub async fn route_voice(
         let voice_target = udp_state.voice_target(target);
 
         if let Some(vt) = voice_target {
+            tracing::trace!(
+                session = u32::from(sender_id),
+                channel = sender_channel,
+                target,
+                "resolving whisper/shout recipients"
+             );
+
             // Direct session targets
             for session_raw in vt.sessions() {
                 let session_id =
                     crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw);
                 if let Some(client) = server.get_clients().get_client(session_id).await {
-                    if client.is_authenticated().await {
+                    if client.is_authenticated() {
                         let mut whisper_out = outgoing.clone();
                         whisper_out.target = 2; // AudioContext::WHISPER
                         targets.push((client, whisper_out));
@@ -119,10 +163,10 @@ pub async fn route_voice(
                     if client.get_session_id() == sender_id {
                         continue;
                     }
-                    if !client.is_authenticated().await {
+                    if !client.is_authenticated() {
                         continue;
                     }
-                    if channel_ids.contains(&client.get_current_channel_id().await) {
+                    if channel_ids.contains(&client.get_current_channel_id()) {
                         let mut shout_out = outgoing.clone();
                         shout_out.target = 1; // AudioContext::SHOUT
                         targets.push((client.clone(), shout_out));
@@ -144,23 +188,23 @@ pub async fn route_voice(
     // broadcast (default) or targeted multicast using the recipient
     // index. Targeted falls back to broadcast when the index has no
     // entry for the channel (cold start, sparse cluster).
-    if let Some(payload) = s2s_payload {
-        if let Some(app) = server.s2s_manager().application() {
-            let voice = app.voice().clone();
-            let _ = S2S_TARGET_NORMAL; // currently encoded inside send_for_channel
-            let result = voice
-                .send_for_channel(
-                    u32::from(sender_id),
-                    sender_channel,
-                    audio.is_terminator,
-                    payload,
-                )
-                .await;
-            if let Err(e) = result {
-                tracing::trace!(error=%e, "voice s2s send failed");
-            }
-        }
-    }
+    // if let Some(payload) = s2s_payload {
+    //     if let Some(app) = server.s2s_manager().application() {
+    //         let voice = app.voice().clone();
+    //         let _ = S2S_TARGET_NORMAL; // currently encoded inside send_for_channel
+    //         let result = voice
+    //             .send_for_channel(
+    //                 u32::from(sender_id),
+    //                 sender_channel,
+    //                 audio.is_terminator,
+    //                 payload,
+    //             )
+    //             .await;
+    //         if let Err(e) = result {
+    //             tracing::trace!(error=%e, "voice s2s send failed");
+    //         }
+    //     }
+    // }
 }
 
 /// Encrypt and send voice packets to all targets.
@@ -183,8 +227,14 @@ async fn flush_voice_batch(
         let mut batch: Vec<QueuedDatagram> = Vec::with_capacity(targets.len());
 
         for (client, audio) in targets {
+            let format = if client.read_global_state().uses_protobuf() {
+                PacketFormat::Protobuf
+            } else {
+                PacketFormat::Legacy
+            };
+
             if client.prefers_tcp_tunnel() {
-                let raw = codec::encode_audio_packet(audio, audio.format);
+                let raw = codec::encode_audio_packet(audio, format);
                 let message = crate::messages::Message::UDPTunnel(raw);
                 let _ = client.write_proto_message(&message).await;
                 continue;
@@ -194,16 +244,16 @@ async fn flush_voice_batch(
                 Some(a) => a,
                 None => {
                     // No UDP address — fall back to TCP tunnel
-                    let raw = codec::encode_audio_packet(audio, audio.format);
+                    let raw = codec::encode_audio_packet(audio, format);
                     let message = crate::messages::Message::UDPTunnel(raw);
                     let _ = client.write_proto_message(&message).await;
                     continue;
                 }
             };
 
-            let mut crypt = client.crypt_state().await;
+            let mut crypt = client.crypt_state();
             if let Some(ref mut state) = *crypt {
-                let raw = codec::encode_audio_packet(audio, audio.format);
+                let raw = codec::encode_audio_packet(audio, format);
                 let mut buf = vec![0u8; raw.len() + state.overhead()];
                 if state.encrypt(&mut buf, &raw).is_ok() {
                     batch.push(QueuedDatagram {
@@ -220,11 +270,39 @@ async fn flush_voice_batch(
     } else {
         // TCP tunnel path — send each individually
         for (client, audio) in targets {
-            let raw = codec::encode_audio_packet(audio, audio.format);
+            let format = if client.read_global_state().uses_protobuf() {
+                PacketFormat::Protobuf
+            } else {
+                PacketFormat::Legacy
+            };
+            let raw = codec::encode_audio_packet(audio, format);
             let message = crate::messages::Message::UDPTunnel(raw);
             let _ = client.write_proto_message(&message).await;
         }
     }
+}
+
+/// Spawn a per-user voice routing task.
+///
+/// The receiver half of the queue is taken from `sender` (created in
+/// `Client::new_local`).  The task holds a `Weak` reference to the client so
+/// it does not prevent the client from being dropped — when all strong `Arc`s
+/// are gone the weak upgrade fails, the loop exits, and the task cleans up.
+pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client>>) {
+    let mut rx = match sender.take_voice_routing_rx() {
+        Some(rx) => rx,
+        None => {
+            tracing::warn!(session = u32::from(sender.get_session_id()), "voice routing task already spawned");
+            return;
+        }
+    };
+    let weak_sender = Arc::downgrade(&sender);
+    tokio::spawn(async move {
+        while let Some(payload) = rx.recv().await {
+            let Some(sender) = weak_sender.upgrade() else { break };
+            route_voice(&server, &sender, &payload.decoded_audio, payload.is_udp).await;
+        }
+    });
 }
 
 /// Collect all channel IDs in the subtree rooted at `root_id`.

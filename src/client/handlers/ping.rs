@@ -20,7 +20,7 @@ pub async fn handle_ping(
     }
 
     let response = {
-        let mut crypt_state = sender.crypt_state().await;
+        let mut crypt_state = sender.crypt_state();
         if let Some(state) = crypt_state.as_mut() {
             state.update_from_ping_message(&msg);
             state.create_ping_response(&msg)

@@ -13,7 +13,7 @@ pub async fn handle_channel_remove(
     sender: &Arc<Box<Client>>,
     msg: ChannelRemove,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "ChannelRemove message received before authentication",
         ));
@@ -56,8 +56,8 @@ pub async fn handle_channel_remove(
     let repo = server.get_clients();
     let all_clients = repo.get_all_clients().await;
     for client in &all_clients {
-        if client.get_current_channel_id().await == channel_id {
-            client.set_current_channel_id(parent_id, repo, server.get_channels().current_version()).await;
+        if client.get_current_channel_id() == channel_id {
+            client.set_current_channel_id(parent_id, repo, server.get_channels().current_version());
             // The channel move is now logged via the transactional guard;
             // per-client subscribers will pick up the UserState delta.
         }

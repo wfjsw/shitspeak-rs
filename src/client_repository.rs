@@ -285,8 +285,15 @@ impl ClientRepository {
             };
 
             if client.get_node_id() == self.local_node_id {
-                if let Some(udp_address) = client.get_udp_address() {
-                    client_by_udp_address_guard.remove(&udp_address);
+                // Remove any UDP address dynamically bound to this session (may
+                // differ from the initial udp_address field if the client's port
+                // was discovered later via IP-fallback matching).
+                let stale_udp: Vec<SocketAddr> = client_by_udp_address_guard
+                    .iter()
+                    .filter_map(|(k, v)| if *v == id { Some(*k) } else { None })
+                    .collect();
+                for addr in stale_udp {
+                    client_by_udp_address_guard.remove(&addr);
                 }
 
                 let tcp_address = client.get_tcp_address();
@@ -362,6 +369,13 @@ impl ClientRepository {
             *by_udp.get(addr)?
         };
         self.register.read().await.get(&id).cloned()
+    }
+
+    /// Remove a specific UDP address binding.  Called when decrypt fails for a
+    /// cached address so the UDP process loop can re-probe via IP.
+    pub fn unbind_client_udp_address(&self, addr: &SocketAddr) {
+        let mut by_udp = self.clients_by_udp_address.write();
+        by_udp.remove(addr);
     }
 
     /// Bind/update the UDP address for a client session for fast future lookup.
@@ -652,7 +666,7 @@ impl ClientRepository {
         }
 
         // Apply immediately
-        Self::apply_op_inner(&mut register, &op, remote_node).await;
+        Self::apply_op_inner(&mut register, &op, remote_node);
         Ok(())
     }
 
@@ -672,7 +686,7 @@ impl ClientRepository {
                 remote_node,
                 channel_version,
             );
-            Self::apply_op_inner(&mut register, &op, remote_node).await;
+            Self::apply_op_inner(&mut register, &op, remote_node);
         }
         // Update last_pending_effective_dep from the new front (or 0 if empty)
         register.last_pending_effective_dep = register
@@ -683,7 +697,7 @@ impl ClientRepository {
     }
 
     /// Apply a single remote op to the register (no version/buffer checks).
-    async fn apply_op_inner(
+    fn apply_op_inner(
         register: &mut ClientRegister,
         op: &ClientStateLogEntry,
         remote_node: u16,
@@ -709,7 +723,7 @@ impl ClientRepository {
             } => {
                 let client = register.get(session_id).cloned();
                 if let Some(client) = client {
-                    let mut gs = client.write_global_state_direct().await;
+                    let mut gs = client.write_global_state_direct();
                     apply_delta_to_global_state(&mut gs, delta);
                 }
             }

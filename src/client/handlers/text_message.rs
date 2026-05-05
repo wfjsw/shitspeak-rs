@@ -12,7 +12,7 @@ pub async fn handle_text_message(
     sender: &Arc<Box<Client>>,
     msg: TextMessage,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "TextMessage message received before authentication",
         ));
@@ -43,7 +43,7 @@ pub async fn handle_text_message(
             if client.get_session_id() == sender.get_session_id() {
                 continue; // don't echo back to sender
             }
-            if client.get_current_channel_id().await == *channel_id && client.is_authenticated().await {
+            if client.get_current_channel_id() == *channel_id && client.is_authenticated() {
                 let _ = client.write_proto_message(&relay).await;
             }
         }
@@ -57,7 +57,7 @@ pub async fn handle_text_message(
             if client.get_session_id() == sender.get_session_id() {
                 continue;
             }
-            if channel_ids.contains(&client.get_current_channel_id().await) && client.is_authenticated().await {
+            if channel_ids.contains(&client.get_current_channel_id()) && client.is_authenticated() {
                 let _ = client.write_proto_message(&relay).await;
             }
         }

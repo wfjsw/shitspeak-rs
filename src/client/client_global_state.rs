@@ -159,6 +159,12 @@ impl ClientGlobalState {
         self.protocol_version.clone()
     }
 
+    pub fn uses_protobuf(&self) -> bool {
+        self.protocol_version
+            .as_ref()
+            .map_or(false, |v| *v >= ProtocolVersion::new(1, 5, 0))
+    }
+
     pub fn set_protocol_version(&mut self, version: Option<ProtocolVersion>) {
         if self.protocol_version.is_some() {
             return;

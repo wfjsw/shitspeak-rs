@@ -422,7 +422,6 @@ async fn restart_detection_via_hello() {
         // B's last boot_epoch in its NeighborMonitor when the new B
         // appears (the monitor purges entries only after dead × 4).
         transport_b1.shutdown().await;
-        drop(overlay_b1);
     }
 
     // Subscribe BEFORE starting B' so we don't race the Restarted event.

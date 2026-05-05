@@ -27,17 +27,18 @@ pub struct PingResponse {
     pub max_bandwidth_per_user: u32,
 }
 
-/// Try to decode a UDP packet as a ping.
-///
-/// Returns `Err(DecodeError::NotPing)` if the packet is not a ping.
 pub async fn try_decode_ping(data: &[u8]) -> Result<PingRequest, DecodeError> {
     let header = data.get(0).ok_or(DecodeError::TooShort)?;
     if *header == 0x1u8 {
-        return decode_ping_protobuf(&data[1..]).await;
+        return decode_ping_protobuf(&data[1..])
+            .await
+            .map_err(|_| DecodeError::NotPing);
     }
 
     if data.len() == 12 {
-        return decode_ping_legacy(&data).await;
+        return decode_ping_legacy(&data)
+            .await
+            .map_err(|_| DecodeError::NotPing);
     }
 
     Err(DecodeError::NotPing)
@@ -53,15 +54,29 @@ pub async fn decode_ping_protobuf(data: &[u8]) -> Result<PingRequest, DecodeErro
     })
 }
 
-/// Decode a legacy Ping packet (data is after the type byte).
-/// Legacy ping format: varint timestamp, then optionally a request flag byte.
+/// Decode a legacy Ping packet.
+///
+/// When called from the encrypted path (`decode_udp_packet`), `data` is the
+/// bytes after the type byte: a PDS varint-encoded timestamp (1–4 bytes for
+/// timestamps up to ~74 hours).
+///
+/// When called from the unencrypted path (`try_decode_ping`), `data` is the
+/// full 12-byte packet including the `\x00\x00\x00\x00` header followed by a
+/// raw big-endian u64 timestamp.
 pub async fn decode_ping_legacy(data: &[u8]) -> Result<PingRequest, DecodeError> {
     if data.is_empty() {
         return Err(DecodeError::TooShort);
     }
 
     let mut data_cursor = std::io::Cursor::new(data);
-    let (request_extended_information, timestamp) = if data.len() <= size_of::<u64>() + 1 {
+    let (request_extended_information, timestamp) = if data.len() < size_of::<u64>() {
+        // Short form: PDS varint-encoded timestamp (encrypted pings from authenticated clients).
+        let (ts, consumed) = super::codec::read_varint(data).ok_or(DecodeError::LegacyDecode)?;
+        if consumed != data.len() {
+            return Err(DecodeError::LegacyDecode);
+        }
+        (false, ts)
+    } else if data.len() <= size_of::<u64>() + 1 {
         (false, data_cursor.read_u64().await.map_err(|_| DecodeError::LegacyDecode)?)
     } else if data.len() == 4 + size_of::<u64>() {
         if data_cursor.read_u32().await.map_err(|_| DecodeError::LegacyDecode)? != 0 {

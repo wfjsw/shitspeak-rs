@@ -12,11 +12,11 @@ pub async fn handle_version(
     tracing::debug!(session = u32::from(sender.get_session_id()), version = ?msg.version, release = msg.release, os = msg.os, "Version handler");
     {
         let repo = server.get_clients();
-        let mut global_state_writer = sender.write_global_state(repo).await;
+        let mut global_state_writer = sender.write_global_state(repo);
         global_state_writer.set_protocol_version(msg.version);
     }
     {
-        let mut local_state_writer = sender.write_local_state().await;
+        let mut local_state_writer = sender.write_local_state();
         if let Some(ref mut state) = *local_state_writer {
             state.set_release(msg.release);
             state.set_os(msg.os);

@@ -13,7 +13,7 @@ pub async fn handle_acl(
     sender: &Arc<Box<Client>>,
     msg: EncoderAcl,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated().await {
+    if !sender.is_authenticated() {
         return Err(MessageHandlerError::protocol_violation(
             "ACL message received before authentication",
         ));
@@ -100,16 +100,16 @@ pub async fn handle_acl(
 
         // Safety fallback: if the requesting client would lose Write (and is registered),
         // include a Write|Traverse ACL in the same SetAcls transaction.
-        if sender.is_registered().await {
+        if sender.is_registered() {
             let (channel, ancestors) = server.get_channels().get_channel_with_ancestors(channel_id).await;
             if let Some(mut channel) = channel {
                 channel.inherit_acl = inherit_acl;
                 channel.acls = new_acls.clone();
 
-                let user_id = sender.get_user_id().await;
-                let groups: Vec<String> = sender.get_groups_clone().await.into_iter().collect();
+                let user_id = sender.get_user_id();
+                let groups: Vec<String> = sender.get_groups_clone().into_iter().collect();
                 let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
-                let tokens: Vec<String> = sender.get_tokens_clone().await.into_iter().collect();
+                let tokens: Vec<String> = sender.get_tokens_clone().into_iter().collect();
                 let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
                 let membership = crate::client::group::ClientMembershipQuery {
                     groups: &group_refs,

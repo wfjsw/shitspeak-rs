@@ -733,10 +733,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     pub fn recv_clock_tick(&self, from: NodeIdentifier, t: StrictClockTick) {
-        let mut s = self.state.lock();
-        s.observe_peer(from, t.src_clock);
+        {
+            let mut s = self.state.lock();
+            s.observe_peer(from, t.src_clock);
+        }
         // Tick may unblock delivery.
-        drop(s);
         self.deliver_signal.notify_one();
     }
 
@@ -1215,8 +1216,10 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
 // ---------- Background loops ----------
 
 fn spawn_delivery_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
-    let weak = Arc::downgrade(&rt);
-    drop(rt);
+    let weak = {
+        let rt = rt;
+        Arc::downgrade(&rt)
+    };
     tokio::spawn(async move {
         let Some(rt) = weak.upgrade() else {
             return;
@@ -1293,8 +1296,10 @@ fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
 }
 
 fn spawn_clock_tick_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
-    let weak = Arc::downgrade(&rt);
-    drop(rt);
+    let weak = {
+        let rt = rt;
+        Arc::downgrade(&rt)
+    };
     tokio::spawn(async move {
         let Some(rt) = weak.upgrade() else {
             return;
@@ -1328,8 +1333,10 @@ fn spawn_clock_tick_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
 }
 
 fn spawn_catchup_bootstrap<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
-    let weak = Arc::downgrade(&rt);
-    drop(rt);
+    let weak = {
+        let rt = rt;
+        Arc::downgrade(&rt)
+    };
     tokio::spawn(async move {
         let Some(rt) = weak.upgrade() else {
             return;

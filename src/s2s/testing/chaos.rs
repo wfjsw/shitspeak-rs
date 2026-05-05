@@ -175,40 +175,44 @@ impl LinkChaos {
     /// re-emitting it; `None` means drop. The chaos rules are mutated
     /// (e.g., type-drop counters decrement) as a side effect.
     fn decide(&self, msg: &InboundMessage) -> Option<Duration> {
-        let mut g = self.state.lock();
         let from = msg.from();
-        if g.blocked.contains(&from) {
-            return None;
-        }
-        if let Some(t) = MessageType::classify(msg.payload()) {
-            if let Some(c) = g.type_drops.get_mut(&t) {
-                if *c > 0 {
-                    *c -= 1;
-                    trace!(?t, %from, "chaos: dropped (type rule)");
-                    return None;
-                }
-            }
-            if let Some(c) = g.type_drops_per_sender.get_mut(&(from, t)) {
-                if *c > 0 {
-                    *c -= 1;
-                    trace!(?t, %from, "chaos: dropped (per-sender type rule)");
-                    return None;
-                }
-            }
-        }
-        if let Some(bucket) = g.bandwidth.as_mut() {
-            let bytes = msg.payload().len() as u64;
-            if !bucket.try_consume(bytes) {
-                trace!(%from, bytes, "chaos: dropped (bandwidth)");
+        let (mut delay, jitter_max) = {
+            let mut g = self.state.lock();
+            if g.blocked.contains(&from) {
                 return None;
             }
-        }
-        let mut delay = g.latency.get(&from).copied().unwrap_or_default();
-        if let Some(max) = g.jitter_max {
-            // Sample without holding the chaos lock open longer than
-            // needed.
+            if let Some(t) = MessageType::classify(msg.payload()) {
+                if let Some(c) = g.type_drops.get_mut(&t) {
+                    if *c > 0 {
+                        *c -= 1;
+                        trace!(?t, %from, "chaos: dropped (type rule)");
+                        return None;
+                    }
+                }
+                if let Some(c) = g.type_drops_per_sender.get_mut(&(from, t)) {
+                    if *c > 0 {
+                        *c -= 1;
+                        trace!(?t, %from, "chaos: dropped (per-sender type rule)");
+                        return None;
+                    }
+                }
+            }
+            if let Some(bucket) = g.bandwidth.as_mut() {
+                let bytes = msg.payload().len() as u64;
+                if !bucket.try_consume(bytes) {
+                    trace!(%from, bytes, "chaos: dropped (bandwidth)");
+                    return None;
+                }
+            }
+            // Sample jitter_max before releasing the lock so we can apply it
+            // outside without holding the chaos lock open longer than needed.
+            (
+                g.latency.get(&from).copied().unwrap_or_default(),
+                g.jitter_max,
+            )
+        };
+        if let Some(max) = jitter_max {
             let max_us = max.as_micros() as u64;
-            drop(g);
             if max_us > 0 {
                 let extra_us = rand::thread_rng().gen_range(0..=max_us);
                 delay = delay.saturating_add(Duration::from_micros(extra_us));

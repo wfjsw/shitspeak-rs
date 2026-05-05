@@ -23,9 +23,9 @@ pub async fn handle_authenticate(
     // ── Token-update path ─────────────────────────────────────────────────
     // An already-authenticated client can send Authenticate again to update
     // its access tokens.
-    if sender.is_authenticated().await {
+    if sender.is_authenticated() {
         tracing::debug!(session = u32::from(session), "Authenticate: token update for already-authenticated client");
-        sender.set_tokens(msg.tokens.into_iter().collect(), repo).await;
+        sender.set_tokens(msg.tokens.into_iter().collect(), repo);
         return Ok(());
     }
 
@@ -57,11 +57,11 @@ pub async fn handle_authenticate(
     let session_id = sender.get_session_id();
     let ip_address = sender.get_real_ip_address();
     let (version, client_name, os_name, os_version) = {
-        let global_state = sender.read_global_state().await;
-        let local_state = sender.read_local_state().await;
+        let protocol_version = sender.read_global_state().get_protocol_version();
+        let local_state = sender.read_local_state();
         let local = local_state.as_ref().expect("Local state missing during authenticate");
         (
-            global_state.get_protocol_version(),
+            protocol_version,
             local.get_release().map(|s| s.to_owned()),
             local.get_os_name().map(|s| s.to_owned()),
             local.get_os_version().map(|s| s.to_owned()),
@@ -111,7 +111,7 @@ pub async fn handle_authenticate(
 
     // ── Store identity on client (single transaction) ─────────────────────
     {
-        let mut gs = sender.write_global_state(repo).await;
+        let mut gs = sender.write_global_state(repo);
         gs.set_user_id(result.user_id);
         gs.set_display_name(result.display_name);
         gs.set_groups(result.groups.into_iter().collect());
@@ -127,7 +127,7 @@ pub async fn handle_authenticate(
 
     // ── Traverse permission check on root channel ─────────────────────────
     // Superusers bypass this check.
-    if !sender.is_superuser().await {
+    if !sender.is_superuser() {
         let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
         if !root_perms.contains(crate::acl::ACLPermissions::Traverse) {
             tracing::trace!(session = u32::from(session), "Authenticate built outbound Reject payload");
@@ -139,8 +139,7 @@ pub async fn handle_authenticate(
 
     // ── Generate crypt state and send CryptSetup ──────────────────────────
     if let Err(e) = sender
-        .create_crypt_state("OCB2-AES128")
-        .await {
+        .create_crypt_state("OCB2-AES128") {
         tracing::error!(session = u32::from(session), error = %e, "Failed to create crypt state");
         return Err(AuthRejection::new(RejectType::None)
             .because("Failed to create crypt state")
@@ -148,12 +147,12 @@ pub async fn handle_authenticate(
     }
 
     let crypt_setup_msg: Message = {
-        let crypt = sender.crypt_state().await;
+        let crypt = sender.crypt_state();
         let state = crypt.as_ref().expect("crypt state just created");
         crate::messages::encoder::CryptSetup::new(
             state.key().map(Bytes::copy_from_slice),
-            Some(Bytes::copy_from_slice(state.encrypt_iv())),
             Some(Bytes::copy_from_slice(state.decrypt_iv())),
+            Some(Bytes::copy_from_slice(state.encrypt_iv())),
         ).into()
     };
 
@@ -165,7 +164,7 @@ pub async fn handle_authenticate(
         } else {
             0 // fall back to root
         };
-        sender.set_current_channel_id(target_ch, repo, server.get_channels().current_version()).await;
+        sender.set_current_channel_id(target_ch, repo, server.get_channels().current_version());
     }
 
     // ── Build the full burst of messages to send to the new client ────────
@@ -223,17 +222,17 @@ pub async fn handle_authenticate(
             if client.get_session_id() == session_id {
                 continue;
             }
-            if !client.is_authenticated().await {
+            if !client.is_authenticated() {
                 continue;
             }
-            let us: Message = client.build_user_state_for_broadcast().await.into();
+            let us: Message = client.build_user_state_for_broadcast().into();
             push_burst(us);
         }
     }
 
     // 4. UserState for self
     {
-        let self_us: Message = sender.build_user_state_for_broadcast().await.into();
+        let self_us: Message = sender.build_user_state_for_broadcast().into();
         push_burst(self_us);
     }
 
@@ -275,14 +274,17 @@ pub async fn handle_authenticate(
     sender.write_proto_message_batch(&burst).await?;
 
     // ── Mark as authenticated ─────────────────────────────────────────────
-    sender.set_authenticated(true).await;
+    sender.set_authenticated(true);
+
+    // ── Spawn per-user voice routing task ─────────────────────────────────
+    crate::voice::spawn_voice_routing_task(Arc::clone(server), Arc::clone(sender));
 
     // ── Record last-seen versions so the client doesn't replay old entries ─
     sender.update_last_client_versions(&all_versions).await;
 
     // Store Opus support flag for codec negotiation
     {
-        let mut local = sender.write_local_state().await;
+        let mut local = sender.write_local_state();
         if let Some(ref mut state) = *local {
             state.set_supports_opus(msg.opus.unwrap_or(false));
         }
