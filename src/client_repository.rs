@@ -456,8 +456,24 @@ impl ClientRepository {
     /// Remove a specific UDP address binding.  Called when decrypt fails for a
     /// cached address so the UDP process loop can re-probe via IP.
     pub fn unbind_client_udp_address(&self, addr: &SocketAddr) {
-        let mut by_udp = self.clients_by_udp_address.write();
-        by_udp.remove(addr);
+        let removed_id = {
+            let mut by_udp = self.clients_by_udp_address.write();
+            by_udp.remove(addr)
+        };
+        if let Some(id) = removed_id {
+            // Best-effort: clear the corresponding Client field so the
+            // routing layer's `get_udp_address()` returns `None` and falls
+            // back to the TCP tunnel until the next encrypted UDP packet
+            // re-binds. Use a non-blocking try-read; if the register lock is
+            // contended we'll just leave the stale field in place — the
+            // address-to-session map (the source of truth for inbound
+            // matching) was already cleared above.
+            if let Ok(reg) = self.register.try_read() {
+                if let Some(client) = reg.local_clients.get(&id) {
+                    client.set_udp_address(None);
+                }
+            }
+        }
     }
 
     /// Bind/update the UDP address for a client session for fast future lookup.
@@ -466,16 +482,26 @@ impl ClientRepository {
         id: ClientSessionIdentifier,
         addr: SocketAddr,
     ) {
-        let mut by_udp = self.clients_by_udp_address.write();
-        // Remove stale mappings for this session to keep map one-to-one.
-        let stale: Vec<SocketAddr> = by_udp
-            .iter()
-            .filter_map(|(k, v)| if *v == id { Some(*k) } else { None })
-            .collect();
-        for old in stale {
-            by_udp.remove(&old);
+        {
+            let mut by_udp = self.clients_by_udp_address.write();
+            // Remove stale mappings for this session to keep map one-to-one.
+            let stale: Vec<SocketAddr> = by_udp
+                .iter()
+                .filter_map(|(k, v)| if *v == id { Some(*k) } else { None })
+                .collect();
+            for old in stale {
+                by_udp.remove(&old);
+            }
+            by_udp.insert(addr, id);
         }
-        by_udp.insert(addr, id);
+        // Mirror the binding onto the Client itself so the routing layer's
+        // `client.get_udp_address()` returns it. Without this, `flush_voice_batch`
+        // would always fall back to the TCP tunnel even though we just
+        // confirmed the client is reachable by UDP.
+        let register = self.register.read().await;
+        if let Some(client) = register.local_clients.get(&id) {
+            client.set_udp_address(Some(addr));
+        }
     }
 
     /// Look up clients sharing the same IP (for UDP packet matching fallback).

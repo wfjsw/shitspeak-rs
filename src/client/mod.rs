@@ -14,7 +14,7 @@ pub mod global_state_guard;
 pub(crate) mod acl;
 mod handlers;
 pub mod client_local_state;
-mod crypt;
+pub(crate) mod crypt;
 
 pub use client::Client;
 pub use handlers::AsyncMessageHandlerExt;

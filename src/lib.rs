@@ -30,6 +30,9 @@ pub mod utils;
 pub mod voice;
 pub mod voice_crypto;
 
+#[cfg(test)]
+mod integration_tests;
+
 pub mod mumble_proto {
     include!(concat!(env!("OUT_DIR"), "/mumble_proto.rs"));
 }

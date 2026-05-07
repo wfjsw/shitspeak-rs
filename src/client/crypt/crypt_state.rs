@@ -122,8 +122,13 @@ impl CryptState {
     }
 
     pub fn encrypt(&mut self, dest: &mut [u8], data: &[u8]) -> Result<(), CryptError> {
-        // increase IV
-        for byte in self.encrypt_iv.iter_mut().rev() {
+        // Increment the IV left-to-right (byte 0 first, carry to byte 1, ...).
+        // This matches the Mumble C++ reference (`for i=0..15: if ++iv[i] break`)
+        // and — crucially — matches the wire format which puts `encrypt_iv[0]`
+        // in `dest[0]`. With a right-to-left increment, `dest[0]` would never
+        // change between packets and the receiver would reject every packet
+        // after the first as a duplicate IV.
+        for byte in self.encrypt_iv.iter_mut() {
             *byte = byte.wrapping_add(1);
             if *byte != 0 {
                 break;
@@ -134,7 +139,14 @@ impl CryptState {
             return Err(CryptError::DestinationBufferTooSmall);
         }
 
-        self.mode.encrypt(&mut dest[0..], data, &self.encrypt_iv)?;
+        // Wire layout: `[iv_byte (1), tag (3), ciphertext (N)]`. We hand the
+        // OCB2 layer `&mut dest[1..]` so it places its tag at `dest[1..4]` and
+        // its ciphertext at `dest[4..4+N]`, then we write the IV byte at
+        // position 0. The decrypt path mirrors this by passing `&data[1..]`
+        // to `mode.decrypt`, which reads the tag from positions 0..3 of that
+        // slice (= wire positions 1..4).
+        self.mode
+            .encrypt(&mut dest[1..], data, &self.encrypt_iv)?;
         dest[0] = self.encrypt_iv[0];
 
         Ok(())

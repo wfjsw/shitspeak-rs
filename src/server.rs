@@ -149,6 +149,16 @@ impl Server {
         self.config.read().expect("Config RwLock poisoned")
     }
 
+    /// Local TCP listen address. Useful for tests that bind to `127.0.0.1:0`.
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.tcp_listener.local_addr()
+    }
+
+    /// Local UDP listen address. Useful for tests that bind to `127.0.0.1:0`.
+    pub fn local_udp_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.udp_socket.local_addr()
+    }
+
     pub async fn run(
         self: &Arc<Box<Self>>,
         shutdown_tx: tokio::sync::watch::Sender<()>,
@@ -452,27 +462,12 @@ impl Server {
                 // After decryption, check if this is a ping or audio packet.
                 match crate::voice::codec::decode_udp_packet(&decrypted).await {
                     Ok(crate::voice::codec::UdpPacket::Ping(ping)) => {
-                        // A protobuf-format ping from a client whose version is
-                        // still unknown/legacy means the client speaks 1.5+.
-                        // Upgrade now so subsequent audio is encoded correctly.
                         tracing::trace!(
                             "UDP ping from {}: timestamp={}, format={}",
                             src_addr,
                             ping.timestamp,
                             ping.format
                         );
-                        if ping.format == crate::voice::codec::PacketFormat::Protobuf {
-                            let needs_upgrade = {
-                                let gs = client.read_global_state();
-                                !gs.uses_protobuf()
-                            };
-                            if needs_upgrade {
-                                let mut gs = client.write_global_state(server.get_clients());
-                                gs.set_protocol_version(Some(
-                                    crate::protocol_version::ProtocolVersion::new(1, 5, 0),
-                                ));
-                            }
-                        }
                         tracing::debug!("UDP ping from {}: timestamp={}", src_addr, ping.timestamp);
                         let reply = match Self::build_ping_response(&server, &ping).await {
                             Ok(r) => r,
@@ -496,7 +491,7 @@ impl Server {
                     }
                     Ok(crate::voice::codec::UdpPacket::Audio(mut decoded_audio)) => {
                         tracing::trace!(
-                            "UDP audio packet from {}: sender_session={}, frame_number={}, format={:?}, payload_len={}", 
+                            "UDP audio packet from {}: sender_session={}, frame_number={}, format={:?}, payload_len={}",
                             src_addr, decoded_audio.sender_session, decoded_audio.frame_number, decoded_audio.format, decoded_audio.opus_data.len());
                         let actual_session = u32::from(client.get_session_id());
                         if decoded_audio.sender_session != 0

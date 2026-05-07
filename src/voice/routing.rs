@@ -96,6 +96,35 @@ pub async fn route_voice(
             targets.push((client.clone(), 0)); // AudioContext::NORMAL
         }
 
+        // ── Normal speech: linked channels (local only) ─────────────────
+        // Voice fans out to members of channels linked to the sender's
+        // channel. Per Mumble's reference behavior, the speaker must hold
+        // Speak on the linked channel for voice to cross.
+        let linked_ids: Vec<u32> = server
+            .get_channels()
+            .get_channel(sender_channel)
+            .await
+            .map(|ch| ch.links.into_iter().collect())
+            .unwrap_or_default();
+        for linked_id in linked_ids {
+            let perms =
+                crate::client::acl::compute_permissions_for_client(server, sender, linked_id).await;
+            if !perms.contains(crate::acl::ACLPermissions::Speak) {
+                continue;
+            }
+            let linked_clients =
+                server.get_clients().get_local_clients_in_channel(linked_id).await;
+            for client in &linked_clients {
+                if client.get_session_id() == sender_id {
+                    continue;
+                }
+                if !client.is_authenticated() {
+                    continue;
+                }
+                targets.push((client.clone(), 0)); // AudioContext::NORMAL
+            }
+        }
+
         // ── Normal speech: cross-channel listeners (local only) ─────────
         let listeners = server.get_clients().get_local_listeners_for_channel(sender_channel).await;
         for client in &listeners {

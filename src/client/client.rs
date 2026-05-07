@@ -48,7 +48,13 @@ pub struct Client {
 
     real_ip_address: IpAddr,
     tcp_address: SocketAddr,
-    udp_address: Option<SocketAddr>,
+    /// Address the client is reachable at over UDP. `None` until the server
+    /// has either decoded a valid encrypted UDP packet from the client (which
+    /// flows through `bind_client_udp_address`) or the client provided one at
+    /// connection time. Stored under an `RwLock` because the voice routing
+    /// fan-out reads it for every recipient on every packet, while the
+    /// bind/unbind paths write it only on rare events.
+    udp_address: ParkingRwLock<Option<SocketAddr>>,
     local_address: SocketAddr,
 
     connection_rx: AsyncMutex<ReadHalf<TlsStream<TcpStream>>>,
@@ -139,7 +145,7 @@ impl Client {
             session_id,
             real_ip_address,
             tcp_address,
-            udp_address,
+            udp_address: ParkingRwLock::new(udp_address),
             local_address,
             connection_rx: AsyncMutex::new(connection_rx),
             connection_tx: AsyncMutex::new(connection_tx),
@@ -275,7 +281,15 @@ impl Client {
     }
 
     pub fn get_udp_address(&self) -> Option<SocketAddr> {
-        self.udp_address
+        *self.udp_address.read()
+    }
+
+    /// Update the UDP address this client is reachable at. Called from the
+    /// `ClientRepository::bind_client_udp_address` / `unbind_client_udp_address`
+    /// paths once an incoming encrypted UDP packet has been associated with
+    /// this session.
+    pub fn set_udp_address(&self, addr: Option<SocketAddr>) {
+        *self.udp_address.write() = addr;
     }
 
     pub fn get_real_ip_address(&self) -> IpAddr {
