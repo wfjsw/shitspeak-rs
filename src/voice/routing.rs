@@ -15,11 +15,6 @@ use super::udp_batch::{self, QueuedDatagram};
 /// speech. Mirrors the Mumble `AudioContext::NORMAL` numbering.
 const S2S_TARGET_NORMAL: u32 = 0;
 
-/// Route an incoming voice packet to its intended recipients.
-///
-/// `sender` is the client that originated the audio.
-/// `audio` is the decoded audio data.
-/// `is_udp` indicates whether the packet arrived via UDP (true) or TCP tunnel (false).
 pub async fn route_voice(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
@@ -75,8 +70,6 @@ pub async fn route_voice(
     // speaker's chosen format and `target = 0`.
     let mut s2s_payload: Option<bytes::Bytes> = None;
 
-    let all_clients = server.get_clients().get_all_clients().await;
-
     if target == 0 {
         tracing::trace!(
             session = u32::from(sender_id),
@@ -85,28 +78,33 @@ pub async fn route_voice(
         );
 
         s2s_payload = Some(codec::encode_audio_packet(&outgoing, audio.format));
-        // ── Normal speech: send to all channel members ───────────────────
-        // TODO: optimize
-        for client in &all_clients {
+
+        // ── Normal speech: channel members (local only) ─────────────────
+        // Remote clients in the same channel are reached via S2S delivery,
+        // not by direct UDP/TCP from this node.
+        let channel_clients = server.get_clients().get_local_clients_in_channel(sender_channel).await;
+        for client in &channel_clients {
             if client.get_session_id() == sender_id {
                 continue;
             }
             if !client.is_authenticated() {
                 continue;
             }
-            if client.get_current_channel_id() != sender_channel {
-                // Check if this client is listening to the sender's channel
-                let gs = client.read_global_state();
-                if !gs.is_listening_channel(sender_channel) {
-                    continue;
-                }
-                // Listening context
-                let mut listen_out = outgoing.clone();
-                listen_out.target = 3; // AudioContext::LISTEN
-                targets.push((client.clone(), listen_out));
+            targets.push((client.clone(), outgoing.clone()));
+        }
+
+        // ── Normal speech: cross-channel listeners (local only) ─────────
+        let listeners = server.get_clients().get_local_listeners_for_channel(sender_channel).await;
+        for client in &listeners {
+            if client.get_session_id() == sender_id {
                 continue;
             }
-            targets.push((client.clone(), outgoing.clone()));
+            if !client.is_authenticated() {
+                continue;
+            }
+            let mut listen_out = outgoing.clone();
+            listen_out.target = 3; // AudioContext::LISTEN
+            targets.push((client.clone(), listen_out));
         }
 
         tracing::trace!(
@@ -138,10 +136,16 @@ pub async fn route_voice(
                 "resolving whisper/shout recipients"
              );
 
-            // Direct session targets
+            // Direct session targets — only deliver to local sessions on
+            // this node.  Remote whisper recipients must be reached via
+            // S2S (deferred to a later phase).
+            let local_node_id = server.get_clients().local_node_id();
             for session_raw in vt.sessions() {
                 let session_id =
                     crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw);
+                if session_id.node_id != local_node_id {
+                    continue;
+                }
                 if let Some(client) = server.get_clients().get_client(session_id).await {
                     if client.is_authenticated() {
                         let mut whisper_out = outgoing.clone();
@@ -151,7 +155,7 @@ pub async fn route_voice(
                 }
             }
 
-            // Channel targets
+            // Channel targets — use the index for each target channel subtree
             for ch_target in vt.channels() {
                 let channel_ids = if ch_target.sub_channels() {
                     collect_subtree_ids(server, ch_target.id()).await
@@ -159,18 +163,17 @@ pub async fn route_voice(
                     vec![ch_target.id()]
                 };
 
-                for client in &all_clients {
+                let channel_clients = server.get_clients().get_local_clients_in_channels(&channel_ids).await;
+                for client in &channel_clients {
                     if client.get_session_id() == sender_id {
                         continue;
                     }
                     if !client.is_authenticated() {
                         continue;
                     }
-                    if channel_ids.contains(&client.get_current_channel_id()) {
-                        let mut shout_out = outgoing.clone();
-                        shout_out.target = 1; // AudioContext::SHOUT
-                        targets.push((client.clone(), shout_out));
-                    }
+                    let mut shout_out = outgoing.clone();
+                    shout_out.target = 1; // AudioContext::SHOUT
+                    targets.push((client.clone(), shout_out));
                 }
             }
         }
@@ -180,14 +183,6 @@ pub async fn route_voice(
     flush_voice_batch(server, &targets, is_udp).await;
 
     // ── Cross-node delivery (NORMAL channel speech only for now) ─────────
-    // Whisper/shout cross-node delivery requires shipping the resolved
-    // recipient set in the envelope; deferred to a later phase. Local
-    // delivery for whisper above is unaffected.
-    //
-    // `send_for_channel` routes via the configured `delivery_strategy`:
-    // broadcast (default) or targeted multicast using the recipient
-    // index. Targeted falls back to broadcast when the index has no
-    // entry for the channel (cold start, sparse cluster).
     // if let Some(payload) = s2s_payload {
     //     if let Some(app) = server.s2s_manager().application() {
     //         let voice = app.voice().clone();
@@ -210,9 +205,14 @@ pub async fn route_voice(
 /// Encrypt and send voice packets to all targets.
 ///
 /// On the UDP path, packets are encoded (legacy or protobuf based on client
-/// version), encrypted, and collected into a batched send for a single
-/// syscall (Linux) or sent per-packet (other OS).
-/// On the TCP path, each packet is tunnelled individually.
+/// version) and encrypted **in parallel** (rayon), then collected into a
+/// single batched send (`sendmmsg` on Linux, per-packet `send_to` elsewhere).
+/// Recipients that prefer/need the TCP tunnel are delegated to their per-user
+/// TCP send queue rather than being awaited inline, so a slow TLS write to one
+/// recipient does not stall the routing fan-out for the rest.
+///
+/// On the TCP path (the speaker's audio arrived over the TCP `UDPTunnel`),
+/// every recipient is fed via their per-user TCP send queue.
 async fn flush_voice_batch(
     server: &Arc<Box<Server>>,
     targets: &[(Arc<Box<Client>>, DecodedAudio)],
@@ -223,8 +223,12 @@ async fn flush_voice_batch(
     }
 
     if is_udp {
-        let socket = server.get_udp_socket();
-        let mut batch: Vec<QueuedDatagram> = Vec::with_capacity(targets.len());
+        // Bucket targets: those reachable via UDP (encrypt + batch) vs. those
+        // that must fall back to the TCP tunnel (no UDP address known yet, or
+        // client has explicitly switched to tunneled mode).
+        let mut udp_items: Vec<(Arc<Box<Client>>, std::net::SocketAddr, PacketFormat, DecodedAudio)> =
+            Vec::with_capacity(targets.len());
+        let mut tcp_items: Vec<(Arc<Box<Client>>, PacketFormat, DecodedAudio)> = Vec::new();
 
         for (client, audio) in targets {
             let format = if client.read_global_state().uses_protobuf() {
@@ -234,41 +238,64 @@ async fn flush_voice_batch(
             };
 
             if client.prefers_tcp_tunnel() {
-                let raw = codec::encode_audio_packet(audio, format);
-                let message = crate::messages::Message::UDPTunnel(raw);
-                let _ = client.write_proto_message(&message).await;
+                tcp_items.push((client.clone(), format, audio.clone()));
                 continue;
             }
 
-            let udp_addr = match client.get_udp_address() {
-                Some(a) => a,
-                None => {
-                    // No UDP address — fall back to TCP tunnel
-                    let raw = codec::encode_audio_packet(audio, format);
-                    let message = crate::messages::Message::UDPTunnel(raw);
-                    let _ = client.write_proto_message(&message).await;
-                    continue;
-                }
-            };
-
-            let mut crypt = client.crypt_state();
-            if let Some(ref mut state) = *crypt {
-                let raw = codec::encode_audio_packet(audio, format);
-                let mut buf = vec![0u8; raw.len() + state.overhead()];
-                if state.encrypt(&mut buf, &raw).is_ok() {
-                    batch.push(QueuedDatagram {
-                        addr: udp_addr,
-                        data: bytes::Bytes::from(buf),
-                    });
-                }
+            match client.get_udp_address() {
+                Some(addr) => udp_items.push((client.clone(), addr, format, audio.clone())),
+                None => tcp_items.push((client.clone(), format, audio.clone())),
             }
         }
 
-        if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &batch).await {
-            tracing::warn!("UDP batch send error: {e}");
+        // ── TCP-fallback recipients: enqueue, do not await ───────────────────
+        for (client, format, audio) in tcp_items {
+            let raw = codec::encode_audio_packet(&audio, format);
+            client.try_enqueue_voice_tcp(raw);
+        }
+
+        // ── Parallel encode + encrypt for UDP-reachable recipients ───────────
+        // Each recipient owns its own `CryptState` (parking_lot mutex), so
+        // different recipients can encrypt concurrently.  We hand the entire
+        // bucket to `spawn_blocking` and use rayon's work-stealing pool inside
+        // for the actual parallelism — this keeps the reactor thread free while
+        // the CPU work is in flight.
+        let batch: Vec<QueuedDatagram> = if udp_items.is_empty() {
+            Vec::new()
+        } else {
+            tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                udp_items
+                    .into_par_iter()
+                    .filter_map(|(client, addr, format, audio)| {
+                        let raw = codec::encode_audio_packet(&audio, format);
+                        let mut crypt = client.crypt_state();
+                        let state = crypt.as_mut()?;
+                        let mut buf = vec![0u8; raw.len() + state.overhead()];
+                        state.encrypt(&mut buf, &raw).ok()?;
+                        Some(QueuedDatagram {
+                            addr,
+                            data: bytes::Bytes::from(buf),
+                        })
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("voice encrypt task join error: {e}");
+                Vec::new()
+            })
+        };
+
+        if !batch.is_empty() {
+            let socket = server.get_udp_socket();
+            if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &batch).await {
+                tracing::warn!("UDP batch send error: {e}");
+            }
         }
     } else {
-        // TCP tunnel path — send each individually
+        // TCP tunnel path — encode and enqueue per recipient.  The per-user
+        // TCP send task drains the queue and writes serially to the TLS stream.
         for (client, audio) in targets {
             let format = if client.read_global_state().uses_protobuf() {
                 PacketFormat::Protobuf
@@ -276,8 +303,7 @@ async fn flush_voice_batch(
                 PacketFormat::Legacy
             };
             let raw = codec::encode_audio_packet(audio, format);
-            let message = crate::messages::Message::UDPTunnel(raw);
-            let _ = client.write_proto_message(&message).await;
+            client.try_enqueue_voice_tcp(raw);
         }
     }
 }
@@ -301,6 +327,44 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
         while let Some(payload) = rx.recv().await {
             let Some(sender) = weak_sender.upgrade() else { break };
             route_voice(&server, &sender, &payload.decoded_audio, payload.is_udp).await;
+        }
+    });
+}
+
+/// Spawn a per-user voice TCP send task.
+///
+/// Drains the per-user `voice_tcp` queue and writes each `UDPTunnel` payload
+/// to the TLS stream serially.  Decouples the routing fan-out from
+/// per-recipient TCP backpressure: if a recipient's TLS write is slow,
+/// only their own queue backs up (and ultimately drops), other recipients
+/// in the same fan-out are unaffected.
+///
+/// Holds a `Weak` reference to the client so the task does not prevent
+/// client drop; on a failed upgrade or a write error, the task exits.
+pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
+    let mut rx = match client.take_voice_tcp_rx() {
+        Some(rx) => rx,
+        None => {
+            tracing::warn!(
+                session = u32::from(client.get_session_id()),
+                "voice TCP send task already spawned"
+            );
+            return;
+        }
+    };
+    let weak_client = Arc::downgrade(&client);
+    tokio::spawn(async move {
+        while let Some(raw) = rx.recv().await {
+            let Some(client) = weak_client.upgrade() else { break };
+            let message = crate::messages::Message::UDPTunnel(raw);
+            if let Err(e) = client.write_proto_message(&message).await {
+                tracing::trace!(
+                    session = u32::from(client.get_session_id()),
+                    error = %e,
+                    "voice TCP send failed, terminating send task"
+                );
+                break;
+            }
         }
     });
 }

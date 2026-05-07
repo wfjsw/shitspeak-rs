@@ -229,7 +229,7 @@ fn decode_audio_protobuf(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
         target,
         sender_session: audio.sender_session,
         frame_number: audio.frame_number,
-        opus_data: Bytes::from(audio.opus_data),
+        opus_data: audio.opus_data,
         positional_data: audio.positional_data,
         // proto3 default 0.0 means the field is unset; normalise to 1.0 (no-op gain)
         // so downstream code never multiplies audio samples by zero.
@@ -389,23 +389,26 @@ fn encode_audio_protobuf(audio: &DecodedAudio) -> Bytes {
         header: Some(audio::Header::Context(audio.target)),
         sender_session: audio.sender_session,
         frame_number: audio.frame_number,
-        opus_data: audio.opus_data.to_vec(),
+        opus_data: audio.opus_data.clone(),
         positional_data: audio.positional_data.clone(),
         volume_adjustment: audio.volume_adjustment,
         is_terminator: audio.is_terminator,
     };
 
-    let proto_bytes = msg.encode_to_vec();
-    if 1 + proto_bytes.len() > 1024 {
+    let total_len = 1 + msg.encoded_len();
+    if total_len > 1024 {
         tracing::warn!(
-            len = 1 + proto_bytes.len(),
+            len = total_len,
             "protobuf voice packet exceeds MAX_UDP_PACKET_SIZE, dropping"
         );
         return Bytes::new();
     }
-    let mut buf = BytesMut::with_capacity(1 + proto_bytes.len());
+    let mut buf = BytesMut::with_capacity(total_len);
     buf.put_u8(0x00); // type = Audio
-    buf.extend_from_slice(&proto_bytes);
+    // Encode directly into `buf` — avoids the intermediate Vec that
+    // `encode_to_vec` + `extend_from_slice` would allocate and memcpy through.
+    msg.encode(&mut buf)
+        .expect("BytesMut has reserved capacity equal to encoded_len()");
     buf.freeze()
 }
 
@@ -427,7 +430,15 @@ fn encode_audio_legacy(audio: &DecodedAudio) -> Bytes {
     }
     let header = (0x04u8 << 5) | (audio.target as u8 & 0x1f); // VoiceOpus + target/context
 
-    let mut buf = BytesMut::new();
+    // Tight upper bound — single allocation, no growth realloc:
+    //   header(1) + sender_session_varint(≤4) + frame_number_varint(≤4)
+    //   + size_flag_varint(≤4) + opus_data + positional(0 or 12).
+    // `write_varint` clamps each varint to 4 bytes; positional is exactly
+    // 12 bytes when present.
+    let positional_len = if audio.positional_data.len() == 3 { 12 } else { 0 };
+    let cap = 1 + 4 + 4 + 4 + audio.opus_data.len() + positional_len;
+
+    let mut buf = BytesMut::with_capacity(cap);
     buf.put_u8(header);
     write_varint(&mut buf, audio.sender_session as u64);
     write_varint(&mut buf, audio.frame_number);
@@ -522,7 +533,7 @@ mod tests {
             header: Some(audio::Header::Target(0)),
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x01],
+            opus_data: Bytes::from_static(&[0x01]),
             positional_data: vec![],
             volume_adjustment: 0.0, // explicitly "unset"
             is_terminator: false,
@@ -543,7 +554,7 @@ mod tests {
             header: Some(audio::Header::Target(0)),
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x01],
+            opus_data: Bytes::from_static(&[0x01]),
             positional_data: vec![1.0, 2.0], // invalid: must be 0 or 3
             volume_adjustment: 0.0,
             is_terminator: false,
@@ -870,7 +881,7 @@ mod tests {
             header: Some(audio::Header::Target(0)),
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x01],
+            opus_data: Bytes::from_static(&[0x01]),
             positional_data: vec![1.0, 2.0, 3.0],
             volume_adjustment: 1.0,
             is_terminator: false,
@@ -890,7 +901,7 @@ mod tests {
             header: Some(audio::Header::Target(0)),
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x01],
+            opus_data: Bytes::from_static(&[0x01]),
             positional_data: vec![1.0],
             volume_adjustment: 1.0,
             is_terminator: false,
@@ -912,7 +923,7 @@ mod tests {
             header: Some(audio::Header::Target(0)),
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x01],
+            opus_data: Bytes::from_static(&[0x01]),
             positional_data: vec![1.0, 2.0, 3.0, 4.0],
             volume_adjustment: 1.0,
             is_terminator: false,
@@ -935,7 +946,7 @@ mod tests {
             header: Some(audio::Header::Target(0)),
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x01],
+            opus_data: Bytes::from_static(&[0x01]),
             positional_data: vec![],
             volume_adjustment: 0.5,
             is_terminator: false,
@@ -956,7 +967,7 @@ mod tests {
             header: None,
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x01],
+            opus_data: Bytes::from_static(&[0x01]),
             positional_data: vec![],
             volume_adjustment: 1.0,
             is_terminator: false,
@@ -1052,7 +1063,7 @@ mod tests {
             header: Some(audio::Header::Target(0)),
             sender_session: 1,
             frame_number: 0,
-            opus_data: vec![0x01],
+            opus_data: Bytes::from_static(&[0x01]),
             positional_data: vec![1.0, 2.0], // invalid: 2 floats
             volume_adjustment: 1.0,
             is_terminator: false,

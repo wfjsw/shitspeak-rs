@@ -15,4 +15,5 @@ pub mod udp_batch;
 
 pub use routing::route_voice;
 pub use routing::spawn_voice_routing_task;
+pub use routing::spawn_voice_tcp_task;
 pub use routing_queue::VoiceRoutingPayload;

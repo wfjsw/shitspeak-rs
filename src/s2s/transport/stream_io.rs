@@ -230,7 +230,7 @@ async fn run_pump<S>(
                     out.class(),
                     peer.next_seq(),
                     now_us(),
-                    out.payload().to_vec(),
+                    out.payload().clone(),
                 );
                 if let Err(e) = encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
                     warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream write failed");
@@ -248,7 +248,7 @@ async fn run_pump<S>(
                     MessageClass::Regular,
                     peer.next_seq(),
                     ts,
-                    Vec::new(),
+                    Bytes::new(),
                 );
                 match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
                     Ok(sent) => pending.insert(ts, sent),
@@ -261,7 +261,7 @@ async fn run_pump<S>(
 
             _ = probe_tick.tick() => {
                 let ts = now_us();
-                let payload = vec![0u8; cfg.bandwidth_probe_size];
+                let payload = BytesMut::zeroed(cfg.bandwidth_probe_size).freeze();
                 let frame = build_frame(
                     cfg.local_node,
                     cfg.peer_node,
@@ -346,7 +346,7 @@ where
                 level,
                 cfg.transport,
                 class,
-                Bytes::from(frame.payload),
+                frame.payload,
             ));
         }
         pb::FrameType::FramePing => {

@@ -172,7 +172,7 @@ pub fn build_frame(
     class: MessageClass,
     seq: u32,
     ts_us: u64,
-    payload: Vec<u8>,
+    payload: Bytes,
 ) -> Frame {
     Frame {
         src_node: node_to_wire(src),
@@ -190,7 +190,7 @@ pub fn build_frame(
 mod tests {
     use super::*;
 
-    fn roundtrip_frame(payload: Vec<u8>) {
+    fn roundtrip_frame(payload: Bytes) {
         let f = build_frame(
             42,
             7,
@@ -222,17 +222,17 @@ mod tests {
 
     #[test]
     fn roundtrip_empty() {
-        roundtrip_frame(vec![]);
+        roundtrip_frame(Bytes::new());
     }
 
     #[test]
     fn roundtrip_small() {
-        roundtrip_frame(b"hello world".to_vec());
+        roundtrip_frame(Bytes::from_static(b"hello world"));
     }
 
     #[test]
     fn roundtrip_large() {
-        roundtrip_frame(vec![0xab; 64 * 1024]);
+        roundtrip_frame(Bytes::from(vec![0xab; 64 * 1024]));
     }
 
     #[test]

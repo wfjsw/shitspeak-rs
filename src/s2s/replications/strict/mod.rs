@@ -12,6 +12,7 @@ pub mod runtime;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::oneshot;
 
@@ -53,7 +54,7 @@ pub trait StrictReplicable: Send + Sync + 'static {
 
     /// Atomic snapshot. Returns `(version, msgpack_bytes)` where `version`
     /// matches the applied state captured by `msgpack_bytes`.
-    fn snapshot(&self) -> (u64, Vec<u8>);
+    fn snapshot(&self) -> (u64, Bytes);
 
     /// Ops with version in `(since, current_version]`. Returns
     /// `LogSlice::TooOld` when the structure can no longer satisfy from its
@@ -66,7 +67,7 @@ pub trait StrictReplicable: Send + Sync + 'static {
     async fn apply_committed(&self, version: u64, op: Self::Op);
 
     /// Replace local state with the supplied snapshot.
-    async fn install_snapshot(&self, version: u64, snapshot: Vec<u8>);
+    async fn install_snapshot(&self, version: u64, snapshot: Bytes);
 }
 
 /// Caller-facing handle for a strict topic. Cloning is cheap (internally an

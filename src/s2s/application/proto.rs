@@ -89,7 +89,7 @@ mod tests {
             s2s_seq: 42,
             target_kind: 0,
             is_terminator: false,
-            payload: vec![1, 2, 3, 4, 5],
+            payload: Bytes::from_static(&[1, 2, 3, 4, 5]),
         };
         let bytes = encode_voice(&frame).unwrap();
         let decoded = decode_voice(&bytes).unwrap();

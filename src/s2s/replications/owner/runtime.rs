@@ -286,7 +286,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
     /// Local-side propose. Broadcasts first, then applies locally — see
     /// the trait doc for why.
     pub async fn propose_local(self: Arc<Self>, op: R::Op) -> Result<u64, ReplicationError> {
-        let op_msgpack = rmp_serde::to_vec(&op)?;
+        let op_msgpack = Bytes::from(rmp_serde::to_vec(&op)?);
         let version = self.local_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
         let body = OwnerBody::Op(OwnerOp {
@@ -557,7 +557,7 @@ mod tests {
             origin_node: origin as u32,
             origin_epoch: epoch,
             origin_version: ver,
-            op_msgpack: vec![],
+            op_msgpack: Bytes::new(),
         }
     }
 

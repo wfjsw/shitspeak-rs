@@ -52,8 +52,8 @@ pub const REPLICATION_SERVICE_TAG: u32 = 1;
 mod tests {
     use super::*;
 
-    fn pretend_msgpack(n: u8) -> Vec<u8> {
-        vec![n; 64]
+    fn pretend_msgpack(n: u8) -> Bytes {
+        Bytes::from(vec![n; 64])
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
             "channels",
             StrictBody::CatchupResp(StrictCatchupResp {
                 snapshot_version: 0,
-                snapshot_msgpack: vec![],
+                snapshot_msgpack: Bytes::new(),
                 ops: vec![
                     CatchupOp {
                         version: 6,
@@ -237,7 +237,7 @@ mod tests {
                 origin_node: 5,
                 origin_epoch: 100_000,
                 snapshot_version: 0,
-                snapshot_msgpack: vec![],
+                snapshot_msgpack: Bytes::new(),
                 ops: vec![CatchupOp {
                     version: 1,
                     op_msgpack: pretend_msgpack(0x11),
@@ -338,7 +338,7 @@ mod tests {
                 op_id_hi: 0,
                 op_id_lo: 1,
                 ts_propose: 1,
-                op_msgpack: blob.clone(),
+                op_msgpack: Bytes::from(blob.clone()),
                 src_clock: 1,
             }),
         );

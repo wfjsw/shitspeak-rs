@@ -334,7 +334,7 @@ mod tests {
             s2s_seq: seq,
             target_kind: 0,
             is_terminator: terminator,
-            payload: Bytes::from(format!("p-{seq}").into_bytes()).to_vec(),
+            payload: Bytes::from(format!("p-{seq}").into_bytes()),
         }
     }
 

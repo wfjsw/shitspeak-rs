@@ -292,7 +292,7 @@ async fn run_write(
                     out.class(),
                     peer.next_seq(),
                     now_us(),
-                    out.payload().to_vec(),
+                    out.payload().clone(),
                 );
                 if let Err(e) = send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
                     warn!(peer=%peer.node_id(), error=%e, "udp dtls write failed");
@@ -305,7 +305,7 @@ async fn run_write(
                 let frame = build_frame(
                     inner.self_id(), peer.node_id(), level,
                     FrameType::Ping, MessageClass::Regular,
-                    peer.next_seq(), ts, Vec::new(),
+                    peer.next_seq(), ts, Bytes::new(),
                 );
                 match send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
                     Ok(sent) => pending.lock().insert(ts, sent),
@@ -317,7 +317,7 @@ async fn run_write(
                 let ts = now_us();
                 let max_probe_payload = inner.cfg().udp_mtu().saturating_sub(128).min(inner.cfg().bandwidth_probe_size());
                 if max_probe_payload == 0 { continue; }
-                let payload = vec![0u8; max_probe_payload];
+                let payload = bytes::BytesMut::zeroed(max_probe_payload).freeze();
                 let frame = build_frame(
                     inner.self_id(), peer.node_id(), level,
                     FrameType::Ping, MessageClass::Regular,
@@ -383,7 +383,7 @@ async fn handle_frame(
                 level,
                 TransportKind::Udp,
                 class,
-                Bytes::from(frame.payload),
+                frame.payload,
             ));
         }
         pb::FrameType::FramePing => {

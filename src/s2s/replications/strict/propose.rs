@@ -75,7 +75,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             op_id_hi: op_id.0,
             op_id_lo: op_id.1,
             ts_propose,
-            op_msgpack: op_msgpack.to_vec(),
+            op_msgpack,
             src_clock,
         });
         if !dsts.is_empty() {

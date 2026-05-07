@@ -41,6 +41,7 @@ use crate::{
 };
 
 const VOICE_ROUTING_QUEUE_CAPACITY: usize = 256;
+const VOICE_TCP_QUEUE_CAPACITY: usize = 256;
 
 pub struct Client {
     session_id: ClientSessionIdentifier,
@@ -71,6 +72,13 @@ pub struct Client {
     crypt_state: ParkingMutex<Option<CryptState>>,
     voice_routing_tx: mpsc::Sender<VoiceRoutingPayload>,
     voice_routing_rx: ParkingMutex<Option<mpsc::Receiver<VoiceRoutingPayload>>>,
+    /// Per-user outgoing TCP voice tunnel queue.  The routing task pushes raw
+    /// `UDPTunnel` payload bytes here without awaiting the TCP write; a
+    /// dedicated per-user task drains the queue and writes them to the TLS
+    /// stream serially.  This decouples the routing fan-out from per-recipient
+    /// TCP backpressure.
+    voice_tcp_tx: mpsc::Sender<Bytes>,
+    voice_tcp_rx: ParkingMutex<Option<mpsc::Receiver<Bytes>>>,
 
     /// Whether this client has been published to the log (i.e. `AddClient`
     /// has been emitted).  Only published clients generate `RemoveClient`
@@ -122,6 +130,8 @@ impl Client {
 
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
+        let (voice_tcp_tx, voice_tcp_rx) =
+            mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
 
         let (connection_rx, connection_tx) = tokio::io::split(connection);
 
@@ -147,6 +157,8 @@ impl Client {
             crypt_state: ParkingMutex::new(None),
             voice_routing_tx,
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
+            voice_tcp_tx,
+            voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
             published: AtomicBool::new(false),
             prefer_tcp_tunnel: AtomicBool::new(false),
             last_client_version: ParkingMutex::new(HashMap::new()),
@@ -373,6 +385,43 @@ impl Client {
     /// `spawn_voice_routing_task`; returns `None` on any subsequent call.
     pub fn take_voice_routing_rx(&self) -> Option<mpsc::Receiver<VoiceRoutingPayload>> {
         self.voice_routing_rx.lock().take()
+    }
+
+    /// Enqueue an already-encoded `UDPTunnel` payload for transmission to
+    /// this client over its TCP voice tunnel.  Non-blocking: returns
+    /// immediately, dropping the packet if the queue is full or closed.
+    ///
+    /// In debug builds a full queue triggers a `debug_assert!` panic since it
+    /// indicates the per-user TCP send task is not keeping up; in release
+    /// builds the packet is silently dropped (voice is realtime, backlog is
+    /// worse than loss).
+    pub fn try_enqueue_voice_tcp(&self, raw: Bytes) {
+        match self.voice_tcp_tx.try_send(raw) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug_assert!(
+                    false,
+                    "voice TCP queue full for session {}",
+                    u32::from(self.session_id)
+                );
+                tracing::trace!(
+                    session = u32::from(self.session_id),
+                    "voice TCP queue full, dropping packet"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::trace!(
+                    session = u32::from(self.session_id),
+                    "voice TCP queue closed, dropping packet"
+                );
+            }
+        }
+    }
+
+    /// Take the receiver half of the voice TCP send queue.  Called once by
+    /// `spawn_voice_tcp_task`; returns `None` on any subsequent call.
+    pub fn take_voice_tcp_rx(&self) -> Option<mpsc::Receiver<Bytes>> {
+        self.voice_tcp_rx.lock().take()
     }
 
     pub async fn write_stats(&self) -> RwLockWriteGuard<'_, ClientStats> {

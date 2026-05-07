@@ -1,6 +1,24 @@
 use std::{io::Result, process::Command};
 fn main() -> Result<()> {
-    prost_build::compile_protos(
+    let mut config = prost_build::Config::new();
+    // Generate `bytes::Bytes` instead of `Vec<u8>` for opaque-blob fields on
+    // hot paths so cloning becomes an Arc-bump and decode→forward chains do
+    // not need Vec↔Bytes wrappers:
+    //   - voice packets (opus payload, S2S voice envelope)
+    //   - every S2S transport / overlay envelope payload
+    //   - replication op/snapshot blobs (msgpack-encoded, sometimes large)
+    //   - user-stats cert chain (Vec↔Bytes loop in encoder)
+    // Package-level entry `.s2s_replication` covers all op_msgpack /
+    // snapshot_msgpack fields in that package.
+    config.bytes([
+        ".MumbleUDP.Audio.opus_data",
+        ".MumbleProto.UserStats.certificates",
+        ".s2s_transport.Frame.payload",
+        ".s2s_overlay.OverlayData.payload",
+        ".s2s_application.VoiceFrame.payload",
+        ".s2s_replication",
+    ]);
+    config.compile_protos(
         &[
             "src/protos/Mumble.proto",
             "src/protos/MumbleUDP.proto",

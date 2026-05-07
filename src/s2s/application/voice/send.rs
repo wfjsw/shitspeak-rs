@@ -108,7 +108,7 @@ pub fn build_envelope(
         s2s_seq,
         target_kind,
         is_terminator,
-        payload: payload.to_vec(),
+        payload,
     };
     proto::encode_voice(&frame)
 }

@@ -48,7 +48,7 @@ pub async fn originate(
         service_tag: tag,
         service_level: level_to_wire(level),
         message_class: class_to_wire(class),
-        payload: body.to_vec(),
+        payload: body,
     };
     forward_pb(transport, routing, self_id, data, class, /*is_originator=*/ true).await
 }
@@ -75,7 +75,7 @@ pub async fn handle_inbound(
             src,
             level,
             class,
-            Bytes::from(data.payload.clone()),
+            data.payload.clone(),
         );
     }
     // Forward the remainder if any.

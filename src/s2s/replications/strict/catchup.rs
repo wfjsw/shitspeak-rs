@@ -7,6 +7,7 @@
 //! re-issuing requests with `since_version = repo.current_version()` until
 //! `has_more = false`.
 
+use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
@@ -24,7 +25,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     req: StrictCatchupReq,
 ) {
     let mut snapshot_version = 0u64;
-    let mut snapshot_msgpack: Vec<u8> = Vec::new();
+    let mut snapshot_msgpack: Bytes = Bytes::new();
     let mut too_old_use_snapshot = false;
 
     let (effective_ops, _effective_since) = match rt.repo.log_since(req.since_version) {
@@ -48,7 +49,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         match rmp_serde::to_vec(op) {
             Ok(b) => catchup_ops.push(CatchupOp {
                 version: *v,
-                op_msgpack: b,
+                op_msgpack: Bytes::from(b),
             }),
             Err(e) => {
                 warn!(error=%e, "catchup op msgpack encode failed; skipping");

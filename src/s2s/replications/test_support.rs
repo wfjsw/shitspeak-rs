@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use parking_lot::Mutex;
 
 use super::error::ReplicationError;
@@ -240,10 +241,10 @@ impl StrictReplicable for CountingStrictRepo {
         self.state.lock().0
     }
 
-    fn snapshot(&self) -> (u64, Vec<u8>) {
+    fn snapshot(&self) -> (u64, Bytes) {
         let s = self.state.lock();
         let v = s.0;
-        let bytes = rmp_serde::to_vec(&s.1).unwrap_or_default();
+        let bytes = Bytes::from(rmp_serde::to_vec(&s.1).unwrap_or_default());
         (v, bytes)
     }
 
@@ -259,7 +260,7 @@ impl StrictReplicable for CountingStrictRepo {
         s.1.push((version, op));
     }
 
-    async fn install_snapshot(&self, version: u64, snapshot: Vec<u8>) {
+    async fn install_snapshot(&self, version: u64, snapshot: Bytes) {
         let entries: Vec<(u64, u64)> = rmp_serde::from_slice(&snapshot).unwrap_or_default();
         let mut s = self.state.lock();
         s.0 = version;
@@ -316,10 +317,10 @@ impl OwnerReplicable for CountingOwnerRepo {
             .collect()
     }
 
-    fn snapshot_for_origin(&self, origin: NodeIdentifier) -> Option<(u64, u64, Vec<u8>)> {
+    fn snapshot_for_origin(&self, origin: NodeIdentifier) -> Option<(u64, u64, Bytes)> {
         let s = self.state.lock();
         s.get(&origin).map(|(e, v, log)| {
-            let bytes = rmp_serde::to_vec(log).unwrap_or_default();
+            let bytes = Bytes::from(rmp_serde::to_vec(log).unwrap_or_default());
             (*e, *v, bytes)
         })
     }
@@ -348,7 +349,7 @@ impl OwnerReplicable for CountingOwnerRepo {
         origin: NodeIdentifier,
         epoch: u64,
         version: u64,
-        snapshot: Vec<u8>,
+        snapshot: Bytes,
     ) {
         let log: Vec<(u64, u64)> = rmp_serde::from_slice(&snapshot).unwrap_or_default();
         let mut s = self.state.lock();
@@ -435,7 +436,7 @@ mod e2e_tests {
                 op_id_hi: 1,
                 op_id_lo: 1,
                 ts_propose: 50,
-                op_msgpack: rmp_serde::to_vec(&7u64).unwrap(),
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&7u64).unwrap()),
                 src_clock: 50,
             },
         )
@@ -500,7 +501,7 @@ mod e2e_tests {
                 origin_node: 2,
                 origin_epoch: 200,
                 origin_version: 5,
-                op_msgpack: rmp_serde::to_vec(&77u64).unwrap(),
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&77u64).unwrap()),
             },
         )
         .await;
@@ -548,7 +549,7 @@ mod e2e_tests {
                 origin_node: 2,
                 origin_epoch: 11,
                 origin_version: 1,
-                op_msgpack: rmp_serde::to_vec(&999u64).unwrap(),
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&999u64).unwrap()),
             },
         )
         .await;

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::error::ReplicationError;
@@ -54,7 +55,7 @@ pub trait OwnerReplicable: Send + Sync + 'static {
 
     /// Atomic snapshot of `origin`'s state. Returns
     /// `(epoch, version, msgpack_bytes)`. `None` if the origin is unknown.
-    fn snapshot_for_origin(&self, origin: NodeIdentifier) -> Option<(u64, u64, Vec<u8>)>;
+    fn snapshot_for_origin(&self, origin: NodeIdentifier) -> Option<(u64, u64, Bytes)>;
 
     /// Ops for `origin` in `(since, current]`. `LogSlice::TooOld` triggers
     /// a snapshot fallback in the runtime.
@@ -70,7 +71,7 @@ pub trait OwnerReplicable: Send + Sync + 'static {
         origin: NodeIdentifier,
         epoch: u64,
         version: u64,
-        snapshot: Vec<u8>,
+        snapshot: Bytes,
     );
 
     /// Called whenever the runtime detects a strictly-greater epoch for

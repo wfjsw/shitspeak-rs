@@ -682,7 +682,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 op_id_hi: op_id.0,
                 op_id_lo: op_id.1,
                 ts_final,
-                op_msgpack: op_bytes.to_vec(),
+                op_msgpack: op_bytes,
                 src_clock: clock_now,
             });
             Some((body, dsts))
@@ -801,7 +801,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             committed_ts_final,
             has_op,
             ts_local,
-            op_msgpack: op_msgpack.to_vec(),
+            op_msgpack,
             src_clock,
         });
         if let Err(e) = self.net.send_unicast(takeover, &self.topic, body).await {
@@ -836,7 +836,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     committed_ts_final: ack.committed_ts_final,
                     has_op: ack.has_op,
                     ts_local: ack.ts_local,
-                    op_msgpack: Bytes::from(ack.op_msgpack),
+                    op_msgpack: ack.op_msgpack,
                 },
             );
             let rq = recovery_quorum_size(rec.target_set.len());
@@ -949,7 +949,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             op_id_hi: op_id.0,
             op_id_lo: op_id.1,
             ts_final,
-            op_msgpack: op_msgpack.to_vec(),
+            op_msgpack,
             src_clock: clock_now,
         });
         if !dsts.is_empty() {
@@ -1136,7 +1136,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 committed_ts_final: self_ack.committed_ts_final,
                 has_op: self_ack.has_op,
                 ts_local: self_ack.ts_local,
-                op_msgpack: self_ack.op_msgpack.to_vec(),
+                op_msgpack: self_ack.op_msgpack.clone(),
                 src_clock: 0,
             }
         };

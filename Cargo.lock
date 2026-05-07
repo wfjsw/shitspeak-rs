@@ -3308,6 +3308,7 @@ dependencies = [
  "prost-types",
  "quinn",
  "rand 0.8.6",
+ "rayon",
  "rcgen",
  "reqwest",
  "rmp-serde",

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::time::timeout;
 
 use super::super::error::ReplicationError;
@@ -325,7 +326,7 @@ async fn owner_remote_propose_dropped_with_warntrace() {
     // Build the forged frame on C's side: OwnerOp{origin=B, ...}.
     let b_id = cluster.cluster.nodes[1].overlay.local_node_id();
     let b_epoch = cluster.cluster.nodes[1].overlay.local_boot_epoch();
-    let op_msgpack = rmp_serde::to_vec(&123u64).unwrap();
+    let op_msgpack = Bytes::from(rmp_serde::to_vec(&123u64).unwrap());
     let body = OwnerBody::Op(OwnerOp {
         origin_node: b_id as u32,
         origin_epoch: b_epoch,

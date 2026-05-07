@@ -3,6 +3,7 @@
 //! Same chunking model as strict catchup: stateless server-side, client
 //! re-issues with `since_version = repo.known_versions()[origin].1`.
 
+use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
@@ -37,7 +38,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
                         origin_node: origin as u32,
                         origin_epoch: 0,
                         snapshot_version: 0,
-                        snapshot_msgpack: vec![],
+                        snapshot_msgpack: Bytes::new(),
                         ops: vec![],
                         has_more: false,
                         next_chunk_token: 0,
@@ -50,7 +51,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
     };
 
     let mut snapshot_version = 0u64;
-    let mut snapshot_msgpack: Vec<u8> = Vec::new();
+    let mut snapshot_msgpack: Bytes = Bytes::new();
     let mut too_old_use_snapshot = false;
 
     let effective_ops: Vec<(u64, R::Op)> = match rt.repo.log_for_origin(origin, req.since_version)
@@ -80,7 +81,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
         match rmp_serde::to_vec(op) {
             Ok(b) => catchup_ops.push(CatchupOp {
                 version: *v,
-                op_msgpack: b,
+                op_msgpack: Bytes::from(b),
             }),
             Err(e) => warn!(error=%e, "owner catchup op encode failed; skipping"),
         }

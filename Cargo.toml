@@ -49,6 +49,7 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 rand = { version = "0.8", features = ["small_rng"] }
 arc-swap = "1"
 rmp-serde = "1"
+rayon = "1"
 
 [build-dependencies]
 chrono = "0.4.41"

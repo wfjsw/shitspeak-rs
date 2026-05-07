@@ -63,6 +63,17 @@ pub struct ClientRegister {
     pending_remote_ops: VecDeque<(Arc<ClientStateLogEntry>, u64)>,
     /// The effective dep of the last entry in `pending_remote_ops` (0 if empty).
     last_pending_effective_dep: u64,
+
+    // ── Channel membership index (LOCAL clients only) ───────────────────
+    // Used by voice routing to find recipients on this node.  Remote
+    // clients are deliberately excluded — they receive voice via S2S
+    // cross-node delivery routed by their owning node.
+    /// Maps channel_id → set of local session IDs currently in that channel.
+    clients_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
+    /// Reverse map: local session_id → current channel_id, for O(1) index moves.
+    client_channel: HashMap<ClientSessionIdentifier, u32>,
+    /// Maps channel_id → set of local session IDs listening to that channel.
+    listeners_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
 }
 
 impl ClientRegister {
@@ -88,6 +99,65 @@ impl ClientRegister {
             .chain(self.remote_clients.values().flat_map(|m| m.values()))
     }
 
+    /// Insert a client into the channel index.
+    fn channel_index_insert(&mut self, id: ClientSessionIdentifier, channel_id: u32) {
+        self.client_channel.insert(id, channel_id);
+        self.clients_by_channel.entry(channel_id).or_default().insert(id);
+    }
+
+    /// Move a client from its current channel to `new_channel` in the index.
+    fn channel_index_move(&mut self, id: ClientSessionIdentifier, new_channel: u32) {
+        let old = self.client_channel.get(&id).copied();
+        if old == Some(new_channel) {
+            return;
+        }
+        if let Some(old_ch) = old {
+            if let Some(set) = self.clients_by_channel.get_mut(&old_ch) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.clients_by_channel.remove(&old_ch);
+                }
+            }
+        }
+        self.client_channel.insert(id, new_channel);
+        self.clients_by_channel.entry(new_channel).or_default().insert(id);
+    }
+
+    /// Remove a client from the channel index entirely.
+    fn channel_index_remove(&mut self, id: &ClientSessionIdentifier) {
+        if let Some(old_ch) = self.client_channel.remove(id) {
+            if let Some(set) = self.clients_by_channel.get_mut(&old_ch) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.clients_by_channel.remove(&old_ch);
+                }
+            }
+        }
+    }
+
+    /// Add `id` as a listener for `channel_id`.
+    fn listener_index_add(&mut self, id: ClientSessionIdentifier, channel_id: u32) {
+        self.listeners_by_channel.entry(channel_id).or_default().insert(id);
+    }
+
+    /// Remove `id` from the listener set for a specific channel.
+    fn listener_index_remove_channel(&mut self, id: &ClientSessionIdentifier, channel_id: u32) {
+        if let Some(set) = self.listeners_by_channel.get_mut(&channel_id) {
+            set.remove(id);
+            if set.is_empty() {
+                self.listeners_by_channel.remove(&channel_id);
+            }
+        }
+    }
+
+    /// Remove `id` from all listener sets (called on disconnect).
+    fn listener_index_remove_all(&mut self, id: &ClientSessionIdentifier) {
+        self.listeners_by_channel.retain(|_, set| {
+            set.remove(id);
+            !set.is_empty()
+        });
+    }
+
     /// Iterate over all client entries (local + remote).
     fn all_entries(&self) -> impl Iterator<Item = (&ClientSessionIdentifier, &Arc<Box<Client>>)> {
         self.local_clients
@@ -111,6 +181,9 @@ impl ClientRepository {
                 versions: HashMap::new(),
                 pending_remote_ops: VecDeque::new(),
                 last_pending_effective_dep: 0,
+                clients_by_channel: HashMap::new(),
+                client_channel: HashMap::new(),
+                listeners_by_channel: HashMap::new(),
             }),
             clients_by_host: ParkingRwLock::new(HashMap::new()),
             clients_by_udp_address: ParkingRwLock::new(HashMap::new()),
@@ -169,6 +242,7 @@ impl ClientRepository {
         register
             .local_clients
             .insert(client_identifier, Arc::clone(&client));
+        register.channel_index_insert(client_identifier, 0); // root channel until auth sets it
 
         if let Some(udp_address) = udp_address {
             client_by_udp_address_guard.insert(udp_address, client_identifier);
@@ -239,6 +313,9 @@ impl ClientRepository {
             // Ensure version/log entries exist for this node
             register.versions.entry(node_id).or_insert(0);
             register.remote_logs.entry(node_id).or_default();
+            // NOTE: remote clients are intentionally NOT added to the channel
+            // index — voice routing only targets local clients (remote
+            // clients receive audio via S2S from their owning node).
         }
 
         // ── Log the operation ───────────────────────────────────────────
@@ -283,6 +360,11 @@ impl ClientRepository {
             } else {
                 return None;
             };
+
+            // The index only tracks local clients — these calls are no-ops
+            // for remote clients but still safe to run unconditionally.
+            register.channel_index_remove(&id);
+            register.listener_index_remove_all(&id);
 
             if client.get_node_id() == self.local_node_id {
                 // Remove any UDP address dynamically bound to this session (may
@@ -459,6 +541,45 @@ impl ClientRepository {
     /// Return a snapshot of all currently-connected clients (including unauthenticated).
     pub async fn get_all_clients(&self) -> Vec<Arc<Box<Client>>> {
         self.register.read().await.all_clients().cloned().collect()
+    }
+
+    /// Return **local** clients currently in `channel_id` via the channel
+    /// index. Remote clients are not tracked here — voice for them is
+    /// delivered to their owning node over S2S.
+    pub async fn get_local_clients_in_channel(&self, channel_id: u32) -> Vec<Arc<Box<Client>>> {
+        let register = self.register.read().await;
+        let ids = match register.clients_by_channel.get(&channel_id) {
+            Some(s) => s.iter().cloned().collect::<Vec<_>>(),
+            None => return Vec::new(),
+        };
+        ids.iter().filter_map(|id| register.get(id).cloned()).collect()
+    }
+
+    /// Return **local** clients currently in any of the given `channel_ids`
+    /// in a single lock acquisition.
+    pub async fn get_local_clients_in_channels(&self, channel_ids: &[u32]) -> Vec<Arc<Box<Client>>> {
+        let register = self.register.read().await;
+        let mut result = Vec::new();
+        for &ch_id in channel_ids {
+            if let Some(ids) = register.clients_by_channel.get(&ch_id) {
+                for id in ids {
+                    if let Some(c) = register.get(id) {
+                        result.push(c.clone());
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Return **local** clients that have subscribed to listen to `channel_id`.
+    pub async fn get_local_listeners_for_channel(&self, channel_id: u32) -> Vec<Arc<Box<Client>>> {
+        let register = self.register.read().await;
+        let ids = match register.listeners_by_channel.get(&channel_id) {
+            Some(s) => s.iter().cloned().collect::<Vec<_>>(),
+            None => return Vec::new(),
+        };
+        ids.iter().filter_map(|id| register.get(id).cloned()).collect()
     }
 
     pub async fn len(&self) -> usize {
@@ -707,6 +828,8 @@ impl ClientRepository {
                 tracing::debug!("remote AddClient {session_id:?} v{}", op.version);
             }
             ClientStateOperation::RemoveClient { session_id } => {
+                // Remote clients are not in the channel/listener index, so
+                // no index cleanup is necessary here.
                 if let Some(remote_map) = register.remote_clients.get_mut(&remote_node) {
                     remote_map.remove(session_id);
                     if remote_map.is_empty() {
@@ -721,6 +844,9 @@ impl ClientRepository {
                 sender_session_id: _,
                 delta,
             } => {
+                // Remote-only path: do NOT touch the local channel/listener
+                // index — those exist solely for routing voice to local
+                // recipients on this node.
                 let client = register.get(session_id).cloned();
                 if let Some(client) = client {
                     let mut gs = client.write_global_state_direct();
@@ -758,6 +884,25 @@ impl ClientRepository {
                 Ok(r) => r,
                 Err(_) => return, // deadlock avoidance in Drop contexts
             };
+
+            // Update channel/listener indices for any state change, before the
+            // early-return for unpublished clients (the index is local state,
+            // not propagated over the log).
+            if let ClientStateOperation::UpdateGlobalState { session_id, delta, .. } = &op {
+                if let Some(new_ch) = delta.current_channel_id {
+                    register.channel_index_move(*session_id, new_ch);
+                }
+                if let Some(ref adds) = delta.listening_channel_add {
+                    for &ch in adds {
+                        register.listener_index_add(*session_id, ch);
+                    }
+                }
+                if let Some(ref removes) = delta.listening_channel_remove {
+                    for &ch in removes {
+                        register.listener_index_remove_channel(session_id, ch);
+                    }
+                }
+            }
 
             // Suppress log entries and broadcasts for UpdateGlobalState on
             // unpublished clients.  The in-memory write has already happened;

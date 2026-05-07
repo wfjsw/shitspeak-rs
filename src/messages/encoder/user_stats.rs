@@ -30,7 +30,7 @@ impl From<crate::mumble_proto::UserStats> for UserStats {
         Self {
             session: proto.session,
             stats_only: proto.stats_only,
-            certificates: proto.certificates.into_iter().map(Bytes::from).collect(),
+            certificates: proto.certificates,
             from_client: proto.from_client,
             from_server: proto.from_server,
             udp_packets: proto.udp_packets,
@@ -84,7 +84,7 @@ impl Into<crate::mumble_proto::UserStats> for UserStats {
         crate::mumble_proto::UserStats {
             session: self.session,
             stats_only: self.stats_only,
-            certificates: self.certificates.into_iter().map(|b| b.to_vec()).collect(),
+            certificates: self.certificates,
             from_client: self.from_client,
             from_server: self.from_server,
             udp_packets: self.udp_packets,
