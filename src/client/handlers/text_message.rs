@@ -21,23 +21,31 @@ pub async fn handle_text_message(
     let sender_session = u32::from(sender.get_session_id());
     tracing::debug!(session = sender_session, channels = ?msg.channel_id, trees = ?msg.tree_id, targets = ?msg.session, "TextMessage handler");
 
-    // Relay as-is but stamp the actor session.
+    // Relay as-is but stamp the actor session. `msg` is owned, so move the
+    // routing fields and message body into the relay rather than cloning.
+    let TextMessage { session, channel_id, tree_id, message, .. } = msg;
     let relay: Message = TextMessage {
         actor: Some(sender_session),
-        session: msg.session.clone(),
-        channel_id: msg.channel_id.clone(),
-        tree_id: msg.tree_id.clone(),
-        message: msg.message.clone(),
+        session,
+        channel_id,
+        tree_id,
+        message,
     }.into();
 
+    // Pull the routing target slices back out of the relay so we can iterate
+    // them without re-cloning.
+    let Message::TextMessage(ref relay_inner) = relay else {
+        unreachable!("relay was just constructed from TextMessage");
+    };
+
     // Direct messages: send to each target session
-    for target_session in &msg.session {
+    for target_session in &relay_inner.session {
         let session_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(*target_session);
         server.get_clients().send_to(session_id, &relay).await;
     }
 
     // Channel messages: send to all users in the target channels
-    for channel_id in &msg.channel_id {
+    for channel_id in &relay_inner.channel_id {
         let all_clients = server.get_clients().get_all_clients().await;
         for client in &all_clients {
             if client.get_session_id() == sender.get_session_id() {
@@ -50,7 +58,7 @@ pub async fn handle_text_message(
     }
 
     // Tree messages: send to all users in channel subtrees
-    for root_channel_id in &msg.tree_id {
+    for root_channel_id in &relay_inner.tree_id {
         let channel_ids = collect_subtree_ids(server, *root_channel_id).await;
         let all_clients = server.get_clients().get_all_clients().await;
         for client in &all_clients {

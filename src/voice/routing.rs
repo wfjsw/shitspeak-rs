@@ -49,9 +49,12 @@ pub async fn route_voice(
         "routing voice packet"
     );
 
-    // Build the outgoing audio data (server → client format)
-    let outgoing = DecodedAudio {
-        target: 0, // will be overridden per-recipient
+    // Build the outgoing audio data (server → client format) and share it
+    // across recipients via Arc — only the per-recipient target context
+    // differs, so we avoid cloning the full struct (and the positional_data
+    // Vec when present) for every listener.
+    let outgoing = Arc::new(DecodedAudio {
+        target: 0, // unused — target is passed separately per recipient
         sender_session: u32::from(sender_id),
         frame_number: audio.frame_number,
         opus_data: audio.opus_data.clone(),
@@ -59,15 +62,15 @@ pub async fn route_voice(
         volume_adjustment: 0.0,
         is_terminator: audio.is_terminator,
         format: audio.format,
-    };
+    });
 
-    // Collect (client, audio) pairs for batched sending
-    let mut targets: Vec<(Arc<Box<Client>>, DecodedAudio)> = Vec::new();
+    // Collect (client, target_context) pairs for batched sending. The audio
+    // payload is shared via the `outgoing` Arc.
+    let mut targets: Vec<(Arc<Box<Client>>, u32)> = Vec::new();
 
     // Pre-encoded payload for cross-node delivery (NORMAL channel speech
-    // only). Built up front while `outgoing` is still owned. Receivers
-    // decode and re-target per local recipient, so we encode with the
-    // speaker's chosen format and `target = 0`.
+    // only). Receivers decode and re-target per local recipient, so we
+    // encode with the speaker's chosen format and `target = 0`.
     let mut s2s_payload: Option<bytes::Bytes> = None;
 
     if target == 0 {
@@ -77,7 +80,7 @@ pub async fn route_voice(
             "routing normal channel speech"
         );
 
-        s2s_payload = Some(codec::encode_audio_packet(&outgoing, audio.format));
+        s2s_payload = Some(codec::encode_audio_packet(&outgoing, 0, audio.format));
 
         // ── Normal speech: channel members (local only) ─────────────────
         // Remote clients in the same channel are reached via S2S delivery,
@@ -90,7 +93,7 @@ pub async fn route_voice(
             if !client.is_authenticated() {
                 continue;
             }
-            targets.push((client.clone(), outgoing.clone()));
+            targets.push((client.clone(), 0)); // AudioContext::NORMAL
         }
 
         // ── Normal speech: cross-channel listeners (local only) ─────────
@@ -102,9 +105,7 @@ pub async fn route_voice(
             if !client.is_authenticated() {
                 continue;
             }
-            let mut listen_out = outgoing.clone();
-            listen_out.target = 3; // AudioContext::LISTEN
-            targets.push((client.clone(), listen_out));
+            targets.push((client.clone(), 3)); // AudioContext::LISTEN
         }
 
         tracing::trace!(
@@ -122,7 +123,7 @@ pub async fn route_voice(
             target,
             "routing server loopback (target=31)"
          );
-        targets.push((sender.clone(), outgoing));
+        targets.push((sender.clone(), 0)); // AudioContext::NORMAL
     } else {
         // ── Whisper/shout target ─────────────────────────────────────────
         let udp_state = sender.udp_state().await;
@@ -148,9 +149,7 @@ pub async fn route_voice(
                 }
                 if let Some(client) = server.get_clients().get_client(session_id).await {
                     if client.is_authenticated() {
-                        let mut whisper_out = outgoing.clone();
-                        whisper_out.target = 2; // AudioContext::WHISPER
-                        targets.push((client, whisper_out));
+                        targets.push((client, 2)); // AudioContext::WHISPER
                     }
                 }
             }
@@ -171,16 +170,14 @@ pub async fn route_voice(
                     if !client.is_authenticated() {
                         continue;
                     }
-                    let mut shout_out = outgoing.clone();
-                    shout_out.target = 1; // AudioContext::SHOUT
-                    targets.push((client.clone(), shout_out));
+                    targets.push((client.clone(), 1)); // AudioContext::SHOUT
                 }
             }
         }
     }
 
     // ── Flush all targets locally ────────────────────────────────────────
-    flush_voice_batch(server, &targets, is_udp).await;
+    flush_voice_batch(server, &outgoing, &targets, is_udp).await;
 
     // ── Cross-node delivery (NORMAL channel speech only for now) ─────────
     // if let Some(payload) = s2s_payload {
@@ -202,20 +199,10 @@ pub async fn route_voice(
     // }
 }
 
-/// Encrypt and send voice packets to all targets.
-///
-/// On the UDP path, packets are encoded (legacy or protobuf based on client
-/// version) and encrypted **in parallel** (rayon), then collected into a
-/// single batched send (`sendmmsg` on Linux, per-packet `send_to` elsewhere).
-/// Recipients that prefer/need the TCP tunnel are delegated to their per-user
-/// TCP send queue rather than being awaited inline, so a slow TLS write to one
-/// recipient does not stall the routing fan-out for the rest.
-///
-/// On the TCP path (the speaker's audio arrived over the TCP `UDPTunnel`),
-/// every recipient is fed via their per-user TCP send queue.
 async fn flush_voice_batch(
     server: &Arc<Box<Server>>,
-    targets: &[(Arc<Box<Client>>, DecodedAudio)],
+    audio: &Arc<DecodedAudio>,
+    targets: &[(Arc<Box<Client>>, u32)],
     is_udp: bool,
 ) {
     if targets.is_empty() {
@@ -226,11 +213,11 @@ async fn flush_voice_batch(
         // Bucket targets: those reachable via UDP (encrypt + batch) vs. those
         // that must fall back to the TCP tunnel (no UDP address known yet, or
         // client has explicitly switched to tunneled mode).
-        let mut udp_items: Vec<(Arc<Box<Client>>, std::net::SocketAddr, PacketFormat, DecodedAudio)> =
+        let mut udp_items: Vec<(Arc<Box<Client>>, std::net::SocketAddr, PacketFormat, u32)> =
             Vec::with_capacity(targets.len());
-        let mut tcp_items: Vec<(Arc<Box<Client>>, PacketFormat, DecodedAudio)> = Vec::new();
+        let mut tcp_items: Vec<(Arc<Box<Client>>, PacketFormat, u32)> = Vec::new();
 
-        for (client, audio) in targets {
+        for (client, target) in targets {
             let format = if client.read_global_state().uses_protobuf() {
                 PacketFormat::Protobuf
             } else {
@@ -238,19 +225,19 @@ async fn flush_voice_batch(
             };
 
             if client.prefers_tcp_tunnel() {
-                tcp_items.push((client.clone(), format, audio.clone()));
+                tcp_items.push((client.clone(), format, *target));
                 continue;
             }
 
             match client.get_udp_address() {
-                Some(addr) => udp_items.push((client.clone(), addr, format, audio.clone())),
-                None => tcp_items.push((client.clone(), format, audio.clone())),
+                Some(addr) => udp_items.push((client.clone(), addr, format, *target)),
+                None => tcp_items.push((client.clone(), format, *target)),
             }
         }
 
         // ── TCP-fallback recipients: enqueue, do not await ───────────────────
-        for (client, format, audio) in tcp_items {
-            let raw = codec::encode_audio_packet(&audio, format);
+        for (client, format, target) in tcp_items {
+            let raw = codec::encode_audio_packet(audio, target, format);
             client.try_enqueue_voice_tcp(raw);
         }
 
@@ -263,12 +250,13 @@ async fn flush_voice_batch(
         let batch: Vec<QueuedDatagram> = if udp_items.is_empty() {
             Vec::new()
         } else {
+            let audio_for_encode = audio.clone();
             tokio::task::spawn_blocking(move || {
                 use rayon::prelude::*;
                 udp_items
                     .into_par_iter()
-                    .filter_map(|(client, addr, format, audio)| {
-                        let raw = codec::encode_audio_packet(&audio, format);
+                    .filter_map(|(client, addr, format, target)| {
+                        let raw = codec::encode_audio_packet(&audio_for_encode, target, format);
                         let mut crypt = client.crypt_state();
                         let state = crypt.as_mut()?;
                         let mut buf = vec![0u8; raw.len() + state.overhead()];
@@ -296,13 +284,13 @@ async fn flush_voice_batch(
     } else {
         // TCP tunnel path — encode and enqueue per recipient.  The per-user
         // TCP send task drains the queue and writes serially to the TLS stream.
-        for (client, audio) in targets {
+        for (client, target) in targets {
             let format = if client.read_global_state().uses_protobuf() {
                 PacketFormat::Protobuf
             } else {
                 PacketFormat::Legacy
             };
-            let raw = codec::encode_audio_packet(audio, format);
+            let raw = codec::encode_audio_packet(audio, *target, format);
             client.try_enqueue_voice_tcp(raw);
         }
     }

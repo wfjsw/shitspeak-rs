@@ -366,27 +366,19 @@ fn write_varint(buf: &mut BytesMut, value: u64) {
     }
 }
 
-/// Encode audio data into a UDP packet using the specified format.
-///
-/// Returns the raw bytes ready to send, or an empty `Bytes` if the encoded
-/// packet would exceed `MAX_UDP_PACKET_SIZE` (1024 bytes).
-pub fn encode_audio_packet(audio: &DecodedAudio, format: PacketFormat) -> Bytes {
+pub fn encode_audio_packet(audio: &DecodedAudio, target: u32, format: PacketFormat) -> Bytes {
     match format {
-        PacketFormat::Protobuf => encode_audio_protobuf(audio),
-        PacketFormat::Legacy => encode_audio_legacy(audio),
+        PacketFormat::Protobuf => encode_audio_protobuf(audio, target),
+        PacketFormat::Legacy => encode_audio_legacy(audio, target),
     }
 }
 
-/// Encode as a protobuf Audio message (server→client).
-///
-/// The server always sends server→client, so `Header::Context` is used
-/// instead of `Header::Target` per the Mumble protocol spec.
-fn encode_audio_protobuf(audio: &DecodedAudio) -> Bytes {
+fn encode_audio_protobuf(audio: &DecodedAudio, target: u32) -> Bytes {
     use crate::mumble_udp::{audio, Audio};
 
     let msg = Audio {
         // Server→client: context field (not target)
-        header: Some(audio::Header::Context(audio.target)),
+        header: Some(audio::Header::Context(target)),
         sender_session: audio.sender_session,
         frame_number: audio.frame_number,
         opus_data: audio.opus_data.clone(),
@@ -405,36 +397,18 @@ fn encode_audio_protobuf(audio: &DecodedAudio) -> Bytes {
     }
     let mut buf = BytesMut::with_capacity(total_len);
     buf.put_u8(0x00); // type = Audio
-    // Encode directly into `buf` — avoids the intermediate Vec that
-    // `encode_to_vec` + `extend_from_slice` would allocate and memcpy through.
     msg.encode(&mut buf)
         .expect("BytesMut has reserved capacity equal to encoded_len()");
     buf.freeze()
 }
 
-/// Encode as a legacy-format Opus voice packet (server→client).
-///
-/// Outbound wire layout:
-/// ```text
-/// byte 0       : header  (3 bits codec = 4/Opus | 5 bits target/context)
-/// varint       : sender_session  (server→client includes this)
-/// varint       : frame_number
-/// varint       : payload_size | (0x2000 if is_terminator)
-/// [payload_size bytes]: Opus payload
-/// [12 bytes]   : optional positional data (3 × IEEE-754 float, little-endian)
-/// ```
-fn encode_audio_legacy(audio: &DecodedAudio) -> Bytes {
-    if audio.target >= (1 << 5) {
-        tracing::warn!(target = audio.target, "legacy voice target out of range, dropping");
+fn encode_audio_legacy(audio: &DecodedAudio, target: u32) -> Bytes {
+    if target >= (1 << 5) {
+        tracing::warn!(target = target, "legacy voice target out of range, dropping");
         return Bytes::new();
     }
-    let header = (0x04u8 << 5) | (audio.target as u8 & 0x1f); // VoiceOpus + target/context
+    let header = (0x04u8 << 5) | (target as u8 & 0x1f); // VoiceOpus + target/context
 
-    // Tight upper bound — single allocation, no growth realloc:
-    //   header(1) + sender_session_varint(≤4) + frame_number_varint(≤4)
-    //   + size_flag_varint(≤4) + opus_data + positional(0 or 12).
-    // `write_varint` clamps each varint to 4 bytes; positional is exactly
-    // 12 bytes when present.
     let positional_len = if audio.positional_data.len() == 3 { 12 } else { 0 };
     let cap = 1 + 4 + 4 + 4 + audio.opus_data.len() + positional_len;
 
@@ -513,7 +487,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Protobuf,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Protobuf);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Protobuf);
         assert_eq!(encoded[0], 0x00, "type byte");
         // Parse back: Context(2) must survive the round-trip through decode.
         let decoded = decode_audio_packet(&encoded).expect("decode protobuf");
@@ -632,7 +606,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
         assert_eq!(encoded[0], 0x80); // Opus (0x04<<5) | target 0
         assert_eq!(encoded[1], 7);    // sender_session = 7 (1-byte PDS varint)
         assert_eq!(encoded[2], 42);   // frame_number = 42
@@ -652,7 +626,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
         // Tail should be three 4-byte little-endian floats
         let tail_start = encoded.len() - 12;
         let x = f32::from_le_bytes(encoded[tail_start..tail_start + 4].try_into().unwrap());
@@ -708,7 +682,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Protobuf,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Protobuf);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Protobuf);
         let decoded = decode_audio_packet(&encoded).expect("decode");
         assert_eq!(decoded.format, PacketFormat::Protobuf);
     }
@@ -848,7 +822,7 @@ mod tests {
             is_terminator: true,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
         // Skip header(1) + sender_session varint(1) + frame_number varint(1).
         let (size_flag, _) = read_varint(&encoded[3..]).expect("read size_flag");
         assert!(size_flag & 0x2000 != 0, "terminator bit must be set");
@@ -867,7 +841,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
         assert!(encoded.is_empty(), "out-of-range target must produce empty packet");
     }
 
@@ -993,7 +967,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Protobuf,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Protobuf);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Protobuf);
         assert!(encoded.is_empty(), "oversized protobuf packet must be dropped");
     }
 
@@ -1009,7 +983,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
         assert!(encoded.is_empty(), "oversized legacy packet must be dropped");
     }
 
@@ -1027,7 +1001,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Protobuf,
         };
-        let encoded = encode_audio_packet(&audio, PacketFormat::Protobuf);
+        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Protobuf);
         let packet = decode_udp_packet(&encoded).await.expect("decode protobuf audio");
         let UdpPacket::Audio(a) = packet else { panic!("expected Audio") };
         assert_eq!(a.frame_number, 7);
