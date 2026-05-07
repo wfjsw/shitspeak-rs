@@ -39,13 +39,16 @@ use std::fmt::Display;
 use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message as _;
 
+use crate::messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget};
+
 /// The decoded result of a UDP voice packet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedAudio {
-    /// Target ID (client→server: 0=normal, 31=loopback, other=whisper/shout).
-    /// Context ID (server→client: 0=normal, 1=shout, 2=whisper, 3=listen).
-    /// Stored in the same field regardless of direction.
-    pub target: u32,
+    /// Routing target carried by the inbound packet. For server→client packets
+    /// reconstructed from a `DecodedAudio` (e.g. server loopback), this field
+    /// is unused at the wire boundary — the caller of `encode_audio_packet`
+    /// supplies an `AudioContext` separately.
+    pub target: AudioTarget,
     /// Sender session ID. Zero for client→server (not present on wire).
     pub sender_session: u32,
     /// Frame number (sequence).
@@ -107,30 +110,30 @@ pub enum UdpPacket {
 ///
 /// Tries protobuf format first (detected by first byte `0x00` or `0x01`).
 /// Falls back to legacy format for other first-byte values.
-pub async fn decode_udp_packet(data: &[u8]) -> Result<UdpPacket, DecodeError> {
+pub fn decode_udp_packet(data: &[u8]) -> Result<UdpPacket, DecodeError> {
     if data.is_empty() {
         return Err(DecodeError::TooShort);
     }
 
     // Protobuf ping has an unambiguous one-byte type header.
     if data[0] == 0x01 {
-        if let Ok(packet) = try_decode_protobuf(data).await {
+        if let Ok(packet) = try_decode_protobuf(data) {
             return Ok(packet);
         }
     }
 
     // Legacy pings can appear without header (12/24 bytes).
-    if (data.len() == 12 || data.len() == 24)
-        && super::ping::decode_ping_legacy(data).await.is_ok()
-    {
-        return Ok(UdpPacket::Ping(super::ping::decode_ping_legacy(data).await?));
+    if data.len() == 12 || data.len() == 24 {
+        if let Ok(ping) = super::ping::decode_ping_legacy(data) {
+            return Ok(UdpPacket::Ping(ping));
+        }
     }
 
     // Protobuf audio (0x00) overlaps legacy CELTAlpha (type bits 000).
     // Try protobuf first; propagate any domain error (MalformedPacket, etc.)
     // but fall through to legacy only when the bytes simply aren't valid protobuf.
     if data[0] == 0x00 {
-        match try_decode_protobuf(data).await {
+        match try_decode_protobuf(data) {
             Ok(packet) => return Ok(packet),
             Err(DecodeError::ProtobufDecode(_)) | Err(DecodeError::NotVoice) => {}
             Err(e) => return Err(e),
@@ -141,17 +144,17 @@ pub async fn decode_udp_packet(data: &[u8]) -> Result<UdpPacket, DecodeError> {
     let legacy_type = (data[0] >> 5) & 0x07;
     match legacy_type {
         0 | 2 | 3 => Err(DecodeError::UnsupportedCodec), // CELTAlpha, Speex, CELTBeta
-        1 => Ok(UdpPacket::Ping(super::ping::decode_ping_legacy(&data[1..]).await?)),
+        1 => Ok(UdpPacket::Ping(super::ping::decode_ping_legacy(&data[1..])?)),
         4 => Ok(UdpPacket::Audio(decode_audio_legacy(data)?)),
         _ => Err(DecodeError::NotVoice),
     }
 }
 
 /// Try to decode as protobuf. Returns `Err` if it is not actually protobuf.
-async fn try_decode_protobuf(data: &[u8]) -> Result<UdpPacket, DecodeError> {
+fn try_decode_protobuf(data: &[u8]) -> Result<UdpPacket, DecodeError> {
     match data[0] {
         0x00 => Ok(UdpPacket::Audio(decode_audio_protobuf(&data[1..])?)),
-        0x01 => Ok(UdpPacket::Ping(super::ping::decode_ping_protobuf(&data[1..]).await?)),
+        0x01 => Ok(UdpPacket::Ping(super::ping::decode_ping_protobuf(&data[1..])?)),
         _ => Err(DecodeError::NotVoice),
     }
 }
@@ -209,21 +212,24 @@ pub fn decode_audio_packet(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
 
 /// Decode a protobuf-encoded Audio packet (`data` is the bytes after the type byte).
 ///
-/// The server always receives client→server protobuf packets which carry
-/// `target` in the `oneof Header`. The `context` variant is also accepted and
-/// its value is stored identically (both represent the audio routing target/context).
+/// Delegates the protobuf parse to the encoder wrapper so the wire-level
+/// `mumble_udp::Audio` type is contained there. The server is permissive about
+/// which `oneof Header` variant the client sent — both `target` and `context`
+/// are collapsed to `AudioTarget` by the wrapper.
 fn decode_audio_protobuf(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
-    let audio = crate::mumble_udp::Audio::decode(data).map_err(DecodeError::ProtobufDecode)?;
+    let audio = AudioWire::decode_wire(data).map_err(|e| match e {
+        crate::messages::encoder::AudioWireError::Protobuf(e) => DecodeError::ProtobufDecode(e),
+        crate::messages::encoder::AudioWireError::Domain(_) => DecodeError::MalformedPacket,
+        crate::messages::encoder::AudioWireError::EncodeOverflow(_) => DecodeError::MalformedPacket,
+    })?;
 
-    // Positional data must be absent or exactly [x, y, z].
-    if !matches!(audio.positional_data.len(), 0 | 3) {
-        return Err(DecodeError::MalformedPacket);
-    }
-
-    let target = audio.header.as_ref().map_or(0, |h| match h {
-        crate::mumble_udp::audio::Header::Target(t) => *t,
-        crate::mumble_udp::audio::Header::Context(c) => *c,
-    });
+    let target = match audio.header {
+        Some(AudioHeader::Target(t)) => t,
+        // Server is permissive: accept Context the client (incorrectly) sent
+        // and treat its value as a routing target.
+        Some(AudioHeader::Context(c)) => AudioTarget::from(u32::from(c)),
+        None => AudioTarget::Normal,
+    };
 
     Ok(DecodedAudio {
         target,
@@ -258,12 +264,12 @@ fn decode_audio_legacy(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
         return Err(DecodeError::TooShort);
     }
 
-    let target = (data[0] & 0x1f) as u32;
+    let target = AudioTarget::from((data[0] & 0x1f) as u32);
 
     decode_audio_legacy_inner(data, target).ok_or(DecodeError::LegacyDecode)
 }
 
-fn decode_audio_legacy_inner(data: &[u8], target: u32) -> Option<DecodedAudio> {
+fn decode_audio_legacy_inner(data: &[u8], target: AudioTarget) -> Option<DecodedAudio> {
     // Skip the header byte. Client→server packets carry no sender_session.
     let mut pos = 1usize;
 
@@ -366,19 +372,21 @@ fn write_varint(buf: &mut BytesMut, value: u64) {
     }
 }
 
-pub fn encode_audio_packet(audio: &DecodedAudio, target: u32, format: PacketFormat) -> Bytes {
+pub fn encode_audio_packet(
+    audio: &DecodedAudio,
+    context: AudioContext,
+    format: PacketFormat,
+) -> Bytes {
     match format {
-        PacketFormat::Protobuf => encode_audio_protobuf(audio, target),
-        PacketFormat::Legacy => encode_audio_legacy(audio, target),
+        PacketFormat::Protobuf => encode_audio_protobuf(audio, context),
+        PacketFormat::Legacy => encode_audio_legacy(audio, context),
     }
 }
 
-fn encode_audio_protobuf(audio: &DecodedAudio, target: u32) -> Bytes {
-    use crate::mumble_udp::{audio, Audio};
-
-    let msg = Audio {
-        // Server→client: context field (not target)
-        header: Some(audio::Header::Context(target)),
+fn encode_audio_protobuf(audio: &DecodedAudio, context: AudioContext) -> Bytes {
+    let wire = AudioWire {
+        // Server→client: always emits the `context` variant of the oneof.
+        header: Some(AudioHeader::Context(context)),
         sender_session: audio.sender_session,
         frame_number: audio.frame_number,
         opus_data: audio.opus_data.clone(),
@@ -387,7 +395,7 @@ fn encode_audio_protobuf(audio: &DecodedAudio, target: u32) -> Bytes {
         is_terminator: audio.is_terminator,
     };
 
-    let total_len = 1 + msg.encoded_len();
+    let total_len = 1 + wire.encoded_len();
     if total_len > 1024 {
         tracing::warn!(
             len = total_len,
@@ -397,17 +405,23 @@ fn encode_audio_protobuf(audio: &DecodedAudio, target: u32) -> Bytes {
     }
     let mut buf = BytesMut::with_capacity(total_len);
     buf.put_u8(0x00); // type = Audio
-    msg.encode(&mut buf)
+    wire.encode(&mut buf)
         .expect("BytesMut has reserved capacity equal to encoded_len()");
     buf.freeze()
 }
 
-fn encode_audio_legacy(audio: &DecodedAudio, target: u32) -> Bytes {
-    if target >= (1 << 5) {
-        tracing::warn!(target = target, "legacy voice target out of range, dropping");
+fn encode_audio_legacy(audio: &DecodedAudio, context: AudioContext) -> Bytes {
+    let context_bits = u32::from(context);
+    // The 5-bit legacy header field can hold 0..=31; AudioContext is at most
+    // 3, so it always fits — but check defensively in case the enum grows.
+    if context_bits >= (1 << 5) {
+        tracing::warn!(
+            context = context_bits,
+            "legacy voice context out of range, dropping"
+        );
         return Bytes::new();
     }
-    let header = (0x04u8 << 5) | (target as u8 & 0x1f); // VoiceOpus + target/context
+    let header = (0x04u8 << 5) | (context_bits as u8 & 0x1f); // VoiceOpus + context
 
     let positional_len = if audio.positional_data.len() == 3 { 12 } else { 0 };
     let cap = 1 + 4 + 4 + 4 + audio.opus_data.len() + positional_len;
@@ -478,7 +492,7 @@ mod tests {
     fn protobuf_encode_uses_context_oneof() {
         // Server→client packets must carry context, not target.
         let audio = DecodedAudio {
-            target: 2, // WHISPER context
+            target: AudioTarget::Normal, // unused — context is the encoder param
             sender_session: 42,
             frame_number: 100,
             opus_data: Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]),
@@ -487,11 +501,12 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Protobuf,
         };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Protobuf);
+        let encoded = encode_audio_packet(&audio, AudioContext::Whisper, PacketFormat::Protobuf);
         assert_eq!(encoded[0], 0x00, "type byte");
-        // Parse back: Context(2) must survive the round-trip through decode.
+        // Parse back: the server-side decoder collapses Context(2) into the
+        // AudioTarget enum by raw value — VoiceTarget(2).
         let decoded = decode_audio_packet(&encoded).expect("decode protobuf");
-        assert_eq!(decoded.target, 2);
+        assert_eq!(decoded.target, AudioTarget::VoiceTarget(2));
         assert_eq!(decoded.sender_session, 42);
         assert_eq!(decoded.frame_number, 100);
         assert_eq!(decoded.format, PacketFormat::Protobuf);
@@ -566,7 +581,7 @@ mod tests {
     fn legacy_decode_client_to_server() {
         let packet = build_legacy_client_packet(0, 42, &[0x01, 0x02, 0x03], false);
         let decoded = decode_audio_packet(&packet).expect("decode legacy c→s");
-        assert_eq!(decoded.target, 0);
+        assert_eq!(decoded.target, AudioTarget::Normal);
         assert_eq!(decoded.sender_session, 0); // not present in client→server
         assert_eq!(decoded.frame_number, 42);
         assert_eq!(decoded.opus_data, &[0x01u8, 0x02, 0x03][..]);
@@ -587,7 +602,7 @@ mod tests {
         // target = 31 (loopback): no special position_count field
         let packet = build_legacy_client_packet(31, 1, &[0xAA], false);
         let decoded = decode_audio_packet(&packet).expect("decode loopback");
-        assert_eq!(decoded.target, 31);
+        assert_eq!(decoded.target, AudioTarget::ServerLoopback);
         assert_eq!(decoded.sender_session, 0);
         assert_eq!(decoded.frame_number, 1);
         assert_eq!(decoded.opus_data, &[0xAAu8][..]);
@@ -597,7 +612,7 @@ mod tests {
     fn legacy_encode_server_to_client() {
         // Server→client legacy packets include sender_session.
         let audio = DecodedAudio {
-            target: 0,
+            target: AudioTarget::Normal,
             sender_session: 7,
             frame_number: 42,
             opus_data: Bytes::from_static(&[0x01, 0x02, 0x03]),
@@ -606,7 +621,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
         assert_eq!(encoded[0], 0x80); // Opus (0x04<<5) | target 0
         assert_eq!(encoded[1], 7);    // sender_session = 7 (1-byte PDS varint)
         assert_eq!(encoded[2], 42);   // frame_number = 42
@@ -617,7 +632,7 @@ mod tests {
     #[test]
     fn legacy_encode_with_positional() {
         let audio = DecodedAudio {
-            target: 0,
+            target: AudioTarget::Normal,
             sender_session: 1,
             frame_number: 0,
             opus_data: Bytes::from_static(&[0xAA]),
@@ -626,7 +641,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
         // Tail should be three 4-byte little-endian floats
         let tail_start = encoded.len() - 12;
         let x = f32::from_le_bytes(encoded[tail_start..tail_start + 4].try_into().unwrap());
@@ -673,7 +688,7 @@ mod tests {
     #[test]
     fn detect_protobuf_format() {
         let audio = DecodedAudio {
-            target: 0,
+            target: AudioTarget::Normal,
             sender_session: 1,
             frame_number: 0,
             opus_data: Bytes::from_static(&[0x00]),
@@ -682,7 +697,7 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Protobuf,
         };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Protobuf);
+        let encoded = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Protobuf);
         let decoded = decode_audio_packet(&encoded).expect("decode");
         assert_eq!(decoded.format, PacketFormat::Protobuf);
     }
@@ -783,7 +798,7 @@ mod tests {
     fn legacy_decode_whisper_target() {
         let packet = build_legacy_client_packet(15, 0, &[0x01], false);
         let decoded = decode_audio_packet(&packet).expect("decode whisper target");
-        assert_eq!(decoded.target, 15);
+        assert_eq!(decoded.target, AudioTarget::VoiceTarget(15));
     }
 
     #[test]
@@ -813,7 +828,7 @@ mod tests {
         // Server→client packet: sender_session=0 and frame_number=0 are both 1-byte varints,
         // so the size_flag varint starts at encoded[3].
         let audio = DecodedAudio {
-            target: 0,
+            target: AudioTarget::Normal,
             sender_session: 0,
             frame_number: 0,
             opus_data: Bytes::new(),
@@ -822,27 +837,10 @@ mod tests {
             is_terminator: true,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
         // Skip header(1) + sender_session varint(1) + frame_number varint(1).
         let (size_flag, _) = read_varint(&encoded[3..]).expect("read size_flag");
         assert!(size_flag & 0x2000 != 0, "terminator bit must be set");
-    }
-
-    #[test]
-    fn legacy_encode_target_out_of_range_drops() {
-        // target ≥ 32 cannot fit in 5 bits; encoder must drop the packet.
-        let audio = DecodedAudio {
-            target: 32,
-            sender_session: 0,
-            frame_number: 0,
-            opus_data: Bytes::from_static(&[0x01]),
-            positional_data: vec![],
-            volume_adjustment: 1.0,
-            is_terminator: false,
-            format: PacketFormat::Legacy,
-        };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
-        assert!(encoded.is_empty(), "out-of-range target must produce empty packet");
     }
 
     // ── Protobuf decode additional ────────────────────────────────────────
@@ -950,7 +948,7 @@ mod tests {
         buf.put_u8(0x00);
         msg.encode(&mut buf).unwrap();
         let decoded = decode_audio_packet(&buf).expect("decode");
-        assert_eq!(decoded.target, 0);
+        assert_eq!(decoded.target, AudioTarget::Normal);
     }
 
     // ── Size limits ───────────────────────────────────────────────────────
@@ -958,7 +956,7 @@ mod tests {
     #[test]
     fn protobuf_encode_oversized_returns_empty() {
         let audio = DecodedAudio {
-            target: 0,
+            target: AudioTarget::Normal,
             sender_session: 1,
             frame_number: 0,
             opus_data: Bytes::from(vec![0xAA; 2000]),
@@ -967,14 +965,14 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Protobuf,
         };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Protobuf);
+        let encoded = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Protobuf);
         assert!(encoded.is_empty(), "oversized protobuf packet must be dropped");
     }
 
     #[test]
     fn legacy_encode_oversized_returns_empty() {
         let audio = DecodedAudio {
-            target: 0,
+            target: AudioTarget::Normal,
             sender_session: 1,
             frame_number: 0,
             opus_data: Bytes::from(vec![0xBB; 2000]),
@@ -983,16 +981,16 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Legacy,
         };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Legacy);
+        let encoded = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
         assert!(encoded.is_empty(), "oversized legacy packet must be dropped");
     }
 
-    // ── decode_udp_packet (async) ────────────────────────────────────────
+    // ── decode_udp_packet ────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn udp_packet_protobuf_audio() {
+    #[test]
+    fn udp_packet_protobuf_audio() {
         let audio = DecodedAudio {
-            target: 0,
+            target: AudioTarget::Normal,
             sender_session: 5,
             frame_number: 7,
             opus_data: Bytes::from_static(&[0x01, 0x02]),
@@ -1001,34 +999,34 @@ mod tests {
             is_terminator: false,
             format: PacketFormat::Protobuf,
         };
-        let encoded = encode_audio_packet(&audio, audio.target, PacketFormat::Protobuf);
-        let packet = decode_udp_packet(&encoded).await.expect("decode protobuf audio");
+        let encoded = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Protobuf);
+        let packet = decode_udp_packet(&encoded).expect("decode protobuf audio");
         let UdpPacket::Audio(a) = packet else { panic!("expected Audio") };
         assert_eq!(a.frame_number, 7);
         assert_eq!(a.format, PacketFormat::Protobuf);
     }
 
-    #[tokio::test]
-    async fn udp_packet_legacy_opus() {
+    #[test]
+    fn udp_packet_legacy_opus() {
         let raw = build_legacy_client_packet(0, 3, &[0x01, 0x02], false);
-        let packet = decode_udp_packet(&raw).await.expect("decode legacy audio");
+        let packet = decode_udp_packet(&raw).expect("decode legacy audio");
         let UdpPacket::Audio(a) = packet else { panic!("expected Audio") };
         assert_eq!(a.frame_number, 3);
         assert_eq!(a.format, PacketFormat::Legacy);
     }
 
-    #[tokio::test]
-    async fn udp_packet_celt_rejected() {
+    #[test]
+    fn udp_packet_celt_rejected() {
         // CELTAlpha type bits (top 3 = 000): use 0x02 to avoid the protobuf 0x00 path.
         let raw = [0x02u8, 0x00, 0x00];
         assert!(matches!(
-            decode_udp_packet(&raw).await,
+            decode_udp_packet(&raw),
             Err(DecodeError::UnsupportedCodec)
         ));
     }
 
-    #[tokio::test]
-    async fn udp_packet_malformed_packet_propagated() {
+    #[test]
+    fn udp_packet_malformed_packet_propagated() {
         // Valid protobuf bytes but invalid positional count must propagate MalformedPacket,
         // not silently fall through to the legacy decoder.
         use crate::mumble_udp::{audio, Audio};
@@ -1046,7 +1044,7 @@ mod tests {
         buf.put_u8(0x00);
         msg.encode(&mut buf).unwrap();
         assert!(matches!(
-            decode_udp_packet(&buf).await,
+            decode_udp_packet(&buf),
             Err(DecodeError::MalformedPacket)
         ));
     }

@@ -2,14 +2,82 @@
 
 use std::sync::Arc;
 
+use bytes::{Bytes, BytesMut};
+
 use crate::{
     client::Client,
+    messages::encoder::{AudioContext, AudioTarget},
     server::Server,
 };
 
 use super::codec::{self, DecodedAudio, PacketFormat};
 use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, QueuedDatagram};
+
+/// Recipient count above which the encrypt fan-out is dispatched to rayon
+/// inside `spawn_blocking`. Below this threshold, sequential per-recipient
+/// encrypt on the routing task is faster: the per-recipient unit of work
+/// (~600 ns at 170-byte packet) is too small to amortize rayon's task
+/// scheduling overhead. Measured crossover on a Ryzen 7 5800H is ~256.
+const RAYON_FANOUT_THRESHOLD: usize = 256;
+
+/// Pluck the recipient's preferred wire format. One RwLock acquisition.
+#[inline]
+fn client_packet_format(client: &Client) -> PacketFormat {
+    if client.read_global_state().uses_protobuf() {
+        PacketFormat::Protobuf
+    } else {
+        PacketFormat::Legacy
+    }
+}
+
+/// Per-(format, context) plaintext cache. Inlined fixed-size storage covers
+/// every case `route_voice` produces (≤4 unique keys: 2 formats × ≤2 distinct
+/// outbound contexts) without allocation. The overflow `Vec` is a defensive
+/// fallback should new audio contexts be added.
+struct EncodeCache {
+    slots: [Option<((PacketFormat, AudioContext), Bytes)>; 4],
+    overflow: Vec<((PacketFormat, AudioContext), Bytes)>,
+}
+
+impl EncodeCache {
+    fn new() -> Self {
+        Self {
+            slots: [const { None }; 4],
+            overflow: Vec::new(),
+        }
+    }
+
+    fn get_or_encode(
+        &mut self,
+        audio: &DecodedAudio,
+        context: AudioContext,
+        format: PacketFormat,
+    ) -> Bytes {
+        let key = (format, context);
+        for slot in &self.slots {
+            if let Some((k, b)) = slot {
+                if *k == key {
+                    return b.clone();
+                }
+            }
+        }
+        for (k, b) in &self.overflow {
+            if *k == key {
+                return b.clone();
+            }
+        }
+        let b = codec::encode_audio_packet(audio, context, format);
+        for slot in &mut self.slots {
+            if slot.is_none() {
+                *slot = Some((key, b.clone()));
+                return b;
+            }
+        }
+        self.overflow.push((key, b.clone()));
+        b
+    }
+}
 
 /// `target_kind` value used in the S2S envelope for normal channel
 /// speech. Mirrors the Mumble `AudioContext::NORMAL` numbering.
@@ -44,17 +112,18 @@ pub async fn route_voice(
     tracing::trace!(
         session = u32::from(sender_id),
         channel = sender_channel,
-        target,
+        target = %target,
         is_udp,
         "routing voice packet"
     );
 
     // Build the outgoing audio data (server → client format) and share it
-    // across recipients via Arc — only the per-recipient target context
-    // differs, so we avoid cloning the full struct (and the positional_data
-    // Vec when present) for every listener.
+    // across recipients via Arc — only the per-recipient context differs,
+    // so we avoid cloning the full struct (and the positional_data Vec when
+    // present) for every listener. The `target` field is unused on outbound
+    // packets; the encoder takes an `AudioContext` separately.
     let outgoing = Arc::new(DecodedAudio {
-        target: 0, // unused — target is passed separately per recipient
+        target: AudioTarget::Normal,
         sender_session: u32::from(sender_id),
         frame_number: audio.frame_number,
         opus_data: audio.opus_data.clone(),
@@ -64,142 +133,162 @@ pub async fn route_voice(
         format: audio.format,
     });
 
-    // Collect (client, target_context) pairs for batched sending. The audio
-    // payload is shared via the `outgoing` Arc.
-    let mut targets: Vec<(Arc<Box<Client>>, u32)> = Vec::new();
+    // Collect (client, context) pairs for batched sending. The audio payload
+    // is shared via the `outgoing` Arc.
+    let mut targets: Vec<(Arc<Box<Client>>, AudioContext)> = Vec::new();
 
     // Pre-encoded payload for cross-node delivery (NORMAL channel speech
     // only). Receivers decode and re-target per local recipient, so we
-    // encode with the speaker's chosen format and `target = 0`.
+    // encode with the speaker's chosen format and Normal context.
     let mut s2s_payload: Option<bytes::Bytes> = None;
 
-    if target == 0 {
-        tracing::trace!(
-            session = u32::from(sender_id),
-            channel = sender_channel,
-            "routing normal channel speech"
-        );
+    match target {
+        AudioTarget::Normal => {
+            tracing::trace!(
+                session = u32::from(sender_id),
+                channel = sender_channel,
+                "routing normal channel speech"
+            );
 
-        s2s_payload = Some(codec::encode_audio_packet(&outgoing, 0, audio.format));
+            s2s_payload = Some(codec::encode_audio_packet(
+                &outgoing,
+                AudioContext::Normal,
+                audio.format,
+            ));
 
-        // ── Normal speech: channel members (local only) ─────────────────
-        // Remote clients in the same channel are reached via S2S delivery,
-        // not by direct UDP/TCP from this node.
-        let channel_clients = server.get_clients().get_local_clients_in_channel(sender_channel).await;
-        for client in &channel_clients {
-            if client.get_session_id() == sender_id {
-                continue;
-            }
-            if !client.is_authenticated() {
-                continue;
-            }
-            targets.push((client.clone(), 0)); // AudioContext::NORMAL
-        }
-
-        // ── Normal speech: linked channels (local only) ─────────────────
-        // Voice fans out to members of channels linked to the sender's
-        // channel. Per Mumble's reference behavior, the speaker must hold
-        // Speak on the linked channel for voice to cross.
-        let linked_ids: Vec<u32> = server
-            .get_channels()
-            .get_channel(sender_channel)
-            .await
-            .map(|ch| ch.links.into_iter().collect())
-            .unwrap_or_default();
-        for linked_id in linked_ids {
-            let perms =
-                crate::client::acl::compute_permissions_for_client(server, sender, linked_id).await;
-            if !perms.contains(crate::acl::ACLPermissions::Speak) {
-                continue;
-            }
-            let linked_clients =
-                server.get_clients().get_local_clients_in_channel(linked_id).await;
-            for client in &linked_clients {
+            // ── Normal speech: channel members (local only) ─────────────
+            // Remote clients in the same channel are reached via S2S
+            // delivery, not by direct UDP/TCP from this node.
+            let channel_clients = server
+                .get_clients()
+                .get_local_clients_in_channel(sender_channel)
+                .await;
+            for client in &channel_clients {
                 if client.get_session_id() == sender_id {
                     continue;
                 }
                 if !client.is_authenticated() {
                     continue;
                 }
-                targets.push((client.clone(), 0)); // AudioContext::NORMAL
+                targets.push((client.clone(), AudioContext::Normal));
             }
-        }
 
-        // ── Normal speech: cross-channel listeners (local only) ─────────
-        let listeners = server.get_clients().get_local_listeners_for_channel(sender_channel).await;
-        for client in &listeners {
-            if client.get_session_id() == sender_id {
-                continue;
-            }
-            if !client.is_authenticated() {
-                continue;
-            }
-            targets.push((client.clone(), 3)); // AudioContext::LISTEN
-        }
-
-        tracing::trace!(
-            session = u32::from(sender_id),
-            channel = sender_channel,
-            target,
-            count = targets.len(),
-            "resolved recipients for normal channel speech"
-         );
-    } else if target == 0x1F {
-        // ── Server loopback (target = 31) ────────────────────────────────
-        tracing::trace!(
-            session = u32::from(sender_id),
-            channel = sender_channel,
-            target,
-            "routing server loopback (target=31)"
-         );
-        targets.push((sender.clone(), 0)); // AudioContext::NORMAL
-    } else {
-        // ── Whisper/shout target ─────────────────────────────────────────
-        let udp_state = sender.udp_state().await;
-        let voice_target = udp_state.voice_target(target);
-
-        if let Some(vt) = voice_target {
-            tracing::trace!(
-                session = u32::from(sender_id),
-                channel = sender_channel,
-                target,
-                "resolving whisper/shout recipients"
-             );
-
-            // Direct session targets — only deliver to local sessions on
-            // this node.  Remote whisper recipients must be reached via
-            // S2S (deferred to a later phase).
-            let local_node_id = server.get_clients().local_node_id();
-            for session_raw in vt.sessions() {
-                let session_id =
-                    crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw);
-                if session_id.node_id != local_node_id {
+            // ── Normal speech: linked channels (local only) ─────────────
+            // Voice fans out to members of channels linked to the sender's
+            // channel. Per Mumble's reference behavior, the speaker must
+            // hold Speak on the linked channel for voice to cross.
+            let linked_ids: Vec<u32> = server
+                .get_channels()
+                .get_channel(sender_channel)
+                .await
+                .map(|ch| ch.links.into_iter().collect())
+                .unwrap_or_default();
+            for linked_id in linked_ids {
+                let perms = crate::client::acl::compute_permissions_for_client(
+                    server, sender, linked_id,
+                )
+                .await;
+                if !perms.contains(crate::acl::ACLPermissions::Speak) {
                     continue;
                 }
-                if let Some(client) = server.get_clients().get_client(session_id).await {
-                    if client.is_authenticated() {
-                        targets.push((client, 2)); // AudioContext::WHISPER
-                    }
-                }
-            }
-
-            // Channel targets — use the index for each target channel subtree
-            for ch_target in vt.channels() {
-                let channel_ids = if ch_target.sub_channels() {
-                    collect_subtree_ids(server, ch_target.id()).await
-                } else {
-                    vec![ch_target.id()]
-                };
-
-                let channel_clients = server.get_clients().get_local_clients_in_channels(&channel_ids).await;
-                for client in &channel_clients {
+                let linked_clients = server
+                    .get_clients()
+                    .get_local_clients_in_channel(linked_id)
+                    .await;
+                for client in &linked_clients {
                     if client.get_session_id() == sender_id {
                         continue;
                     }
                     if !client.is_authenticated() {
                         continue;
                     }
-                    targets.push((client.clone(), 1)); // AudioContext::SHOUT
+                    targets.push((client.clone(), AudioContext::Normal));
+                }
+            }
+
+            // ── Normal speech: cross-channel listeners (local only) ─────
+            let listeners = server
+                .get_clients()
+                .get_local_listeners_for_channel(sender_channel)
+                .await;
+            for client in &listeners {
+                if client.get_session_id() == sender_id {
+                    continue;
+                }
+                if !client.is_authenticated() {
+                    continue;
+                }
+                targets.push((client.clone(), AudioContext::Listen));
+            }
+
+            tracing::trace!(
+                session = u32::from(sender_id),
+                channel = sender_channel,
+                count = targets.len(),
+                "resolved recipients for normal channel speech"
+            );
+        }
+        AudioTarget::ServerLoopback => {
+            tracing::trace!(
+                session = u32::from(sender_id),
+                channel = sender_channel,
+                "routing server loopback (target=31)"
+            );
+            targets.push((sender.clone(), AudioContext::Normal));
+        }
+        AudioTarget::VoiceTarget(slot) => {
+            // ── Whisper/shout target ─────────────────────────────────────
+            let udp_state = sender.udp_state().await;
+            let voice_target = udp_state.voice_target(slot);
+
+            if let Some(vt) = voice_target {
+                tracing::trace!(
+                    session = u32::from(sender_id),
+                    channel = sender_channel,
+                    slot,
+                    "resolving whisper/shout recipients"
+                );
+
+                // Direct session targets — only deliver to local sessions
+                // on this node. Remote whisper recipients must be reached
+                // via S2S (deferred to a later phase).
+                let local_node_id = server.get_clients().local_node_id();
+                for session_raw in vt.sessions() {
+                    let session_id =
+                        crate::client::client_session_identifier::ClientSessionIdentifier::from(
+                            *session_raw,
+                        );
+                    if session_id.node_id != local_node_id {
+                        continue;
+                    }
+                    if let Some(client) = server.get_clients().get_client(session_id).await {
+                        if client.is_authenticated() {
+                            targets.push((client, AudioContext::Whisper));
+                        }
+                    }
+                }
+
+                // Channel targets — use the index for each target channel subtree
+                for ch_target in vt.channels() {
+                    let channel_ids = if ch_target.sub_channels() {
+                        collect_subtree_ids(server, ch_target.id()).await
+                    } else {
+                        vec![ch_target.id()]
+                    };
+
+                    let channel_clients = server
+                        .get_clients()
+                        .get_local_clients_in_channels(&channel_ids)
+                        .await;
+                    for client in &channel_clients {
+                        if client.get_session_id() == sender_id {
+                            continue;
+                        }
+                        if !client.is_authenticated() {
+                            continue;
+                        }
+                        targets.push((client.clone(), AudioContext::Shout));
+                    }
                 }
             }
         }
@@ -231,96 +320,133 @@ pub async fn route_voice(
 async fn flush_voice_batch(
     server: &Arc<Box<Server>>,
     audio: &Arc<DecodedAudio>,
-    targets: &[(Arc<Box<Client>>, u32)],
+    targets: &[(Arc<Box<Client>>, AudioContext)],
     is_udp: bool,
 ) {
     if targets.is_empty() {
         return;
     }
 
-    if is_udp {
-        // Bucket targets: those reachable via UDP (encrypt + batch) vs. those
-        // that must fall back to the TCP tunnel (no UDP address known yet, or
-        // client has explicitly switched to tunneled mode).
-        let mut udp_items: Vec<(Arc<Box<Client>>, std::net::SocketAddr, PacketFormat, u32)> =
-            Vec::with_capacity(targets.len());
-        let mut tcp_items: Vec<(Arc<Box<Client>>, PacketFormat, u32)> = Vec::new();
-
-        for (client, target) in targets {
-            let format = if client.read_global_state().uses_protobuf() {
-                PacketFormat::Protobuf
-            } else {
-                PacketFormat::Legacy
-            };
-
-            if client.prefers_tcp_tunnel() {
-                tcp_items.push((client.clone(), format, *target));
-                continue;
-            }
-
-            match client.get_udp_address() {
-                Some(addr) => udp_items.push((client.clone(), addr, format, *target)),
-                None => tcp_items.push((client.clone(), format, *target)),
-            }
-        }
-
-        // ── TCP-fallback recipients: enqueue, do not await ───────────────────
-        for (client, format, target) in tcp_items {
-            let raw = codec::encode_audio_packet(audio, target, format);
+    if !is_udp {
+        // TCP-tunnel path — encode (cached) and enqueue per recipient. The
+        // per-user TCP send task drains the queue and writes serially.
+        let mut cache = EncodeCache::new();
+        for (client, context) in targets {
+            let format = client_packet_format(client);
+            let raw = cache.get_or_encode(audio, *context, format);
             client.try_enqueue_voice_tcp(raw);
         }
+        return;
+    }
 
-        // ── Parallel encode + encrypt for UDP-reachable recipients ───────────
-        // Each recipient owns its own `CryptState` (parking_lot mutex), so
-        // different recipients can encrypt concurrently.  We hand the entire
-        // bucket to `spawn_blocking` and use rayon's work-stealing pool inside
-        // for the actual parallelism — this keeps the reactor thread free while
-        // the CPU work is in flight.
-        let batch: Vec<QueuedDatagram> = if udp_items.is_empty() {
-            Vec::new()
-        } else {
-            let audio_for_encode = audio.clone();
-            tokio::task::spawn_blocking(move || {
-                use rayon::prelude::*;
-                udp_items
-                    .into_par_iter()
-                    .filter_map(|(client, addr, format, target)| {
-                        let raw = codec::encode_audio_packet(&audio_for_encode, target, format);
-                        let mut crypt = client.crypt_state();
-                        let state = crypt.as_mut()?;
-                        let mut buf = vec![0u8; raw.len() + state.overhead()];
-                        state.encrypt(&mut buf, &raw).ok()?;
-                        Some(QueuedDatagram {
-                            addr,
-                            data: bytes::Bytes::from(buf),
-                        })
-                    })
-                    .collect()
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("voice encrypt task join error: {e}");
-                Vec::new()
-            })
-        };
+    // UDP path. For small fan-outs (the common case), do everything on the
+    // routing task: encode (cached), encrypt, queue. For large fan-outs,
+    // bucket and dispatch the encrypt work to rayon inside spawn_blocking
+    // so multiple cores share the load.
+    if targets.len() < RAYON_FANOUT_THRESHOLD {
+        let mut cache = EncodeCache::new();
+        let mut udp_batch: Vec<QueuedDatagram> = Vec::with_capacity(targets.len());
 
-        if !batch.is_empty() {
+        for (client, context) in targets {
+            let format = client_packet_format(client);
+            let raw = cache.get_or_encode(audio, *context, format);
+
+            if client.prefers_tcp_tunnel() {
+                client.try_enqueue_voice_tcp(raw);
+                continue;
+            }
+            let Some(addr) = client.get_udp_address() else {
+                client.try_enqueue_voice_tcp(raw);
+                continue;
+            };
+            let mut crypt = client.crypt_state();
+            let Some(state) = crypt.as_mut() else { continue };
+            let mut buf = BytesMut::zeroed(raw.len() + state.overhead());
+            if state.encrypt(&mut buf, &raw).is_err() {
+                continue;
+            }
+            udp_batch.push(QueuedDatagram { addr, data: buf.freeze() });
+        }
+
+        if !udp_batch.is_empty() {
             let socket = server.get_udp_socket();
-            if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &batch).await {
+            if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &udp_batch).await {
                 tracing::warn!("UDP batch send error: {e}");
             }
         }
-    } else {
-        // TCP tunnel path — encode and enqueue per recipient.  The per-user
-        // TCP send task drains the queue and writes serially to the TLS stream.
-        for (client, target) in targets {
-            let format = if client.read_global_state().uses_protobuf() {
-                PacketFormat::Protobuf
-            } else {
-                PacketFormat::Legacy
-            };
-            let raw = codec::encode_audio_packet(audio, *target, format);
-            client.try_enqueue_voice_tcp(raw);
+        return;
+    }
+
+    // Large-fanout path: bucket recipients while collecting unique
+    // (format, context) keys, pre-encode each unique key once, then dispatch
+    // the encrypt loop to rayon.
+    let mut udp_items: Vec<(Arc<Box<Client>>, std::net::SocketAddr, PacketFormat, AudioContext)> =
+        Vec::with_capacity(targets.len());
+    let mut tcp_items: Vec<(Arc<Box<Client>>, PacketFormat, AudioContext)> = Vec::new();
+    let mut cache = EncodeCache::new();
+
+    for (client, context) in targets {
+        let format = client_packet_format(client);
+        // Touch the cache so every (format, context) seen is pre-encoded.
+        let _ = cache.get_or_encode(audio, *context, format);
+
+        if client.prefers_tcp_tunnel() {
+            tcp_items.push((client.clone(), format, *context));
+            continue;
+        }
+        match client.get_udp_address() {
+            Some(addr) => udp_items.push((client.clone(), addr, format, *context)),
+            None => tcp_items.push((client.clone(), format, *context)),
+        }
+    }
+
+    // TCP fallback recipients — enqueue using the cached plaintext, do not await.
+    for (client, format, context) in &tcp_items {
+        let raw = cache.get_or_encode(audio, *context, *format);
+        client.try_enqueue_voice_tcp(raw);
+    }
+
+    if udp_items.is_empty() {
+        return;
+    }
+
+    // Snapshot the cache as a plain Vec for the rayon closure (Send + Sync).
+    let plaintexts: Arc<Vec<((PacketFormat, AudioContext), Bytes)>> = Arc::new(
+        cache
+            .slots
+            .into_iter()
+            .flatten()
+            .chain(cache.overflow.into_iter())
+            .collect(),
+    );
+
+    let plaintexts_for_task = plaintexts.clone();
+    let batch: Vec<QueuedDatagram> = tokio::task::spawn_blocking(move || {
+        use rayon::prelude::*;
+        udp_items
+            .into_par_iter()
+            .filter_map(|(client, addr, format, context)| {
+                let raw = plaintexts_for_task
+                    .iter()
+                    .find_map(|(k, b)| (*k == (format, context)).then(|| b.clone()))?;
+                let mut crypt = client.crypt_state();
+                let state = crypt.as_mut()?;
+                let mut buf = BytesMut::zeroed(raw.len() + state.overhead());
+                state.encrypt(&mut buf, &raw).ok()?;
+                Some(QueuedDatagram { addr, data: buf.freeze() })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("voice encrypt task join error: {e}");
+        Vec::new()
+    });
+
+    if !batch.is_empty() {
+        let socket = server.get_udp_socket();
+        if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &batch).await {
+            tracing::warn!("UDP batch send error: {e}");
         }
     }
 }

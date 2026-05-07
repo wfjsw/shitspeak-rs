@@ -74,7 +74,7 @@ async fn handle_udp_tunnel(
         }
     };
 
-    tracing::trace!(session = u32::from(sender.get_session_id()), target = audio.target, frame = audio.frame_number, len = audio.opus_data.len(), "UDPTunnel: routing voice");
+    tracing::trace!(session = u32::from(sender.get_session_id()), target = %audio.target, frame = audio.frame_number, len = audio.opus_data.len(), "UDPTunnel: routing voice");
     sender.push_voice_routing(audio, false);
     Ok(())
 }

@@ -527,6 +527,12 @@ pub(crate) struct StrictRuntime<R: StrictReplicable> {
     /// Weak self-pointer set immediately after `Arc::new`, used to spawn
     /// async work (recovery) from `&self` callbacks like `on_membership`.
     pub weak_self: Mutex<Option<Weak<Self>>>,
+    /// Time of the last bootstrap-catchup attempt. None = never. Used to
+    /// throttle retries triggered by Joined/Restarted membership events
+    /// (the alive view can outrun the routing table immediately after a
+    /// heal, so the initial attempt may fail with NoRoute and we rely on
+    /// later membership events to drive a retry).
+    pub last_bootstrap_attempt: Mutex<Option<Instant>>,
     pub shutdown: CancellationToken,
     pub cfg: Arc<ReplicationConfig>,
 }
@@ -555,6 +561,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             recovery_attempt_counter: AtomicU64::new(1),
             recoveries: Mutex::new(HashMap::new()),
             weak_self: Mutex::new(None),
+            last_bootstrap_attempt: Mutex::new(None),
             shutdown,
             cfg,
         });
@@ -567,7 +574,67 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     pub fn start(self: &Arc<Self>) {
         spawn_delivery_loop(self.clone());
         spawn_clock_tick_loop(self.clone());
-        spawn_catchup_bootstrap(self.clone());
+        let rt = self.clone();
+        tokio::spawn(async move {
+            rt.try_bootstrap_catchup().await;
+        });
+    }
+
+    /// Send a single bootstrap `CatchupReq` if we haven't applied any data
+    /// yet. Idempotent: returns immediately when `current_version() != 0`
+    /// or when another attempt was made within
+    /// `cfg.strict_bootstrap_retry_interval()`. On failure (e.g., the
+    /// overlay's routing table hasn't caught up to the alive view yet)
+    /// iterates through the alive peers in random order until one accepts
+    /// the send; if none accepts, returns and waits for the next
+    /// membership event to retry.
+    pub(crate) async fn try_bootstrap_catchup(self: &Arc<Self>) {
+        eprintln!("DIAGFIX[try@{}/{}] called, version={}", self.self_id, self.topic, self.repo.current_version());
+        if self.repo.current_version() != 0 {
+            return;
+        }
+        {
+            let mut last = self.last_bootstrap_attempt.lock();
+            let now = Instant::now();
+            if let Some(prev) = *last {
+                if now.duration_since(prev) < self.cfg.strict_bootstrap_retry_interval() {
+                    eprintln!("DIAGFIX[try@{}/{}] throttled", self.self_id, self.topic);
+                    return;
+                }
+            }
+            *last = Some(now);
+        }
+        let mut peers: Vec<NodeIdentifier> = self
+            .net
+            .alive_members()
+            .into_iter()
+            .filter(|n| *n != self.self_id)
+            .collect();
+        eprintln!("DIAGFIX[try@{}/{}] peers={:?}", self.self_id, self.topic, peers);
+        if peers.is_empty() {
+            return;
+        }
+        {
+            let mut rng = rand::thread_rng();
+            peers.shuffle(&mut rng);
+        }
+        for dst in peers {
+            let body = StrictBody::CatchupReq(StrictCatchupReq {
+                src_node: self.self_id as u32,
+                since_version: 0,
+                chunk_token: 0,
+            });
+            match self.net.send_unicast(dst, &self.topic, body).await {
+                Ok(()) => {
+                    eprintln!("DIAGFIX[try@{}/{}] sent to {}", self.self_id, self.topic, dst);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("DIAGFIX[try@{}/{}] send to {} failed: {:?}", self.self_id, self.topic, dst, e);
+                    debug!(%dst, error=%e, "strict catchup bootstrap send failed");
+                }
+            }
+        }
     }
 
     /// Compute `(target_set, fast_quorum)` from the current alive view.
@@ -1176,6 +1243,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 });
             }
         }
+
+        // A new peer just became reachable: retry the bootstrap catchup if
+        // we haven't applied any data yet. The initial attempt at register
+        // time can fail with NoRoute when the alive view (Hello-driven)
+        // outruns the routing table (LSDB-driven), so we lean on these
+        // membership events — which are themselves LSDB-driven, hence
+        // emitted only after routing has the new peer — to drive a retry.
+        let peer_added = matches!(
+            ev,
+            MembershipEvent::Joined(_) | MembershipEvent::Restarted(_),
+        );
+        eprintln!("DIAGFIX[on_mem@{}/{}] event={:?} peer_added={}", self.self_id, self.topic, ev, peer_added);
+        if peer_added {
+            let weak = self.weak_self.lock().clone();
+            if let Some(weak) = weak {
+                tokio::spawn(async move {
+                    if let Some(rt) = weak.upgrade() {
+                        rt.try_bootstrap_catchup().await;
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -1328,40 +1417,6 @@ fn spawn_clock_tick_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             if let Err(e) = rt.net.send_broadcast(&rt.topic, body).await {
                 trace!(error=%e, "clock tick broadcast failed");
             }
-        }
-    });
-}
-
-fn spawn_catchup_bootstrap<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
-    let weak = {
-        let rt = rt;
-        Arc::downgrade(&rt)
-    };
-    tokio::spawn(async move {
-        let Some(rt) = weak.upgrade() else {
-            return;
-        };
-        if rt.repo.current_version() != 0 {
-            return;
-        }
-        let alive = rt.net.alive_members();
-        let mut peers: Vec<NodeIdentifier> =
-            alive.into_iter().filter(|n| *n != rt.self_id).collect();
-        if peers.is_empty() {
-            return;
-        }
-        let dst = {
-            let mut rng = rand::thread_rng();
-            peers.shuffle(&mut rng);
-            peers[0]
-        };
-        let body = StrictBody::CatchupReq(StrictCatchupReq {
-            src_node: rt.self_id as u32,
-            since_version: 0,
-            chunk_token: 0,
-        });
-        if let Err(e) = rt.net.send_unicast(dst, &rt.topic, body).await {
-            debug!(error=%e, "strict catchup bootstrap send failed");
         }
     });
 }

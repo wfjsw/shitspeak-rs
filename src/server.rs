@@ -21,7 +21,6 @@ use crate::errors::{HandleIncomingConnectionError, ReadProtoMessageError};
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
-use crate::voice::ping::decode_ping_protobuf;
 use crate::{
     client_repository::ClientRepository, codec_info::CodecInfo, config::Config, s2s::S2SManager,
     types::NodeIdentifier,
@@ -258,7 +257,7 @@ impl Server {
                 tracing::trace!("UDP received {} bytes from {}", len, src_addr);
 
                 if ping_enabled {
-                    match crate::voice::ping::try_decode_ping(packet).await {
+                    match crate::voice::ping::try_decode_ping(packet) {
                         Ok(ping) => {
                             tracing::debug!(
                                 "UDP ping from {}: timestamp={}, format={}",
@@ -460,7 +459,7 @@ impl Server {
                 };
 
                 // After decryption, check if this is a ping or audio packet.
-                match crate::voice::codec::decode_udp_packet(&decrypted).await {
+                match crate::voice::codec::decode_udp_packet(&decrypted) {
                     Ok(crate::voice::codec::UdpPacket::Ping(ping)) => {
                         tracing::trace!(
                             "UDP ping from {}: timestamp={}, format={}",

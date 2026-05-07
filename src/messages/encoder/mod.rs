@@ -1,5 +1,7 @@
+mod audio;
 mod version;
 mod ping;
+mod udp_ping;
 mod authenticate;
 mod crypt_setup;
 mod user_state;
@@ -25,8 +27,10 @@ mod context_action_modify;
 mod permission_denied;
 mod reject_type;
 
+pub use audio::*;
 pub use version::*;
 pub use ping::*;
+pub use udp_ping::*;
 pub use authenticate::*;
 pub use crypt_setup::*;
 pub use user_state::*;

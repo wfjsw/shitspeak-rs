@@ -2,8 +2,9 @@
 //! and protobuf (1.5.0+) formats.
 
 use bytes::{BufMut as _, Bytes, BytesMut};
-use prost::{EncodeError, Message as _};
-use tokio::io::AsyncReadExt;
+use prost::EncodeError;
+
+use crate::messages::encoder::UdpPing;
 
 use super::codec::{DecodeError, PacketFormat};
 
@@ -27,26 +28,22 @@ pub struct PingResponse {
     pub max_bandwidth_per_user: u32,
 }
 
-pub async fn try_decode_ping(data: &[u8]) -> Result<PingRequest, DecodeError> {
+pub fn try_decode_ping(data: &[u8]) -> Result<PingRequest, DecodeError> {
     let header = data.get(0).ok_or(DecodeError::TooShort)?;
     if *header == 0x1u8 {
-        return decode_ping_protobuf(&data[1..])
-            .await
-            .map_err(|_| DecodeError::NotPing);
+        return decode_ping_protobuf(&data[1..]).map_err(|_| DecodeError::NotPing);
     }
 
     if data.len() == 12 {
-        return decode_ping_legacy(&data)
-            .await
-            .map_err(|_| DecodeError::NotPing);
+        return decode_ping_legacy(&data).map_err(|_| DecodeError::NotPing);
     }
 
     Err(DecodeError::NotPing)
 }
 
 /// Decode a protobuf Ping packet (data is after the 2-byte header).
-pub async fn decode_ping_protobuf(data: &[u8]) -> Result<PingRequest, DecodeError> {
-    let ping = crate::mumble_udp::Ping::decode(data).map_err(DecodeError::ProtobufDecode)?;
+pub fn decode_ping_protobuf(data: &[u8]) -> Result<PingRequest, DecodeError> {
+    let ping = UdpPing::decode_wire(data).map_err(DecodeError::ProtobufDecode)?;
     Ok(PingRequest {
         timestamp: ping.timestamp,
         request_extended_information: ping.request_extended_information,
@@ -63,12 +60,11 @@ pub async fn decode_ping_protobuf(data: &[u8]) -> Result<PingRequest, DecodeErro
 /// When called from the unencrypted path (`try_decode_ping`), `data` is the
 /// full 12-byte packet including the `\x00\x00\x00\x00` header followed by a
 /// raw big-endian u64 timestamp.
-pub async fn decode_ping_legacy(data: &[u8]) -> Result<PingRequest, DecodeError> {
+pub fn decode_ping_legacy(data: &[u8]) -> Result<PingRequest, DecodeError> {
     if data.is_empty() {
         return Err(DecodeError::TooShort);
     }
 
-    let mut data_cursor = std::io::Cursor::new(data);
     let (request_extended_information, timestamp) = if data.len() < size_of::<u64>() {
         // Short form: PDS varint-encoded timestamp (encrypted pings from authenticated clients).
         let (ts, consumed) = super::codec::read_varint(data).ok_or(DecodeError::LegacyDecode)?;
@@ -77,14 +73,21 @@ pub async fn decode_ping_legacy(data: &[u8]) -> Result<PingRequest, DecodeError>
         }
         (false, ts)
     } else if data.len() <= size_of::<u64>() + 1 {
-        (false, data_cursor.read_u64().await.map_err(|_| DecodeError::LegacyDecode)?)
+        let bytes: [u8; 8] = data[..size_of::<u64>()]
+            .try_into()
+            .map_err(|_| DecodeError::LegacyDecode)?;
+        (false, u64::from_be_bytes(bytes))
     } else if data.len() == 4 + size_of::<u64>() {
-        if data_cursor.read_u32().await.map_err(|_| DecodeError::LegacyDecode)? != 0 {
+        let prefix: [u8; 4] = data[..4]
+            .try_into()
+            .map_err(|_| DecodeError::LegacyDecode)?;
+        if u32::from_be_bytes(prefix) != 0 {
             return Err(DecodeError::TooShort);
         }
-
-        let timestamp = data_cursor.read_u64().await.map_err(|_| DecodeError::LegacyDecode)?;
-        (true, timestamp)
+        let ts_bytes: [u8; 8] = data[4..4 + size_of::<u64>()]
+            .try_into()
+            .map_err(|_| DecodeError::LegacyDecode)?;
+        (true, u64::from_be_bytes(ts_bytes))
     } else {
         return Err(DecodeError::NotPing);
     };
@@ -115,7 +118,7 @@ pub fn encode_ping_response(response: &PingResponse, format: PacketFormat) -> Re
 }
 
 fn encode_ping_protobuf(response: &PingResponse) -> Result<Bytes, EncodeError> {
-    let msg = crate::mumble_udp::Ping {
+    let ping = UdpPing {
         timestamp: response.timestamp,
         request_extended_information: false,
         server_version_v2: response.server_version.into(),
@@ -123,9 +126,9 @@ fn encode_ping_protobuf(response: &PingResponse) -> Result<Bytes, EncodeError> {
         max_user_count: response.max_user_count.unwrap_or(u32::MAX),
         max_bandwidth_per_user: response.max_bandwidth_per_user,
     };
-    let mut buf = BytesMut::with_capacity(1 + msg.encoded_len());
+    let mut buf = BytesMut::with_capacity(1 + ping.encoded_len());
     buf.put_u8(0x01); // type = Ping
-    msg.encode(&mut buf)?;
+    ping.encode(&mut buf)?;
     Ok(buf.freeze())
 }
 

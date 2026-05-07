@@ -1,25 +1,29 @@
-use aws_lc_rs::{
-    cipher::{DecryptingKey, EncryptingKey, UnboundCipherKey, AES_128},
-    rand::{self, SecureRandom},
-};
+use aws_lc_rs::rand::SecureRandom;
 use bytes::Bytes;
 
-use crate::client::crypt::{errors::CryptError, CryptoMode};
+use crate::client::crypt::{
+    aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops, CryptoMode,
+};
 
 const BLOCK_SIZE: usize = 16;
+/// Hard upper bound on plaintext we ever encrypt in one OCB2 call. The Mumble
+/// UDP voice path caps wire packets at 1024 bytes (incl. tag overhead), so
+/// the largest plaintext we'll see is comfortably below this.
+const MAX_PLAINTEXT_BYTES: usize = 1024;
+const MAX_BLOCKS: usize = MAX_PLAINTEXT_BYTES / BLOCK_SIZE; // 64
 
 pub struct Ocb2 {
     key: Bytes,
-    encrypt_key: EncryptingKey,
-    decrypt_key: DecryptingKey,
+    aes: Aes128,
+    gf128: Gf128Ops,
 }
 
 impl Ocb2 {
     pub fn from_key(key: [u8; BLOCK_SIZE]) -> Result<Self, CryptError> {
         Ok(Ocb2 {
             key: Bytes::copy_from_slice(&key),
-            encrypt_key: EncryptingKey::ecb(UnboundCipherKey::new(&AES_128, &key)?)?,
-            decrypt_key: DecryptingKey::ecb(UnboundCipherKey::new(&AES_128, &key)?)?,
+            aes: Aes128::new(&key)?,
+            gf128: Gf128Ops::new(),
         })
     }
 
@@ -53,75 +57,97 @@ impl CryptoMode for Ocb2 {
         if nonce.len() != self.nonce_size() {
             return Err(CryptError::InvalidNonceSize);
         }
-
         if dest.len() < cleartext_len + self.overhead() {
             return Err(CryptError::DestinationBufferTooSmall);
         }
-
-        // delta = E(nonce)
-        let mut delta = [0u8; BLOCK_SIZE];
-        delta.copy_from_slice(nonce);
-        self.encrypt_key.encrypt(&mut delta)?;
-
-        let mut checksum = [0u8; BLOCK_SIZE];
-
-        let mut tmp = [0u8; BLOCK_SIZE];
-        let mut pad = [0u8; BLOCK_SIZE];
-
-        let tag_size = self.overhead();
-        let dest_ciphertext = &mut dest[tag_size..];
-
-        // Process all full blocks except the final block
-        for pos in (0..cleartext_len)
-            .step_by(BLOCK_SIZE)
-            .take_while(|&p| p + BLOCK_SIZE < cleartext_len)
-        {
-            times2(&mut delta);
-
-            tmp.copy_from_slice(&data[pos..pos + BLOCK_SIZE]);
-            xor(&mut tmp, &delta);
-
-            self.encrypt_key.encrypt(&mut tmp)?;
-
-            let mut out_block = [0u8; BLOCK_SIZE];
-            xor_into(&mut out_block, &delta, &tmp);
-            dest_ciphertext[pos..pos + BLOCK_SIZE].copy_from_slice(&out_block);
-
-            xor(&mut checksum, &data[pos..pos + BLOCK_SIZE]);
+        if cleartext_len > MAX_PLAINTEXT_BYTES {
+            return Err(CryptError::DestinationBufferTooSmall);
         }
+
+        // ── Phase 1: initial delta = E(nonce). 1 AES call.
+        let mut delta_chain = [[0u8; BLOCK_SIZE]; MAX_BLOCKS + 2];
+        delta_chain[0].copy_from_slice(nonce);
+        self.aes.encrypt_blocks(&mut delta_chain[0])?;
 
         let last_pos = cleartext_len.saturating_sub(1) / BLOCK_SIZE * BLOCK_SIZE;
         let remaining = cleartext_len - last_pos;
+        let n_main = last_pos / BLOCK_SIZE; // count of "main loop" full blocks
 
-        // Final (partial or zero-length) block
-        times2(&mut delta);
-        tmp.fill(0);
+        // ── Phase 2: pre-compute all per-block deltas in one shot.
+        // delta_chain[0]   = E(nonce)            (intermediate; never used directly below)
+        // delta_chain[i]   = times2^i(E(nonce))  for i = 1..=n_main+1
+        //   - delta_chain[1..=n_main]  → main-loop block deltas
+        //   - delta_chain[n_main + 1]  → partial-block delta
+        // The whole chain is dispatched once; the SIMD backend keeps the
+        // running value in LE form between iterations to amortize the
+        // BE↔LE byte-reverse cost.
+        self.gf128.fill_chain(&mut delta_chain, n_main + 1);
+
+        let tag_size = self.overhead();
+        let dest_ciphertext = &mut dest[tag_size..];
+        let mut checksum = [0u8; BLOCK_SIZE];
+
+        // ── Phase 3: pre-XOR every main-loop block with its delta into one
+        // contiguous buffer. Pure Rust, no FFI.
+        let mut bulk = [0u8; MAX_PLAINTEXT_BYTES];
+        let bulk_len = n_main * BLOCK_SIZE;
+        for i in 0..n_main {
+            let block = &data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+            let d = &delta_chain[i + 1];
+            for j in 0..BLOCK_SIZE {
+                bulk[i * BLOCK_SIZE + j] = block[j] ^ d[j];
+            }
+        }
+
+        // ── Phase 4: ONE batched ECB encrypt for all main-loop blocks.
+        if bulk_len > 0 {
+            self.aes.encrypt_blocks(&mut bulk[..bulk_len])?;
+        }
+
+        // ── Phase 5: post-XOR to produce ciphertext, accumulate checksum.
+        // Pure Rust, no FFI.
+        for i in 0..n_main {
+            let d = &delta_chain[i + 1];
+            for j in 0..BLOCK_SIZE {
+                dest_ciphertext[i * BLOCK_SIZE + j] = bulk[i * BLOCK_SIZE + j] ^ d[j];
+                checksum[j] ^= data[i * BLOCK_SIZE + j];
+            }
+        }
+
+        // ── Phase 6: partial (or final empty) block. 1 AES call.
+        let final_delta = delta_chain[n_main + 1];
+        let mut pad = [0u8; BLOCK_SIZE];
         let num_bits = (remaining * 8) as u16;
-        tmp[BLOCK_SIZE - 2] = ((num_bits >> 8) & 0xff) as u8;
-        tmp[BLOCK_SIZE - 1] = (num_bits & 0xff) as u8;
-        xor(&mut tmp, &delta);
+        pad[BLOCK_SIZE - 2] = ((num_bits >> 8) & 0xff) as u8;
+        pad[BLOCK_SIZE - 1] = (num_bits & 0xff) as u8;
+        for j in 0..BLOCK_SIZE {
+            pad[j] ^= final_delta[j];
+        }
+        self.aes.encrypt_blocks(&mut pad)?;
 
-        pad.copy_from_slice(&tmp);
-        self.encrypt_key.encrypt(&mut pad)?;
-
+        // tmp = data fragment (first `remaining` bytes) | pad (upper bytes)
+        let mut tmp = [0u8; BLOCK_SIZE];
         if remaining > 0 {
             tmp[..remaining].copy_from_slice(&data[last_pos..last_pos + remaining]);
         }
-
         tmp[remaining..].copy_from_slice(&pad[remaining..]);
 
-        xor(&mut checksum, &tmp);
-        xor_into(
-            &mut dest_ciphertext[last_pos..last_pos + remaining],
-            &pad,
-            &tmp,
-        );
+        for j in 0..BLOCK_SIZE {
+            checksum[j] ^= tmp[j];
+        }
+        for j in 0..remaining {
+            dest_ciphertext[last_pos + j] = pad[j] ^ tmp[j];
+        }
 
-        times3(&mut delta);
-        xor(&mut delta, &checksum);
-        self.encrypt_key.encrypt(&mut delta)?;
+        // ── Phase 7: tag = E(times3(final_delta) ^ checksum). 1 AES call.
+        let mut tag_buf = final_delta;
+        self.gf128.triple(&mut tag_buf);
+        for j in 0..BLOCK_SIZE {
+            tag_buf[j] ^= checksum[j];
+        }
+        self.aes.encrypt_blocks(&mut tag_buf)?;
 
-        dest[..tag_size].copy_from_slice(&delta[..tag_size]);
+        dest[..tag_size].copy_from_slice(&tag_buf[..tag_size]);
 
         Ok(())
     }
@@ -130,85 +156,101 @@ impl CryptoMode for Ocb2 {
         if nonce.len() != self.nonce_size() {
             return Err(CryptError::InvalidNonceSize);
         }
-
         if data.len() < self.overhead() {
             return Err(CryptError::DataTooShort);
         }
 
         let tag_len = self.overhead();
         let ciphertext_len = data.len() - tag_len;
-
         if dest.len() < ciphertext_len {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+        if ciphertext_len > MAX_PLAINTEXT_BYTES {
             return Err(CryptError::DestinationBufferTooSmall);
         }
 
         let tag = &data[..tag_len];
         let ciphertext = &data[tag_len..];
 
-        // prepare
-        let mut checksum = [0u8; BLOCK_SIZE];
-        let mut delta = [0u8; BLOCK_SIZE];
-        delta.copy_from_slice(nonce);
-        self.encrypt_key.encrypt(&mut delta)?;
-
-        let mut tmp = [0u8; BLOCK_SIZE];
-        let mut pad = [0u8; BLOCK_SIZE];
-        let mut calc_tag = [0u8; BLOCK_SIZE];
-
-        // process full blocks
-        for off in (0..ciphertext_len)
-            .step_by(BLOCK_SIZE)
-            .take_while(|&p| p + BLOCK_SIZE < ciphertext_len)
-        {
-            times2(&mut delta);
-            // tmp = delta xor ciphertext_block
-            xor_into(&mut tmp, &delta, &ciphertext[off..off + BLOCK_SIZE]);
-            // decrypt tmp in-place
-            self.decrypt_key
-                .decrypt(&mut tmp, aws_lc_rs::cipher::DecryptionContext::None)?;
-            // plain_block = delta xor tmp
-            xor(&mut tmp, &delta);
-            dest[off..off + BLOCK_SIZE].copy_from_slice(&tmp);
-            // checksum ^= plain_block
-            xor(&mut checksum, &tmp);
-        }
+        // ── Phase 1: initial delta = E(nonce). 1 AES call (encrypt).
+        let mut delta_chain = [[0u8; BLOCK_SIZE]; MAX_BLOCKS + 2];
+        delta_chain[0].copy_from_slice(nonce);
+        self.aes.encrypt_blocks(&mut delta_chain[0])?;
 
         let last_pos = ciphertext_len.saturating_sub(1) / BLOCK_SIZE * BLOCK_SIZE;
         let remaining = ciphertext_len - last_pos;
+        let n_main = last_pos / BLOCK_SIZE;
 
-        // final partial block
-        times2(&mut delta);
-        tmp.fill(0);
+        // ── Phase 2: pre-compute all deltas in one shot (see encrypt for layout).
+        self.gf128.fill_chain(&mut delta_chain, n_main + 1);
+
+        let mut checksum = [0u8; BLOCK_SIZE];
+
+        // ── Phase 3: pre-XOR every main-loop ciphertext block with its delta
+        // into one contiguous buffer.
+        let mut bulk = [0u8; MAX_PLAINTEXT_BYTES];
+        let bulk_len = n_main * BLOCK_SIZE;
+        for i in 0..n_main {
+            let block = &ciphertext[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+            let d = &delta_chain[i + 1];
+            for j in 0..BLOCK_SIZE {
+                bulk[i * BLOCK_SIZE + j] = block[j] ^ d[j];
+            }
+        }
+
+        // ── Phase 4: ONE batched ECB decrypt.
+        if bulk_len > 0 {
+            self.aes.decrypt_blocks(&mut bulk[..bulk_len])?;
+        }
+
+        // ── Phase 5: post-XOR to produce plaintext, accumulate checksum.
+        for i in 0..n_main {
+            let d = &delta_chain[i + 1];
+            for j in 0..BLOCK_SIZE {
+                let plain = bulk[i * BLOCK_SIZE + j] ^ d[j];
+                dest[i * BLOCK_SIZE + j] = plain;
+                checksum[j] ^= plain;
+            }
+        }
+
+        // ── Phase 6: partial (or final empty) block. 1 AES call (encrypt).
+        let final_delta = delta_chain[n_main + 1];
+        let mut pad = [0u8; BLOCK_SIZE];
         let num_bits = (remaining * 8) as u16;
-        tmp[BLOCK_SIZE - 2] = ((num_bits >> 8) & 0xff) as u8;
-        tmp[BLOCK_SIZE - 1] = (num_bits & 0xff) as u8;
-        xor(&mut tmp, &delta);
+        pad[BLOCK_SIZE - 2] = ((num_bits >> 8) & 0xff) as u8;
+        pad[BLOCK_SIZE - 1] = (num_bits & 0xff) as u8;
+        for j in 0..BLOCK_SIZE {
+            pad[j] ^= final_delta[j];
+        }
+        self.aes.encrypt_blocks(&mut pad)?;
 
-        pad.copy_from_slice(&tmp);
-        self.encrypt_key.encrypt(&mut pad)?;
-
-        // tmp = ciphertext fragment (in first `remaining` bytes)
-        tmp.fill(0);
+        // tmp = ciphertext fragment (first `remaining` bytes), zero-padded.
+        let mut tmp = [0u8; BLOCK_SIZE];
         if remaining > 0 {
             tmp[..remaining].copy_from_slice(&ciphertext[last_pos..last_pos + remaining]);
         }
+        // tmp ^= pad (first `remaining` bytes are plaintext fragment;
+        // upper bytes equal pad[remaining..] since tmp[remaining..] was zero).
+        for j in 0..BLOCK_SIZE {
+            tmp[j] ^= pad[j];
+        }
 
-        // tmp = tmp xor pad
-        xor(&mut tmp, &pad);
+        for j in 0..BLOCK_SIZE {
+            checksum[j] ^= tmp[j];
+        }
+        if remaining > 0 {
+            dest[last_pos..last_pos + remaining].copy_from_slice(&tmp[..remaining]);
+        }
 
-        // checksum ^= tmp
-        xor(&mut checksum, &tmp);
+        // ── Phase 7: tag = E(times3(final_delta) ^ checksum). 1 AES call.
+        let mut tag_buf = final_delta;
+        self.gf128.triple(&mut tag_buf);
+        for j in 0..BLOCK_SIZE {
+            tag_buf[j] ^= checksum[j];
+        }
+        self.aes.encrypt_blocks(&mut tag_buf)?;
 
-        // write plaintext fragment
-        dest[last_pos..last_pos + remaining].copy_from_slice(&tmp[..remaining]);
-
-        // finalize tag: E((3*delta) xor checksum)
-        times3(&mut delta);
-        xor(&mut delta, &checksum);
-        self.encrypt_key.encrypt(&mut delta)?;
-
-        // constant-time compare of computed tag prefix with provided tag
-        if !consttime_eq(&delta[..tag_len], tag) {
+        if !consttime_eq(&tag_buf[..tag_len], tag) {
             return Err(CryptError::TagMismatch);
         }
 
@@ -227,69 +269,9 @@ fn consttime_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn xor(d: &mut [u8], s: &[u8]) {
-    d.iter_mut().zip(s.iter()).for_each(|(d, &s)| *d = *d ^ s);
-}
-
-fn xor_into(dst: &mut [u8], a: &[u8], b: &[u8]) {
-    dst.iter_mut()
-        .zip(a.iter())
-        .zip(b.iter())
-        .for_each(|((d, &a), &b)| *d = a ^ b);
-}
-
-// times2 performs the times2 operation, defined as:
-//
-// times2(S)
-//     S << 1 if S[1] = 0, and (S << 1) xor const(bitlength(S)) if S[1] = 1.
-//
-// where const(n) is defined as
-//
-// const(n)
-//     The lexicographically first n-bit string C among all
-//     strings that have a minimal possible number of "1"
-//     bits and which name a polynomial x^n + C[1] *
-//     x^{n-1} + ... + C[n-1] * x^1 + C[n] * x^0 that is
-//     irreducible over the field with two elements.  In
-//     particular, const(128) = num2str(135, 128).  For
-//     other values of n, refer to a standard table of
-//     irreducible polynomials [G. Seroussi,
-//     "Table of low-weight binary irreducible polynomials",
-//     HP Labs Technical Report HPL-98-135, 1998.].
-//
-// and num2str(x, n) is defined as
-//
-// num2str(x, n)
-//     The n-bit binary representation of the integer x.
-//     More formally, the n-bit string S where x = S[1] *
-//     2^{n-1} + S[2] * 2^{n-2} + ... + S[n] * 2^{0}.  Only
-//     used when 0 <= x < 2^n.
-//
-// For our 128-bit block size implementation, this means that
-// the xor with const(bitlength(S)) if S[1] = 1 is implemented
-// by simply xor'ing the last byte with the number 135 when
-// S[1] = 1.
-fn times2(d: &mut [u8]) {
-    assert!(d.len() == BLOCK_SIZE);
-    let carry = (d[0] >> 7) & 0x1;
-    for i in 0..(BLOCK_SIZE - 1) {
-        d[i] = (d[i] << 1) | ((d[i + 1] >> 7) & 0x1);
-    }
-    d[BLOCK_SIZE - 1] = (d[BLOCK_SIZE - 1] << 1) ^ (carry * 0x87);
-}
-
-// times3 performs the times3 operation, defined as:
-//
-// times3(S)
-//     times2(S) xor S
-fn times3(d: &mut [u8]) {
-    assert!(d.len() == BLOCK_SIZE);
-    let carry = (d[0] >> 7) & 0x1;
-    for i in 0..(BLOCK_SIZE - 1) {
-        d[i] ^= (d[i] << 1) | ((d[i + 1] >> 7) & 0x1);
-    }
-    d[BLOCK_SIZE - 1] ^= (d[BLOCK_SIZE - 1] << 1) ^ (carry * 0x87);
-}
+// `times2` and `times3` (GF(2^128) doubling/tripling) live in
+// `super::gf128` with both scalar and SIMD backends, runtime-probed at
+// startup. See the comments there for the polynomial definition.
 
 #[cfg(test)]
 mod tests {
@@ -361,42 +343,6 @@ mod tests {
             tag: "9DB0CDF880F73E3E10D4EB3217766688",
         },
     ];
-
-    #[test]
-    fn test_times2_and_times3_and_xor() {
-        let mut msg: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];
-        msg[0] = 0x80;
-        for i in 1..(BLOCK_SIZE - 1) {
-            msg[i] = 0xff;
-        }
-        msg[BLOCK_SIZE - 1] = 0xfe;
-
-        let mut expect2 = [0u8; BLOCK_SIZE];
-        expect2[0] = 0x01;
-        for i in 1..(BLOCK_SIZE - 1) {
-            expect2[i] = 0xff;
-        }
-        expect2[BLOCK_SIZE - 1] = 0x7b;
-
-        let mut m2 = msg;
-        times2(&mut m2);
-        assert_eq!(m2, expect2);
-
-        let mut m3 = msg;
-        times3(&mut m3);
-        let mut expect3 = [0u8; BLOCK_SIZE];
-        expect3[0] = 0x81;
-        expect3[BLOCK_SIZE - 1] = 0x85;
-        assert_eq!(m3, expect3);
-
-        // xor test
-        let mut out = [0u8; BLOCK_SIZE];
-        xor(&mut out, &msg);
-        // out should be msg xor msg == zero
-        let mut tmp = [0u8; BLOCK_SIZE];
-        xor(&mut tmp, &out);
-        assert_eq!(tmp, msg);
-    }
 
     #[test]
     fn test_encrypt_decrypt_vectors() {

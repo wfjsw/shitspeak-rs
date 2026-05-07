@@ -94,6 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Probe the AES + GF(2^128) backends once at launch (each logs its
+    // choice via `tracing::info!`).
+    crate::client::crypt::probe_aes_backend();
+    crate::client::crypt::probe_gf128_backend();
+
     let config = Config::load();
     let server = Server::new(config, NoopAuthenticator).await?;
 

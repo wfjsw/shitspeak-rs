@@ -30,6 +30,11 @@ pub struct ReplicationConfig {
     propose_semaphore_size: usize,
     /// Cap on `CatchupOp`s returned per `StrictCatchupResp` chunk.
     strict_max_catchup_ops: usize,
+    /// Minimum interval between bootstrap-catchup attempts. Triggered both
+    /// by topic registration and by `Joined`/`Restarted` membership events;
+    /// this throttle dedupes burst events so we don't fan out duplicate
+    /// requests when several peers join in quick succession after a heal.
+    strict_bootstrap_retry_interval: Duration,
     /// Pending propose entries are GC'd after this period. Must be longer
     /// than `propose_ttl` so a proposer's caller-visible timeout fires
     /// before the remote-side state evaporates.
@@ -56,6 +61,7 @@ impl Default for ReplicationConfig {
             propose_ttl: Duration::from_secs(10),
             propose_semaphore_size: 32,
             strict_max_catchup_ops: 256,
+            strict_bootstrap_retry_interval: Duration::from_millis(200),
             pending_propose_ttl: Duration::from_secs(20),
             recovery_ttl: Duration::from_secs(10),
 
@@ -86,6 +92,9 @@ impl ReplicationConfig {
     }
     pub fn strict_max_catchup_ops(&self) -> usize {
         self.strict_max_catchup_ops
+    }
+    pub fn strict_bootstrap_retry_interval(&self) -> Duration {
+        self.strict_bootstrap_retry_interval
     }
     pub fn pending_propose_ttl(&self) -> Duration {
         self.pending_propose_ttl
@@ -128,6 +137,10 @@ impl ReplicationConfig {
         self.strict_max_catchup_ops = n;
         self
     }
+    pub fn with_strict_bootstrap_retry_interval(mut self, d: Duration) -> Self {
+        self.strict_bootstrap_retry_interval = d;
+        self
+    }
     pub fn with_pending_propose_ttl(mut self, d: Duration) -> Self {
         self.pending_propose_ttl = d;
         self
@@ -165,6 +178,8 @@ pub struct ReplicationTuning {
     pub propose_semaphore_size: usize,
     #[serde(default = "default_strict_max_catchup_ops")]
     pub strict_max_catchup_ops: usize,
+    #[serde(default = "default_strict_bootstrap_retry_interval_ms")]
+    pub strict_bootstrap_retry_interval_ms: u64,
     #[serde(default = "default_pending_propose_ttl_ms")]
     pub pending_propose_ttl_ms: u64,
     #[serde(default = "default_recovery_ttl_ms")]
@@ -185,6 +200,7 @@ impl Default for ReplicationTuning {
             propose_ttl_ms: default_propose_ttl_ms(),
             propose_semaphore_size: default_propose_semaphore_size(),
             strict_max_catchup_ops: default_strict_max_catchup_ops(),
+            strict_bootstrap_retry_interval_ms: default_strict_bootstrap_retry_interval_ms(),
             pending_propose_ttl_ms: default_pending_propose_ttl_ms(),
             recovery_ttl_ms: default_recovery_ttl_ms(),
             owner_catchup_timeout_ms: default_owner_catchup_timeout_ms(),
@@ -203,6 +219,9 @@ impl From<ReplicationTuning> for ReplicationConfig {
             .with_propose_ttl(Duration::from_millis(t.propose_ttl_ms))
             .with_propose_semaphore_size(t.propose_semaphore_size)
             .with_strict_max_catchup_ops(t.strict_max_catchup_ops)
+            .with_strict_bootstrap_retry_interval(Duration::from_millis(
+                t.strict_bootstrap_retry_interval_ms,
+            ))
             .with_pending_propose_ttl(Duration::from_millis(t.pending_propose_ttl_ms))
             .with_recovery_ttl(Duration::from_millis(t.recovery_ttl_ms))
             .with_owner_catchup_timeout(Duration::from_millis(t.owner_catchup_timeout_ms))
@@ -217,6 +236,7 @@ fn default_delivery_tick_interval_ms() -> u64 { 50 }
 fn default_propose_ttl_ms() -> u64 { 10_000 }
 fn default_propose_semaphore_size() -> usize { 32 }
 fn default_strict_max_catchup_ops() -> usize { 256 }
+fn default_strict_bootstrap_retry_interval_ms() -> u64 { 200 }
 fn default_pending_propose_ttl_ms() -> u64 { 20_000 }
 fn default_recovery_ttl_ms() -> u64 { 10_000 }
 fn default_owner_catchup_timeout_ms() -> u64 { 5_000 }

@@ -56,10 +56,10 @@ fn encode_legacy_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> By
 /// official client does. Type byte 0x00 prefixes the encoded `MumbleUDP.Audio`.
 /// `sender_session` is omitted (server fills it from the authenticated session).
 fn encode_protobuf_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> Bytes {
-    use crate::mumble_udp::{audio, Audio};
+    use crate::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
     use prost::Message as _;
-    let msg = Audio {
-        header: Some(audio::Header::Target(target)),
+    let wire = AudioWire {
+        header: Some(AudioHeader::Target(AudioTarget::from(target))),
         sender_session: 0,
         frame_number,
         opus_data: Bytes::copy_from_slice(opus),
@@ -67,9 +67,10 @@ fn encode_protobuf_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> 
         volume_adjustment: 0.0,
         is_terminator: false,
     };
-    let mut buf = BytesMut::with_capacity(1 + msg.encoded_len());
+    let proto: crate::mumble_udp::Audio = wire.into();
+    let mut buf = BytesMut::with_capacity(1 + proto.encoded_len());
     buf.put_u8(0x00);
-    msg.encode(&mut buf).expect("encode protobuf audio");
+    proto.encode(&mut buf).expect("encode protobuf audio");
     buf.freeze()
 }
 
@@ -109,7 +110,7 @@ fn decode_legacy_server_voice(data: &[u8]) -> Option<DecodedAudio> {
     if (header >> 5) != 4 {
         return None; // not VoiceOpus
     }
-    let target = (header & 0x1f) as u32;
+    let target = crate::messages::encoder::AudioTarget::from((header & 0x1f) as u32);
     let mut pos = 1usize;
     let (sender_session, n) = read_pds_varint(&data[pos..])?;
     pos += n;
@@ -777,7 +778,7 @@ impl TestClient {
                 // legacy server-encoded voice packets correctly.
                 if !decrypted.is_empty() && (decrypted[0] == 0x01 || (decrypted[0] >> 5) == 1) {
                     if matches!(
-                        decode_udp_packet(&decrypted).await,
+                        decode_udp_packet(&decrypted),
                         Ok(UdpPacket::Ping(_))
                     ) {
                         continue;

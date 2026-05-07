@@ -1,7 +1,9 @@
+mod audio;
 mod ping;
 mod user_state;
 use std::fmt::Display;
 
+pub use audio::*;
 pub use ping::*;
 pub use user_state::*;
 
@@ -9,6 +11,7 @@ pub use user_state::*;
 pub enum MessageProtocolError {
     PingProtocolError(PingProtocolError),
     UserStateProtocolError(UserStateProtocolError),
+    AudioProtocolError(AudioProtocolError),
 }
 
 impl Display for MessageProtocolError {
@@ -19,6 +22,9 @@ impl Display for MessageProtocolError {
             },
             MessageProtocolError::UserStateProtocolError(e) => {
                 write!(f, "UserState protocol error: {}", e)
+            }
+            MessageProtocolError::AudioProtocolError(e) => {
+                write!(f, "Audio protocol error: {}", e)
             }
         }
     }
