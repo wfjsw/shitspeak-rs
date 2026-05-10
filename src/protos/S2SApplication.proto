@@ -45,6 +45,42 @@ message UserRemovePatch {
   bool   ban             = 2;
 }
 
+// ── UserStats RPC ─────────────────────────────────────────────────────────
+//
+// Request/reply RPC for the Mumble `UserStats` query. Unlike moderation
+// (fire-and-forget), the moderator's client is waiting for a reply, so
+// the owner of the target client builds the full reply and ships it back
+// to the originator. Tag = 4 on the overlay's `ServiceRegistry`.
+//
+// The reply carries an opaque `payload` that is an *already-encoded*
+// `MumbleProto.UserStats` message: the originator forwards it to the
+// moderator's TLS stream as-is, no decode/re-encode round trip.
+
+message UserStatsEnvelope {
+  oneof kind {
+    UserStatsRequest request = 1;
+    UserStatsReply   reply   = 2;
+  }
+}
+
+message UserStatsRequest {
+  uint64 request_id    = 1;   // originator-assigned correlation id
+  uint32 actor_session = 2;   // composite ClientSessionIdentifier of the moderator
+  uint32 target_session = 3;  // composite ClientSessionIdentifier of the target
+  bool   stats_only    = 4;   // mirrors UserStats.stats_only
+}
+
+message UserStatsReply {
+  uint64 request_id = 1;       // mirrors request_id from the originating Request
+  // Whether the owner found the target session in its local repository.
+  // If false, `payload` is empty and the originator should silently drop
+  // (matches the local-only behavior of returning Ok(())).
+  bool   found      = 2;
+  // Encoded `MumbleProto.UserStats` message body, ready to ship to the
+  // moderator's TLS stream. The originator does *not* re-encode.
+  bytes  payload    = 3;
+}
+
 // ── Voice ─────────────────────────────────────────────────────────────────
 
 // Cross-node voice frame. The receiver does not decode `payload` — it is

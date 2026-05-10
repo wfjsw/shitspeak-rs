@@ -34,9 +34,7 @@ use crate::messages::encoder::{
 };
 use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use crate::protocol_version::ProtocolVersion;
-use crate::voice::codec::{
-    decode_audio_packet, decode_udp_packet, DecodedAudio, PacketFormat, UdpPacket,
-};
+use crate::voice::codec::{Audio, AudioPayload, OpusPayload, PacketFormat, IncomingUdpPacket};
 
 /// Build a Mumble-legacy client→server Opus voice packet.
 ///
@@ -102,7 +100,7 @@ fn read_pds_varint(data: &[u8]) -> Option<(u64, usize)> {
 /// codec's c→s decoder by reading the `sender_session` varint between the
 /// header byte and the frame number — that field is present on s→c packets
 /// only.
-fn decode_legacy_server_voice(data: &[u8]) -> Option<DecodedAudio> {
+fn decode_legacy_server_voice(data: &[u8]) -> Option<Audio> {
     if data.len() < 2 {
         return None;
     }
@@ -126,26 +124,25 @@ fn decode_legacy_server_voice(data: &[u8]) -> Option<DecodedAudio> {
     let opus_data = Bytes::copy_from_slice(&data[pos..pos + payload_size]);
     pos += payload_size;
     let positional_data = if data.len() == pos {
-        Vec::new()
+        None
     } else if data.len() == pos + 12 {
-        let mut out = Vec::with_capacity(3);
+        let mut out = [0f32; 3];
         for i in 0..3 {
             let start = pos + i * 4;
             let bytes: [u8; 4] = data[start..start + 4].try_into().ok()?;
-            out.push(f32::from_le_bytes(bytes));
+            out[i] = f32::from_le_bytes(bytes);
         }
-        out
+        Some(out)
     } else {
         return None;
     };
-    Some(DecodedAudio {
+    Some(Audio {
         target,
-        sender_session: sender_session as u32,
+        sender_session: Some(ClientSessionIdentifier::from(sender_session as u32)),
         frame_number,
-        opus_data,
+        audio_payload: AudioPayload::Opus(OpusPayload { frame: opus_data, is_terminator }),
         positional_data,
         volume_adjustment: 1.0,
-        is_terminator,
         format: PacketFormat::Legacy,
     })
 }
@@ -154,12 +151,12 @@ fn decode_legacy_server_voice(data: &[u8]) -> Option<DecodedAudio> {
 /// legacy. Protobuf packets carry their own sender_session field, so the
 /// codec's existing decoder works in both directions; legacy packets need
 /// the s→c-aware decoder above.
-fn decode_server_voice(data: &[u8]) -> Option<DecodedAudio> {
+fn decode_server_voice(data: &[u8]) -> Option<Audio> {
     if data.is_empty() {
         return None;
     }
     if data[0] == 0x00 {
-        if let Ok(audio) = decode_audio_packet(data) {
+        if let Ok(audio) = Audio::decode(data, None) {
             return Some(audio);
         }
     }
@@ -646,7 +643,7 @@ impl TestClient {
     }
 
     /// Wait for the next `Message::UDPTunnel` and return the decoded audio.
-    pub async fn recv_voice_tcp(&self, deadline: Duration) -> Option<DecodedAudio> {
+    pub async fn recv_voice_tcp(&self, deadline: Duration) -> Option<Audio> {
         let msg = self
             .recv_until(|m| matches!(m, Message::UDPTunnel(_)), deadline)
             .await?;
@@ -743,7 +740,7 @@ impl TestClient {
     /// Receive UDP datagrams until the first audio packet arrives, decrypt
     /// it with the OCB2 state, decode it, and return it. Non-audio packets
     /// (pings) and decrypt failures are silently skipped within the deadline.
-    pub async fn recv_voice_udp(&self, deadline: Duration) -> Option<DecodedAudio> {
+    pub async fn recv_voice_udp(&self, deadline: Duration) -> Option<Audio> {
         self.recv_voice_udp_until(|_| true, deadline).await
     }
 
@@ -754,9 +751,9 @@ impl TestClient {
         &self,
         mut predicate: F,
         deadline: Duration,
-    ) -> Option<DecodedAudio>
+    ) -> Option<Audio>
     where
-        F: FnMut(&DecodedAudio) -> bool,
+        F: FnMut(&Audio) -> bool,
     {
         let socket = self.udp.as_ref().expect("open_udp first").clone();
         let crypt = self.crypt.as_ref().expect("crypt state").clone();
@@ -778,8 +775,8 @@ impl TestClient {
                 // legacy server-encoded voice packets correctly.
                 if !decrypted.is_empty() && (decrypted[0] == 0x01 || (decrypted[0] >> 5) == 1) {
                     if matches!(
-                        decode_udp_packet(&decrypted),
-                        Ok(UdpPacket::Ping(_))
+                        IncomingUdpPacket::decode(&decrypted, None),
+                        Ok(IncomingUdpPacket::Ping(_))
                     ) {
                         continue;
                     }

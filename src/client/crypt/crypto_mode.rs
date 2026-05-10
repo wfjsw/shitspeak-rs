@@ -8,5 +8,19 @@ pub trait CryptoMode: Send + Sync {
     fn encrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError>;
     fn decrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError>;
 
+    /// Variant of `encrypt` that takes a precomputed plaintext-derived
+    /// checksum (see `CryptState::compute_plaintext_checksum`). Default
+    /// implementation ignores the precomputation and falls through to
+    /// `encrypt`; modes that benefit from fan-out reuse override this.
+    fn encrypt_with_plaintext_checksum(
+        &self,
+        dest: &mut [u8],
+        data: &[u8],
+        nonce: &[u8],
+        _plaintext_checksum: &[u8; 16],
+    ) -> Result<(), CryptError> {
+        self.encrypt(dest, data, nonce)
+    }
+
     fn key(&self) -> Option<&[u8]>;
 }

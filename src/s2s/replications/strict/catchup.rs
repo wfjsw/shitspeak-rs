@@ -89,6 +89,14 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             .await;
     }
     for cop in resp.ops {
+        // Dedup: skip ops we've already applied. This protects against
+        // overlapping responses when two bootstrap requests are in
+        // flight (e.g., the periodic retry loop fired again before the
+        // first response arrived, or a `Joined` event-driven retry
+        // raced with the periodic loop).
+        if cop.version <= rt.repo.current_version() {
+            continue;
+        }
         let op: R::Op = match rmp_serde::from_slice(&cop.op_msgpack) {
             Ok(o) => o,
             Err(e) => {

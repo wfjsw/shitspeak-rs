@@ -1,6 +1,5 @@
-use crate::voice::codec::DecodedAudio;
+use crate::voice::codec::Audio;
 
 pub struct VoiceRoutingPayload {
-    pub decoded_audio: DecodedAudio,
-    pub is_udp: bool,
+    pub decoded_audio: Audio,
 }

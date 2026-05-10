@@ -67,12 +67,32 @@ impl From<u32> for AudioTarget {
     }
 }
 
+impl From<u8> for AudioTarget {
+    fn from(raw: u8) -> Self {
+        Self::from(raw as u32)
+    }
+}
+
 impl From<AudioTarget> for u32 {
     fn from(t: AudioTarget) -> u32 {
         match t {
             AudioTarget::Normal => 0,
             AudioTarget::ServerLoopback => 0x1F,
             AudioTarget::VoiceTarget(n) => n,
+        }
+    }
+}
+
+impl From<AudioTarget> for u8 {
+    fn from(t: AudioTarget) -> u8 {
+        match t {
+            AudioTarget::Normal => 0,
+            AudioTarget::ServerLoopback => 0x1F,
+            AudioTarget::VoiceTarget(n) if n <= 30 => n as u8, // Legacy wire only supports up to 30 here.
+            AudioTarget::VoiceTarget(_) => {
+                tracing::debug!("voice target out of range for legacy wire, mocking as 30");
+                30
+            }
         }
     }
 }

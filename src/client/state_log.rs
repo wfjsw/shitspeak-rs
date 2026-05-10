@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client_repository::ClientRepository;
-use crate::protocol_version::ProtocolVersion;
 
 // ─── Macros ──────────────────────────────────────────────────────────────────
 
@@ -69,8 +68,6 @@ macro_rules! diff_option {
 /// Only `Some` fields represent values that changed in a transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientGlobalStateDelta {
-    pub protocol_version: Option<Option<ProtocolVersion>>,
-
     pub current_channel_id: Option<u32>,
     pub listening_channel_add: Option<HashSet<u32>>,
     pub listening_channel_remove: Option<HashSet<u32>>,
@@ -104,8 +101,7 @@ pub struct ClientGlobalStateDelta {
 impl ClientGlobalStateDelta {
     /// Returns `true` if no fields are set (nothing changed).
     pub fn is_empty(&self) -> bool {
-        !(self.protocol_version.is_some()
-            || self.current_channel_id.is_some()
+        !(self.current_channel_id.is_some()
             || self.listening_channel_add.is_some()
             || self.listening_channel_remove.is_some()
             || self.mute.is_some()

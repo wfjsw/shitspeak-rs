@@ -11,6 +11,8 @@ use crate::s2s_application_proto as pb;
 pub use pb::{
     moderation_envelope::Command as ModerationCommand, ModerationEnvelope, UserRemovePatch,
     UserStatePatch, VoiceFrame,
+    user_stats_envelope::Kind as UserStatsKind,
+    UserStatsEnvelope, UserStatsReply, UserStatsRequest,
 };
 
 /// Reserved overlay service tag for moderation envelopes.
@@ -18,6 +20,9 @@ pub const MODERATION_SERVICE_TAG: u32 = 2;
 
 /// Reserved overlay service tag for voice frames.
 pub const VOICE_SERVICE_TAG: u32 = 3;
+
+/// Reserved overlay service tag for the UserStats request/reply RPC.
+pub const USER_STATS_SERVICE_TAG: u32 = 4;
 
 pub fn encode_moderation(env: &ModerationEnvelope) -> Result<Bytes, prost::EncodeError> {
     let mut buf = BytesMut::with_capacity(env.encoded_len());
@@ -37,6 +42,16 @@ pub fn encode_voice(frame: &VoiceFrame) -> Result<Bytes, prost::EncodeError> {
 
 pub fn decode_voice(src: &[u8]) -> Result<VoiceFrame, prost::DecodeError> {
     VoiceFrame::decode(src)
+}
+
+pub fn encode_user_stats(env: &UserStatsEnvelope) -> Result<Bytes, prost::EncodeError> {
+    let mut buf = BytesMut::with_capacity(env.encoded_len());
+    env.encode(&mut buf)?;
+    Ok(buf.freeze())
+}
+
+pub fn decode_user_stats(src: &[u8]) -> Result<UserStatsEnvelope, prost::DecodeError> {
+    UserStatsEnvelope::decode(src)
 }
 
 #[cfg(test)]

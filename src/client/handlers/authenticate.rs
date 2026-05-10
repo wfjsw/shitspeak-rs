@@ -57,7 +57,7 @@ pub async fn handle_authenticate(
     let session_id = sender.get_session_id();
     let ip_address = sender.get_real_ip_address();
     let (version, client_name, os_name, os_version) = {
-        let protocol_version = sender.read_global_state().get_protocol_version();
+        let protocol_version = sender.protocol_version();
         let local_state = sender.read_local_state();
         let local = local_state.as_ref().expect("Local state missing during authenticate");
         (

@@ -12,11 +12,18 @@ use bytes::Bytes;
 use crate::channels::Channel;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::protocol_version::ProtocolVersion;
-use crate::voice::codec::PacketFormat;
+use crate::voice::codec::{AudioPayload, PacketFormat};
 
 const VOICE_DEADLINE: Duration = Duration::from_secs(2);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(500);
 const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+
+fn opus_frame(payload: &AudioPayload) -> &[u8] {
+    match payload {
+        AudioPayload::Opus(p) => &p.frame,
+        _ => panic!("expected Opus payload, got {payload:?}"),
+    }
+}
 
 // ── TCP-tunneled tests ──────────────────────────────────────────────────────
 
@@ -43,8 +50,8 @@ async fn voice_tcp_same_channel_routes() {
 
     let received = bob.recv_voice_tcp(VOICE_DEADLINE).await;
     let audio = received.expect("Bob should receive Alice's voice over TCP tunnel");
-    assert_eq!(audio.opus_data.as_ref(), SAMPLE_OPUS);
-    assert_eq!(audio.sender_session, alice.session_id);
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
 #[tokio::test]
@@ -181,8 +188,8 @@ async fn voice_tcp_linked_channel_routes() {
     let received = bob.recv_voice_tcp(VOICE_DEADLINE).await;
     let audio =
         received.expect("Bob in a linked channel should receive Alice's voice over TCP tunnel");
-    assert_eq!(audio.opus_data.as_ref(), SAMPLE_OPUS);
-    assert_eq!(audio.sender_session, alice.session_id);
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
 // ── Real UDP / OCB2 tests ──────────────────────────────────────────────────
@@ -226,11 +233,11 @@ async fn voice_udp_same_channel_round_trips_and_decrypts() {
         .await
         .expect("Bob should receive Alice's voice over real UDP");
     assert_eq!(
-        audio.opus_data.as_ref(),
+        opus_frame(&audio.audio_payload),
         SAMPLE_OPUS,
         "opus payload should round-trip byte-identical through OCB2 + routing"
     );
-    assert_eq!(audio.sender_session, alice.session_id);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
 #[tokio::test]
@@ -262,8 +269,8 @@ async fn voice_tcp_protobuf_round_trips() {
         .recv_voice_tcp(VOICE_DEADLINE)
         .await
         .expect("Bob (1.5) should receive Alice's protobuf voice over TCP tunnel");
-    assert_eq!(audio.opus_data.as_ref(), SAMPLE_OPUS);
-    assert_eq!(audio.sender_session, alice.session_id);
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
     assert_eq!(
         audio.format,
         PacketFormat::Protobuf,
@@ -302,8 +309,8 @@ async fn voice_udp_protobuf_round_trips_and_decrypts() {
         .recv_voice_udp(VOICE_DEADLINE)
         .await
         .expect("Bob (1.5) should receive Alice's protobuf voice over UDP");
-    assert_eq!(audio.opus_data.as_ref(), SAMPLE_OPUS);
-    assert_eq!(audio.sender_session, alice.session_id);
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
     assert_eq!(
         audio.format,
         PacketFormat::Protobuf,
@@ -365,8 +372,8 @@ async fn voice_udp_format_matches_recipient_proto_version() {
         .recv_voice_udp(VOICE_DEADLINE)
         .await
         .expect("Bob (1.5) should receive Alice's voice");
-    assert_eq!(bob_audio.opus_data.as_ref(), SAMPLE_OPUS);
-    assert_eq!(bob_audio.sender_session, alice.session_id);
+    assert_eq!(opus_frame(&bob_audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(bob_audio.sender_session, Some(alice.server_session));
     assert_eq!(
         bob_audio.format,
         PacketFormat::Protobuf,
@@ -377,13 +384,50 @@ async fn voice_udp_format_matches_recipient_proto_version() {
         .recv_voice_udp(VOICE_DEADLINE)
         .await
         .expect("Charlie (1.4) should receive Alice's voice");
-    assert_eq!(charlie_audio.opus_data.as_ref(), SAMPLE_OPUS);
-    assert_eq!(charlie_audio.sender_session, alice.session_id);
+    assert_eq!(opus_frame(&charlie_audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(charlie_audio.sender_session, Some(alice.server_session));
     assert_eq!(
         charlie_audio.format,
         PacketFormat::Legacy,
         "Charlie declared 1.4 — server must send legacy format"
     );
+}
+
+#[tokio::test]
+async fn voice_udp_legacy_to_legacy_round_trips() {
+    // Both clients declare 1.4 → both speak legacy. Reproduces the path the
+    // real Mumble 1.4.x client uses: legacy in, legacy out.
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let mut alice =
+        TestClient::connect_with_version(&server, "alice", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("alice");
+    let mut bob =
+        TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("bob");
+
+    open_udp_pair(&mut alice, &mut bob).await;
+
+    alice
+        .send_voice_udp(0, 100, Bytes::from_static(SAMPLE_OPUS))
+        .await
+        .expect("alice send_voice_udp legacy");
+
+    let audio = bob
+        .recv_voice_udp(VOICE_DEADLINE)
+        .await
+        .expect("Bob (1.4) should receive Alice's legacy voice over UDP");
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
+    assert_eq!(audio.format, PacketFormat::Legacy);
 }
 
 #[tokio::test]

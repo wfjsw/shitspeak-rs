@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use shitspeak_rs::client::crypt::CryptState;
 use shitspeak_rs::messages::encoder::{AudioContext, AudioTarget};
 use shitspeak_rs::voice::codec::{
-    decode_audio_packet, decode_udp_packet, encode_audio_packet, DecodedAudio, PacketFormat,
+    decode_audio_packet, decode_udp_packet, encode_audio_packet, Audio, PacketFormat,
 };
 
 const KEY: [u8; 16] = [0x42; 16];
@@ -29,12 +29,12 @@ fn make_crypt() -> CryptState {
     CryptState::from_key("OCB2-AES128", &KEY, &IV_E, &IV_D).expect("crypt state")
 }
 
-fn make_audio(opus_len: usize) -> DecodedAudio {
-    DecodedAudio {
+fn make_audio(opus_len: usize) -> Audio {
+    Audio {
         target: AudioTarget::Normal,
         sender_session: 12345,
         frame_number: 1000,
-        opus_data: Bytes::from(vec![0xABu8; opus_len]),
+        audio_payload: Bytes::from(vec![0xABu8; opus_len]),
         positional_data: Vec::new(),
         volume_adjustment: 0.0,
         is_terminator: false,

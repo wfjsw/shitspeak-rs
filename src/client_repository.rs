@@ -608,6 +608,26 @@ impl ClientRepository {
         ids.iter().filter_map(|id| register.get(id).cloned()).collect()
     }
 
+    /// Return **local** clients that have subscribed to listen to any of the
+    /// given `channel_ids` in a single lock acquisition.
+    pub async fn get_local_listeners_for_channels(
+        &self,
+        channel_ids: &[u32],
+    ) -> Vec<Arc<Box<Client>>> {
+        let register = self.register.read().await;
+        let mut result = Vec::new();
+        for &ch_id in channel_ids {
+            if let Some(ids) = register.listeners_by_channel.get(&ch_id) {
+                for id in ids {
+                    if let Some(c) = register.get(id) {
+                        result.push(c.clone());
+                    }
+                }
+            }
+        }
+        result
+    }
+
     pub async fn len(&self) -> usize {
         let register = self.register.read().await;
         register.local_clients.len()
@@ -986,9 +1006,6 @@ pub(crate) fn apply_delta_to_global_state(
     gs: &mut crate::client::client_global_state::ClientGlobalState,
     delta: &crate::client::state_log::ClientGlobalStateDelta,
 ) {
-    if let Some(ref v) = delta.protocol_version {
-        gs.set_protocol_version(v.clone());
-    }
     if let Some(v) = delta.current_channel_id {
         gs.set_current_channel_id(v);
     }

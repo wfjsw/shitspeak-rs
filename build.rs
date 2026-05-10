@@ -16,6 +16,10 @@ fn main() -> Result<()> {
         ".s2s_transport.Frame.payload",
         ".s2s_overlay.OverlayData.payload",
         ".s2s_application.VoiceFrame.payload",
+        // UserStatsReply.payload is an already-encoded MumbleProto.UserStats
+        // body that the originator forwards as-is to the moderator's TLS
+        // stream — keep it as `Bytes` to skip a Vec↔Bytes copy.
+        ".s2s_application.UserStatsReply.payload",
         ".s2s_replication",
     ]);
     config.compile_protos(

@@ -4,6 +4,8 @@ mod crypto_mode;
 mod gf128;
 mod ocb2;
 mod errors;
+#[cfg(test)]
+mod profile_test;
 
 pub use aes_backend::probe as probe_aes_backend;
 pub use crypt_state::CryptState;

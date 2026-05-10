@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use chrono::{DateTime, Utc};
@@ -42,6 +42,14 @@ use crate::{
 
 const VOICE_ROUTING_QUEUE_CAPACITY: usize = 256;
 const VOICE_TCP_QUEUE_CAPACITY: usize = 256;
+
+/// Sentinel bit on the packed `protocol_version` atomic indicating that
+/// the value has been set. The packed-u64 encoding from
+/// `impl From<ProtocolVersion> for u64` only uses bits 16..64 (it always
+/// shifts left by 16), so bit 0 is free to use as a "set" marker.
+const PROTOCOL_VERSION_SET_BIT: u64 = 1;
+
+const PROTOBUF_INTRODUCED_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 5, patch: 0 };
 
 pub struct Client {
     session_id: ClientSessionIdentifier,
@@ -95,6 +103,14 @@ pub struct Client {
     /// This is toggled when tunneled voice is received and reset once
     /// a valid UDP voice packet is seen again.
     prefer_tcp_tunnel: AtomicBool,
+
+    /// Negotiated client protocol version, populated once during the
+    /// `Version` handshake (~immediately after `Authenticate`) and never
+    /// changed afterwards. Stored as a packed u64 with bit 0 used as a
+    /// "set" sentinel — see `protocol_version()` / `set_protocol_version()`
+    /// for the bit layout. Atomic so the voice fan-out hot path
+    /// (`uses_protobuf()`) reads it without taking a lock.
+    protocol_version: AtomicU64,
 
     /// The last client-state log version this connection has seen,
     /// indexed by node_id.  Used to detect gaps and replay missed entries.
@@ -167,6 +183,7 @@ impl Client {
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
             published: AtomicBool::new(false),
             prefer_tcp_tunnel: AtomicBool::new(false),
+            protocol_version: AtomicU64::new(0),
             last_client_version: ParkingMutex::new(HashMap::new()),
             last_channel_version: ParkingMutex::new(0),
         })
@@ -388,8 +405,8 @@ impl Client {
         Ok(())
     }
 
-    pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::DecodedAudio, is_udp: bool) {
-        let payload = VoiceRoutingPayload { decoded_audio, is_udp };
+    pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) {
+        let payload = VoiceRoutingPayload { decoded_audio };
         if self.voice_routing_tx.try_send(payload).is_err() {
             tracing::trace!(session = u32::from(self.session_id), "voice routing queue full or closed, dropping packet");
         }
@@ -475,9 +492,42 @@ impl Client {
         }
     }
 
-    pub fn set_protocol_version(&self, version: Option<ProtocolVersion>, repo: &ClientRepository) {
-        let mut gs = self.write_global_state(repo);
-        gs.set_protocol_version(version);
+    /// Record the negotiated client protocol version. Called once during
+    /// the `Version` handshake; subsequent calls are no-ops (the field
+    /// is set-once-after-auth). `None` defaults to `1.2.0` to match the
+    /// behavior of the legacy `ClientGlobalState::set_protocol_version`.
+    pub fn set_protocol_version(&self, version: Option<ProtocolVersion>) {
+        // Already set? Don't clobber.
+        if self.protocol_version.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let v = version.unwrap_or(ProtocolVersion::new(1, 2, 0));
+        let packed: u64 = u64::from(v) | PROTOCOL_VERSION_SET_BIT;
+        // CAS so the first writer wins; later callers (if any) silently no-op.
+        let _ = self.protocol_version.compare_exchange(
+            0,
+            packed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Returns the negotiated client protocol version, or `None` if the
+    /// `Version` handshake hasn't completed yet. Lock-free read.
+    pub fn protocol_version(&self) -> Option<ProtocolVersion> {
+        let raw = self.protocol_version.load(Ordering::Acquire);
+        if raw & PROTOCOL_VERSION_SET_BIT == 0 {
+            return None;
+        }
+        Some(ProtocolVersion::from(raw & !PROTOCOL_VERSION_SET_BIT))
+    }
+
+    /// Whether the client speaks the protobuf-format UDP voice path
+    /// (Mumble protocol >= 1.5.0). Read on every voice fan-out fan iteration,
+    /// hence the lock-free atomic.
+    pub fn uses_protobuf(&self) -> bool {
+        self.protocol_version()
+            .map_or(false, |v| v >= PROTOBUF_INTRODUCED_VERSION)
     }
 
     pub fn set_release(&self, release: Option<String>) {

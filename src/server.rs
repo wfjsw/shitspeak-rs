@@ -257,7 +257,7 @@ impl Server {
                 tracing::trace!("UDP received {} bytes from {}", len, src_addr);
 
                 if ping_enabled {
-                    match crate::voice::ping::try_decode_ping(packet) {
+                    match crate::voice::ping::PingRequest::decode(packet) {
                         Ok(ping) => {
                             tracing::debug!(
                                 "UDP ping from {}: timestamp={}, format={}",
@@ -459,8 +459,11 @@ impl Server {
                 };
 
                 // After decryption, check if this is a ping or audio packet.
-                match crate::voice::codec::decode_udp_packet(&decrypted) {
-                    Ok(crate::voice::codec::UdpPacket::Ping(ping)) => {
+                match crate::voice::codec::IncomingUdpPacket::decode(
+                    &decrypted,
+                    Some(client.get_session_id()),
+                ) {
+                    Ok(crate::voice::codec::IncomingUdpPacket::Ping(ping)) => {
                         tracing::trace!(
                             "UDP ping from {}: timestamp={}, format={}",
                             src_addr,
@@ -488,26 +491,11 @@ impl Server {
                         }
                         continue;
                     }
-                    Ok(crate::voice::codec::UdpPacket::Audio(mut decoded_audio)) => {
+                    Ok(crate::voice::codec::IncomingUdpPacket::Audio(decoded_audio)) => {
                         tracing::trace!(
-                            "UDP audio packet from {}: sender_session={}, frame_number={}, format={:?}, payload_len={}",
-                            src_addr, decoded_audio.sender_session, decoded_audio.frame_number, decoded_audio.format, decoded_audio.opus_data.len());
-                        let actual_session = u32::from(client.get_session_id());
-                        if decoded_audio.sender_session != 0
-                            && decoded_audio.sender_session != actual_session
-                        {
-                            tracing::trace!(
-                                "UDP sender_session mismatch from {}: packet={}, matched={}",
-                                src_addr,
-                                decoded_audio.sender_session,
-                                actual_session,
-                            );
-                        }
-                        // Trust authenticated client identity derived from
-                        // endpoint+crypto match, not packet self-asserted session.
-                        decoded_audio.sender_session = actual_session;
-
-                        client.push_voice_routing(decoded_audio, true);
+                            "UDP audio packet from {}: sender_session={:?}, frame_number={}, format={:?}, payload_len={}",
+                            src_addr, decoded_audio.sender_session, decoded_audio.frame_number, decoded_audio.format, decoded_audio.audio_payload.len());
+                        client.push_voice_routing(decoded_audio);
                     }
                     Err(e) => {
                         tracing::trace!("UDP packet decode failed from {}: {e}", src_addr);
@@ -949,7 +937,7 @@ impl Server {
             max_user_count: Some(max_users.clamp(0, u32::MAX.into()) as u32),
             max_bandwidth_per_user: max_bandwidth,
         };
-        crate::voice::ping::encode_ping_response(&response, ping.format)
+        response.encode(ping.format)
     }
 
     // ── Codec negotiation ────────────────────────────────────────────────

@@ -574,10 +574,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     pub fn start(self: &Arc<Self>) {
         spawn_delivery_loop(self.clone());
         spawn_clock_tick_loop(self.clone());
-        let rt = self.clone();
-        tokio::spawn(async move {
-            rt.try_bootstrap_catchup().await;
-        });
+        spawn_bootstrap_retry_loop(self.clone());
     }
 
     /// Send a single bootstrap `CatchupReq` if we haven't applied any data
@@ -589,7 +586,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// the send; if none accepts, returns and waits for the next
     /// membership event to retry.
     pub(crate) async fn try_bootstrap_catchup(self: &Arc<Self>) {
-        eprintln!("DIAGFIX[try@{}/{}] called, version={}", self.self_id, self.topic, self.repo.current_version());
         if self.repo.current_version() != 0 {
             return;
         }
@@ -598,7 +594,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let now = Instant::now();
             if let Some(prev) = *last {
                 if now.duration_since(prev) < self.cfg.strict_bootstrap_retry_interval() {
-                    eprintln!("DIAGFIX[try@{}/{}] throttled", self.self_id, self.topic);
                     return;
                 }
             }
@@ -610,7 +605,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .into_iter()
             .filter(|n| *n != self.self_id)
             .collect();
-        eprintln!("DIAGFIX[try@{}/{}] peers={:?}", self.self_id, self.topic, peers);
         if peers.is_empty() {
             return;
         }
@@ -625,14 +619,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 chunk_token: 0,
             });
             match self.net.send_unicast(dst, &self.topic, body).await {
-                Ok(()) => {
-                    eprintln!("DIAGFIX[try@{}/{}] sent to {}", self.self_id, self.topic, dst);
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("DIAGFIX[try@{}/{}] send to {} failed: {:?}", self.self_id, self.topic, dst, e);
-                    debug!(%dst, error=%e, "strict catchup bootstrap send failed");
-                }
+                Ok(()) => return,
+                Err(e) => debug!(%dst, error=%e, "strict catchup bootstrap send failed"),
             }
         }
     }
@@ -1254,7 +1242,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             ev,
             MembershipEvent::Joined(_) | MembershipEvent::Restarted(_),
         );
-        eprintln!("DIAGFIX[on_mem@{}/{}] event={:?} peer_added={}", self.self_id, self.topic, ev, peer_added);
         if peer_added {
             let weak = self.weak_self.lock().clone();
             if let Some(weak) = weak {
@@ -1416,6 +1403,36 @@ fn spawn_clock_tick_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             });
             if let Err(e) = rt.net.send_broadcast(&rt.topic, body).await {
                 trace!(error=%e, "clock tick broadcast failed");
+            }
+        }
+    });
+}
+
+/// Periodic catchup-bootstrap retry loop. Runs while
+/// `repo.current_version() == 0` and shutdown is not cancelled, firing
+/// [`StrictRuntime::try_bootstrap_catchup`] every
+/// `cfg.strict_bootstrap_retry_interval()`. Required because the relevant
+/// `Joined`/`Restarted` membership events (the LSDB-driven path that the
+/// `on_membership_change` retry hook listens for) typically fire *before*
+/// a late-joining topic registers, so the runtime cannot rely on the
+/// fanout alone to drive a retry. Exits as soon as catchup applies its
+/// first op or the runtime is shut down.
+fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
+    let weak = Arc::downgrade(&rt);
+    drop(rt);
+    tokio::spawn(async move {
+        let Some(rt) = weak.upgrade() else {
+            return;
+        };
+        let interval = rt.cfg.strict_bootstrap_retry_interval();
+        loop {
+            if rt.repo.current_version() != 0 {
+                return;
+            }
+            rt.try_bootstrap_catchup().await;
+            tokio::select! {
+                _ = rt.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
             }
         }
     });

@@ -171,11 +171,9 @@ async fn strict_late_join_catches_up_via_log() {
     .await;
     assert!(ok, "C must see A and B as alive after heal");
 
-    eprintln!("DIAGFIX[scenarios] registering C now");
     // Now register on C — catchup_bootstrap fires with current_version=0.
     let repo_c = CountingStrictRepo::new();
     let _h_c = cluster.register_strict(2, "channels", repo_c.clone()).unwrap();
-    eprintln!("DIAGFIX[scenarios] registered C, awaiting catchup");
 
     let ok = wait_until(Duration::from_secs(10), || repo_c.current_version() == 10).await;
     assert!(ok, "late join must catch up to version 10");

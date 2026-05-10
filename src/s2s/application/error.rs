@@ -16,4 +16,10 @@ pub enum ApplicationError {
 
     #[error("invalid envelope: {0}")]
     InvalidEnvelope(&'static str),
+
+    #[error("rpc timed out")]
+    Timeout,
+
+    #[error("rpc service unavailable")]
+    Unavailable,
 }

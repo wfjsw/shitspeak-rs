@@ -10,6 +10,7 @@ mod ping;
 mod query_users;
 mod request_blob;
 mod text_message;
+mod udp_tunnel;
 mod user_list;
 mod user_remove;
 mod user_state;
@@ -19,7 +20,6 @@ mod voice_target;
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use prost::Message as _;
 
 use acl::handle_acl;
@@ -34,52 +34,20 @@ use ping::handle_ping;
 use query_users::handle_query_users;
 use request_blob::handle_request_blob;
 use text_message::handle_text_message;
+use udp_tunnel::handle_udp_tunnel;
 use user_list::handle_user_list;
 use user_remove::handle_user_remove;
+use user_state::handle_user_state;
 use user_stats::handle_user_stats;
 use version::handle_version;
 use voice_target::handle_voice_target;
 
 use crate::{
-    client::handlers::user_state::handle_user_state,
     errors::{MessageHandlerError, MessageTypeNotForIncoming},
     messages::{errors::MessageProtocolError, Message},
     server::Server,
 };
 
-/// Handle a TCP-tunneled voice packet.
-///
-/// The `data` is the raw voice packet bytes (legacy or protobuf format).
-/// We decode it and push it to the per-user voice routing queue.
-async fn handle_udp_tunnel(
-    server: &Arc<Box<Server>>,
-    sender: &Arc<Box<crate::client::Client>>,
-    data: Bytes,
-) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated() {
-        return Err(MessageHandlerError::protocol_violation(
-            "UDPTunnel message received before authentication",
-        ));
-    }
-
-    // Match Mumble/shitspeak behavior: a tunneled voice packet means
-    // this client currently prefers TCP transport for voice.
-    sender.set_prefer_tcp_tunnel(true);
-
-    let audio = match crate::voice::codec::decode_audio_packet(&data) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::trace!(session = u32::from(sender.get_session_id()), len = data.len(), error = %e, "UDPTunnel: decode failed");
-            return Ok(());
-        }
-    };
-
-    tracing::trace!(session = u32::from(sender.get_session_id()), target = %audio.target, frame = audio.frame_number, len = audio.opus_data.len(), "UDPTunnel: routing voice");
-    sender.push_voice_routing(audio, false);
-    Ok(())
-}
-
- 
 pub trait AsyncMessageHandlerExt {
     /// Dispatch a message to the appropriate handler.
     async fn handle_message(
@@ -127,11 +95,19 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 Err(MessageTypeNotForIncoming::new(message).into())
             }
             Message::ChannelRemove(channel_remove) => {
-                tracing::debug!(session, channel_id = channel_remove.channel_id, "handling ChannelRemove");
+                tracing::debug!(
+                    session,
+                    channel_id = channel_remove.channel_id,
+                    "handling ChannelRemove"
+                );
                 handle_channel_remove(server, self, channel_remove.into()).await
             }
             Message::ChannelState(channel_state) => {
-                tracing::debug!(session, channel_id = channel_state.channel_id, "handling ChannelState");
+                tracing::debug!(
+                    session,
+                    channel_id = channel_state.channel_id,
+                    "handling ChannelState"
+                );
                 handle_channel_state(server, self, channel_state.into()).await
             }
             Message::UserRemove(user_remove) => {
@@ -160,7 +136,12 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 Err(MessageTypeNotForIncoming::new(message).into())
             }
             Message::ACL(acl) => {
-                tracing::debug!(session, channel_id = acl.channel_id, query = acl.query, "handling ACL");
+                tracing::debug!(
+                    session,
+                    channel_id = acl.channel_id,
+                    query = acl.query,
+                    "handling ACL"
+                );
                 handle_acl(server, self, acl.into()).await
             }
             Message::QueryUsers(query_users) => {
@@ -180,7 +161,11 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 handle_context_action(server, self, context_action.into()).await
             }
             Message::UserList(user_list) => {
-                tracing::debug!(session, num_users = user_list.users.len(), "handling UserList");
+                tracing::debug!(
+                    session,
+                    num_users = user_list.users.len(),
+                    "handling UserList"
+                );
                 handle_user_list(server, self, user_list.into()).await
             }
             Message::VoiceTarget(voice_target) => {
@@ -188,7 +173,11 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 handle_voice_target(server, self, voice_target.into()).await
             }
             Message::PermissionQuery(permission_query) => {
-                tracing::debug!(session, channel_id = permission_query.channel_id, "handling PermissionQuery");
+                tracing::debug!(
+                    session,
+                    channel_id = permission_query.channel_id,
+                    "handling PermissionQuery"
+                );
                 handle_permission_query(server, self, permission_query.into()).await
             }
             Message::CodecVersion(_) => {
@@ -200,7 +189,12 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 handle_user_stats(server, self, user_stats.into()).await
             }
             Message::RequestBlob(request_blob) => {
-                tracing::debug!(session, textures = request_blob.session_texture.len(), comments = request_blob.session_comment.len(), "handling RequestBlob");
+                tracing::debug!(
+                    session,
+                    textures = request_blob.session_texture.len(),
+                    comments = request_blob.session_comment.len(),
+                    "handling RequestBlob"
+                );
                 handle_request_blob(server, self, request_blob.into()).await
             }
             Message::ServerConfig(_) => {
@@ -219,8 +213,9 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             Err(MessageHandlerError::ProtocolViolation(reason)) => {
                 use crate::messages::WriteMessageExt;
                 tracing::warn!(session, reason = %reason, "Protocol violation");
-                let reject = crate::errors::AuthRejection::new(crate::messages::encoder::RejectType::None)
-                    .because(reason);
+                let reject =
+                    crate::errors::AuthRejection::new(crate::messages::encoder::RejectType::None)
+                        .because(reason);
                 let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
                 let msg = crate::messages::Message::Reject(reject_msg.into());
                 self.write_proto_message(&msg).await?;

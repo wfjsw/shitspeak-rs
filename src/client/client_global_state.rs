@@ -2,13 +2,10 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use crate::protocol_version::ProtocolVersion;
 use crate::client::state_log::ClientGlobalStateDelta;
 
 #[derive(Debug, Clone)]
 pub struct ClientGlobalState {
-    protocol_version: Option<ProtocolVersion>, 
-
     current_channel_id: u32,
     last_active_timestamp: Option<std::time::Instant>,
     listening_channel_id: HashSet<u32>,
@@ -45,8 +42,6 @@ pub struct ClientGlobalState {
 impl ClientGlobalState {
     pub fn new() -> Self {
         ClientGlobalState {
-            protocol_version: None,
-
             current_channel_id: 0,
             last_active_timestamp: None,
             listening_channel_id: HashSet::new(),
@@ -153,30 +148,6 @@ impl ClientGlobalState {
 
     pub fn is_listening_channel(&self, channel_id: u32) -> bool {
         self.listening_channel_id.contains(&channel_id)
-    }
-
-    pub fn get_protocol_version(&self) -> Option<ProtocolVersion> {
-        self.protocol_version.clone()
-    }
-
-    pub fn uses_protobuf(&self) -> bool {
-        self.protocol_version
-            .as_ref()
-            .map_or(false, |v| *v >= ProtocolVersion::new(1, 5, 0))
-    }
-
-    pub fn set_protocol_version(&mut self, version: Option<ProtocolVersion>) {
-        if self.protocol_version.is_some() {
-            return;
-        }
-        let new_version = match version {
-            None => Some(ProtocolVersion::new(1, 2, 0)),
-            Some(v) => Some(v),
-        };
-        self.protocol_version = new_version.clone();
-        if self.delta_recording {
-            self.pending_delta.protocol_version = Some(new_version);
-        }
     }
 
     pub fn get_texture_url(&self) -> Option<&str> {
