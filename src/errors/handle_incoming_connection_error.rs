@@ -74,4 +74,20 @@ impl std::fmt::Display for HandleIncomingConnectionError {
     }
 }
 
+impl HandleIncomingConnectionError {
+    /// Returns `true` when the error represents a peer that closed the
+    /// connection without sending TLS `close_notify` — a normal occurrence
+    /// with many Mumble clients and should not be logged as a warning.
+    pub fn is_clean_disconnect(&self) -> bool {
+        let io_err = match self {
+            HandleIncomingConnectionError::IOError(e) => e,
+            HandleIncomingConnectionError::ReadProtoMessageError(
+                ReadProtoMessageError::IOError(e),
+            ) => e,
+            _ => return false,
+        };
+        io_err.kind() == std::io::ErrorKind::UnexpectedEof
+    }
+}
+
 impl std::error::Error for HandleIncomingConnectionError {}

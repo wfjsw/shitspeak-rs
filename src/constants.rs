@@ -13,6 +13,12 @@ pub const APP_PROTO_VER: ProtocolVersion = ProtocolVersion {
     patch: 0,
 };
 
+pub const PROTOBUF_INTRODUCED_VERSION: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 5,
+    patch: 0,
+};
+
 pub const BUILD_DATE: &str = env!("BUILD_DATE");
 pub const COMMIT_HASH: &str = env!("COMMIT_HASH");
 pub const COMMIT_DATE: &str = env!("COMMIT_DATE");

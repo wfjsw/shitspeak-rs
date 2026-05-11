@@ -469,3 +469,238 @@ async fn voice_udp_different_channel_does_not_route() {
         "Bob in a different channel should NOT receive Alice's voice over UDP"
     );
 }
+
+// ── Legacy-specific packet behaviors (pre-protobuf / 1.4 clients) ───────────
+
+#[tokio::test]
+async fn voice_tcp_legacy_terminator_bit_preserved() {
+    // Opus terminator bit (0x2000 in the legacy size_flag) must survive the
+    // server routing pipeline. Doc: "The 14th bit (mask: 0x2000) is the
+    // terminator bit which signals whether the packet is the last one in the
+    // voice transmission."
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice =
+        TestClient::connect_with_version(&server, "alice", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("alice");
+    let bob =
+        TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("bob");
+
+    alice
+        .send_voice_tcp_terminator(0, 50, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    let audio = bob
+        .recv_voice_tcp(VOICE_DEADLINE)
+        .await
+        .expect("Bob (1.4) should receive Alice's terminator frame");
+    let AudioPayload::Opus(p) = &audio.audio_payload else {
+        panic!("expected Opus payload, got {:?}", audio.audio_payload);
+    };
+    assert!(
+        p.is_terminator,
+        "terminator bit must survive the server routing pipeline"
+    );
+    assert_eq!(p.frame.as_ref(), SAMPLE_OPUS);
+}
+
+#[tokio::test]
+async fn voice_tcp_protobuf_terminator_bit_preserved() {
+    // Same invariant as above but through the 1.5+ protobuf pipeline.
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    alice
+        .send_voice_tcp_protobuf_terminator(0, 51, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    let audio = bob
+        .recv_voice_tcp(VOICE_DEADLINE)
+        .await
+        .expect("Bob (1.5) should receive Alice's terminator frame");
+    let AudioPayload::Opus(p) = &audio.audio_payload else {
+        panic!("expected Opus payload, got {:?}", audio.audio_payload);
+    };
+    assert!(
+        p.is_terminator,
+        "terminator bit must survive the server routing pipeline (protobuf)"
+    );
+    assert_eq!(p.frame.as_ref(), SAMPLE_OPUS);
+}
+
+#[tokio::test]
+async fn voice_tcp_legacy_positional_data_round_trip() {
+    // Positional audio (optional 3 × f32 XYZ appended after the Opus payload
+    // in the legacy wire format) must survive server routing unchanged.
+    // Doc: "The XYZ coordinates of the audio source."
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice =
+        TestClient::connect_with_version(&server, "alice", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("alice");
+    let bob =
+        TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("bob");
+
+    let positional = [1.5_f32, 2.5, 3.5];
+    alice
+        .send_voice_tcp_with_positional(0, 60, Bytes::from_static(SAMPLE_OPUS), positional)
+        .await;
+
+    let audio = bob
+        .recv_voice_tcp(VOICE_DEADLINE)
+        .await
+        .expect("Bob (1.4) should receive Alice's voice with positional data");
+    assert_eq!(
+        audio.positional_data,
+        Some(positional),
+        "positional XYZ must survive legacy routing unchanged"
+    );
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+}
+
+#[tokio::test]
+async fn voice_tcp_protobuf_positional_data_round_trip() {
+    // Same as above but through the 1.5+ protobuf pipeline, where positional
+    // data is encoded in the MumbleUDP.Audio proto field.
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let positional = [4.0_f32, 5.0, 6.0];
+    alice
+        .send_voice_tcp_protobuf_with_positional(0, 61, Bytes::from_static(SAMPLE_OPUS), positional)
+        .await;
+
+    let audio = bob
+        .recv_voice_tcp(VOICE_DEADLINE)
+        .await
+        .expect("Bob (1.5) should receive Alice's voice with positional data");
+    assert_eq!(
+        audio.positional_data,
+        Some(positional),
+        "positional XYZ must survive protobuf routing unchanged"
+    );
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+}
+
+#[tokio::test]
+async fn voice_tcp_legacy_server_loopback() {
+    // target=31 (Server Loopback) must echo the packet back to the sender;
+    // other channel members must not receive it. Doc: "Server Loopback (31)".
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice =
+        TestClient::connect_with_version(&server, "alice", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("alice");
+    let bob =
+        TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("bob");
+
+    alice
+        .send_voice_tcp(31, 70, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    let echo = alice
+        .recv_voice_tcp(VOICE_DEADLINE)
+        .await
+        .expect("Alice should receive her own loopback packet (legacy)");
+    assert_eq!(
+        opus_frame(&echo.audio_payload),
+        SAMPLE_OPUS,
+        "loopback must echo the original audio payload"
+    );
+
+    let received_by_bob = bob.recv_voice_tcp(NEGATIVE_WINDOW).await;
+    assert!(
+        received_by_bob.is_none(),
+        "Bob must not receive the server loopback packet"
+    );
+}
+
+#[tokio::test]
+async fn voice_tcp_protobuf_server_loopback() {
+    // Same as above but through the 1.5+ protobuf pipeline.
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    alice
+        .send_voice_tcp_protobuf(31, 71, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    let echo = alice
+        .recv_voice_tcp(VOICE_DEADLINE)
+        .await
+        .expect("Alice should receive her own loopback packet (protobuf)");
+    assert_eq!(
+        opus_frame(&echo.audio_payload),
+        SAMPLE_OPUS,
+        "loopback must echo the original audio payload"
+    );
+
+    let received_by_bob = bob.recv_voice_tcp(NEGATIVE_WINDOW).await;
+    assert!(
+        received_by_bob.is_none(),
+        "Bob must not receive the server loopback packet"
+    );
+}

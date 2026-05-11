@@ -529,7 +529,11 @@ impl Server {
                         .handle_incoming_connection(tcp_stream, remote_addr)
                         .await
                     {
-                        tracing::warn!("Error handling connection: {}", e);
+                        if e.is_clean_disconnect() {
+                            tracing::trace!("Connection closed without TLS close_notify: {}", e);
+                        } else {
+                            tracing::warn!("Error handling connection: {}", e);
+                        }
                     }
                 });
             }

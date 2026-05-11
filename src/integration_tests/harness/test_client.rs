@@ -163,6 +163,62 @@ fn decode_server_voice(data: &[u8]) -> Option<Audio> {
     decode_legacy_server_voice(data)
 }
 
+/// Like [`encode_legacy_client_voice`] but supports the Opus terminator bit
+/// and optional positional audio data (3 × little-endian f32 appended after
+/// the payload per the Mumble wire spec).
+fn encode_legacy_client_voice_ex(
+    target: u32,
+    frame_number: u64,
+    opus: &[u8],
+    is_terminator: bool,
+    positional: Option<[f32; 3]>,
+) -> Bytes {
+    let pos_len = if positional.is_some() { 12 } else { 0 };
+    let mut buf = BytesMut::with_capacity(1 + 4 + 4 + opus.len() + pos_len);
+    buf.put_u8((0x04u8 << 5) | (target as u8 & 0x1f));
+    write_pds_varint(&mut buf, frame_number);
+    let size_flag =
+        (opus.len() as u64 & 0x1FFF) | if is_terminator { 0x2000 } else { 0 };
+    write_pds_varint(&mut buf, size_flag);
+    buf.extend_from_slice(opus);
+    if let Some([x, y, z]) = positional {
+        buf.extend_from_slice(&x.to_le_bytes());
+        buf.extend_from_slice(&y.to_le_bytes());
+        buf.extend_from_slice(&z.to_le_bytes());
+    }
+    buf.freeze()
+}
+
+/// Like [`encode_protobuf_client_voice`] but supports the terminator bit and
+/// optional positional data in the MumbleUDP.Audio proto fields.
+fn encode_protobuf_client_voice_ex(
+    target: u32,
+    frame_number: u64,
+    opus: &[u8],
+    is_terminator: bool,
+    positional: Option<[f32; 3]>,
+) -> Bytes {
+    use crate::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
+    use prost::Message as _;
+    let wire = AudioWire {
+        header: Some(AudioHeader::Target(AudioTarget::from(target))),
+        sender_session: 0,
+        frame_number,
+        opus_data: Bytes::copy_from_slice(opus),
+        positional_data: match positional {
+            Some([x, y, z]) => vec![x, y, z],
+            None => vec![],
+        },
+        volume_adjustment: 0.0,
+        is_terminator,
+    };
+    let proto: crate::mumble_udp::Audio = wire.into();
+    let mut buf = BytesMut::with_capacity(1 + proto.encoded_len());
+    buf.put_u8(0x00);
+    proto.encode(&mut buf).expect("encode protobuf audio");
+    buf.freeze()
+}
+
 /// PacketDataStream varint (Mumble's framing — not LEB128).
 fn write_pds_varint(buf: &mut BytesMut, value: u64) {
     if value <= 0x7F {
@@ -639,6 +695,56 @@ impl TestClient {
         opus: Bytes,
     ) {
         let bytes = encode_protobuf_client_voice(target, frame_number, &opus);
+        self.send(Message::UDPTunnel(bytes)).await;
+    }
+
+    /// Send a legacy Opus voice frame with the terminator bit set (`0x2000` in
+    /// the size_flag). Signals end-of-transmission per the Mumble wire spec.
+    pub async fn send_voice_tcp_terminator(&self, target: u32, frame_number: u64, opus: Bytes) {
+        let bytes = encode_legacy_client_voice_ex(target, frame_number, &opus, true, None);
+        self.send(Message::UDPTunnel(bytes)).await;
+    }
+
+    /// Send a legacy Opus voice frame with positional audio data (XYZ floats
+    /// in little-endian, appended after the Opus payload per the Mumble spec).
+    pub async fn send_voice_tcp_with_positional(
+        &self,
+        target: u32,
+        frame_number: u64,
+        opus: Bytes,
+        positional: [f32; 3],
+    ) {
+        let bytes =
+            encode_legacy_client_voice_ex(target, frame_number, &opus, false, Some(positional));
+        self.send(Message::UDPTunnel(bytes)).await;
+    }
+
+    /// Send a protobuf (Mumble 1.5+) voice frame with the terminator bit set.
+    pub async fn send_voice_tcp_protobuf_terminator(
+        &self,
+        target: u32,
+        frame_number: u64,
+        opus: Bytes,
+    ) {
+        let bytes = encode_protobuf_client_voice_ex(target, frame_number, &opus, true, None);
+        self.send(Message::UDPTunnel(bytes)).await;
+    }
+
+    /// Send a protobuf (Mumble 1.5+) voice frame with positional audio data.
+    pub async fn send_voice_tcp_protobuf_with_positional(
+        &self,
+        target: u32,
+        frame_number: u64,
+        opus: Bytes,
+        positional: [f32; 3],
+    ) {
+        let bytes = encode_protobuf_client_voice_ex(
+            target,
+            frame_number,
+            &opus,
+            false,
+            Some(positional),
+        );
         self.send(Message::UDPTunnel(bytes)).await;
     }
 

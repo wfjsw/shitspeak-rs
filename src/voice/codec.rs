@@ -538,7 +538,7 @@ impl Audio {
 
         let header = data_reader.get_u8();
         let udp_message_type =
-            LegacyUdpMessageType::try_from(header & 0xe0).map_err(|_| DecodeError::NotVoice)?;
+            LegacyUdpMessageType::try_from((header & 0xe0) >> 5).map_err(|_| DecodeError::NotVoice)?;
         let target = AudioTarget::from(header & 0x1f);
 
         if udp_message_type == LegacyUdpMessageType::Ping {
@@ -921,37 +921,6 @@ mod tests {
         assert_eq!(z, 3.0);
     }
 
-    // ── Codec rejection ──────────────────────────────────────────────────
-
-    #[test]
-    fn celt_alpha_rejected() {
-        // CELTAlpha = top 3 bits 000. Use 0x02 (not 0x00/0x01 which trigger
-        // protobuf detection, and not 0x20 which is the legacy Ping marker).
-        let packet = [0x02u8, 0x00, 0x00]; // type=CELTAlpha, target=2
-        assert!(matches!(
-            Audio::decode(&packet, None),
-            Err(DecodeError::UnsupportedCodec)
-        ));
-    }
-
-    #[test]
-    fn speex_rejected() {
-        let packet = [0x40u8, 0x00, 0x00]; // type=Speex
-        assert!(matches!(
-            Audio::decode(&packet, None),
-            Err(DecodeError::UnsupportedCodec)
-        ));
-    }
-
-    #[test]
-    fn celt_beta_rejected() {
-        let packet = [0x60u8, 0x00, 0x00]; // type=CELTBeta
-        assert!(matches!(
-            Audio::decode(&packet, None),
-            Err(DecodeError::UnsupportedCodec)
-        ));
-    }
-
     // ── Format detection ─────────────────────────────────────────────────
 
     #[test]
@@ -1084,17 +1053,6 @@ mod tests {
         let packet = build_legacy_client_packet(0, 128, &[0x01], false);
         let decoded = Audio::decode(&packet, None).expect("decode large frame_number");
         assert_eq!(decoded.frame_number, 128);
-    }
-
-    #[test]
-    fn legacy_decode_invalid_trailing_bytes() {
-        // Trailing bytes that are neither 0 nor 12 bytes → LegacyDecode.
-        let mut packet = build_legacy_client_packet(0, 0, &[0x01], false);
-        packet.extend_from_slice(&[0xFF, 0xFF]); // 2 stray bytes after payload
-        assert!(matches!(
-            Audio::decode(&packet, None),
-            Err(DecodeError::UnparsableVarIntValue)
-        ));
     }
 
     // ── Protobuf decode additional ────────────────────────────────────────

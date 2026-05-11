@@ -49,7 +49,7 @@ const VOICE_TCP_QUEUE_CAPACITY: usize = 256;
 /// shifts left by 16), so bit 0 is free to use as a "set" marker.
 const PROTOCOL_VERSION_SET_BIT: u64 = 1;
 
-const PROTOBUF_INTRODUCED_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 5, patch: 0 };
+use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 
 pub struct Client {
     session_id: ClientSessionIdentifier,

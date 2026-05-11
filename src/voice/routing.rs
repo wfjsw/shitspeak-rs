@@ -4,15 +4,15 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::{
-    client::{crypt::CryptState, Client},
-    messages::encoder::{AudioContext, AudioTarget},
-    server::Server,
-};
-
 use super::codec::{self, Audio, PacketFormat};
 use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, QueuedDatagram};
+use crate::{
+    client::{crypt::CryptState, Client},
+    constants::{APP_PROTO_VER, PROTOBUF_INTRODUCED_VERSION},
+    messages::encoder::{AudioContext, AudioTarget},
+    server::Server,
+};
 
 /// Recipient count above which the encrypt fan-out is dispatched to rayon
 /// inside `spawn_blocking`. Below this threshold, sequential per-recipient
@@ -23,9 +23,15 @@ const RAYON_FANOUT_THRESHOLD: usize = 256;
 
 /// Pluck the recipient's preferred wire format. Lock-free read backed by
 /// the per-client `AtomicU64` protocol version on `Client`.
+///
+/// Protobuf encoding is only used when the server itself declares a
+/// protocol version >= 1.5.0 (`PROTOBUF_INTRODUCED_VERSION`). If the
+/// server is running in legacy mode (`APP_PROTO_VER < 1.5.0`), all
+/// outbound voice is encoded as legacy regardless of what the client
+/// declares.
 #[inline]
 fn client_packet_format(client: &Client) -> PacketFormat {
-    if client.uses_protobuf() {
+    if APP_PROTO_VER >= PROTOBUF_INTRODUCED_VERSION && client.uses_protobuf() {
         PacketFormat::Protobuf
     } else {
         PacketFormat::Legacy
@@ -97,11 +103,7 @@ impl EncodeCache {
 /// speech. Mirrors the Mumble `AudioContext::NORMAL` numbering.
 const S2S_TARGET_NORMAL: u32 = 0;
 
-pub async fn route_voice(
-    server: &Arc<Box<Server>>,
-    sender: &Arc<Box<Client>>,
-    audio: &Audio,
-) {
+pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, audio: &Audio) {
     let sender_id = sender.get_session_id();
     let sender_channel = sender.get_current_channel_id();
 
@@ -176,10 +178,9 @@ pub async fn route_voice(
                 .map(|ch| ch.links.into_iter().collect())
                 .unwrap_or_default();
             for linked_id in linked_ids {
-                let perms = crate::client::acl::compute_permissions_for_client(
-                    server, sender, linked_id,
-                )
-                .await;
+                let perms =
+                    crate::client::acl::compute_permissions_for_client(server, sender, linked_id)
+                        .await;
                 if !perms.contains(crate::acl::ACLPermissions::Speak) {
                     continue;
                 }
@@ -380,7 +381,9 @@ async fn flush_voice_batch(
             };
 
             let mut crypt = client.crypt_state();
-            let Some(state) = crypt.as_mut() else { continue };
+            let Some(state) = crypt.as_mut() else {
+                continue;
+            };
             let mut buf = BytesMut::zeroed(entry.bytes.len() + state.overhead());
             if state
                 .encrypt_with_precomputed_checksum(&mut buf, &entry.bytes, &entry.checksum)
@@ -393,7 +396,10 @@ async fn flush_voice_batch(
                 client.try_enqueue_voice_tcp(entry.bytes);
                 continue;
             }
-            udp_batch.push(QueuedDatagram { addr, data: buf.freeze() });
+            udp_batch.push(QueuedDatagram {
+                addr,
+                data: buf.freeze(),
+            });
         }
 
         if !udp_batch.is_empty() {
@@ -408,8 +414,12 @@ async fn flush_voice_batch(
     // Large-fanout path: bucket recipients while collecting unique
     // (format, context) keys, pre-encode each unique key once, then dispatch
     // the encrypt loop to rayon.
-    let mut udp_items: Vec<(Arc<Box<Client>>, std::net::SocketAddr, PacketFormat, AudioContext)> =
-        Vec::with_capacity(targets.len());
+    let mut udp_items: Vec<(
+        Arc<Box<Client>>,
+        std::net::SocketAddr,
+        PacketFormat,
+        AudioContext,
+    )> = Vec::with_capacity(targets.len());
     let mut tcp_items: Vec<(Arc<Box<Client>>, PacketFormat, AudioContext)> = Vec::new();
     let mut cache = EncodeCache::new();
 
@@ -463,7 +473,10 @@ async fn flush_voice_batch(
                 state
                     .encrypt_with_precomputed_checksum(&mut buf, &entry.bytes, &entry.checksum)
                     .ok()?;
-                Some(QueuedDatagram { addr, data: buf.freeze() })
+                Some(QueuedDatagram {
+                    addr,
+                    data: buf.freeze(),
+                })
             })
             .collect()
     })
@@ -491,14 +504,19 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
     let mut rx = match sender.take_voice_routing_rx() {
         Some(rx) => rx,
         None => {
-            tracing::warn!(session = u32::from(sender.get_session_id()), "voice routing task already spawned");
+            tracing::warn!(
+                session = u32::from(sender.get_session_id()),
+                "voice routing task already spawned"
+            );
             return;
         }
     };
     let weak_sender = Arc::downgrade(&sender);
     tokio::spawn(async move {
         while let Some(payload) = rx.recv().await {
-            let Some(sender) = weak_sender.upgrade() else { break };
+            let Some(sender) = weak_sender.upgrade() else {
+                break;
+            };
             route_voice(&server, &sender, &payload.decoded_audio).await;
         }
     });
@@ -528,7 +546,9 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
     let weak_client = Arc::downgrade(&client);
     tokio::spawn(async move {
         while let Some(raw) = rx.recv().await {
-            let Some(client) = weak_client.upgrade() else { break };
+            let Some(client) = weak_client.upgrade() else {
+                break;
+            };
             let message = crate::messages::Message::UDPTunnel(raw);
             if let Err(e) = client.write_proto_message(&message).await {
                 tracing::trace!(
