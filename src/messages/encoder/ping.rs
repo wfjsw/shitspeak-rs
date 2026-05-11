@@ -1,4 +1,4 @@
-use crate::messages::{Message, errors::PingProtocolError};
+use crate::messages::{errors::PingProtocolError, Message};
 
 #[derive(Debug, Clone)]
 pub struct Ping {
@@ -15,7 +15,6 @@ pub struct Ping {
     pub tcp_ping_avg: Option<f32>,
     pub tcp_ping_var: Option<f32>,
 }
-
 
 impl TryFrom<crate::mumble_proto::Ping> for Ping {
     fn try_from(proto: crate::mumble_proto::Ping) -> Result<Self, PingProtocolError> {

@@ -34,6 +34,7 @@ pub struct MemberSnapshot {
     status: MemberStatus,
     addresses: Vec<PeerAddress>,
     boot_epoch: u64,
+    max_users: u64,
 }
 
 impl MemberSnapshot {
@@ -51,6 +52,10 @@ impl MemberSnapshot {
 
     pub fn boot_epoch(&self) -> u64 {
         self.boot_epoch
+    }
+
+    pub fn max_users(&self) -> u64 {
+        self.max_users
     }
 
     /// Phase-1 compatibility: callers expect an "incarnation"; we map it
@@ -128,6 +133,7 @@ impl MembershipTable {
                 },
                 addresses: e.addresses.clone(),
                 boot_epoch: e.boot_epoch,
+                max_users: e.max_users,
             })
             .collect();
         out.sort_by_key(|m| m.node_id);
@@ -144,12 +150,23 @@ impl MembershipTable {
             },
             addresses: e.addresses.clone(),
             boot_epoch: e.boot_epoch,
+            max_users: e.max_users,
         })
     }
 
     /// IDs of every origin with a current non-tombstone LSA.
     pub fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.lsdb.active_origins()
+    }
+
+    /// Sum max_users advertised by every current non-tombstone LSA.
+    pub fn alive_max_users(&self) -> u64 {
+        self.lsdb
+            .snapshot()
+            .into_iter()
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| entry.max_users)
+            .sum()
     }
 
     /// Event broadcast subscriber. Each subscriber receives every event.
@@ -230,6 +247,41 @@ pub fn new_table(
         Arc::new(MembershipTable::new(self_id, lsdb, tx.clone())),
         tx,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::s2s::overlay::lsdb::{LsaEntry, LsaFloor};
+
+    fn entry(origin: NodeIdentifier, seq: u64, tombstone: bool, max_users: u64) -> LsaEntry {
+        LsaEntry {
+            origin,
+            boot_epoch: 100,
+            seq,
+            ts_local_received: Instant::now(),
+            tombstone,
+            addresses: Vec::new(),
+            links: Vec::new(),
+            max_users,
+        }
+    }
+
+    #[test]
+    fn alive_max_users_sums_alive_members_only() {
+        let floor = Arc::new(LsaFloor::new(None));
+        let lsdb = Arc::new(LinkStateDb::new(floor));
+        let (table, _) = new_table(1, lsdb.clone(), 8);
+
+        lsdb.admit(entry(1, 1, false, 100));
+        lsdb.admit(entry(2, 1, false, 200));
+        lsdb.admit(entry(3, 1, true, 300));
+
+        assert_eq!(table.alive_max_users(), 300);
+        assert_eq!(table.snapshot_one(1).unwrap().max_users(), 100);
+    }
 }
 
 /// Background task: diff the LSDB on every change_signal + after sweep

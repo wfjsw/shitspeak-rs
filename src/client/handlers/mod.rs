@@ -57,6 +57,8 @@ pub trait AsyncMessageHandlerExt {
     ) -> Result<(), MessageHandlerError>;
 }
 
+pub(crate) use user_stats::ServerUserStatsResponder;
+
 impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
     async fn handle_message(
         &self,

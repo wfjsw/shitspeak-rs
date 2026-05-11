@@ -47,7 +47,10 @@ impl TransportKind {
     /// True for transports that carry a TLS-authenticated bidirectional stream.
     #[inline]
     pub fn is_stream(self) -> bool {
-        matches!(self, TransportKind::Tcp | TransportKind::Kcp | TransportKind::Quic)
+        matches!(
+            self,
+            TransportKind::Tcp | TransportKind::Kcp | TransportKind::Quic
+        )
     }
 }
 
@@ -123,8 +126,14 @@ mod tests {
     #[test]
     fn transport_levels() {
         assert_eq!(TransportKind::Tcp.service_level(), ServiceLevel::Reliable);
-        assert_eq!(TransportKind::Kcp.service_level(), ServiceLevel::ReliableLowLatency);
-        assert_eq!(TransportKind::Quic.service_level(), ServiceLevel::ReliableLowLatency);
+        assert_eq!(
+            TransportKind::Kcp.service_level(),
+            ServiceLevel::ReliableLowLatency
+        );
+        assert_eq!(
+            TransportKind::Quic.service_level(),
+            ServiceLevel::ReliableLowLatency
+        );
         assert_eq!(TransportKind::Udp.service_level(), ServiceLevel::BestEffort);
     }
 }

@@ -1,9 +1,7 @@
 use aws_lc_rs::rand::SecureRandom;
 use bytes::Bytes;
 
-use crate::client::crypt::{
-    aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops, CryptoMode,
-};
+use crate::client::crypt::{aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops, CryptoMode};
 
 const BLOCK_SIZE: usize = 16;
 /// Hard upper bound on plaintext we ever encrypt in one OCB2 call. The Mumble
@@ -557,7 +555,11 @@ mod tests {
             ocb.encrypt_with_plaintext_checksum(&mut b, &plain, &nonce, &chk)
                 .unwrap();
 
-            assert_eq!(a, b, "precomputed-checksum encrypt diverged for {}", v._name);
+            assert_eq!(
+                a, b,
+                "precomputed-checksum encrypt diverged for {}",
+                v._name
+            );
         }
     }
 
@@ -577,7 +579,9 @@ mod tests {
             0, 1, 7, 15, 16, 17, 31, 32, 33, 47, 48, 64, 80, 96, 175, 256, 1023, 1024,
         ];
         for &len in lengths {
-            let plain: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) ^ 0x5a) as u8).collect();
+            let plain: Vec<u8> = (0..len)
+                .map(|i| (i.wrapping_mul(31) ^ 0x5a) as u8)
+                .collect();
 
             let mut a = vec![0u8; plain.len() + ocb.overhead()];
             let mut b = vec![0u8; plain.len() + ocb.overhead()];

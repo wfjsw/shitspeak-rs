@@ -11,9 +11,7 @@ use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
-use super::super::proto::{
-    CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp,
-};
+use super::super::proto::{CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp};
 use super::runtime::StrictRuntime;
 use super::{LogSlice, StrictReplicable};
 use crate::types::NodeIdentifier;

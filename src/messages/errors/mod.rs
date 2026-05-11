@@ -19,7 +19,7 @@ impl Display for MessageProtocolError {
         match self {
             MessageProtocolError::PingProtocolError(e) => {
                 write!(f, "Ping protocol error: {}", e)
-            },
+            }
             MessageProtocolError::UserStateProtocolError(e) => {
                 write!(f, "UserState protocol error: {}", e)
             }
@@ -31,4 +31,3 @@ impl Display for MessageProtocolError {
 }
 
 impl std::error::Error for MessageProtocolError {}
-

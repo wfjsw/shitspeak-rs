@@ -145,8 +145,7 @@ impl CryptState {
         // position 0. The decrypt path mirrors this by passing `&data[1..]`
         // to `mode.decrypt`, which reads the tag from positions 0..3 of that
         // slice (= wire positions 1..4).
-        self.mode
-            .encrypt(&mut dest[1..], data, &self.encrypt_iv)?;
+        self.mode.encrypt(&mut dest[1..], data, &self.encrypt_iv)?;
         dest[0] = self.encrypt_iv[0];
 
         Ok(())
@@ -197,7 +196,7 @@ impl CryptState {
         if data.len() < self.overhead() {
             return Err(CryptError::DataTooShort);
         }
-        
+
         let plain_len = data.len() - self.overhead();
         dest.resize(plain_len, 0);
 
@@ -251,10 +250,14 @@ impl CryptState {
                 }
             } else if diff > 0 {
                 if incoming_iv_byte > known_iv_byte {
-                    self.lost = self.lost.wrapping_add(incoming_iv_byte as u32 - known_iv_byte as u32 - 1);
+                    self.lost = self
+                        .lost
+                        .wrapping_add(incoming_iv_byte as u32 - known_iv_byte as u32 - 1);
                     self.decrypt_iv[0] = incoming_iv_byte;
                 } else if incoming_iv_byte < known_iv_byte {
-                    self.lost = self.lost.wrapping_add(256 - known_iv_byte as u32 + incoming_iv_byte as u32 - 1);
+                    self.lost = self
+                        .lost
+                        .wrapping_add(256 - known_iv_byte as u32 + incoming_iv_byte as u32 - 1);
                     self.decrypt_iv[0] = incoming_iv_byte;
                     for byte in self.decrypt_iv.iter_mut().skip(1) {
                         *byte = byte.wrapping_add(1);
@@ -271,7 +274,7 @@ impl CryptState {
                 self.decrypt_iv.copy_from_slice(&iv_backup);
                 return Err(CryptError::UnexpectedTag);
             }
-        
+
             if self.decrypt_history[self.decrypt_iv[0] as usize] == self.decrypt_iv[1] {
                 // restore the IV
                 self.decrypt_iv.copy_from_slice(&iv_backup);

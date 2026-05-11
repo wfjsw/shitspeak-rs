@@ -66,6 +66,16 @@ pub(crate) trait Endpoint: Send + Sync + 'static {
         peer: Arc<PeerState>,
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Dial an address whose node id is not yet known. The endpoint must
+    /// complete authentication, extract the remote node id from the validated
+    /// certificate, reject self-loops, and install the live connection under
+    /// the discovered node.
+    fn dial_unidentified(
+        self: Arc<Self>,
+        inner: Arc<ManagerInner>,
+        addr: SocketAddr,
+    ) -> impl Future<Output = io::Result<NodeIdentifier>> + Send;
 }
 
 /// Holds one shared endpoint per `TransportKind`. `None` means the local
@@ -84,11 +94,21 @@ impl EndpointRegistry {
         quic: Option<Arc<quic::QuicEndpoint>>,
         udp: Option<Arc<udp::UdpEndpoint>>,
     ) -> Self {
-        Self { tcp, kcp, quic, udp }
+        Self {
+            tcp,
+            kcp,
+            quic,
+            udp,
+        }
     }
 
     pub fn empty() -> Self {
-        Self { tcp: None, kcp: None, quic: None, udp: None }
+        Self {
+            tcp: None,
+            kcp: None,
+            quic: None,
+            udp: None,
+        }
     }
 
     pub fn any_configured(&self) -> bool {
@@ -188,6 +208,20 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
                 peer_c.end_connect();
             });
         }
+
+        for addr in inner.cfg().seed_addresses().iter().copied() {
+            if seed_address_registered(&inner, addr) {
+                continue;
+            }
+            let inner_c = inner.clone();
+            tokio::spawn(async move {
+                match dial_seed_address(&inner_c, addr).await {
+                    Ok(node) => debug!(peer=%node, ?addr, "seed dial succeeded"),
+                    Err(e) => debug!(?addr, error=%e, "seed dial failed"),
+                }
+            });
+        }
+
         tokio::select! {
             _ = sleep(interval) => {}
             _ = inner.shutdown().cancelled() => return,
@@ -201,6 +235,13 @@ fn needs_dial(peer: &PeerState) -> bool {
     peer.snapshot_addresses()
         .iter()
         .any(|a| !live.contains(&a.transport()))
+}
+
+fn seed_address_registered(inner: &ManagerInner, addr: PeerAddress) -> bool {
+    inner
+        .iter_peers()
+        .into_iter()
+        .any(|(_, peer)| peer.snapshot_addresses().contains(&addr))
 }
 
 async fn try_dial_peer(inner: &Arc<ManagerInner>, peer: &Arc<PeerState>) -> io::Result<()> {
@@ -271,6 +312,33 @@ async fn dispatch_dial(
             None => Err(unconfigured(TransportKind::Udp)),
         },
     }
+}
+
+pub(crate) async fn dial_seed_address(
+    inner: &Arc<ManagerInner>,
+    addr: PeerAddress,
+) -> io::Result<NodeIdentifier> {
+    let node = match addr.transport() {
+        TransportKind::Tcp => match inner.endpoints().tcp().cloned() {
+            Some(ep) => ep.dial_unidentified(inner.clone(), addr.addr()).await?,
+            None => return Err(unconfigured(TransportKind::Tcp)),
+        },
+        TransportKind::Kcp => match inner.endpoints().kcp().cloned() {
+            Some(ep) => ep.dial_unidentified(inner.clone(), addr.addr()).await?,
+            None => return Err(unconfigured(TransportKind::Kcp)),
+        },
+        TransportKind::Quic => match inner.endpoints().quic().cloned() {
+            Some(ep) => ep.dial_unidentified(inner.clone(), addr.addr()).await?,
+            None => return Err(unconfigured(TransportKind::Quic)),
+        },
+        TransportKind::Udp => match inner.endpoints().udp().cloned() {
+            Some(ep) => ep.dial_unidentified(inner.clone(), addr.addr()).await?,
+            None => return Err(unconfigured(TransportKind::Udp)),
+        },
+    };
+    let peer = inner.get_or_create_peer(node);
+    peer.add_address(addr);
+    Ok(node)
 }
 
 fn unconfigured(kind: TransportKind) -> io::Error {

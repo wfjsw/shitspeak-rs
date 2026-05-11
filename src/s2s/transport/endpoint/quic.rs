@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
-    ClientConfig as QuinnClientConfig, Endpoint as QuinnEndpoint,
-    ServerConfig as QuinnServerConfig,
+    ClientConfig as QuinnClientConfig, Endpoint as QuinnEndpoint, ServerConfig as QuinnServerConfig,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, warn};
@@ -59,7 +58,11 @@ impl QuicEndpoint {
             None => QuinnEndpoint::client("[::]:0".parse().unwrap())?,
         };
 
-        Ok(Self { handle, client_cfg, listen_addr })
+        Ok(Self {
+            handle,
+            client_cfg,
+            listen_addr,
+        })
     }
 }
 
@@ -89,15 +92,24 @@ impl Endpoint for QuicEndpoint {
         async move {
             let connecting = self
                 .handle
-                .connect_with(self.client_cfg.clone(), addr, &format!("node-{}", peer.node_id()))
+                .connect_with(
+                    self.client_cfg.clone(),
+                    addr,
+                    &format!("node-{}", peer.node_id()),
+                )
                 .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
             let conn = connecting
                 .await
                 .map_err(|e| io::Error::other(format!("quic connecting: {e}")))?;
             let chain = conn
                 .peer_identity()
-                .and_then(|d| d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>().ok())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity"))?;
+                .and_then(|d| {
+                    d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+                        .ok()
+                })
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity")
+                })?;
             let peer_node = parse_peer_cn(&chain)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
             if peer_node != peer.node_id() {
@@ -118,6 +130,51 @@ impl Endpoint for QuicEndpoint {
                 BiStream { send, recv },
             );
             Ok(())
+        }
+    }
+
+    fn dial_unidentified(
+        self: Arc<Self>,
+        inner: Arc<ManagerInner>,
+        addr: SocketAddr,
+    ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
+        async move {
+            let connecting = self
+                .handle
+                .connect_with(self.client_cfg.clone(), addr, "s2s-seed.local")
+                .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
+            let conn = connecting
+                .await
+                .map_err(|e| io::Error::other(format!("quic connecting: {e}")))?;
+            let chain = conn
+                .peer_identity()
+                .and_then(|d| {
+                    d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+                        .ok()
+                })
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity")
+                })?;
+            let peer_node = parse_peer_cn(&chain)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+            if peer_node == inner.self_id() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "self-loop rejected",
+                ));
+            }
+            let (send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| io::Error::other(format!("quic open_bi: {e}")))?;
+            install_stream_session(
+                &inner,
+                peer_node,
+                TransportKind::Quic,
+                true,
+                BiStream { send, recv },
+            );
+            Ok(peer_node)
         }
     }
 }
@@ -145,12 +202,18 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
         .map_err(|e| io::Error::other(format!("quic connect: {e}")))?;
     let chain = conn
         .peer_identity()
-        .and_then(|d| d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>().ok())
+        .and_then(|d| {
+            d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity"))?;
     let peer_node = parse_peer_cn(&chain)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
     if peer_node == inner.self_id() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "self-loop rejected"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "self-loop rejected",
+        ));
     }
     let (send, recv) = conn
         .accept_bi()

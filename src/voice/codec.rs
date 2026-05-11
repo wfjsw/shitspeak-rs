@@ -334,7 +334,6 @@ fn varint_encoded_len(value: u32) -> usize {
 
 // ── Public helpers ────────────────────────────────────────────────────────────
 
-
 // ── UdpPacket impl ────────────────────────────────────────────────────────────
 
 impl IncomingUdpPacket {
@@ -537,8 +536,8 @@ impl Audio {
         let mut data_reader = Cursor::new(data);
 
         let header = data_reader.get_u8();
-        let udp_message_type =
-            LegacyUdpMessageType::try_from((header & 0xe0) >> 5).map_err(|_| DecodeError::NotVoice)?;
+        let udp_message_type = LegacyUdpMessageType::try_from((header & 0xe0) >> 5)
+            .map_err(|_| DecodeError::NotVoice)?;
         let target = AudioTarget::from(header & 0x1f);
 
         if udp_message_type == LegacyUdpMessageType::Ping {

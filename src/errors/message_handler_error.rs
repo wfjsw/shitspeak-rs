@@ -4,7 +4,10 @@ use crate::{
     errors::{
         AuthRejection, MessageTypeNotForIncoming, ReadProtoMessageError, WriteProtoMessageError,
     },
-    messages::{encoder::{PermissionDenied, RejectType}, errors::MessageProtocolError},
+    messages::{
+        encoder::{PermissionDenied, RejectType},
+        errors::MessageProtocolError,
+    },
 };
 
 #[derive(Debug)]

@@ -7,9 +7,7 @@
 use std::sync::Arc;
 
 use crate::{
-    channel_repository::ChannelRepository,
-    client::Client,
-    messages::encoder::ChannelState,
+    channel_repository::ChannelRepository, client::Client, messages::encoder::ChannelState,
     server::Server,
 };
 
@@ -24,9 +22,8 @@ pub async fn apply_permission_info_to_channel_state(
     if let crate::messages::Message::ChannelState(ref cs_proto) = cs_proto {
         if let Some(ch_id) = cs_proto.channel_id {
             if let Some(ch) = channels.get_channel(ch_id).await {
-                let perms = crate::client::acl::compute_permissions_for_client(
-                    server, client, ch_id,
-                ).await;
+                let perms =
+                    crate::client::acl::compute_permissions_for_client(server, client, ch_id).await;
                 let encoder_cs: crate::messages::encoder::ChannelState = cs_proto.clone().into();
                 return Some(encoder_cs.with_permission_info(&ch, perms).into());
             }
@@ -66,16 +63,16 @@ pub async fn convert_channel_operation_to_messages(
     // For SetAcls operations, generate PermissionQuery when send_permission_info is enabled
     if send_permission_info {
         if let crate::channel_repository::ChannelOp::SetAcls { channel_id, .. } = &op.op {
-            let perms = crate::client::acl::compute_permissions_for_client(
-                server,
-                client,
-                *channel_id,
-            ).await;
-            let permission_query: crate::messages::Message = crate::messages::encoder::PermissionQuery {
-                channel_id: Some(*channel_id),
-                permissions: Some(perms.bits()),
-                flush: Some(false),
-            }.into();
+            let perms =
+                crate::client::acl::compute_permissions_for_client(server, client, *channel_id)
+                    .await;
+            let permission_query: crate::messages::Message =
+                crate::messages::encoder::PermissionQuery {
+                    channel_id: Some(*channel_id),
+                    permissions: Some(perms.bits()),
+                    flush: Some(false),
+                }
+                .into();
             messages.push(permission_query);
         }
     }
@@ -99,14 +96,17 @@ pub async fn replay_channel_log_gap(
 
     tracing::warn!(
         "Client {:?} missed channel log entries: last={} current={}",
-        session_id, last, current,
+        session_id,
+        last,
+        current,
     );
 
     let missed = channels.get_log_since(last).await;
     if missed.is_empty() && last > 0 {
         tracing::error!(
             "Client {:?} channel log gap unrecoverable (last={})",
-            session_id, last,
+            session_id,
+            last,
         );
         return Err(());
     }
@@ -156,7 +156,8 @@ pub async fn build_channel_state_message(
 
     // Add permission info if configured
     if server.get_send_permission_info() {
-        let perms = crate::client::acl::compute_permissions_for_client(server, client, channel.id).await;
+        let perms =
+            crate::client::acl::compute_permissions_for_client(server, client, channel.id).await;
         cs = cs.with_permission_info(channel, perms);
     }
 

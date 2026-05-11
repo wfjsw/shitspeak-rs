@@ -30,9 +30,7 @@ use crate::types::NodeIdentifier;
 
 use super::super::config::OverlayConfig;
 use super::super::neighbor::monitor::NeighborMonitor;
-use super::super::proto::{
-    encode_message, node_from_wire, node_to_wire, wrap, OverlayBody,
-};
+use super::super::proto::{encode_message, node_from_wire, node_to_wire, wrap, OverlayBody};
 use super::store::{AdmissionResult, LinkStateDb, LsaEntry, OriginVersion};
 
 /// Send an `LsdbSync` request to `dst`. `have` is our digest; pass `&[]`
@@ -105,7 +103,12 @@ pub async fn handle_request(
             }
         };
         if let Err(e) = transport
-            .send(sender, ServiceLevel::Reliable, MessageClass::Regular, payload)
+            .send(
+                sender,
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+                payload,
+            )
             .await
         {
             trace!(peer=%sender, error=%e, "lsdb sync resp send failed");

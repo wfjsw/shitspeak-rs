@@ -1,4 +1,9 @@
-use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme, client::danger::HandshakeSignatureValid, pki_types::{CertificateDer, UnixTime}, server::danger::{ClientCertVerified, ClientCertVerifier}};
+use rustls::{
+    client::danger::HandshakeSignatureValid,
+    pki_types::{CertificateDer, UnixTime},
+    server::danger::{ClientCertVerified, ClientCertVerifier},
+    DigitallySignedStruct, DistinguishedName, Error, SignatureScheme,
+};
 
 #[derive(Debug)]
 pub struct ClientCertificateVerifier;
@@ -22,7 +27,7 @@ impl ClientCertVerifier for ClientCertificateVerifier {
     ) -> Result<ClientCertVerified, Error> {
         Ok(ClientCertVerified::assertion())
     }
-    
+
     fn verify_tls12_signature(
         &self,
         message: &[u8],
@@ -31,7 +36,7 @@ impl ClientCertVerifier for ClientCertificateVerifier {
     ) -> Result<HandshakeSignatureValid, Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
-    
+
     fn verify_tls13_signature(
         &self,
         message: &[u8],
@@ -56,15 +61,15 @@ impl ClientCertVerifier for ClientCertificateVerifier {
     }
 
     // Provided methods
-    fn offer_client_auth(&self) -> bool { 
+    fn offer_client_auth(&self) -> bool {
         true
     }
 
-    fn client_auth_mandatory(&self) -> bool { 
+    fn client_auth_mandatory(&self) -> bool {
         false
     }
 
-    fn requires_raw_public_keys(&self) -> bool { 
+    fn requires_raw_public_keys(&self) -> bool {
         false
     }
 }

@@ -388,7 +388,10 @@ where
             // No-op for now; reserved for future use.
         }
         pb::FrameType::FrameBye => {
-            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "peer sent BYE"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "peer sent BYE",
+            ));
         }
     }
     Ok(())

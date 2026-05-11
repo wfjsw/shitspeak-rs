@@ -1,4 +1,4 @@
-use crate::messages::{Message};
+use crate::messages::Message;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ClientType {
@@ -42,13 +42,14 @@ impl From<crate::mumble_proto::Authenticate> for Authenticate {
             tokens: proto.tokens,
             celt_versions: proto.celt_versions,
             opus: proto.opus,
-            client_type: proto.client_type.map_or(ClientType::Regular, |ct| ClientType::from(ct)),
+            client_type: proto
+                .client_type
+                .map_or(ClientType::Regular, |ct| ClientType::from(ct)),
         }
     }
 }
 
-impl Authenticate {
-}
+impl Authenticate {}
 
 impl Default for Authenticate {
     fn default() -> Self {

@@ -1,4 +1,4 @@
-use crate::messages::{Message};
+use crate::messages::Message;
 use bytes::Bytes;
 
 #[derive(Debug, Clone)]

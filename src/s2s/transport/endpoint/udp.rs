@@ -47,7 +47,10 @@ pub(crate) struct UdpEndpoint {
 
 impl UdpEndpoint {
     pub fn new(identity: Arc<NodeIdentity>, listen_addr: Option<SocketAddr>) -> Self {
-        Self { identity, listen_addr }
+        Self {
+            identity,
+            listen_addr,
+        }
     }
 }
 
@@ -59,7 +62,9 @@ impl Endpoint for UdpEndpoint {
         inner: Arc<ManagerInner>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let Some(addr) = self.listen_addr else { return Ok(()); };
+            let Some(addr) = self.listen_addr else {
+                return Ok(());
+            };
             let server_cfg = build_server_dtls_config(&self.identity, inner.cfg().udp_mtu())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
             let listener = webrtc_dtls::listener::listen(addr, server_cfg)
@@ -108,6 +113,45 @@ impl Endpoint for UdpEndpoint {
             Ok(())
         }
     }
+
+    fn dial_unidentified(
+        self: Arc<Self>,
+        inner: Arc<ManagerInner>,
+        addr: SocketAddr,
+    ) -> impl Future<Output = io::Result<NodeIdentifier>> + Send {
+        async move {
+            let local_bind: SocketAddr = match addr {
+                SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+                SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+            };
+            let socket = UdpSocket::bind(local_bind).await?;
+            socket.connect(addr).await?;
+            let conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(socket);
+
+            let client_cfg = build_client_dtls_config(
+                &self.identity,
+                "s2s-seed.local".to_string(),
+                inner.cfg().udp_mtu(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
+
+            let dtls_conn = DTLSConn::new(conn, client_cfg, true, None)
+                .await
+                .map_err(|e| io::Error::other(format!("dtls handshake: {e}")))?;
+            let peer_node = peer_node_id_from_dtls(&dtls_conn)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+            if peer_node == inner.self_id() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "self-loop rejected",
+                ));
+            }
+            let dyn_conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(dtls_conn);
+            install_session(&inner, peer_node, addr, true, dyn_conn);
+            Ok(peer_node)
+        }
+    }
 }
 
 async fn accept_loop(
@@ -152,7 +196,10 @@ async fn handle_inbound(
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
     if peer_node == inner.self_id() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "self-loop rejected"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "self-loop rejected",
+        ));
     }
     install_session(&inner, peer_node, peer_addr, false, conn);
     Ok(())
@@ -422,7 +469,10 @@ async fn handle_frame(
         }
         pb::FrameType::FrameKeepalive | pb::FrameType::FrameHello => {}
         pb::FrameType::FrameBye => {
-            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "peer sent BYE"));
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "peer sent BYE",
+            ));
         }
     }
     Ok(())

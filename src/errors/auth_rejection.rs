@@ -11,7 +11,10 @@ pub struct AuthRejection {
 impl AuthRejection {
     pub fn new(rejection_type: RejectType) -> Self {
         // TODO: populate reason based on type
-        Self { rejection_type, reason: None }
+        Self {
+            rejection_type,
+            reason: None,
+        }
     }
 
     pub fn because(mut self, reason: impl Into<Cow<'static, str>>) -> Self {

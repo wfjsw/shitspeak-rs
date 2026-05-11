@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::broadcast;
 
 // ─── Ban entry ───────────────────────────────────────────────────────────────
@@ -25,6 +25,7 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BanEntry {
     /// IP address (IPv4 or IPv6).
+    #[serde(with = "ip_addr_string")]
     pub address: IpAddr,
     /// CIDR prefix length (mask).  32 for single IPv4, 128 for single IPv6.
     pub mask: u8,
@@ -38,6 +39,26 @@ pub struct BanEntry {
     pub start: i64,
     /// Duration in seconds; 0 = permanent.
     pub duration: u64,
+}
+
+mod ip_addr_string {
+    use super::*;
+    use serde::de::Error;
+
+    pub fn serialize<S>(value: &IpAddr, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<IpAddr, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(D::Error::custom)
+    }
 }
 
 impl BanEntry {
@@ -110,9 +131,10 @@ impl BanRepository {
         })?;
 
         // Enable WAL mode for better concurrent read performance
-        conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("failed to set WAL mode: {e}"))
-        })?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("failed to set WAL mode: {e}"))
+            })?;
 
         let repo = Self::init_db(node_id, conn, Some(storage_dir.to_owned()));
         Ok(Arc::new(repo))
@@ -168,6 +190,10 @@ impl BanRepository {
 
     pub fn current_version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
+    }
+
+    pub fn local_node_id(&self) -> u16 {
+        self.node_id
     }
 
     // ── Read API ──────────────────────────────────────────────────────────
@@ -301,11 +327,7 @@ impl BanRepository {
     }
 
     /// Remove a ban entry by address and mask.
-    pub async fn remove_ban(
-        self: &Arc<Self>,
-        address: IpAddr,
-        mask: u8,
-    ) -> Result<(), io::Error> {
+    pub async fn remove_ban(self: &Arc<Self>, address: IpAddr, mask: u8) -> Result<(), io::Error> {
         let op = {
             let conn = self.conn.lock();
             conn.execute(
@@ -370,15 +392,29 @@ impl BanRepository {
         let conn = self.conn.lock();
         apply_op_to_db(&conn, &op.op).ok();
         // Record the operation in the log
-        let op_data =
-            serde_json::to_string(&op.op).expect("BanOp should be serializable");
+        let op_data = serde_json::to_string(&op.op).expect("BanOp should be serializable");
         conn.execute(
             "INSERT OR IGNORE INTO ban_operations (version, node_id, timestamp, op_type, op_data)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![op.version, op.node_id, op.timestamp, op_type_str(&op.op), op_data],
+            params![
+                op.version,
+                op.node_id,
+                op.timestamp,
+                op_type_str(&op.op),
+                op_data
+            ],
         )
         .ok();
         self.version.fetch_max(op.version, Ordering::AcqRel);
+    }
+
+    pub async fn install_s2s_snapshot(&self, version: u64, entries: Vec<BanEntry>) {
+        let conn = self.conn.lock();
+        if let Err(e) = apply_op_to_db(&conn, &BanOp::SetBans { entries }) {
+            tracing::warn!("ban snapshot install failed: {e}");
+            return;
+        }
+        self.version.store(version, Ordering::Release);
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -404,19 +440,31 @@ impl BanRepository {
     }
 
     /// Commit an operation synchronously. The caller must hold `conn` lock.
-    fn commit_locked(&self, conn: &Connection, mut op: BanOperation) -> Result<Arc<BanOperation>, io::Error> {
+    fn commit_locked(
+        &self,
+        conn: &Connection,
+        mut op: BanOperation,
+    ) -> Result<Arc<BanOperation>, io::Error> {
         let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
         op.version = version;
 
-        let op_data =
-            serde_json::to_string(&op.op).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("op serialisation error: {e}"))
-            })?;
+        let op_data = serde_json::to_string(&op.op).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("op serialisation error: {e}"),
+            )
+        })?;
 
         conn.execute(
             "INSERT INTO ban_operations (version, node_id, timestamp, op_type, op_data)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![version, op.node_id, op.timestamp, op_type_str(&op.op), op_data],
+            params![
+                version,
+                op.node_id,
+                op.timestamp,
+                op_type_str(&op.op),
+                op_data
+            ],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -502,5 +550,44 @@ fn ip_matches_cidr(ban_addr: IpAddr, mask: u8, client_addr: IpAddr) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ban_operation_msgpack_round_trips() {
+        let op = BanOperation {
+            version: 7,
+            node_id: 1,
+            timestamp: 123,
+            op: BanOp::AddBan {
+                entry: BanEntry {
+                    address: "203.0.113.17".parse().unwrap(),
+                    mask: 32,
+                    name: Some("replicated-ban".into()),
+                    hash: None,
+                    reason: Some("s2s integration test".into()),
+                    start: 123,
+                    duration: 0,
+                },
+            },
+        };
+
+        let encoded = rmp_serde::to_vec(&op).expect("encode ban op");
+        let decoded: BanOperation = rmp_serde::from_slice(&encoded).expect("decode ban op");
+
+        assert_eq!(decoded.version, op.version);
+        assert_eq!(decoded.node_id, op.node_id);
+        assert_eq!(decoded.timestamp, op.timestamp);
+        match decoded.op {
+            BanOp::AddBan { entry } => {
+                assert_eq!(entry.address, IpAddr::from([203, 0, 113, 17]));
+                assert_eq!(entry.reason.as_deref(), Some("s2s integration test"));
+            }
+            other => panic!("expected AddBan, got {other:?}"),
+        }
     }
 }

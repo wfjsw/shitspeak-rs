@@ -79,7 +79,9 @@ pub fn peers_file(persistence_dir: &Path) -> PathBuf {
 
 /// Load the saved peers file. Returns an empty vec if the file is absent;
 /// errors only on I/O or parse problems.
-pub fn load(persistence_dir: &Path) -> Result<Vec<(NodeIdentifier, Vec<PeerAddress>)>, OverlayError> {
+pub fn load(
+    persistence_dir: &Path,
+) -> Result<Vec<(NodeIdentifier, Vec<PeerAddress>)>, OverlayError> {
     let path = peers_file(persistence_dir);
     if !path.exists() {
         return Ok(Vec::new());
@@ -107,7 +109,9 @@ pub fn load(persistence_dir: &Path) -> Result<Vec<(NodeIdentifier, Vec<PeerAddre
     for p in parsed.peers {
         let mut addrs = Vec::with_capacity(p.addresses.len());
         for a in p.addresses {
-            let Ok(sa) = a.addr.parse::<SocketAddr>() else { continue };
+            let Ok(sa) = a.addr.parse::<SocketAddr>() else {
+                continue;
+            };
             addrs.push(PeerAddress::new(sa, a.transport.into()));
         }
         out.push((p.node_id, addrs));
@@ -145,22 +149,22 @@ pub fn save(
             .collect(),
     };
 
-    let bytes = serde_json::to_vec_pretty(&payload).map_err(|source| {
-        OverlayError::PersistenceParse {
+    let bytes =
+        serde_json::to_vec_pretty(&payload).map_err(|source| OverlayError::PersistenceParse {
             path: final_path.clone(),
             source,
-        }
-    })?;
+        })?;
 
     {
         let mut f = fs::File::create(&tmp_path).map_err(|source| OverlayError::Persistence {
             path: tmp_path.clone(),
             source,
         })?;
-        f.write_all(&bytes).map_err(|source| OverlayError::Persistence {
-            path: tmp_path.clone(),
-            source,
-        })?;
+        f.write_all(&bytes)
+            .map_err(|source| OverlayError::Persistence {
+                path: tmp_path.clone(),
+                source,
+            })?;
         f.sync_all().map_err(|source| OverlayError::Persistence {
             path: tmp_path.clone(),
             source,
@@ -192,14 +196,8 @@ mod tests {
             (
                 42u16,
                 vec![
-                    PeerAddress::new(
-                        "10.0.0.1:9000".parse().unwrap(),
-                        TransportKind::Quic,
-                    ),
-                    PeerAddress::new(
-                        "10.0.0.1:9001".parse().unwrap(),
-                        TransportKind::Udp,
-                    ),
+                    PeerAddress::new("10.0.0.1:9000".parse().unwrap(), TransportKind::Quic),
+                    PeerAddress::new("10.0.0.1:9001".parse().unwrap(), TransportKind::Udp),
                 ],
             ),
         ];

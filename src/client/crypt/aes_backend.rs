@@ -446,9 +446,17 @@ mod tests {
         let aes = Aes128::with_backend(kind, &FIPS_KEY).expect("backend init");
         let mut buf = FIPS_PLAIN;
         aes.encrypt_blocks(&mut buf).expect("encrypt");
-        assert_eq!(buf, FIPS_CIPHER, "FIPS-197 KAT (encrypt) failed for {:?}", kind);
+        assert_eq!(
+            buf, FIPS_CIPHER,
+            "FIPS-197 KAT (encrypt) failed for {:?}",
+            kind
+        );
         aes.decrypt_blocks(&mut buf).expect("decrypt");
-        assert_eq!(buf, FIPS_PLAIN, "FIPS-197 KAT (decrypt) failed for {:?}", kind);
+        assert_eq!(
+            buf, FIPS_PLAIN,
+            "FIPS-197 KAT (decrypt) failed for {:?}",
+            kind
+        );
     }
 
     #[test]

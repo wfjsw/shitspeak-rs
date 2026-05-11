@@ -170,12 +170,8 @@ impl From<Audio> for crate::mumble_udp::Audio {
     fn from(a: Audio) -> Self {
         crate::mumble_udp::Audio {
             header: a.header.map(|h| match h {
-                AudioHeader::Target(t) => {
-                    crate::mumble_udp::audio::Header::Target(u32::from(t))
-                }
-                AudioHeader::Context(c) => {
-                    crate::mumble_udp::audio::Header::Context(u32::from(c))
-                }
+                AudioHeader::Target(t) => crate::mumble_udp::audio::Header::Target(u32::from(t)),
+                AudioHeader::Context(c) => crate::mumble_udp::audio::Header::Context(u32::from(c)),
             }),
             sender_session: a.sender_session,
             frame_number: a.frame_number,

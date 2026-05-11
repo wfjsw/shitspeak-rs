@@ -1,4 +1,4 @@
-use std::collections::{HashMap};
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
@@ -28,7 +28,9 @@ impl UdpState {
     }
 
     pub fn voice_target_mut(&mut self, id: u32) -> &mut VoiceTarget {
-        self.voice_targets.entry(id).or_insert_with(VoiceTarget::new)
+        self.voice_targets
+            .entry(id)
+            .or_insert_with(VoiceTarget::new)
     }
 
     pub fn voice_target(&self, id: u32) -> Option<&VoiceTarget> {

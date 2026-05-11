@@ -104,10 +104,7 @@ pub fn spawn_hello_task(ctx: Arc<HelloContext>) {
 
 /// Spawn the link-up watcher: every time the monitor signals a link-up,
 /// schedule a full LSDB pull against the new neighbor.
-pub fn spawn_link_up_watcher(
-    ctx: Arc<HelloContext>,
-    on_link_up: Arc<Notify>,
-) {
+pub fn spawn_link_up_watcher(ctx: Arc<HelloContext>, on_link_up: Arc<Notify>) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -125,11 +122,7 @@ pub fn spawn_link_up_watcher(
 }
 
 /// Inbound: respond to a Hello with a HelloAck echoing nonce + ts.
-pub async fn respond_to_hello(
-    ctx: &HelloContext,
-    from: NodeIdentifier,
-    hello: pb::Hello,
-) {
+pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: pb::Hello) {
     ctx.monitor.record_hello(from, hello.src_boot_epoch);
     let body = OverlayBody::HelloAck(pb::HelloAck {
         src_node: node_to_wire(ctx.self_id),
@@ -160,6 +153,11 @@ pub fn handle_hello_ack(
     ack: pb::HelloAck,
     transport_kind: crate::s2s::transport::TransportKind,
 ) {
-    ctx.monitor
-        .record_hello_ack(from, ack.src_boot_epoch, ack.nonce, ack.ts_send_us, Some(transport_kind));
+    ctx.monitor.record_hello_ack(
+        from,
+        ack.src_boot_epoch,
+        ack.nonce,
+        ack.ts_send_us,
+        Some(transport_kind),
+    );
 }

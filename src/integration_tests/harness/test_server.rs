@@ -9,10 +9,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, S2sConfig};
+use crate::config::{Config, S2sConfig, S2sSeedAddressConfig, UdpPingUserCountScope};
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
 use crate::s2s::testing::pki::{install_provider_once, mint_pki, Pki};
 use crate::server::Server;
@@ -46,10 +47,11 @@ pub struct TestServer {
     pub server: Arc<Box<Server>>,
     pub addr: SocketAddr,
     pub udp_addr: SocketAddr,
-    pub pki: Pki,
+    pub pki: Arc<Pki>,
     pub authenticator: Arc<TestAuthenticator>,
     shutdown_tx: watch::Sender<()>,
     run_handle: Option<JoinHandle<()>>,
+    _s2s_persistence_dir: Option<TempDir>,
 }
 
 impl Drop for TestServer {
@@ -65,14 +67,64 @@ impl Drop for TestServer {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TestS2sServerOpts {
+    pub node_id: u16,
+    pub cert_index: usize,
+    pub tcp_listen: SocketAddr,
+    pub seed_addresses: Vec<S2sSeedAddressConfig>,
+}
+
 pub async fn spawn_test_server(opts: TestServerOpts) -> TestServer {
     install_provider_once();
 
-    let pki = mint_pki(&[1]);
-    let (cert_path, key_path) = pki.nodes[0].clone();
+    let pki = Arc::new(mint_pki(&[1]));
+    spawn_test_server_with_pki(opts, Arc::clone(&pki), 1, 0, S2sConfig::default(), None).await
+}
+
+pub async fn spawn_s2s_test_server(
+    opts: TestServerOpts,
+    pki: Arc<Pki>,
+    s2s_opts: TestS2sServerOpts,
+) -> TestServer {
+    install_provider_once();
+
+    let persistence_dir = TempDir::new().expect("s2s persistence dir");
+    let (cert_path, key_path) = pki.nodes[s2s_opts.cert_index].clone();
+    let s2s = S2sConfig {
+        enabled: true,
+        ca_path: Some(pki.ca_path.clone()),
+        cert_path: Some(cert_path.clone()),
+        key_path: Some(key_path.clone()),
+        tcp_listen: Some(s2s_opts.tcp_listen),
+        persistence_dir: Some(persistence_dir.path().to_path_buf()),
+        seed_addresses: s2s_opts.seed_addresses,
+        ..S2sConfig::default()
+    };
+
+    spawn_test_server_with_pki(
+        opts,
+        pki,
+        s2s_opts.node_id,
+        s2s_opts.cert_index,
+        s2s,
+        Some(persistence_dir),
+    )
+    .await
+}
+
+async fn spawn_test_server_with_pki(
+    opts: TestServerOpts,
+    pki: Arc<Pki>,
+    node_id: u16,
+    cert_index: usize,
+    s2s: S2sConfig,
+    s2s_persistence_dir: Option<TempDir>,
+) -> TestServer {
+    let (cert_path, key_path) = pki.nodes[cert_index].clone();
 
     let config = Config {
-        node_id: 1,
+        node_id,
         listen: "127.0.0.1:0".into(),
         register_name: "test".into(),
         register_password: None,
@@ -102,11 +154,12 @@ pub async fn spawn_test_server(opts: TestServerOpts) -> TestServer {
         channel_wal_compaction_expire_count: 2_000,
         udp_voice_enabled: opts.udp_voice_enabled,
         udp_ping_enabled: opts.udp_ping_enabled,
+        udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
         udp_channel_size: 2_048,
         client_idle_timeout_secs: 30,
         required_groups: Vec::new(),
         send_permission_info: opts.send_permission_info,
-        s2s: S2sConfig::default(),
+        s2s,
     };
 
     let authenticator = Arc::new(TestAuthenticator::new());
@@ -137,5 +190,6 @@ pub async fn spawn_test_server(opts: TestServerOpts) -> TestServer {
         authenticator,
         shutdown_tx,
         run_handle: Some(run_handle),
+        _s2s_persistence_dir: s2s_persistence_dir,
     }
 }

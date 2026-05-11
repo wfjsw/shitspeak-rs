@@ -24,7 +24,7 @@ pub(super) async fn handle_udp_tunnel(
             tracing::trace!(session = u32::from(sender.get_session_id()), target = %audio.target, frame = audio.frame_number, len = audio.audio_payload.len(), "UDPTunnel: routing voice");
             sender.push_voice_routing(audio);
             Ok(())
-        },
+        }
         Err(e) => {
             tracing::trace!(session = u32::from(sender.get_session_id()), len = data.len(), error = %e, "UDPTunnel: decode failed");
             return Err(MessageHandlerError::protocol_violation(format!(

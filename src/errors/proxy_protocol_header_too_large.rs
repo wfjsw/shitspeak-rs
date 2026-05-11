@@ -6,7 +6,11 @@ pub struct ProxyProtocolHeaderTooLargeError {
 
 impl std::fmt::Display for ProxyProtocolHeaderTooLargeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Proxy protocol header is too large: expected {} bytes, got {} bytes", self.expected_size, self.actual_size)
+        write!(
+            f,
+            "Proxy protocol header is too large: expected {} bytes, got {} bytes",
+            self.expected_size, self.actual_size
+        )
     }
 }
 

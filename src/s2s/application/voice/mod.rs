@@ -10,8 +10,6 @@ pub mod sink;
 pub mod targeted;
 
 pub use ingress::{VoiceInbound, VoiceService};
-pub use send::{
-    build_envelope, OverlayVoiceTransport, VoiceTransport, VOICE_CLASS, VOICE_LEVEL,
-};
+pub use send::{build_envelope, OverlayVoiceTransport, VoiceTransport, VOICE_CLASS, VOICE_LEVEL};
 pub use sink::AudioSink;
 pub use targeted::RecipientIndex;

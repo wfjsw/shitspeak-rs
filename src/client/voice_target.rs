@@ -3,7 +3,6 @@ pub struct VoiceTarget {
     channels: Vec<VoiceTargetChannel>,
 }
 
-
 pub struct VoiceTargetChannel {
     id: u32,
     sub_channels: bool,
@@ -13,13 +12,26 @@ pub struct VoiceTargetChannel {
 
 impl VoiceTargetChannel {
     pub fn new(id: u32, sub_channels: bool, links: bool, only_group: String) -> Self {
-        VoiceTargetChannel { id, sub_channels, links, only_group }
+        VoiceTargetChannel {
+            id,
+            sub_channels,
+            links,
+            only_group,
+        }
     }
 
-    pub fn id(&self) -> u32 { self.id }
-    pub fn sub_channels(&self) -> bool { self.sub_channels }
-    pub fn links(&self) -> bool { self.links }
-    pub fn only_group(&self) -> &str { &self.only_group }
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+    pub fn sub_channels(&self) -> bool {
+        self.sub_channels
+    }
+    pub fn links(&self) -> bool {
+        self.links
+    }
+    pub fn only_group(&self) -> &str {
+        &self.only_group
+    }
 }
 
 impl VoiceTarget {

@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    client::Client,
-    errors::MessageHandlerError,
-    messages::encoder::VoiceTarget,
-    server::Server,
+    client::Client, errors::MessageHandlerError, messages::encoder::VoiceTarget, server::Server,
 };
 
 pub async fn handle_voice_target(
@@ -19,7 +16,12 @@ pub async fn handle_voice_target(
     }
 
     let target_id = msg.id.unwrap_or(0);
-    tracing::debug!(session = u32::from(sender.get_session_id()), target_id, num_targets = msg.targets.len(), "VoiceTarget handler");
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        target_id,
+        num_targets = msg.targets.len(),
+        "VoiceTarget handler"
+    );
     // Valid target IDs are 1..30
     if target_id == 0 || target_id > 30 {
         return Ok(());

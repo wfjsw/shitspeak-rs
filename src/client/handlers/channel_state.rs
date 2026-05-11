@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     acl::ACLPermissions,
+    channel_repository::ChannelOp,
     channels::{Channel, ChannelPatch},
     client::Client,
     errors::MessageHandlerError,
@@ -76,9 +77,22 @@ pub async fn handle_channel_state(
                 Some(parent_id),
             );
 
-            let created = match channels.create_channel(new_ch).await {
-                Ok(ch) => ch,
-                Err(e) => {
+            let op = ChannelOp::CreateChannel {
+                channel: new_ch.clone(),
+            };
+            if let Err(e) = channels.validate_s2s_op(&op).await {
+                tracing::warn!("create_channel failed: {:?}", e);
+                return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                    r#type: DenyType::Text,
+                    session: u32::from(sender.get_session_id()),
+                    channel_id: None,
+                    reason: Some(format!("Failed to create channel: {:?}", e).into()),
+                    name: None,
+                    permission: None,
+                }));
+            }
+            if !server.s2s_manager().propose_channel_op(op.clone()).await {
+                if let Err(e) = channels.create_channel(new_ch).await {
                     tracing::warn!("create_channel failed: {:?}", e);
                     return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                         r#type: DenyType::Text,
@@ -89,9 +103,9 @@ pub async fn handle_channel_state(
                         permission: None,
                     }));
                 }
-            };
+            }
 
-            // Channel creation is logged and broadcast via ChannelRepository::commit().
+            // Channel creation is logged and broadcast via the repository or S2S strict replication.
             // Per-client subscribers will pick up the ChannelState delta.
         }
 
@@ -223,15 +237,27 @@ pub async fn handle_channel_state(
                 parent_id: msg.parent.map(|p| Some(p)),
             };
 
-            if let Err(e) = channels
-                .edit_channel(channel_id, patch, msg.links_add, msg.links_remove)
-                .await
-            {
+            let op = ChannelOp::EditChannel {
+                id: channel_id,
+                patch: patch.clone(),
+                links_add: msg.links_add.clone(),
+                links_remove: msg.links_remove.clone(),
+            };
+            if let Err(e) = channels.validate_s2s_op(&op).await {
                 tracing::warn!("update_channel {channel_id} failed: {:?}", e);
                 return Ok(());
             }
+            if !server.s2s_manager().propose_channel_op(op).await {
+                if let Err(e) = channels
+                    .edit_channel(channel_id, patch, msg.links_add, msg.links_remove)
+                    .await
+                {
+                    tracing::warn!("update_channel {channel_id} failed: {:?}", e);
+                    return Ok(());
+                }
+            }
 
-            // Channel update is logged and broadcast via a single ChannelRepository::commit().
+            // Channel update is logged and broadcast via the repository or S2S strict replication.
             // Per-client subscribers will pick up the ChannelState delta.
         }
     }

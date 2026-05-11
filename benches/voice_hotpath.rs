@@ -2,9 +2,9 @@
 //!
 //! The hot path on the server is:
 //!   1. socket.recv_from -> Bytes copy -> mpsc try_send
-//!   2. (process task) lookup client -> CryptState::decrypt -> decode_udp_packet
+//!   2. (process task) lookup client -> CryptState::decrypt -> IncomingUdpPacket::decode
 //!   3. (routing task) route_voice -> bucket recipients
-//!   4. (spawn_blocking + rayon) for each recipient: encode_audio_packet + CryptState::encrypt
+//!   4. (spawn_blocking + rayon) for each recipient: Audio::encode + CryptState::encrypt
 //!   5. udp_batch::flush_batch (sendmmsg on Linux, send_to loop elsewhere)
 //!
 //! This bench isolates the CPU-bound steps (#2 decode, #4 encode+encrypt) so we
@@ -15,10 +15,11 @@ use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rayon::prelude::*;
 
+use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_rs::client::crypt::CryptState;
 use shitspeak_rs::messages::encoder::{AudioContext, AudioTarget};
 use shitspeak_rs::voice::codec::{
-    decode_audio_packet, decode_udp_packet, encode_audio_packet, Audio, PacketFormat,
+    Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat,
 };
 
 const KEY: [u8; 16] = [0x42; 16];
@@ -32,12 +33,14 @@ fn make_crypt() -> CryptState {
 fn make_audio(opus_len: usize) -> Audio {
     Audio {
         target: AudioTarget::Normal,
-        sender_session: 12345,
+        sender_session: Some(ClientSessionIdentifier::from(12345)),
         frame_number: 1000,
-        audio_payload: Bytes::from(vec![0xABu8; opus_len]),
-        positional_data: Vec::new(),
-        volume_adjustment: 0.0,
-        is_terminator: false,
+        audio_payload: AudioPayload::Opus(OpusPayload {
+            frame: Bytes::from(vec![0xABu8; opus_len]),
+            is_terminator: false,
+        }),
+        positional_data: None,
+        volume_adjustment: 1.0,
         format: PacketFormat::Legacy,
     }
 }
@@ -65,7 +68,8 @@ fn bench_encode_legacy(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &audio, |b, audio| {
             b.iter(|| {
-                let out = encode_audio_packet(black_box(audio), AudioContext::Normal, PacketFormat::Legacy);
+                let out =
+                    Audio::encode(black_box(audio), AudioContext::Normal, PacketFormat::Legacy);
                 black_box(out)
             });
         });
@@ -80,7 +84,11 @@ fn bench_encode_protobuf(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &audio, |b, audio| {
             b.iter(|| {
-                let out = encode_audio_packet(black_box(audio), AudioContext::Normal, PacketFormat::Protobuf);
+                let out = Audio::encode(
+                    black_box(audio),
+                    AudioContext::Normal,
+                    PacketFormat::Protobuf,
+                );
                 black_box(out)
             });
         });
@@ -92,7 +100,7 @@ fn bench_encode_protobuf(c: &mut Criterion) {
 //
 // The server's legacy decoder expects client→server wire layout (no
 // `sender_session` field on the wire). Hand-roll a minimal inbound packet
-// for that — encode_audio_packet writes the server→client layout and would
+// for that - Audio::encode writes the server-to-client layout and would
 // not round-trip.
 
 fn write_mumble_varint(buf: &mut Vec<u8>, value: u64) {
@@ -126,12 +134,13 @@ fn build_inbound_legacy(opus_len: usize) -> Vec<u8> {
 
 fn bench_decode_legacy(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode/legacy");
+    let from_session = Some(ClientSessionIdentifier::from(12345));
     for &len in opus_sizes().iter() {
         let encoded = build_inbound_legacy(len);
         group.throughput(Throughput::Bytes(encoded.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &encoded, |b, encoded| {
             b.iter(|| {
-                let out = decode_audio_packet(black_box(encoded));
+                let out = Audio::decode(black_box(encoded), from_session);
                 black_box(out.unwrap())
             });
         });
@@ -139,16 +148,12 @@ fn bench_decode_legacy(c: &mut Criterion) {
     for &len in opus_sizes().iter() {
         let encoded = build_inbound_legacy(len);
         group.throughput(Throughput::Bytes(encoded.len() as u64));
-        group.bench_with_input(
-            BenchmarkId::new("udp_sync", len),
-            &encoded,
-            |b, encoded| {
-                b.iter(|| {
-                    let out = decode_udp_packet(black_box(encoded));
-                    black_box(out.unwrap())
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("udp_sync", len), &encoded, |b, encoded| {
+            b.iter(|| {
+                let out = IncomingUdpPacket::decode(black_box(encoded), from_session);
+                black_box(out.unwrap())
+            });
+        });
     }
     group.finish();
 }
@@ -160,7 +165,7 @@ fn bench_crypt_encrypt(c: &mut Criterion) {
     for &len in opus_sizes().iter() {
         // encrypt input is the encoded audio packet, not the Opus payload
         let audio = make_audio(len);
-        let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+        let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
         let plaintext_len = raw.len();
         group.throughput(Throughput::Bytes(plaintext_len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &raw, |b, raw| {
@@ -179,7 +184,7 @@ fn bench_crypt_decrypt(c: &mut Criterion) {
     let mut group = c.benchmark_group("crypt/decrypt");
     for &len in opus_sizes().iter() {
         let audio = make_audio(len);
-        let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+        let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
         let plaintext_len = raw.len();
         // Encrypt once into `cipher`, but to reuse for many decrypt iterations we
         // need decrypt to NOT advance the IV history. CryptState::decrypt does
@@ -230,18 +235,14 @@ fn bench_fanout_seq(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &_n| {
             // Wrap states in a Mutex so the closure can take &mut CryptState
             // sequentially without owning them across iterations.
-            let states_cell = std::cell::RefCell::new(
-                states
-                    .iter()
-                    .map(|_| make_crypt())
-                    .collect::<Vec<_>>(),
-            );
+            let states_cell =
+                std::cell::RefCell::new(states.iter().map(|_| make_crypt()).collect::<Vec<_>>());
             b.iter(|| {
                 let mut states = states_cell.borrow_mut();
                 let out: Vec<Bytes> = states
                     .iter_mut()
                     .map(|state| {
-                        let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+                        let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
                         let mut buf = vec![0u8; raw.len() + state.overhead()];
                         state.encrypt(&mut buf, &raw).unwrap();
                         Bytes::from(buf)
@@ -273,7 +274,8 @@ fn bench_fanout_rayon(c: &mut Criterion) {
                     let out: Vec<Bytes> = states
                         .into_par_iter()
                         .map(|mut state| {
-                            let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+                            let raw =
+                                Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
                             let mut buf = vec![0u8; raw.len() + state.overhead()];
                             state.encrypt(&mut buf, &raw).unwrap();
                             Bytes::from(buf)
@@ -293,7 +295,7 @@ fn bench_fanout_seq_encrypt_only(c: &mut Criterion) {
     let mut group = c.benchmark_group("fanout/seq_encrypt_only");
     let opus_len = 170;
     let audio = make_audio(opus_len);
-    let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
     for &n in recipient_counts().iter() {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &_n| {
@@ -330,12 +332,11 @@ fn bench_fanout_seq_cached(c: &mut Criterion) {
                 || (0..*&_n).map(|_| make_crypt()).collect::<Vec<_>>(),
                 |mut states| {
                     // Single encode shared across all recipients.
-                    let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+                    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
                     let out: Vec<bytes::Bytes> = states
                         .iter_mut()
                         .map(|state| {
-                            let mut buf =
-                                bytes::BytesMut::zeroed(raw.len() + state.overhead());
+                            let mut buf = bytes::BytesMut::zeroed(raw.len() + state.overhead());
                             state.encrypt(&mut buf, &raw).unwrap();
                             buf.freeze()
                         })
@@ -361,7 +362,7 @@ fn bench_fanout_seq_cached_vec(c: &mut Criterion) {
             b.iter_with_setup(
                 || (0..*&_n).map(|_| make_crypt()).collect::<Vec<_>>(),
                 |mut states| {
-                    let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+                    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
                     let out: Vec<bytes::Bytes> = states
                         .iter_mut()
                         .map(|state| {
@@ -441,7 +442,7 @@ async fn dispatch_spawn_rayon(states: Vec<CryptState>, raw: bytes::Bytes) -> Vec
 fn bench_dispatch_strategies(c: &mut Criterion) {
     let opus_len = 170;
     let audio = make_audio(opus_len);
-    let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
     let rt = make_runtime();
 
     let mut group = c.benchmark_group("dispatch/single_call");
@@ -514,7 +515,7 @@ fn stream_counts() -> [usize; 5] {
 fn bench_multistream(c: &mut Criterion) {
     let opus_len = 170;
     let audio = make_audio(opus_len);
-    let raw = encode_audio_packet(&audio, AudioContext::Normal, PacketFormat::Legacy);
+    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
     let rt = make_runtime();
 
     let mut group = c.benchmark_group("multistream/serial");

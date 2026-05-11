@@ -1,7 +1,10 @@
-use std::{convert::TryFrom, fmt::Display};
 use serde::{Deserialize, Serialize};
+use std::{convert::TryFrom, fmt::Display};
 
-use crate::{constants::{MAX_LOCAL_SESSION_ID, MAX_NODE_ID}, types::NodeIdentifier};
+use crate::{
+    constants::{MAX_LOCAL_SESSION_ID, MAX_NODE_ID},
+    types::NodeIdentifier,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClientSessionIdentifier {
@@ -21,12 +24,15 @@ pub enum ClientSessionIdentifierError {
 
 impl Display for ClientSessionIdentifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ClientSessionIdentifier(node_id={}, local_session_id={})", self.node_id, self.local_session_id)
+        write!(
+            f,
+            "ClientSessionIdentifier(node_id={}, local_session_id={})",
+            self.node_id, self.local_session_id
+        )
     }
 }
 
 impl ClientSessionIdentifier {
-
     /// Create a new identifier, returning an error if either part doesn't fit its bit-size.
     pub fn new(node_id: u16, local_session_id: u32) -> Result<Self, ClientSessionIdentifierError> {
         if node_id > MAX_NODE_ID {
@@ -35,7 +41,10 @@ impl ClientSessionIdentifier {
         if local_session_id > MAX_LOCAL_SESSION_ID {
             return Err(ClientSessionIdentifierError::LocalSessionIdOutOfRange);
         }
-        Ok(Self { node_id, local_session_id })
+        Ok(Self {
+            node_id,
+            local_session_id,
+        })
     }
 
     /// Pack the two parts into a single u32.
@@ -63,7 +72,10 @@ impl From<u32> for ClientSessionIdentifier {
     fn from(value: u32) -> Self {
         let local_session_id = value & MAX_LOCAL_SESSION_ID;
         let node_id = ((value >> 20) & (MAX_NODE_ID as u32)) as u16;
-        ClientSessionIdentifier { node_id, local_session_id }
+        ClientSessionIdentifier {
+            node_id,
+            local_session_id,
+        }
     }
 }
 

@@ -101,4 +101,8 @@ impl<R: StrictReplicable> StrictHandle<R> {
     pub fn current_version(&self) -> u64 {
         self.runtime.repo.current_version()
     }
+
+    pub fn local_node_id(&self) -> crate::types::NodeIdentifier {
+        self.runtime.self_id
+    }
 }

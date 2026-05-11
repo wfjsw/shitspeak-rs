@@ -56,11 +56,7 @@ pub struct ModerationDelivery {
 /// impl wraps [`OverlayNetwork`]; tests inject a recording fake.
 #[async_trait]
 pub trait ModerationTransport: Send + Sync + 'static {
-    async fn send_unicast(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-    ) -> Result<(), ApplicationError>;
+    async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError>;
 }
 
 /// Production `ModerationTransport` impl backed by the overlay.
@@ -70,11 +66,7 @@ pub struct OverlayModerationTransport {
 
 #[async_trait]
 impl ModerationTransport for OverlayModerationTransport {
-    async fn send_unicast(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-    ) -> Result<(), ApplicationError> {
+    async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
             .send_unicast(
                 dst,

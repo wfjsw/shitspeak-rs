@@ -17,14 +17,38 @@ pub(crate) async fn compute_permissions_for_client(
 ) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
     let session = u32::from(client.get_session_id());
 
-    // Superuser bypasses all ACL checks
+    // Superuser bypasses all ACL checks.
     if client.is_superuser() {
         tracing::trace!(session, channel_id, "ACL compute bypassed for superuser");
         return enumflags2::BitFlags::all();
     }
 
-    // Single lock acquisition for channel + ancestors
-    let (channel, ancestors) = server.get_channels().get_channel_with_ancestors(channel_id).await;
+    let channels = server.get_channels();
+    let client_acl_generation = client.get_acl_generation();
+    let channel_acl_generation = channels.channel_acl_generation();
+    let cache_session = u64::from(session);
+
+    if let Some(permissions) = channels
+        .get_cached_permissions(
+            cache_session,
+            channel_id,
+            channel_acl_generation,
+            client_acl_generation,
+        )
+        .await
+    {
+        tracing::trace!(
+            session,
+            channel_id,
+            permissions = ?permissions,
+            "ACL cache hit"
+        );
+        return permissions;
+    }
+
+    let (channel_acl_generation, channel, ancestors) = channels
+        .get_channel_with_ancestors_for_acl(channel_id)
+        .await;
     let Some(channel) = channel else {
         tracing::trace!(session, channel_id, "ACL compute found no channel");
         return enumflags2::BitFlags::empty();
@@ -41,7 +65,7 @@ pub(crate) async fn compute_permissions_for_client(
         authenticated: user_id.is_some(),
         access_tokens: &token_refs,
         cert_hash: client.get_certificate_hash(),
-        has_verified_cert_chain: client.has_certificate(),
+        has_verified_cert_chain: client.is_verified(),
         ip_address: Some(client.get_real_ip_address()),
         asn: None,
         country_code: None,
@@ -58,13 +82,8 @@ pub(crate) async fn compute_permissions_for_client(
         "Computing ACL permissions"
     );
 
-    let permissions = crate::acl::evaluate_permission(
-        &channel,
-        &ancestors,
-        user_id,
-        &membership,
-        channel_id,
-    );
+    let permissions =
+        crate::acl::evaluate_permission(&channel, &ancestors, user_id, &membership, channel_id);
 
     tracing::trace!(
         session,
@@ -73,6 +92,20 @@ pub(crate) async fn compute_permissions_for_client(
         permissions = ?permissions,
         "Computed ACL permissions"
     );
+
+    if channels.channel_acl_generation() == channel_acl_generation
+        && client.get_acl_generation() == client_acl_generation
+    {
+        channels
+            .cache_permissions(
+                cache_session,
+                channel_id,
+                channel_acl_generation,
+                client_acl_generation,
+                permissions,
+            )
+            .await;
+    }
 
     permissions
 }

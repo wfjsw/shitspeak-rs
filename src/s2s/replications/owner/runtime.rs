@@ -35,11 +35,7 @@ pub(crate) trait OwnerNet: Send + Sync + 'static {
         topic: &str,
         body: OwnerBody,
     ) -> Result<(), ReplicationError>;
-    async fn send_broadcast(
-        &self,
-        topic: &str,
-        body: OwnerBody,
-    ) -> Result<(), ReplicationError>;
+    async fn send_broadcast(&self, topic: &str, body: OwnerBody) -> Result<(), ReplicationError>;
     fn alive_members(&self) -> Vec<NodeIdentifier>;
     fn local_node_id(&self) -> NodeIdentifier;
     /// Look up an origin's `boot_epoch` via the overlay's LSDB. Used after
@@ -73,11 +69,7 @@ impl OwnerNet for OverlayOwnerNet {
         Ok(())
     }
 
-    async fn send_broadcast(
-        &self,
-        topic: &str,
-        body: OwnerBody,
-    ) -> Result<(), ReplicationError> {
+    async fn send_broadcast(&self, topic: &str, body: OwnerBody) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_owner(topic, body);
         let bytes = repl_proto::encode(&msg)?;
         self.overlay
@@ -175,12 +167,7 @@ impl OwnerState {
 
     /// Insert a buffered out-of-order op. Returns `true` if the buffer was
     /// previously empty (i.e. caller should consider arming catchup).
-    pub fn buffer_op(
-        &mut self,
-        origin: NodeIdentifier,
-        version: u64,
-        op_msgpack: Bytes,
-    ) -> bool {
+    pub fn buffer_op(&mut self, origin: NodeIdentifier, version: u64, op_msgpack: Bytes) -> bool {
         let buf = self.pending_buffers.entry(origin).or_default();
         let was_empty = buf.is_empty();
         buf.entry(version).or_insert(OwnerBufferedOp { op_msgpack });
@@ -312,7 +299,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
 
     pub async fn recv_op(&self, from: NodeIdentifier, op: OwnerOp) {
         let Some(origin) = node_from_u32(op.origin_node) else {
-            warn!(node=op.origin_node, "owner op has invalid origin_node");
+            warn!(node = op.origin_node, "owner op has invalid origin_node");
             return;
         };
         // Owner-mode rule: only the named origin may originate ops.
@@ -360,11 +347,8 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                     Classification::Buffer => {
                         let arm = {
                             let mut s = self.state.lock();
-                            let was_empty = s.buffer_op(
-                                origin,
-                                op.origin_version,
-                                Bytes::from(op.op_msgpack),
-                            );
+                            let was_empty =
+                                s.buffer_op(origin, op.origin_version, Bytes::from(op.op_msgpack));
                             was_empty
                                 && s.arm_catchup(
                                     origin,
@@ -396,11 +380,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                     let was_empty =
                         s.buffer_op(origin, op.origin_version, Bytes::from(op.op_msgpack));
                     let arm = was_empty
-                        && s.arm_catchup(
-                            origin,
-                            Instant::now(),
-                            self.cfg.owner_catchup_timeout(),
-                        );
+                        && s.arm_catchup(origin, Instant::now(), self.cfg.owner_catchup_timeout());
                     (arm, known_epoch)
                 };
                 if arm {

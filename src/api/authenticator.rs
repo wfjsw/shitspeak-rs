@@ -91,4 +91,3 @@ pub trait Authenticator: Send + Sync + 'static {
         Ok(())
     }
 }
-

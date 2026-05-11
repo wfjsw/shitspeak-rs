@@ -44,9 +44,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use crate::s2s::overlay::{
-    MembershipEvent, OverlayInboundMessage, OverlayNetwork, ServiceInbound,
-};
+use crate::s2s::overlay::{MembershipEvent, OverlayInboundMessage, OverlayNetwork, ServiceInbound};
 use crate::types::NodeIdentifier;
 
 pub use config::{ReplicationConfig, ReplicationTuning};
@@ -221,9 +219,7 @@ impl ReplicationManager {
     /// Cancel all background tasks and unregister the L3 handler.
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
-        self.inner
-            .strict_topics
-            .scan(|_, rt| rt.shutdown());
+        self.inner.strict_topics.scan(|_, rt| rt.shutdown());
         self.inner.owner_topics.scan(|_, rt| rt.shutdown());
         self.inner
             .overlay

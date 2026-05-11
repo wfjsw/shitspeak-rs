@@ -61,7 +61,9 @@ pub fn u32_to_kind(v: u32) -> Option<TransportKind> {
 
 /// Bitmask of every transport kind for which the peer is reachable.
 pub fn transports_to_mask(kinds: &[TransportKind]) -> u32 {
-    kinds.iter().fold(0u32, |acc, k| acc | super::config::transport_bit(*k))
+    kinds
+        .iter()
+        .fold(0u32, |acc, k| acc | super::config::transport_bit(*k))
 }
 
 pub fn mask_to_transports(mask: u32) -> Vec<TransportKind> {

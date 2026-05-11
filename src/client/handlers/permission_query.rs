@@ -18,24 +18,34 @@ pub async fn handle_permission_query(
         ));
     }
 
-    tracing::debug!(session = u32::from(sender.get_session_id()), flush = msg.flush, "PermissionQuery handler");
-    
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        flush = msg.flush,
+        "PermissionQuery handler"
+    );
+
     if let Some(channel_id) = msg.channel_id {
         // Compute effective permissions using the ACL system
-        let perms = crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
+        let perms =
+            crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
 
-        tracing::debug!(session = u32::from(sender.get_session_id()), channel_id, permissions = perms.bits(), "Computed permissions for PermissionQuery");
+        tracing::debug!(
+            session = u32::from(sender.get_session_id()),
+            channel_id,
+            permissions = perms.bits(),
+            "Computed permissions for PermissionQuery"
+        );
 
         let reply: Message = PermissionQuery {
             channel_id: Some(channel_id),
             // permissions: Some(perms.bits()),
             permissions: Some(0x1F0FFFu32),
             flush: None,
-        }.into();
+        }
+        .into();
 
         sender.write_proto_message(&reply).await?;
     }
 
     Ok(())
 }
-

@@ -10,7 +10,7 @@ use super::udp_batch::{self, QueuedDatagram};
 use crate::{
     client::{crypt::CryptState, Client},
     constants::{APP_PROTO_VER, PROTOBUF_INTRODUCED_VERSION},
-    messages::encoder::{AudioContext, AudioTarget},
+    messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget},
     server::Server,
 };
 
@@ -35,6 +35,33 @@ fn client_packet_format(client: &Client) -> PacketFormat {
         PacketFormat::Protobuf
     } else {
         PacketFormat::Legacy
+    }
+}
+
+fn encode_s2s_voice_payload(audio: &Audio) -> Bytes {
+    match &audio.audio_payload {
+        codec::AudioPayload::Opus(opus) => {
+            let positional_data = audio
+                .positional_data
+                .map(|[x, y, z]| vec![x, y, z])
+                .unwrap_or_default();
+            let wire = AudioWire {
+                header: Some(AudioHeader::Target(audio.target)),
+                sender_session: 0,
+                frame_number: audio.frame_number,
+                opus_data: opus.frame.clone(),
+                positional_data,
+                volume_adjustment: audio.volume_adjustment,
+                is_terminator: opus.is_terminator,
+            };
+            let mut encoded = BytesMut::with_capacity(1 + wire.encoded_len());
+            encoded.extend_from_slice(&[0x00]);
+            match wire.encode(&mut encoded) {
+                Ok(()) => encoded.freeze(),
+                Err(_) => Bytes::new(),
+            }
+        }
+        _ => audio.encode(AudioContext::Normal, PacketFormat::Legacy),
     }
 }
 
@@ -148,7 +175,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
                 "routing normal channel speech"
             );
 
-            s2s_payload = Some(audio.encode(AudioContext::Normal, audio.format));
+            s2s_payload = Some(encode_s2s_voice_payload(audio));
 
             // ── Normal speech: channel members (local only) ─────────────
             // Remote clients in the same channel are reached via S2S
@@ -324,26 +351,89 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
     flush_voice_batch(server, audio, &targets).await;
 
     // ── Cross-node delivery (NORMAL channel speech only for now) ─────────
-    // if let Some(payload) = s2s_payload {
-    //     if let Some(app) = server.s2s_manager().application() {
-    //         let voice = app.voice().clone();
-    //         let _ = S2S_TARGET_NORMAL; // currently encoded inside send_for_channel
-    //         let result = voice
-    //             .send_for_channel(
-    //                 u32::from(sender_id),
-    //                 sender_channel,
-    //                 audio.is_terminator,
-    //                 payload,
-    //             )
-    //             .await;
-    //         if let Err(e) = result {
-    //             tracing::trace!(error=%e, "voice s2s send failed");
-    //         }
-    //     }
-    // }
+    if let Some(payload) = s2s_payload {
+        if let Some(app) = server.s2s_manager().application() {
+            let result = app
+                .voice()
+                .send_for_channel(
+                    u32::from(sender_id),
+                    sender_channel,
+                    matches!(
+                        &audio.audio_payload,
+                        codec::AudioPayload::Opus(payload) if payload.is_terminator
+                    ),
+                    payload,
+                )
+                .await;
+            if let Err(e) = result {
+                tracing::trace!(error=%e, "voice s2s send failed");
+            }
+        }
+    }
 }
 
-async fn flush_voice_batch(
+pub(crate) async fn route_s2s_voice_frame(
+    server: &Arc<Box<Server>>,
+    from_immediate: crate::types::NodeIdentifier,
+    frame: crate::s2s::application::proto::VoiceFrame,
+) {
+    let sender_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
+        frame.sender_session,
+    );
+    let decoded = match Audio::decode(&frame.payload, Some(sender_id)) {
+        Ok(audio) => audio,
+        Err(e) => {
+            tracing::trace!(
+                from = from_immediate,
+                sender = frame.sender_session,
+                error = %e,
+                "s2s voice frame decode failed"
+            );
+            return;
+        }
+    };
+
+    let sender_channel = server
+        .get_clients()
+        .get_client(sender_id)
+        .await
+        .map(|client| client.get_current_channel_id())
+        .unwrap_or(0);
+
+    let mut targets: Vec<(Arc<Box<Client>>, AudioContext)> = Vec::new();
+    let channel_clients = server
+        .get_clients()
+        .get_local_clients_in_channel(sender_channel)
+        .await;
+    for client in &channel_clients {
+        if client.get_session_id() == sender_id || !client.is_authenticated() {
+            continue;
+        }
+        targets.push((client.clone(), AudioContext::Normal));
+    }
+
+    let listeners = server
+        .get_clients()
+        .get_local_listeners_for_channel(sender_channel)
+        .await;
+    for client in &listeners {
+        if client.get_session_id() == sender_id || !client.is_authenticated() {
+            continue;
+        }
+        targets.push((client.clone(), AudioContext::Listen));
+    }
+
+    tracing::trace!(
+        from = from_immediate,
+        sender = frame.sender_session,
+        channel = sender_channel,
+        count = targets.len(),
+        "routing s2s normal voice frame to local recipients"
+    );
+    flush_voice_batch(server, &decoded, &targets).await;
+}
+
+pub(crate) async fn flush_voice_batch(
     server: &Arc<Box<Server>>,
     audio: &Audio,
     targets: &[(Arc<Box<Client>>, AudioContext)],

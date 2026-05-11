@@ -8,6 +8,11 @@ use std::time::Duration;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::Message;
 
+/// Checks that a moderator mute is applied to another user.
+/// Expected: Bob receives `UserState { mute: true }` for his session. Mumble
+/// implements admin mute/deaf updates in `D:\mumble\src\murmur\Messages.cpp::msgUserState`;
+/// shitspeak mirrors the permission and broadcast behavior in
+/// `D:\shitspeak\message.go::handleUserStateMessage`.
 #[tokio::test]
 async fn mod_mutes_other() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -40,6 +45,11 @@ async fn mod_mutes_other() {
     assert!(msg.is_some(), "Bob should have received mute=true");
 }
 
+/// Checks that a moderator kick removes the target from the server.
+/// Expected: Alice receives `UserRemove` for Bob's session. This comes from
+/// Mumble's kick path in `D:\mumble\src\murmur\Messages.cpp::msgUserRemove`
+/// and the `UserRemove` proto semantics; shitspeak implements the same path in
+/// `D:\shitspeak\message.go::handleUserRemoveMessage`.
 #[tokio::test]
 async fn mod_kicks_other() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -73,6 +83,11 @@ async fn mod_kicks_other() {
     );
 }
 
+/// Checks that a moderator ban records a server ban entry after removing a user.
+/// Expected: the ban repository contains an active entry after Alice bans Bob.
+/// Mumble's behavior is defined by `UserRemove.ban` and ban persistence in
+/// `D:\mumble\src\murmur\Messages.cpp::msgUserRemove`; shitspeak mirrors this
+/// in `D:\shitspeak\message.go::handleUserRemoveMessage` and `D:\shitspeak\ban.go`.
 #[tokio::test]
 async fn mod_bans_other_blocks_reconnect() {
     let server = spawn_test_server(TestServerOpts::default()).await;

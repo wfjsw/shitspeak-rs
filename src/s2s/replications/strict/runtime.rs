@@ -38,10 +38,7 @@ use crate::types::NodeIdentifier;
 /// `[cfg.min_clock_tick(), cfg.max_clock_tick()]`. Empty input
 /// → `cfg.fallback_clock_tick()`. Uses nearest-rank:
 /// idx = `ceil(0.95 * n) - 1`.
-pub(crate) fn p95_clock_tick_interval(
-    samples: &[Duration],
-    cfg: &ReplicationConfig,
-) -> Duration {
+pub(crate) fn p95_clock_tick_interval(samples: &[Duration], cfg: &ReplicationConfig) -> Duration {
     if samples.is_empty() {
         return cfg.fallback_clock_tick();
     }
@@ -92,11 +89,7 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
         topic: &str,
         body: StrictBody,
     ) -> Result<(), ReplicationError>;
-    async fn send_broadcast(
-        &self,
-        topic: &str,
-        body: StrictBody,
-    ) -> Result<(), ReplicationError>;
+    async fn send_broadcast(&self, topic: &str, body: StrictBody) -> Result<(), ReplicationError>;
     fn alive_members(&self) -> Vec<NodeIdentifier>;
     fn local_node_id(&self) -> NodeIdentifier;
     /// Snapshot of every directed-edge RTT in the overlay's LSDB. Used to
@@ -154,11 +147,7 @@ impl StrictNet for OverlayStrictNet {
         Ok(())
     }
 
-    async fn send_broadcast(
-        &self,
-        topic: &str,
-        body: StrictBody,
-    ) -> Result<(), ReplicationError> {
+    async fn send_broadcast(&self, topic: &str, body: StrictBody) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_strict(topic, body);
         let bytes = repl_proto::encode(&msg)?;
         self.overlay
@@ -413,7 +402,8 @@ impl StrictState {
     /// ts_final cannot be re-bufferable from a stale commit).
     pub fn gc_committed_ts_final(&mut self) {
         let dhw = self.delivered_high_water;
-        self.committed_ts_final.retain(|_, ts_final| *ts_final >= dhw);
+        self.committed_ts_final
+            .retain(|_, ts_final| *ts_final >= dhw);
     }
 
     /// Drop pending_proposes entries older than `pending_propose_ttl`.
@@ -645,7 +635,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let coord = match node_from_u32(p.coord_node) {
             Some(c) => c,
             None => {
-                warn!(node=p.coord_node, "strict propose has invalid coord_node");
+                warn!(node = p.coord_node, "strict propose has invalid coord_node");
                 return;
             }
         };
@@ -772,8 +762,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             if let Some(prev_ts) = s.committed_ts_final.get(&op_id).copied() {
                 if prev_ts != c.ts_final {
                     error!(
-                        op_id_hi = op_id.0, op_id_lo = op_id.1,
-                        prev_ts, new_ts = c.ts_final,
+                        op_id_hi = op_id.0,
+                        op_id_lo = op_id.1,
+                        prev_ts,
+                        new_ts = c.ts_final,
                         "strict commit ts_final disagreement; keeping first"
                     );
                 }
@@ -821,7 +813,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let takeover = match node_from_u32(req.takeover_node) {
             Some(c) => c,
             None => {
-                warn!(node = req.takeover_node, "recovery req has invalid takeover_node");
+                warn!(
+                    node = req.takeover_node,
+                    "recovery req has invalid takeover_node"
+                );
                 return;
             }
         };
@@ -904,7 +899,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 // A higher ballot exists; abort. Liveness will recover via
                 // RecoveryCommit from the higher-ballot takeover.
                 debug!(
-                    op_id_hi = op_id.0, op_id_lo = op_id.1,
+                    op_id_hi = op_id.0,
+                    op_id_lo = op_id.1,
                     "recovery aborted: higher ballot promised elsewhere"
                 );
                 recoveries.remove(&op_id);
@@ -959,7 +955,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     }
                     None => {
                         debug!(
-                            op_id_hi = op_id.0, op_id_lo = op_id.1,
+                            op_id_hi = op_id.0,
+                            op_id_lo = op_id.1,
                             "recovery aborted: no replica holds the op (genuinely lost)"
                         );
                         recoveries.remove(&op_id);
@@ -983,7 +980,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
             clock_now = s.clock;
             s.peer_clocks.insert(self.self_id, clock_now);
-            if s.committed_ts_final.get(&op_id).copied().is_none() && s.mark_committed(op_id, ts_final) {
+            if s.committed_ts_final.get(&op_id).copied().is_none()
+                && s.mark_committed(op_id, ts_final)
+            {
                 s.buffer_commit(op_id, ts_final, op_msgpack.clone());
                 notify = true;
             }
@@ -1024,7 +1023,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let promised_now = s.recovery_promises.get(&op_id).copied().unwrap_or(0);
             if c.ballot < promised_now {
                 trace!(
-                    ballot = c.ballot, promised = promised_now,
+                    ballot = c.ballot,
+                    promised = promised_now,
                     "recovery commit rejected: stale ballot"
                 );
                 return;
@@ -1040,8 +1040,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             if let Some(prev_ts) = s.committed_ts_final.get(&op_id).copied() {
                 if prev_ts != c.ts_final {
                     error!(
-                        op_id_hi = op_id.0, op_id_lo = op_id.1,
-                        prev_ts, new_ts = c.ts_final,
+                        op_id_hi = op_id.0,
+                        op_id_lo = op_id.1,
+                        prev_ts,
+                        new_ts = c.ts_final,
                         "recovery commit ts_final disagreement; keeping first"
                     );
                 }
@@ -1101,7 +1103,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             if already_running {
                 continue;
             }
-            let attempt = self.recovery_attempt_counter.fetch_add(1, Ordering::Relaxed);
+            let attempt = self
+                .recovery_attempt_counter
+                .fetch_add(1, Ordering::Relaxed);
             let ballot = make_ballot(self.self_id, attempt);
             // Self-ack inline (we always promise our own ballot on creation).
             let self_ack = {
@@ -1204,8 +1208,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// longer reach fast-quorum, and initiates slow-path recovery for any
     /// pending Propose whose coord just died.
     pub fn on_membership_change(&self, ev: &MembershipEvent) {
-        let alive_set: HashSet<NodeIdentifier> =
-            self.net.alive_members().into_iter().chain([self.self_id]).collect();
+        let alive_set: HashSet<NodeIdentifier> = self
+            .net
+            .alive_members()
+            .into_iter()
+            .chain([self.self_id])
+            .collect();
         let wakers = {
             let mut s = self.state.lock();
             s.fail_quorum_lost(&alive_set)
@@ -1458,7 +1466,10 @@ mod tests {
     #[test]
     fn p95_clock_tick_returns_fallback_when_empty() {
         let cfg = ReplicationConfig::default();
-        assert_eq!(p95_clock_tick_interval(&[], &cfg), cfg.fallback_clock_tick());
+        assert_eq!(
+            p95_clock_tick_interval(&[], &cfg),
+            cfg.fallback_clock_tick()
+        );
     }
 
     #[test]
@@ -1481,7 +1492,10 @@ mod tests {
         let cfg = ReplicationConfig::default();
         // All samples below min_clock_tick() ⇒ result clamped up.
         let samples = vec![Duration::from_millis(5); 10];
-        assert_eq!(p95_clock_tick_interval(&samples, &cfg), cfg.min_clock_tick());
+        assert_eq!(
+            p95_clock_tick_interval(&samples, &cfg),
+            cfg.min_clock_tick()
+        );
     }
 
     #[test]
@@ -1489,7 +1503,10 @@ mod tests {
         let cfg = ReplicationConfig::default();
         // All samples above max_clock_tick() ⇒ result clamped down.
         let samples = vec![Duration::from_secs(30); 10];
-        assert_eq!(p95_clock_tick_interval(&samples, &cfg), cfg.max_clock_tick());
+        assert_eq!(
+            p95_clock_tick_interval(&samples, &cfg),
+            cfg.max_clock_tick()
+        );
     }
 
     #[test]

@@ -50,7 +50,10 @@ pub async fn originate(
         message_class: class_to_wire(class),
         payload: body,
     };
-    forward_pb(transport, routing, self_id, data, class, /*is_originator=*/ true).await
+    forward_pb(
+        transport, routing, self_id, data, class, /*is_originator=*/ true,
+    )
+    .await
 }
 
 /// Handle an inbound `OverlayData`: deliver locally if applicable,
@@ -65,7 +68,10 @@ pub async fn handle_inbound(
 ) {
     let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
     // Deliver-to-self if applicable.
-    let is_for_self = data.dsts.iter().any(|d| node_from_wire(*d) == Some(self_id));
+    let is_for_self = data
+        .dsts
+        .iter()
+        .any(|d| node_from_wire(*d) == Some(self_id));
     if is_for_self {
         let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
         let src = node_from_wire(data.src).unwrap_or(0);
@@ -90,7 +96,10 @@ pub async fn handle_inbound(
     }
     let mut data2 = data;
     data2.dsts = remaining;
-    let _ = forward_pb(transport, routing, self_id, data2, class, /*is_originator=*/ false).await;
+    let _ = forward_pb(
+        transport, routing, self_id, data2, class, /*is_originator=*/ false,
+    )
+    .await;
 }
 
 /// Forward an `OverlayData` whose `dsts` already excludes self.
@@ -106,8 +115,7 @@ async fn forward_pb(
     let tables = routing.load();
 
     // Bucket dsts by next_hop.
-    let path_trace_set: std::collections::HashSet<u32> =
-        data.path_trace.iter().copied().collect();
+    let path_trace_set: std::collections::HashSet<u32> = data.path_trace.iter().copied().collect();
     let mut buckets: HashMap<NodeIdentifier, Vec<u32>> = HashMap::new();
     for dst_wire in &data.dsts {
         let Some(dst) = node_from_wire(*dst_wire) else {

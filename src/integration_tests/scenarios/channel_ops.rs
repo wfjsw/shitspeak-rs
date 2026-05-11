@@ -6,6 +6,11 @@ use crate::channels::Channel;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::Message;
 
+/// Checks that creating a permanent channel is broadcast to all clients.
+/// Expected: both creator and peer receive a `ChannelState` for the new
+/// channel. This follows Mumble's `ChannelState` create path in
+/// `D:\mumble\src\murmur\Messages.cpp::msgChannelState` and shitspeak's
+/// `D:\shitspeak\message.go::handleChannelStateMessage`.
 #[tokio::test]
 async fn create_permanent_channel_propagates() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -41,6 +46,11 @@ async fn create_permanent_channel_propagates() {
     assert!(saw_bob.is_some(), "Bob should observe Alice's creation");
 }
 
+/// Checks that renaming an existing channel propagates to peers.
+/// Expected: Bob receives `ChannelState { channel_id: 11, name: "Renamed" }`.
+/// Mumble sends channel edits through `msgChannelState` in
+/// `D:\mumble\src\murmur\Messages.cpp`; shitspeak mirrors that update/broadcast
+/// path in `D:\shitspeak\message.go::handleChannelStateMessage`.
 #[tokio::test]
 async fn update_channel_name_propagates() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -78,6 +88,12 @@ async fn update_channel_name_propagates() {
     assert!(saw_bob.is_some(), "Bob should see the renamed channel");
 }
 
+/// Checks that removing a channel migrates occupants to its parent.
+/// Expected: Bob is moved back to root and Alice observes the resulting
+/// `UserState`. This is the Murmur channel-removal behavior in
+/// `D:\mumble\src\murmur\Messages.cpp::msgChannelRemove` and
+/// `D:\mumble\src\murmur\Server.cpp`, with matching shitspeak handling in
+/// `D:\shitspeak\message.go::handleChannelRemoveMessage`.
 #[tokio::test]
 async fn remove_channel_migrates_users_to_parent() {
     let server = spawn_test_server(TestServerOpts::default()).await;

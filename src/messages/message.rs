@@ -1,7 +1,7 @@
-use prost::Message as _;
 use bytes::Bytes;
+use prost::Message as _;
 
-use crate::{mumble_proto::*};
+use crate::mumble_proto::*;
 
 use message_macro::MessageConversion;
 

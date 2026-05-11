@@ -84,7 +84,17 @@ pub async fn send_unicast(
     class: MessageClass,
     body: Bytes,
 ) -> Result<(), OverlayError> {
-    forward::originate(transport, routing, self_id, vec![dst], tag, level, class, body).await
+    forward::originate(
+        transport,
+        routing,
+        self_id,
+        vec![dst],
+        tag,
+        level,
+        class,
+        body,
+    )
+    .await
 }
 
 /// Public API: send to a specific list of peers.

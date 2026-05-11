@@ -1,4 +1,4 @@
-pub trait CryptoProvider : Send + Sync {
+pub trait CryptoProvider: Send + Sync {
     fn nonce_size(&self) -> usize;
     fn key_size(&self) -> usize;
     fn overhead_size(&self) -> usize;

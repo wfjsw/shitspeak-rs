@@ -30,6 +30,11 @@ use super::super::OverlayNetwork;
 // Phase-2 baseline tests (5)
 // ---------------------------------------------------------------------------
 
+/// Checks basic two-node overlay discovery and LSDB convergence.
+/// Expected: both nodes become alive members and learn each other's node id.
+/// This S2S overlay behavior is local to this crate; it exists to preserve the
+/// single-server Mumble/shitspeak semantics from `D:\mumble\src\murmur` and
+/// `D:\shitspeak\server.go` when those semantics are distributed.
 #[tokio::test]
 async fn two_node_mesh_forms_and_lsdb_converges() {
     let cluster = Cluster::build(&[1, 2], |idx, _ids, ports| {
@@ -65,6 +70,11 @@ async fn two_node_mesh_forms_and_lsdb_converges() {
     cluster.shutdown_all().await;
 }
 
+/// Checks graceful overlay shutdown membership signaling.
+/// Expected: node A receives `MembershipEvent::Left(200)` after node B shuts
+/// down cleanly. Mumble has no S2S membership protocol; the expected behavior
+/// is this crate's overlay contract for clean departure, with shitspeak's
+/// `D:\shitspeak\slavehub.go` as the local side-channel precedent.
 #[tokio::test]
 async fn graceful_shutdown_emits_left() {
     let cluster = Cluster::build(&[100, 200], |idx, _ids, ports| {
@@ -109,6 +119,10 @@ async fn graceful_shutdown_emits_left() {
     b.transport.shutdown().await;
 }
 
+/// Checks failure detection for an ungraceful peer loss.
+/// Expected: node A emits `MembershipEvent::Failed(20)` when B's transport is
+/// killed without overlay shutdown. This is this crate's S2S liveness contract,
+/// needed so distributed Mumble/shitspeak state can stop targeting dead nodes.
 #[tokio::test]
 async fn failure_detection_marks_peer_failed() {
     let cluster = Cluster::build(&[10, 20], |idx, _ids, ports| {
@@ -154,6 +168,11 @@ async fn failure_detection_marks_peer_failed() {
     a.transport.shutdown().await;
 }
 
+/// Checks unicast dispatch through the overlay service registry.
+/// Expected: service 7 on node B receives one message from node A with the
+/// original payload and reliable service level. This crate's service registry
+/// is the S2S delivery substrate for Mumble/shitspeak handlers such as
+/// `D:\mumble\src\murmur\Messages.cpp` and `D:\shitspeak\message.go`.
 #[tokio::test]
 async fn service_registry_dispatch_unicast() {
     let cluster = Cluster::build(&[1, 2], |idx, _ids, ports| {
@@ -206,6 +225,10 @@ async fn service_registry_dispatch_unicast() {
     cluster.shutdown_all().await;
 }
 
+/// Checks reliable broadcast delivery to every other overlay member.
+/// Expected: nodes B and C both receive A's broadcast body. Broadcast is this
+/// crate's S2S extension for fan-out behavior that Mumble and shitspeak perform
+/// inside one server process via `sendAll`/broadcast helpers.
 #[tokio::test]
 async fn broadcast_reaches_all_members() {
     let cluster = Cluster::build(&[1, 2, 3], full_mesh_seeds).await;
@@ -250,9 +273,10 @@ async fn broadcast_reaches_all_members() {
 // Phase-2 advanced scenarios (5)
 // ---------------------------------------------------------------------------
 
-/// Ten-node full mesh: every node seeds every other; verify all converge
-/// on the same membership view, all routing tables are populated, and a
-/// broadcast from one node reaches the other nine.
+/// Checks ten-node full-mesh overlay convergence and broadcast fan-out.
+/// Expected: all nodes converge on the same membership/routing view and nodes
+/// 2 through 10 receive node 1's broadcast. This is this crate's S2S scaling
+/// contract for preserving Mumble/shitspeak broadcast semantics across servers.
 #[tokio::test]
 async fn ten_node_full_mesh_converges_and_broadcasts() {
     let ids: Vec<u16> = (1..=10).collect();
@@ -303,10 +327,10 @@ async fn ten_node_full_mesh_converges_and_broadcasts() {
     cluster.shutdown_all().await;
 }
 
-/// 3-node ring (A↔B, B↔C, A↔C) with a redundant direct A↔C link. After
-/// killing the A↔C link bidirectionally, A's routing must converge onto
-/// the A→B→C path within a few seconds, and unicast from A to C still
-/// succeeds.
+/// Checks route repair after a direct S2S link is cut.
+/// Expected: A's route to C changes from direct to next-hop B, and unicast to C
+/// still succeeds. This is local S2S overlay behavior that keeps distributed
+/// Mumble/shitspeak operations deliverable after link loss.
 #[tokio::test]
 async fn link_down_reroutes() {
     let cluster = Cluster::build(&[1, 2, 3], full_mesh_seeds).await;
@@ -370,9 +394,11 @@ async fn link_down_reroutes() {
     cluster.shutdown_all().await;
 }
 
-/// Restart B (same node id, new boot_epoch). A must observe
-/// `MembershipEvent::Restarted(B)` faster than waiting for the next LSA
-/// to flood — Hello carries the boot_epoch directly.
+/// Checks restart detection using Hello boot epochs.
+/// Expected: when B restarts with the same node id and a new boot epoch, A
+/// emits `MembershipEvent::Restarted(2)` before waiting for normal LSA flooding.
+/// This is this crate's S2S membership behavior for distinguishing restarts
+/// from ordinary joins/leaves.
 #[tokio::test]
 async fn restart_detection_via_hello() {
     install_provider_once();
@@ -395,19 +421,23 @@ async fn restart_detection_via_hello() {
         ConnectionManager::start(transport_cfg(&pki, 0, loopback(port_a)))
             .await
             .unwrap();
-    let overlay_a = OverlayNetwork::start(transport_a.clone(), inbound_a, overlay_cfg(vec![seed_b]))
-        .await
-        .unwrap();
+    let overlay_a =
+        OverlayNetwork::start(transport_a.clone(), inbound_a, overlay_cfg(vec![seed_b]))
+            .await
+            .unwrap();
 
     {
         let (transport_b1, inbound_b1) =
             ConnectionManager::start(transport_cfg(&pki, 1, loopback(port_b)))
                 .await
                 .unwrap();
-        let overlay_b1 =
-            OverlayNetwork::start(transport_b1.clone(), inbound_b1, overlay_cfg(vec![seed_a.clone()]))
-                .await
-                .unwrap();
+        let overlay_b1 = OverlayNetwork::start(
+            transport_b1.clone(),
+            inbound_b1,
+            overlay_cfg(vec![seed_a.clone()]),
+        )
+        .await
+        .unwrap();
 
         // Wait for A to see B alive.
         assert!(
@@ -434,9 +464,10 @@ async fn restart_detection_via_hello() {
         ConnectionManager::start(transport_cfg(&pki, 1, loopback(port_b)))
             .await
             .unwrap();
-    let overlay_b2 = OverlayNetwork::start(transport_b2.clone(), inbound_b2, overlay_cfg(vec![seed_a]))
-        .await
-        .unwrap();
+    let overlay_b2 =
+        OverlayNetwork::start(transport_b2.clone(), inbound_b2, overlay_cfg(vec![seed_a]))
+            .await
+            .unwrap();
 
     let mut got_restarted = false;
     let until = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -456,10 +487,11 @@ async fn restart_detection_via_hello() {
     transport_b2.shutdown().await;
 }
 
-/// Partition {1,2} from {3,4}, let each side's view of the other age out,
-/// then heal. The link-up watcher issues a full LsdbSync pull that
-/// repopulates each side's LSDB; `Joined` events fire for the recovered
-/// members.
+/// Checks LSDB synchronization after a network partition heals.
+/// Expected: after {1,2} and {3,4} age each other out, healing the partition
+/// repopulates node 1's view with nodes 3 and 4. This is this crate's S2S
+/// anti-partition contract for keeping distributed Mumble/shitspeak state
+/// consistent after connectivity returns.
 #[tokio::test]
 async fn partition_heal_sync() {
     let cluster = Cluster::build(&[1, 2, 3, 4], full_mesh_seeds).await;
@@ -507,8 +539,12 @@ async fn partition_heal_sync() {
             }
         }
         // Even if events are missed, polling alive_members works.
-        let alive: std::collections::HashSet<u16> =
-            cluster.node(1).overlay.alive_members().into_iter().collect();
+        let alive: std::collections::HashSet<u16> = cluster
+            .node(1)
+            .overlay
+            .alive_members()
+            .into_iter()
+            .collect();
         if alive.contains(&3) {
             joined.insert(3);
         }
@@ -526,21 +562,19 @@ async fn partition_heal_sync() {
     cluster.shutdown_all().await;
 }
 
-/// 3-node line A-B-C where C drops the first several LsaFlood frames
-/// from B. With anti-entropy on a tight cadence, C still learns A's LSA
-/// well before the lsa_refresh_interval would deliver it.
+/// Checks anti-entropy repair after lost LSA flood messages.
+/// Expected: in an A-B-C line, C still learns A's LSA before the slower refresh
+/// interval even when initial floods from B are dropped. This is this crate's
+/// S2S LSDB repair behavior, ensuring distributed Mumble/shitspeak state has a
+/// converged routing substrate.
 #[tokio::test]
 async fn anti_entropy_repairs_lost_lsa() {
     // Tighter anti-entropy so the test is fast; longer refresh so flood
     // alone is not enough.
-    let cluster = Cluster::build_with_cfg(
-        &[1, 2, 3],
-        line_seeds,
-        |_idx, base| {
-            base.with_anti_entropy_interval(Duration::from_millis(150))
-                .with_lsa_refresh_interval(Duration::from_secs(8))
-        },
-    )
+    let cluster = Cluster::build_with_cfg(&[1, 2, 3], line_seeds, |_idx, base| {
+        base.with_anti_entropy_interval(Duration::from_millis(150))
+            .with_lsa_refresh_interval(Duration::from_secs(8))
+    })
     .await;
 
     let a = cluster.node(1);

@@ -229,15 +229,39 @@ impl From<ReplicationTuning> for ReplicationConfig {
     }
 }
 
-fn default_fallback_clock_tick_ms() -> u64 { 250 }
-fn default_min_clock_tick_ms() -> u64 { 100 }
-fn default_max_clock_tick_ms() -> u64 { 5_000 }
-fn default_delivery_tick_interval_ms() -> u64 { 50 }
-fn default_propose_ttl_ms() -> u64 { 10_000 }
-fn default_propose_semaphore_size() -> usize { 32 }
-fn default_strict_max_catchup_ops() -> usize { 256 }
-fn default_strict_bootstrap_retry_interval_ms() -> u64 { 200 }
-fn default_pending_propose_ttl_ms() -> u64 { 20_000 }
-fn default_recovery_ttl_ms() -> u64 { 10_000 }
-fn default_owner_catchup_timeout_ms() -> u64 { 5_000 }
-fn default_owner_max_catchup_ops() -> usize { 256 }
+fn default_fallback_clock_tick_ms() -> u64 {
+    250
+}
+fn default_min_clock_tick_ms() -> u64 {
+    100
+}
+fn default_max_clock_tick_ms() -> u64 {
+    5_000
+}
+fn default_delivery_tick_interval_ms() -> u64 {
+    50
+}
+fn default_propose_ttl_ms() -> u64 {
+    10_000
+}
+fn default_propose_semaphore_size() -> usize {
+    32
+}
+fn default_strict_max_catchup_ops() -> usize {
+    256
+}
+fn default_strict_bootstrap_retry_interval_ms() -> u64 {
+    200
+}
+fn default_pending_propose_ttl_ms() -> u64 {
+    20_000
+}
+fn default_recovery_ttl_ms() -> u64 {
+    10_000
+}
+fn default_owner_catchup_timeout_ms() -> u64 {
+    5_000
+}
+fn default_owner_max_catchup_ops() -> usize {
+    256
+}

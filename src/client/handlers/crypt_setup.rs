@@ -5,7 +5,10 @@ use bytes::Bytes;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::{CryptSetup, RejectType}, Message, WriteMessageExt},
+    messages::{
+        encoder::{CryptSetup, RejectType},
+        Message, WriteMessageExt,
+    },
     server::Server,
 };
 
@@ -15,7 +18,12 @@ pub async fn handle_crypt_setup(
     msg: CryptSetup,
 ) -> Result<(), MessageHandlerError> {
     let session = sender.get_session_id();
-    tracing::debug!(session = u32::from(session), is_resync = msg.is_client_request_resync(), has_client_nonce = msg.client_nonce().is_some(), "CryptSetup handler");
+    tracing::debug!(
+        session = u32::from(session),
+        is_resync = msg.is_client_request_resync(),
+        has_client_nonce = msg.client_nonce().is_some(),
+        "CryptSetup handler"
+    );
 
     // A CryptSetup message from the client has two meanings:
     //
@@ -39,7 +47,8 @@ pub async fn handle_crypt_setup(
                 state.key().map(Bytes::copy_from_slice),
                 Some(Bytes::copy_from_slice(state.decrypt_iv())),
                 Some(Bytes::copy_from_slice(state.encrypt_iv())),
-            ).into()
+            )
+            .into()
         };
 
         sender.write_proto_message(&reply).await?;
@@ -56,11 +65,7 @@ pub async fn handle_crypt_setup(
                 .as_ref()
                 .map(|s| s.encrypt_iv().to_vec())
                 .unwrap_or_default();
-            CryptSetup::new(
-                None,
-                None,
-                Some(Bytes::from(encrypt_iv)),
-            ).into()
+            CryptSetup::new(None, None, Some(Bytes::from(encrypt_iv))).into()
         };
         // Drop the crypt lock before the async write
         sender.write_proto_message(&reply).await?;

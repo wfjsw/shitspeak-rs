@@ -12,7 +12,10 @@ use tokio_rustls::server::TlsStream;
 use crate::{
     client::{
         client_session_identifier::ClientSessionIdentifier,
-        state_log::{ClientStateBroadcastPayload, ClientStateLogEntry, ClientStateOperation},
+        state_log::{
+            ClientGlobalStateDelta, ClientStateBroadcastPayload, ClientStateLogEntry,
+            ClientStateOperation,
+        },
         Client,
     },
     constants::MAX_LOCAL_SESSION_ID,
@@ -92,6 +95,11 @@ impl ClientRegister {
         }
     }
 
+    /// Iterate over locally connected clients.
+    fn local_clients(&self) -> impl Iterator<Item = &Arc<Box<Client>>> {
+        self.local_clients.values()
+    }
+
     /// Iterate over all clients (local + remote).
     fn all_clients(&self) -> impl Iterator<Item = &Arc<Box<Client>>> {
         self.local_clients
@@ -102,7 +110,10 @@ impl ClientRegister {
     /// Insert a client into the channel index.
     fn channel_index_insert(&mut self, id: ClientSessionIdentifier, channel_id: u32) {
         self.client_channel.insert(id, channel_id);
-        self.clients_by_channel.entry(channel_id).or_default().insert(id);
+        self.clients_by_channel
+            .entry(channel_id)
+            .or_default()
+            .insert(id);
     }
 
     /// Move a client from its current channel to `new_channel` in the index.
@@ -120,7 +131,10 @@ impl ClientRegister {
             }
         }
         self.client_channel.insert(id, new_channel);
-        self.clients_by_channel.entry(new_channel).or_default().insert(id);
+        self.clients_by_channel
+            .entry(new_channel)
+            .or_default()
+            .insert(id);
     }
 
     /// Remove a client from the channel index entirely.
@@ -137,7 +151,10 @@ impl ClientRegister {
 
     /// Add `id` as a listener for `channel_id`.
     fn listener_index_add(&mut self, id: ClientSessionIdentifier, channel_id: u32) {
-        self.listeners_by_channel.entry(channel_id).or_default().insert(id);
+        self.listeners_by_channel
+            .entry(channel_id)
+            .or_default()
+            .insert(id);
     }
 
     /// Remove `id` from the listener set for a specific channel.
@@ -280,8 +297,13 @@ impl ClientRepository {
                 tcp_addr: client.get_tcp_address(),
                 udp_addr: client.get_udp_address(),
                 local_addr: client.get_tcp_address(),
-                cert_hash: client.get_certificate_hash().map(bytes::Bytes::copy_from_slice),
+                cert_hash: client
+                    .get_certificate_hash()
+                    .map(bytes::Bytes::copy_from_slice),
                 login_time: client.get_login_time(),
+                initial_state: ClientGlobalStateDelta::from_global_state(
+                    &client.read_global_state(),
+                ),
             },
             None,
         )
@@ -302,6 +324,7 @@ impl ClientRepository {
             .get_certificate_hash()
             .map(bytes::Bytes::copy_from_slice);
         let login_time = client.get_login_time();
+        let initial_state = ClientGlobalStateDelta::from_global_state(&client.read_global_state());
 
         {
             let mut register = self.register.write().await;
@@ -328,6 +351,7 @@ impl ClientRepository {
                 local_addr: tcp_addr, // remote clients don't have a separate local addr
                 cert_hash,
                 login_time,
+                initial_state,
             },
             None,
         )
@@ -477,11 +501,7 @@ impl ClientRepository {
     }
 
     /// Bind/update the UDP address for a client session for fast future lookup.
-    pub async fn bind_client_udp_address(
-        &self,
-        id: ClientSessionIdentifier,
-        addr: SocketAddr,
-    ) {
+    pub async fn bind_client_udp_address(&self, id: ClientSessionIdentifier, addr: SocketAddr) {
         {
             let mut by_udp = self.clients_by_udp_address.write();
             // Remove stale mappings for this session to keep map one-to-one.
@@ -514,7 +534,9 @@ impl ClientRepository {
             }
         };
         let register = self.register.read().await;
-        ids.iter().filter_map(|id| register.get(id).cloned()).collect()
+        ids.iter()
+            .filter_map(|id| register.get(id).cloned())
+            .collect()
     }
 
     // ── Broadcast helpers ─────────────────────────────────────────────────
@@ -522,7 +544,7 @@ impl ClientRepository {
     /// Send `message` to every connected client.
     pub async fn broadcast_all(&self, message: &crate::messages::Message) {
         let register = self.register.read().await;
-        for client in register.all_clients() {
+        for client in register.local_clients() {
             if let Err(e) = client.write_proto_message(message).await {
                 tracing::warn!("broadcast_all write error: {e}");
             }
@@ -536,7 +558,7 @@ impl ClientRepository {
         message: &crate::messages::Message,
     ) {
         let register = self.register.read().await;
-        for (id, client) in register.all_entries() {
+        for (id, client) in &register.local_clients {
             if *id == exclude {
                 continue;
             }
@@ -554,7 +576,7 @@ impl ClientRepository {
         messages: &[crate::messages::Message],
     ) {
         let register = self.register.read().await;
-        for (id, client) in register.all_entries() {
+        for (id, client) in &register.local_clients {
             if *id == exclude {
                 continue;
             }
@@ -578,12 +600,17 @@ impl ClientRepository {
             Some(s) => s.iter().cloned().collect::<Vec<_>>(),
             None => return Vec::new(),
         };
-        ids.iter().filter_map(|id| register.get(id).cloned()).collect()
+        ids.iter()
+            .filter_map(|id| register.get(id).cloned())
+            .collect()
     }
 
     /// Return **local** clients currently in any of the given `channel_ids`
     /// in a single lock acquisition.
-    pub async fn get_local_clients_in_channels(&self, channel_ids: &[u32]) -> Vec<Arc<Box<Client>>> {
+    pub async fn get_local_clients_in_channels(
+        &self,
+        channel_ids: &[u32],
+    ) -> Vec<Arc<Box<Client>>> {
         let register = self.register.read().await;
         let mut result = Vec::new();
         for &ch_id in channel_ids {
@@ -605,7 +632,9 @@ impl ClientRepository {
             Some(s) => s.iter().cloned().collect::<Vec<_>>(),
             None => return Vec::new(),
         };
-        ids.iter().filter_map(|id| register.get(id).cloned()).collect()
+        ids.iter()
+            .filter_map(|id| register.get(id).cloned())
+            .collect()
     }
 
     /// Return **local** clients that have subscribed to listen to any of the
@@ -636,6 +665,10 @@ impl ClientRepository {
                 .values()
                 .map(|m| m.len())
                 .sum::<usize>()
+    }
+
+    pub async fn local_len(&self) -> usize {
+        self.register.read().await.local_clients.len()
     }
 
     /// Return a snapshot of all clients along with the current version
@@ -793,85 +826,137 @@ impl ClientRepository {
     /// Apply an operation that arrived from a remote node.
     ///
     /// The operation is applied to the local in-memory map but **not**
-    /// re-appended to the log or re-broadcast (the remote node already did
-    /// that).  Idempotent: if `op.version ≤ current_version` the op is
-    /// silently dropped.
+    /// re-appended to the local log or re-sent over S2S (the remote node
+    /// already did that). It is broadcast to local client subscribers so they
+    /// observe replicated remote user state. Idempotent: if
+    /// `op.version <= current_version` for that remote node, the op is dropped.
     ///
     /// `current_channel_version` is the local channel repository's current
-    /// version.  If the op has a `channel_version_dep` that exceeds this,
-    /// it is buffered in `pending_remote_ops` until the channel catches up.
+    /// version. If the op has a `channel_version_dep` that exceeds this, it is
+    /// buffered in `pending_remote_ops` until the channel catches up.
     pub async fn apply_remote_operation(
         &self,
         op: Arc<ClientStateLogEntry>,
         current_channel_version: u64,
     ) -> Result<(), ()> {
-        let mut register = self.register.write().await;
-        let remote_node = op.node_id;
+        let broadcast = {
+            let mut register = self.register.write().await;
+            let remote_node = op.node_id;
 
-        // Check version against the remote node's tracked version
-        let current_ver = register.versions.get(&remote_node).copied().unwrap_or(0);
-        if op.version <= current_ver {
-            return Ok(());
+            // Check version against the remote node's tracked version
+            let current_ver = register.versions.get(&remote_node).copied().unwrap_or(0);
+            if op.version <= current_ver {
+                return Ok(());
+            }
+
+            // Compute effective dep using the monotonic rule
+            let own_dep = op.channel_version_dep.unwrap_or(0);
+            let effective_dep = own_dep.max(register.last_pending_effective_dep);
+
+            if effective_dep > current_channel_version {
+                // Buffer for later — channel state isn't caught up yet
+                tracing::debug!(
+                    "Buffering remote client op v{} (node {}) — waiting for channel v{} (have v{})",
+                    op.version,
+                    remote_node,
+                    effective_dep,
+                    current_channel_version,
+                );
+                register.last_pending_effective_dep = effective_dep;
+                register.pending_remote_ops.push_back((op, effective_dep));
+                return Ok(());
+            }
+
+            Self::apply_op_inner(&mut register, &op, remote_node);
+            Some(Arc::new(ClientStateBroadcastPayload {
+                entry: Arc::clone(&op),
+                versions: register.versions.clone(),
+            }))
+        };
+
+        if let Some(broadcast) = broadcast {
+            let _ = self.tx.send(broadcast);
         }
-
-        // Compute effective dep using the monotonic rule
-        let own_dep = op.channel_version_dep.unwrap_or(0);
-        let effective_dep = own_dep.max(register.last_pending_effective_dep);
-
-        if effective_dep > current_channel_version {
-            // Buffer for later — channel state isn't caught up yet
-            tracing::debug!(
-                "Buffering remote client op v{} (node {}) — waiting for channel v{} (have v{})",
-                op.version,
-                remote_node,
-                effective_dep,
-                current_channel_version,
-            );
-            register.last_pending_effective_dep = effective_dep;
-            register.pending_remote_ops.push_back((op, effective_dep));
-            return Ok(());
-        }
-
-        // Apply immediately
-        Self::apply_op_inner(&mut register, &op, remote_node);
         Ok(())
     }
 
-    /// Drain pending remote ops whose effective dep ≤ `channel_version`.
+    /// Drain pending remote ops whose effective dep <= `channel_version`.
     /// Called after each channel op is applied.
     pub async fn drain_pending_ops(&self, channel_version: u64) {
-        let mut register = self.register.write().await;
-        while let Some((op, effective_dep)) = register.pending_remote_ops.front() {
-            if *effective_dep > channel_version {
-                break;
+        let mut broadcasts = Vec::new();
+        {
+            let mut register = self.register.write().await;
+            while let Some((op, effective_dep)) = register.pending_remote_ops.front() {
+                if *effective_dep > channel_version {
+                    break;
+                }
+                let (op, _) = register.pending_remote_ops.pop_front().unwrap();
+                let remote_node = op.node_id;
+                tracing::debug!(
+                    "Draining buffered remote client op v{} (node {}) at channel v{}",
+                    op.version,
+                    remote_node,
+                    channel_version,
+                );
+                Self::apply_op_inner(&mut register, &op, remote_node);
+                broadcasts.push(Arc::new(ClientStateBroadcastPayload {
+                    entry: Arc::clone(&op),
+                    versions: register.versions.clone(),
+                }));
             }
-            let (op, _) = register.pending_remote_ops.pop_front().unwrap();
-            let remote_node = op.node_id;
-            tracing::debug!(
-                "Draining buffered remote client op v{} (node {}) at channel v{}",
-                op.version,
-                remote_node,
-                channel_version,
-            );
-            Self::apply_op_inner(&mut register, &op, remote_node);
+            // Update last_pending_effective_dep from the new front (or 0 if empty)
+            register.last_pending_effective_dep = register
+                .pending_remote_ops
+                .front()
+                .map(|(_, d)| *d)
+                .unwrap_or(0);
         }
-        // Update last_pending_effective_dep from the new front (or 0 if empty)
-        register.last_pending_effective_dep = register
-            .pending_remote_ops
-            .front()
-            .map(|(_, d)| *d)
-            .unwrap_or(0);
+
+        for broadcast in broadcasts {
+            let _ = self.tx.send(broadcast);
+        }
     }
 
     /// Apply a single remote op to the register (no version/buffer checks).
-    fn apply_op_inner(
-        register: &mut ClientRegister,
-        op: &ClientStateLogEntry,
-        remote_node: u16,
-    ) {
+    fn apply_op_inner(register: &mut ClientRegister, op: &ClientStateLogEntry, remote_node: u16) {
         match &op.op {
-            ClientStateOperation::AddClient { session_id, .. } => {
+            ClientStateOperation::AddClient {
+                session_id,
+                real_ip,
+                tcp_addr,
+                udp_addr,
+                local_addr,
+                cert_hash,
+                login_time,
+                initial_state,
+            } => {
                 tracing::debug!("remote AddClient {session_id:?} v{}", op.version);
+                if session_id.get_node_id() != remote_node {
+                    tracing::warn!(
+                        remote_node,
+                        session = u32::from(*session_id),
+                        "remote AddClient ignored: session node does not match operation origin"
+                    );
+                } else {
+                    let client = Arc::new(Client::new_remote(
+                        *session_id,
+                        *real_ip,
+                        *tcp_addr,
+                        *udp_addr,
+                        *local_addr,
+                        cert_hash.clone(),
+                        *login_time,
+                    ));
+                    {
+                        let mut gs = client.write_global_state_direct();
+                        apply_delta_to_global_state(&mut gs, initial_state);
+                    }
+                    register
+                        .remote_clients
+                        .entry(remote_node)
+                        .or_default()
+                        .insert(*session_id, client);
+                }
             }
             ClientStateOperation::RemoveClient { session_id } => {
                 // Remote clients are not in the channel/listener index, so
@@ -880,8 +965,6 @@ impl ClientRepository {
                     remote_map.remove(session_id);
                     if remote_map.is_empty() {
                         register.remote_clients.remove(&remote_node);
-                        register.versions.remove(&remote_node);
-                        register.remote_logs.remove(&remote_node);
                     }
                 }
             }
@@ -901,6 +984,8 @@ impl ClientRepository {
             }
         }
 
+        let log = register.remote_logs.entry(remote_node).or_default();
+        log.push_back(Arc::new(op.clone()));
         register.versions.insert(remote_node, op.version);
     }
 
@@ -934,7 +1019,10 @@ impl ClientRepository {
             // Update channel/listener indices for any state change, before the
             // early-return for unpublished clients (the index is local state,
             // not propagated over the log).
-            if let ClientStateOperation::UpdateGlobalState { session_id, delta, .. } = &op {
+            if let ClientStateOperation::UpdateGlobalState {
+                session_id, delta, ..
+            } = &op
+            {
                 if let Some(new_ch) = delta.current_channel_id {
                     register.channel_index_move(*session_id, new_ch);
                 }

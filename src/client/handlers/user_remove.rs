@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    client::Client,
-    errors::MessageHandlerError,
-    messages::encoder::UserRemove,
-    server::Server,
+    ban_repository::BanOp, client::Client, errors::MessageHandlerError,
+    messages::encoder::UserRemove, server::Server,
 };
 
 pub async fn handle_user_remove(
@@ -19,7 +17,13 @@ pub async fn handle_user_remove(
     }
 
     let target_raw = msg.session;
-    tracing::debug!(session = u32::from(sender.get_session_id()), target = target_raw, ban = msg.ban, reason = msg.reason, "UserRemove handler");
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        target = target_raw,
+        ban = msg.ban,
+        reason = msg.reason,
+        "UserRemove handler"
+    );
     if target_raw == 0 {
         return Ok(());
     }
@@ -71,18 +75,31 @@ pub async fn handle_user_remove(
     if is_ban {
         let entry = crate::ban_repository::BanEntry {
             address: target.get_real_ip_address(),
-            mask: if target.get_real_ip_address().is_ipv4() { 32 } else { 128 },
+            mask: if target.get_real_ip_address().is_ipv4() {
+                32
+            } else {
+                128
+            },
             name: {
                 let gs = target.read_global_state();
                 gs.get_display_name_opt().map(|s| s.to_owned())
             },
             hash: target.get_certificate_hash().map(|h| hex::encode(h)),
-            reason: if reason.is_empty() { None } else { Some(reason.clone()) },
+            reason: if reason.is_empty() {
+                None
+            } else {
+                Some(reason.clone())
+            },
             start: chrono::Utc::now().timestamp(),
             duration: 0, // permanent
         };
-        if let Err(e) = server.get_bans().add_ban(entry).await {
-            tracing::warn!("Failed to persist ban: {e}");
+        let op = BanOp::AddBan {
+            entry: entry.clone(),
+        };
+        if !server.s2s_manager().propose_ban_op(op).await {
+            if let Err(e) = server.get_bans().add_ban(entry).await {
+                tracing::warn!("Failed to persist ban: {e}");
+            }
         }
         tracing::info!(
             "Ban added for session {:?} by {:?}: {}",

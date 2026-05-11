@@ -1,7 +1,5 @@
 use crate::messages::encoder::Ping;
 
-
-
 #[derive(Debug, Clone, Copy)]
 pub struct ClientStats {
     udp_ping_avg: f32,
@@ -55,10 +53,22 @@ impl ClientStats {
         }
     }
 
-    pub fn udp_ping_avg(&self) -> f32 { self.udp_ping_avg }
-    pub fn udp_ping_var(&self) -> f32 { self.udp_ping_var }
-    pub fn udp_packets(&self) -> u32 { self.udp_packets }
-    pub fn tcp_ping_avg(&self) -> f32 { self.tcp_ping_avg }
-    pub fn tcp_ping_var(&self) -> f32 { self.tcp_ping_var }
-    pub fn tcp_packets(&self) -> u32 { self.tcp_packets }
+    pub fn udp_ping_avg(&self) -> f32 {
+        self.udp_ping_avg
+    }
+    pub fn udp_ping_var(&self) -> f32 {
+        self.udp_ping_var
+    }
+    pub fn udp_packets(&self) -> u32 {
+        self.udp_packets
+    }
+    pub fn tcp_ping_avg(&self) -> f32 {
+        self.tcp_ping_avg
+    }
+    pub fn tcp_ping_var(&self) -> f32 {
+        self.tcp_ping_var
+    }
+    pub fn tcp_packets(&self) -> u32 {
+        self.tcp_packets
+    }
 }

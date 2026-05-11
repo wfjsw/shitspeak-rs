@@ -15,12 +15,7 @@
 //! list is reconstructed and re-sent to every connected client so that
 //! ordering is preserved.
 
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use parking_lot::RwLock;
 
@@ -118,18 +113,13 @@ pub struct ContextActionPayload {
 }
 
 /// A boxed async callback for one-shot actions.
-pub type OneShotCallback = Arc<
-    dyn Fn(ContextActionPayload) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
+pub type OneShotCallback =
+    Arc<dyn Fn(ContextActionPayload) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// A boxed async callback for toggle actions.
 /// Receives the payload and the **new** state after toggling.
 pub type ToggleCallback = Arc<
-    dyn Fn(ContextActionPayload, bool) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(ContextActionPayload, bool) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
 // ── Action handler enum ──────────────────────────────────────────────────
@@ -147,10 +137,7 @@ enum ActionHandler {
 /// so the lock can be released before the async callback is awaited.
 enum Action {
     OneShot(OneShotCallback),
-    Toggle {
-        cb: ToggleCallback,
-        new_state: bool,
-    },
+    Toggle { cb: ToggleCallback, new_state: bool },
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────

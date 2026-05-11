@@ -48,6 +48,13 @@ fn config_with_udp(pki: &Pki, node_idx: usize, udp: SocketAddr) -> TransportConf
         .with_udp_mtu(1400)
 }
 
+/// Checks that two S2S transport managers establish mTLS over TCP and exchange
+/// both regular and high-priority frames.
+/// Expected: each side receives the peer's payload with the correct node id,
+/// message class, and TCP transport marker. Mumble does not define S2S
+/// transport; this crate extends the side-channel idea present in
+/// `D:\shitspeak\slavehub.go` while preserving Mumble's authenticated-server
+/// assumptions from `D:\mumble\src\murmur`.
 #[tokio::test]
 async fn two_node_tcp_data_roundtrip() {
     let _guard = TEST_LOCK.lock().await;
@@ -76,7 +83,12 @@ async fn two_node_tcp_data_roundtrip() {
 
     // A → B
     mgr_a
-        .send(2, ServiceLevel::Reliable, MessageClass::Regular, Bytes::from_static(b"hi-from-a"))
+        .send(
+            2,
+            ServiceLevel::Reliable,
+            MessageClass::Regular,
+            Bytes::from_static(b"hi-from-a"),
+        )
         .await
         .unwrap();
     let recv = timeout(Duration::from_secs(2), inbound_b.regular().recv())
@@ -112,6 +124,12 @@ async fn two_node_tcp_data_roundtrip() {
     let _ = inbound_b;
 }
 
+/// Checks that idle transport probes produce a usable throughput metric.
+/// Expected: after probe round trips, TCP probe throughput is positive and the
+/// estimated throughput is at least that probe-only value. The expected
+/// behavior is local to this crate's S2S transport health model; the reference
+/// projects provide the surrounding server model (`D:\mumble\src\murmur`) and
+/// shitspeak's side-channel precedent (`D:\shitspeak\slavehub.go`).
 #[tokio::test]
 async fn probe_throughput_reports_idle_link_bandwidth() {
     let _guard = TEST_LOCK.lock().await;
@@ -161,6 +179,11 @@ async fn probe_throughput_reports_idle_link_bandwidth() {
     panic!("never recorded a probe round trip");
 }
 
+/// Checks service-level fallback when only TCP is available.
+/// Expected: a BestEffort frame is still delivered over TCP, with the received
+/// frame recording TCP as the actual transport. This is this crate's S2S
+/// transport policy, built to carry Mumble/shitspeak server messages even when
+/// an unreliable path is unavailable.
 #[tokio::test]
 async fn upward_fallback_uses_tcp_for_best_effort() {
     let _guard = TEST_LOCK.lock().await;
@@ -182,7 +205,12 @@ async fn upward_fallback_uses_tcp_for_best_effort() {
 
     // Send BestEffort — only TCP is up, so it must fall back to TCP.
     mgr_a
-        .send(20, ServiceLevel::BestEffort, MessageClass::Regular, Bytes::from_static(b"fb"))
+        .send(
+            20,
+            ServiceLevel::BestEffort,
+            MessageClass::Regular,
+            Bytes::from_static(b"fb"),
+        )
         .await
         .unwrap();
     let recv = timeout(Duration::from_secs(2), inb.regular().recv())
@@ -194,6 +222,12 @@ async fn upward_fallback_uses_tcp_for_best_effort() {
     assert_eq!(recv.transport(), TransportKind::Tcp);
 }
 
+/// Checks UDP/DTLS S2S transport establishment and bidirectional delivery.
+/// Expected: both nodes install the DTLS session and exchange BestEffort frames
+/// with the correct peer node id, class, payload, and UDP transport marker.
+/// Mumble's client UDP crypt path is in `D:\mumble\src\murmur\Server.cpp::run`;
+/// shitspeak's UDP/OCB2 precedent is in `D:\shitspeak\client.go`; this test
+/// verifies this crate's S2S DTLS transport equivalent.
 #[tokio::test]
 async fn two_node_udp_dtls_roundtrip() {
     let _guard = TEST_LOCK.lock().await;

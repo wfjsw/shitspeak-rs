@@ -110,7 +110,10 @@ fn mint_node_cert(
     };
     params
         .custom_extensions
-        .push(rcgen::CustomExtension::from_oid_content(DEFAULT_OID, der_value));
+        .push(rcgen::CustomExtension::from_oid_content(
+            DEFAULT_OID,
+            der_value,
+        ));
 
     let node_key = rcgen::KeyPair::generate()?;
     let node_cert = params.signed_by(&node_key, &ca_cert, &ca_key)?;

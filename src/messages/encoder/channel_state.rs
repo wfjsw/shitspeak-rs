@@ -25,7 +25,11 @@ impl ChannelState {
     /// Fill `is_enter_restricted` and `can_enter` from the channel's ACLs
     /// and the given effective permissions.  Call this when
     /// `send_permission_info` is enabled.
-    pub fn with_permission_info(mut self, channel: &crate::channels::Channel, perms: enumflags2::BitFlags<crate::acl::ACLPermissions>) -> Self {
+    pub fn with_permission_info(
+        mut self,
+        channel: &crate::channels::Channel,
+        perms: enumflags2::BitFlags<crate::acl::ACLPermissions>,
+    ) -> Self {
         use crate::acl::ACLPermissions;
         self.is_enter_restricted = Some(
             crate::acl::channel_has_restriction(channel, ACLPermissions::Traverse)

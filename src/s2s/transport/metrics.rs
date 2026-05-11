@@ -199,7 +199,9 @@ impl PeerMetrics {
     pub fn record_rtt(&self, transport: TransportKind, rtt: Duration) {
         let sample = rtt.as_micros() as f64;
         let mut g = self.inner.lock();
-        let entry = g.entry(transport).or_insert_with(|| LinkInner::new(self.window));
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
         entry.samples += 1;
         entry.last_update = Some(Instant::now());
         entry.rtt_us = Some(match entry.rtt_us {
@@ -236,7 +238,9 @@ impl PeerMetrics {
         let secs = rtt.as_secs_f64().max(1e-6);
         let bps = (bytes_round_trip as f64) / secs;
         let mut g = self.inner.lock();
-        let entry = g.entry(transport).or_insert_with(|| LinkInner::new(self.window));
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
         entry.probe_throughput_bps = Some(match entry.probe_throughput_bps {
             None => bps,
             Some(prev) => prev + self.tuning.throughput_alpha * (bps - prev),
@@ -321,7 +325,11 @@ mod tests {
         let snap = m.snapshot_per_transport();
         let tcp = snap.get(&TransportKind::Tcp).unwrap();
         // EWMA with α=0.2 starting at 10000, sequence above ~ converges near 11k.
-        assert!(tcp.rtt_us > 10_000.0 && tcp.rtt_us < 12_500.0, "rtt {}", tcp.rtt_us);
+        assert!(
+            tcp.rtt_us > 10_000.0 && tcp.rtt_us < 12_500.0,
+            "rtt {}",
+            tcp.rtt_us
+        );
         assert!(tcp.jitter_us > 0.0);
         assert_eq!(tcp.samples, 5);
     }
@@ -334,7 +342,10 @@ mod tests {
         m.record_rtt(TransportKind::Udp, Duration::from_millis(15));
 
         // For best-effort, all three qualify; lowest RTT wins.
-        assert_eq!(m.best_transport_for(ServiceLevel::BestEffort), Some(TransportKind::Udp));
+        assert_eq!(
+            m.best_transport_for(ServiceLevel::BestEffort),
+            Some(TransportKind::Udp)
+        );
         // For RLL (the strongest tier), only QUIC qualifies in this setup
         // (TCP is plain Reliable, UDP is BestEffort).
         assert_eq!(
@@ -343,7 +354,10 @@ mod tests {
         );
         // For Reliable, both TCP and QUIC qualify (QUIC is strictly stronger);
         // QUIC wins on lowest RTT.
-        assert_eq!(m.best_transport_for(ServiceLevel::Reliable), Some(TransportKind::Quic));
+        assert_eq!(
+            m.best_transport_for(ServiceLevel::Reliable),
+            Some(TransportKind::Quic)
+        );
     }
 
     #[test]

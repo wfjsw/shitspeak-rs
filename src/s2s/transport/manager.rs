@@ -45,7 +45,13 @@ impl InboundMessage {
         class: MessageClass,
         payload: Bytes,
     ) -> Self {
-        Self { from, level, transport, class, payload }
+        Self {
+            from,
+            level,
+            transport,
+            class,
+            payload,
+        }
     }
 
     pub fn from(&self) -> NodeIdentifier {
@@ -80,7 +86,10 @@ impl Inbound {
         high_priority: mpsc::Receiver<InboundMessage>,
         regular: mpsc::Receiver<InboundMessage>,
     ) -> Self {
-        Self { high_priority, regular }
+        Self {
+            high_priority,
+            regular,
+        }
     }
 
     pub fn high_priority(&mut self) -> &mut mpsc::Receiver<InboundMessage> {
@@ -112,10 +121,7 @@ pub(crate) struct InboundDispatch {
 }
 
 impl InboundDispatch {
-    pub fn new(
-        high: mpsc::Sender<InboundMessage>,
-        regular: mpsc::Sender<InboundMessage>,
-    ) -> Self {
+    pub fn new(high: mpsc::Sender<InboundMessage>, regular: mpsc::Sender<InboundMessage>) -> Self {
         Self { high, regular }
     }
 
@@ -221,7 +227,11 @@ impl ConnectionManager {
     /// Bring up listeners, build TLS configs, install peer table, and return
     /// the handle along with the two inbound receivers.
     pub async fn start(cfg: TransportConfig) -> Result<(Self, Inbound), TransportError> {
-        let identity = Arc::new(NodeIdentity::load(cfg.ca_path(), cfg.cert_path(), cfg.key_path())?);
+        let identity = Arc::new(NodeIdentity::load(
+            cfg.ca_path(),
+            cfg.cert_path(),
+            cfg.key_path(),
+        )?);
         let (server_tls, client_tls) = build_tls_configs(&identity)?;
 
         let endpoints = build_endpoints(&cfg, identity.clone(), server_tls, client_tls)?;
@@ -243,9 +253,20 @@ impl ConnectionManager {
         });
 
         super::endpoint::start_all(inner.clone()).await?;
+        for addr in inner.cfg().seed_addresses().iter().copied() {
+            let inner_c = inner.clone();
+            tokio::spawn(async move {
+                if let Err(e) = super::endpoint::dial_seed_address(&inner_c, addr).await {
+                    debug!(?addr, error=%e, "initial seed dial failed");
+                }
+            });
+        }
         tokio::spawn(super::endpoint::run_supervisor(inner.clone()));
 
-        Ok((ConnectionManager { inner }, Inbound::new(high_rx, regular_rx)))
+        Ok((
+            ConnectionManager { inner },
+            Inbound::new(high_rx, regular_rx),
+        ))
     }
 
     pub fn local_node_id(&self) -> NodeIdentifier {
@@ -294,8 +315,7 @@ impl ConnectionManager {
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
 
-        let chosen = pick_transport(&peer, level)
-            .ok_or(SendError::NoSuitableTransport { node })?;
+        let chosen = pick_transport(&peer, level).ok_or(SendError::NoSuitableTransport { node })?;
 
         self.send_stream(&peer, chosen, class, payload).await
     }
@@ -323,9 +343,10 @@ impl ConnectionManager {
         class: MessageClass,
         payload: Bytes,
     ) -> Result<(), SendError> {
-        let sender = peer
-            .try_get_stream(kind)
-            .ok_or(SendError::StreamClosed { node: peer.node_id(), transport: kind })?;
+        let sender = peer.try_get_stream(kind).ok_or(SendError::StreamClosed {
+            node: peer.node_id(),
+            transport: kind,
+        })?;
         sender
             .try_send(OutboundFrame::new(class, payload))
             .map_err(|e| match e {
@@ -422,23 +443,43 @@ fn build_endpoints(
     server_tls: Arc<rustls::ServerConfig>,
     client_tls: Arc<rustls::ClientConfig>,
 ) -> Result<EndpointRegistry, TransportError> {
-    let tcp = cfg.tcp_listen().map(|addr| {
-        Arc::new(TcpEndpoint::new(server_tls.clone(), client_tls.clone(), Some(addr)))
-    });
-    let kcp = cfg.kcp_listen().map(|addr| {
-        Arc::new(KcpEndpoint::new(server_tls.clone(), client_tls.clone(), Some(addr)))
-    });
-    let quic = match cfg.quic_listen() {
-        Some(addr) => Some(Arc::new(
-            QuicEndpoint::new(server_tls.clone(), client_tls.clone(), Some(addr))
-                .map_err(|source| TransportError::Bind { addr, source })?,
-        )),
-        None => None,
+    let has_seed = |kind| {
+        cfg.seed_addresses()
+            .iter()
+            .any(|addr| addr.transport() == kind)
     };
-    let udp = cfg
-        .udp_listen()
-        .map(|addr| Arc::new(UdpEndpoint::new(identity, Some(addr))));
+
+    let tcp = (cfg.tcp_listen().is_some() || has_seed(TransportKind::Tcp)).then(|| {
+        Arc::new(TcpEndpoint::new(
+            server_tls.clone(),
+            client_tls.clone(),
+            cfg.tcp_listen(),
+        ))
+    });
+    let kcp = (cfg.kcp_listen().is_some() || has_seed(TransportKind::Kcp)).then(|| {
+        Arc::new(KcpEndpoint::new(
+            server_tls.clone(),
+            client_tls.clone(),
+            cfg.kcp_listen(),
+        ))
+    });
+    let quic = if cfg.quic_listen().is_some() || has_seed(TransportKind::Quic) {
+        match cfg.quic_listen() {
+            Some(addr) => Some(Arc::new(
+                QuicEndpoint::new(server_tls.clone(), client_tls.clone(), Some(addr))
+                    .map_err(|source| TransportError::Bind { addr, source })?,
+            )),
+            None => Some(Arc::new(QuicEndpoint::new(
+                server_tls.clone(),
+                client_tls.clone(),
+                None,
+            )?)),
+        }
+    } else {
+        None
+    };
+    let udp = (cfg.udp_listen().is_some() || has_seed(TransportKind::Udp))
+        .then(|| Arc::new(UdpEndpoint::new(identity, cfg.udp_listen())));
 
     Ok(EndpointRegistry::new(tcp, kcp, quic, udp))
 }
-

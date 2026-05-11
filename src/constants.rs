@@ -1,6 +1,5 @@
 use crate::protocol_version::ProtocolVersion;
 
-
 pub const MAX_NODE_ID: u16 = 0x0FFF;
 pub const MAX_LOCAL_SESSION_ID: u32 = 0x0FFFFF;
 pub const MTU: usize = 1600;
@@ -37,7 +36,8 @@ pub fn release() -> String {
     let short_sha = &COMMIT_HASH[..7];
     let build_date = &BUILD_DATE[..19];
 
-    format!("{} {} ({}) [{}]", app_name, app_version, short_sha, build_date)
+    format!(
+        "{} {} ({}) [{}]",
+        app_name, app_version, short_sha, build_date
+    )
 }
-
-

@@ -20,7 +20,9 @@ impl std::fmt::Display for WriteProtoMessageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WriteProtoMessageError::IOError(err) => write!(f, "IO error: {}", err),
-            WriteProtoMessageError::ProtobufEncodeError(err) => write!(f, "Protobuf encode error: {}", err),
+            WriteProtoMessageError::ProtobufEncodeError(err) => {
+                write!(f, "Protobuf encode error: {}", err)
+            }
         }
     }
 }

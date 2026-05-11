@@ -11,13 +11,16 @@ impl std::fmt::Display for UserStateProtocolError {
             // Add display implementations for each variant here
             UserStateProtocolError::MissingSessionId => {
                 write!(f, "UserState message is missing a session ID")
-            },
+            }
             UserStateProtocolError::VolumeAdjustmentMissingListeningChannel => {
-                write!(f, "VolumeAdjustment is missing a required listening channel")
-            },
+                write!(
+                    f,
+                    "VolumeAdjustment is missing a required listening channel"
+                )
+            }
             UserStateProtocolError::VolumeAdjustmentMissingValue => {
                 write!(f, "VolumeAdjustment is missing a required value")
-            },
+            }
         }
     }
 }

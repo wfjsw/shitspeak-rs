@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client_repository::ClientRepository;
@@ -60,8 +60,6 @@ macro_rules! diff_option {
     };
 }
 
-
-
 // ─── ClientGlobalStateDelta ───────────────────────────────────────────────────
 
 /// A mirror of `ClientGlobalState` where every field is `Option<T>`.
@@ -99,6 +97,33 @@ pub struct ClientGlobalStateDelta {
 }
 
 impl ClientGlobalStateDelta {
+    pub fn from_global_state(
+        state: &crate::client::client_global_state::ClientGlobalState,
+    ) -> Self {
+        Self {
+            current_channel_id: Some(state.get_current_channel_id()),
+            listening_channel_add: Some(state.get_listening_channel_id().clone()),
+            listening_channel_remove: None,
+            mute: Some(state.is_muted()),
+            deaf: Some(state.is_deafened()),
+            suppress: Some(state.is_suppressed()),
+            self_mute: Some(state.is_self_muted()),
+            self_deaf: Some(state.is_self_deafened()),
+            priority_speaker: Some(state.is_priority_speaker()),
+            recording: Some(state.is_recording()),
+            plugin_context: Some(Bytes::copy_from_slice(state.get_plugin_context())),
+            plugin_identity: Some(state.get_plugin_identity().to_owned()),
+            texture_url: Some(state.get_texture_url().map(ToOwned::to_owned)),
+            texture_hash: Some(state.get_texture_hash().map(ToOwned::to_owned)),
+            comment_url: Some(state.get_comment_url().map(ToOwned::to_owned)),
+            comment_hash: Some(state.get_comment_hash().map(ToOwned::to_owned)),
+            user_id: Some(state.get_user_id()),
+            groups: Some(state.get_groups().clone()),
+            tokens: Some(state.get_tokens().clone()),
+            display_name: Some(state.get_display_name_opt().map(ToOwned::to_owned)),
+        }
+    }
+
     /// Returns `true` if no fields are set (nothing changed).
     pub fn is_empty(&self) -> bool {
         !(self.current_channel_id.is_some()
@@ -122,22 +147,87 @@ impl ClientGlobalStateDelta {
             || self.tokens.is_some()
             || self.display_name.is_some())
     }
-
 }
 
 // ─── ClientStateOperation ────────────────────────────────────────────────────
 
+mod ip_addr_string {
+    use super::*;
+    use serde::de::Error;
+
+    pub fn serialize<S>(value: &IpAddr, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<IpAddr, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(D::Error::custom)
+    }
+}
+
+mod socket_addr_string {
+    use super::*;
+    use serde::de::Error;
+
+    pub fn serialize<S>(value: &SocketAddr, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(D::Error::custom)
+    }
+}
+
+mod opt_socket_addr_string {
+    use super::*;
+    use serde::de::Error;
+
+    pub fn serialize<S>(value: &Option<SocketAddr>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.map(|addr| addr.to_string()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<SocketAddr>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?;
+        value
+            .map(|addr| addr.parse().map_err(D::Error::custom))
+            .transpose()
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientStateOperation {
     AddClient {
         session_id: ClientSessionIdentifier,
+        #[serde(with = "ip_addr_string")]
         real_ip: IpAddr,
+        #[serde(with = "socket_addr_string")]
         tcp_addr: SocketAddr,
+        #[serde(with = "opt_socket_addr_string")]
         udp_addr: Option<SocketAddr>,
+        #[serde(with = "socket_addr_string")]
         local_addr: SocketAddr,
         cert_hash: Option<Bytes>,
         login_time: DateTime<Utc>,
+        initial_state: ClientGlobalStateDelta,
     },
     RemoveClient {
         session_id: ClientSessionIdentifier,
@@ -192,10 +282,7 @@ impl ClientStateLogEntry {
     /// * `AddClient` → `UserState` snapshot of the new client
     /// * `RemoveClient` → `UserRemove` message
     /// * `UpdateGlobalState` → `UserState` delta (only changed fields)
-    pub async fn to_message(
-        &self,
-        repo: &ClientRepository,
-    ) -> Option<crate::messages::Message> {
+    pub async fn to_message(&self, repo: &ClientRepository) -> Option<crate::messages::Message> {
         match &self.op {
             ClientStateOperation::AddClient { session_id, .. } => {
                 let client = repo.get_client(*session_id).await?;
@@ -203,14 +290,15 @@ impl ClientStateLogEntry {
                     client.build_user_state_for_broadcast();
                 Some(crate::messages::Message::UserState(us.into()))
             }
-            ClientStateOperation::RemoveClient { session_id } => {
-                Some(crate::messages::encoder::UserRemove {
+            ClientStateOperation::RemoveClient { session_id } => Some(
+                crate::messages::encoder::UserRemove {
                     session: u32::from(*session_id),
                     actor: None,
                     reason: None,
                     ban: Some(false),
-                }.into())
-            }
+                }
+                .into(),
+            ),
             ClientStateOperation::UpdateGlobalState {
                 session_id,
                 sender_session_id,
@@ -300,6 +388,74 @@ impl ClientStateLogEntry {
 
                 Some(us.into())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_state_log_entry_msgpack_round_trips_add_client() {
+        let entry = ClientStateLogEntry {
+            version: 3,
+            node_id: 1,
+            timestamp: 123,
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                session_id: ClientSessionIdentifier::new(1, 42).unwrap(),
+                real_ip: "203.0.113.17".parse().unwrap(),
+                tcp_addr: "203.0.113.17:64738".parse().unwrap(),
+                udp_addr: Some("203.0.113.17:64739".parse().unwrap()),
+                local_addr: "10.0.0.1:64738".parse().unwrap(),
+                cert_hash: Some(Bytes::from_static(b"hash")),
+                login_time: chrono::DateTime::from_timestamp(123, 0).unwrap(),
+                initial_state: ClientGlobalStateDelta {
+                    display_name: Some(Some("alice".into())),
+                    user_id: Some(Some(42)),
+                    current_channel_id: Some(0),
+                    ..ClientGlobalStateDelta::default()
+                },
+            },
+        };
+
+        let encoded = rmp_serde::to_vec(&entry).expect("encode client state entry");
+        let decoded: ClientStateLogEntry =
+            rmp_serde::from_slice(&encoded).expect("decode client state entry");
+
+        assert_eq!(decoded.version, entry.version);
+        assert_eq!(decoded.node_id, entry.node_id);
+        match decoded.op {
+            ClientStateOperation::AddClient {
+                session_id,
+                real_ip,
+                tcp_addr,
+                udp_addr,
+                local_addr,
+                cert_hash,
+                initial_state,
+                ..
+            } => {
+                assert_eq!(
+                    u32::from(session_id),
+                    u32::from(ClientSessionIdentifier::new(1, 42).unwrap())
+                );
+                assert_eq!(real_ip, "203.0.113.17".parse::<IpAddr>().unwrap());
+                assert_eq!(
+                    tcp_addr,
+                    "203.0.113.17:64738".parse::<SocketAddr>().unwrap()
+                );
+                assert_eq!(
+                    udp_addr,
+                    Some("203.0.113.17:64739".parse::<SocketAddr>().unwrap())
+                );
+                assert_eq!(local_addr, "10.0.0.1:64738".parse::<SocketAddr>().unwrap());
+                assert_eq!(cert_hash, Some(Bytes::from_static(b"hash")));
+                assert_eq!(initial_state.display_name, Some(Some("alice".into())));
+                assert_eq!(initial_state.user_id, Some(Some(42)));
+            }
+            other => panic!("expected AddClient, got {other:?}"),
         }
     }
 }

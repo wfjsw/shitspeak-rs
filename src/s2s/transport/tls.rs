@@ -57,7 +57,9 @@ fn build_client(identity: &NodeIdentity) -> Result<ClientConfig, ConfigError> {
 /// `PrivateKeyDer` is not `Clone` directly. Clone via reference into the right
 /// arm — works because the loaded keys are always one of the three flavors
 /// returned by `rustls_pemfile::private_key`.
-fn clone_key(k: &rustls_pki_types::PrivateKeyDer<'static>) -> rustls_pki_types::PrivateKeyDer<'static> {
+fn clone_key(
+    k: &rustls_pki_types::PrivateKeyDer<'static>,
+) -> rustls_pki_types::PrivateKeyDer<'static> {
     use rustls_pki_types::PrivateKeyDer;
     match k {
         PrivateKeyDer::Pkcs1(d) => PrivateKeyDer::Pkcs1(d.clone_key()),
@@ -107,13 +109,18 @@ impl ServerCertVerifier for CaPinnedVerifier {
             ServerName::try_from("invalid.s2s.local").expect("static name parses")
         });
 
-        match self
-            .inner
-            .verify_server_cert(end_entity, intermediates, &server_name, ocsp_response, now)
-        {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            &server_name,
+            ocsp_response,
+            now,
+        ) {
             Ok(v) => Ok(v),
             Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName))
-            | Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForNameContext { .. })) => {
+            | Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForNameContext { .. },
+            )) => {
                 // Chain validated, but the SAN didn't match the dummy name —
                 // accept anyway; identity is asserted via CN at the app layer.
                 Ok(ServerCertVerified::assertion())
@@ -192,9 +199,18 @@ mod tests {
         let ca_path = dir.path().join(format!("ca-{cn}.pem"));
         let cert_path = dir.path().join(format!("cert-{cn}.pem"));
         let key_path = dir.path().join(format!("key-{cn}.pem"));
-        File::create(&ca_path).unwrap().write_all(ca_cert.pem().as_bytes()).unwrap();
-        File::create(&cert_path).unwrap().write_all(node_cert.pem().as_bytes()).unwrap();
-        File::create(&key_path).unwrap().write_all(node_key.serialize_pem().as_bytes()).unwrap();
+        File::create(&ca_path)
+            .unwrap()
+            .write_all(ca_cert.pem().as_bytes())
+            .unwrap();
+        File::create(&cert_path)
+            .unwrap()
+            .write_all(node_cert.pem().as_bytes())
+            .unwrap();
+        File::create(&key_path)
+            .unwrap()
+            .write_all(node_key.serialize_pem().as_bytes())
+            .unwrap();
 
         NodeIdentity::load(&ca_path, &cert_path, &key_path).unwrap()
     }

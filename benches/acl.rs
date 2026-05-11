@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use enumflags2::BitFlags;
-use shitspeak_rs::acl::{ACL, ACLPermissions, evaluate_permission};
+use shitspeak_rs::acl::{evaluate_permission, ACLPermissions, ACL};
 use shitspeak_rs::channels::Channel;
 use shitspeak_rs::client::group::ClientMembershipQuery;
 
@@ -41,12 +41,8 @@ fn make_channel_with_acls(n: usize) -> Channel {
 }
 
 fn make_membership() -> ClientMembershipQuery<'static> {
-    let group_refs: &'static [&str] = Box::leak(Box::new([
-        "admin", "user", "trusted",
-    ]));
-    let token_refs: &'static [&str] = Box::leak(Box::new([
-        "token_a", "token_b",
-    ]));
+    let group_refs: &'static [&str] = Box::leak(Box::new(["admin", "user", "trusted"]));
+    let token_refs: &'static [&str] = Box::leak(Box::new(["token_a", "token_b"]));
     ClientMembershipQuery {
         groups: group_refs,
         authenticated: true,
@@ -86,9 +82,10 @@ fn bench_channel_has_restriction_iter_any(c: &mut Criterion) {
         let ch = make_channel_with_acls(n);
         group.bench_with_input(BenchmarkId::new("iter_any", n), &ch, |b, ch| {
             b.iter(|| {
-                let found = ch.acls.iter().any(|acl| {
-                    acl.apply_here && acl.deny.contains(ACLPermissions::Traverse)
-                });
+                let found = ch
+                    .acls
+                    .iter()
+                    .any(|acl| acl.apply_here && acl.deny.contains(ACLPermissions::Traverse));
                 black_box(found)
             });
         });
@@ -99,12 +96,18 @@ fn bench_channel_has_restriction_iter_any(c: &mut Criterion) {
 
 fn bench_evaluate_permission(c: &mut Criterion) {
     let membership = make_membership();
-    let ancestors: Vec<Channel> = (0..5).map(|i| {
-        let mut ch = make_channel_with_acls(10);
-        ch.id = 100 + i as u32;
-        ch.parent_id = if i == 0 { Some(0) } else { Some(100 + (i - 1) as u32) };
-        ch
-    }).collect();
+    let ancestors: Vec<Channel> = (0..5)
+        .map(|i| {
+            let mut ch = make_channel_with_acls(10);
+            ch.id = 100 + i as u32;
+            ch.parent_id = if i == 0 {
+                Some(0)
+            } else {
+                Some(100 + (i - 1) as u32)
+            };
+            ch
+        })
+        .collect();
 
     let mut group = c.benchmark_group("evaluate_permission");
     for n in [0, 10, 100] {
@@ -139,7 +142,11 @@ fn bench_evaluate_permission_deep(c: &mut Criterion) {
         for i in 0..depth {
             let mut ch = make_channel_with_acls(10);
             ch.id = 100 + i as u32;
-            ch.parent_id = if i == 0 { Some(0) } else { Some(100 + (i - 1) as u32) };
+            ch.parent_id = if i == 0 {
+                Some(0)
+            } else {
+                Some(100 + (i - 1) as u32)
+            };
             ch.inherit_acl = true;
             ancestors.push(ch);
         }
@@ -175,7 +182,11 @@ fn bench_evaluate_permission_mixed_inherit(c: &mut Criterion) {
         for i in 0..10 {
             let mut ch = make_channel_with_acls(10);
             ch.id = 100 + i as u32;
-            ch.parent_id = if i == 0 { Some(0) } else { Some(100 + (i - 1) as u32) };
+            ch.parent_id = if i == 0 {
+                Some(0)
+            } else {
+                Some(100 + (i - 1) as u32)
+            };
             ch.inherit_acl = i != break_at;
             ancestors.push(ch);
         }

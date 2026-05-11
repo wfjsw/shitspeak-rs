@@ -1,9 +1,11 @@
-use crate::{errors::{MessageLengthExceededError, ReadProtoMessageError}, messages::Message};
+use crate::{
+    errors::{MessageLengthExceededError, ReadProtoMessageError},
+    messages::Message,
+};
 use bytes::BytesMut;
 pub trait ReadMessageExt {
     async fn read_proto_message(&mut self) -> Result<Message, ReadProtoMessageError>;
 }
-
 
 impl<T: tokio::io::AsyncReadExt + Unpin> ReadMessageExt for T {
     async fn read_proto_message(&mut self) -> Result<Message, ReadProtoMessageError> {

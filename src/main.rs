@@ -1,5 +1,11 @@
 #![allow(warnings)]
-#![allow(dead_code, unused_variables, unused_imports, unused_must_use, unused_assignments)]
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_imports,
+    unused_must_use,
+    unused_assignments
+)]
 
 use crate::{config::Config, server::Server};
 

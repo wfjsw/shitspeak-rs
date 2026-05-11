@@ -54,11 +54,7 @@ pub struct UserStatsApplyOutcome {
 /// impl wraps [`OverlayNetwork`]; tests inject a recording fake.
 #[async_trait]
 pub trait UserStatsTransport: Send + Sync + 'static {
-    async fn send_unicast(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-    ) -> Result<(), ApplicationError>;
+    async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError>;
 }
 
 /// Production [`UserStatsTransport`] impl backed by the overlay.
@@ -68,11 +64,7 @@ pub struct OverlayUserStatsTransport {
 
 #[async_trait]
 impl UserStatsTransport for OverlayUserStatsTransport {
-    async fn send_unicast(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-    ) -> Result<(), ApplicationError> {
+    async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
             .send_unicast(
                 dst,
@@ -141,13 +133,7 @@ impl UserStatsService {
             pending: pending.clone(),
             next_request_id: AtomicU64::new(1),
         });
-        spawn_dispatch_task(
-            inbox_rx,
-            shutdown,
-            transport,
-            responder,
-            pending,
-        );
+        spawn_dispatch_task(inbox_rx, shutdown, transport, responder, pending);
         svc
     }
 
@@ -542,13 +528,7 @@ mod tests {
         *loopback.originator_inbound.lock() = Some(originator.inbound_handler());
 
         let reply = originator
-            .dispatch_request_with_timeout(
-                99,
-                1,
-                2,
-                true,
-                Duration::from_millis(500),
-            )
+            .dispatch_request_with_timeout(99, 1, 2, true, Duration::from_millis(500))
             .await
             .expect("reply should arrive");
         assert!(reply.found);

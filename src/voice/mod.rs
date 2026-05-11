@@ -13,6 +13,7 @@ mod routing;
 pub mod routing_queue;
 pub mod udp_batch;
 
+pub(crate) use routing::route_s2s_voice_frame;
 pub use routing::route_voice;
 pub use routing::spawn_voice_routing_task;
 pub use routing::spawn_voice_tcp_task;

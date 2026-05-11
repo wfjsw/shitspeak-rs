@@ -6,4 +6,6 @@ pub mod test_server;
 
 pub use test_authenticator::{AuthenticatorAdapter, TestAuthenticator};
 pub use test_client::TestClient;
-pub use test_server::{spawn_test_server, TestServer, TestServerOpts};
+pub use test_server::{
+    spawn_s2s_test_server, spawn_test_server, TestS2sServerOpts, TestServer, TestServerOpts,
+};

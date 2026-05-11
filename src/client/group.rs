@@ -2,7 +2,7 @@ use std::{net::IpAddr, str::FromStr};
 
 use bytes::Bytes;
 
-use cidr::{AnyIpCidr};
+use cidr::AnyIpCidr;
 
 enum IPMaskType<'a> {
     FullMatch(IpAddr),
@@ -48,7 +48,8 @@ pub fn is_member_in_group(
     join_passwords: &[&str],
     client: &ClientMembershipQuery,
 ) -> bool {
-    let (match_type, invert, use_target_channel) = evaluate_group_string_match_type(group, current_channel_id, target_channel_id);
+    let (match_type, invert, use_target_channel) =
+        evaluate_group_string_match_type(group, current_channel_id, target_channel_id);
     let channel_id = match use_target_channel {
         true => match target_channel_id {
             Some(id) => id,
@@ -63,56 +64,48 @@ pub fn is_member_in_group(
         Some(MatchType::None) => false,
         Some(MatchType::Authenticated) => client.authenticated,
         Some(MatchType::HasVerifiedCertificateChain) => client.has_verified_cert_chain,
-        Some(MatchType::CertificateHash(expected_hash)) => {
-            match client.cert_hash {
-                Some(actual_hash) => actual_hash == expected_hash.as_ref(),
-                None => false,
-            }
+        Some(MatchType::CertificateHash(expected_hash)) => match client.cert_hash {
+            Some(actual_hash) => actual_hash == expected_hash.as_ref(),
+            None => false,
         },
         Some(MatchType::InChannel(expected_channel_id)) => channel_id == expected_channel_id,
         Some(MatchType::OutOfChannel(expected_channel_id)) => channel_id != expected_channel_id,
-        Some(MatchType::ClientGroup(expected_group)) => {
-            client.groups.iter().any(|&g| g.trim().eq_ignore_ascii_case(expected_group.trim()))
-        }
+        Some(MatchType::ClientGroup(expected_group)) => client
+            .groups
+            .iter()
+            .any(|&g| g.trim().eq_ignore_ascii_case(expected_group.trim())),
         Some(MatchType::Token(token_match_type)) => match token_match_type {
             TokenMatchType::All(token) => {
-                join_passwords.iter().any(|&p| p.trim().eq_ignore_ascii_case(token.trim()))
+                join_passwords
+                    .iter()
+                    .any(|&p| p.trim().eq_ignore_ascii_case(token.trim()))
                     || client.access_tokens.iter().any(|&t| t == token)
             }
-            TokenMatchType::ChannelPassword(token) => {
-                join_passwords.iter().any(|&p| p.trim().eq_ignore_ascii_case(token.trim()))
-            }
+            TokenMatchType::ChannelPassword(token) => join_passwords
+                .iter()
+                .any(|&p| p.trim().eq_ignore_ascii_case(token.trim())),
             TokenMatchType::UserAccessToken(token) => {
                 client.access_tokens.iter().any(|&t| t == token)
             }
         },
         Some(MatchType::IPMask(ip_mask_type)) => match ip_mask_type {
-            IPMaskType::FullMatch(ip) => {
-                match client.ip_address {
-                    Some(client_ip) => client_ip == ip,
-                    None => false,
-                }
-            }
-            IPMaskType::CIDR(cidr) => {
-                match client.ip_address {
-                    Some(client_ip) => cidr.contains(&client_ip),
-                    None => false,
-                }
-            }
-            IPMaskType::ASN(asn) => {
-                match client.asn {
-                    Some(client_asn) => client_asn == asn,
-                    None => false,
-                }
-            }
-            IPMaskType::CountryCode(country_code) => {
-                match client.country_code {
-                    Some(client_cc) => client_cc.eq_ignore_ascii_case(country_code),
-                    None => false,
-                }
-            }
+            IPMaskType::FullMatch(ip) => match client.ip_address {
+                Some(client_ip) => client_ip == ip,
+                None => false,
+            },
+            IPMaskType::CIDR(cidr) => match client.ip_address {
+                Some(client_ip) => cidr.contains(&client_ip),
+                None => false,
+            },
+            IPMaskType::ASN(asn) => match client.asn {
+                Some(client_asn) => client_asn == asn,
+                None => false,
+            },
+            IPMaskType::CountryCode(country_code) => match client.country_code {
+                Some(client_cc) => client_cc.eq_ignore_ascii_case(country_code),
+                None => false,
+            },
         },
-
     };
 
     if invert {
@@ -122,7 +115,11 @@ pub fn is_member_in_group(
     }
 }
 
-fn evaluate_group_string_match_type<'a>(group: &'a str, current_channel_id: u32, target_channel_id: Option<u32>) -> (Option<MatchType<'a>>, bool, bool) {
+fn evaluate_group_string_match_type<'a>(
+    group: &'a str,
+    current_channel_id: u32,
+    target_channel_id: Option<u32>,
+) -> (Option<MatchType<'a>>, bool, bool) {
     let mut invert = false;
     let mut use_target_channel = false;
     let mut group_name_slice = group;
@@ -220,13 +217,17 @@ fn evaluate_group_string_match_type<'a>(group: &'a str, current_channel_id: u32,
             _ => {
                 // Built-in group names that are not prefix-delimited.
                 let m = match group_name_slice {
-                    "all"    => Some(MatchType::All),
-                    "none"   => Some(MatchType::None),
-                    "auth"   => Some(MatchType::Authenticated),
+                    "all" => Some(MatchType::All),
+                    "none" => Some(MatchType::None),
+                    "auth" => Some(MatchType::Authenticated),
                     "strong" => Some(MatchType::HasVerifiedCertificateChain),
-                    "in"     => Some(MatchType::InChannel(target_channel_id.unwrap_or(current_channel_id))),
-                    "out"    => Some(MatchType::OutOfChannel(target_channel_id.unwrap_or(current_channel_id))), 
-                    name     => Some(MatchType::ClientGroup(name)),
+                    "in" => Some(MatchType::InChannel(
+                        target_channel_id.unwrap_or(current_channel_id),
+                    )),
+                    "out" => Some(MatchType::OutOfChannel(
+                        target_channel_id.unwrap_or(current_channel_id),
+                    )),
+                    name => Some(MatchType::ClientGroup(name)),
                 };
                 break m;
             }

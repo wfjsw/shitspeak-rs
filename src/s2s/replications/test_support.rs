@@ -145,11 +145,7 @@ impl StrictNet for MockNet {
         Ok(())
     }
 
-    async fn send_broadcast(
-        &self,
-        topic: &str,
-        body: StrictBody,
-    ) -> Result<(), ReplicationError> {
+    async fn send_broadcast(&self, topic: &str, body: StrictBody) -> Result<(), ReplicationError> {
         self.captured.lock().push(CapturedFrame::StrictBroadcast {
             topic: topic.to_owned(),
             body,
@@ -186,11 +182,7 @@ impl OwnerNet for MockNet {
         Ok(())
     }
 
-    async fn send_broadcast(
-        &self,
-        topic: &str,
-        body: OwnerBody,
-    ) -> Result<(), ReplicationError> {
+    async fn send_broadcast(&self, topic: &str, body: OwnerBody) -> Result<(), ReplicationError> {
         self.captured.lock().push(CapturedFrame::OwnerBroadcast {
             topic: topic.to_owned(),
             body,
@@ -329,7 +321,8 @@ impl OwnerReplicable for CountingOwnerRepo {
         let s = self.state.lock();
         match s.get(&origin) {
             Some((_, _, log)) => {
-                let out: Vec<(u64, u64)> = log.iter().copied().filter(|(v, _)| *v > since).collect();
+                let out: Vec<(u64, u64)> =
+                    log.iter().copied().filter(|(v, _)| *v > since).collect();
                 OwnerLog::Available(out)
             }
             None => OwnerLog::Available(Vec::new()),
@@ -368,7 +361,6 @@ impl OwnerReplicable for CountingOwnerRepo {
 
 #[cfg(test)]
 mod e2e_tests {
-    use super::*;
     use super::super::config::ReplicationConfig;
     use super::super::owner::runtime::OwnerRuntime;
     use super::super::proto::{
@@ -376,6 +368,7 @@ mod e2e_tests {
         StrictProposeAck,
     };
     use super::super::strict::runtime::StrictRuntime;
+    use super::*;
     use std::time::Duration;
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
@@ -539,7 +532,9 @@ mod e2e_tests {
         );
 
         // Pre-seed knowledge that origin 2 was at (epoch=10, ver=4).
-        repo.state.lock().insert(2, (10, 4, vec![(1, 1), (2, 2), (3, 3), (4, 4)]));
+        repo.state
+            .lock()
+            .insert(2, (10, 4, vec![(1, 1), (2, 2), (3, 3), (4, 4)]));
         rt.state.lock().known.insert(2, (10, 4));
 
         // Now feed an op with epoch=11.
@@ -589,7 +584,10 @@ mod e2e_tests {
             );
             m
         });
-        rt.state.lock().catchup_in_flight.insert(2, std::time::Instant::now());
+        rt.state
+            .lock()
+            .catchup_in_flight
+            .insert(2, std::time::Instant::now());
 
         // Restart event arrives.
         rt.on_membership_event(&MembershipEvent::Restarted(2));
@@ -601,4 +599,3 @@ mod e2e_tests {
         assert!(repo.reset_calls_for(2).is_empty());
     }
 }
-

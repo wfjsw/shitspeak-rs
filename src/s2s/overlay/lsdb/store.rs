@@ -47,6 +47,7 @@ pub struct LsaEntry {
     pub tombstone: bool,
     pub addresses: Vec<PeerAddress>,
     pub links: Vec<LinkAdvertised>,
+    pub max_users: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +88,7 @@ impl LsaEntry {
             tombstone: pb.tombstone,
             addresses,
             links,
+            max_users: pb.max_users,
         })
     }
 
@@ -110,6 +112,7 @@ impl LsaEntry {
                     transports_mask: l.transports_mask,
                 })
                 .collect(),
+            max_users: self.max_users,
         }
     }
 }
@@ -467,6 +470,7 @@ mod tests {
             tombstone,
             addresses: vec![],
             links: vec![],
+            max_users: 0,
         }
     }
 
@@ -476,6 +480,37 @@ mod tests {
         let db = LinkStateDb::new(floor);
         assert_eq!(db.admit(entry(1, 100, 1, false)), AdmissionResult::Accepted);
         assert!(db.get(1).is_some());
+    }
+
+    #[test]
+    fn lsa_roundtrips_max_users() {
+        let mut lsa = entry(1, 100, 1, false);
+        lsa.max_users = 250;
+        let pb = lsa.to_pb();
+        assert_eq!(pb.max_users, 250);
+        assert_eq!(LsaEntry::from_pb(&pb).unwrap().max_users, 250);
+    }
+
+    #[test]
+    fn link_state_db_sums_alive_max_users() {
+        let floor = Arc::new(LsaFloor::new(None));
+        let db = LinkStateDb::new(floor);
+        let mut first = entry(1, 100, 1, false);
+        first.max_users = 100;
+        let mut second = entry(2, 100, 1, false);
+        second.max_users = 200;
+        let mut left = entry(3, 100, 1, true);
+        left.max_users = 300;
+        db.admit(first);
+        db.admit(second);
+        db.admit(left);
+        let total: u64 = db
+            .snapshot()
+            .into_iter()
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| entry.max_users)
+            .sum();
+        assert_eq!(total, 300);
     }
 
     #[test]

@@ -52,4 +52,3 @@ pub async fn handle_query_users(
     sender.write_proto_message(&reply).await?;
     Ok(())
 }
-

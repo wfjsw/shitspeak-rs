@@ -68,8 +68,8 @@ impl PingRequest {
 
         let (request_extended_information, timestamp) = if data.len() < size_of::<u64>() {
             // Short form: PDS varint-encoded timestamp (encrypted pings from authenticated clients).
-            let (ts, consumed) = super::codec::read_varint_slice(data)
-                .ok_or(DecodeError::UnparsableVarIntValue)?;
+            let (ts, consumed) =
+                super::codec::read_varint_slice(data).ok_or(DecodeError::UnparsableVarIntValue)?;
             if consumed != data.len() {
                 return Err(DecodeError::UnparsableVarIntValue);
             }

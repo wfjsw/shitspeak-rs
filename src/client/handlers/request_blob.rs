@@ -181,7 +181,8 @@ pub async fn handle_request_blob(
             can_enter: None,
         };
         if server.get_send_permission_info() {
-            let perms = crate::client::acl::compute_permissions_for_client(server, sender, ch.id).await;
+            let perms =
+                crate::client::acl::compute_permissions_for_client(server, sender, ch.id).await;
             cs = cs.with_permission_info(&ch, perms);
         }
         let reply: Message = cs.into();

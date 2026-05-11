@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::service_level::PeerAddress;
+
 /// Knobs for [`super::ConnectionManager::start`]. All listeners are optional —
 /// at least one must be set or [`super::ConfigError::NoListener`] is returned.
 #[derive(Debug, Clone)]
@@ -16,6 +18,7 @@ pub struct TransportConfig {
     kcp_listen: Option<SocketAddr>,
     quic_listen: Option<SocketAddr>,
     udp_listen: Option<SocketAddr>,
+    seed_addresses: Vec<PeerAddress>,
 
     backoff_initial: Duration,
     backoff_cap: Duration,
@@ -64,6 +67,7 @@ impl TransportConfig {
             kcp_listen: None,
             quic_listen: None,
             udp_listen: None,
+            seed_addresses: Vec::new(),
             backoff_initial: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
             reconnect_check_interval: Duration::from_secs(1),
@@ -111,6 +115,10 @@ impl TransportConfig {
 
     pub fn udp_listen(&self) -> Option<SocketAddr> {
         self.udp_listen
+    }
+
+    pub fn seed_addresses(&self) -> &[PeerAddress] {
+        &self.seed_addresses
     }
 
     pub fn backoff_initial(&self) -> Duration {
@@ -196,6 +204,16 @@ impl TransportConfig {
 
     pub fn with_udp_listen(mut self, addr: SocketAddr) -> Self {
         self.udp_listen = Some(addr);
+        self
+    }
+
+    pub fn with_seed_addresses(mut self, addrs: Vec<PeerAddress>) -> Self {
+        self.seed_addresses = addrs;
+        self
+    }
+
+    pub fn with_seed_address(mut self, addr: PeerAddress) -> Self {
+        self.seed_addresses.push(addr);
         self
     }
 
@@ -317,7 +335,15 @@ impl TransportTuning {
     }
 }
 
-fn default_latency_ewma_alpha() -> f64 { 0.2 }
-fn default_jitter_ewma_alpha() -> f64 { 1.0 / 16.0 }
-fn default_throughput_ewma_alpha() -> f64 { 0.3 }
-fn default_max_pending_pings() -> usize { 64 }
+fn default_latency_ewma_alpha() -> f64 {
+    0.2
+}
+fn default_jitter_ewma_alpha() -> f64 {
+    1.0 / 16.0
+}
+fn default_throughput_ewma_alpha() -> f64 {
+    0.3
+}
+fn default_max_pending_pings() -> usize {
+    64
+}

@@ -53,7 +53,11 @@ impl ActiveStream {
         sender: mpsc::Sender<OutboundFrame>,
         closed: CancellationToken,
     ) -> Self {
-        Self { transport, sender, closed }
+        Self {
+            transport,
+            sender,
+            closed,
+        }
     }
 
     pub fn transport(&self) -> TransportKind {
@@ -103,7 +107,11 @@ impl BackoffState {
     pub fn record_failure(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         let doubled = self.next_delay.saturating_mul(2);
-        self.next_delay = if doubled > self.cap { self.cap } else { doubled };
+        self.next_delay = if doubled > self.cap {
+            self.cap
+        } else {
+            doubled
+        };
     }
 
     pub fn record_success(&mut self) {

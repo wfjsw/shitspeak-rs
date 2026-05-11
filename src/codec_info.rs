@@ -6,7 +6,6 @@ pub struct CodecInfo {
 }
 
 impl Default for CodecInfo {
-
     fn default() -> Self {
         CodecInfo {
             alpha_codec: 0,
@@ -18,10 +17,18 @@ impl Default for CodecInfo {
 }
 
 impl CodecInfo {
-    pub fn alpha_codec(&self) -> i32 { self.alpha_codec }
-    pub fn beta_codec(&self) -> i32 { self.beta_codec }
-    pub fn prefer_alpha_codec(&self) -> bool { self.prefer_alpha_codec }
-    pub fn opus(&self) -> bool { self.opus }
+    pub fn alpha_codec(&self) -> i32 {
+        self.alpha_codec
+    }
+    pub fn beta_codec(&self) -> i32 {
+        self.beta_codec
+    }
+    pub fn prefer_alpha_codec(&self) -> bool {
+        self.prefer_alpha_codec
+    }
+    pub fn opus(&self) -> bool {
+        self.opus
+    }
     /// Re-evaluate codec selection based on client capabilities.
     /// Returns `true` if the codec selection changed.
     pub fn recheck(

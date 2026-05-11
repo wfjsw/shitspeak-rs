@@ -17,7 +17,7 @@
 //! one-size-fits-all default.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, BTreeMap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -110,11 +110,10 @@ impl Reorderer {
         // ── 1. Sender restart (strictly greater epoch) ────────────────
         if arrived_epoch > entry.epoch {
             // Flush pending under old epoch in seq order, then reset.
-            let drained: Vec<(NodeIdentifier, VoiceFrame)> =
-                std::mem::take(&mut entry.pending)
-                    .into_iter()
-                    .map(|(_, e)| e)
-                    .collect();
+            let drained: Vec<(NodeIdentifier, VoiceFrame)> = std::mem::take(&mut entry.pending)
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect();
             state.total_pending = state.total_pending.saturating_sub(drained.len());
             for e in drained {
                 emit.push(e);
@@ -197,8 +196,8 @@ impl Reorderer {
             entry.pending.insert(frame.s2s_seq, (from, frame.clone()));
             state.total_pending = state.total_pending.saturating_add(1);
             if was_empty_before_insert {
-                let deadline = Instant::now()
-                    + Duration::from_millis(self.cfg.reorder_max_delay_ms);
+                let deadline =
+                    Instant::now() + Duration::from_millis(self.cfg.reorder_max_delay_ms);
                 let entry = state.per_sender.get_mut(&session).unwrap();
                 entry.deadline = Some(deadline);
                 state.deadlines.push(Reverse((deadline, session)));
@@ -209,11 +208,10 @@ impl Reorderer {
         // ── 7. Terminator: flush any pending for this sender now ──────
         if frame.is_terminator {
             let entry = state.per_sender.get_mut(&session).unwrap();
-            let drained: Vec<(NodeIdentifier, VoiceFrame)> =
-                std::mem::take(&mut entry.pending)
-                    .into_iter()
-                    .map(|(_, e)| e)
-                    .collect();
+            let drained: Vec<(NodeIdentifier, VoiceFrame)> = std::mem::take(&mut entry.pending)
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect();
             state.total_pending = state.total_pending.saturating_sub(drained.len());
             let entry = state.per_sender.get_mut(&session).unwrap();
             // Advance next_seq past the drained range so subsequent
@@ -287,11 +285,8 @@ impl Reorderer {
 /// nudges the dispatch task to drain expired entries via
 /// `dispatch_tx`. Owns the long-running `tokio::time::sleep_until`
 /// future so the dispatch task itself stays purely event-driven.
-pub fn spawn_deadline_task<F>(
-    reorderer: Arc<Reorderer>,
-    shutdown: CancellationToken,
-    nudge: F,
-) where
+pub fn spawn_deadline_task<F>(reorderer: Arc<Reorderer>, shutdown: CancellationToken, nudge: F)
+where
     F: Fn() + Send + 'static,
 {
     let notify = reorderer.deadline_notify();

@@ -30,7 +30,11 @@ impl KcpEndpoint {
         client_tls: Arc<rustls::ClientConfig>,
         listen_addr: Option<SocketAddr>,
     ) -> Self {
-        Self { server_tls, client_tls, listen_addr }
+        Self {
+            server_tls,
+            client_tls,
+            listen_addr,
+        }
     }
 }
 
@@ -42,7 +46,9 @@ impl Endpoint for KcpEndpoint {
         inner: Arc<ManagerInner>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let Some(addr) = self.listen_addr else { return Ok(()); };
+            let Some(addr) = self.listen_addr else {
+                return Ok(());
+            };
             let cfg = KcpConfig::default();
             let listener = KcpListener::bind(cfg, addr)
                 .await
@@ -85,6 +91,36 @@ impl Endpoint for KcpEndpoint {
             Ok(())
         }
     }
+
+    fn dial_unidentified(
+        self: Arc<Self>,
+        inner: Arc<ManagerInner>,
+        addr: SocketAddr,
+    ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
+        async move {
+            let cfg = KcpConfig::default();
+            let sock = KcpStream::connect(&cfg, addr)
+                .await
+                .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
+            let connector = TlsConnector::from(self.client_tls.clone());
+            let server_name = ServerName::try_from("s2s-seed.local").expect("static name parses");
+            let tls = connector.connect(server_name, sock).await?;
+            let (_, client) = tls.get_ref();
+            let chain = client
+                .peer_certificates()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no peer cert chain"))?;
+            let peer_node = parse_peer_cn(chain)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+            if peer_node == inner.self_id() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "self-loop rejected",
+                ));
+            }
+            install_stream_session(&inner, peer_node, TransportKind::Kcp, true, tls);
+            Ok(peer_node)
+        }
+    }
 }
 
 async fn accept_loop(mut listener: KcpListener, acceptor: TlsAcceptor, inner: Arc<ManagerInner>) {
@@ -122,7 +158,10 @@ async fn handle_inbound(
     let peer_node = parse_peer_cn(chain)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
     if peer_node == inner.self_id() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "self-loop rejected"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "self-loop rejected",
+        ));
     }
     install_stream_session(&inner, peer_node, TransportKind::Kcp, false, tls);
     Ok(())

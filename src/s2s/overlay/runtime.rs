@@ -47,7 +47,11 @@ pub(crate) struct OverlayInner {
 }
 
 impl OverlayInner {
-    pub fn new(transport: ConnectionManager, cfg: OverlayConfig) -> Self {
+    pub fn new(
+        transport: ConnectionManager,
+        cfg: OverlayConfig,
+        max_users: Arc<AtomicU64>,
+    ) -> Self {
         let self_id = transport.local_node_id();
         let boot_epoch = capture_boot_epoch();
 
@@ -74,7 +78,12 @@ impl OverlayInner {
         // L3 (it routes by node id).
         // TODO(future): expose listen addrs from transport public API.
         let self_addresses = Vec::new();
-        let emitter = Arc::new(LsaEmitter::new(self_id, boot_epoch, self_addresses));
+        let emitter = Arc::new(LsaEmitter::new(
+            self_id,
+            boot_epoch,
+            self_addresses,
+            max_users,
+        ));
 
         let shutdown = CancellationToken::new();
         let hello = Arc::new(HelloContext {
@@ -215,8 +224,9 @@ pub(crate) async fn start_inner(
     transport: ConnectionManager,
     inbound: Inbound,
     cfg: OverlayConfig,
+    max_users: Arc<AtomicU64>,
 ) -> Result<Arc<OverlayInner>, OverlayError> {
-    let inner = Arc::new(OverlayInner::new(transport, cfg));
+    let inner = Arc::new(OverlayInner::new(transport, cfg, max_users));
 
     super::discovery::bootstrap(&inner.cfg, &inner.transport);
 

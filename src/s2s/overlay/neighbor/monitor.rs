@@ -158,7 +158,11 @@ impl NeighborMonitor {
 
     /// True if `node` is currently considered a direct neighbor.
     pub fn is_up(&self, node: NodeIdentifier) -> bool {
-        self.state.lock().get(&node).map(|s| s.is_up).unwrap_or(false)
+        self.state
+            .lock()
+            .get(&node)
+            .map(|s| s.is_up)
+            .unwrap_or(false)
     }
 
     /// Record an outbound Hello so we can match its ack later.
@@ -182,7 +186,9 @@ impl NeighborMonitor {
                 // Only emit Restarted if we'd seen a *previous* epoch (>0).
                 // First-ever boot_epoch is just initial state.
                 if prev_be > 0 {
-                    let _ = self.membership_events.send(MembershipEvent::Restarted(from));
+                    let _ = self
+                        .membership_events
+                        .send(MembershipEvent::Restarted(from));
                     debug!(peer=%from, new_epoch=boot_epoch, "neighbor restart detected via hello");
                 }
             }
@@ -218,7 +224,9 @@ impl NeighborMonitor {
             if boot_epoch > prev_be {
                 st.boot_epoch = boot_epoch;
                 if prev_be > 0 {
-                    let _ = self.membership_events.send(MembershipEvent::Restarted(from));
+                    let _ = self
+                        .membership_events
+                        .send(MembershipEvent::Restarted(from));
                 }
             }
             st.last_ack_at = Some(now);
@@ -278,7 +286,10 @@ impl NeighborMonitor {
                         transitions.push((*nid, false));
                     }
                     // L1 also dropped; eventually purge.
-                    if st.last_ack_at.map_or(true, |t| now.duration_since(t) > dead * 4) {
+                    if st
+                        .last_ack_at
+                        .map_or(true, |t| now.duration_since(t) > dead * 4)
+                    {
                         to_remove.push(*nid);
                     }
                     continue;

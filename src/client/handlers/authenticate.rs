@@ -5,9 +5,12 @@ use bytes::Bytes;
 use crate::{
     api::{AuthenticateAuxiliaryData, AuthenticationRejection},
     channel_handler::build_channel_state_message,
-    client::{Client, user_info::Credential},
+    client::{user_info::Credential, Client},
     errors::{AuthRejection, MessageHandlerError},
-    messages::{Message, WriteMessageExt, encoder::{Authenticate, ChannelState, CodecVersion, RejectType, ServerConfig, ServerSync}},
+    messages::{
+        encoder::{Authenticate, ChannelState, CodecVersion, RejectType, ServerConfig, ServerSync},
+        Message, WriteMessageExt,
+    },
     server::Server,
 };
 
@@ -18,13 +21,22 @@ pub async fn handle_authenticate(
 ) -> Result<(), MessageHandlerError> {
     let repo = server.get_clients();
     let session = sender.get_session_id();
-    tracing::debug!(session = u32::from(session), username = msg.username, has_password = msg.password.is_some(), tokens = msg.tokens.len(), "Authenticate handler");
+    tracing::debug!(
+        session = u32::from(session),
+        username = msg.username,
+        has_password = msg.password.is_some(),
+        tokens = msg.tokens.len(),
+        "Authenticate handler"
+    );
 
     // ── Token-update path ─────────────────────────────────────────────────
     // An already-authenticated client can send Authenticate again to update
     // its access tokens.
     if sender.is_authenticated() {
-        tracing::debug!(session = u32::from(session), "Authenticate: token update for already-authenticated client");
+        tracing::debug!(
+            session = u32::from(session),
+            "Authenticate: token update for already-authenticated client"
+        );
         sender.set_tokens(msg.tokens.into_iter().collect(), repo);
         return Ok(());
     }
@@ -39,8 +51,11 @@ pub async fn handle_authenticate(
 
     // ── Max-users check ───────────────────────────────────────────────────
     {
-        let n = all_clients.len() as u64;
-        if n >= server.get_max_users() {
+        let authenticated_clients = all_clients
+            .iter()
+            .filter(|client| client.is_authenticated())
+            .count() as u64;
+        if authenticated_clients >= server.get_max_users() {
             return Err(RejectType::ServerFull.into());
         }
     }
@@ -51,15 +66,15 @@ pub async fn handle_authenticate(
     }
 
     // ── Authenticate ──────────────────────────────────────────────────────
-    let certificate_hash = sender
-        .get_certificate_hash()
-        .map(Bytes::copy_from_slice);
+    let certificate_hash = sender.get_certificate_hash().map(Bytes::copy_from_slice);
     let session_id = sender.get_session_id();
     let ip_address = sender.get_real_ip_address();
     let (version, client_name, os_name, os_version) = {
         let protocol_version = sender.protocol_version();
         let local_state = sender.read_local_state();
-        let local = local_state.as_ref().expect("Local state missing during authenticate");
+        let local = local_state
+            .as_ref()
+            .expect("Local state missing during authenticate");
         (
             protocol_version,
             local.get_release().map(|s| s.to_owned()),
@@ -98,10 +113,17 @@ pub async fn handle_authenticate(
     {
         let required = server.get_required_groups();
         if !required.is_empty() {
-            let user_groups = result.groups.iter().map(|s| s.as_str()).collect::<std::collections::HashSet<_>>();
+            let user_groups = result
+                .groups
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<std::collections::HashSet<_>>();
             let has_required = required.iter().any(|g| user_groups.contains(g.as_str()));
             if !has_required {
-                tracing::trace!(session = u32::from(session), "Authenticate built outbound Reject payload");
+                tracing::trace!(
+                    session = u32::from(session),
+                    "Authenticate built outbound Reject payload"
+                );
                 return Err(AuthRejection::new(RejectType::None)
                     .because("Missing required group membership")
                     .into());
@@ -128,9 +150,13 @@ pub async fn handle_authenticate(
     // ── Traverse permission check on root channel ─────────────────────────
     // Superusers bypass this check.
     if !sender.is_superuser() {
-        let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
+        let root_perms =
+            crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
         if !root_perms.contains(crate::acl::ACLPermissions::Traverse) {
-            tracing::trace!(session = u32::from(session), "Authenticate built outbound Reject payload");
+            tracing::trace!(
+                session = u32::from(session),
+                "Authenticate built outbound Reject payload"
+            );
             return Err(AuthRejection::new(RejectType::None)
                 .because("No traverse permission on root channel")
                 .into());
@@ -138,8 +164,7 @@ pub async fn handle_authenticate(
     }
 
     // ── Generate crypt state and send CryptSetup ──────────────────────────
-    if let Err(e) = sender
-        .create_crypt_state("OCB2-AES128") {
+    if let Err(e) = sender.create_crypt_state("OCB2-AES128") {
         tracing::error!(session = u32::from(session), error = %e, "Failed to create crypt state");
         return Err(AuthRejection::new(RejectType::None)
             .because("Failed to create crypt state")
@@ -153,13 +178,19 @@ pub async fn handle_authenticate(
             state.key().map(Bytes::copy_from_slice),
             Some(Bytes::copy_from_slice(state.decrypt_iv())),
             Some(Bytes::copy_from_slice(state.encrypt_iv())),
-        ).into()
+        )
+        .into()
     };
 
     // ── Place user in the default channel ────────────────────────────────
     {
         let default_ch = server.get_default_channel();
-        let target_ch = if server.get_channels().get_channel(default_ch).await.is_some() {
+        let target_ch = if server
+            .get_channels()
+            .get_channel(default_ch)
+            .await
+            .is_some()
+        {
             default_ch
         } else {
             0 // fall back to root
@@ -197,7 +228,7 @@ pub async fn handle_authenticate(
         // BFS ordering: root first, then children in order
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(0u32); // root channel id
-        // Map id -> channel for quick lookup
+                               // Map id -> channel for quick lookup
         let ch_map: std::collections::HashMap<u32, _> =
             all_channels.into_iter().map(|c| (c.id, c)).collect();
 
@@ -240,34 +271,43 @@ pub async fn handle_authenticate(
     {
         // Effective root permissions for the new user: full for now (TODO: ACL eval)
         let root_perm = 0x0000_FFFF_u32;
-        push_burst(Message::ServerSync(ServerSync {
-            session: Some(u32::from(session_id)),
-            max_bandwidth: Some(server.get_max_bandwidth()),
-            welcome_text: server.get_welcome_text(),
-            permissions: Some(root_perm.into()),
-        }.into()));
+        push_burst(Message::ServerSync(
+            ServerSync {
+                session: Some(u32::from(session_id)),
+                max_bandwidth: Some(server.get_max_bandwidth()),
+                welcome_text: server.get_welcome_text(),
+                permissions: Some(root_perm.into()),
+            }
+            .into(),
+        ));
     }
 
     // 6. ServerConfig
     {
-        push_burst(Message::ServerConfig(ServerConfig {
-            max_bandwidth: None,
-            welcome_text: None,
-            allow_html: Some(server.get_allow_html()),
-            message_length: Some(server.get_max_text_message_length()),
-            image_message_length: Some(server.get_max_image_message_length()),
-            max_users: Some(server.get_max_users() as u32),
-        }.into()));
+        push_burst(Message::ServerConfig(
+            ServerConfig {
+                max_bandwidth: None,
+                welcome_text: None,
+                allow_html: Some(server.get_allow_html()),
+                message_length: Some(server.get_max_text_message_length()),
+                image_message_length: Some(server.get_max_image_message_length()),
+                max_users: Some(server.get_max_users() as u32),
+            }
+            .into(),
+        ));
     }
 
     // 7. CodecVersion — advertise Opus-only (OCB2-AES128 encrypted voice)
     {
-        push_burst(Message::CodecVersion(CodecVersion {
-            alpha: -2147483637, // CELT alpha version (unused, but required by clients)
-            beta: 0,
-            prefer_alpha: false,
-            opus: Some(true),
-        }.into()));
+        push_burst(Message::CodecVersion(
+            CodecVersion {
+                alpha: -2147483637, // CELT alpha version (unused, but required by clients)
+                beta: 0,
+                prefer_alpha: false,
+                opus: Some(true),
+            }
+            .into(),
+        ));
     }
 
     // ── Send the burst to the joining client in one shot ──────────────────

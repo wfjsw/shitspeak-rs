@@ -45,6 +45,7 @@ message LinkStateAdvert {
   bool   tombstone  = 5;   // graceful-leave marker
   repeated AddressEntry addresses = 6;  // origin's own listen addresses
   repeated LinkAdvert links = 7;
+  uint64 max_users = 8;     // origin's local max_users capacity
 }
 
 // One advertised edge from `origin` to `neighbor`.

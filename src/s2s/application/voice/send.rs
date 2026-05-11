@@ -25,11 +25,7 @@ pub const VOICE_CLASS: MessageClass = MessageClass::HighPriority;
 /// impl: [`OverlayVoiceTransport`]. Test impl: see the unit tests below.
 #[async_trait]
 pub trait VoiceTransport: Send + Sync + 'static {
-    async fn send_unicast(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-    ) -> Result<(), ApplicationError>;
+    async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError>;
 
     async fn send_multicast(
         &self,
@@ -51,11 +47,7 @@ pub struct OverlayVoiceTransport {
 
 #[async_trait]
 impl VoiceTransport for OverlayVoiceTransport {
-    async fn send_unicast(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-    ) -> Result<(), ApplicationError> {
+    async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
             .send_unicast(dst, VOICE_SERVICE_TAG, VOICE_LEVEL, VOICE_CLASS, body)
             .await?;
@@ -129,9 +121,17 @@ pub(crate) mod testing {
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum FakeCall {
-        Unicast { dst: NodeIdentifier, body: Bytes },
-        Multicast { dsts: Vec<NodeIdentifier>, body: Bytes },
-        Broadcast { body: Bytes },
+        Unicast {
+            dst: NodeIdentifier,
+            body: Bytes,
+        },
+        Multicast {
+            dsts: Vec<NodeIdentifier>,
+            body: Bytes,
+        },
+        Broadcast {
+            body: Bytes,
+        },
     }
 
     impl FakeVoiceTransport {
@@ -155,7 +155,10 @@ pub(crate) mod testing {
             dst: NodeIdentifier,
             body: Bytes,
         ) -> Result<(), ApplicationError> {
-            self.calls.lock().unwrap().push(FakeCall::Unicast { dst, body });
+            self.calls
+                .lock()
+                .unwrap()
+                .push(FakeCall::Unicast { dst, body });
             Ok(())
         }
 
@@ -172,7 +175,10 @@ pub(crate) mod testing {
         }
 
         async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError> {
-            self.calls.lock().unwrap().push(FakeCall::Broadcast { body });
+            self.calls
+                .lock()
+                .unwrap()
+                .push(FakeCall::Broadcast { body });
             Ok(())
         }
 

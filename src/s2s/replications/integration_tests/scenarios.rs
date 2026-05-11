@@ -7,9 +7,7 @@ use bytes::Bytes;
 use tokio::time::timeout;
 
 use super::super::error::ReplicationError;
-use super::super::proto::{
-    self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG,
-};
+use super::super::proto::{self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG};
 use super::super::test_support::{CountingOwnerRepo, CountingStrictRepo};
 use super::super::topic::{InboundBody, InboundFrame};
 use super::super::{OwnerReplicable, StrictReplicable};
@@ -17,8 +15,12 @@ use super::harness::ReplCluster;
 use crate::s2s::testing::wait_until;
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 
-/// 3 nodes; each proposes 5 ops; assert all replicas converge to the
-/// same total-ordered log of length 15.
+/// Checks strict replication convergence with sequential proposers.
+/// Expected: three replicas converge to the same total-ordered 15-operation
+/// log. The replicated channel/state operations carry Mumble/shitspeak
+/// semantics from `D:\mumble\src\murmur\Messages.cpp` and
+/// `D:\shitspeak\message.go`; the strict total order is this crate's S2S
+/// replication contract.
 #[tokio::test]
 async fn strict_three_node_convergence() {
     let cluster = ReplCluster::build_full_mesh(&[1, 2, 3]).await;
@@ -60,8 +62,10 @@ async fn strict_three_node_convergence() {
     cluster.shutdown().await;
 }
 
-/// 3 nodes; A and B propose concurrently in tight loops; assert all
-/// replicas converge to the SAME interleaving (Tempo total order).
+/// Checks strict replication with concurrent proposers.
+/// Expected: all replicas converge to version 20 with the same interleaving,
+/// despite A and B proposing concurrently. Mumble/shitspeak define the state
+/// being replicated; this crate defines the S2S total-order protocol.
 #[tokio::test]
 async fn strict_concurrent_proposers_total_order() {
     let cluster = ReplCluster::build_full_mesh(&[10, 20, 30]).await;
@@ -108,15 +112,10 @@ async fn strict_concurrent_proposers_total_order() {
     cluster.shutdown().await;
 }
 
-/// 3-node cluster: partition C off, register the topic + propose between
-/// A and B, then heal and register on C — its catchup bootstrap should
-/// pull the entire log from a peer.
-///
-/// Note: per the plan, this exercises `spawn_catchup_bootstrap`. Late
-/// join with C participating from the start would block A/B's proposals
-/// (C is in `target_set` but has no topic to ack with), so we use the
-/// existing partition primitive in the harness to ensure A and B see only
-/// each other as alive while proposing.
+/// Checks strict-replication catchup for a late-joining topic.
+/// Expected: after C is partitioned while A and B reach version 10, C heals,
+/// registers the topic, pulls the full log, and matches A's log. This is this
+/// crate's S2S catchup behavior for replicated Mumble/shitspeak state.
 #[tokio::test]
 async fn strict_late_join_catches_up_via_log() {
     use std::collections::HashSet;
@@ -143,8 +142,12 @@ async fn strict_late_join_catches_up_via_log() {
 
     let repo_a = CountingStrictRepo::new();
     let repo_b = CountingStrictRepo::new();
-    let h_a = cluster.register_strict(0, "channels", repo_a.clone()).unwrap();
-    let h_b = cluster.register_strict(1, "channels", repo_b.clone()).unwrap();
+    let h_a = cluster
+        .register_strict(0, "channels", repo_a.clone())
+        .unwrap();
+    let h_b = cluster
+        .register_strict(1, "channels", repo_b.clone())
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     for k in 0..5u64 {
         h_a.propose(1000 + k).await.unwrap();
@@ -173,7 +176,9 @@ async fn strict_late_join_catches_up_via_log() {
 
     // Now register on C — catchup_bootstrap fires with current_version=0.
     let repo_c = CountingStrictRepo::new();
-    let _h_c = cluster.register_strict(2, "channels", repo_c.clone()).unwrap();
+    let _h_c = cluster
+        .register_strict(2, "channels", repo_c.clone())
+        .unwrap();
 
     let ok = wait_until(Duration::from_secs(10), || repo_c.current_version() == 10).await;
     assert!(ok, "late join must catch up to version 10");
@@ -185,9 +190,11 @@ async fn strict_late_join_catches_up_via_log() {
     cluster.shutdown().await;
 }
 
-/// 3-node cluster: A is the owner. A proposes 10 ops; assert B and C
-/// converge to `(epoch_a, 10)` for origin A and have the same applied
-/// log.
+/// Checks owner-mode replication from one owner to remote replicas.
+/// Expected: B and C apply A's ten operations, record `(epoch_a, 10)`, and
+/// match A's applied log. The owner-mode data model distributes local
+/// Mumble/shitspeak state such as clients; the S2S owner log is local to this
+/// crate.
 #[tokio::test]
 async fn owner_three_node_replication() {
     let cluster = ReplCluster::build_full_mesh(&[1, 2, 3]).await;
@@ -224,22 +231,24 @@ async fn owner_three_node_replication() {
     cluster.shutdown().await;
 }
 
-/// 2 nodes: B is owner, A is a remote replica. B proposes; A applies.
-/// Then we register the topic on A late, so A's catchup pulls from B.
+/// Checks owner-mode catchup for a late remote replica.
+/// Expected: after A registers late and B proposes one more operation, A
+/// detects the gap, pulls the missing owner log, and records `(epoch_b, 6)`.
+/// This is this crate's S2S catchup behavior for owner-scoped Mumble/shitspeak
+/// state.
 #[tokio::test]
 async fn owner_late_join_catches_up_via_log() {
     let cluster = ReplCluster::build_full_mesh(&[5, 6]).await;
     let epoch_b = cluster.cluster.nodes[1].overlay.local_boot_epoch();
     let repo_b = CountingOwnerRepo::new();
-    let h_b = cluster.register_owner(1, "clients", repo_b.clone()).unwrap();
+    let h_b = cluster
+        .register_owner(1, "clients", repo_b.clone())
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     for k in 0..5u64 {
         h_b.propose(700 + k).await.unwrap();
     }
-    let ok = wait_until(Duration::from_secs(5), || {
-        repo_b.applied_for(6).len() == 5
-    })
-    .await;
+    let ok = wait_until(Duration::from_secs(5), || repo_b.applied_for(6).len() == 5).await;
     assert!(ok, "owner B must apply its own 5 ops");
 
     // Register on A late: we get nothing automatically because owner
@@ -247,14 +256,13 @@ async fn owner_late_join_catches_up_via_log() {
     // catchup hooks fire it. So have B propose one more op after A
     // registers; A should detect a gap and pull the missing 5 + 1.
     let repo_a = CountingOwnerRepo::new();
-    let _h_a = cluster.register_owner(0, "clients", repo_a.clone()).unwrap();
+    let _h_a = cluster
+        .register_owner(0, "clients", repo_a.clone())
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     h_b.propose(999u64).await.unwrap();
 
-    let ok = wait_until(Duration::from_secs(10), || {
-        repo_a.applied_for(6).len() == 6
-    })
-    .await;
+    let ok = wait_until(Duration::from_secs(10), || repo_a.applied_for(6).len() == 6).await;
     assert!(ok, "late-joined replica must converge to all 6 ops");
     let known_a = repo_a.known_versions();
     assert_eq!(known_a.get(&6), Some(&(epoch_b, 6)));
@@ -265,14 +273,11 @@ async fn owner_late_join_catches_up_via_log() {
 // Deferred scenarios from the previous milestone — now enabled.
 // ---------------------------------------------------------------------------
 
-/// 4-node mesh, fast-quorum = 3. We install a partition chaos block of
-/// {1,2}|{3,4} BEFORE proposing so acks from 3,4 never reach the proposer
-/// (they're dropped at node 1's inbound chaos), but node 1's `alive_members`
-/// snapshot at propose-time still includes 3,4 (Hello dead-detect hasn't
-/// fired yet) so `target_set = {1,2,3,4}, fq = 3`. Once Failed events for
-/// 3,4 arrive, `on_membership_change` fires `QuorumLost` (still=2 < fq=3).
-/// Recovery cannot help the proposer because its own coord (= itself) is
-/// alive on the {1,2} side.
+/// Checks strict-replication quorum loss during a partition.
+/// Expected: a proposal that still targets four nodes loses quorum after the
+/// {1,2}|{3,4} partition is detected and returns `ReplicationError::QuorumLost`.
+/// Mumble/shitspeak do not define distributed quorum; this is this crate's S2S
+/// safety rule for replicated Mumble/shitspeak state.
 #[tokio::test]
 async fn strict_quorum_lost_on_partition() {
     let cluster = ReplCluster::build_full_mesh(&[1, 2, 3, 4]).await;
@@ -310,9 +315,10 @@ async fn strict_quorum_lost_on_partition() {
     cluster.shutdown().await;
 }
 
-/// Node C forges an `OwnerOp` claiming origin = B and sends it to B over
-/// the real overlay. B's runtime must drop the op (apply count stays
-/// zero) AND emit a warn-trace.
+/// Checks that owner-mode rejects forged local-origin operations.
+/// Expected: B drops an `OwnerOp` sent by C but claiming B's origin, applies no
+/// operation, and emits a warning trace. This is this crate's S2S integrity
+/// rule for owner-scoped state derived from Mumble/shitspeak server state.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn owner_remote_propose_dropped_with_warntrace() {
@@ -364,10 +370,10 @@ async fn owner_remote_propose_dropped_with_warntrace() {
     cluster.shutdown().await;
 }
 
-/// 3-node owner-mode cluster. A's manager has a `ForwardingShim`-style
-/// inbound filter that drops `OwnerOp{origin=B, version=2}`. B proposes
-/// 5 ops; A is missing version 2 from the natural broadcast, detects the
-/// gap on receiving version 3, fires `OwnerCatchupReq`, and converges.
+/// Checks owner-mode gap detection and catchup.
+/// Expected: when A drops B's version 2 operation, receiving version 3 triggers
+/// catchup and A eventually applies all five B operations. This is this crate's
+/// S2S repair behavior for owner-scoped Mumble/shitspeak state.
 #[tokio::test]
 async fn owner_gap_triggers_catchup() {
     let cluster = ReplCluster::build_full_mesh(&[1, 2, 3]).await;

@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    client::Client,
-    errors::MessageHandlerError,
-    messages::encoder::UserList,
-    server::Server,
+    client::Client, errors::MessageHandlerError, messages::encoder::UserList, server::Server,
 };
 
 /// UserList is intentionally a no-op.  User registration is handled
@@ -20,6 +17,10 @@ pub async fn handle_user_list(
         ));
     }
 
-    tracing::debug!(session = u32::from(sender.get_session_id()), num_users = msg.users.len(), "UserList handler (no-op)");
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        num_users = msg.users.len(),
+        "UserList handler (no-op)"
+    );
     Ok(())
 }

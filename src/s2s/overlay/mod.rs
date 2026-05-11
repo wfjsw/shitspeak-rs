@@ -37,6 +37,7 @@ mod runtime;
 #[cfg(test)]
 mod integration_tests;
 
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -69,7 +70,18 @@ impl OverlayNetwork {
         inbound: Inbound,
         cfg: OverlayConfig,
     ) -> Result<Self, OverlayError> {
-        let inner = runtime::start_inner(transport, inbound, cfg).await?;
+        Self::start_with_max_users(transport, inbound, cfg, Arc::new(AtomicU64::new(0))).await
+    }
+
+    /// Bring up the overlay with local server capacity advertised in this
+    /// node's LSA.
+    pub async fn start_with_max_users(
+        transport: ConnectionManager,
+        inbound: Inbound,
+        cfg: OverlayConfig,
+        max_users: Arc<AtomicU64>,
+    ) -> Result<Self, OverlayError> {
+        let inner = runtime::start_inner(transport, inbound, cfg, max_users).await?;
         Ok(Self { inner })
     }
 
@@ -119,6 +131,20 @@ impl OverlayNetwork {
     /// IDs of every origin with a current non-tombstone LSA.
     pub fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.inner.table.alive_members()
+    }
+
+    /// Sum local max_users advertised by alive cluster members.
+    pub fn alive_max_users(&self) -> u64 {
+        self.inner.table.alive_max_users()
+    }
+
+    /// Publish a changed local max_users value in the next local LSA.
+    pub fn update_local_max_users(&self, max_users: u64) {
+        self.inner
+            .emitter
+            .max_users
+            .store(max_users, std::sync::atomic::Ordering::Relaxed);
+        self.inner.emitter.poke_force();
     }
 
     /// Subscribe to the membership-event stream. Each subscriber receives
@@ -208,7 +234,11 @@ impl OverlayNetwork {
     /// Look up the next-hop for `dst` at `level`. Returns `None` if no
     /// route is known.
     pub fn route_to(&self, dst: NodeIdentifier, level: ServiceLevel) -> Option<NodeIdentifier> {
-        self.inner.routing.load().lookup(dst, level).map(|e| e.next_hop)
+        self.inner
+            .routing
+            .load()
+            .lookup(dst, level)
+            .map(|e| e.next_hop)
     }
 
     /// Announce graceful leave (tombstone LSA flood) to every direct

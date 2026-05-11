@@ -7,6 +7,11 @@ use crate::channels::Channel;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::Message;
 
+/// Checks that a user's own channel move is broadcast to other clients.
+/// Expected: Alice receives Bob's `UserState` with the new channel id. This is
+/// the Mumble `UserState.channel_id` move behavior implemented in
+/// `D:\mumble\src\murmur\Messages.cpp::msgUserState` and mirrored by
+/// `D:\shitspeak\message.go::handleUserStateMessage`.
 #[tokio::test]
 async fn self_move_broadcasts_to_peer() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -45,6 +50,11 @@ async fn self_move_broadcasts_to_peer() {
     assert!(saw.is_some(), "Alice should see Bob's self-move to lobby");
 }
 
+/// Checks that a moderator can move another user and the target sees the move.
+/// Expected: Bob receives a `UserState` placing his own session in the target
+/// channel. Mumble implements this as a privileged `UserState` update in
+/// `D:\mumble\src\murmur\Messages.cpp::msgUserState`; shitspeak follows the
+/// same permission and broadcast path in `D:\shitspeak\message.go::handleUserStateMessage`.
 #[tokio::test]
 async fn moderator_move_other() {
     let server = spawn_test_server(TestServerOpts::default()).await;

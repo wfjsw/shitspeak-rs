@@ -9,10 +9,9 @@ use prost::Message as _;
 use crate::s2s_application_proto as pb;
 
 pub use pb::{
-    moderation_envelope::Command as ModerationCommand, ModerationEnvelope, UserRemovePatch,
-    UserStatePatch, VoiceFrame,
-    user_stats_envelope::Kind as UserStatsKind,
-    UserStatsEnvelope, UserStatsReply, UserStatsRequest,
+    moderation_envelope::Command as ModerationCommand, user_stats_envelope::Kind as UserStatsKind,
+    ModerationEnvelope, UserRemovePatch, UserStatePatch, UserStatsEnvelope, UserStatsReply,
+    UserStatsRequest, VoiceFrame,
 };
 
 /// Reserved overlay service tag for moderation envelopes.

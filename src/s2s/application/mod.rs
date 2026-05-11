@@ -68,15 +68,9 @@ impl ApplicationLayer {
     /// Spawns per-service dispatch tasks and registers the L3 handlers.
     pub fn new(overlay: OverlayNetwork, cfg: ApplicationConfig) -> Arc<Self> {
         let shutdown = CancellationToken::new();
-        let moderation =
-            ModerationService::new(overlay.clone(), shutdown.child_token());
-        let user_stats =
-            UserStatsService::new(overlay.clone(), shutdown.child_token());
-        let voice = VoiceService::new(
-            overlay.clone(),
-            cfg.voice.clone(),
-            shutdown.child_token(),
-        );
+        let moderation = ModerationService::new(overlay.clone(), shutdown.child_token());
+        let user_stats = UserStatsService::new(overlay.clone(), shutdown.child_token());
+        let voice = VoiceService::new(overlay.clone(), cfg.voice.clone(), shutdown.child_token());
 
         overlay.register_service(MODERATION_SERVICE_TAG, moderation.inbound_handler());
         overlay.register_service(USER_STATS_SERVICE_TAG, user_stats.inbound_handler());
@@ -107,8 +101,12 @@ impl ApplicationLayer {
     /// Cancel all background tasks and unregister the L3 handlers.
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
-        self.inner.overlay.unregister_service(MODERATION_SERVICE_TAG);
-        self.inner.overlay.unregister_service(USER_STATS_SERVICE_TAG);
+        self.inner
+            .overlay
+            .unregister_service(MODERATION_SERVICE_TAG);
+        self.inner
+            .overlay
+            .unregister_service(USER_STATS_SERVICE_TAG);
         self.inner.overlay.unregister_service(VOICE_SERVICE_TAG);
     }
 }

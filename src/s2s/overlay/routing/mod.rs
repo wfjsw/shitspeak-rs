@@ -49,11 +49,7 @@ impl RoutingTables {
     ///   Operators who deploy KCP/QUIC alongside TCP get the latency
     ///   benefit; clusters without KCP/QUIC still get their RLL traffic
     ///   delivered.
-    pub fn lookup(
-        &self,
-        dst: NodeIdentifier,
-        level: ServiceLevel,
-    ) -> Option<RouteEntry> {
+    pub fn lookup(&self, dst: NodeIdentifier, level: ServiceLevel) -> Option<RouteEntry> {
         if let Some(e) = self.for_level(level).get(&dst) {
             return Some(*e);
         }

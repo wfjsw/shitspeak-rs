@@ -1,5 +1,5 @@
-use crate::messages::Message;
 use super::RejectType;
+use crate::messages::Message;
 
 #[derive(Debug, Clone)]
 pub struct Reject {

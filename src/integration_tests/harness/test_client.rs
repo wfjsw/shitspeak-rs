@@ -14,9 +14,7 @@ use std::time::Duration;
 use bytes::{BufMut as _, Bytes, BytesMut};
 use parking_lot::Mutex as PMutex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use rustls::pki_types::{
-    pem::PemObject as _, CertificateDer, PrivateKeyDer, ServerName,
-};
+use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
@@ -29,12 +27,11 @@ use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::crypt::CryptState;
 use crate::integration_tests::harness::TestServer;
 use crate::messages::encoder::{
-    Authenticate, ChanAcl, ChannelRemove, ClientType, UserRemove, UserState, Version,
-    VoiceTarget,
+    Authenticate, ChanAcl, ChannelRemove, ClientType, UserRemove, UserState, Version, VoiceTarget,
 };
 use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use crate::protocol_version::ProtocolVersion;
-use crate::voice::codec::{Audio, AudioPayload, OpusPayload, PacketFormat, IncomingUdpPacket};
+use crate::voice::codec::{Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat};
 
 /// Build a Mumble-legacy client→server Opus voice packet.
 ///
@@ -140,7 +137,10 @@ fn decode_legacy_server_voice(data: &[u8]) -> Option<Audio> {
         target,
         sender_session: Some(ClientSessionIdentifier::from(sender_session as u32)),
         frame_number,
-        audio_payload: AudioPayload::Opus(OpusPayload { frame: opus_data, is_terminator }),
+        audio_payload: AudioPayload::Opus(OpusPayload {
+            frame: opus_data,
+            is_terminator,
+        }),
         positional_data,
         volume_adjustment: 1.0,
         format: PacketFormat::Legacy,
@@ -177,8 +177,7 @@ fn encode_legacy_client_voice_ex(
     let mut buf = BytesMut::with_capacity(1 + 4 + 4 + opus.len() + pos_len);
     buf.put_u8((0x04u8 << 5) | (target as u8 & 0x1f));
     write_pds_varint(&mut buf, frame_number);
-    let size_flag =
-        (opus.len() as u64 & 0x1FFF) | if is_terminator { 0x2000 } else { 0 };
+    let size_flag = (opus.len() as u64 & 0x1FFF) | if is_terminator { 0x2000 } else { 0 };
     write_pds_varint(&mut buf, size_flag);
     buf.extend_from_slice(opus);
     if let Some([x, y, z]) = positional {
@@ -276,6 +275,12 @@ pub struct TestClient {
     _reader: JoinHandle<()>,
 }
 
+impl Drop for TestClient {
+    fn drop(&mut self) {
+        self._reader.abort();
+    }
+}
+
 impl TestClient {
     /// Connect to `server`, send Version + Authenticate, wait for ServerSync,
     /// and return the live client. Buffers the full burst of intermediate
@@ -286,7 +291,14 @@ impl TestClient {
         username: &str,
         password: Option<&str>,
     ) -> Result<TestClient, ConnectError> {
-        Self::connect_with(server, username, password, true, ProtocolVersion::new(1, 5, 0)).await
+        Self::connect_with(
+            server,
+            username,
+            password,
+            true,
+            ProtocolVersion::new(1, 5, 0),
+        )
+        .await
     }
 
     /// Connect declaring an explicit protocol version in the `Version`
@@ -309,7 +321,14 @@ impl TestClient {
         username: &str,
         password: Option<&str>,
     ) -> Result<TestClient, ConnectError> {
-        Self::connect_with(server, username, password, false, ProtocolVersion::new(1, 5, 0)).await
+        Self::connect_with(
+            server,
+            username,
+            password,
+            false,
+            ProtocolVersion::new(1, 5, 0),
+        )
+        .await
     }
 
     async fn connect_with(
@@ -348,8 +367,7 @@ impl TestClient {
         // ── Build TLS client config ───────────────────────────────────────
         let cfg_builder = ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-            ;
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert));
         let cfg = if present_client_cert {
             let cert_der = CertificateDer::from(cert_der_owned.clone());
             let key_der: PrivateKeyDer<'static> =
@@ -479,10 +497,8 @@ impl TestClient {
     /// SHA-1 of the DER-encoded client certificate, matching what the server
     /// records in `certificate_hash`.
     pub fn cert_sha1(&self) -> Vec<u8> {
-        let digest = aws_lc_rs::digest::digest(
-            &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
-            &self.cert_der,
-        );
+        let digest =
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY, &self.cert_der);
         digest.as_ref().to_vec()
     }
 
@@ -688,12 +704,7 @@ impl TestClient {
 
     /// Send a voice frame as a `Message::UDPTunnel` using the protobuf
     /// (Mumble 1.5+) wire format — what the official client emits.
-    pub async fn send_voice_tcp_protobuf(
-        &self,
-        target: u32,
-        frame_number: u64,
-        opus: Bytes,
-    ) {
+    pub async fn send_voice_tcp_protobuf(&self, target: u32, frame_number: u64, opus: Bytes) {
         let bytes = encode_protobuf_client_voice(target, frame_number, &opus);
         self.send(Message::UDPTunnel(bytes)).await;
     }
@@ -738,13 +749,8 @@ impl TestClient {
         opus: Bytes,
         positional: [f32; 3],
     ) {
-        let bytes = encode_protobuf_client_voice_ex(
-            target,
-            frame_number,
-            &opus,
-            false,
-            Some(positional),
-        );
+        let bytes =
+            encode_protobuf_client_voice_ex(target, frame_number, &opus, false, Some(positional));
         self.send(Message::UDPTunnel(bytes)).await;
     }
 

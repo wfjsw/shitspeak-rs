@@ -1,7 +1,10 @@
-use core::option::Option;
 use bytes::Bytes;
+use core::option::Option;
 
-use crate::{client::client_session_identifier::ClientSessionIdentifier, messages::{Message, errors::UserStateProtocolError}};
+use crate::{
+    client::client_session_identifier::ClientSessionIdentifier,
+    messages::{errors::UserStateProtocolError, Message},
+};
 
 #[derive(Debug, Clone)]
 pub struct VolumeAdjustment {
@@ -10,10 +13,16 @@ pub struct VolumeAdjustment {
 }
 
 impl TryFrom<crate::mumble_proto::user_state::VolumeAdjustment> for VolumeAdjustment {
-    fn try_from(proto: crate::mumble_proto::user_state::VolumeAdjustment) -> Result<Self, Self::Error> {
+    fn try_from(
+        proto: crate::mumble_proto::user_state::VolumeAdjustment,
+    ) -> Result<Self, Self::Error> {
         Ok(Self {
-            listening_channel: proto.listening_channel.ok_or(UserStateProtocolError::VolumeAdjustmentMissingListeningChannel)?,
-            volume_adjustment: proto.volume_adjustment.ok_or(UserStateProtocolError::VolumeAdjustmentMissingValue)?,
+            listening_channel: proto
+                .listening_channel
+                .ok_or(UserStateProtocolError::VolumeAdjustmentMissingListeningChannel)?,
+            volume_adjustment: proto
+                .volume_adjustment
+                .ok_or(UserStateProtocolError::VolumeAdjustmentMissingValue)?,
         })
     }
 
@@ -72,15 +81,18 @@ impl TryFrom<crate::mumble_proto::UserState> for UserState {
             temporary_access_tokens: proto.temporary_access_tokens,
             listening_channel_add: proto.listening_channel_add,
             listening_channel_remove: proto.listening_channel_remove,
-            listening_volume_adjustment: proto.listening_volume_adjustment.into_iter().map(|va| va.try_into()).collect::<Result<_, _>>()?,
+            listening_volume_adjustment: proto
+                .listening_volume_adjustment
+                .into_iter()
+                .map(|va| va.try_into())
+                .collect::<Result<_, _>>()?,
         })
     }
 
     type Error = UserStateProtocolError;
 }
 
-impl UserState {
-}
+impl UserState {}
 
 impl Default for UserState {
     fn default() -> Self {
@@ -137,10 +149,14 @@ impl Into<crate::mumble_proto::UserState> for UserState {
             temporary_access_tokens: self.temporary_access_tokens,
             listening_channel_add: self.listening_channel_add,
             listening_channel_remove: self.listening_channel_remove,
-            listening_volume_adjustment: self.listening_volume_adjustment.into_iter().map(|va| crate::mumble_proto::user_state::VolumeAdjustment {
-                listening_channel: Some(va.listening_channel),
-                volume_adjustment: Some(va.volume_adjustment),
-            }).collect(),
+            listening_volume_adjustment: self
+                .listening_volume_adjustment
+                .into_iter()
+                .map(|va| crate::mumble_proto::user_state::VolumeAdjustment {
+                    listening_channel: Some(va.listening_channel),
+                    volume_adjustment: Some(va.volume_adjustment),
+                })
+                .collect(),
         }
     }
 }

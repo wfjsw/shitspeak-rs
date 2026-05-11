@@ -123,11 +123,7 @@ async fn sendmmsg_linux(
         let sent = ret as usize;
         if sent < chunk.len() {
             // Some messages weren't sent — log but don't fail the whole batch
-            tracing::warn!(
-                "sendmmsg sent {}/{} datagrams",
-                sent,
-                chunk.len()
-            );
+            tracing::warn!("sendmmsg sent {}/{} datagrams", sent, chunk.len());
         }
     }
 

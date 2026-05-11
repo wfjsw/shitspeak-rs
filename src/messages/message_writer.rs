@@ -2,7 +2,10 @@ use crate::{errors::WriteProtoMessageError, messages::Message};
 use bytes::BytesMut;
 
 pub trait WriteMessageExt {
-    async fn write_proto_message(&mut self, message: &Message) -> Result<(), WriteProtoMessageError>;
+    async fn write_proto_message(
+        &mut self,
+        message: &Message,
+    ) -> Result<(), WriteProtoMessageError>;
 
     /// Encode all `messages` into a single flat buffer and issue one `write_all`.
     ///
@@ -12,11 +15,17 @@ pub trait WriteMessageExt {
     /// write_all).  This helper collapses the entire burst into a single
     /// contiguous allocation and a single `write_all`, matching the spirit of
     /// `sendmmsg` on the UDP path.
-    async fn write_proto_message_batch(&mut self, messages: &[Message]) -> Result<(), WriteProtoMessageError>;
+    async fn write_proto_message_batch(
+        &mut self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError>;
 }
 
 impl<T: tokio::io::AsyncWriteExt + Unpin> WriteMessageExt for T {
-    async fn write_proto_message(&mut self, message: &Message) -> Result<(), WriteProtoMessageError> {
+    async fn write_proto_message(
+        &mut self,
+        message: &Message,
+    ) -> Result<(), WriteProtoMessageError> {
         let proto_tag = message.proto_tag();
         let length = message.encoded_len();
         // Encode header + payload into one buffer to minimise syscalls.
@@ -28,16 +37,16 @@ impl<T: tokio::io::AsyncWriteExt + Unpin> WriteMessageExt for T {
         Ok(())
     }
 
-    async fn write_proto_message_batch(&mut self, messages: &[Message]) -> Result<(), WriteProtoMessageError> {
+    async fn write_proto_message_batch(
+        &mut self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
         if messages.is_empty() {
             return Ok(());
         }
 
         // Pre-calculate total capacity: 6 bytes header + payload per message.
-        let total = messages
-            .iter()
-            .map(|m| 6 + m.encoded_len())
-            .sum();
+        let total = messages.iter().map(|m| 6 + m.encoded_len()).sum();
 
         let mut buf = BytesMut::with_capacity(total);
 

@@ -4,40 +4,32 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use chrono::{DateTime, Utc};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use parking_lot::{
-    MappedMutexGuard as ParkingMappedMutexGuard,
-    Mutex as ParkingMutex,
-    MutexGuard as ParkingMutexGuard,
-    RwLock as ParkingRwLock,
-    RwLockReadGuard as ParkingRwLockReadGuard,
-    RwLockWriteGuard as ParkingRwLockWriteGuard,
+    MappedMutexGuard as ParkingMappedMutexGuard, Mutex as ParkingMutex,
+    MutexGuard as ParkingMutexGuard, RwLock as ParkingRwLock,
+    RwLockReadGuard as ParkingRwLockReadGuard, RwLockWriteGuard as ParkingRwLockWriteGuard,
 };
 use tokio::{
-    io::{ReadHalf, WriteHalf},
+    io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
     net::TcpStream,
-    sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard, mpsc},
+    sync::{mpsc, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard},
 };
 use tokio_rustls::server::TlsStream;
 
 use crate::{
     client::{
-        client_global_state::ClientGlobalState,
-        client_local_state::ClientLocalState,
-        client_session_identifier::ClientSessionIdentifier,
-        client_stats::ClientStats,
-        crypt::CryptState,
-        global_state_guard::GlobalStateWriteGuard,
-        options::ClientOptions,
-        udp_state::UdpState,
-        user_info::UserInfoExtended,
+        client_global_state::ClientGlobalState, client_local_state::ClientLocalState,
+        client_session_identifier::ClientSessionIdentifier, client_stats::ClientStats,
+        crypt::CryptState, global_state_guard::GlobalStateWriteGuard, options::ClientOptions,
+        udp_state::UdpState, user_info::UserInfoExtended,
     },
     client_repository::ClientRepository,
     errors::{ReadProtoMessageError, WriteProtoMessageError},
-    messages::{Message, ReadMessageExt, WriteMessageExt, encoder as msg_encoder},
-    voice::VoiceRoutingPayload,
+    messages::{encoder as msg_encoder, Message, ReadMessageExt, WriteMessageExt},
     protocol_version::ProtocolVersion,
+    voice::VoiceRoutingPayload,
 };
 
 const VOICE_ROUTING_QUEUE_CAPACITY: usize = 256;
@@ -65,8 +57,8 @@ pub struct Client {
     udp_address: ParkingRwLock<Option<SocketAddr>>,
     local_address: SocketAddr,
 
-    connection_rx: AsyncMutex<ReadHalf<TlsStream<TcpStream>>>,
-    connection_tx: AsyncMutex<WriteHalf<TlsStream<TcpStream>>>,
+    connection_rx: Option<AsyncMutex<ReadHalf<TlsStream<TcpStream>>>>,
+    connection_tx: Option<AsyncMutex<WriteHalf<TlsStream<TcpStream>>>>,
     is_verified: bool,
 
     // Statistics
@@ -132,28 +124,27 @@ impl Client {
     ) -> Box<Self> {
         let (certificate_hash, is_verified) = {
             let (_, tls_connection) = connection.get_ref();
-            let cert_hash = match tls_connection.peer_certificates() {
-                Some([cert, ..]) => {
-                    Some(Bytes::copy_from_slice(
-                        aws_lc_rs::digest::digest(
-                            &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
-                            cert.as_ref(),
-                        )
-                        .as_ref(),
-                    ))
-                }
+            let certificate_hash = match tls_connection.peer_certificates() {
+                Some([cert, ..]) => Some(Bytes::copy_from_slice(
+                    aws_lc_rs::digest::digest(
+                        &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                        cert.as_ref(),
+                    )
+                    .as_ref(),
+                )),
                 _ => None,
             };
-            let verified = tls_connection.peer_certificates().map_or(false, |c| !c.is_empty());
-            (cert_hash, verified)
+            let is_verified = tls_connection
+                .peer_certificates()
+                .map_or(false, |certs| !certs.is_empty());
+            (certificate_hash, is_verified)
         };
 
         let now = Utc::now();
 
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
-        let (voice_tcp_tx, voice_tcp_rx) =
-            mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
+        let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
 
         let (connection_rx, connection_tx) = tokio::io::split(connection);
 
@@ -163,8 +154,8 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
-            connection_rx: AsyncMutex::new(connection_rx),
-            connection_tx: AsyncMutex::new(connection_tx),
+            connection_rx: Some(AsyncMutex::new(connection_rx)),
+            connection_tx: Some(AsyncMutex::new(connection_tx)),
             is_verified,
             login_time: now,
             last_active: ParkingMutex::new(now),
@@ -182,6 +173,52 @@ impl Client {
             voice_tcp_tx,
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
             published: AtomicBool::new(false),
+            prefer_tcp_tunnel: AtomicBool::new(false),
+            protocol_version: AtomicU64::new(0),
+            last_client_version: ParkingMutex::new(HashMap::new()),
+            last_channel_version: ParkingMutex::new(0),
+        })
+    }
+
+    pub fn new_remote(
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        udp_address: Option<SocketAddr>,
+        local_address: SocketAddr,
+        cert_hash: Option<Bytes>,
+        login_time: DateTime<Utc>,
+    ) -> Box<Self> {
+        let is_verified = cert_hash.is_some();
+        let (voice_routing_tx, voice_routing_rx) =
+            mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
+        let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
+
+        Box::new(Client {
+            session_id,
+            real_ip_address,
+            tcp_address,
+            udp_address: ParkingRwLock::new(udp_address),
+            local_address,
+            connection_rx: None,
+            connection_tx: None,
+            is_verified,
+            login_time,
+            last_active: ParkingMutex::new(login_time),
+            last_ping: ParkingMutex::new(login_time),
+            udp_state: None,
+            stats: RwLock::new(ClientStats::default()),
+            certificate_hash: cert_hash,
+            user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
+            options: RwLock::new(ClientOptions::default()),
+            local_state: ParkingRwLock::new(None),
+            global_state: ParkingRwLock::new(ClientGlobalState::new()),
+            crypt_state: ParkingMutex::new(None),
+            voice_routing_tx,
+            voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
+            voice_tcp_tx,
+            voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
+            published: AtomicBool::new(true),
             prefer_tcp_tunnel: AtomicBool::new(false),
             protocol_version: AtomicU64::new(0),
             last_client_version: ParkingMutex::new(HashMap::new()),
@@ -274,13 +311,22 @@ impl Client {
         self.global_state.read().get_current_channel_id()
     }
 
-    pub fn set_current_channel_id(&self, channel_id: u32, repo: &ClientRepository, channel_version: u64) {
+    pub fn set_current_channel_id(
+        &self,
+        channel_id: u32,
+        repo: &ClientRepository,
+        channel_version: u64,
+    ) {
         let mut gs = self.write_global_state_as(repo, Some(self.session_id), Some(channel_version));
         gs.set_current_channel_id(channel_id);
     }
 
     pub fn get_user_id(&self) -> Option<u32> {
         self.global_state.read().get_user_id()
+    }
+
+    pub fn get_acl_generation(&self) -> u64 {
+        self.global_state.read().get_acl_generation()
     }
 
     // pub fn get_display_name(&self) -> Option<String> {
@@ -316,42 +362,60 @@ impl Client {
     pub fn get_login_time(&self) -> DateTime<Utc> {
         self.login_time
     }
-    // FIXME: not sure if it is verified or just exists
-    pub async fn is_verified(&self) -> bool {
+
+    pub fn is_verified(&self) -> bool {
         self.is_verified
     }
 
-    pub fn disconnect(&self) {
-        todo!();
+    pub async fn disconnect(&self) -> Result<(), WriteProtoMessageError> {
+        let Some(connection_tx) = &self.connection_tx else {
+            return Ok(());
+        };
+
+        let mut guard = connection_tx.lock().await;
+        guard.shutdown().await?;
+        Ok(())
     }
 
     pub async fn read_proto_message(&self) -> Result<Message, ReadProtoMessageError> {
-        let mut guard = self.connection_rx.lock().await;
+        let Some(connection_rx) = &self.connection_rx else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "remote client has no local connection",
+            )
+            .into());
+        };
+        let mut guard = connection_rx.lock().await;
         guard.read_proto_message().await
     }
 
-    // TODO: instead of a straight write, this should be actually queued and batched so to reduce
-    // the number of syscalls and TLS record overhead, when there is a burst of messages to send. 
-    // When doing it, we should also ensure that messages are not delayed too much. 
-    // That may requires some careful engineering.
     pub async fn write_proto_message(
         &self,
         message: &Message,
     ) -> Result<(), WriteProtoMessageError> {
-        let mut guard = self.connection_tx.lock().await;
+        let Some(connection_tx) = &self.connection_tx else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "remote client has no local connection",
+            )
+            .into());
+        };
+        let mut guard = connection_tx.lock().await;
         guard.write_proto_message(message).await
     }
 
-    /// Send multiple messages in a single syscall burst.
-    ///
-    /// Serialises all messages into one contiguous buffer and issues a single
-    /// `write_all`, avoiding the per-message syscall overhead that would
-    /// accumulate when sending channel trees or user-state bursts.
     pub async fn write_proto_message_batch(
         &self,
         messages: &[Message],
     ) -> Result<(), WriteProtoMessageError> {
-        let mut guard = self.connection_tx.lock().await;
+        let Some(connection_tx) = &self.connection_tx else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "remote client has no local connection",
+            )
+            .into());
+        };
+        let mut guard = connection_tx.lock().await;
         guard.write_proto_message_batch(messages).await
     }
 
@@ -395,10 +459,7 @@ impl Client {
         }
     }
 
-    pub fn create_crypt_state(
-        &self,
-        mode: &str,
-    ) -> Result<(), crate::client::crypt::CryptError> {
+    pub fn create_crypt_state(&self, mode: &str) -> Result<(), crate::client::crypt::CryptError> {
         let mut state = self.crypt_state.lock();
         let rng = aws_lc_rs::rand::SystemRandom::new();
         *state = Some(CryptState::generate(mode, &rng)?);
@@ -408,7 +469,10 @@ impl Client {
     pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) {
         let payload = VoiceRoutingPayload { decoded_audio };
         if self.voice_routing_tx.try_send(payload).is_err() {
-            tracing::trace!(session = u32::from(self.session_id), "voice routing queue full or closed, dropping packet");
+            tracing::trace!(
+                session = u32::from(self.session_id),
+                "voice routing queue full or closed, dropping packet"
+            );
         }
     }
 
@@ -472,7 +536,7 @@ impl Client {
         let local_state_guard = self.local_state.read();
         match &*local_state_guard {
             Some(state) => state.is_authenticated(),
-            None => panic!("Accessing local state on remote user"),
+            None => true,
         }
     }
 
@@ -504,12 +568,9 @@ impl Client {
         let v = version.unwrap_or(ProtocolVersion::new(1, 2, 0));
         let packed: u64 = u64::from(v) | PROTOCOL_VERSION_SET_BIT;
         // CAS so the first writer wins; later callers (if any) silently no-op.
-        let _ = self.protocol_version.compare_exchange(
-            0,
-            packed,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ =
+            self.protocol_version
+                .compare_exchange(0, packed, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Returns the negotiated client protocol version, or `None` if the
@@ -589,7 +650,13 @@ impl Client {
         channel_version_dep: Option<u64>,
     ) -> GlobalStateWriteGuard<'a> {
         let inner = self.global_state.write();
-        GlobalStateWriteGuard::new(inner, repo, self.session_id, sender_session_id, channel_version_dep)
+        GlobalStateWriteGuard::new(
+            inner,
+            repo,
+            self.session_id,
+            sender_session_id,
+            channel_version_dep,
+        )
     }
 
     /// Direct (non-transactional) write access to `ClientGlobalState`.
@@ -622,15 +689,31 @@ impl Client {
             deaf: if gs.is_deafened() { Some(true) } else { None },
             suppress: if gs.is_suppressed() { Some(true) } else { None },
             self_mute: if gs.is_self_muted() { Some(true) } else { None },
-            self_deaf: if gs.is_self_deafened() { Some(true) } else { None },
+            self_deaf: if gs.is_self_deafened() {
+                Some(true)
+            } else {
+                None
+            },
             texture: None,
-            plugin_context: if gs.get_plugin_context().is_empty() { None } else { Some(Bytes::copy_from_slice(gs.get_plugin_context())) },
-            plugin_identity: if gs.get_plugin_identity().is_empty() { None } else { Some(gs.get_plugin_identity().to_owned()) },
+            plugin_context: if gs.get_plugin_context().is_empty() {
+                None
+            } else {
+                Some(Bytes::copy_from_slice(gs.get_plugin_context()))
+            },
+            plugin_identity: if gs.get_plugin_identity().is_empty() {
+                None
+            } else {
+                Some(gs.get_plugin_identity().to_owned())
+            },
             comment: None,
             hash: self.certificate_hash.as_ref().map(|h| hex::encode(h)),
             comment_hash: comment_hash_bytes,
             texture_hash: texture_hash_bytes,
-            priority_speaker: if gs.is_priority_speaker() { Some(true) } else { None },
+            priority_speaker: if gs.is_priority_speaker() {
+                Some(true)
+            } else {
+                None
+            },
             recording: if gs.is_recording() { Some(true) } else { None },
             temporary_access_tokens: Vec::new(),
             listening_channel_add: gs.get_listening_channel_id().iter().copied().collect(),

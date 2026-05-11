@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::{
     acl::ACLPermissions,
@@ -21,7 +21,15 @@ pub async fn handle_user_state(
     }
 
     let sender_id = sender.get_session_id();
-    tracing::debug!(session = u32::from(sender_id), self_mute = msg.self_mute, self_deaf = msg.self_deaf, mute = msg.mute, deaf = msg.deaf, channel_id = msg.channel_id, "UserState handler");
+    tracing::debug!(
+        session = u32::from(sender_id),
+        self_mute = msg.self_mute,
+        self_deaf = msg.self_deaf,
+        mute = msg.mute,
+        deaf = msg.deaf,
+        channel_id = msg.channel_id,
+        "UserState handler"
+    );
     let repo = server.get_clients();
     let local_node_id = repo.local_node_id();
 
@@ -36,9 +44,7 @@ pub async fn handle_user_state(
     // owner's apply path still enforces permissions; we just don't
     // short-circuit `PermissionDenied` on the originator yet.
     if let Some(target_session_id) = msg.session {
-        if target_session_id != sender_id
-            && target_session_id.get_node_id() != local_node_id
-        {
+        if target_session_id != sender_id && target_session_id.get_node_id() != local_node_id {
             if let Some(app) = server.s2s_manager().application() {
                 let patch = crate::s2s::application::proto::UserStatePatch {
                     channel_id: msg.channel_id,
@@ -108,59 +114,107 @@ pub async fn handle_user_state(
             }));
         }
 
-        let dst_perms = crate::client::acl::compute_permissions_for_client(server, &target, new_channel_id).await;
+        let dst_perms =
+            crate::client::acl::compute_permissions_for_client(server, &target, new_channel_id)
+                .await;
         target_destination_perms = Some(dst_perms);
 
         if is_self {
             // Moving self: need Enter on destination.
             if !dst_perms.contains(ACLPermissions::Enter) {
                 return Err(MessageHandlerError::PermissionDenied(
-                    PermissionDenied::for_permission(u32::from(target_id), Some(new_channel_id), ACLPermissions::Enter),
+                    PermissionDenied::for_permission(
+                        u32::from(target_id),
+                        Some(new_channel_id),
+                        ACLPermissions::Enter,
+                    ),
                 ));
             }
         } else {
             // Moving others: need Move on target's current channel.
-            let src_perms = crate::client::acl::compute_permissions_for_client(server, sender, target_current_channel_id).await;
+            let src_perms = crate::client::acl::compute_permissions_for_client(
+                server,
+                sender,
+                target_current_channel_id,
+            )
+            .await;
             actor_source_perms = Some(src_perms);
             if !src_perms.contains(ACLPermissions::Move) {
                 return Err(MessageHandlerError::PermissionDenied(
-                    PermissionDenied::for_permission(u32::from(sender_id), Some(target_current_channel_id), ACLPermissions::Move),
+                    PermissionDenied::for_permission(
+                        u32::from(sender_id),
+                        Some(target_current_channel_id),
+                        ACLPermissions::Move,
+                    ),
                 ));
             }
 
             // If target lacks Enter on destination, actor needs Move on destination too.
             if !dst_perms.contains(ACLPermissions::Enter) {
-                let actor_dst = crate::client::acl::compute_permissions_for_client(server, sender, new_channel_id).await;
+                let actor_dst = crate::client::acl::compute_permissions_for_client(
+                    server,
+                    sender,
+                    new_channel_id,
+                )
+                .await;
                 if !actor_dst.contains(ACLPermissions::Move) {
                     return Err(MessageHandlerError::PermissionDenied(
-                        PermissionDenied::for_permission(u32::from(sender_id), Some(new_channel_id), ACLPermissions::Move),
+                        PermissionDenied::for_permission(
+                            u32::from(sender_id),
+                            Some(new_channel_id),
+                            ACLPermissions::Move,
+                        ),
                     ));
                 }
             }
 
             if !src_perms.contains(ACLPermissions::Traverse) {
                 return Err(MessageHandlerError::PermissionDenied(
-                    PermissionDenied::for_permission(u32::from(sender_id), Some(target_current_channel_id), ACLPermissions::Traverse),
+                    PermissionDenied::for_permission(
+                        u32::from(sender_id),
+                        Some(target_current_channel_id),
+                        ACLPermissions::Traverse,
+                    ),
                 ));
             }
 
             if !dst_perms.contains(ACLPermissions::Traverse) {
                 return Err(MessageHandlerError::PermissionDenied(
-                    PermissionDenied::for_permission(u32::from(target_id), Some(new_channel_id), ACLPermissions::Traverse),
+                    PermissionDenied::for_permission(
+                        u32::from(target_id),
+                        Some(new_channel_id),
+                        ACLPermissions::Traverse,
+                    ),
                 ));
             }
         }
     }
 
     // ── ACL: Mute/deaf/suppress/priority_speaker (moderator actions) ──────
-    if !is_self && (msg.mute.is_some() || msg.deaf.is_some() || msg.suppress.is_some() || msg.priority_speaker.is_some()) {
+    if !is_self
+        && (msg.mute.is_some()
+            || msg.deaf.is_some()
+            || msg.suppress.is_some()
+            || msg.priority_speaker.is_some())
+    {
         let perms = match actor_source_perms {
             Some(perms) => perms,
-            None => crate::client::acl::compute_permissions_for_client(server, sender, target_current_channel_id).await,
+            None => {
+                crate::client::acl::compute_permissions_for_client(
+                    server,
+                    sender,
+                    target_current_channel_id,
+                )
+                .await
+            }
         };
         if !perms.contains(ACLPermissions::MuteDeafen) {
             return Err(MessageHandlerError::PermissionDenied(
-                PermissionDenied::for_permission(u32::from(sender_id), Some(target_current_channel_id), ACLPermissions::MuteDeafen),
+                PermissionDenied::for_permission(
+                    u32::from(sender_id),
+                    Some(target_current_channel_id),
+                    ACLPermissions::MuteDeafen,
+                ),
             ));
         }
     }
@@ -171,10 +225,15 @@ pub async fn handle_user_state(
         if !checked_listen_channels.insert(*ch_id) {
             continue;
         }
-        let perms = crate::client::acl::compute_permissions_for_client(server, sender, *ch_id).await;
+        let perms =
+            crate::client::acl::compute_permissions_for_client(server, sender, *ch_id).await;
         if !perms.contains(ACLPermissions::Listen) {
             return Err(MessageHandlerError::PermissionDenied(
-                PermissionDenied::for_permission(u32::from(sender_id), Some(*ch_id), ACLPermissions::Listen),
+                PermissionDenied::for_permission(
+                    u32::from(sender_id),
+                    Some(*ch_id),
+                    ACLPermissions::Listen,
+                ),
             ));
         }
     }
@@ -243,7 +302,6 @@ pub async fn handle_user_state(
             }
         }
     }
-
 
     if let Some(priority_speaker) = msg.priority_speaker {
         if gs.is_priority_speaker() != priority_speaker {

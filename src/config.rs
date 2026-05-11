@@ -1,15 +1,42 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::Deserialize;
 use config::{Config as ConfigCrate, Environment, File};
+use serde::Deserialize;
 
 use crate::s2s::application::ApplicationConfig;
 use crate::s2s::overlay::OverlayTuning;
 use crate::s2s::replications::ReplicationTuning;
-use crate::s2s::transport::TransportTuning;
+use crate::s2s::transport::{PeerAddress, TransportConfig, TransportKind, TransportTuning};
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct S2sConfig {
+    /// S2S is explicit opt-in. Disabled configs do not need PKI/listen fields.
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub ca_path: Option<PathBuf>,
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+
+    #[serde(default)]
+    pub tcp_listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub kcp_listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub quic_listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub udp_listen: Option<SocketAddr>,
+
+    #[serde(default)]
+    pub persistence_dir: Option<PathBuf>,
+
+    #[serde(default)]
+    pub seed_addresses: Vec<S2sSeedAddressConfig>,
+
     /// L3 application-layer tunables (moderation + voice). Lives under
     /// `[s2s.application.*]` in TOML.
     #[serde(default)]
@@ -28,6 +55,112 @@ pub struct S2sConfig {
     /// `[s2s.replications.*]` in TOML.
     #[serde(default)]
     pub replications: ReplicationTuning,
+}
+
+impl S2sConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn transport_config(&self) -> Result<Option<TransportConfig>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        let ca_path = self
+            .ca_path
+            .clone()
+            .ok_or_else(|| "s2s.enabled=true requires s2s.ca_path".to_string())?;
+        let cert_path = self
+            .cert_path
+            .clone()
+            .ok_or_else(|| "s2s.enabled=true requires s2s.cert_path".to_string())?;
+        let key_path = self
+            .key_path
+            .clone()
+            .ok_or_else(|| "s2s.enabled=true requires s2s.key_path".to_string())?;
+
+        let mut cfg = TransportConfig::new(ca_path, cert_path, key_path);
+        if let Some(addr) = self.tcp_listen {
+            cfg = cfg.with_tcp_listen(addr);
+        }
+        if let Some(addr) = self.kcp_listen {
+            cfg = cfg.with_kcp_listen(addr);
+        }
+        if let Some(addr) = self.quic_listen {
+            cfg = cfg.with_quic_listen(addr);
+        }
+        if let Some(addr) = self.udp_listen {
+            cfg = cfg.with_udp_listen(addr);
+        }
+
+        cfg = cfg.with_seed_addresses(
+            self.seed_addresses
+                .iter()
+                .map(S2sSeedAddressConfig::peer_address)
+                .collect(),
+        );
+        Ok(Some(self.transport.apply(cfg)))
+    }
+
+    pub fn overlay_config(&self) -> crate::s2s::overlay::OverlayConfig {
+        let mut cfg = crate::s2s::overlay::OverlayConfig::new(Vec::new());
+        if let Some(dir) = self.persistence_dir.clone() {
+            cfg = cfg.with_persistence_dir(dir);
+        }
+        self.overlay.apply(cfg)
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S2sSeedAddressConfig {
+    transport: S2sTransportKindConfig,
+    addr: SocketAddr,
+}
+
+impl S2sSeedAddressConfig {
+    pub fn new(transport: S2sTransportKindConfig, addr: SocketAddr) -> Self {
+        Self { transport, addr }
+    }
+
+    pub fn transport(&self) -> S2sTransportKindConfig {
+        self.transport
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn peer_address(&self) -> PeerAddress {
+        PeerAddress::new(self.addr, self.transport.into())
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum S2sTransportKindConfig {
+    Tcp,
+    Kcp,
+    Quic,
+    Udp,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UdpPingUserCountScope {
+    Cluster,
+    Local,
+}
+
+impl From<S2sTransportKindConfig> for TransportKind {
+    fn from(value: S2sTransportKindConfig) -> Self {
+        match value {
+            S2sTransportKindConfig::Tcp => TransportKind::Tcp,
+            S2sTransportKindConfig::Kcp => TransportKind::Kcp,
+            S2sTransportKindConfig::Quic => TransportKind::Quic,
+            S2sTransportKindConfig::Udp => TransportKind::Udp,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -107,6 +240,10 @@ pub struct Config {
     /// (version, user count, max users, bandwidth).  Default: `true`.
     #[serde(default = "default_true")]
     pub udp_ping_enabled: bool,
+    /// Controls whether UDP pings display clusterwide users/max users or only
+    /// this node's local users/max users. Default: `cluster`.
+    #[serde(default = "default_udp_ping_user_count_scope")]
+    pub udp_ping_user_count_scope: UdpPingUserCountScope,
     /// Capacity of the bounded channel between the UDP drain task and the
     /// processing task.  Larger values tolerate processing bursts at the
     /// cost of memory.  Default: 2048 (~2 MB of buffered packets).
@@ -136,17 +273,42 @@ pub struct Config {
     pub s2s: S2sConfig,
 }
 
-fn default_max_bandwidth() -> u32 { 72_000 }
-fn default_true() -> bool { true }
-fn default_max_text_message_length() -> u32 { 5_000 }
-fn default_max_image_message_length() -> u32 { 131_072 }
-fn default_udp_channel_size() -> usize { 2048 }
-fn default_idle_timeout() -> u64 { 30 }
-fn default_channel_log_max_entries() -> usize { 10_000 }
-fn default_client_log_max_entries() -> usize { 10_000 }
-fn default_channel_snapshot_every_ops() -> u64 { 10 }
-fn default_channel_snapshot_every_secs() -> i64 { 60 }
-fn default_channel_wal_compaction_expire_count() -> usize { 2_000 }
+fn default_max_bandwidth() -> u32 {
+    72_000
+}
+fn default_true() -> bool {
+    true
+}
+fn default_max_text_message_length() -> u32 {
+    5_000
+}
+fn default_max_image_message_length() -> u32 {
+    131_072
+}
+fn default_udp_channel_size() -> usize {
+    2048
+}
+fn default_udp_ping_user_count_scope() -> UdpPingUserCountScope {
+    UdpPingUserCountScope::Cluster
+}
+fn default_idle_timeout() -> u64 {
+    30
+}
+fn default_channel_log_max_entries() -> usize {
+    10_000
+}
+fn default_client_log_max_entries() -> usize {
+    10_000
+}
+fn default_channel_snapshot_every_ops() -> u64 {
+    10
+}
+fn default_channel_snapshot_every_secs() -> i64 {
+    60
+}
+fn default_channel_wal_compaction_expire_count() -> usize {
+    2_000
+}
 
 impl Config {
     pub fn load() -> Self {
@@ -179,6 +341,13 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn parse_s2s(raw: &str) -> Result<S2sConfig, ::config::ConfigError> {
+        ::config::Config::builder()
+            .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
+            .build()?
+            .try_deserialize()
+    }
+
     /// Ensure the checked-in `config.toml` parses cleanly under the current
     /// schema, including the new `[s2s.transport]`, `[s2s.overlay]`, and
     /// `[s2s.replications]` sections.
@@ -191,10 +360,128 @@ mod tests {
             .expect("config builder")
             .try_deserialize()
             .expect("config deserialize");
+        assert_eq!(
+            cfg.udp_ping_user_count_scope,
+            UdpPingUserCountScope::Cluster
+        );
         // Spot-check a value from each new block.
         assert!(cfg.s2s.transport.latency_ewma_alpha > 0.0);
         assert!(cfg.s2s.overlay.lsdb_sync_max_response_lsas >= 1);
-        assert!(cfg.s2s.replications.propose_ttl_ms >= cfg.s2s.replications.delivery_tick_interval_ms);
+        assert!(
+            cfg.s2s.replications.propose_ttl_ms >= cfg.s2s.replications.delivery_tick_interval_ms
+        );
+    }
+
+    #[test]
+    fn udp_ping_user_count_scope_parses_local() {
+        let raw = r#"
+            node_id = 1
+            listen = "127.0.0.1:64738"
+            register_name = "test"
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            send_version = true
+            send_build_info = true
+            send_os_info = true
+            allowed_proxies = []
+            min_client_version = 0
+            max_users = 100
+            udp_ping_user_count_scope = "local"
+        "#;
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert_eq!(cfg.udp_ping_user_count_scope, UdpPingUserCountScope::Local);
+    }
+
+    #[test]
+    fn s2s_is_disabled_by_default() {
+        let cfg = S2sConfig::default();
+        assert!(!cfg.is_enabled());
+        assert!(cfg.transport_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn s2s_enabled_flat_seed_addresses_parse() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+            kcp_listen = "0.0.0.0:64740"
+            quic_listen = "0.0.0.0:64741"
+            udp_listen = "0.0.0.0:64742"
+            persistence_dir = "s2s-state"
+
+            seed_addresses = [
+                { transport = "tcp", addr = "10.0.0.2:64739" },
+                { transport = "quic", addr = "10.0.0.3:64741" },
+                { transport = "udp", addr = "10.0.0.4:64742" },
+            ]
+        "#;
+        let cfg: S2sConfig = parse_s2s(raw).expect("s2s config parses");
+        assert!(cfg.is_enabled());
+        assert_eq!(cfg.seed_addresses.len(), 3);
+        assert_eq!(
+            cfg.seed_addresses[0].transport(),
+            S2sTransportKindConfig::Tcp
+        );
+        assert_eq!(
+            cfg.seed_addresses[1].transport(),
+            S2sTransportKindConfig::Quic
+        );
+        assert_eq!(
+            cfg.seed_addresses[2].transport(),
+            S2sTransportKindConfig::Udp
+        );
+
+        let transport = cfg
+            .transport_config()
+            .expect("valid transport config")
+            .expect("s2s enabled");
+        assert_eq!(transport.seed_addresses().len(), 3);
+        assert!(cfg.overlay_config().persistence_dir().is_some());
+    }
+
+    #[test]
+    fn s2s_enabled_requires_identity_paths() {
+        let cfg = S2sConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let error = cfg.transport_config().unwrap_err();
+        assert!(error.contains("ca_path"));
+    }
+
+    #[test]
+    fn s2s_rejects_invalid_seed_transport() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            seed_addresses = [
+                { transport = "ws", addr = "10.0.0.2:64739" },
+            ]
+        "#;
+        assert!(parse_s2s(raw).is_err());
+    }
+
+    #[test]
+    fn s2s_rejects_invalid_seed_address() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            seed_addresses = [
+                { transport = "tcp", addr = "not an address" },
+            ]
+        "#;
+        assert!(parse_s2s(raw).is_err());
     }
 }
-

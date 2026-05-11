@@ -17,7 +17,7 @@
 //! re-flooded to every direct neighbor *except* the sender. Stale/below-
 //! floor LSAs are dropped silently — flood quiesces naturally.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,8 @@ use super::store::{AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry};
 pub struct LsaEmitter {
     pub self_id: NodeIdentifier,
     pub boot_epoch: u64,
+    pub max_users: Arc<AtomicU64>,
+    force_next_emit: AtomicBool,
     next_seq: AtomicU64,
     /// Last `(rtt_us, throughput_bps)` per neighbor we last published. Used
     /// to apply the cost-change-threshold filter.
@@ -55,10 +57,13 @@ impl LsaEmitter {
         self_id: NodeIdentifier,
         boot_epoch: u64,
         self_addresses: Vec<crate::s2s::transport::PeerAddress>,
+        max_users: Arc<AtomicU64>,
     ) -> Self {
         Self {
             self_id,
             boot_epoch,
+            max_users,
+            force_next_emit: AtomicBool::new(false),
             next_seq: AtomicU64::new(1),
             last_published: parking_lot::Mutex::new(std::collections::HashMap::new()),
             self_addresses,
@@ -74,10 +79,20 @@ impl LsaEmitter {
     pub fn poke(&self) {
         self.trigger.notify_one();
     }
+
+    /// Force the next poke to emit even if neighbor costs did not change.
+    pub fn poke_force(&self) {
+        self.force_next_emit.store(true, Ordering::Relaxed);
+        self.trigger.notify_one();
+    }
 }
 
 /// Build a fresh local LSA from the current neighbor snapshot.
-pub fn build_local_lsa(emitter: &LsaEmitter, snap: &[NeighborSnapshot], tombstone: bool) -> LsaEntry {
+pub fn build_local_lsa(
+    emitter: &LsaEmitter,
+    snap: &[NeighborSnapshot],
+    tombstone: bool,
+) -> LsaEntry {
     let links = if tombstone {
         Vec::new()
     } else {
@@ -103,6 +118,11 @@ pub fn build_local_lsa(emitter: &LsaEmitter, snap: &[NeighborSnapshot], tombston
             emitter.self_addresses.clone()
         },
         links,
+        max_users: if tombstone {
+            0
+        } else {
+            emitter.max_users.load(Ordering::Relaxed)
+        },
     }
 }
 
@@ -116,7 +136,8 @@ pub fn cost_changed_significantly(
 ) -> bool {
     let last = emitter.last_published.lock();
     let prev_set: std::collections::HashSet<NodeIdentifier> = last.keys().copied().collect();
-    let now_set: std::collections::HashSet<NodeIdentifier> = snap.iter().map(|n| n.node_id).collect();
+    let now_set: std::collections::HashSet<NodeIdentifier> =
+        snap.iter().map(|n| n.node_id).collect();
     if prev_set != now_set {
         return true;
     }
@@ -178,7 +199,12 @@ pub async fn flood_to_neighbors(
             continue;
         }
         if let Err(e) = transport
-            .send(n.node_id, ServiceLevel::Reliable, MessageClass::Regular, payload.clone())
+            .send(
+                n.node_id,
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+                payload.clone(),
+            )
             .await
         {
             trace!(peer=%n.node_id, error=%e, "lsa flood send failed");
@@ -217,7 +243,7 @@ pub fn spawn_emitter_task(
                         cfg.cost_rerun_rtt_pct(),
                         cfg.cost_rerun_throughput_pct(),
                     );
-                    if changed {
+                    if emitter.force_next_emit.swap(false, Ordering::Relaxed) || changed {
                         emit_once(&emitter, &lsdb, &monitor, &transport, &cfg, false).await;
                     }
                 }

@@ -7,6 +7,11 @@ use crate::channels::Channel;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::Message;
 
+/// Checks that the login channel-tree burst contains every existing channel.
+/// Expected: the authenticated client receives `ChannelState` entries for
+/// root and all pre-created children. Mumble sends this burst during
+/// `D:\mumble\src\murmur\Messages.cpp::msgAuthenticate`; shitspeak mirrors the
+/// initial tree sync in its authenticate path in `D:\shitspeak\server.go`.
 #[tokio::test]
 async fn tree_burst_includes_all_channels() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -65,6 +70,10 @@ async fn tree_burst_includes_all_channels() {
     }
 }
 
+/// Checks that a post-login channel creation reaches already-connected peers.
+/// Expected: Bob receives a `ChannelState` named `lobby`. This follows the
+/// Mumble `ChannelState` create/broadcast behavior in `D:\mumble\src\murmur\Messages.cpp`
+/// and shitspeak's `D:\shitspeak\message.go::handleChannelStateMessage`.
 #[tokio::test]
 async fn tree_create_propagates_to_peer() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -102,6 +111,11 @@ async fn tree_create_propagates_to_peer() {
     );
 }
 
+/// Checks that removing a channel reaches already-connected peers.
+/// Expected: Bob receives `ChannelRemove` for the deleted channel id. The
+/// expected behavior comes from Mumble's `ChannelRemove` message and
+/// `D:\mumble\src\murmur\Messages.cpp::msgChannelRemove`, mirrored by
+/// `D:\shitspeak\message.go::handleChannelRemoveMessage`.
 #[tokio::test]
 async fn tree_remove_propagates_to_peer() {
     let server = spawn_test_server(TestServerOpts::default()).await;

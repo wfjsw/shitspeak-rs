@@ -46,7 +46,9 @@ impl Channel {
     }
 
     pub fn has_description(&self) -> bool {
-        self.description_hash.as_ref().map_or(false, |h| !h.is_empty())
+        self.description_hash
+            .as_ref()
+            .map_or(false, |h| !h.is_empty())
     }
 
     /// Bit-31 of the ID marks a channel as temporary (created by a client
@@ -72,4 +74,3 @@ pub struct ChannelPatch {
     /// `Some(None)` = make root; `Some(Some(id))` = reparent.
     pub parent_id: Option<Option<u32>>,
 }
-

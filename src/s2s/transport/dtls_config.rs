@@ -14,7 +14,9 @@ use super::identity::NodeIdentity;
 /// Build a `webrtc-dtls` `Certificate` from our loaded identity. The cert
 /// chain is reused as-is and the private key is converted via `rcgen::KeyPair`,
 /// which webrtc-dtls accepts directly.
-pub(crate) fn make_dtls_certificate(identity: &NodeIdentity) -> Result<DtlsCertificate, ConfigError> {
+pub(crate) fn make_dtls_certificate(
+    identity: &NodeIdentity,
+) -> Result<DtlsCertificate, ConfigError> {
     let key_pair = rcgen::KeyPair::try_from(identity.key())
         .map_err(|e| ConfigError::X509(format!("rcgen keypair: {e}")))?;
     let private_key = CryptoPrivateKey::from_key_pair(&key_pair)

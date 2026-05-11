@@ -56,9 +56,15 @@ pub enum SendError {
     #[error("node {node} is not known to the connection manager")]
     UnknownNode { node: NodeIdentifier },
     #[error("transport {transport:?} for node {node} is full; frame dropped")]
-    Backpressure { node: NodeIdentifier, transport: TransportKind },
+    Backpressure {
+        node: NodeIdentifier,
+        transport: TransportKind,
+    },
     #[error("transport {transport:?} for node {node} closed before frame could be sent")]
-    StreamClosed { node: NodeIdentifier, transport: TransportKind },
+    StreamClosed {
+        node: NodeIdentifier,
+        transport: TransportKind,
+    },
     #[error("datagram of {bytes} bytes exceeds configured MTU of {mtu}")]
     DatagramTooLarge { bytes: usize, mtu: usize },
     #[error("encode error: {0}")]

@@ -1,12 +1,16 @@
-use std::sync::Arc;
-use enumflags2::_internal::RawBitFlags;
 use crate::{
-    acl::{ACL, ACLPermissions},
+    acl::{ACLPermissions, ACL},
+    channel_repository::ChannelOp,
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt, encoder::{Acl as EncoderAcl, ChanAcl}},
+    messages::{
+        encoder::{Acl as EncoderAcl, ChanAcl},
+        Message, WriteMessageExt,
+    },
     server::Server,
 };
+use enumflags2::_internal::RawBitFlags;
+use std::sync::Arc;
 
 pub async fn handle_acl(
     server: &Arc<Box<Server>>,
@@ -20,14 +24,26 @@ pub async fn handle_acl(
     }
 
     let channel_id = msg.channel_id;
-    tracing::debug!(session = u32::from(sender.get_session_id()), channel_id, query = msg.query, num_acls = msg.acls.len(), "ACL handler");
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        channel_id,
+        query = msg.query,
+        num_acls = msg.acls.len(),
+        "ACL handler"
+    );
 
     // Verify channel exists
-    if server.get_channels().get_channel(channel_id).await.is_none() {
+    if server
+        .get_channels()
+        .get_channel(channel_id)
+        .await
+        .is_none()
+    {
         return Ok(());
     }
 
-    let target_perm = crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
+    let target_perm =
+        crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
     if !target_perm.contains(ACLPermissions::Write) {
         return Err(MessageHandlerError::PermissionDenied(
             crate::messages::encoder::PermissionDenied {
@@ -37,7 +53,8 @@ pub async fn handle_acl(
                 reason: Some("Write permission required to modify ACLs".into()),
                 name: None,
                 permission: Some(ACLPermissions::Write.bits()),
-            }.into()
+            }
+            .into(),
         ));
     }
 
@@ -56,15 +73,20 @@ pub async fn handle_acl(
         for ch in &chain {
             let inherited = ch.id != channel_id;
             // For inherited (ancestor) channels, only include ACLs that apply to subs
-            flattened_acls.extend(ch.acls.iter().filter(|acl| !inherited || acl.apply_subs).map(|acl| ChanAcl {
-                apply_here: acl.apply_here,
-                apply_subs: acl.apply_subs,
-                inherited,
-                user_id: acl.user_id.map(|uid| uid as u32),
-                group: acl.group.clone(),
-                grant: acl.allow.bits(),
-                deny: acl.deny.bits(),
-            }));
+            flattened_acls.extend(
+                ch.acls
+                    .iter()
+                    .filter(|acl| !inherited || acl.apply_subs)
+                    .map(|acl| ChanAcl {
+                        apply_here: acl.apply_here,
+                        apply_subs: acl.apply_subs,
+                        inherited,
+                        user_id: acl.user_id.map(|uid| uid as u32),
+                        group: acl.group.clone(),
+                        grant: acl.allow.bits(),
+                        deny: acl.deny.bits(),
+                    }),
+            );
 
             inherit = ch.inherit_acl;
             if !inherit {
@@ -80,7 +102,9 @@ pub async fn handle_acl(
             acls: flattened_acls,
             query: None,
         };
-        sender.write_proto_message(&Message::ACL(acl_msg.into())).await?;
+        sender
+            .write_proto_message(&Message::ACL(acl_msg.into()))
+            .await?;
     } else {
         // ── Update mode: apply new ACLs ──────────────────────────────────
 
@@ -101,7 +125,10 @@ pub async fn handle_acl(
         // Safety fallback: if the requesting client would lose Write (and is registered),
         // include a Write|Traverse ACL in the same SetAcls transaction.
         if sender.is_registered() {
-            let (channel, ancestors) = server.get_channels().get_channel_with_ancestors(channel_id).await;
+            let (channel, ancestors) = server
+                .get_channels()
+                .get_channel_with_ancestors(channel_id)
+                .await;
             if let Some(mut channel) = channel {
                 channel.inherit_acl = inherit_acl;
                 channel.acls = new_acls.clone();
@@ -116,7 +143,7 @@ pub async fn handle_acl(
                     authenticated: user_id.is_some(),
                     access_tokens: &token_refs,
                     cert_hash: sender.get_certificate_hash(),
-                    has_verified_cert_chain: sender.has_certificate(),
+                    has_verified_cert_chain: sender.is_verified(),
                     ip_address: Some(sender.get_real_ip_address()),
                     asn: None,
                     country_code: None,
@@ -144,9 +171,24 @@ pub async fn handle_acl(
             }
         }
 
-        if let Err(e) = server.get_channels().set_acls(channel_id, inherit_acl, new_acls).await {
+        let op = ChannelOp::SetAcls {
+            channel_id,
+            inherit_acl,
+            acls: new_acls.clone(),
+        };
+        if let Err(e) = server.get_channels().validate_s2s_op(&op).await {
             tracing::warn!("set_acls {channel_id} failed: {:?}", e);
             return Ok(());
+        }
+        if !server.s2s_manager().propose_channel_op(op).await {
+            if let Err(e) = server
+                .get_channels()
+                .set_acls(channel_id, inherit_acl, new_acls)
+                .await
+            {
+                tracing::warn!("set_acls {channel_id} failed: {:?}", e);
+                return Ok(());
+            }
         }
 
         // Permission refresh fanout is handled in each client's channel-log
@@ -155,4 +197,3 @@ pub async fn handle_acl(
 
     Ok(())
 }
-

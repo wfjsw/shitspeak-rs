@@ -8,8 +8,8 @@ use crate::{
     client::Client,
     errors::MessageHandlerError,
     messages::{encoder::UserStats, Message, WriteMessageExt},
-    s2s::application::user_stats::{UserStatsApplyOutcome, UserStatsResponder},
     s2s::application::proto::UserStatsRequest,
+    s2s::application::user_stats::{UserStatsApplyOutcome, UserStatsResponder},
     server::Server,
     types::NodeIdentifier,
 };
@@ -25,7 +25,12 @@ pub async fn handle_user_stats(
         ));
     }
 
-    tracing::debug!(session = u32::from(sender.get_session_id()), target = msg.session, stats_only = msg.stats_only, "UserStats handler");
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        target = msg.session,
+        stats_only = msg.stats_only,
+        "UserStats handler"
+    );
 
     let sender_id = sender.get_session_id();
     let local_node_id = server.get_clients().local_node_id();
@@ -150,10 +155,10 @@ async fn build_user_stats_payload(target: &Arc<Box<Client>>, stats_only: bool) -
         version,
         celt_versions: Vec::new(),
         address: Some(target.get_real_ip_address()),
-        bandwidth: Some(0),  // TODO: bandwidth tracking
+        bandwidth: Some(0), // TODO: bandwidth tracking
         onlinesecs: Some(onlinesecs),
-        idlesecs: Some(0),   // TODO: idle tracking
-        strong_certificate: Some(target.has_certificate()),
+        idlesecs: Some(0), // TODO: idle tracking
+        strong_certificate: Some(target.is_verified()),
         opus: Some(true),
     }
 }
@@ -186,10 +191,9 @@ impl UserStatsResponder for ServerUserStatsResponder {
                 payload: Bytes::new(),
             };
         };
-        let target_id =
-            crate::client::client_session_identifier::ClientSessionIdentifier::from(
-                request.target_session,
-            );
+        let target_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
+            request.target_session,
+        );
         // Owner-only RPC: target should belong to this node. If for some
         // reason it doesn't (replication / lookup race), reply not_found.
         if target_id.get_node_id() != server.get_clients().local_node_id() {

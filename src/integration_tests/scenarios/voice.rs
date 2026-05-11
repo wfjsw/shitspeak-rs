@@ -27,6 +27,11 @@ fn opus_frame(payload: &AudioPayload) -> &[u8] {
 
 // ── TCP-tunneled tests ──────────────────────────────────────────────────────
 
+/// Checks regular TCP-tunneled voice routing within one channel.
+/// Expected: Bob receives Alice's Opus payload with Alice's server session as
+/// sender. Mumble routes `UDPTunnel` audio through `D:\mumble\src\murmur\Server.cpp::processMsg`;
+/// shitspeak mirrors regular voice broadcast in `D:\shitspeak\client.go` and
+/// `D:\shitspeak\message.go`.
 #[tokio::test]
 async fn voice_tcp_same_channel_routes() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -54,6 +59,11 @@ async fn voice_tcp_same_channel_routes() {
     assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
+/// Checks that regular voice is not routed to users in unrelated channels.
+/// Expected: after Bob moves to another channel, he receives no TCP-tunneled
+/// voice from Alice. This comes from Mumble's channel-scoped receiver selection
+/// in `D:\mumble\src\murmur\Server.cpp::processMsg` and shitspeak's voice
+/// target selection in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_tcp_different_channel_does_not_route() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -92,6 +102,11 @@ async fn voice_tcp_different_channel_does_not_route() {
     );
 }
 
+/// Checks that self-muted users cannot send voice.
+/// Expected: Bob receives no audio from Alice while Alice has `self_mute`.
+/// Mumble drops muted/self-muted senders at the top of
+/// `D:\mumble\src\murmur\Server.cpp::processMsg`; shitspeak applies the same
+/// sender gate in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_tcp_self_mute_silences_sender() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -123,6 +138,10 @@ async fn voice_tcp_self_mute_silences_sender() {
     );
 }
 
+/// Checks that server-muted users cannot send voice.
+/// Expected: Alice receives no audio from Bob after Alice sets Bob's server
+/// mute. Mumble's `processMsg` returns for `bMute`, and shitspeak's voice path
+/// checks the corresponding `Mute` state in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_tcp_server_mute_silences_sender() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -154,6 +173,11 @@ async fn voice_tcp_server_mute_silences_sender() {
     );
 }
 
+/// Checks that regular speech crosses linked channels.
+/// Expected: Bob in a linked channel receives Alice's normal-channel voice.
+/// Mumble explicitly walks linked channels with Speak permission in
+/// `D:\mumble\src\murmur\Server.cpp::processMsg`; shitspeak exposes the same
+/// linked-channel voice-target behavior through `D:\shitspeak\voicetarget.go`.
 #[tokio::test]
 async fn voice_tcp_linked_channel_routes() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -204,6 +228,11 @@ async fn open_udp_pair(alice: &mut TestClient, bob: &mut TestClient) {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+/// Checks real UDP voice routing, encryption, and decryption for one channel.
+/// Expected: Bob decrypts Alice's byte-identical Opus payload and sender
+/// session. This follows Mumble's UDP decrypt/route/encrypt path in
+/// `D:\mumble\src\murmur\Server.cpp::run` and `processMsg`, and shitspeak's
+/// OCB2 UDP path in `D:\shitspeak\client.go` plus `D:\shitspeak\cryptstate`.
 #[tokio::test]
 async fn voice_udp_same_channel_round_trips_and_decrypts() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -240,6 +269,11 @@ async fn voice_udp_same_channel_round_trips_and_decrypts() {
     assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
+/// Checks TCP-tunneled voice using the Mumble 1.5 protobuf audio format.
+/// Expected: a 1.5 recipient receives protobuf-format audio with the same Opus
+/// frame and sender session. The wire format comes from
+/// `D:\mumble\src\MumbleUDP.proto` and Mumble protocol handling; shitspeak
+/// keeps the same generated protocol surface in `D:\shitspeak\mumbleproto`.
 #[tokio::test]
 async fn voice_tcp_protobuf_round_trips() {
     // Two 1.5+ clients exchange voice in the official protobuf wire format
@@ -278,6 +312,11 @@ async fn voice_tcp_protobuf_round_trips() {
     );
 }
 
+/// Checks UDP voice using the Mumble 1.5 protobuf audio format.
+/// Expected: the full encrypt/decrypt routing path preserves the Opus payload
+/// and returns protobuf-format audio to a 1.5 recipient. This is sourced from
+/// `D:\mumble\src\MumbleUDP.proto`, `D:\mumble\src\murmur\Server.cpp::run`,
+/// and shitspeak's UDP crypt/protocol path in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_udp_protobuf_round_trips_and_decrypts() {
     // Same as above but over real UDP/OCB2 — exercises the full protobuf
@@ -318,6 +357,11 @@ async fn voice_udp_protobuf_round_trips_and_decrypts() {
     );
 }
 
+/// Checks per-recipient voice encoding based on declared protocol version.
+/// Expected: Bob declaring 1.5 receives protobuf voice, while Charlie declaring
+/// 1.4 receives legacy voice from the same send. Mumble sets protocol-version
+/// aware UDP encoders in `D:\mumble\src\murmur\Server.cpp`; shitspeak's generated
+/// `D:\shitspeak\mumbleproto` and client version handling provide the parity source.
 #[tokio::test]
 async fn voice_udp_format_matches_recipient_proto_version() {
     // One sender, two recipients with different declared protocol versions.
@@ -346,14 +390,10 @@ async fn voice_udp_format_matches_recipient_proto_version() {
             .await
             .expect("bob");
     // Charlie declares 1.4 → expects legacy back.
-    let mut charlie = TestClient::connect_with_version(
-        &server,
-        "charlie",
-        None,
-        ProtocolVersion::new(1, 4, 0),
-    )
-    .await
-    .expect("charlie");
+    let mut charlie =
+        TestClient::connect_with_version(&server, "charlie", None, ProtocolVersion::new(1, 4, 0))
+            .await
+            .expect("charlie");
 
     alice.open_udp().await.expect("alice udp bind");
     bob.open_udp().await.expect("bob udp bind");
@@ -393,6 +433,11 @@ async fn voice_udp_format_matches_recipient_proto_version() {
     );
 }
 
+/// Checks legacy UDP voice when both clients declare pre-1.5 protocol support.
+/// Expected: Bob receives legacy-format Opus with Alice's sender session. This
+/// is the Mumble 1.4-compatible path in `D:\mumble\src\murmur\Server.cpp::run`
+/// and `processMsg`, mirrored by shitspeak's legacy packet handling in
+/// `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_udp_legacy_to_legacy_round_trips() {
     // Both clients declare 1.4 → both speak legacy. Reproduces the path the
@@ -430,6 +475,11 @@ async fn voice_udp_legacy_to_legacy_round_trips() {
     assert_eq!(audio.format, PacketFormat::Legacy);
 }
 
+/// Checks that UDP voice obeys the same channel isolation as TCP voice.
+/// Expected: Bob in a different channel receives no UDP audio from Alice. The
+/// behavior comes from Mumble's receiver selection in
+/// `D:\mumble\src\murmur\Server.cpp::processMsg` and shitspeak's regular voice
+/// routing in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_udp_different_channel_does_not_route() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -472,6 +522,11 @@ async fn voice_udp_different_channel_does_not_route() {
 
 // ── Legacy-specific packet behaviors (pre-protobuf / 1.4 clients) ───────────
 
+/// Checks that the legacy Opus terminator bit survives TCP routing.
+/// Expected: Bob receives an Opus payload with `is_terminator = true` and the
+/// same frame bytes. The bit is defined by Mumble's legacy UDP/TCP audio format
+/// in `D:\mumble\src\MumbleProtocol.*`; shitspeak preserves it in the legacy
+/// packet path in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_tcp_legacy_terminator_bit_preserved() {
     // Opus terminator bit (0x2000 in the legacy size_flag) must survive the
@@ -490,10 +545,9 @@ async fn voice_tcp_legacy_terminator_bit_preserved() {
         TestClient::connect_with_version(&server, "alice", None, ProtocolVersion::new(1, 4, 0))
             .await
             .expect("alice");
-    let bob =
-        TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
-            .await
-            .expect("bob");
+    let bob = TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
+        .await
+        .expect("bob");
 
     alice
         .send_voice_tcp_terminator(0, 50, Bytes::from_static(SAMPLE_OPUS))
@@ -513,6 +567,11 @@ async fn voice_tcp_legacy_terminator_bit_preserved() {
     assert_eq!(p.frame.as_ref(), SAMPLE_OPUS);
 }
 
+/// Checks that the protobuf Opus terminator flag survives TCP routing.
+/// Expected: Bob receives a protobuf-decoded Opus payload with the terminator
+/// flag intact. This follows `D:\mumble\src\MumbleUDP.proto`'s audio fields and
+/// Mumble routing in `D:\mumble\src\murmur\Server.cpp::processMsg`; shitspeak
+/// uses the same generated Mumble UDP protobuf definitions.
 #[tokio::test]
 async fn voice_tcp_protobuf_terminator_bit_preserved() {
     // Same invariant as above but through the 1.5+ protobuf pipeline.
@@ -549,6 +608,11 @@ async fn voice_tcp_protobuf_terminator_bit_preserved() {
     assert_eq!(p.frame.as_ref(), SAMPLE_OPUS);
 }
 
+/// Checks that legacy positional audio data survives TCP routing.
+/// Expected: Bob receives the same XYZ coordinates and Opus payload Alice sent.
+/// Mumble defines positional audio in the legacy audio packet format and routes
+/// it through `D:\mumble\src\murmur\Server.cpp::processMsg`; shitspeak preserves
+/// positional bytes in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_tcp_legacy_positional_data_round_trip() {
     // Positional audio (optional 3 × f32 XYZ appended after the Opus payload
@@ -566,10 +630,9 @@ async fn voice_tcp_legacy_positional_data_round_trip() {
         TestClient::connect_with_version(&server, "alice", None, ProtocolVersion::new(1, 4, 0))
             .await
             .expect("alice");
-    let bob =
-        TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
-            .await
-            .expect("bob");
+    let bob = TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
+        .await
+        .expect("bob");
 
     let positional = [1.5_f32, 2.5, 3.5];
     alice
@@ -588,6 +651,11 @@ async fn voice_tcp_legacy_positional_data_round_trip() {
     assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
 }
 
+/// Checks that protobuf positional audio data survives TCP routing.
+/// Expected: Bob receives the same XYZ coordinates and Opus payload from the
+/// `MumbleUDP.Audio` protobuf field. The source is `D:\mumble\src\MumbleUDP.proto`
+/// and Murmur's voice routing; shitspeak keeps the same protobuf schema under
+/// `D:\shitspeak\mumbleproto`.
 #[tokio::test]
 async fn voice_tcp_protobuf_positional_data_round_trip() {
     // Same as above but through the 1.5+ protobuf pipeline, where positional
@@ -624,6 +692,11 @@ async fn voice_tcp_protobuf_positional_data_round_trip() {
     assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
 }
 
+/// Checks legacy server loopback target handling.
+/// Expected: target 31 echoes the packet only to Alice and not to Bob. Mumble
+/// handles `ReservedTargetIDs::SERVER_LOOPBACK` in
+/// `D:\mumble\src\murmur\Server.cpp::processMsg`; shitspeak mirrors target 31
+/// handling in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_tcp_legacy_server_loopback() {
     // target=31 (Server Loopback) must echo the packet back to the sender;
@@ -640,10 +713,9 @@ async fn voice_tcp_legacy_server_loopback() {
         TestClient::connect_with_version(&server, "alice", None, ProtocolVersion::new(1, 4, 0))
             .await
             .expect("alice");
-    let bob =
-        TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
-            .await
-            .expect("bob");
+    let bob = TestClient::connect_with_version(&server, "bob", None, ProtocolVersion::new(1, 4, 0))
+        .await
+        .expect("bob");
 
     alice
         .send_voice_tcp(31, 70, Bytes::from_static(SAMPLE_OPUS))
@@ -666,6 +738,11 @@ async fn voice_tcp_legacy_server_loopback() {
     );
 }
 
+/// Checks protobuf server loopback target handling.
+/// Expected: target 31 echoes protobuf voice only to Alice and does not route it
+/// to Bob. This comes from Mumble's reserved server-loopback target in
+/// `D:\mumble\src\murmur\Server.cpp::processMsg` and shitspeak's equivalent
+/// target handling in `D:\shitspeak\client.go`.
 #[tokio::test]
 async fn voice_tcp_protobuf_server_loopback() {
     // Same as above but through the 1.5+ protobuf pipeline.

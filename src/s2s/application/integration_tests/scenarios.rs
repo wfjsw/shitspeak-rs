@@ -27,10 +27,12 @@ fn seed_pair(idx: usize, _ids: &[u16], ports: &[u16]) -> Vec<SeedPeer> {
     )]
 }
 
-/// 1 speaker on A, 1 listener on B. A broadcasts ≥100 voice frames; B's
-/// installed `AudioSink` receives them in order with byte-identical
-/// payloads. No reorder buffer in this phase, so ordering is just
-/// "arrival order on a single TCP/QUIC stream", which is FIFO per peer.
+/// Checks S2S application voice passthrough ordering.
+/// Expected: B's installed `AudioSink` receives 100 frames from A in sequence,
+/// with byte-identical payloads and terminator metadata. Voice semantics come
+/// from Mumble's `D:\mumble\src\murmur\Server.cpp::processMsg` and shitspeak's
+/// `D:\shitspeak\client.go`; this crate's S2S application layer preserves
+/// those frames over the overlay.
 #[tokio::test]
 async fn two_node_voice_passthrough_in_order() {
     let cluster = Cluster::build(&[1, 2], seed_pair).await;
@@ -63,10 +65,7 @@ async fn two_node_voice_passthrough_in_order() {
             .expect("send_broadcast");
     }
 
-    let ok = wait_until(Duration::from_secs(8), || {
-        sink_b.len() as u64 == N_FRAMES
-    })
-    .await;
+    let ok = wait_until(Duration::from_secs(8), || sink_b.len() as u64 == N_FRAMES).await;
     let received = sink_b.snapshot();
     assert!(
         ok,
@@ -86,10 +85,7 @@ async fn two_node_voice_passthrough_in_order() {
         assert_eq!(frame.target_kind, 0);
         assert_eq!(frame.is_terminator, i as u64 + 1 == N_FRAMES);
         let expected = format!("opus-frame-{i}").into_bytes();
-        assert_eq!(
-            frame.payload, expected,
-            "frame {i} payload mismatch"
-        );
+        assert_eq!(frame.payload, expected, "frame {i} payload mismatch");
     }
 
     app_a.shutdown().await;
@@ -97,10 +93,12 @@ async fn two_node_voice_passthrough_in_order() {
     cluster.shutdown_all().await;
 }
 
-/// 3-node cluster: A, B, C. A dispatches a moderation envelope targeting
-/// a client owned by B. Verify only B's installed applier receives it
-/// (the envelope is unicast, not broadcast). C's applier sees nothing.
-/// A's own applier also sees nothing (we never round-trip to ourselves).
+/// Checks S2S application moderation delivery to the owning node only.
+/// Expected: B receives exactly one moderation envelope for its owned target,
+/// while A and C receive none. The user-state moderation semantics come from
+/// `D:\mumble\src\murmur\Messages.cpp::msgUserState` and
+/// `D:\shitspeak\message.go::handleUserStateMessage`; this crate adds the S2S
+/// owner-directed envelope.
 #[tokio::test]
 async fn three_node_moderation_unicasts_to_owner() {
     let cluster = Cluster::build(&[1, 2, 3], full_mesh_seeds).await;
@@ -113,9 +111,18 @@ async fn three_node_moderation_unicasts_to_owner() {
         "3-node routing failed to converge"
     );
 
-    let app_a = ApplicationLayer::new(cluster.node(1).overlay.clone(), ApplicationConfig::default());
-    let app_b = ApplicationLayer::new(cluster.node(2).overlay.clone(), ApplicationConfig::default());
-    let app_c = ApplicationLayer::new(cluster.node(3).overlay.clone(), ApplicationConfig::default());
+    let app_a = ApplicationLayer::new(
+        cluster.node(1).overlay.clone(),
+        ApplicationConfig::default(),
+    );
+    let app_b = ApplicationLayer::new(
+        cluster.node(2).overlay.clone(),
+        ApplicationConfig::default(),
+    );
+    let app_c = ApplicationLayer::new(
+        cluster.node(3).overlay.clone(),
+        ApplicationConfig::default(),
+    );
 
     let applier_a = RecordingApplier::new();
     let applier_b = RecordingApplier::new();
@@ -163,8 +170,16 @@ async fn three_node_moderation_unicasts_to_owner() {
     // Briefly wait — non-routing of duplicate to A or C might race the
     // single hop, so allow a short settle.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(applier_a.len(), 0, "A should not have received its own envelope");
-    assert_eq!(applier_c.len(), 0, "C should not have received the envelope");
+    assert_eq!(
+        applier_a.len(),
+        0,
+        "A should not have received its own envelope"
+    );
+    assert_eq!(
+        applier_c.len(),
+        0,
+        "C should not have received the envelope"
+    );
 
     app_a.shutdown().await;
     app_b.shutdown().await;
@@ -172,8 +187,10 @@ async fn three_node_moderation_unicasts_to_owner() {
     cluster.shutdown_all().await;
 }
 
-/// Without an installed sink on B, frames are decoded and dropped. Smoke
-/// test that nothing panics and that A's send_broadcast still succeeds.
+/// Checks S2S voice behavior when the destination has no audio sink installed.
+/// Expected: A's sends succeed and B decodes then drops frames without panics.
+/// Mumble/shitspeak define the voice frame semantics; this crate's S2S
+/// application layer defines the missing-sink drop behavior.
 #[tokio::test]
 async fn two_node_voice_drops_when_sink_missing() {
     let cluster = Cluster::build(&[1, 2], seed_pair).await;

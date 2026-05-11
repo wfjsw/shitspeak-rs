@@ -7,9 +7,7 @@ use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
-use super::super::proto::{
-    CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp,
-};
+use super::super::proto::{CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp};
 use super::runtime::OwnerRuntime;
 use super::{LogSlice, OwnerReplicable};
 use crate::types::NodeIdentifier;
@@ -54,8 +52,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
     let mut snapshot_msgpack: Bytes = Bytes::new();
     let mut too_old_use_snapshot = false;
 
-    let effective_ops: Vec<(u64, R::Op)> = match rt.repo.log_for_origin(origin, req.since_version)
-    {
+    let effective_ops: Vec<(u64, R::Op)> = match rt.repo.log_for_origin(origin, req.since_version) {
         LogSlice::Available(ops) => ops,
         LogSlice::TooOld => {
             too_old_use_snapshot = true;

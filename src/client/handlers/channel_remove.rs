@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     acl::ACLPermissions,
+    channel_repository::ChannelOp,
     client::Client,
     errors::MessageHandlerError,
     messages::encoder::{ChannelRemove, DenyType, PermissionDenied},
@@ -20,7 +21,11 @@ pub async fn handle_channel_remove(
     }
 
     let channel_id = msg.channel_id;
-    tracing::debug!(session = u32::from(sender.get_session_id()), channel_id, "ChannelRemove handler");
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        channel_id,
+        "ChannelRemove handler"
+    );
     if channel_id == 0 {
         return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
             r#type: DenyType::Permission,
@@ -33,15 +38,25 @@ pub async fn handle_channel_remove(
     }
 
     // Verify channel exists
-    if server.get_channels().get_channel(channel_id).await.is_none() {
+    if server
+        .get_channels()
+        .get_channel(channel_id)
+        .await
+        .is_none()
+    {
         return Ok(());
     }
 
     // ACL: need Write on the channel to remove it
-    let perms = crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
+    let perms =
+        crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
     if !perms.contains(ACLPermissions::Write) {
         return Err(MessageHandlerError::PermissionDenied(
-            PermissionDenied::for_permission(u32::from(sender.get_session_id()), Some(channel_id), ACLPermissions::Write),
+            PermissionDenied::for_permission(
+                u32::from(sender.get_session_id()),
+                Some(channel_id),
+                ACLPermissions::Write,
+            ),
         ));
     }
 
@@ -63,12 +78,19 @@ pub async fn handle_channel_remove(
         }
     }
 
-    if let Err(e) = server.get_channels().delete_channel(channel_id).await {
+    let op = ChannelOp::DeleteChannel { id: channel_id };
+    if let Err(e) = server.get_channels().validate_s2s_op(&op).await {
         tracing::warn!("delete_channel {channel_id} failed: {:?}", e);
         return Ok(());
     }
+    if !server.s2s_manager().propose_channel_op(op).await {
+        if let Err(e) = server.get_channels().delete_channel(channel_id).await {
+            tracing::warn!("delete_channel {channel_id} failed: {:?}", e);
+            return Ok(());
+        }
+    }
 
-    // Channel deletion is logged and broadcast via ChannelRepository::commit().
+    // Channel deletion is logged and broadcast via the repository or S2S strict replication.
     // Per-client subscribers will pick up the ChannelRemove message.
 
     Ok(())

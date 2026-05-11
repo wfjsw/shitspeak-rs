@@ -23,14 +23,21 @@ pub async fn handle_text_message(
 
     // Relay as-is but stamp the actor session. `msg` is owned, so move the
     // routing fields and message body into the relay rather than cloning.
-    let TextMessage { session, channel_id, tree_id, message, .. } = msg;
+    let TextMessage {
+        session,
+        channel_id,
+        tree_id,
+        message,
+        ..
+    } = msg;
     let relay: Message = TextMessage {
         actor: Some(sender_session),
         session,
         channel_id,
         tree_id,
         message,
-    }.into();
+    }
+    .into();
 
     // Pull the routing target slices back out of the relay so we can iterate
     // them without re-cloning.
@@ -40,7 +47,9 @@ pub async fn handle_text_message(
 
     // Direct messages: send to each target session
     for target_session in &relay_inner.session {
-        let session_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(*target_session);
+        let session_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
+            *target_session,
+        );
         server.get_clients().send_to(session_id, &relay).await;
     }
 
@@ -75,7 +84,10 @@ pub async fn handle_text_message(
 }
 
 /// Collect all channel IDs in the subtree rooted at `root_id`.
-async fn collect_subtree_ids(server: &Arc<Box<Server>>, root_id: u32) -> std::collections::HashSet<u32> {
+async fn collect_subtree_ids(
+    server: &Arc<Box<Server>>,
+    root_id: u32,
+) -> std::collections::HashSet<u32> {
     let all_channels = server.get_channels().get_all().await;
     let mut result = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();

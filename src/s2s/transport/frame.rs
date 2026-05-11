@@ -56,7 +56,9 @@ impl From<pb::FrameType> for FrameType {
 impl TryFrom<i32> for FrameType {
     type Error = i32;
     fn try_from(value: i32) -> Result<Self, i32> {
-        pb::FrameType::try_from(value).map(FrameType::from).map_err(|_| value)
+        pb::FrameType::try_from(value)
+            .map(FrameType::from)
+            .map_err(|_| value)
     }
 }
 
@@ -83,7 +85,9 @@ impl From<pb::ServiceLevel> for ServiceLevel {
 impl TryFrom<i32> for ServiceLevel {
     type Error = i32;
     fn try_from(value: i32) -> Result<Self, i32> {
-        pb::ServiceLevel::try_from(value).map(ServiceLevel::from).map_err(|_| value)
+        pb::ServiceLevel::try_from(value)
+            .map(ServiceLevel::from)
+            .map_err(|_| value)
     }
 }
 
@@ -108,7 +112,9 @@ impl From<pb::MessageClass> for MessageClass {
 impl TryFrom<i32> for MessageClass {
     type Error = i32;
     fn try_from(value: i32) -> Result<Self, i32> {
-        pb::MessageClass::try_from(value).map(MessageClass::from).map_err(|_| value)
+        pb::MessageClass::try_from(value)
+            .map(MessageClass::from)
+            .map_err(|_| value)
     }
 }
 
@@ -213,7 +219,10 @@ mod tests {
             ServiceLevel::try_from(decoded.service_level).unwrap(),
             ServiceLevel::ReliableLowLatency
         );
-        assert_eq!(FrameType::try_from(decoded.frame_type).unwrap(), FrameType::Data);
+        assert_eq!(
+            FrameType::try_from(decoded.frame_type).unwrap(),
+            FrameType::Data
+        );
         assert_eq!(
             MessageClass::try_from(decoded.message_class).unwrap(),
             MessageClass::HighPriority
@@ -246,7 +255,11 @@ mod tests {
 
     #[test]
     fn enum_conversions_total() {
-        for lvl in [ServiceLevel::Reliable, ServiceLevel::ReliableLowLatency, ServiceLevel::BestEffort] {
+        for lvl in [
+            ServiceLevel::Reliable,
+            ServiceLevel::ReliableLowLatency,
+            ServiceLevel::BestEffort,
+        ] {
             let i = pb::ServiceLevel::from(lvl) as i32;
             assert_eq!(ServiceLevel::try_from(i).unwrap(), lvl);
         }

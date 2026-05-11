@@ -34,6 +34,7 @@ pub struct ClientGlobalState {
     groups: HashSet<String>,
     tokens: HashSet<String>,
     display_name: Option<String>,
+    acl_generation: u64,
 
     delta_recording: bool,
     pending_delta: ClientGlobalStateDelta,
@@ -65,6 +66,7 @@ impl ClientGlobalState {
             groups: HashSet::new(),
             tokens: HashSet::new(),
             display_name: None,
+            acl_generation: 0,
 
             delta_recording: false,
             pending_delta: ClientGlobalStateDelta::default(),
@@ -124,7 +126,7 @@ impl ClientGlobalState {
         }
         changed
     }
-    
+
     pub fn unlisten_channel(&mut self, channel_id: u32) -> bool {
         let changed = self.listening_channel_id.remove(&channel_id);
         if changed && self.delta_recording {
@@ -214,7 +216,9 @@ impl ClientGlobalState {
 
     // ── Voice / moderation getters & setters ─────────────────────────────
 
-    pub fn is_muted(&self) -> bool { self.mute }
+    pub fn is_muted(&self) -> bool {
+        self.mute
+    }
     pub fn set_mute(&mut self, v: bool) {
         if self.mute == v {
             return;
@@ -225,7 +229,9 @@ impl ClientGlobalState {
         }
     }
 
-    pub fn is_deafened(&self) -> bool { self.deaf }
+    pub fn is_deafened(&self) -> bool {
+        self.deaf
+    }
     pub fn set_deaf(&mut self, v: bool) {
         if self.deaf == v {
             return;
@@ -236,7 +242,9 @@ impl ClientGlobalState {
         }
     }
 
-    pub fn is_suppressed(&self) -> bool { self.suppress }
+    pub fn is_suppressed(&self) -> bool {
+        self.suppress
+    }
     pub fn set_suppress(&mut self, v: bool) {
         if self.suppress == v {
             return;
@@ -247,7 +255,9 @@ impl ClientGlobalState {
         }
     }
 
-    pub fn is_self_muted(&self) -> bool { self.self_mute }
+    pub fn is_self_muted(&self) -> bool {
+        self.self_mute
+    }
     pub fn set_self_mute(&mut self, v: bool) {
         if self.self_mute == v {
             return;
@@ -258,7 +268,9 @@ impl ClientGlobalState {
         }
     }
 
-    pub fn is_self_deafened(&self) -> bool { self.self_deaf }
+    pub fn is_self_deafened(&self) -> bool {
+        self.self_deaf
+    }
     pub fn set_self_deaf(&mut self, v: bool) {
         if self.self_deaf == v {
             return;
@@ -269,7 +281,9 @@ impl ClientGlobalState {
         }
     }
 
-    pub fn is_priority_speaker(&self) -> bool { self.priority_speaker }
+    pub fn is_priority_speaker(&self) -> bool {
+        self.priority_speaker
+    }
     pub fn set_priority_speaker(&mut self, v: bool) {
         if self.priority_speaker == v {
             return;
@@ -280,7 +294,9 @@ impl ClientGlobalState {
         }
     }
 
-    pub fn is_recording(&self) -> bool { self.recording }
+    pub fn is_recording(&self) -> bool {
+        self.recording
+    }
     pub fn set_recording(&mut self, v: bool) {
         if self.recording == v {
             return;
@@ -291,7 +307,9 @@ impl ClientGlobalState {
         }
     }
 
-    pub fn get_plugin_context(&self) -> &[u8] { &self.plugin_context }
+    pub fn get_plugin_context(&self) -> &[u8] {
+        &self.plugin_context
+    }
     pub fn set_plugin_context(&mut self, ctx: Bytes) {
         if self.plugin_context == ctx {
             return;
@@ -302,7 +320,9 @@ impl ClientGlobalState {
         }
     }
 
-    pub fn get_plugin_identity(&self) -> &str { &self.plugin_identity }
+    pub fn get_plugin_identity(&self) -> &str {
+        &self.plugin_identity
+    }
     pub fn set_plugin_identity(&mut self, id: String) {
         if self.plugin_identity == id {
             return;
@@ -319,11 +339,20 @@ impl ClientGlobalState {
         self.user_id
     }
 
+    pub fn get_acl_generation(&self) -> u64 {
+        self.acl_generation
+    }
+
+    fn bump_acl_generation(&mut self) {
+        self.acl_generation = self.acl_generation.wrapping_add(1);
+    }
+
     pub fn set_user_id(&mut self, user_id: Option<u32>) {
         if self.user_id == user_id {
             return;
         }
         self.user_id = user_id;
+        self.bump_acl_generation();
         if self.delta_recording {
             self.pending_delta.user_id = Some(user_id);
         }
@@ -346,14 +375,20 @@ impl ClientGlobalState {
     }
 
     pub fn add_group(&mut self, group: String) {
-        if self.groups.insert(group) && self.delta_recording {
-            self.pending_delta.groups = Some(self.groups.clone());
+        if self.groups.insert(group) {
+            self.bump_acl_generation();
+            if self.delta_recording {
+                self.pending_delta.groups = Some(self.groups.clone());
+            }
         }
     }
 
     pub fn del_group(&mut self, group: &str) {
-        if self.groups.remove(&group.to_string()) && self.delta_recording {
-            self.pending_delta.groups = Some(self.groups.clone());
+        if self.groups.remove(&group.to_string()) {
+            self.bump_acl_generation();
+            if self.delta_recording {
+                self.pending_delta.groups = Some(self.groups.clone());
+            }
         }
     }
 
@@ -362,6 +397,7 @@ impl ClientGlobalState {
             return;
         }
         self.groups = groups;
+        self.bump_acl_generation();
         if self.delta_recording {
             self.pending_delta.groups = Some(self.groups.clone());
         }
@@ -372,34 +408,47 @@ impl ClientGlobalState {
     }
 
     pub fn add_token(&mut self, token: String) {
-        if self.tokens.insert(token) && self.delta_recording {
-            self.pending_delta.tokens = Some(self.tokens.clone());
+        if self.tokens.insert(token.to_ascii_lowercase()) {
+            self.bump_acl_generation();
+            if self.delta_recording {
+                self.pending_delta.tokens = Some(self.tokens.clone());
+            }
         }
     }
 
     pub fn del_token(&mut self, token: &str) {
-        if self.tokens.remove(token) && self.delta_recording {
-            self.pending_delta.tokens = Some(self.tokens.clone());
+        if self.tokens.remove(&token.to_ascii_lowercase()) {
+            self.bump_acl_generation();
+            if self.delta_recording {
+                self.pending_delta.tokens = Some(self.tokens.clone());
+            }
         }
     }
 
     pub fn set_tokens(&mut self, tokens: HashSet<String>) {
+        let tokens = tokens
+            .into_iter()
+            .map(|token| token.to_ascii_lowercase())
+            .collect();
+
         if self.tokens == tokens {
             return;
         }
         self.tokens = tokens;
+        self.bump_acl_generation();
         if self.delta_recording {
             self.pending_delta.tokens = Some(self.tokens.clone());
         }
     }
 
-    // TODO: case insensitive
     pub fn has_token(&self, token: &str) -> bool {
-        self.tokens.contains(&token.to_string())
+        self.tokens.contains(&token.to_ascii_lowercase())
     }
 
     pub fn get_display_name(&self) -> &str {
-        self.display_name.as_deref().expect("Unexpected empty username; Accessing before initialization?")
+        self.display_name
+            .as_deref()
+            .expect("Unexpected empty username; Accessing before initialization?")
     }
 
     pub fn get_display_name_opt(&self) -> Option<&str> {

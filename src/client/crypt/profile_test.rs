@@ -62,9 +62,7 @@ where
     let p10 = samples[samples.len() / 10] as f64 / BATCH as f64;
     let p90 = samples[samples.len() * 9 / 10] as f64 / BATCH as f64;
     let med = med_total / BATCH as f64;
-    println!(
-        "  {label:50}  median={med:>7.2} ns/iter   p10={p10:>6.2}  p90={p90:>6.2}"
-    );
+    println!("  {label:50}  median={med:>7.2} ns/iter   p10={p10:>6.2}  p90={p90:>6.2}");
     med
 }
 
@@ -118,20 +116,23 @@ fn profile_ocb2_phases() {
     });
 
     // Phase 3: pre-XOR data → bulk (n_main full blocks)
-    batch_time("phase3_pre_xor:        data ^ delta → bulk (10 blocks)", |i| {
-        let mut bulk = [0u8; 1024];
-        let mut chain = [[0xa5u8; 16]; 12];
-        chain[0][0] ^= i as u8;
-        let plaintext = black_box(&plaintext);
-        for k in 0..n_main {
-            let block = &plaintext[k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE];
-            let d = &chain[k + 1];
-            for j in 0..BLOCK_SIZE {
-                bulk[k * BLOCK_SIZE + j] = block[j] ^ d[j];
+    batch_time(
+        "phase3_pre_xor:        data ^ delta → bulk (10 blocks)",
+        |i| {
+            let mut bulk = [0u8; 1024];
+            let mut chain = [[0xa5u8; 16]; 12];
+            chain[0][0] ^= i as u8;
+            let plaintext = black_box(&plaintext);
+            for k in 0..n_main {
+                let block = &plaintext[k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE];
+                let d = &chain[k + 1];
+                for j in 0..BLOCK_SIZE {
+                    bulk[k * BLOCK_SIZE + j] = block[j] ^ d[j];
+                }
             }
-        }
-        black_box(bulk);
-    });
+            black_box(bulk);
+        },
+    );
 
     // Phase 4: batched ECB on n_main blocks
     batch_time("phase4_aes_10blocks:   aes.encrypt_blocks(160 B)", |i| {
@@ -179,17 +180,20 @@ fn profile_ocb2_phases() {
     });
 
     // Phase 5c: checksum fold ONLY — direct measurement of shared-checksum savings
-    batch_time("phase5c_checksum_only: XOR-fold of plaintext (10 blk)", |i| {
-        let mut checksum = [0u8; 16];
-        checksum[0] ^= i as u8;
-        let plaintext = black_box(&plaintext);
-        for k in 0..n_main {
-            for j in 0..BLOCK_SIZE {
-                checksum[j] ^= plaintext[k * BLOCK_SIZE + j];
+    batch_time(
+        "phase5c_checksum_only: XOR-fold of plaintext (10 blk)",
+        |i| {
+            let mut checksum = [0u8; 16];
+            checksum[0] ^= i as u8;
+            let plaintext = black_box(&plaintext);
+            for k in 0..n_main {
+                for j in 0..BLOCK_SIZE {
+                    checksum[j] ^= plaintext[k * BLOCK_SIZE + j];
+                }
             }
-        }
-        black_box(checksum);
-    });
+            black_box(checksum);
+        },
+    );
 
     // Phase 6: pad encrypt. 1 AES block.
     batch_time("phase6_pad_aes:        aes.encrypt_blocks(16 B)", |i| {
@@ -218,8 +222,13 @@ fn profile_ocb2_phases() {
         let mut out = vec![0u8; PLAINTEXT_LEN + 3];
         let mut nonce = IV;
         nonce[0] ^= i as u8;
-        super::CryptoMode::encrypt(black_box(&ocb), black_box(&mut out), black_box(&plaintext), black_box(&nonce))
-            .unwrap();
+        super::CryptoMode::encrypt(
+            black_box(&ocb),
+            black_box(&mut out),
+            black_box(&plaintext),
+            black_box(&nonce),
+        )
+        .unwrap();
         black_box(out);
     });
 
@@ -227,7 +236,9 @@ fn profile_ocb2_phases() {
     let mut state = CryptState::from_key("OCB2-AES128", &KEY, &IV, &IV).unwrap();
     let mut buf = vec![0u8; PLAINTEXT_LEN + 4];
     batch_time("ref_full_CryptState::encrypt (single hot state)", |_| {
-        state.encrypt(black_box(&mut buf), black_box(&plaintext)).unwrap();
+        state
+            .encrypt(black_box(&mut buf), black_box(&plaintext))
+            .unwrap();
         black_box(&buf);
     });
 }
@@ -363,8 +374,14 @@ fn profile_shared_checksum_savings() {
     let pct = 100.0 * savings / baseline;
 
     println!();
-    println!("  baseline (encrypt × 256)             : {baseline:>10.0} ns  ({:.1} ns/rcp)", baseline / n as f64);
-    println!("  optimized (precompute + encrypt × 256): {optimized:>10.0} ns  ({:.1} ns/rcp)", optimized / n as f64);
+    println!(
+        "  baseline (encrypt × 256)             : {baseline:>10.0} ns  ({:.1} ns/rcp)",
+        baseline / n as f64
+    );
+    println!(
+        "  optimized (precompute + encrypt × 256): {optimized:>10.0} ns  ({:.1} ns/rcp)",
+        optimized / n as f64
+    );
     println!("  measured savings                     : {savings:>+10.0} ns  ({pct:>+5.1}%)");
 }
 
@@ -460,7 +477,13 @@ fn profile_lean_layout_savings() {
     let pct = 100.0 * savings / prod;
 
     println!();
-    println!("  production CryptState fanout :   {prod:>10.0} ns  ({:.1} ns/rcp)", prod / n as f64);
-    println!("  lean-layout fanout           :   {lean:>10.0} ns  ({:.1} ns/rcp)", lean / n as f64);
+    println!(
+        "  production CryptState fanout :   {prod:>10.0} ns  ({:.1} ns/rcp)",
+        prod / n as f64
+    );
+    println!(
+        "  lean-layout fanout           :   {lean:>10.0} ns  ({:.1} ns/rcp)",
+        lean / n as f64
+    );
     println!("  savings                      :   {savings:>+10.0} ns  ({pct:>+5.1}%)");
 }

@@ -22,7 +22,10 @@ use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
 use crate::{
-    client_repository::ClientRepository, codec_info::CodecInfo, config::Config, s2s::S2SManager,
+    client_repository::ClientRepository,
+    codec_info::CodecInfo,
+    config::{Config, UdpPingUserCountScope},
+    s2s::S2SManager,
     types::NodeIdentifier,
 };
 
@@ -195,7 +198,8 @@ impl Server {
         let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx.clone());
         let idle_reaper =
             Self::spawn_idle_reaper(Arc::clone(self), idle_timeout_secs, shutdown_rx.clone());
-        let _s2s_task = Arc::clone(&self.s2s_manager).spawn_runtime_task(shutdown_rx.clone());
+        let _s2s_task = Arc::clone(&self.s2s_manager)
+            .spawn_runtime_task(Arc::downgrade(self), shutdown_rx.clone());
 
         // Public server registration (periodic HTTP POST to registry).
         // This task is optional and may exit early when registration is disabled;
@@ -787,6 +791,7 @@ impl Server {
                         current.max_users,
                         new_config.max_users
                     );
+                    self.s2s_manager.update_max_users(new_config.max_users);
                 }
                 if current.udp_voice_enabled != new_config.udp_voice_enabled {
                     tracing::info!(
@@ -800,6 +805,13 @@ impl Server {
                         "config reload: udp_ping_enabled {} -> {}",
                         current.udp_ping_enabled,
                         new_config.udp_ping_enabled
+                    );
+                }
+                if current.udp_ping_user_count_scope != new_config.udp_ping_user_count_scope {
+                    tracing::info!(
+                        "config reload: udp_ping_user_count_scope {:?} -> {:?}",
+                        current.udp_ping_user_count_scope,
+                        new_config.udp_ping_user_count_scope
                     );
                 }
                 if current.client_idle_timeout_secs != new_config.client_idle_timeout_secs {
@@ -920,25 +932,41 @@ impl Server {
 
     // ── UDP ping ─────────────────────────────────────────────────────────
 
-    /// Build a ping response with current server information.
     async fn build_ping_response(
         server: &Arc<Box<Self>>,
         ping: &crate::voice::ping::PingRequest,
     ) -> Result<Bytes, EncodeError> {
         // Snapshot config values before any .await (RwLockReadGuard is !Send)
-        let (max_users, max_bandwidth) = {
+        let (local_max_users, max_bandwidth, user_count_scope) = {
             let cfg = server.read_config();
-            (cfg.max_users, cfg.max_bandwidth)
+            (
+                cfg.max_users,
+                cfg.max_bandwidth,
+                cfg.udp_ping_user_count_scope,
+            )
         };
+
+        let (user_count, max_user_count) = match user_count_scope {
+            UdpPingUserCountScope::Cluster => {
+                let users = server.clients.len().await;
+                let max_users = server
+                    .s2s_manager
+                    .cluster_max_users()
+                    .filter(|max_users| *max_users > 0)
+                    .unwrap_or(local_max_users);
+                (users as u64, max_users)
+            }
+            UdpPingUserCountScope::Local => {
+                let users = server.clients.local_len().await;
+                (users as u64, local_max_users)
+            }
+        };
+
         let response = crate::voice::ping::PingResponse {
             timestamp: ping.timestamp,
             server_version: crate::constants::APP_PROTO_VER,
-            user_count: server
-                .clients
-                .len()
-                .await
-                .clamp(0, u32::MAX.try_into().unwrap()) as u32,
-            max_user_count: Some(max_users.clamp(0, u32::MAX.into()) as u32),
+            user_count: user_count.clamp(0, u32::MAX.into()) as u32,
+            max_user_count: Some(max_user_count.clamp(0, u32::MAX.into()) as u32),
             max_bandwidth_per_user: max_bandwidth,
         };
         response.encode(ping.format)

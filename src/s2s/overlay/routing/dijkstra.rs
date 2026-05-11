@@ -87,7 +87,9 @@ pub fn compute(
         if d > *dist.get(&u).unwrap_or(&u64::MAX) {
             continue;
         }
-        let Some(neighbors) = adj.get(&u) else { continue };
+        let Some(neighbors) = adj.get(&u) else {
+            continue;
+        };
         for (v, w) in neighbors {
             let nd = d.saturating_add(*w);
             if nd < *dist.get(v).unwrap_or(&u64::MAX) {
@@ -109,7 +111,13 @@ pub fn compute(
         loop {
             match prev.get(&cur) {
                 Some(p) if *p == self_id => {
-                    out.insert(dst, RouteEntry { next_hop: cur, cost });
+                    out.insert(
+                        dst,
+                        RouteEntry {
+                            next_hop: cur,
+                            cost,
+                        },
+                    );
                     break;
                 }
                 Some(p) => cur = *p,
@@ -171,6 +179,7 @@ mod tests {
                     ),
                 })
                 .collect(),
+            max_users: 0,
         }
     }
 
@@ -188,7 +197,12 @@ mod tests {
         // 1 -> 2 -> 3
         let db = build_db(vec![
             entry(1, 100, 1, vec![(2, 5_000, 100, 1_000_000)]),
-            entry(2, 100, 1, vec![(1, 5_000, 100, 1_000_000), (3, 4_000, 100, 1_000_000)]),
+            entry(
+                2,
+                100,
+                1,
+                vec![(1, 5_000, 100, 1_000_000), (3, 4_000, 100, 1_000_000)],
+            ),
             entry(3, 100, 1, vec![(2, 4_000, 100, 1_000_000)]),
         ]);
         let table = compute(&db, 1, ServiceLevel::ReliableLowLatency, &cfg());
@@ -202,9 +216,24 @@ mod tests {
         // 1—2 (rtt=10ms), 1—3 (rtt=2ms), 3—2 (rtt=2ms).
         // Direct 1->2 costs 10ms; via 3: 2+2=4ms. So next_hop(2) = 3.
         let db = build_db(vec![
-            entry(1, 100, 1, vec![(2, 10_000, 0, 1_000_000), (3, 2_000, 0, 1_000_000)]),
-            entry(2, 100, 1, vec![(1, 10_000, 0, 1_000_000), (3, 2_000, 0, 1_000_000)]),
-            entry(3, 100, 1, vec![(1, 2_000, 0, 1_000_000), (2, 2_000, 0, 1_000_000)]),
+            entry(
+                1,
+                100,
+                1,
+                vec![(2, 10_000, 0, 1_000_000), (3, 2_000, 0, 1_000_000)],
+            ),
+            entry(
+                2,
+                100,
+                1,
+                vec![(1, 10_000, 0, 1_000_000), (3, 2_000, 0, 1_000_000)],
+            ),
+            entry(
+                3,
+                100,
+                1,
+                vec![(1, 2_000, 0, 1_000_000), (2, 2_000, 0, 1_000_000)],
+            ),
         ]);
         let table = compute(&db, 1, ServiceLevel::ReliableLowLatency, &cfg());
         assert_eq!(table[&2].next_hop, 3);

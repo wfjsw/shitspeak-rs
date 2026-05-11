@@ -5,6 +5,10 @@ use std::time::Duration;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::Message;
 
+/// Checks that self-mute changes are broadcast to peers.
+/// Expected: Bob receives Alice's `UserState` with `self_mute = true`. This is
+/// Mumble's self-state update behavior in `D:\mumble\src\murmur\Messages.cpp::msgUserState`
+/// and shitspeak's equivalent in `D:\shitspeak\message.go::handleUserStateMessage`.
 #[tokio::test]
 async fn self_mute_broadcasts() {
     let server = spawn_test_server(TestServerOpts::default()).await;
@@ -40,6 +44,11 @@ async fn self_mute_broadcasts() {
     );
 }
 
+/// Checks that self-deaf changes are broadcast to peers.
+/// Expected: Bob receives Alice's `UserState` with `self_deaf = true`; Mumble
+/// also treats deaf as implying mute in `msgUserState`. The expected behavior
+/// comes from `D:\mumble\src\murmur\Messages.cpp::msgUserState` and
+/// `D:\shitspeak\message.go::handleUserStateMessage`.
 #[tokio::test]
 async fn self_deaf_broadcasts() {
     let server = spawn_test_server(TestServerOpts::default()).await;

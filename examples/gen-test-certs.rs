@@ -8,7 +8,8 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Generate a self-signed certificate using rcgen
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
 
     std::fs::write("cert.pem", cert.cert.pem())?;
     std::fs::write("key.pem", cert.key_pair.serialize_pem())?;
@@ -16,4 +17,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Generated cert.pem and key.pem for localhost");
     Ok(())
 }
-

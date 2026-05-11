@@ -36,11 +36,7 @@ impl std::fmt::Debug for NodeIdentity {
 }
 
 impl NodeIdentity {
-    pub fn load(
-        ca_path: &Path,
-        cert_path: &Path,
-        key_path: &Path,
-    ) -> Result<Self, ConfigError> {
+    pub fn load(ca_path: &Path, cert_path: &Path, key_path: &Path) -> Result<Self, ConfigError> {
         let roots = load_roots(ca_path)?;
         let chain = load_certs(cert_path)?;
         let key = load_private_key(key_path)?;
@@ -123,10 +119,12 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ConfigError> 
         source: e,
     })?);
 
-    if let Some(key) = rustls_pemfile::private_key(&mut reader).map_err(|e| ConfigError::KeyRead {
-        path: path.display().to_string(),
-        source: e,
-    })? {
+    if let Some(key) =
+        rustls_pemfile::private_key(&mut reader).map_err(|e| ConfigError::KeyRead {
+            path: path.display().to_string(),
+            source: e,
+        })?
+    {
         return Ok(key);
     }
 
@@ -141,8 +139,8 @@ pub fn parse_cn_node_id(
     cert_der: &CertificateDer<'_>,
     cert_path_for_diag: &Path,
 ) -> Result<NodeIdentifier, ConfigError> {
-    let (_, parsed) =
-        X509Certificate::from_der(cert_der.as_ref()).map_err(|e| ConfigError::X509(format!("{e}")))?;
+    let (_, parsed) = X509Certificate::from_der(cert_der.as_ref())
+        .map_err(|e| ConfigError::X509(format!("{e}")))?;
 
     let cn = parsed
         .subject()
@@ -166,8 +164,8 @@ pub fn parse_peer_cn(chain: &[CertificateDer<'_>]) -> Result<NodeIdentifier, Con
     let first = chain.first().ok_or(ConfigError::CertEmpty {
         path: "<peer-chain>".to_string(),
     })?;
-    let (_, parsed) = X509Certificate::from_der(first.as_ref())
-        .map_err(|e| ConfigError::X509(format!("{e}")))?;
+    let (_, parsed) =
+        X509Certificate::from_der(first.as_ref()).map_err(|e| ConfigError::X509(format!("{e}")))?;
     let cn = parsed
         .subject()
         .iter_common_name()
@@ -191,7 +189,10 @@ mod tests {
 
     /// Mints a self-signed CA + a node cert with CN=`node_cn`, all written to
     /// PEM files inside `dir`. Returns (ca.pem, cert.pem, key.pem).
-    fn mint_identity(dir: &TempDir, node_cn: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    fn mint_identity(
+        dir: &TempDir,
+        node_cn: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(vec!["s2s-test-ca".to_string()]).unwrap();
         let mut dn = DistinguishedName::new();
@@ -216,7 +217,9 @@ mod tests {
         let mut cert_f = File::create(&cert_path).unwrap();
         cert_f.write_all(node_cert.pem().as_bytes()).unwrap();
         let mut key_f = File::create(&key_path).unwrap();
-        key_f.write_all(node_key.serialize_pem().as_bytes()).unwrap();
+        key_f
+            .write_all(node_key.serialize_pem().as_bytes())
+            .unwrap();
 
         (ca_path, cert_path, key_path)
     }

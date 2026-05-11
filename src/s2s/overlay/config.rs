@@ -39,9 +39,11 @@ pub const fn idx_to_kind(i: u32) -> Option<TransportKind> {
 /// `{Tcp, Kcp, Quic}` — the three reliable streams. Default for both
 /// `Reliable` and `ReliableLowLatency` admission. `Udp` is lossy/datagram-
 /// based and is excluded by default for any reliable level.
-pub const RELIABLE_TRANSPORTS_DEFAULT: TransportMask =
-    transport_bit(TransportKind::Tcp) | transport_bit(TransportKind::Kcp) | transport_bit(TransportKind::Quic);
-pub const ALL_TRANSPORTS_DEFAULT: TransportMask = RELIABLE_TRANSPORTS_DEFAULT | transport_bit(TransportKind::Udp);
+pub const RELIABLE_TRANSPORTS_DEFAULT: TransportMask = transport_bit(TransportKind::Tcp)
+    | transport_bit(TransportKind::Kcp)
+    | transport_bit(TransportKind::Quic);
+pub const ALL_TRANSPORTS_DEFAULT: TransportMask =
+    RELIABLE_TRANSPORTS_DEFAULT | transport_bit(TransportKind::Udp);
 
 /// Knobs for [`super::OverlayNetwork::start`].
 #[derive(Debug, Clone)]
@@ -75,7 +77,7 @@ pub struct OverlayConfig {
     best_effort_transports_mask: TransportMask,
 
     // ── Cost-change re-emit thresholds ──
-    cost_rerun_rtt_pct: f64,        // re-emit when RTT shifts >= this fraction
+    cost_rerun_rtt_pct: f64, // re-emit when RTT shifts >= this fraction
     cost_rerun_throughput_pct: f64, // re-emit when throughput shifts >= this fraction
 
     // ── LSDB sync chunking ──
@@ -287,4 +289,6 @@ impl OverlayTuning {
     }
 }
 
-fn default_lsdb_sync_max_response_lsas() -> usize { 256 }
+fn default_lsdb_sync_max_response_lsas() -> usize {
+    256
+}

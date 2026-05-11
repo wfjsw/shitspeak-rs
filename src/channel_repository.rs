@@ -96,13 +96,10 @@ impl ChannelOperation {
                     name: patch.name.clone(),
                     position: patch.position,
                     max_users: patch.max_users,
-                    description_hash: patch
-                        .description_hash
-                        .as_ref()
-                        .and_then(|h| {
-                            h.as_ref()
-                                .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from))
-                        }),
+                    description_hash: patch.description_hash.as_ref().and_then(|h| {
+                        h.as_ref()
+                            .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from))
+                    }),
                     links_add: links_add.clone(),
                     links_remove: links_remove.clone(),
                     ..Default::default()
@@ -165,13 +162,10 @@ fn channel_to_proto_delta(id: u32, patch: &ChannelPatch) -> crate::messages::Mes
         name: patch.name.clone(),
         position: patch.position,
         max_users: patch.max_users,
-        description_hash: patch
-            .description_hash
-            .as_ref()
-            .and_then(|h| {
-                h.as_ref()
-                    .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from))
-            }),
+        description_hash: patch.description_hash.as_ref().and_then(|h| {
+            h.as_ref()
+                .and_then(|h| hex::decode(h).ok().map(bytes::Bytes::from))
+        }),
         ..Default::default()
     }
     .into()
@@ -223,6 +217,13 @@ struct Snapshot {
 
 // ─── ChannelRepository ────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug)]
+struct CachedAclPermissions {
+    channel_acl_generation: u64,
+    client_acl_generation: u64,
+    permissions: BitFlags<ACLPermissions>,
+}
+
 pub struct ChannelRepository {
     node_id: u16,
     channels: ParkingRwLock<HashMap<u32, Channel>>,
@@ -230,9 +231,11 @@ pub struct ChannelRepository {
     /// In-memory log for `get_log_since` and future S2S queries.
     log: ParkingRwLock<std::collections::VecDeque<Arc<ChannelOperation>>>,
     log_max_entries: usize,
-    /// Cached effective permissions: (session_id_u64, channel_id) → perms.
+    /// Bumped whenever channel state can change effective ACL results.
+    channel_acl_generation: AtomicU64,
+    /// Cached effective permissions: (session_id_u64, channel_id) -> entry.
     /// Lock-free concurrent cache using scc::HashCache.
-    acl_cache: HashCache<(u64, u32), BitFlags<ACLPermissions>>,
+    acl_cache: HashCache<(u64, u32), CachedAclPermissions>,
     /// Optional storage directory.
     storage_dir: Option<PathBuf>,
     /// Append-only WAL file handle; `None` when running in-memory.
@@ -269,6 +272,7 @@ impl ChannelRepository {
             version: AtomicU64::new(0),
             log: ParkingRwLock::new(std::collections::VecDeque::new()),
             log_max_entries: tuning.log_max_entries,
+            channel_acl_generation: AtomicU64::new(0),
             acl_cache: HashCache::new(),
             storage_dir: None,
             wal_file: None,
@@ -379,6 +383,7 @@ impl ChannelRepository {
             version: AtomicU64::new(max_version),
             log: ParkingRwLock::new(log_entries),
             log_max_entries: tuning.log_max_entries,
+            channel_acl_generation: AtomicU64::new(0),
             acl_cache: HashCache::new(),
             storage_dir: Some(storage_dir.to_owned()),
             wal_file: Some(AsyncMutex::new(wal_file)),
@@ -396,6 +401,18 @@ impl ChannelRepository {
 
     pub fn current_version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn channel_acl_generation(&self) -> u64 {
+        self.channel_acl_generation.load(Ordering::Acquire)
+    }
+
+    fn bump_channel_acl_generation(&self) {
+        self.channel_acl_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn local_node_id(&self) -> u16 {
+        self.node_id
     }
 
     // ── Read API ──────────────────────────────────────────────────────────
@@ -444,7 +461,10 @@ impl ChannelRepository {
 
     /// Return both a channel and its ancestor chain in a single lock
     /// acquisition.  Avoids the double-lock pattern in ACL evaluation.
-    pub async fn get_channel_with_ancestors(&self, channel_id: u32) -> (Option<Channel>, Vec<Channel>) {
+    pub async fn get_channel_with_ancestors(
+        &self,
+        channel_id: u32,
+    ) -> (Option<Channel>, Vec<Channel>) {
         let channels = self.channels.read();
         let channel = channels.get(&channel_id).cloned();
         let mut ancestors = Vec::new();
@@ -461,6 +481,20 @@ impl ChannelRepository {
             current_id = pid;
         }
         (channel, ancestors)
+    }
+
+    /// Return a channel and ancestors from a stable ACL generation snapshot.
+    pub(crate) async fn get_channel_with_ancestors_for_acl(
+        &self,
+        channel_id: u32,
+    ) -> (u64, Option<Channel>, Vec<Channel>) {
+        loop {
+            let generation = self.channel_acl_generation();
+            let (channel, ancestors) = self.get_channel_with_ancestors(channel_id).await;
+            if self.channel_acl_generation() == generation {
+                return (generation, channel, ancestors);
+            }
+        }
     }
 
     // ── Mutation API ──────────────────────────────────────────────────────
@@ -511,6 +545,7 @@ impl ChannelRepository {
             op
         };
 
+        self.bump_channel_acl_generation();
         self.commit(op).await?;
         Ok(channel)
     }
@@ -520,6 +555,7 @@ impl ChannelRepository {
         id: u32,
         patch: ChannelPatch,
     ) -> Result<Channel, ChannelRepoError> {
+        let parent_changed = patch.parent_id.is_some();
         let mut channels = self.channels.write();
 
         if !channels.contains_key(&id) {
@@ -560,7 +596,9 @@ impl ChannelRepository {
             (op, updated)
         };
 
-        self.invalidate_acl_cache_for_channel(id).await;
+        if parent_changed {
+            self.bump_channel_acl_generation();
+        }
         self.commit(op).await?;
         Ok(updated)
     }
@@ -572,6 +610,7 @@ impl ChannelRepository {
         links_add: Vec<u32>,
         links_remove: Vec<u32>,
     ) -> Result<Channel, ChannelRepoError> {
+        let parent_changed = patch.parent_id.is_some();
         let updated = {
             let mut channels = self.channels.write();
 
@@ -636,7 +675,9 @@ impl ChannelRepository {
             links_add,
             links_remove,
         });
-        self.invalidate_acl_cache_for_channel(id).await;
+        if parent_changed {
+            self.bump_channel_acl_generation();
+        }
         self.commit(op).await?;
         Ok(updated)
     }
@@ -663,7 +704,7 @@ impl ChannelRepository {
             to_delete
         };
         let op = self.make_op(ChannelOp::DeleteChannel { id });
-        self.invalidate_acl_cache_for_channel(id).await;
+        self.bump_channel_acl_generation();
         self.commit(op).await?;
         Ok(to_delete)
     }
@@ -725,57 +766,52 @@ impl ChannelRepository {
             inherit_acl,
             acls,
         });
-        self.invalidate_acl_cache_for_channel(channel_id).await;
+        self.bump_channel_acl_generation();
         self.commit(op).await?;
         Ok(())
     }
 
     // ── ACL cache ─────────────────────────────────────────────────────────
 
-    pub async fn get_cached_permissions(
+    pub(crate) async fn get_cached_permissions(
         &self,
         session_id: u64,
         channel_id: u32,
+        channel_acl_generation: u64,
+        client_acl_generation: u64,
     ) -> Option<BitFlags<ACLPermissions>> {
-        self.acl_cache.get(&(session_id, channel_id)).map(|entry| *entry)
+        self.acl_cache
+            .get(&(session_id, channel_id))
+            .and_then(|entry| {
+                (entry.channel_acl_generation == channel_acl_generation
+                    && entry.client_acl_generation == client_acl_generation)
+                    .then_some(entry.permissions)
+            })
     }
 
-    pub async fn cache_permissions(
+    pub(crate) async fn cache_permissions(
         &self,
         session_id: u64,
         channel_id: u32,
-        perms: BitFlags<ACLPermissions>,
+        channel_acl_generation: u64,
+        client_acl_generation: u64,
+        permissions: BitFlags<ACLPermissions>,
     ) {
-        self.acl_cache.put((session_id, channel_id), perms);
+        self.acl_cache.put(
+            (session_id, channel_id),
+            CachedAclPermissions {
+                channel_acl_generation,
+                client_acl_generation,
+                permissions,
+            },
+        );
     }
 
-    pub async fn invalidate_acl_cache_for_channel(&self, channel_id: u32) {
-        // Collect keys to remove (can't modify during iteration)
-        let mut keys_to_remove = Vec::new();
-        self.acl_cache.scan(|k, _| {
-            if k.1 == channel_id {
-                keys_to_remove.push(*k);
-            }
-        });
-        // Remove collected keys
-        for key in keys_to_remove {
-            self.acl_cache.remove(&key);
-        }
+    pub async fn invalidate_acl_cache_for_channel(&self, _channel_id: u32) {
+        self.bump_channel_acl_generation();
     }
 
-    pub async fn invalidate_acl_cache_for_user(&self, session_id: u64) {
-        // Collect keys to remove (can't modify during iteration)
-        let mut keys_to_remove = Vec::new();
-        self.acl_cache.scan(|k, _| {
-            if k.0 == session_id {
-                keys_to_remove.push(*k);
-            }
-        });
-        // Remove collected keys
-        for key in keys_to_remove {
-            self.acl_cache.remove(&key);
-        }
-    }
+    pub async fn invalidate_acl_cache_for_user(&self, _session_id: u64) {}
 
     // ── Snapshot / compaction ─────────────────────────────────────────────
 
@@ -833,7 +869,10 @@ impl ChannelRepository {
 
                 wal.sync_data().await?;
 
-                let src = tokio::fs::OpenOptions::new().read(true).open(&wal_path).await?;
+                let src = tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&wal_path)
+                    .await?;
                 let mut reader = tokio::io::BufReader::new(src).lines();
                 let mut skipped = 0usize;
                 let mut kept = 0usize;
@@ -948,6 +987,37 @@ impl ChannelRepository {
         self.commit_assigned_operation(op).await
     }
 
+    pub async fn install_s2s_snapshot(
+        self: &Arc<Self>,
+        version: u64,
+        channels_snapshot: Vec<Channel>,
+    ) -> Result<(), ChannelRepoError> {
+        {
+            let mut channels = self.channels.write();
+            channels.clear();
+            for channel in channels_snapshot {
+                channels.insert(channel.id, channel);
+            }
+            self.version.store(version, Ordering::Release);
+            self.log.write().clear();
+        }
+        self.channel_acl_generation.fetch_add(1, Ordering::AcqRel);
+        self.acl_cache.clear();
+
+        let client_repo = self.client_repo.lock().clone();
+        if let Some(client_repo) = client_repo {
+            client_repo.drain_pending_ops(version).await;
+        }
+
+        if self.storage_dir.is_some() {
+            if let Err(e) = self.save_snapshot().await {
+                tracing::warn!("channel snapshot compaction failed after s2s install: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Set the `ClientRepository` reference for cross-repo causal notification.
     pub async fn set_client_repo(
         &self,
@@ -965,6 +1035,81 @@ impl ChannelRepository {
             timestamp: chrono::Utc::now().timestamp(),
             op,
         }
+    }
+
+    pub async fn validate_s2s_op(&self, op: &ChannelOp) -> Result<(), ChannelRepoError> {
+        let channels = self.channels.read();
+        match op {
+            ChannelOp::CreateChannel { channel } => {
+                if let Some(pid) = channel.parent_id {
+                    if !channels.contains_key(&pid) && pid != 0 {
+                        return Err(ChannelRepoError::ParentNotFound(pid));
+                    }
+                }
+                if channels.values().any(|c| {
+                    c.parent_id == channel.parent_id && c.name == channel.name && c.id != channel.id
+                }) {
+                    return Err(ChannelRepoError::NameConflict(channel.name.clone()));
+                }
+            }
+            ChannelOp::UpdateChannel { id, patch } | ChannelOp::EditChannel { id, patch, .. } => {
+                if !channels.contains_key(id) {
+                    return Err(ChannelRepoError::NotFound(*id));
+                }
+                if let Some(new_parent) = patch.parent_id {
+                    if let Some(pid) = new_parent {
+                        if !channels.contains_key(&pid) {
+                            return Err(ChannelRepoError::ParentNotFound(pid));
+                        }
+                        if is_descendant(&channels, pid, *id) {
+                            return Err(ChannelRepoError::CannotMoveIntoDescendant);
+                        }
+                    }
+                }
+                if let Some(ref new_name) = patch.name {
+                    let target_parent = patch.parent_id.unwrap_or_else(|| channels[id].parent_id);
+                    if channels
+                        .values()
+                        .any(|c| c.parent_id == target_parent && &c.name == new_name && c.id != *id)
+                    {
+                        return Err(ChannelRepoError::NameConflict(new_name.clone()));
+                    }
+                }
+                if let ChannelOp::EditChannel { links_add, .. } = op {
+                    for &link_add in links_add {
+                        if link_add != *id && !channels.contains_key(&link_add) {
+                            return Err(ChannelRepoError::NotFound(link_add));
+                        }
+                    }
+                }
+            }
+            ChannelOp::DeleteChannel { id } => {
+                if *id == 0 {
+                    return Err(ChannelRepoError::CannotDeleteRoot);
+                }
+                if !channels.contains_key(id) {
+                    return Err(ChannelRepoError::NotFound(*id));
+                }
+            }
+            ChannelOp::AddLink { a, b } => {
+                if a == b {
+                    return Ok(());
+                }
+                if !channels.contains_key(a) {
+                    return Err(ChannelRepoError::NotFound(*a));
+                }
+                if !channels.contains_key(b) {
+                    return Err(ChannelRepoError::NotFound(*b));
+                }
+            }
+            ChannelOp::RemoveLink { .. } => {}
+            ChannelOp::SetAcls { channel_id, .. } => {
+                if !channels.contains_key(channel_id) {
+                    return Err(ChannelRepoError::NotFound(*channel_id));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn commit_assigned_operation(
@@ -1023,22 +1168,8 @@ impl ChannelRepository {
     }
 
     async fn invalidate_acl_cache_for_op(&self, op: &ChannelOp) {
-        match op {
-            ChannelOp::CreateChannel { channel } => {
-                self.invalidate_acl_cache_for_channel(channel.id).await;
-            }
-            ChannelOp::EditChannel { id, .. }
-            | ChannelOp::UpdateChannel { id, .. }
-            | ChannelOp::DeleteChannel { id } => {
-                self.invalidate_acl_cache_for_channel(*id).await;
-            }
-            ChannelOp::AddLink { a, b } | ChannelOp::RemoveLink { a, b } => {
-                self.invalidate_acl_cache_for_channel(*a).await;
-                self.invalidate_acl_cache_for_channel(*b).await;
-            }
-            ChannelOp::SetAcls { channel_id, .. } => {
-                self.invalidate_acl_cache_for_channel(*channel_id).await;
-            }
+        if channel_op_affects_acl_generation(op) {
+            self.bump_channel_acl_generation();
         }
     }
 }
@@ -1135,6 +1266,18 @@ fn apply_patch(ch: &mut Channel, patch: &ChannelPatch) {
     }
     if let Some(ref pid) = patch.parent_id {
         ch.parent_id = *pid;
+    }
+}
+
+fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
+    match op {
+        ChannelOp::CreateChannel { .. }
+        | ChannelOp::DeleteChannel { .. }
+        | ChannelOp::SetAcls { .. } => true,
+        ChannelOp::UpdateChannel { patch, .. } | ChannelOp::EditChannel { patch, .. } => {
+            patch.parent_id.is_some()
+        }
+        ChannelOp::AddLink { .. } | ChannelOp::RemoveLink { .. } => false,
     }
 }
 

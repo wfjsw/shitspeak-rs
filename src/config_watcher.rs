@@ -47,8 +47,8 @@ pub fn spawn_config_watcher(
 
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let mut watcher = match notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = res {
                     // Only care about data changes (write, create)
                     match event.kind {
@@ -63,14 +63,13 @@ pub fn spawn_config_watcher(
                         _ => {}
                     }
                 }
-            },
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!("config watcher: failed to create filesystem watcher: {e}");
-                return;
-            }
-        };
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("config watcher: failed to create filesystem watcher: {e}");
+                    return;
+                }
+            };
 
         if let Err(e) = watcher.watch(&parent, notify::RecursiveMode::NonRecursive) {
             tracing::error!("config watcher: failed to watch directory: {e}");

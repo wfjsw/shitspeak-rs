@@ -7,25 +7,19 @@ pub struct UserList {
 
 impl From<crate::mumble_proto::UserList> for UserList {
     fn from(proto: crate::mumble_proto::UserList) -> Self {
-        Self {
-            users: proto.users,
-        }
+        Self { users: proto.users }
     }
 }
 
 impl Default for UserList {
     fn default() -> Self {
-        Self {
-            users: Vec::new(),
-        }
+        Self { users: Vec::new() }
     }
 }
 
 impl Into<crate::mumble_proto::UserList> for UserList {
     fn into(self) -> crate::mumble_proto::UserList {
-        crate::mumble_proto::UserList {
-            users: self.users,
-        }
+        crate::mumble_proto::UserList { users: self.users }
     }
 }
 

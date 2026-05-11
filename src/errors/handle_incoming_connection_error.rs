@@ -1,4 +1,7 @@
-use crate::{errors::{AuthRejection, MessageHandlerError, ReadProtoMessageError, WriteProtoMessageError}, proxy_protocol::GetProxyProtocolRealIpError};
+use crate::{
+    errors::{AuthRejection, MessageHandlerError, ReadProtoMessageError, WriteProtoMessageError},
+    proxy_protocol::GetProxyProtocolRealIpError,
+};
 
 #[derive(Debug)]
 pub enum HandleIncomingConnectionError {

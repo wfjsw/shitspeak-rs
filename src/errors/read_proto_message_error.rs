@@ -1,4 +1,7 @@
-use crate::errors::{MessageLengthExceededError, UnknownMessageTypeError, from_proto_to_message_error::FromProtoToMessageError};
+use crate::errors::{
+    from_proto_to_message_error::FromProtoToMessageError, MessageLengthExceededError,
+    UnknownMessageTypeError,
+};
 
 #[derive(Debug)]
 pub enum ReadProtoMessageError {
@@ -35,8 +38,12 @@ impl From<UnknownMessageTypeError> for ReadProtoMessageError {
 impl From<FromProtoToMessageError> for ReadProtoMessageError {
     fn from(err: FromProtoToMessageError) -> Self {
         match err {
-            FromProtoToMessageError::ProtobufDecodeError(e) => ReadProtoMessageError::ProtobufDecodeError(e),
-            FromProtoToMessageError::UnknownMessageType(e) => ReadProtoMessageError::UnknownMessageType(e),
+            FromProtoToMessageError::ProtobufDecodeError(e) => {
+                ReadProtoMessageError::ProtobufDecodeError(e)
+            }
+            FromProtoToMessageError::UnknownMessageType(e) => {
+                ReadProtoMessageError::UnknownMessageType(e)
+            }
         }
     }
 }
@@ -46,7 +53,9 @@ impl std::fmt::Display for ReadProtoMessageError {
         match self {
             ReadProtoMessageError::IOError(err) => write!(f, "IO error: {}", err),
             ReadProtoMessageError::MessageLengthExceeded(err) => write!(f, "{}", err),
-            ReadProtoMessageError::ProtobufDecodeError(err) => write!(f, "Protobuf decode error: {}", err),
+            ReadProtoMessageError::ProtobufDecodeError(err) => {
+                write!(f, "Protobuf decode error: {}", err)
+            }
             ReadProtoMessageError::UnknownMessageType(err) => write!(f, "{}", err),
         }
     }

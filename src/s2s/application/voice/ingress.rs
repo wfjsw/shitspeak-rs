@@ -19,9 +19,7 @@ use crate::s2s::application::config::{DeliveryStrategy, VoiceConfig};
 use crate::s2s::application::error::ApplicationError;
 use crate::s2s::application::proto::{self, VoiceFrame};
 use crate::s2s::application::voice::reorder::{self, Reorderer};
-use crate::s2s::application::voice::send::{
-    self, OverlayVoiceTransport, VoiceTransport,
-};
+use crate::s2s::application::voice::send::{self, OverlayVoiceTransport, VoiceTransport};
 use crate::s2s::application::voice::sink::AudioSink;
 use crate::s2s::application::voice::targeted::RecipientIndex;
 use crate::s2s::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
@@ -95,8 +93,7 @@ impl VoiceService {
         shutdown: CancellationToken,
     ) -> Arc<Self> {
         let sender_epoch = overlay.local_boot_epoch();
-        let transport: Arc<dyn VoiceTransport> =
-            Arc::new(OverlayVoiceTransport { overlay });
+        let transport: Arc<dyn VoiceTransport> = Arc::new(OverlayVoiceTransport { overlay });
         Self::new_with_transport(transport, cfg, shutdown, sender_epoch)
     }
 
@@ -247,7 +244,8 @@ impl VoiceService {
     ) -> Result<(), ApplicationError> {
         match self.delivery_strategy {
             DeliveryStrategy::Broadcast => {
-                self.send_broadcast(sender_session, 0, is_terminator, payload).await
+                self.send_broadcast(sender_session, 0, is_terminator, payload)
+                    .await
             }
             DeliveryStrategy::Targeted => {
                 let nodes = self
@@ -265,14 +263,8 @@ impl VoiceService {
                             // channel; nothing to do for cross-node delivery.
                             return Ok(());
                         }
-                        self.send_multicast(
-                            sender_session,
-                            0,
-                            is_terminator,
-                            payload,
-                            &dsts,
-                        )
-                        .await
+                        self.send_multicast(sender_session, 0, is_terminator, payload, &dsts)
+                            .await
                     }
                     _ => {
                         // No index entry yet — degrade safely to broadcast.
@@ -280,7 +272,8 @@ impl VoiceService {
                             channel_id,
                             "voice targeted: no index entry; falling back to broadcast"
                         );
-                        self.send_broadcast(sender_session, 0, is_terminator, payload).await
+                        self.send_broadcast(sender_session, 0, is_terminator, payload)
+                            .await
                     }
                 }
             }
@@ -401,7 +394,9 @@ mod tests {
         let svc = make_service(transport.clone());
 
         let payload = Bytes::from_static(b"opus-1");
-        svc.send_broadcast(0xABC, 0, false, payload.clone()).await.unwrap();
+        svc.send_broadcast(0xABC, 0, false, payload.clone())
+            .await
+            .unwrap();
         svc.send_broadcast(0xABC, 0, true, Bytes::from_static(b"opus-2"))
             .await
             .unwrap();
@@ -440,15 +435,9 @@ mod tests {
     async fn multicast_emits_envelope_with_dsts() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service(transport.clone());
-        svc.send_multicast(
-            0xABC,
-            2,
-            false,
-            Bytes::from_static(b"whisper"),
-            &[1, 3],
-        )
-        .await
-        .unwrap();
+        svc.send_multicast(0xABC, 2, false, Bytes::from_static(b"whisper"), &[1, 3])
+            .await
+            .unwrap();
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
@@ -563,15 +552,8 @@ mod tests {
 
         // Synthesize an inbound overlay message and feed it through the
         // production decode path.
-        let envelope = send::build_envelope(
-            0xABC,
-            42,
-            5,
-            0,
-            true,
-            Bytes::from_static(b"opus-bytes"),
-        )
-        .unwrap();
+        let envelope =
+            send::build_envelope(0xABC, 42, 5, 0, true, Bytes::from_static(b"opus-bytes")).unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 11,
             level: crate::s2s::transport::ServiceLevel::BestEffort,
@@ -600,15 +582,8 @@ mod tests {
     async fn ingress_drops_when_no_sink_installed() {
         let transport = FakeVoiceTransport::new(7, vec![1]);
         let svc = make_service(transport);
-        let envelope = send::build_envelope(
-            0xABC,
-            42,
-            0,
-            0,
-            false,
-            Bytes::from_static(b"x"),
-        )
-        .unwrap();
+        let envelope =
+            send::build_envelope(0xABC, 42, 0, 0, false, Bytes::from_static(b"x")).unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 1,
             level: crate::s2s::transport::ServiceLevel::BestEffort,

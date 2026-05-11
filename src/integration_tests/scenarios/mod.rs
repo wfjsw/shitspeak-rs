@@ -6,5 +6,6 @@ pub mod channel_move;
 pub mod channel_ops;
 pub mod channel_tree;
 pub mod mod_actions;
+pub mod s2s;
 pub mod self_actions;
 pub mod voice;

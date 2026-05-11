@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::{
-    ban_repository::BanEntry,
+    ban_repository::{BanEntry, BanOp},
     client::Client,
     errors::MessageHandlerError,
     messages::{encoder::BanList, Message, WriteMessageExt},
@@ -20,9 +20,23 @@ pub async fn handle_ban_list(
         ));
     }
 
-    tracing::debug!(session = u32::from(sender.get_session_id()), query = msg.query, num_bans = msg.bans.len(), "BanList handler");
+    tracing::debug!(
+        session = u32::from(sender.get_session_id()),
+        query = msg.query,
+        num_bans = msg.bans.len(),
+        "BanList handler"
+    );
 
-    // TODO: require Ban permission on root channel
+    let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
+    if !root_perms.contains(crate::acl::ACLPermissions::Ban) {
+        return Err(MessageHandlerError::PermissionDenied(
+            crate::messages::encoder::PermissionDenied::for_permission(
+                u32::from(sender.get_session_id()),
+                Some(0),
+                crate::acl::ACLPermissions::Ban,
+            ),
+        ));
+    }
 
     if msg.query.unwrap_or(false) {
         // Query mode: return current ban list
@@ -42,25 +56,39 @@ pub async fn handle_ban_list(
         let reply: Message = BanList {
             bans,
             query: Some(false),
-        }.into();
+        }
+        .into();
         sender.write_proto_message(&reply).await?;
     } else {
         // Update mode: replace ban list with provided entries
-        let entries: Vec<BanEntry> = msg.bans.iter().map(|b| {
-            let addr_str = String::from_utf8_lossy(&b.address);
-            BanEntry {
-                address: addr_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0])),
-                mask: b.mask as u8,
-                name: b.name.clone(),
-                hash: b.hash.clone(),
-                reason: b.reason.clone(),
-                start: b.start.as_ref().and_then(|s| s.parse().ok()).unwrap_or(chrono::Utc::now().timestamp()),
-                duration: b.duration.unwrap_or(0) as u64,
-            }
-        }).collect();
+        let entries: Vec<BanEntry> = msg
+            .bans
+            .iter()
+            .map(|b| {
+                let addr_str = String::from_utf8_lossy(&b.address);
+                BanEntry {
+                    address: addr_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0])),
+                    mask: b.mask as u8,
+                    name: b.name.clone(),
+                    hash: b.hash.clone(),
+                    reason: b.reason.clone(),
+                    start: b
+                        .start
+                        .as_ref()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(chrono::Utc::now().timestamp()),
+                    duration: b.duration.unwrap_or(0) as u64,
+                }
+            })
+            .collect();
 
-        if let Err(e) = server.get_bans().set_bans(entries).await {
-            tracing::warn!("Failed to persist ban list: {e}");
+        let op = BanOp::SetBans {
+            entries: entries.clone(),
+        };
+        if !server.s2s_manager().propose_ban_op(op).await {
+            if let Err(e) = server.get_bans().set_bans(entries).await {
+                tracing::warn!("Failed to persist ban list: {e}");
+            }
         }
         tracing::info!(
             "Ban list update from session {:?} with {} entries",

@@ -132,10 +132,6 @@ pub fn evaluate_permission(
     client: &ClientMembershipQuery,
     current_channel_id: u32,
 ) -> BitFlags<ACLPermissions> {
-
-    // FIXME: Temporarily allow all permissions for testing until we implement real ACLs
-    // return BitFlags::all();
-
     let mut allowed = BitFlags::empty();
     let mut denied = BitFlags::empty();
 
@@ -205,5 +201,8 @@ pub fn evaluate_permission(
 /// Check whether a channel has any deny rules on the given permission.
 /// Used to compute `is_enter_restricted` for `ChannelState` messages.
 pub fn channel_has_restriction(channel: &crate::channels::Channel, perm: ACLPermissions) -> bool {
-    return channel.acls.iter().any(|acl| acl.deny.contains(perm) || acl.deny.contains(ACLPermissions::Traverse));
+    return channel
+        .acls
+        .iter()
+        .any(|acl| acl.deny.contains(perm) || acl.deny.contains(ACLPermissions::Traverse));
 }

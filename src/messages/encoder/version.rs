@@ -1,5 +1,7 @@
 use crate::{
-    constants::{APP_PROTO_VER, release}, messages::Message, protocol_version::ProtocolVersion
+    constants::{release, APP_PROTO_VER},
+    messages::Message,
+    protocol_version::ProtocolVersion,
 };
 
 pub struct Version {

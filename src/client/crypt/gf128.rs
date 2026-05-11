@@ -169,8 +169,12 @@ mod scalar {
     #[inline]
     pub fn fill_chain(chain: &mut [[u8; 16]], count: usize) {
         let seed = chain[0];
-        let mut hi = u64::from_be_bytes([seed[0], seed[1], seed[2], seed[3], seed[4], seed[5], seed[6], seed[7]]);
-        let mut lo = u64::from_be_bytes([seed[8], seed[9], seed[10], seed[11], seed[12], seed[13], seed[14], seed[15]]);
+        let mut hi = u64::from_be_bytes([
+            seed[0], seed[1], seed[2], seed[3], seed[4], seed[5], seed[6], seed[7],
+        ]);
+        let mut lo = u64::from_be_bytes([
+            seed[8], seed[9], seed[10], seed[11], seed[12], seed[13], seed[14], seed[15],
+        ]);
         for i in 1..=count {
             let (nh, nl) = double_u64(hi, lo);
             hi = nh;
