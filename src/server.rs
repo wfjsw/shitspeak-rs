@@ -10,14 +10,18 @@ use cidr::AnyIpCidr;
 use prost::{EncodeError, Message as _};
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
 use rustls::version::{TLS12, TLS13};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::api::Authenticator;
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
-use crate::channel_repository::{ChannelRepoTuning, ChannelRepository};
-use crate::client::AsyncMessageHandlerExt;
+use crate::channel_repository::{ChannelOperation, ChannelRepoTuning, ChannelRepository};
+use crate::client::{
+    client_session_identifier::ClientSessionIdentifier, state_log::ClientStateBroadcastPayload,
+    AsyncMessageHandlerExt, Client,
+};
 use crate::client_certificate_verifier::ClientCertificateVerifier;
-use crate::errors::{HandleIncomingConnectionError, ReadProtoMessageError};
+use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError};
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
@@ -28,6 +32,9 @@ use crate::{
     s2s::S2SManager,
     types::NodeIdentifier,
 };
+
+type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
+type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
 
 pub struct Server {
     node_identifier: NodeIdentifier,
@@ -55,6 +62,76 @@ pub struct Server {
     context_actions: Arc<crate::context_action::ContextActionRegistry>,
 
     s2s_manager: Arc<S2SManager>,
+}
+
+fn is_realtime_client_message(message: &Message) -> bool {
+    matches!(message, Message::Ping(_) | Message::UDPTunnel(_))
+}
+
+fn map_handler_result(
+    session_id: ClientSessionIdentifier,
+    result: Result<(), MessageHandlerError>,
+) -> Result<(), HandleIncomingConnectionError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(MessageHandlerError::AuthRejection(rejection)) => {
+            tracing::info!(
+                session = u32::from(session_id),
+                reason = rejection.reason(),
+                "closing connection after auth rejection",
+            );
+            Err(HandleIncomingConnectionError::AuthRejected(rejection))
+        }
+        Err(err) => Err(HandleIncomingConnectionError::MessageHandlerFailed(err)),
+    }
+}
+
+async fn activate_client_subscriptions(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_session_id: ClientSessionIdentifier,
+    client_log_rx: &mut Option<ClientLogReceiver>,
+    channel_log_rx: &mut Option<ChannelLogReceiver>,
+) -> Result<(), HandleIncomingConnectionError> {
+    if !client.is_authenticated() || client_log_rx.is_some() {
+        return Ok(());
+    }
+
+    let channel_snapshot_version = server.channels.current_version();
+    client.set_last_channel_version(channel_snapshot_version).await;
+
+    server.clients.publish_client(client_session_id).await;
+
+    *client_log_rx = Some(server.clients.subscribe());
+    *channel_log_rx = Some(server.channels.subscribe());
+
+    let last_seen = client.get_last_client_versions().await;
+    let (missed, new_versions) = server
+        .clients
+        .replay_since(&last_seen)
+        .await
+        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+    for msg in &missed {
+        client
+            .write_proto_message(msg)
+            .await
+            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+    }
+    client.update_last_client_versions(&new_versions).await;
+    Ok(())
+}
+
+async fn finish_handler_result(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_session_id: ClientSessionIdentifier,
+    client_log_rx: &mut Option<ClientLogReceiver>,
+    channel_log_rx: &mut Option<ChannelLogReceiver>,
+    result: Result<(), MessageHandlerError>,
+) -> Result<(), HandleIncomingConnectionError> {
+    map_handler_result(client_session_id, result)?;
+    activate_client_subscriptions(server, client, client_session_id, client_log_rx, channel_log_rx)
+        .await
 }
 
 impl Server {
@@ -617,47 +694,53 @@ impl Server {
         let client_session_id = client.get_session_id();
 
         // Subscriptions start as None — they're activated after auth.
-        let mut client_log_rx: Option<tokio::sync::broadcast::Receiver<_>> = None;
-        let mut channel_log_rx: Option<tokio::sync::broadcast::Receiver<_>> = None;
+        let mut client_log_rx: Option<ClientLogReceiver> = None;
+        let mut channel_log_rx: Option<ChannelLogReceiver> = None;
 
         // Run the connection loop.  On any unrecoverable error, clean up
         // the client and return the error to the caller.
         let result: Result<(), HandleIncomingConnectionError> = async {
+            let mut handler_tasks = JoinSet::new();
+
             loop {
                 tokio::select! {
+                    // ── Completed client message handler ─────────────────────
+                    result = handler_tasks.join_next(), if !handler_tasks.is_empty() => {
+                        let Some(result) = result else { continue };
+                        let result = result
+                            .map_err(HandleIncomingConnectionError::MessageHandlerTaskFailed)?;
+                        finish_handler_result(
+                            self,
+                            &client,
+                            client_session_id,
+                            &mut client_log_rx,
+                            &mut channel_log_rx,
+                            result,
+                        )
+                        .await?;
+                    }
+
                     // ── Incoming message from this client ────────────────────
                     result = client.read_proto_message() => {
                         match result {
                             Ok(message) => {
-                                match client.handle_message(self, message).await {
-                                    Ok(()) => {}
-                                    Err(crate::errors::MessageHandlerError::AuthRejection(rejection)) => {
-                                        tracing::info!(session = u32::from(client_session_id), reason = rejection.reason(), "closing connection after auth rejection");
-                                        return Err(HandleIncomingConnectionError::AuthRejected(rejection));
-                                    }
-                                    Err(err) => {
-                                        return Err(HandleIncomingConnectionError::MessageHandlerFailed(err));
-                                    }
-                                }
-
-                                // Transition to post-auth: publish and subscribe.
-                                if client.is_authenticated() && client_log_rx.is_none() {
-                                    let channel_snapshot_version = self.channels.current_version();
-                                    client.set_last_channel_version(channel_snapshot_version).await;
-
-                                    self.clients.publish_client(client_session_id).await;
-
-                                    client_log_rx = Some(self.clients.subscribe());
-                                    channel_log_rx = Some(self.channels.subscribe());
-
-                                    let last_seen = client.get_last_client_versions().await;
-                                    let (missed, new_versions) = self.clients.replay_since(&last_seen).await
-                                        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
-                                    for msg in &missed {
-                                        client.write_proto_message(msg).await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    }
-                                    client.update_last_client_versions(&new_versions).await;
+                                if is_realtime_client_message(&message) {
+                                    let result = client.handle_message(self, message).await;
+                                    finish_handler_result(
+                                        self,
+                                        &client,
+                                        client_session_id,
+                                        &mut client_log_rx,
+                                        &mut channel_log_rx,
+                                        result,
+                                    )
+                                    .await?;
+                                } else {
+                                    let handler_server = Arc::clone(self);
+                                    let handler_client = Arc::clone(&client);
+                                    handler_tasks.spawn(async move {
+                                        handler_client.handle_message(&handler_server, message).await
+                                    });
                                 }
                             }
                             Err(crate::errors::ReadProtoMessageError::UnknownMessageType(err)) => {

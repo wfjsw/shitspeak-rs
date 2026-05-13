@@ -19,6 +19,8 @@ pub enum HandleIncomingConnectionError {
     AuthRejected(AuthRejection),
     /// The client's message handler returned an error.
     MessageHandlerFailed(MessageHandlerError),
+    /// A spawned message handler task panicked or was cancelled.
+    MessageHandlerTaskFailed(tokio::task::JoinError),
 }
 
 impl From<std::io::Error> for HandleIncomingConnectionError {
@@ -72,6 +74,9 @@ impl std::fmt::Display for HandleIncomingConnectionError {
             }
             HandleIncomingConnectionError::MessageHandlerFailed(err) => {
                 write!(f, "Client message handler failed: {}", err)
+            }
+            HandleIncomingConnectionError::MessageHandlerTaskFailed(err) => {
+                write!(f, "Client message handler task failed: {}", err)
             }
         }
     }

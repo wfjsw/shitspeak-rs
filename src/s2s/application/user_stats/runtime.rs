@@ -290,7 +290,11 @@ fn spawn_dispatch_task(
                     };
                     match kind {
                         UserStatsKind::Request(req) => {
-                            handle_request(&transport, &responder, from, req).await;
+                            let transport = Arc::clone(&transport);
+                            let responder = Arc::clone(&responder);
+                            tokio::spawn(async move {
+                                handle_request(&transport, &responder, from, req).await;
+                            });
                         }
                         UserStatsKind::Reply(reply) => {
                             handle_reply(&pending, from, reply);
