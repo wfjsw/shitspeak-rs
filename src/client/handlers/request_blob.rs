@@ -156,7 +156,10 @@ pub async fn handle_request_blob(
             continue;
         };
         let desc_data = match ch.description_hash.as_ref() {
-            Some(hash) => server.get_channel_blobs().get(hash).await.ok().flatten(),
+            Some(hash) => match server.get_channel_blobs().get(hash).await.ok().flatten() {
+                Some(bytes) => Some(bytes),
+                None => server.s2s_manager().get_channel_blob(hash).await,
+            },
             None => None,
         };
 

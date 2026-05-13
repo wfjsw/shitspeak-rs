@@ -1,6 +1,6 @@
 //! Cluster-wide replications subsystem.
 //!
-//! Two replication modes layered atop the L2 overlay:
+//! Three replication modes layered atop the L2 overlay:
 //!
 //! * **Strict (Tempo)** — leader-less, multi-writer total-order broadcast.
 //!   Used by repositories that require linearizable writes across the
@@ -8,6 +8,9 @@
 //! * **Owner-scoped** — single-writer (per-node), multi-reader. Each node
 //!   "owns" its slot and is the only proposer for it. Used for per-node
 //!   transient state (clients).
+//! * **Blob** — demand-driven, content-addressed immutable data transfer.
+//!   Used by channel description blobs. This mode does not synchronize a
+//!   versioned log; it fetches missing content from any peer that has it.
 //!
 //! See the trait docs on [`StrictReplicable`] and [`OwnerReplicable`] for
 //! the load-bearing local-apply ordering rules.
@@ -24,6 +27,7 @@
 //! a documented guarantee. If cross-topic isolation becomes a
 //! bottleneck, switch to per-topic mpsc + drain task.
 
+pub mod blob;
 pub mod config;
 pub mod error;
 pub mod owner;
@@ -47,16 +51,20 @@ use tracing::{debug, trace, warn};
 use crate::s2s::overlay::{MembershipEvent, OverlayInboundMessage, OverlayNetwork, ServiceInbound};
 use crate::types::NodeIdentifier;
 
+pub use blob::{BlobHandle, BlobReplicable};
 pub use config::{ReplicationConfig, ReplicationTuning};
 pub use error::ReplicationError;
 pub use owner::{OwnerHandle, OwnerReplicable};
 pub use proto::REPLICATION_SERVICE_TAG;
 pub use strict::{StrictHandle, StrictReplicable};
 
+use self::blob::{BlobNet, BlobRuntime, OverlayBlobNet};
 use self::owner::runtime::{OverlayOwnerNet, OwnerNet, OwnerRuntime};
-use self::proto::{OwnerBody, ReplBody, StrictBody};
+use self::proto::{BlobBody, OwnerBody, ReplBody, StrictBody};
 use self::strict::runtime::{OverlayStrictNet, StrictNet, StrictRuntime};
-use self::topic::{ErasedOwnerRuntime, ErasedStrictRuntime, InboundBody, InboundFrame};
+use self::topic::{
+    ErasedBlobRuntime, ErasedOwnerRuntime, ErasedStrictRuntime, InboundBody, InboundFrame,
+};
 
 /// Public entry-point for cluster replications. Cheap to clone — internally
 /// an `Arc`.
@@ -71,10 +79,12 @@ struct ManagerInner {
     self_epoch: u64,
     strict_topics: Arc<SccMap<String, Arc<dyn ErasedStrictRuntime>>>,
     owner_topics: Arc<SccMap<String, Arc<dyn ErasedOwnerRuntime>>>,
+    blob_topics: Arc<SccMap<String, Arc<dyn ErasedBlobRuntime>>>,
     inbox_tx: mpsc::UnboundedSender<InboundFrame>,
     shutdown: CancellationToken,
     strict_net: Arc<dyn StrictNet>,
     owner_net: Arc<dyn OwnerNet>,
+    blob_net: Arc<dyn BlobNet>,
     cfg: Arc<ReplicationConfig>,
 }
 
@@ -96,6 +106,7 @@ impl ReplicationManager {
             Arc::new(SccMap::new());
         let owner_topics: Arc<SccMap<String, Arc<dyn ErasedOwnerRuntime>>> =
             Arc::new(SccMap::new());
+        let blob_topics: Arc<SccMap<String, Arc<dyn ErasedBlobRuntime>>> = Arc::new(SccMap::new());
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
 
@@ -103,6 +114,9 @@ impl ReplicationManager {
             overlay: overlay.clone(),
         });
         let owner_net: Arc<dyn OwnerNet> = Arc::new(OverlayOwnerNet {
+            overlay: overlay.clone(),
+        });
+        let blob_net: Arc<dyn BlobNet> = Arc::new(OverlayBlobNet {
             overlay: overlay.clone(),
         });
 
@@ -113,10 +127,12 @@ impl ReplicationManager {
             self_epoch,
             strict_topics: strict_topics.clone(),
             owner_topics: owner_topics.clone(),
+            blob_topics: blob_topics.clone(),
             inbox_tx: inbox_tx.clone(),
             shutdown: shutdown.clone(),
             strict_net,
             owner_net,
+            blob_net,
             cfg,
         });
 
@@ -130,6 +146,7 @@ impl ReplicationManager {
             inbox_rx,
             strict_topics.clone(),
             owner_topics.clone(),
+            blob_topics.clone(),
             shutdown.clone(),
         );
 
@@ -137,6 +154,7 @@ impl ReplicationManager {
         let mut events = overlay.subscribe_membership();
         let strict_for_ev = strict_topics.clone();
         let owner_for_ev = owner_topics.clone();
+        let blob_for_ev = blob_topics.clone();
         let shutdown_for_ev = shutdown.clone();
         tokio::spawn(async move {
             loop {
@@ -147,6 +165,7 @@ impl ReplicationManager {
                             Ok(ev) => {
                                 strict_for_ev.scan(|_, rt| rt.on_membership(&ev));
                                 owner_for_ev.scan(|_, rt| rt.on_membership(&ev));
+                                blob_for_ev.scan(|_, rt| rt.on_membership(&ev));
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!(skipped = n, "membership event subscriber lagged");
@@ -174,7 +193,10 @@ impl ReplicationManager {
         repo: Arc<R>,
     ) -> Result<StrictHandle<R>, ReplicationError> {
         let topic = topic.into();
-        if self.inner.strict_topics.contains(&topic) || self.inner.owner_topics.contains(&topic) {
+        if self.inner.strict_topics.contains(&topic)
+            || self.inner.owner_topics.contains(&topic)
+            || self.inner.blob_topics.contains(&topic)
+        {
             return Err(ReplicationError::TopicAlreadyRegistered(topic));
         }
         let runtime = StrictRuntime::new(
@@ -199,7 +221,10 @@ impl ReplicationManager {
         repo: Arc<R>,
     ) -> Result<OwnerHandle<R>, ReplicationError> {
         let topic = topic.into();
-        if self.inner.strict_topics.contains(&topic) || self.inner.owner_topics.contains(&topic) {
+        if self.inner.strict_topics.contains(&topic)
+            || self.inner.owner_topics.contains(&topic)
+            || self.inner.blob_topics.contains(&topic)
+        {
             return Err(ReplicationError::TopicAlreadyRegistered(topic));
         }
         let runtime = OwnerRuntime::new(
@@ -216,11 +241,39 @@ impl ReplicationManager {
         Ok(OwnerHandle { runtime })
     }
 
+    /// Register a content-addressed blob topic.
+    pub fn register_blob<R: BlobReplicable>(
+        &self,
+        topic: impl Into<String>,
+        repo: Arc<R>,
+    ) -> Result<BlobHandle<R>, ReplicationError> {
+        let topic = topic.into();
+        if self.inner.strict_topics.contains(&topic)
+            || self.inner.owner_topics.contains(&topic)
+            || self.inner.blob_topics.contains(&topic)
+        {
+            return Err(ReplicationError::TopicAlreadyRegistered(topic));
+        }
+        let runtime = BlobRuntime::new(
+            repo,
+            self.inner.self_id,
+            topic.clone(),
+            self.inner.blob_net.clone(),
+            self.inner.shutdown.child_token(),
+            self.inner.cfg.clone(),
+        );
+        runtime.start();
+        let erased: Arc<dyn ErasedBlobRuntime> = runtime.clone();
+        let _ = self.inner.blob_topics.insert(topic, erased);
+        Ok(BlobHandle { runtime })
+    }
+
     /// Cancel all background tasks and unregister the L3 handler.
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         self.inner.strict_topics.scan(|_, rt| rt.shutdown());
         self.inner.owner_topics.scan(|_, rt| rt.shutdown());
+        self.inner.blob_topics.scan(|_, rt| rt.shutdown());
         self.inner
             .overlay
             .unregister_service(REPLICATION_SERVICE_TAG);
@@ -245,6 +298,7 @@ fn decode_to_frame(msg: OverlayInboundMessage) -> Option<InboundFrame> {
     let body = match decoded.body? {
         ReplBody::Strict(strict) => InboundBody::Strict(strict.body?),
         ReplBody::Owner(owner) => InboundBody::Owner(owner.body?),
+        ReplBody::Blob(blob) => InboundBody::Blob(blob.body?),
     };
     Some(InboundFrame {
         from: msg.from,
@@ -315,6 +369,7 @@ fn spawn_dispatch_task(
     mut rx: mpsc::UnboundedReceiver<InboundFrame>,
     strict_topics: Arc<SccMap<String, Arc<dyn ErasedStrictRuntime>>>,
     owner_topics: Arc<SccMap<String, Arc<dyn ErasedOwnerRuntime>>>,
+    blob_topics: Arc<SccMap<String, Arc<dyn ErasedBlobRuntime>>>,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -340,6 +395,15 @@ fn spawn_dispatch_task(
                                 rt.dispatch(frame.from, b).await;
                             } else {
                                 trace!(topic=%frame.topic, "owner frame for unknown topic");
+                            }
+                        }
+                        InboundBody::Blob(b) => {
+                            let rt = blob_topics
+                                .read(&frame.topic, |_, v| v.clone());
+                            if let Some(rt) = rt {
+                                rt.dispatch(frame.from, b).await;
+                            } else {
+                                trace!(topic=%frame.topic, "blob frame for unknown topic");
                             }
                         }
                     }

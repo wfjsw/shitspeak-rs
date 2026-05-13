@@ -10,11 +10,12 @@ use super::error::ReplicationError;
 use crate::s2s_replication_proto as pb;
 
 pub use pb::{
-    owner_message::Body as OwnerBody, replication_message::Body as ReplBody,
-    strict_message::Body as StrictBody, CatchupOp, OwnerCatchupReq, OwnerCatchupResp, OwnerMessage,
-    OwnerOp, ReplicationMessage, StrictCatchupReq, StrictCatchupResp, StrictClockTick,
-    StrictCommit, StrictMessage, StrictPropose, StrictProposeAck, StrictRecoveryAck,
-    StrictRecoveryCommit, StrictRecoveryReq,
+    blob_message::Body as BlobBody, owner_message::Body as OwnerBody,
+    replication_message::Body as ReplBody, strict_message::Body as StrictBody, BlobChunk,
+    BlobChunkReq, BlobFind, BlobMessage, BlobOffer, CatchupOp, OwnerCatchupReq,
+    OwnerCatchupResp, OwnerMessage, OwnerOp, ReplicationMessage, StrictCatchupReq,
+    StrictCatchupResp, StrictClockTick, StrictCommit, StrictMessage, StrictPropose,
+    StrictProposeAck, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
 };
 
 /// Encode a `ReplicationMessage` to bytes ready for the overlay payload.
@@ -42,6 +43,14 @@ pub fn wrap_owner(topic: impl Into<String>, body: OwnerBody) -> ReplicationMessa
     ReplicationMessage {
         topic: topic.into(),
         body: Some(ReplBody::Owner(OwnerMessage { body: Some(body) })),
+    }
+}
+
+/// Build a blob outer message for a given topic.
+pub fn wrap_blob(topic: impl Into<String>, body: BlobBody) -> ReplicationMessage {
+    ReplicationMessage {
+        topic: topic.into(),
+        body: Some(ReplBody::Blob(BlobMessage { body: Some(body) })),
     }
 }
 

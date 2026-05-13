@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::proto::{OwnerBody, StrictBody};
+use super::proto::{BlobBody, OwnerBody, StrictBody};
 use crate::s2s::overlay::MembershipEvent;
 use crate::types::NodeIdentifier;
 
@@ -32,6 +32,15 @@ pub(crate) trait ErasedOwnerRuntime: Send + Sync + 'static {
     fn shutdown(&self);
 }
 
+#[async_trait::async_trait]
+pub(crate) trait ErasedBlobRuntime: Send + Sync + 'static {
+    /// Inbound `BlobMessage` body addressed to this topic.
+    async fn dispatch(&self, from: NodeIdentifier, body: BlobBody);
+    /// Membership event broadcast.
+    fn on_membership(&self, ev: &MembershipEvent);
+    fn shutdown(&self);
+}
+
 /// Inbound frame the manager pushes onto the dispatch mpsc.
 pub(crate) struct InboundFrame {
     pub from: NodeIdentifier,
@@ -42,6 +51,7 @@ pub(crate) struct InboundFrame {
 pub(crate) enum InboundBody {
     Strict(StrictBody),
     Owner(OwnerBody),
+    Blob(BlobBody),
 }
 
 /// Convenience: erase a concrete strict runtime.

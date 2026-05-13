@@ -13,6 +13,7 @@
 //!   currently return `None`/`Ok(())` stubs that compile and satisfy callers.
 
 use std::io;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -117,6 +118,39 @@ impl ChannelBlobStore {
         fs::metadata(&path).await.is_ok()
     }
 
+    /// Return every locally stored blob key.
+    pub async fn keys(&self) -> io::Result<HashSet<String>> {
+        let mut out = HashSet::new();
+        let mut dirs = match fs::read_dir(&self.root).await {
+            Ok(dirs) => dirs,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        while let Some(dir) = dirs.next_entry().await? {
+            let file_type = dir.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let prefix = dir.file_name().to_string_lossy().to_string();
+            if prefix.len() != 2 || !prefix.bytes().all(is_lower_hex) {
+                continue;
+            }
+            let prefix = prefix.to_ascii_lowercase();
+            let mut files = fs::read_dir(dir.path()).await?;
+            while let Some(file) = files.next_entry().await? {
+                if !file.file_type().await?.is_file() {
+                    continue;
+                }
+                let suffix = file.file_name().to_string_lossy().to_string();
+                if suffix.len() != 38 || !suffix.bytes().all(is_lower_hex) {
+                    continue;
+                }
+                out.insert(format!("{prefix}{}", suffix.to_ascii_lowercase()));
+            }
+        }
+        Ok(out)
+    }
+
     // ── S2S readiness stubs ──────────────────────────────────────────────
 
     /// Push a blob to a peer node over S2S.  Not yet implemented.
@@ -132,8 +166,6 @@ impl ChannelBlobStore {
         None
     }
 }
-
-// ─── SessionBlobStore ────────────────────────────────────────────────────────
 
 /// Persistent URL-keyed cache for user textures and comments.
 ///
@@ -261,4 +293,8 @@ impl SessionBlobStore {
         let path = blob_path(&self.root, key);
         fs::metadata(path).await.is_ok()
     }
+}
+
+fn is_lower_hex(b: u8) -> bool {
+    b.is_ascii_hexdigit()
 }

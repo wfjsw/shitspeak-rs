@@ -48,6 +48,22 @@ pub struct ReplicationConfig {
     owner_catchup_timeout: Duration,
     /// Cap on `CatchupOp`s returned per `OwnerCatchupResp` chunk.
     owner_max_catchup_ops: usize,
+
+    // ── Content-addressed blobs ──
+    /// Max bytes per blob chunk carried inside a replication frame.
+    blob_chunk_size: usize,
+    /// Total time a blob fetch may stay in-flight before waiters are failed.
+    blob_request_timeout: Duration,
+    /// Time to wait for offers before re-broadcasting the find request.
+    blob_offer_wait: Duration,
+    /// Minimum time before retrying unanswered chunk requests.
+    blob_retry_interval: Duration,
+    /// Number of providers to request from concurrently for one blob.
+    blob_max_parallel_peers: usize,
+    /// Cadence for scanning unused channel blobs.
+    blob_decay_interval: Duration,
+    /// Time an unreferenced blob must remain unused before deletion.
+    blob_unused_grace: Duration,
 }
 
 impl Default for ReplicationConfig {
@@ -67,6 +83,14 @@ impl Default for ReplicationConfig {
 
             owner_catchup_timeout: Duration::from_secs(5),
             owner_max_catchup_ops: 256,
+
+            blob_chunk_size: 64 * 1024,
+            blob_request_timeout: Duration::from_secs(10),
+            blob_offer_wait: Duration::from_millis(250),
+            blob_retry_interval: Duration::from_millis(500),
+            blob_max_parallel_peers: 3,
+            blob_decay_interval: Duration::from_secs(60),
+            blob_unused_grace: Duration::from_secs(600),
         }
     }
 }
@@ -107,6 +131,27 @@ impl ReplicationConfig {
     }
     pub fn owner_max_catchup_ops(&self) -> usize {
         self.owner_max_catchup_ops
+    }
+    pub fn blob_chunk_size(&self) -> usize {
+        self.blob_chunk_size
+    }
+    pub fn blob_request_timeout(&self) -> Duration {
+        self.blob_request_timeout
+    }
+    pub fn blob_offer_wait(&self) -> Duration {
+        self.blob_offer_wait
+    }
+    pub fn blob_retry_interval(&self) -> Duration {
+        self.blob_retry_interval
+    }
+    pub fn blob_max_parallel_peers(&self) -> usize {
+        self.blob_max_parallel_peers
+    }
+    pub fn blob_decay_interval(&self) -> Duration {
+        self.blob_decay_interval
+    }
+    pub fn blob_unused_grace(&self) -> Duration {
+        self.blob_unused_grace
     }
 
     pub fn with_fallback_clock_tick(mut self, d: Duration) -> Self {
@@ -157,6 +202,34 @@ impl ReplicationConfig {
         self.owner_max_catchup_ops = n;
         self
     }
+    pub fn with_blob_chunk_size(mut self, n: usize) -> Self {
+        self.blob_chunk_size = n.max(1);
+        self
+    }
+    pub fn with_blob_request_timeout(mut self, d: Duration) -> Self {
+        self.blob_request_timeout = d;
+        self
+    }
+    pub fn with_blob_offer_wait(mut self, d: Duration) -> Self {
+        self.blob_offer_wait = d;
+        self
+    }
+    pub fn with_blob_retry_interval(mut self, d: Duration) -> Self {
+        self.blob_retry_interval = d;
+        self
+    }
+    pub fn with_blob_max_parallel_peers(mut self, n: usize) -> Self {
+        self.blob_max_parallel_peers = n.max(1);
+        self
+    }
+    pub fn with_blob_decay_interval(mut self, d: Duration) -> Self {
+        self.blob_decay_interval = d;
+        self
+    }
+    pub fn with_blob_unused_grace(mut self, d: Duration) -> Self {
+        self.blob_unused_grace = d;
+        self
+    }
 }
 
 /// TOML-deserializable shadow of [`ReplicationConfig`]. Each field maps
@@ -188,6 +261,20 @@ pub struct ReplicationTuning {
     pub owner_catchup_timeout_ms: u64,
     #[serde(default = "default_owner_max_catchup_ops")]
     pub owner_max_catchup_ops: usize,
+    #[serde(default = "default_blob_chunk_size")]
+    pub blob_chunk_size: usize,
+    #[serde(default = "default_blob_request_timeout_ms")]
+    pub blob_request_timeout_ms: u64,
+    #[serde(default = "default_blob_offer_wait_ms")]
+    pub blob_offer_wait_ms: u64,
+    #[serde(default = "default_blob_retry_interval_ms")]
+    pub blob_retry_interval_ms: u64,
+    #[serde(default = "default_blob_max_parallel_peers")]
+    pub blob_max_parallel_peers: usize,
+    #[serde(default = "default_blob_decay_interval_ms")]
+    pub blob_decay_interval_ms: u64,
+    #[serde(default = "default_blob_unused_grace_ms")]
+    pub blob_unused_grace_ms: u64,
 }
 
 impl Default for ReplicationTuning {
@@ -205,6 +292,13 @@ impl Default for ReplicationTuning {
             recovery_ttl_ms: default_recovery_ttl_ms(),
             owner_catchup_timeout_ms: default_owner_catchup_timeout_ms(),
             owner_max_catchup_ops: default_owner_max_catchup_ops(),
+            blob_chunk_size: default_blob_chunk_size(),
+            blob_request_timeout_ms: default_blob_request_timeout_ms(),
+            blob_offer_wait_ms: default_blob_offer_wait_ms(),
+            blob_retry_interval_ms: default_blob_retry_interval_ms(),
+            blob_max_parallel_peers: default_blob_max_parallel_peers(),
+            blob_decay_interval_ms: default_blob_decay_interval_ms(),
+            blob_unused_grace_ms: default_blob_unused_grace_ms(),
         }
     }
 }
@@ -226,6 +320,13 @@ impl From<ReplicationTuning> for ReplicationConfig {
             .with_recovery_ttl(Duration::from_millis(t.recovery_ttl_ms))
             .with_owner_catchup_timeout(Duration::from_millis(t.owner_catchup_timeout_ms))
             .with_owner_max_catchup_ops(t.owner_max_catchup_ops)
+            .with_blob_chunk_size(t.blob_chunk_size)
+            .with_blob_request_timeout(Duration::from_millis(t.blob_request_timeout_ms))
+            .with_blob_offer_wait(Duration::from_millis(t.blob_offer_wait_ms))
+            .with_blob_retry_interval(Duration::from_millis(t.blob_retry_interval_ms))
+            .with_blob_max_parallel_peers(t.blob_max_parallel_peers)
+            .with_blob_decay_interval(Duration::from_millis(t.blob_decay_interval_ms))
+            .with_blob_unused_grace(Duration::from_millis(t.blob_unused_grace_ms))
     }
 }
 
@@ -264,4 +365,25 @@ fn default_owner_catchup_timeout_ms() -> u64 {
 }
 fn default_owner_max_catchup_ops() -> usize {
     256
+}
+fn default_blob_chunk_size() -> usize {
+    64 * 1024
+}
+fn default_blob_request_timeout_ms() -> u64 {
+    10_000
+}
+fn default_blob_offer_wait_ms() -> u64 {
+    250
+}
+fn default_blob_retry_interval_ms() -> u64 {
+    500
+}
+fn default_blob_max_parallel_peers() -> usize {
+    3
+}
+fn default_blob_decay_interval_ms() -> u64 {
+    60_000
+}
+fn default_blob_unused_grace_ms() -> u64 {
+    600_000
 }

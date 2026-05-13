@@ -6,7 +6,7 @@ pub mod transport;
 #[cfg(test)]
 pub(crate) mod testing;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, trace, warn};
 
 use crate::ban_repository::{BanEntry, BanOp, BanOperation, BanRepository};
+use crate::blob_store::ChannelBlobStore;
 use crate::channel_repository::{ChannelOp, ChannelOperation, ChannelRepository};
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::ClientStateLogEntry;
@@ -32,7 +33,7 @@ use self::application::proto::{
 };
 use self::application::voice::{AudioSink, RecipientIndex};
 use self::overlay::OverlayNetwork;
-use self::replications::{OwnerReplicable, ReplicationManager, StrictReplicable};
+use self::replications::{BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable};
 use self::transport::{ConnectionManager, TransportConfig};
 
 pub struct S2SManager {
@@ -58,6 +59,7 @@ struct S2SRuntimeState {
     channel_replication: Option<replications::StrictHandle<ChannelReplicationAdapter>>,
     ban_replication: Option<replications::StrictHandle<BanReplicationAdapter>>,
     client_replication: Option<replications::OwnerHandle<ClientReplicationAdapter>>,
+    channel_blob_replication: Option<replications::BlobHandle<ChannelBlobReplicationAdapter>>,
     bridge_tasks: Vec<JoinHandle<()>>,
 }
 
@@ -198,6 +200,13 @@ impl S2SManager {
         }
     }
 
+    pub async fn get_channel_blob(&self, key: &str) -> Option<Bytes> {
+        let Some(handle) = self.state.read().channel_blob_replication.clone() else {
+            return None;
+        };
+        handle.get(key).await
+    }
+
     pub fn spawn_runtime_task(
         self: Arc<Self>,
         server: Weak<Box<Server>>,
@@ -275,12 +284,18 @@ impl S2SManager {
             .voice()
             .set_recipient_index(recipient_index.clone());
 
-        let (channel_replication, ban_replication, client_replication, bridge_tasks) =
+        let (
+            channel_replication,
+            ban_replication,
+            client_replication,
+            channel_blob_replication,
+            bridge_tasks,
+        ) =
             match server.upgrade() {
                 Some(server) => self.register_repositories(&replications, &server).await,
                 None => {
                     warn!("s2s repository replication skipped: server handle dropped");
-                    (None, None, None, Vec::new())
+                    (None, None, None, None, Vec::new())
                 }
             };
 
@@ -294,6 +309,7 @@ impl S2SManager {
             state.channel_replication = channel_replication;
             state.ban_replication = ban_replication;
             state.client_replication = client_replication;
+            state.channel_blob_replication = channel_blob_replication;
             state.bridge_tasks = bridge_tasks;
         }
 
@@ -307,6 +323,7 @@ impl S2SManager {
             state.channel_replication = None;
             state.ban_replication = None;
             state.client_replication = None;
+            state.channel_blob_replication = None;
             state.recipient_index = None;
             state.application = None;
             state.replications = None;
@@ -334,6 +351,7 @@ impl S2SManager {
         Option<replications::StrictHandle<ChannelReplicationAdapter>>,
         Option<replications::StrictHandle<BanReplicationAdapter>>,
         Option<replications::OwnerHandle<ClientReplicationAdapter>>,
+        Option<replications::BlobHandle<ChannelBlobReplicationAdapter>>,
         Vec<JoinHandle<()>>,
     ) {
         let channels = Arc::new(ChannelReplicationAdapter::new(
@@ -342,6 +360,10 @@ impl S2SManager {
         let bans = Arc::new(BanReplicationAdapter::new(server.get_bans().clone()));
         let clients = Arc::new(ClientReplicationAdapter::new(
             server.get_clients().clone(),
+            server.get_channels().clone(),
+        ));
+        let channel_blobs = Arc::new(ChannelBlobReplicationAdapter::new(
+            server.get_channel_blobs().clone(),
             server.get_channels().clone(),
         ));
 
@@ -366,6 +388,13 @@ impl S2SManager {
                 None
             }
         };
+        let channel_blob_handle = match replications.register_blob("channel_blobs", channel_blobs) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(error = %e, "failed to register s2s channel blob replication");
+                None
+            }
+        };
 
         let mut bridge_tasks = Vec::new();
         if let Some(handle) = client_handle.clone() {
@@ -375,7 +404,13 @@ impl S2SManager {
             ));
         }
 
-        (channel_handle, ban_handle, client_handle, bridge_tasks)
+        (
+            channel_handle,
+            ban_handle,
+            client_handle,
+            channel_blob_handle,
+            bridge_tasks,
+        )
     }
 }
 
@@ -654,6 +689,63 @@ impl StrictReplicable for ChannelReplicationAdapter {
         {
             warn!(error = ?e, "s2s channel snapshot install failed");
         }
+    }
+}
+
+#[derive(Clone)]
+struct ChannelBlobReplicationAdapter {
+    blobs: Arc<ChannelBlobStore>,
+    channels: Arc<ChannelRepository>,
+}
+
+impl ChannelBlobReplicationAdapter {
+    fn new(blobs: Arc<ChannelBlobStore>, channels: Arc<ChannelRepository>) -> Self {
+        Self { blobs, channels }
+    }
+}
+
+#[async_trait]
+impl BlobReplicable for ChannelBlobReplicationAdapter {
+    async fn get_blob(&self, key: &str) -> Option<Bytes> {
+        self.blobs.get(key).await.ok().flatten()
+    }
+
+    async fn put_blob(&self, key: &str, data: Bytes) -> Result<(), replications::ReplicationError> {
+        let written = self
+            .blobs
+            .put(&data)
+            .await
+            .map_err(|_| {
+                replications::ReplicationError::Malformed("channel blob store write failed")
+            })?;
+        if written == key {
+            Ok(())
+        } else {
+            Err(replications::ReplicationError::Malformed(
+                "channel blob key does not match content",
+            ))
+        }
+    }
+
+    async fn delete_blob(&self, key: &str) -> Result<(), replications::ReplicationError> {
+        self.blobs
+            .delete(key)
+            .await
+            .map_err(|_| replications::ReplicationError::Malformed("channel blob delete failed"))
+    }
+
+    async fn stored_keys(&self) -> HashSet<String> {
+        self.blobs.keys().await.unwrap_or_default()
+    }
+
+    async fn referenced_keys(&self) -> HashSet<String> {
+        self.channels
+            .get_all()
+            .await
+            .into_iter()
+            .filter_map(|channel| channel.description_hash)
+            .filter(|key| key.len() == 40)
+            .collect()
     }
 }
 
