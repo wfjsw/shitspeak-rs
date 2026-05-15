@@ -101,7 +101,7 @@ async fn build_register_xml(server: &Arc<Box<Server>>, config: &Config) -> Strin
 
     // Mumble version compatibility
     xml.push_str("  <version>");
-    xml.push_str(&crate::constants::APP_PROTO_VER.to_string());
+    xml.push_str(&config.server_protocol_version.to_string());
     xml.push_str("</version>\n");
 
     xml.push_str("</server>\n");

@@ -424,10 +424,7 @@ impl<R: BlobReplicable> BlobRuntime<R> {
 
         let (tx, rx) = oneshot::channel();
         let request_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
-        let should_start = self
-            .state
-            .lock()
-            .start_fetch(key.clone(), request_id, tx);
+        let should_start = self.state.lock().start_fetch(key.clone(), request_id, tx);
 
         if should_start {
             if let Some(bytes) = self.repo.get_blob(&key).await {
@@ -503,7 +500,11 @@ impl<R: BlobReplicable> BlobRuntime<R> {
             chunk_size: chunk_size as u32,
         };
         let dst = find.requester as NodeIdentifier;
-        if let Err(e) = self.net.send_unicast(dst, &self.topic, BlobBody::Offer(offer)).await {
+        if let Err(e) = self
+            .net
+            .send_unicast(dst, &self.topic, BlobBody::Offer(offer))
+            .await
+        {
             trace!(error=%e, %dst, "blob offer send failed");
         }
     }
@@ -521,11 +522,7 @@ impl<R: BlobReplicable> BlobRuntime<R> {
         }
         let requests = {
             let mut state = self.state.lock();
-            state.add_offer(
-                offer,
-                self.cfg.max_parallel_peers,
-                self.cfg.offer_wait,
-            )
+            state.add_offer(offer, self.cfg.max_parallel_peers, self.cfg.offer_wait)
         };
         self.send_chunk_requests(requests).await;
     }
@@ -680,7 +677,9 @@ impl<R: BlobReplicable> BlobRuntime<R> {
         let mut to_delete = Vec::new();
         {
             let mut state = self.state.lock();
-            state.unused_since.retain(|key, _| !referenced.contains(key));
+            state
+                .unused_since
+                .retain(|key, _| !referenced.contains(key));
             let mut local_known = referenced.clone();
             for fetch in state.fetches.values() {
                 local_known.insert(fetch.key.clone());
@@ -713,7 +712,6 @@ impl<R: BlobReplicable> BlobRuntime<R> {
             }
         }
     }
-
 }
 
 #[async_trait]
@@ -768,10 +766,7 @@ fn spawn_decay_loop<R: BlobReplicable>(rt: Arc<BlobRuntime<R>>) {
 }
 
 fn is_valid_blob_key(key: &str) -> bool {
-    key.len() == 40
-        && key
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    key.len() == 40 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn normalized_chunk_size(requested: usize, default: usize) -> usize {

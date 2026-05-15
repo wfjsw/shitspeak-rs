@@ -12,8 +12,8 @@
 //!   content.  Full HTTP-fetch implementation is deferred; all methods
 //!   currently return `None`/`Ok(())` stubs that compile and satisfy callers.
 
-use std::io;
 use std::collections::HashSet;
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 

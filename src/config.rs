@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::constants::APP_PROTO_VER;
+use crate::protocol_version::ProtocolVersion;
+
 use config::{Config as ConfigCrate, Environment, File};
 use serde::Deserialize;
 
@@ -188,6 +191,12 @@ pub struct Config {
     pub send_version: bool,
     pub send_build_info: bool,
     pub send_os_info: bool,
+    /// Server protocol version advertised to clients and used as the
+    /// server-side feature gate for protocol-version-dependent behavior.
+    /// Defaults to the compile-time `APP_PROTO_VER`; tests can override it
+    /// per server without mutating global process state.
+    #[serde(default = "default_server_protocol_version")]
+    pub server_protocol_version: ProtocolVersion,
     pub allowed_proxies: Vec<String>,
     pub min_client_version: u64,
     pub max_users: u64,
@@ -278,6 +287,10 @@ fn default_max_bandwidth() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+
+fn default_server_protocol_version() -> ProtocolVersion {
+    APP_PROTO_VER
 }
 fn default_max_text_message_length() -> u32 {
     5_000

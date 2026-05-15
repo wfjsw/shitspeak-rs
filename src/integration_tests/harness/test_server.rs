@@ -14,7 +14,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, S2sConfig, S2sSeedAddressConfig, UdpPingUserCountScope};
+use crate::constants::APP_PROTO_VER;
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
+use crate::protocol_version::ProtocolVersion;
 use crate::s2s::testing::pki::{install_provider_once, mint_pki, Pki};
 use crate::server::Server;
 
@@ -27,6 +29,7 @@ pub struct TestServerOpts {
     pub udp_ping_enabled: bool,
     pub default_channel: u32,
     pub send_permission_info: bool,
+    pub server_protocol_version: ProtocolVersion,
 }
 
 impl Default for TestServerOpts {
@@ -39,6 +42,7 @@ impl Default for TestServerOpts {
             udp_ping_enabled: true,
             default_channel: 0,
             send_permission_info: false,
+            server_protocol_version: APP_PROTO_VER,
         }
     }
 }
@@ -136,6 +140,7 @@ async fn spawn_test_server_with_pki(
         send_version: false,
         send_build_info: false,
         send_os_info: false,
+        server_protocol_version: opts.server_protocol_version,
         allowed_proxies: Vec::new(),
         min_client_version: 0,
         max_users: opts.max_users,

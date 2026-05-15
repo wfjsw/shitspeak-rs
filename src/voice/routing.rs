@@ -9,7 +9,7 @@ use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, QueuedDatagram};
 use crate::{
     client::{crypt::CryptState, Client},
-    constants::{APP_PROTO_VER, PROTOBUF_INTRODUCED_VERSION},
+    constants::PROTOBUF_INTRODUCED_VERSION,
     messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget},
     server::Server,
 };
@@ -26,12 +26,15 @@ const RAYON_FANOUT_THRESHOLD: usize = 256;
 ///
 /// Protobuf encoding is only used when the server itself declares a
 /// protocol version >= 1.5.0 (`PROTOBUF_INTRODUCED_VERSION`). If the
-/// server is running in legacy mode (`APP_PROTO_VER < 1.5.0`), all
+/// server is running in legacy mode (`server_protocol_version < 1.5.0`), all
 /// outbound voice is encoded as legacy regardless of what the client
 /// declares.
 #[inline]
-fn client_packet_format(client: &Client) -> PacketFormat {
-    if APP_PROTO_VER >= PROTOBUF_INTRODUCED_VERSION && client.uses_protobuf() {
+fn client_packet_format(
+    client: &Client,
+    server_protocol_version: crate::protocol_version::ProtocolVersion,
+) -> PacketFormat {
+    if server_protocol_version >= PROTOBUF_INTRODUCED_VERSION && client.uses_protobuf() {
         PacketFormat::Protobuf
     } else {
         PacketFormat::Legacy
@@ -452,12 +455,14 @@ pub(crate) async fn flush_voice_batch(
     // task: encode (cached), encrypt, queue. For large fan-outs, bucket
     // and dispatch the encrypt work to rayon inside spawn_blocking so
     // multiple cores share the load.
+    let server_protocol_version = server.get_server_protocol_version();
+
     if targets.len() < RAYON_FANOUT_THRESHOLD {
         let mut cache = EncodeCache::new();
         let mut udp_batch: Vec<QueuedDatagram> = Vec::with_capacity(targets.len());
 
         for (client, context) in targets {
-            let format = client_packet_format(client);
+            let format = client_packet_format(client, server_protocol_version);
             let entry = cache.get_or_encode(audio, *context, format);
 
             if client.prefers_tcp_tunnel() {
@@ -514,7 +519,7 @@ pub(crate) async fn flush_voice_batch(
     let mut cache = EncodeCache::new();
 
     for (client, context) in targets {
-        let format = client_packet_format(client);
+        let format = client_packet_format(client, server_protocol_version);
         // Touch the cache so every (format, context) seen is pre-encoded.
         let _ = cache.get_or_encode(audio, *context, format);
 

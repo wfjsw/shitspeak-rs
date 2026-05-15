@@ -12,10 +12,10 @@ use crate::s2s_replication_proto as pb;
 pub use pb::{
     blob_message::Body as BlobBody, owner_message::Body as OwnerBody,
     replication_message::Body as ReplBody, strict_message::Body as StrictBody, BlobChunk,
-    BlobChunkReq, BlobFind, BlobMessage, BlobOffer, CatchupOp, OwnerCatchupReq,
-    OwnerCatchupResp, OwnerMessage, OwnerOp, ReplicationMessage, StrictCatchupReq,
-    StrictCatchupResp, StrictClockTick, StrictCommit, StrictMessage, StrictPropose,
-    StrictProposeAck, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
+    BlobChunkReq, BlobFind, BlobMessage, BlobOffer, CatchupOp, OwnerCatchupReq, OwnerCatchupResp,
+    OwnerMessage, OwnerOp, ReplicationMessage, StrictCatchupReq, StrictCatchupResp,
+    StrictClockTick, StrictCommit, StrictMessage, StrictPropose, StrictProposeAck,
+    StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
 };
 
 /// Encode a `ReplicationMessage` to bytes ready for the overlay payload.

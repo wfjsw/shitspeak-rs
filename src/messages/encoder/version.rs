@@ -1,8 +1,4 @@
-use crate::{
-    constants::{release, APP_PROTO_VER},
-    messages::Message,
-    protocol_version::ProtocolVersion,
-};
+use crate::{constants::release, messages::Message, protocol_version::ProtocolVersion};
 
 pub struct Version {
     pub version: Option<ProtocolVersion>,
@@ -27,12 +23,17 @@ impl From<crate::mumble_proto::Version> for Version {
 }
 
 impl Version {
-    pub fn for_server(send_version: bool, send_build_info: bool, send_os_info: bool) -> Self {
+    pub fn for_server(
+        send_version: bool,
+        send_build_info: bool,
+        send_os_info: bool,
+        server_protocol_version: ProtocolVersion,
+    ) -> Self {
         let os_info = os_info::get();
 
         Version {
             version: if send_version {
-                Some(APP_PROTO_VER.into())
+                Some(server_protocol_version)
             } else {
                 None
             },

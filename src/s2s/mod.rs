@@ -290,14 +290,13 @@ impl S2SManager {
             client_replication,
             channel_blob_replication,
             bridge_tasks,
-        ) =
-            match server.upgrade() {
-                Some(server) => self.register_repositories(&replications, &server).await,
-                None => {
-                    warn!("s2s repository replication skipped: server handle dropped");
-                    (None, None, None, None, Vec::new())
-                }
-            };
+        ) = match server.upgrade() {
+            Some(server) => self.register_repositories(&replications, &server).await,
+            None => {
+                warn!("s2s repository replication skipped: server handle dropped");
+                (None, None, None, None, Vec::new())
+            }
+        };
 
         {
             let mut state = self.state.write();
@@ -711,13 +710,9 @@ impl BlobReplicable for ChannelBlobReplicationAdapter {
     }
 
     async fn put_blob(&self, key: &str, data: Bytes) -> Result<(), replications::ReplicationError> {
-        let written = self
-            .blobs
-            .put(&data)
-            .await
-            .map_err(|_| {
-                replications::ReplicationError::Malformed("channel blob store write failed")
-            })?;
+        let written = self.blobs.put(&data).await.map_err(|_| {
+            replications::ReplicationError::Malformed("channel blob store write failed")
+        })?;
         if written == key {
             Ok(())
         } else {

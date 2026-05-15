@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::channels::Channel;
+use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{AudioPayload, PacketFormat};
@@ -280,7 +281,11 @@ async fn voice_tcp_protobuf_round_trips() {
     // over the TCP tunnel: Alice sends `[0x00, MumbleUDP.Audio]`; the server
     // routes; Bob receives the same payload re-encoded in protobuf because
     // his declared version is also 1.5.
-    let server = spawn_test_server(TestServerOpts::default()).await;
+    let server = spawn_test_server(TestServerOpts {
+        server_protocol_version: PROTOBUF_INTRODUCED_VERSION,
+        ..TestServerOpts::default()
+    })
+    .await;
     server
         .authenticator
         .register_user("alice", None, Some(1), vec!["admin".into()]);
@@ -322,7 +327,11 @@ async fn voice_udp_protobuf_round_trips_and_decrypts() {
     // Same as above but over real UDP/OCB2 — exercises the full protobuf
     // pipeline: client encrypt → server decrypt → protobuf decode →
     // re-encode protobuf for recipient → encrypt → client decrypt.
-    let server = spawn_test_server(TestServerOpts::default()).await;
+    let server = spawn_test_server(TestServerOpts {
+        server_protocol_version: PROTOBUF_INTRODUCED_VERSION,
+        ..TestServerOpts::default()
+    })
+    .await;
     server
         .authenticator
         .register_user("alice", None, Some(1), vec!["admin".into()]);
@@ -368,7 +377,11 @@ async fn voice_udp_format_matches_recipient_proto_version() {
     // The server must encode each outbound voice packet in the format the
     // recipient declared via its `Version` message: protobuf for 1.5+,
     // legacy Opus for 1.4 and below.
-    let server = spawn_test_server(TestServerOpts::default()).await;
+    let server = spawn_test_server(TestServerOpts {
+        server_protocol_version: PROTOBUF_INTRODUCED_VERSION,
+        ..TestServerOpts::default()
+    })
+    .await;
     server
         .authenticator
         .register_user("alice", None, Some(1), vec!["admin".into()]);
@@ -431,6 +444,82 @@ async fn voice_udp_format_matches_recipient_proto_version() {
         PacketFormat::Legacy,
         "Charlie declared 1.4 — server must send legacy format"
     );
+}
+
+/// Checks that the server protocol version gates protobuf voice output before
+/// recipient capability is considered.
+#[tokio::test]
+async fn voice_server_protocol_version_gates_protobuf_voice() {
+    async fn run_case(
+        server_protocol_version: ProtocolVersion,
+        bob_version: ProtocolVersion,
+        charlie_version: ProtocolVersion,
+        expected_bob: PacketFormat,
+        expected_charlie: PacketFormat,
+    ) {
+        let server = spawn_test_server(TestServerOpts {
+            server_protocol_version,
+            ..TestServerOpts::default()
+        })
+        .await;
+        server
+            .authenticator
+            .register_user("alice", None, Some(1), vec!["admin".into()]);
+        server
+            .authenticator
+            .register_user("bob", None, Some(2), vec![]);
+        server
+            .authenticator
+            .register_user("charlie", None, Some(3), vec![]);
+
+        let alice =
+            TestClient::connect_with_version(&server, "alice", None, PROTOBUF_INTRODUCED_VERSION)
+                .await
+                .expect("alice");
+        let bob = TestClient::connect_with_version(&server, "bob", None, bob_version)
+            .await
+            .expect("bob");
+        let charlie = TestClient::connect_with_version(&server, "charlie", None, charlie_version)
+            .await
+            .expect("charlie");
+
+        alice
+            .send_voice_tcp_protobuf(0, 22, Bytes::from_static(SAMPLE_OPUS))
+            .await;
+
+        let bob_audio = bob
+            .recv_voice_tcp(VOICE_DEADLINE)
+            .await
+            .expect("Bob should receive Alice's voice over TCP tunnel");
+        assert_eq!(opus_frame(&bob_audio.audio_payload), SAMPLE_OPUS);
+        assert_eq!(bob_audio.sender_session, Some(alice.server_session));
+        assert_eq!(bob_audio.format, expected_bob);
+
+        let charlie_audio = charlie
+            .recv_voice_tcp(VOICE_DEADLINE)
+            .await
+            .expect("Charlie should receive Alice's voice over TCP tunnel");
+        assert_eq!(opus_frame(&charlie_audio.audio_payload), SAMPLE_OPUS);
+        assert_eq!(charlie_audio.sender_session, Some(alice.server_session));
+        assert_eq!(charlie_audio.format, expected_charlie);
+    }
+
+    run_case(
+        ProtocolVersion::new(1, 4, 0),
+        PROTOBUF_INTRODUCED_VERSION,
+        PROTOBUF_INTRODUCED_VERSION,
+        PacketFormat::Legacy,
+        PacketFormat::Legacy,
+    )
+    .await;
+    run_case(
+        PROTOBUF_INTRODUCED_VERSION,
+        PROTOBUF_INTRODUCED_VERSION,
+        ProtocolVersion::new(1, 4, 0),
+        PacketFormat::Protobuf,
+        PacketFormat::Legacy,
+    )
+    .await;
 }
 
 /// Checks legacy UDP voice when both clients declare pre-1.5 protocol support.
@@ -575,7 +664,11 @@ async fn voice_tcp_legacy_terminator_bit_preserved() {
 #[tokio::test]
 async fn voice_tcp_protobuf_terminator_bit_preserved() {
     // Same invariant as above but through the 1.5+ protobuf pipeline.
-    let server = spawn_test_server(TestServerOpts::default()).await;
+    let server = spawn_test_server(TestServerOpts {
+        server_protocol_version: PROTOBUF_INTRODUCED_VERSION,
+        ..TestServerOpts::default()
+    })
+    .await;
     server
         .authenticator
         .register_user("alice", None, Some(1), vec!["admin".into()]);
@@ -660,7 +753,11 @@ async fn voice_tcp_legacy_positional_data_round_trip() {
 async fn voice_tcp_protobuf_positional_data_round_trip() {
     // Same as above but through the 1.5+ protobuf pipeline, where positional
     // data is encoded in the MumbleUDP.Audio proto field.
-    let server = spawn_test_server(TestServerOpts::default()).await;
+    let server = spawn_test_server(TestServerOpts {
+        server_protocol_version: PROTOBUF_INTRODUCED_VERSION,
+        ..TestServerOpts::default()
+    })
+    .await;
     server
         .authenticator
         .register_user("alice", None, Some(1), vec!["admin".into()]);
@@ -746,7 +843,11 @@ async fn voice_tcp_legacy_server_loopback() {
 #[tokio::test]
 async fn voice_tcp_protobuf_server_loopback() {
     // Same as above but through the 1.5+ protobuf pipeline.
-    let server = spawn_test_server(TestServerOpts::default()).await;
+    let server = spawn_test_server(TestServerOpts {
+        server_protocol_version: PROTOBUF_INTRODUCED_VERSION,
+        ..TestServerOpts::default()
+    })
+    .await;
     server
         .authenticator
         .register_user("alice", None, Some(1), vec!["admin".into()]);

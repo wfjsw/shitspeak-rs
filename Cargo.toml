@@ -68,3 +68,7 @@ harness = false
 [[bench]]
 name = "voice_hotpath"
 harness = false
+
+[[bench]]
+name = "voice_e2e"
+harness = false

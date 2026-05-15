@@ -4,15 +4,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use tokio::time::timeout;
 
+use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::proto::{self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG};
 use super::super::test_support::{CountingOwnerRepo, CountingStrictRepo};
 use super::super::topic::{InboundBody, InboundFrame};
 use super::super::{OwnerReplicable, StrictReplicable};
 use super::harness::ReplCluster;
-use crate::s2s::testing::wait_until;
+use crate::s2s::testing::chaos::MessageType;
+use crate::s2s::testing::{wait_for_full_routing, wait_until};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 
 /// Checks strict replication convergence with sequential proposers.
@@ -311,6 +315,232 @@ async fn strict_quorum_lost_on_partition() {
         "expected QuorumLost, got {:?}",
         res
     );
+
+    cluster.shutdown().await;
+}
+
+/// Checks strict-replication behavior when a quorum never forms but membership
+/// remains alive.
+/// Expected: the coordinator receives only its self-ack plus one peer ack, so
+/// fast quorum is never reached and the proposal resolves with
+/// `ReplicationError::ProposeTimeout` instead of hanging or panicking.
+#[tokio::test]
+async fn strict_quorum_never_forms_times_out() {
+    let cfg = ReplicationConfig::default()
+        .with_delivery_tick_interval(Duration::from_millis(25))
+        .with_propose_ttl(Duration::from_millis(500))
+        .with_pending_propose_ttl(Duration::from_secs(2));
+    let cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3, 4], cfg.clone()).await;
+    let repos: Vec<Arc<CountingStrictRepo>> = (0..4).map(|_| CountingStrictRepo::new()).collect();
+    let mut handles = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        handles.push(
+            cluster
+                .register_strict(i, "channels", repo.clone())
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    cluster
+        .cluster
+        .node(1)
+        .chaos
+        .drop_next_of_type_from(3, MessageType::Data, 1);
+    cluster
+        .cluster
+        .node(1)
+        .chaos
+        .drop_next_of_type_from(4, MessageType::Data, 1);
+
+    let h0 = handles[0].clone();
+    let task = tokio::spawn(async move { h0.propose(6666u64).await });
+
+    let res = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("propose task hung while quorum never formed")
+        .expect("propose task panicked while quorum never formed");
+    assert!(
+        matches!(res, Err(ReplicationError::ProposeTimeout(d)) if d == cfg.propose_ttl()),
+        "expected ProposeTimeout({:?}), got {:?}",
+        cfg.propose_ttl(),
+        res
+    );
+    assert!(
+        repos.iter().all(|r| r.current_version() == 0),
+        "no replica should apply an uncommitted operation: versions = {:?}",
+        repos
+            .iter()
+            .map(|r| r.current_version())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        wait_for_full_routing(&cluster.cluster, Duration::from_secs(2)).await,
+        "membership/routing should remain healthy; only quorum acks were lost"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Checks strict replication when a target node is actually stopped.
+/// Expected: a proposal started while the stale alive set still includes the
+/// stopped node completes with the surviving fast quorum; the task does not
+/// panic or hang while sends to the unreachable node fail underneath.
+#[tokio::test]
+async fn strict_unreachable_node_during_replication_survives() {
+    let cluster = ReplCluster::build_full_mesh(&[1, 2, 3, 4]).await;
+    let repos: Vec<Arc<CountingStrictRepo>> = (0..4).map(|_| CountingStrictRepo::new()).collect();
+    let mut handles = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        handles.push(
+            cluster
+                .register_strict(i, "channels", repo.clone())
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    cluster.managers[3].shutdown().await;
+    cluster.cluster.nodes[3].shutdown().await;
+
+    let h0 = handles[0].clone();
+    let task = tokio::spawn(async move { h0.propose(8888u64).await });
+
+    let version = timeout(Duration::from_secs(20), task)
+        .await
+        .expect("propose task hung after node became unreachable")
+        .expect("propose task panicked after node became unreachable")
+        .expect("surviving fast quorum should commit despite one unreachable target");
+    assert_eq!(version, 1);
+
+    let ok = wait_until(Duration::from_secs(5), || {
+        repos[..3].iter().all(|r| r.current_version() == 1)
+    })
+    .await;
+    assert!(ok, "surviving replicas should receive the committed op");
+    assert_eq!(repos[3].current_version(), 0);
+
+    for m in &cluster.managers[..3] {
+        m.shutdown().await;
+    }
+    for n in &cluster.cluster.nodes[..3] {
+        n.shutdown().await;
+    }
+}
+
+/// Checks strict replication while direct cross-node links fail in a hostile,
+/// randomly shaped but deterministic network.
+/// Expected: each proposal routes around detected transient link cuts; no
+/// proposal task panics or hangs, and every replica has the same total-ordered
+/// log after each hostile-network round.
+#[tokio::test]
+async fn strict_replication_survives_random_cross_node_link_failures() {
+    let node_ids: Vec<u16> = (1..=7).collect();
+    let cluster = ReplCluster::build_full_mesh(&node_ids).await;
+    let repos: Vec<Arc<CountingStrictRepo>> =
+        node_ids.iter().map(|_| CountingStrictRepo::new()).collect();
+    let mut handles = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        handles.push(
+            cluster
+                .register_strict(i, "channels", repo.clone())
+                .unwrap(),
+        );
+    }
+    for node in &cluster.cluster.nodes {
+        node.chaos.set_jitter(Some(Duration::from_millis(40)));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let is_backbone = |a: u16, b: u16| {
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        hi == lo + 1 || (lo == 1 && hi == 7)
+    };
+
+    let mut rng = SmallRng::seed_from_u64(0x52_32_52_4f_42_55_53_54);
+    let mut blocked_pairs = Vec::new();
+    for round in 0..10u64 {
+        while blocked_pairs.len() < 5 {
+            let a = rng.gen_range(1..=7);
+            let mut b = rng.gen_range(1..=7);
+            while b == a {
+                b = rng.gen_range(1..=7);
+            }
+            let pair = if a < b { (a, b) } else { (b, a) };
+            if is_backbone(pair.0, pair.1) || blocked_pairs.contains(&pair) {
+                continue;
+            }
+            cluster.cluster.node(pair.0).chaos.block(pair.1);
+            cluster.cluster.node(pair.1).chaos.block(pair.0);
+            blocked_pairs.push(pair);
+        }
+
+        assert!(
+            wait_until(Duration::from_secs(15), || blocked_pairs.iter().all(
+                |&(a, b)| {
+                    let a_route = cluster
+                        .cluster
+                        .node(a)
+                        .overlay
+                        .route_to(b, ServiceLevel::Reliable);
+                    let b_route = cluster
+                        .cluster
+                        .node(b)
+                        .overlay
+                        .route_to(a, ServiceLevel::Reliable);
+                    matches!(a_route, Some(next) if next != b)
+                        && matches!(b_route, Some(next) if next != a)
+                }
+            ))
+            .await,
+            "routing did not move off failed direct links: {:?}",
+            blocked_pairs
+        );
+        assert!(
+            wait_for_full_routing(&cluster.cluster, Duration::from_secs(10)).await,
+            "routing did not converge while hostile links were failing"
+        );
+
+        let proposer = rng.gen_range(0..handles.len());
+        let handle = handles[proposer].clone();
+        let expected_version = round + 1;
+        let task = tokio::spawn(async move { handle.propose(9000 + round).await });
+        let version = timeout(Duration::from_secs(30), task)
+            .await
+            .expect("proposal hung while cross-node links were failing")
+            .expect("proposal task panicked while cross-node links were failing")
+            .expect("strict replication should route around hostile link failures");
+        assert_eq!(version, expected_version);
+
+        let ok = wait_until(Duration::from_secs(15), || {
+            repos
+                .iter()
+                .all(|r| r.current_version() == expected_version)
+        })
+        .await;
+        assert!(
+            ok,
+            "replicas did not converge after round {round}: versions = {:?}",
+            repos
+                .iter()
+                .map(|r| r.current_version())
+                .collect::<Vec<_>>()
+        );
+
+        for (a, b) in blocked_pairs.drain(..) {
+            cluster.cluster.node(a).chaos.unblock(b);
+            cluster.cluster.node(b).chaos.unblock(a);
+        }
+        assert!(
+            wait_for_full_routing(&cluster.cluster, Duration::from_secs(15)).await,
+            "routing did not converge after hostile links healed"
+        );
+    }
+
+    let log0 = repos[0].log();
+    for r in &repos[1..] {
+        assert_eq!(r.log(), log0, "replicas diverged under hostile links");
+    }
 
     cluster.shutdown().await;
 }

@@ -98,7 +98,9 @@ async fn activate_client_subscriptions(
     }
 
     let channel_snapshot_version = server.channels.current_version();
-    client.set_last_channel_version(channel_snapshot_version).await;
+    client
+        .set_last_channel_version(channel_snapshot_version)
+        .await;
 
     server.clients.publish_client(client_session_id).await;
 
@@ -130,8 +132,14 @@ async fn finish_handler_result(
     result: Result<(), MessageHandlerError>,
 ) -> Result<(), HandleIncomingConnectionError> {
     map_handler_result(client_session_id, result)?;
-    activate_client_subscriptions(server, client, client_session_id, client_log_rx, channel_log_rx)
-        .await
+    activate_client_subscriptions(
+        server,
+        client,
+        client_session_id,
+        client_log_rx,
+        channel_log_rx,
+    )
+    .await
 }
 
 impl Server {
@@ -682,7 +690,12 @@ impl Server {
         // Send server version (these are startup-only, read once)
         let version = {
             let cfg = self.read_config();
-            Version::for_server(cfg.send_version, cfg.send_build_info, cfg.send_os_info)
+            Version::for_server(
+                cfg.send_version,
+                cfg.send_build_info,
+                cfg.send_os_info,
+                cfg.server_protocol_version,
+            )
         }; // cfg dropped here
         tls_stream.write_proto_message(&version.into()).await?;
 
@@ -989,6 +1002,10 @@ impl Server {
         self.read_config().max_bandwidth
     }
 
+    pub fn get_server_protocol_version(&self) -> crate::protocol_version::ProtocolVersion {
+        self.read_config().server_protocol_version
+    }
+
     pub fn get_welcome_text(&self) -> Option<String> {
         self.read_config().welcome_text.clone()
     }
@@ -1020,12 +1037,13 @@ impl Server {
         ping: &crate::voice::ping::PingRequest,
     ) -> Result<Bytes, EncodeError> {
         // Snapshot config values before any .await (RwLockReadGuard is !Send)
-        let (local_max_users, max_bandwidth, user_count_scope) = {
+        let (local_max_users, max_bandwidth, user_count_scope, server_version) = {
             let cfg = server.read_config();
             (
                 cfg.max_users,
                 cfg.max_bandwidth,
                 cfg.udp_ping_user_count_scope,
+                cfg.server_protocol_version,
             )
         };
 
@@ -1047,7 +1065,7 @@ impl Server {
 
         let response = crate::voice::ping::PingResponse {
             timestamp: ping.timestamp,
-            server_version: crate::constants::APP_PROTO_VER,
+            server_version,
             user_count: user_count.clamp(0, u32::MAX.into()) as u32,
             max_user_count: Some(max_user_count.clamp(0, u32::MAX.into()) as u32),
             max_bandwidth_per_user: max_bandwidth,

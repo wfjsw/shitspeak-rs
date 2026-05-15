@@ -350,6 +350,16 @@ impl StrictState {
         to_fire
     }
 
+    /// Returns true while no strict traffic has been observed locally, so a
+    /// bootstrap catchup response can safely install repository state without
+    /// racing normal commit delivery.
+    pub fn can_bootstrap_catchup(&self) -> bool {
+        self.proposals.is_empty()
+            && self.commit_buffer.is_empty()
+            && self.pending_proposes.is_empty()
+            && self.committed_ids.is_empty()
+    }
+
     /// Record a Propose we just ack'd so a takeover can recover it.
     pub fn record_pending_propose(
         &mut self,
@@ -568,15 +578,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     /// Send a single bootstrap `CatchupReq` if we haven't applied any data
-    /// yet. Idempotent: returns immediately when `current_version() != 0`
-    /// or when another attempt was made within
+    /// yet. Idempotent: returns immediately when `current_version() != 0`,
+    /// when this runtime has already observed strict traffic, or when another
+    /// attempt was made within
     /// `cfg.strict_bootstrap_retry_interval()`. On failure (e.g., the
     /// overlay's routing table hasn't caught up to the alive view yet)
     /// iterates through the alive peers in random order until one accepts
     /// the send; if none accepts, returns and waits for the next
     /// membership event to retry.
     pub(crate) async fn try_bootstrap_catchup(self: &Arc<Self>) {
-        if self.repo.current_version() != 0 {
+        if self.repo.current_version() != 0 || !self.state.lock().can_bootstrap_catchup() {
             return;
         }
         {
@@ -1770,6 +1781,15 @@ mod tests {
         assert!(s.pending_proposes.contains_key(&op_id));
         s.mark_committed(op_id, 50);
         assert!(!s.pending_proposes.contains_key(&op_id));
+    }
+
+    #[test]
+    fn bootstrap_catchup_disabled_after_observed_strict_traffic() {
+        let mut s = StrictState::new();
+        assert!(s.can_bootstrap_catchup());
+
+        s.record_pending_propose((1, 1), 10, Bytes::from_static(b"op"), 1, Instant::now());
+        assert!(!s.can_bootstrap_catchup());
     }
 
     #[test]

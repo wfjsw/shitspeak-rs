@@ -81,6 +81,9 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     resp: StrictCatchupResp,
 ) {
+    if !rt.state.lock().can_bootstrap_catchup() {
+        return;
+    }
     if resp.too_old_use_snapshot && !resp.snapshot_msgpack.is_empty() {
         rt.repo
             .install_snapshot(resp.snapshot_version, resp.snapshot_msgpack)

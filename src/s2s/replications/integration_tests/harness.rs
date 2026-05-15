@@ -9,8 +9,8 @@ use crate::s2s::testing::{
 };
 
 use super::super::{
-    OwnerHandle, OwnerReplicable, ReplicationError, ReplicationManager, StrictHandle,
-    StrictReplicable,
+    OwnerHandle, OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager,
+    StrictHandle, StrictReplicable,
 };
 
 pub struct ReplCluster {
@@ -35,6 +35,24 @@ impl ReplCluster {
             .nodes
             .iter()
             .map(|n| ReplicationManager::new(n.overlay.clone()))
+            .collect();
+        Self { cluster, managers }
+    }
+
+    pub async fn build_full_mesh_with_config(node_ids: &[u16], cfg: ReplicationConfig) -> Self {
+        let cluster = Cluster::build(node_ids, full_mesh_seeds).await;
+        assert!(
+            wait_for_full_alive_mesh(&cluster, Duration::from_secs(5)).await,
+            "alive mesh did not form"
+        );
+        assert!(
+            wait_for_full_routing(&cluster, Duration::from_secs(5)).await,
+            "routing did not converge"
+        );
+        let managers: Vec<Arc<ReplicationManager>> = cluster
+            .nodes
+            .iter()
+            .map(|n| ReplicationManager::with_config(n.overlay.clone(), cfg.clone()))
             .collect();
         Self { cluster, managers }
     }
