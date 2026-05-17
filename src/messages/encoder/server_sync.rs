@@ -5,7 +5,7 @@ pub struct ServerSync {
     pub session: Option<u32>,
     pub max_bandwidth: Option<u32>,
     pub welcome_text: Option<String>,
-    pub permissions: Option<u64>,
+    pub permissions: Option<enumflags2::BitFlags<crate::acl::ACLPermissions>>,
 }
 
 impl From<crate::mumble_proto::ServerSync> for ServerSync {
@@ -14,7 +14,9 @@ impl From<crate::mumble_proto::ServerSync> for ServerSync {
             session: proto.session,
             max_bandwidth: proto.max_bandwidth,
             welcome_text: proto.welcome_text,
-            permissions: proto.permissions,
+            permissions: proto
+                .permissions
+                .map(|permissions| enumflags2::BitFlags::from_bits_truncate(permissions as u32)),
         }
     }
 }
@@ -36,7 +38,9 @@ impl Into<crate::mumble_proto::ServerSync> for ServerSync {
             session: self.session,
             max_bandwidth: self.max_bandwidth,
             welcome_text: self.welcome_text,
-            permissions: self.permissions,
+            permissions: self
+                .permissions
+                .map(|permissions| u64::from(permissions.bits())),
         }
     }
 }

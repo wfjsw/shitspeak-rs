@@ -102,4 +102,5 @@ message OverlayData {
   uint32 service_level    = 5;   // matches s2s::transport::ServiceLevel
   uint32 message_class    = 6;   // matches s2s::transport::MessageClass
   bytes  payload          = 7;
+  bool   process_on_transit = 8; // deliver to local service on transit hops too
 }

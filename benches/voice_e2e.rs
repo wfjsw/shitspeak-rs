@@ -192,6 +192,7 @@ impl Authenticator for AuthenticatorAdapter {
             user_id: user.user_id,
             display_name: Some(username.to_owned()),
             groups: user.groups,
+            language: shitspeak_rs::localization::Language::default(),
             texture_url: None,
             comment_url: None,
         })
@@ -294,6 +295,7 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
         udp_channel_size: 2_048,
         client_idle_timeout_secs: 30,
+        pending_delete_timeout_ms: 5_000,
         required_groups: Vec::new(),
         send_permission_info: false,
         s2s: S2sConfig::default(),

@@ -40,6 +40,7 @@ pub async fn originate(
     level: ServiceLevel,
     class: MessageClass,
     body: Bytes,
+    process_on_transit: bool,
 ) -> Result<(), OverlayError> {
     let data = pb::OverlayData {
         src: node_to_wire(self_id),
@@ -49,6 +50,7 @@ pub async fn originate(
         service_level: level_to_wire(level),
         message_class: class_to_wire(class),
         payload: body,
+        process_on_transit,
     };
     forward_pb(
         transport, routing, self_id, data, class, /*is_originator=*/ true,
@@ -67,12 +69,11 @@ pub async fn handle_inbound(
     data: pb::OverlayData,
 ) {
     let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
-    // Deliver-to-self if applicable.
     let is_for_self = data
         .dsts
         .iter()
         .any(|d| node_from_wire(*d) == Some(self_id));
-    if is_for_self {
+    if is_for_self || data.process_on_transit {
         let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
         let src = node_from_wire(data.src).unwrap_or(0);
         delivery::deliver(
@@ -164,6 +165,7 @@ async fn forward_pb(
             service_level: data.service_level,
             message_class: data.message_class,
             payload: data.payload.clone(),
+            process_on_transit: data.process_on_transit,
         };
         let payload = match encode_message(&wrap(OverlayBody::Data(pb_msg))) {
             Ok(b) => b,

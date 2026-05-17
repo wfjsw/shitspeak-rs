@@ -264,6 +264,10 @@ pub struct Config {
     /// Default: 30.
     #[serde(default = "default_idle_timeout")]
     pub client_idle_timeout_secs: u64,
+    /// Milliseconds before a pending two-phase channel delete is rolled back.
+    /// Default: 5000.
+    #[serde(default = "default_pending_delete_timeout_ms")]
+    pub pending_delete_timeout_ms: u64,
 
     // ── Access control ────────────────────────────────────────────────────
     /// Groups required to connect.  If empty, all authenticated users are
@@ -306,6 +310,9 @@ fn default_udp_ping_user_count_scope() -> UdpPingUserCountScope {
 }
 fn default_idle_timeout() -> u64 {
     30
+}
+fn default_pending_delete_timeout_ms() -> u64 {
+    5_000
 }
 fn default_channel_log_max_entries() -> usize {
     10_000

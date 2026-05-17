@@ -60,11 +60,6 @@ impl ServiceRegistry {
     pub fn get(&self, tag: u32) -> Option<Arc<dyn ServiceInbound>> {
         self.inner.get(&tag).map(|e| e.get().clone())
     }
-
-    /// Stub used by older API drafts; kept for compile-only consumers.
-    pub fn last_tag_for_inbound(&self) -> u32 {
-        0
-    }
 }
 
 impl Default for ServiceRegistry {
@@ -84,6 +79,24 @@ pub async fn send_unicast(
     class: MessageClass,
     body: Bytes,
 ) -> Result<(), OverlayError> {
+    send_unicast_with_transit_processing(
+        transport, routing, self_id, dst, tag, level, class, body, false,
+    )
+    .await
+}
+
+/// Public API: send to one peer, optionally delivering to service handlers on transit nodes.
+pub async fn send_unicast_with_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    dst: NodeIdentifier,
+    tag: u32,
+    level: ServiceLevel,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
     forward::originate(
         transport,
         routing,
@@ -93,6 +106,7 @@ pub async fn send_unicast(
         level,
         class,
         body,
+        process_on_transit,
     )
     .await
 }
@@ -108,8 +122,37 @@ pub async fn send_multicast(
     class: MessageClass,
     body: Bytes,
 ) -> Result<(), OverlayError> {
+    send_multicast_with_transit_processing(
+        transport, routing, self_id, dsts, tag, level, class, body, false,
+    )
+    .await
+}
+
+/// Public API: send to a specific list of peers, optionally delivering to service handlers on transit nodes.
+pub async fn send_multicast_with_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    dsts: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
     let dsts: Vec<NodeIdentifier> = dsts.iter().copied().filter(|n| *n != self_id).collect();
-    forward::originate(transport, routing, self_id, dsts, tag, level, class, body).await
+    forward::originate(
+        transport,
+        routing,
+        self_id,
+        dsts,
+        tag,
+        level,
+        class,
+        body,
+        process_on_transit,
+    )
+    .await
 }
 
 /// Public API: broadcast to every alive peer.
@@ -123,9 +166,38 @@ pub async fn send_broadcast(
     class: MessageClass,
     body: Bytes,
 ) -> Result<(), OverlayError> {
+    send_broadcast_with_transit_processing(
+        transport, routing, self_id, alive, tag, level, class, body, false,
+    )
+    .await
+}
+
+/// Public API: broadcast to every alive peer, optionally delivering to service handlers on transit nodes.
+pub async fn send_broadcast_with_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    alive: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
     let dsts: Vec<NodeIdentifier> = alive.iter().copied().filter(|n| *n != self_id).collect();
     if dsts.is_empty() {
         return Ok(());
     }
-    forward::originate(transport, routing, self_id, dsts, tag, level, class, body).await
+    forward::originate(
+        transport,
+        routing,
+        self_id,
+        dsts,
+        tag,
+        level,
+        class,
+        body,
+        process_on_transit,
+    )
+    .await
 }

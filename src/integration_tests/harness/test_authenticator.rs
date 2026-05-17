@@ -12,12 +12,14 @@ use async_trait::async_trait;
 use crate::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
 };
+use crate::localization::Language;
 
 #[derive(Debug, Clone)]
 struct ScriptedUser {
     password: Option<String>,
     user_id: Option<u32>,
     groups: Vec<String>,
+    language: Language,
 }
 
 #[derive(Default)]
@@ -39,12 +41,24 @@ impl TestAuthenticator {
         user_id: Option<u32>,
         groups: Vec<String>,
     ) {
+        self.register_user_with_language(name, password, user_id, groups, Language::default());
+    }
+
+    pub fn register_user_with_language(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+        language: Language,
+    ) {
         self.users.lock().unwrap().insert(
             name.to_owned(),
             ScriptedUser {
                 password: password.map(str::to_owned),
                 user_id,
                 groups,
+                language,
             },
         );
     }
@@ -78,8 +92,26 @@ impl Authenticator for AuthenticatorAdapter {
             user_id: entry.user_id,
             display_name: Some(username.to_owned()),
             groups: entry.groups,
+            language: entry.language,
             texture_url: None,
             comment_url: None,
         })
+    }
+
+    async fn language(
+        &self,
+        username: Option<&str>,
+        _auxiliary_data: &AuthenticateAuxiliaryData,
+    ) -> Language {
+        let Some(username) = username else {
+            return Language::default();
+        };
+        self.0
+            .users
+            .lock()
+            .unwrap()
+            .get(username)
+            .map(|entry| entry.language)
+            .unwrap_or_default()
     }
 }

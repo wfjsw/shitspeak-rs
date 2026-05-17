@@ -2,10 +2,13 @@ use std::collections::HashSet;
 
 use crate::client::user_version::UserVersion;
 
+use crate::localization::Language;
+
 pub struct ClientLocalState {
     synced: bool,
     authenticated: bool,
     supports_opus: bool,
+    language: Language,
 
     last_active_timestamp: Option<std::time::Instant>,
 
@@ -20,6 +23,7 @@ impl ClientLocalState {
             synced: false,
             authenticated: false,
             supports_opus: false,
+            language: Language::default(),
 
             last_active_timestamp: None,
 
@@ -43,6 +47,14 @@ impl ClientLocalState {
 
     pub fn set_supports_opus(&mut self, value: bool) {
         self.supports_opus = value;
+    }
+
+    pub fn language(&self) -> Language {
+        self.language
+    }
+
+    pub fn set_language(&mut self, language: Language) {
+        self.language = language;
     }
 
     pub fn get_release(&self) -> Option<&str> {

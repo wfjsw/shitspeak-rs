@@ -10,7 +10,7 @@ use crate::config::{S2sSeedAddressConfig, S2sTransportKindConfig};
 use crate::integration_tests::harness::{
     spawn_s2s_test_server, TestClient, TestS2sServerOpts, TestServer, TestServerOpts,
 };
-use crate::messages::encoder::UserStats;
+use crate::messages::encoder::{PluginDataTransmission, UserStats};
 use crate::messages::Message;
 use crate::s2s::testing::{loopback, mint_pki, pick_free_port, wait_until};
 use crate::s2s::transport::ServiceLevel;
@@ -158,6 +158,55 @@ async fn s2s_cross_node_user_stats_rpc() {
         .await;
 
     assert!(msg.is_some(), "Alice should receive Bob's cross-node stats");
+}
+
+/// Checks cross-node plugin data routing to explicitly targeted receiver sessions.
+/// Expected: Bob receives Alice's `PluginDataTransmission` with the sender
+/// stamped by server A and the payload preserved over S2S.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_cross_node_plugin_data_transmission_routes_to_remote_recipient() {
+    let _guard = S2S_TEST_LOCK.lock().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    let payload = Bytes::from_static(b"plugin-payload");
+    alice
+        .send(
+            PluginDataTransmission {
+                sender_session: Some(999),
+                receiver_sessions: vec![bob.session_id, bob.session_id, alice.session_id],
+                data: Some(payload.clone()),
+                data_id: Some("plugin.data.test".to_string()),
+            }
+            .into(),
+        )
+        .await;
+
+    let msg = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::PluginDataTransmission(p)
+                    if p.sender_session == Some(alice.session_id)
+                        && p.receiver_sessions == vec![bob.session_id]
+                        && p.data.as_ref() == Some(&payload)
+                        && p.data_id.as_deref() == Some("plugin.data.test"))
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+
+    assert!(
+        msg.is_some(),
+        "Bob should receive Alice's cross-node plugin data"
+    );
 }
 
 /// Checks cross-node moderation routing to the target user's owning server.

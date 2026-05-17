@@ -8,4 +8,5 @@ pub mod channel_tree;
 pub mod mod_actions;
 pub mod s2s;
 pub mod self_actions;
+pub mod user_stats;
 pub mod voice;

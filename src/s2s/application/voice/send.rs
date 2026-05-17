@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::s2s::application::error::ApplicationError;
-use crate::s2s::application::proto::{self, VOICE_SERVICE_TAG};
+use crate::s2s::application::proto::{self, VoiceIntent, VOICE_SERVICE_TAG};
 use crate::s2s::overlay::OverlayNetwork;
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
@@ -49,7 +49,13 @@ pub struct OverlayVoiceTransport {
 impl VoiceTransport for OverlayVoiceTransport {
     async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
-            .send_unicast(dst, VOICE_SERVICE_TAG, VOICE_LEVEL, VOICE_CLASS, body)
+            .send_unicast_with_transit_processing(
+                dst,
+                VOICE_SERVICE_TAG,
+                VOICE_LEVEL,
+                VOICE_CLASS,
+                body,
+            )
             .await?;
         Ok(())
     }
@@ -63,14 +69,25 @@ impl VoiceTransport for OverlayVoiceTransport {
             return Ok(());
         }
         self.overlay
-            .send_multicast(dsts, VOICE_SERVICE_TAG, VOICE_LEVEL, VOICE_CLASS, body)
+            .send_multicast_with_transit_processing(
+                dsts,
+                VOICE_SERVICE_TAG,
+                VOICE_LEVEL,
+                VOICE_CLASS,
+                body,
+            )
             .await?;
         Ok(())
     }
 
     async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
-            .send_broadcast(VOICE_SERVICE_TAG, VOICE_LEVEL, VOICE_CLASS, body)
+            .send_broadcast_with_transit_processing(
+                VOICE_SERVICE_TAG,
+                VOICE_LEVEL,
+                VOICE_CLASS,
+                body,
+            )
             .await?;
         Ok(())
     }
@@ -93,6 +110,7 @@ pub fn build_envelope(
     target_kind: u32,
     is_terminator: bool,
     payload: Bytes,
+    intent: VoiceIntent,
 ) -> Result<Bytes, prost::EncodeError> {
     let frame = proto::VoiceFrame {
         sender_session,
@@ -101,6 +119,7 @@ pub fn build_envelope(
         target_kind,
         is_terminator,
         payload,
+        intent: Some(intent),
     };
     proto::encode_voice(&frame)
 }
@@ -206,6 +225,11 @@ mod tests {
             0,
             false,
             payload.clone(),
+            VoiceIntent {
+                kind: Some(proto::VoiceIntentKind::Normal(proto::VoiceIntentNormal {
+                    source_channel: 5,
+                })),
+            },
         )
         .unwrap();
         let decoded = proto::decode_voice(&bytes).unwrap();
@@ -215,5 +239,9 @@ mod tests {
         assert_eq!(decoded.target_kind, 0);
         assert!(!decoded.is_terminator);
         assert_eq!(decoded.payload, payload.as_ref());
+        assert!(matches!(
+            decoded.intent.and_then(|i| i.kind),
+            Some(proto::VoiceIntentKind::Normal(n)) if n.source_channel == 5
+        ));
     }
 }

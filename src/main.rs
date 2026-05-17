@@ -26,6 +26,7 @@ mod constants;
 mod context_action;
 mod errors;
 mod geoip;
+mod localization;
 mod messages;
 mod protocol_version;
 mod proxy_protocol;
@@ -83,6 +84,7 @@ impl api::Authenticator for NoopAuthenticator {
             user_id: None,
             display_name: Some(username.to_owned()),
             groups,
+            language: localization::Language::default(),
             texture_url: None,
             comment_url: None,
         })

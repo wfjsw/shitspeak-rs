@@ -1,8 +1,12 @@
 use std::sync::Arc;
 
 use crate::{
-    ban_repository::BanOp, client::Client, errors::MessageHandlerError,
-    messages::encoder::UserRemove, server::Server,
+    acl::ACLPermissions,
+    ban_repository::BanOp,
+    client::Client,
+    errors::MessageHandlerError,
+    messages::encoder::{PermissionDenied, UserRemove},
+    server::Server,
 };
 
 pub async fn handle_user_remove(
@@ -29,6 +33,23 @@ pub async fn handle_user_remove(
     }
     let target_session =
         crate::client::client_session_identifier::ClientSessionIdentifier::from(target_raw);
+    let is_ban = msg.ban.unwrap_or(false);
+    let required_permission = if is_ban {
+        ACLPermissions::Ban
+    } else {
+        ACLPermissions::Kick
+    };
+    let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
+    if !root_perms.contains(required_permission) {
+        return Err(MessageHandlerError::PermissionDenied(
+            PermissionDenied::for_permission(
+                u32::from(sender.get_session_id()),
+                Some(0),
+                required_permission,
+            ),
+        ));
+    }
+
     let local_node_id = server.get_clients().local_node_id();
 
     // Cross-owner kick/ban: dispatch the intent to the owner. Same
@@ -41,7 +62,7 @@ pub async fn handle_user_remove(
         if let Some(app) = server.s2s_manager().application() {
             let patch = crate::s2s::application::proto::UserRemovePatch {
                 reason: msg.reason.clone().map(Into::into),
-                ban: msg.ban.unwrap_or(false),
+                ban: is_ban,
             };
             if let Err(e) = app
                 .moderation()
@@ -68,8 +89,6 @@ pub async fn handle_user_remove(
         None => return Ok(()),
     };
 
-    // TODO: check Kick/Ban permissions against ACL; for now allow all authenticated.
-    let is_ban = msg.ban.unwrap_or(false);
     let reason = msg.reason.clone().unwrap_or_default();
 
     if is_ban {
@@ -113,9 +132,15 @@ pub async fn handle_user_remove(
     // drive the UserRemove broadcast to all per-client subscribers.
     // No need to broadcast manually.
 
-    // Disconnect the target (TODO: actual TCP disconnect)
-    // For now we just remove from the client list; disconnect() is a todo!()
-    server.get_clients().remove_client(target_session).await;
+    let removed = server.get_clients().remove_client(target_session).await;
+    let target = removed.as_ref().unwrap_or(&target);
+    if let Err(e) = target.disconnect().await {
+        tracing::debug!(
+            error = %e,
+            target = target_raw,
+            "failed to gracefully disconnect removed client",
+        );
+    }
 
     Ok(())
 }

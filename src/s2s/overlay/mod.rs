@@ -155,8 +155,8 @@ impl OverlayNetwork {
 
     /// Register an L3 service handler for `tag`. The handler is invoked
     /// synchronously on the inbound dispatcher when an `OverlayData`
-    /// frame with that tag arrives addressed to (or transiting through)
-    /// this node and destined locally.
+    /// frame with that tag is destined locally, or when the frame opts
+    /// into transit processing for nodes it passes through.
     pub fn register_service(&self, tag: u32, handler: Arc<dyn ServiceInbound>) {
         self.inner.services.register(tag, handler);
     }
@@ -187,6 +187,29 @@ impl OverlayNetwork {
         .await
     }
 
+    /// Send to a single peer and also deliver to matching services on transit nodes.
+    pub async fn send_unicast_with_transit_processing(
+        &self,
+        dst: NodeIdentifier,
+        tag: u32,
+        level: ServiceLevel,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        messaging::send_unicast_with_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            dst,
+            tag,
+            level,
+            class,
+            body,
+            true,
+        )
+        .await
+    }
+
     /// Send to a list of peers — fanned out per next-hop.
     pub async fn send_multicast(
         &self,
@@ -209,6 +232,29 @@ impl OverlayNetwork {
         .await
     }
 
+    /// Send to a list of peers and also deliver to matching services on transit nodes.
+    pub async fn send_multicast_with_transit_processing(
+        &self,
+        dsts: &[NodeIdentifier],
+        tag: u32,
+        level: ServiceLevel,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        messaging::send_multicast_with_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            dsts,
+            tag,
+            level,
+            class,
+            body,
+            true,
+        )
+        .await
+    }
+
     /// Send to every alive peer.
     pub async fn send_broadcast(
         &self,
@@ -227,6 +273,29 @@ impl OverlayNetwork {
             level,
             class,
             body,
+        )
+        .await
+    }
+
+    /// Send to every alive peer and also deliver to matching services on transit nodes.
+    pub async fn send_broadcast_with_transit_processing(
+        &self,
+        tag: u32,
+        level: ServiceLevel,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        let alive = self.alive_members();
+        messaging::send_broadcast_with_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            &alive,
+            tag,
+            level,
+            class,
+            body,
+            true,
         )
         .await
     }

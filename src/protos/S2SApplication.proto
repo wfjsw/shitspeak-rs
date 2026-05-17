@@ -5,6 +5,8 @@ package s2s_application;
 // reserved on the overlay's `ServiceRegistry`:
 //   tag = 2 → ModerationEnvelope (sent to a single owner node)
 //   tag = 3 → VoiceFrame (broadcast / multicast / unicast per delivery mode)
+//   tag = 4 → UserStatsEnvelope (request/reply RPC)
+//   tag = 5 → PluginDataEnvelope (client-to-client plugin payload fanout)
 
 // ── Moderation ────────────────────────────────────────────────────────────
 
@@ -81,6 +83,20 @@ message UserStatsReply {
   bytes  payload    = 3;
 }
 
+// ── Plugin Data ───────────────────────────────────────────────────────────
+//
+// Direct client-to-client plugin payload fanout. The originator groups
+// `receiver_sessions` by owning node and unicasts one envelope per node.
+// The destination node forwards the payload to locally-owned recipient
+// sessions only.
+
+message PluginDataEnvelope {
+  uint32 sender_session = 1;          // stamped by the originator
+  repeated uint32 receiver_sessions = 2;
+  bytes data = 3;
+  optional string data_id = 4;
+}
+
 // ── Voice ─────────────────────────────────────────────────────────────────
 
 // Cross-node voice frame. The receiver does not decode `payload` — it is
@@ -100,4 +116,31 @@ message VoiceFrame {
   bool   is_terminator  = 5;   // last frame of an utterance; receiver
                                 // flushes its reorder pending immediately.
   bytes  payload        = 6;   // encoded UDP audio body, codec-agnostic
+  VoiceIntent intent    = 7;   // unresolved routing intent. Receivers
+                                // resolve this against local/replicated
+                                // client and channel state.
+}
+
+message VoiceIntent {
+  oneof kind {
+    VoiceIntentNormal normal = 1;
+    VoiceIntentTarget target = 2;
+  }
+}
+
+message VoiceIntentNormal {
+  uint32 source_channel = 1;
+}
+
+message VoiceIntentTarget {
+  uint32 source_channel = 1;
+  repeated uint32 sessions = 2;
+  repeated VoiceTargetChannel channels = 3;
+}
+
+message VoiceTargetChannel {
+  uint32 id = 1;
+  bool children = 2;
+  bool links = 3;
+  string group = 4;
 }

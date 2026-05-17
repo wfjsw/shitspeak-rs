@@ -1,0 +1,204 @@
+{
+  "languages": {
+    "en": {
+      "text": {
+        "MissingRequiredGroup": "Missing required group membership",
+        "NoRootTraverse": "No traverse permission on root channel",
+        "CryptSetupFailed": "Failed to create crypt state",
+        "WriteAclRequired": "Write permission required to modify ACLs",
+        "CannotDeleteRootChannel": "Cannot delete the root channel",
+        "ChannelNameRequired": "Channel name is required",
+        "CannotRenameRootChannel": "Cannot rename the root channel",
+        "ChannelDoesNotExist": "Channel {channel_id} does not exist"
+      },
+      "reject": {
+        "None": "The server rejected the request",
+        "WrongVersion": "Unsupported client version",
+        "InvalidUsername": "Invalid username",
+        "WrongUserPw": "Incorrect username or password",
+        "WrongServerPw": "Incorrect server password",
+        "UsernameInUse": "Username is already in use",
+        "ServerFull": "The server is full",
+        "NoCertificate": "A client certificate is required",
+        "AuthenticatorFail": "Authentication service is unavailable",
+        "NoNewConnections": "The server is not accepting new connections"
+      },
+      "deny": {
+        "Text": "Text message denied",
+        "Permission": "Permission denied",
+        "SuperUser": "Superuser privileges are required",
+        "ChannelName": "Invalid channel name",
+        "TextTooLong": "Text message is too long",
+        "H9k": "Operation denied",
+        "TemporaryChannel": "Temporary channel operation denied",
+        "MissingCertificate": "A client certificate is required",
+        "UserName": "Invalid username",
+        "ChannelFull": "The channel is full",
+        "NestingLimit": "Channel nesting limit reached",
+        "ChannelCountLimit": "Channel count limit reached",
+        "ChannelListenerLimit": "Channel listener limit reached",
+        "UserListenerLimit": "User listener limit reached"
+      }
+    },
+    "es": {
+      "text": {
+        "MissingRequiredGroup": "Falta pertenecer a un grupo requerido",
+        "NoRootTraverse": "Sin permiso de recorrido en el canal raíz",
+        "CryptSetupFailed": "No se pudo crear el estado de cifrado",
+        "WriteAclRequired": "Se requiere permiso de escritura para modificar las ACL",
+        "CannotDeleteRootChannel": "No se puede eliminar el canal raíz",
+        "ChannelNameRequired": "El nombre del canal es obligatorio",
+        "CannotRenameRootChannel": "No se puede cambiar el nombre del canal raíz",
+        "ChannelDoesNotExist": "El canal {channel_id} no existe"
+      },
+      "reject": {
+        "None": "El servidor rechazó la solicitud",
+        "WrongVersion": "Versión del cliente no compatible",
+        "InvalidUsername": "Nombre de usuario no válido",
+        "WrongUserPw": "Usuario o contraseña incorrectos",
+        "WrongServerPw": "Contraseña del servidor incorrecta",
+        "UsernameInUse": "El nombre de usuario ya está en uso",
+        "ServerFull": "El servidor está lleno",
+        "NoCertificate": "Se requiere un certificado de cliente",
+        "AuthenticatorFail": "El servicio de autenticación no está disponible",
+        "NoNewConnections": "El servidor no acepta conexiones nuevas"
+      },
+      "deny": {
+        "Text": "Mensaje de texto denegado",
+        "Permission": "Permiso denegado",
+        "SuperUser": "Se requieren privilegios de superusuario",
+        "ChannelName": "Nombre de canal no válido",
+        "TextTooLong": "El mensaje de texto es demasiado largo",
+        "H9k": "Operación denegada",
+        "TemporaryChannel": "Operación de canal temporal denegada",
+        "MissingCertificate": "Se requiere un certificado de cliente",
+        "UserName": "Nombre de usuario no válido",
+        "ChannelFull": "El canal está lleno",
+        "NestingLimit": "Se alcanzó el límite de anidamiento de canales",
+        "ChannelCountLimit": "Se alcanzó el límite de canales",
+        "ChannelListenerLimit": "Se alcanzó el límite de oyentes del canal",
+        "UserListenerLimit": "Se alcanzó el límite de oyentes del usuario"
+      }
+    },
+    "fr": {
+      "text": {
+        "MissingRequiredGroup": "Appartenance à un groupe requis manquante",
+        "NoRootTraverse": "Permission de traversée absente sur le canal racine",
+        "CryptSetupFailed": "Impossible de créer l'état de chiffrement",
+        "WriteAclRequired": "La permission d'écriture est requise pour modifier les ACL",
+        "CannotDeleteRootChannel": "Impossible de supprimer le canal racine",
+        "ChannelNameRequired": "Le nom du canal est obligatoire",
+        "CannotRenameRootChannel": "Impossible de renommer le canal racine",
+        "ChannelDoesNotExist": "Le canal {channel_id} n'existe pas"
+      },
+      "reject": {
+        "None": "Le serveur a rejeté la demande",
+        "WrongVersion": "Version du client non prise en charge",
+        "InvalidUsername": "Nom d'utilisateur non valide",
+        "WrongUserPw": "Nom d'utilisateur ou mot de passe incorrect",
+        "WrongServerPw": "Mot de passe du serveur incorrect",
+        "UsernameInUse": "Le nom d'utilisateur est déjà utilisé",
+        "ServerFull": "Le serveur est plein",
+        "NoCertificate": "Un certificat client est requis",
+        "AuthenticatorFail": "Le service d'authentification est indisponible",
+        "NoNewConnections": "Le serveur n'accepte pas de nouvelles connexions"
+      },
+      "deny": {
+        "Text": "Message texte refusé",
+        "Permission": "Permission refusée",
+        "SuperUser": "Les privilèges superutilisateur sont requis",
+        "ChannelName": "Nom de canal non valide",
+        "TextTooLong": "Le message texte est trop long",
+        "H9k": "Opération refusée",
+        "TemporaryChannel": "Opération de canal temporaire refusée",
+        "MissingCertificate": "Un certificat client est requis",
+        "UserName": "Nom d'utilisateur non valide",
+        "ChannelFull": "Le canal est plein",
+        "NestingLimit": "Limite d'imbrication des canaux atteinte",
+        "ChannelCountLimit": "Limite du nombre de canaux atteinte",
+        "ChannelListenerLimit": "Limite d'écouteurs du canal atteinte",
+        "UserListenerLimit": "Limite d'écouteurs de l'utilisateur atteinte"
+      }
+    },
+    "de": {
+      "text": {
+        "MissingRequiredGroup": "Erforderliche Gruppenmitgliedschaft fehlt",
+        "NoRootTraverse": "Keine Traverse-Berechtigung für den Root-Kanal",
+        "CryptSetupFailed": "Kryptostatus konnte nicht erstellt werden",
+        "WriteAclRequired": "Zum Ändern von ACLs ist Schreibberechtigung erforderlich",
+        "CannotDeleteRootChannel": "Der Root-Kanal kann nicht gelöscht werden",
+        "ChannelNameRequired": "Kanalname ist erforderlich",
+        "CannotRenameRootChannel": "Der Root-Kanal kann nicht umbenannt werden",
+        "ChannelDoesNotExist": "Kanal {channel_id} existiert nicht"
+      },
+      "reject": {
+        "None": "Der Server hat die Anfrage abgelehnt",
+        "WrongVersion": "Nicht unterstützte Client-Version",
+        "InvalidUsername": "Ungültiger Benutzername",
+        "WrongUserPw": "Benutzername oder Passwort ist falsch",
+        "WrongServerPw": "Serverpasswort ist falsch",
+        "UsernameInUse": "Benutzername wird bereits verwendet",
+        "ServerFull": "Der Server ist voll",
+        "NoCertificate": "Ein Client-Zertifikat ist erforderlich",
+        "AuthenticatorFail": "Authentifizierungsdienst ist nicht verfügbar",
+        "NoNewConnections": "Der Server nimmt keine neuen Verbindungen an"
+      },
+      "deny": {
+        "Text": "Textnachricht abgelehnt",
+        "Permission": "Berechtigung verweigert",
+        "SuperUser": "Superuser-Rechte sind erforderlich",
+        "ChannelName": "Ungültiger Kanalname",
+        "TextTooLong": "Textnachricht ist zu lang",
+        "H9k": "Vorgang abgelehnt",
+        "TemporaryChannel": "Temporäre Kanaloperation abgelehnt",
+        "MissingCertificate": "Ein Client-Zertifikat ist erforderlich",
+        "UserName": "Ungültiger Benutzername",
+        "ChannelFull": "Der Kanal ist voll",
+        "NestingLimit": "Verschachtelungslimit für Kanäle erreicht",
+        "ChannelCountLimit": "Kanallimit erreicht",
+        "ChannelListenerLimit": "Kanal-Listener-Limit erreicht",
+        "UserListenerLimit": "Benutzer-Listener-Limit erreicht"
+      }
+    },
+    "zh": {
+      "text": {
+        "MissingRequiredGroup": "缺少必需的组成员身份",
+        "NoRootTraverse": "没有根频道的遍历权限",
+        "CryptSetupFailed": "无法创建加密状态",
+        "WriteAclRequired": "修改 ACL 需要写入权限",
+        "CannotDeleteRootChannel": "不能删除根频道",
+        "ChannelNameRequired": "频道名称是必需的",
+        "CannotRenameRootChannel": "不能重命名根频道",
+        "ChannelDoesNotExist": "频道 {channel_id} 不存在"
+      },
+      "reject": {
+        "None": "服务器拒绝了该请求",
+        "WrongVersion": "不支持的客户端版本",
+        "InvalidUsername": "用户名无效",
+        "WrongUserPw": "用户名或密码错误",
+        "WrongServerPw": "服务器密码错误",
+        "UsernameInUse": "用户名已被使用",
+        "ServerFull": "服务器已满",
+        "NoCertificate": "需要客户端证书",
+        "AuthenticatorFail": "认证服务不可用",
+        "NoNewConnections": "服务器不接受新连接"
+      },
+      "deny": {
+        "Text": "文本消息被拒绝",
+        "Permission": "权限被拒绝",
+        "SuperUser": "需要超级用户权限",
+        "ChannelName": "频道名称无效",
+        "TextTooLong": "文本消息过长",
+        "H9k": "操作被拒绝",
+        "TemporaryChannel": "临时频道操作被拒绝",
+        "MissingCertificate": "需要客户端证书",
+        "UserName": "用户名无效",
+        "ChannelFull": "频道已满",
+        "NestingLimit": "已达到频道嵌套限制",
+        "ChannelCountLimit": "已达到频道数量限制",
+        "ChannelListenerLimit": "已达到频道监听者限制",
+        "UserListenerLimit": "已达到用户监听者限制"
+      }
+    }
+  }
+}

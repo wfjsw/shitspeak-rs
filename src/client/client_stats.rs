@@ -53,6 +53,26 @@ impl ClientStats {
         }
     }
 
+    pub fn record_udp_packet(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.udp_total_packets = self.udp_total_packets.saturating_add(1);
+        self.udp_volume = self.udp_volume.saturating_add(bytes as u64);
+    }
+
+    pub fn record_tcp_packets(&mut self, packets: usize, bytes: usize) {
+        if packets == 0 || bytes == 0 {
+            return;
+        }
+        self.tcp_total_packets = self.tcp_total_packets.saturating_add(packets as u64);
+        self.tcp_volume = self.tcp_volume.saturating_add(bytes as u64);
+    }
+
+    pub fn total_volume(&self) -> u64 {
+        self.udp_volume.saturating_add(self.tcp_volume)
+    }
+
     pub fn udp_ping_avg(&self) -> f32 {
         self.udp_ping_avg
     }
@@ -61,6 +81,7 @@ impl ClientStats {
     }
     pub fn udp_packets(&self) -> u32 {
         self.udp_packets
+            .max(self.udp_total_packets.min(u32::MAX as u64) as u32)
     }
     pub fn tcp_ping_avg(&self) -> f32 {
         self.tcp_ping_avg
@@ -70,5 +91,6 @@ impl ClientStats {
     }
     pub fn tcp_packets(&self) -> u32 {
         self.tcp_packets
+            .max(self.tcp_total_packets.min(u32::MAX as u64) as u32)
     }
 }

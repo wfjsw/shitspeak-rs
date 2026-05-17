@@ -1,10 +1,10 @@
 //! Moderator actions: mute another user, kick, ban (and verify ban survives a
-//! reconnect attempt). The current `handle_user_remove` doesn't gate
-//! kick/ban on ACL Kick/Ban, so any authenticated user can issue them; the
-//! Mute path *does* go through MuteDeafen, which only the admin has by default.
+//! reconnect attempt). Kick and ban are guarded by root-channel ACL permissions,
+//! while mute/deaf moderation is guarded by MuteDeafen.
 
 use std::time::Duration;
 
+use crate::acl::ACLPermissions;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::Message;
 
@@ -81,6 +81,53 @@ async fn mod_kicks_other() {
         alice_observed.is_some(),
         "Alice should have received UserRemove for Bob"
     );
+
+    assert!(
+        bob.recv_closed(Duration::from_secs(2)).await,
+        "Bob's TCP connection should close after kick"
+    );
+}
+
+/// Checks that a user without root Kick permission cannot kick another user.
+#[tokio::test]
+async fn non_mod_cannot_kick_other() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let bob_session = bob.session_id;
+    alice.kick(bob_session, "test").await;
+
+    let denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionDenied(pd)
+                    if pd.channel_id == Some(0)
+                        && pd.permission == Some(ACLPermissions::Kick as u32))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(denied.is_some(), "Alice should be denied Kick on root");
+
+    let removed = alice
+        .recv_until(
+            |m| matches!(m, Message::UserRemove(ur) if ur.session == bob_session),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(removed.is_none(), "Bob should not be kicked");
 }
 
 /// Checks that a moderator ban records a server ban entry after removing a user.
@@ -123,4 +170,52 @@ async fn mod_bans_other_blocks_reconnect() {
         !bans.is_empty(),
         "Ban repository should contain at least one entry after ban"
     );
+}
+
+/// Checks that a user without root Ban permission cannot ban another user.
+#[tokio::test]
+async fn non_mod_cannot_ban_other() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let bob_session = bob.session_id;
+    alice.ban(bob_session, "test").await;
+
+    let denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionDenied(pd)
+                    if pd.channel_id == Some(0)
+                        && pd.permission == Some(ACLPermissions::Ban as u32))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(denied.is_some(), "Alice should be denied Ban on root");
+
+    let removed = alice
+        .recv_until(
+            |m| matches!(m, Message::UserRemove(ur) if ur.session == bob_session),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        removed.is_none(),
+        "Bob should not be removed by a denied ban"
+    );
+
+    let bans = server.server.get_bans().get_active_bans().await;
+    assert!(bans.is_empty(), "Denied ban should not create a ban entry");
 }

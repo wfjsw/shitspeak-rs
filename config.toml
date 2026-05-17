@@ -32,10 +32,13 @@ cert_required = false
 # UDP
 udp_voice_enabled = true
 udp_ping_enabled = true
+# cluster = clusterwide user count and summed cluster max_users; local = this node only
+udp_ping_user_count_scope = "cluster"
 udp_channel_size = 2048
 
 # Idle timeout (seconds)
 client_idle_timeout_secs = 30
+pending_delete_timeout_ms = 5000
 
 # Persistence
 blob_storage_dir = "data"
@@ -98,3 +101,19 @@ recovery_ttl_ms = 10000
 owner_catchup_timeout_ms = 5000
 # Cap on `CatchupOp`s returned per `OwnerCatchupResp` chunk.
 owner_max_catchup_ops = 256
+
+# Content-addressed channel blob transfer.
+# Max bytes per blob chunk carried inside one replication frame.
+blob_chunk_size = 65536
+# Total time a blob fetch may stay in-flight before the client request misses.
+blob_request_timeout_ms = 10000
+# Time to wait for seed offers before re-broadcasting the find request.
+blob_offer_wait_ms = 250
+# Minimum time before retrying unanswered chunk requests.
+blob_retry_interval_ms = 500
+# Number of seed nodes to request from concurrently for one blob.
+blob_max_parallel_peers = 3
+# Cadence for scanning unused channel blobs.
+blob_decay_interval_ms = 60000
+# Time an unreferenced channel blob must remain unused before deletion.
+blob_unused_grace_ms = 600000

@@ -6,14 +6,25 @@ use bytes::Bytes;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::s2s::application::config::ApplicationConfig;
 use crate::s2s::application::moderation::runtime::testing::RecordingApplier;
-use crate::s2s::application::proto::{ModerationCommand, UserStatePatch};
+use crate::s2s::application::proto::{
+    ModerationCommand, UserStatePatch, VoiceIntent, VoiceIntentKind, VoiceIntentNormal,
+};
 use crate::s2s::application::voice::sink::testing::RecordingSink;
 use crate::s2s::application::ApplicationLayer;
 use crate::s2s::overlay::config::SeedPeer;
 use crate::s2s::testing::{
-    full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing, wait_until, Cluster,
+    full_mesh_seeds, line_seeds, wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
+    Cluster,
 };
 use crate::s2s::transport::{PeerAddress, TransportKind};
+
+fn normal_voice_intent(channel_id: u32) -> VoiceIntent {
+    VoiceIntent {
+        kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
+            source_channel: channel_id,
+        })),
+    }
+}
 
 /// Helper: bidirectional 2-node seeding.
 fn seed_pair(idx: usize, _ids: &[u16], ports: &[u16]) -> Vec<SeedPeer> {
@@ -60,7 +71,13 @@ async fn two_node_voice_passthrough_in_order() {
         let is_terminator = i + 1 == N_FRAMES;
         app_a
             .voice()
-            .send_broadcast(sender_session, 0, is_terminator, payload)
+            .send_broadcast(
+                sender_session,
+                0,
+                is_terminator,
+                payload,
+                normal_voice_intent(0),
+            )
             .await
             .expect("send_broadcast");
     }
@@ -90,6 +107,79 @@ async fn two_node_voice_passthrough_in_order() {
 
     app_a.shutdown().await;
     app_b.shutdown().await;
+    cluster.shutdown_all().await;
+}
+
+/// Checks targeted voice over a routed line topology.
+/// Expected: B receives A's frame while forwarding it to C, even though
+/// B is not listed as an overlay destination.
+#[tokio::test]
+async fn three_node_voice_unicast_delivers_to_transit_node() {
+    let cluster = Cluster::build(&[1, 2, 3], line_seeds).await;
+    let a = cluster.node(1);
+    let b = cluster.node(2);
+    let c = cluster.node(3);
+
+    assert!(
+        wait_for_full_alive_mesh(&cluster, Duration::from_secs(8)).await,
+        "3-node line mesh failed to converge"
+    );
+    assert!(
+        wait_for_full_routing(&cluster, Duration::from_secs(8)).await,
+        "3-node line routing failed to converge"
+    );
+    assert_eq!(
+        a.overlay
+            .route_to(3, crate::s2s::transport::ServiceLevel::Reliable),
+        Some(2),
+        "A should route to C through B in the line topology"
+    );
+
+    let app_a = ApplicationLayer::new(a.overlay.clone(), ApplicationConfig::default());
+    let app_b = ApplicationLayer::new(b.overlay.clone(), ApplicationConfig::default());
+    let app_c = ApplicationLayer::new(c.overlay.clone(), ApplicationConfig::default());
+    let sink_b = RecordingSink::new();
+    let sink_c = RecordingSink::new();
+    app_b.voice().set_audio_sink(sink_b.clone());
+    app_c.voice().set_audio_sink(sink_c.clone());
+
+    app_a
+        .voice()
+        .send_unicast(
+            0xABC_12345,
+            0,
+            false,
+            Bytes::from_static(b"line-frame"),
+            normal_voice_intent(0),
+            3,
+        )
+        .await
+        .expect("send_unicast");
+
+    let ok = wait_until(Duration::from_secs(8), || {
+        sink_b.len() == 1 && sink_c.len() == 1
+    })
+    .await;
+    assert!(
+        ok,
+        "expected B transit and C destination sinks to receive one frame; got B={}, C={}",
+        sink_b.len(),
+        sink_c.len()
+    );
+
+    let b_received = sink_b.snapshot();
+    let c_received = sink_c.snapshot();
+    for (label, received) in [("B", &b_received), ("C", &c_received)] {
+        let (from, frame) = &received[0];
+        assert_eq!(*from, 1, "{label} should see original voice sender A");
+        assert_eq!(frame.sender_session, 0xABC_12345);
+        assert_eq!(frame.target_kind, 0);
+        assert_eq!(frame.payload, b"line-frame".as_ref());
+    }
+
+    app_a.shutdown().await;
+    app_b.shutdown().await;
+    app_c.shutdown().await;
     cluster.shutdown_all().await;
 }
 
@@ -212,6 +302,7 @@ async fn two_node_voice_drops_when_sink_missing() {
                 0,
                 false,
                 Bytes::from(format!("frame-{i}").into_bytes()),
+                normal_voice_intent(0),
             )
             .await
             .expect("send_broadcast");

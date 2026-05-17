@@ -3,6 +3,7 @@ use crate::{
     channel_repository::ChannelOp,
     client::Client,
     errors::MessageHandlerError,
+    localization::{text, TextKey},
     messages::{
         encoder::{Acl as EncoderAcl, ChanAcl},
         Message, WriteMessageExt,
@@ -50,7 +51,7 @@ pub async fn handle_acl(
                 r#type: crate::messages::encoder::DenyType::Permission,
                 session: u32::from(sender.get_session_id()),
                 channel_id: Some(channel_id),
-                reason: Some("Write permission required to modify ACLs".into()),
+                reason: Some(text(sender.language(), TextKey::WriteAclRequired)),
                 name: None,
                 permission: Some(ACLPermissions::Write.bits()),
             }

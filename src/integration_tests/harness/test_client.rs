@@ -27,7 +27,8 @@ use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::crypt::CryptState;
 use crate::integration_tests::harness::TestServer;
 use crate::messages::encoder::{
-    Authenticate, ChanAcl, ChannelRemove, ClientType, UserRemove, UserState, Version, VoiceTarget,
+    Authenticate, ChanAcl, ChannelRemove, ClientType, RequestBlob, UserRemove, UserState, Version,
+    VoiceTarget,
 };
 use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use crate::protocol_version::ProtocolVersion;
@@ -265,6 +266,7 @@ pub struct TestClient {
     pub initial_user_states: Vec<crate::mumble_proto::UserState>,
     pub welcome_text: Option<String>,
     pub max_bandwidth: Option<u32>,
+    pub initial_permissions: Option<u64>,
     pub server_session: ClientSessionIdentifier,
     pub cert_der: Vec<u8>,
     write: Mutex<WriteHalf<TlsStream<TcpStream>>>,
@@ -402,6 +404,7 @@ impl TestClient {
             initial_user_states: Vec::new(),
             welcome_text: None,
             max_bandwidth: None,
+            initial_permissions: None,
             server_session: ClientSessionIdentifier::from(0u32),
             cert_der: cert_der_owned,
             write: Mutex::new(write_half),
@@ -472,6 +475,7 @@ impl TestClient {
                         client.server_session = ClientSessionIdentifier::from(session_u32);
                         client.welcome_text = sync.welcome_text;
                         client.max_bandwidth = sync.max_bandwidth;
+                        client.initial_permissions = sync.permissions;
                         // Find self UserState to extract user_id
                         for us in &client.initial_user_states {
                             if us.session == Some(session_u32) {
@@ -521,6 +525,21 @@ impl TestClient {
     /// Wait up to `deadline` for any incoming message.
     pub async fn recv(&self, deadline: Duration) -> Option<Message> {
         timeout(deadline, self.recv_one()).await.ok().flatten()
+    }
+
+    /// Wait up to `deadline` for the reader loop to observe connection close.
+    pub async fn recv_closed(&self, deadline: Duration) -> bool {
+        let res = timeout(deadline, async {
+            loop {
+                let mut rx = self.rx.lock().await;
+                match rx.recv().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(())) | None => return true,
+                }
+            }
+        })
+        .await;
+        res.unwrap_or(false)
     }
 
     /// Wait up to `deadline` for the first incoming message that satisfies
@@ -581,6 +600,37 @@ impl TestClient {
         us.session = Some(self.server_session);
         us.comment = Some(comment.into());
         self.send(us.into()).await;
+    }
+
+    pub async fn set_texture(&self, texture: Bytes) {
+        let mut us = UserState::default();
+        us.session = Some(self.server_session);
+        us.texture = Some(texture);
+        self.send(us.into()).await;
+    }
+
+    pub async fn request_session_comment(&self, session: u32) {
+        self.send(
+            RequestBlob {
+                session_texture: Vec::new(),
+                session_comment: vec![session],
+                channel_description: Vec::new(),
+            }
+            .into(),
+        )
+        .await;
+    }
+
+    pub async fn request_session_texture(&self, session: u32) {
+        self.send(
+            RequestBlob {
+                session_texture: vec![session],
+                session_comment: Vec::new(),
+                channel_description: Vec::new(),
+            }
+            .into(),
+        )
+        .await;
     }
 
     pub async fn mute_other(&self, target_session: u32, mute: bool) {

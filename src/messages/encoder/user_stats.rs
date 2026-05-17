@@ -1,12 +1,13 @@
 use crate::messages::Message;
 use bytes::Bytes;
+use rustls::pki_types::CertificateDer;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone)]
 pub struct UserStats {
     pub session: Option<u32>,
     pub stats_only: Option<bool>,
-    pub certificates: Vec<Bytes>,
+    pub certificates: Vec<CertificateDer<'static>>,
     pub from_client: Option<crate::mumble_proto::user_stats::Stats>,
     pub from_server: Option<crate::mumble_proto::user_stats::Stats>,
     pub udp_packets: Option<u32>,
@@ -30,7 +31,11 @@ impl From<crate::mumble_proto::UserStats> for UserStats {
         Self {
             session: proto.session,
             stats_only: proto.stats_only,
-            certificates: proto.certificates,
+            certificates: proto
+                .certificates
+                .into_iter()
+                .map(|cert| CertificateDer::from(cert.to_vec()))
+                .collect(),
             from_client: proto.from_client,
             from_server: proto.from_server,
             udp_packets: proto.udp_packets,
@@ -84,7 +89,11 @@ impl Into<crate::mumble_proto::UserStats> for UserStats {
         crate::mumble_proto::UserStats {
             session: self.session,
             stats_only: self.stats_only,
-            certificates: self.certificates,
+            certificates: self
+                .certificates
+                .into_iter()
+                .map(|cert| Bytes::copy_from_slice(cert.as_ref()))
+                .collect(),
             from_client: self.from_client,
             from_server: self.from_server,
             udp_packets: self.udp_packets,

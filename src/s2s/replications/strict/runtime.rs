@@ -686,12 +686,36 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }
     }
 
-    pub async fn recv_propose_ack(&self, from: NodeIdentifier, ack: StrictProposeAck) {
+    pub async fn recv_propose_ack(&self, _from: NodeIdentifier, ack: StrictProposeAck) {
         let op_id: OpId = (ack.op_id_hi, ack.op_id_lo);
+        let ack_node = match node_from_u32(ack.ack_node) {
+            Some(node) => node,
+            None => {
+                warn!(
+                    node = ack.ack_node,
+                    "strict propose ack has invalid ack_node"
+                );
+                return;
+            }
+        };
+        let coord = match node_from_u32(ack.coord_node) {
+            Some(node) => node,
+            None => {
+                warn!(
+                    node = ack.coord_node,
+                    "strict propose ack has invalid coord_node"
+                );
+                return;
+            }
+        };
+        if coord != self.self_id {
+            trace!(coord, "strict propose ack ignored: not coordinator");
+            return;
+        }
         // Update peer clock.
         {
             let mut s = self.state.lock();
-            s.observe_peer(from, ack.src_clock);
+            s.observe_peer(ack_node, ack.src_clock);
         }
 
         // Decide whether quorum reached for this proposal we're coordinating.
@@ -709,7 +733,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if p.committed {
                     return;
                 }
-                p.acks.insert(from, ack.ts_local);
+                if !p.target_set.contains(&ack_node) {
+                    trace!(ack_node, "strict propose ack ignored: outside target set");
+                    return;
+                }
+                p.acks.insert(ack_node, ack.ts_local);
                 let fq = fast_quorum_size(p.target_set.len());
                 if p.acks.len() < fq {
                     return;

@@ -7,6 +7,7 @@ use crate::{
     channel_handler::build_channel_state_message,
     client::{user_info::Credential, Client},
     errors::{AuthRejection, MessageHandlerError},
+    localization::{text, TextKey},
     messages::{
         encoder::{Authenticate, ChannelState, CodecVersion, RejectType, ServerConfig, ServerSync},
         Message, WriteMessageExt,
@@ -45,27 +46,7 @@ pub async fn handle_authenticate(
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
     let password = msg.password;
 
-    // ── Snapshot all clients + versions (used for max-users, UserState
-    //     broadcast, and last-seen version tracking) ────────────────────────
-    let (all_clients, all_versions) = server.get_clients().snapshot_with_versions().await;
-
-    // ── Max-users check ───────────────────────────────────────────────────
-    {
-        let authenticated_clients = all_clients
-            .iter()
-            .filter(|client| client.is_authenticated())
-            .count() as u64;
-        if authenticated_clients >= server.get_max_users() {
-            return Err(RejectType::ServerFull.into());
-        }
-    }
-
-    // ── Certificate required ──────────────────────────────────────────────
-    if server.get_cert_required() && !sender.has_certificate() {
-        return Err(RejectType::NoCertificate.into());
-    }
-
-    // ── Authenticate ──────────────────────────────────────────────────────
+    // ── Authentication context and language ───────────────────────────────
     let certificate_hash = sender.get_certificate_hash().map(Bytes::copy_from_slice);
     let session_id = sender.get_session_id();
     let ip_address = sender.get_real_ip_address();
@@ -82,30 +63,75 @@ pub async fn handle_authenticate(
             local.get_os_version().map(|s| s.to_owned()),
         )
     };
+    let auth_auxiliary = AuthenticateAuxiliaryData {
+        certificate_hash,
+        session_id: session_id.into(),
+        ip_address,
+        version,
+        client_name,
+        os_name,
+        os_version,
+    };
+    let pre_auth_language = server
+        .get_authenticator()
+        .language(Some(username.as_str()), &auth_auxiliary)
+        .await;
+    sender.set_language(pre_auth_language);
 
+    // ── Snapshot all clients + versions (used for max-users, UserState
+    //     broadcast, and last-seen version tracking) ────────────────────────
+    let (all_clients, all_versions) = server.get_clients().snapshot_with_versions().await;
+
+    // ── Max-users check ───────────────────────────────────────────────────
+    {
+        let authenticated_clients = all_clients
+            .iter()
+            .filter(|client| client.is_authenticated())
+            .count() as u64;
+        if authenticated_clients >= server.get_max_users() {
+            return Err(AuthRejection::new_with_language(
+                RejectType::ServerFull,
+                sender.language(),
+            )
+            .into());
+        }
+    }
+
+    // ── Certificate required ──────────────────────────────────────────────
+    if server.get_cert_required() && !sender.has_certificate() {
+        return Err(
+            AuthRejection::new_with_language(RejectType::NoCertificate, sender.language()).into(),
+        );
+    }
+
+    // ── Authenticate ──────────────────────────────────────────────────────
     let auth_result = server
         .get_authenticator()
-        .authenticate(
-            &username,
-            password.as_deref(),
-            &AuthenticateAuxiliaryData {
-                certificate_hash,
-                session_id: session_id.into(),
-                ip_address,
-                version,
-                client_name,
-                os_name,
-                os_version,
-            },
-        )
+        .authenticate(&username, password.as_deref(), &auth_auxiliary)
         .await;
 
     let result = match auth_result {
         Ok(r) => r,
-        Err(AuthenticationRejection::NoSuchUser) => return Err(RejectType::InvalidUsername.into()),
-        Err(AuthenticationRejection::WrongPassword) => return Err(RejectType::WrongUserPw.into()),
+        Err(AuthenticationRejection::NoSuchUser) => {
+            return Err(AuthRejection::new_with_language(
+                RejectType::InvalidUsername,
+                sender.language(),
+            )
+            .into())
+        }
+        Err(AuthenticationRejection::WrongPassword) => {
+            return Err(AuthRejection::new_with_language(
+                RejectType::WrongUserPw,
+                sender.language(),
+            )
+            .into())
+        }
         Err(AuthenticationRejection::RetryLater) => {
-            return Err(RejectType::AuthenticatorFail.into())
+            return Err(AuthRejection::new_with_language(
+                RejectType::AuthenticatorFail,
+                sender.language(),
+            )
+            .into())
         }
     };
 
@@ -125,20 +151,86 @@ pub async fn handle_authenticate(
                     "Authenticate built outbound Reject payload"
                 );
                 return Err(AuthRejection::new(RejectType::None)
-                    .because("Missing required group membership")
+                    .because(text(sender.language(), TextKey::MissingRequiredGroup))
                     .into());
             }
         }
     }
 
+    let (texture_url, texture_hash) = match result.texture_url {
+        Some(url) => {
+            let hash = server
+                .get_session_blobs()
+                .fetch_and_cache(&url)
+                .await
+                .map(|(hash, _)| hash);
+            (Some(url), hash)
+        }
+        None => match result.user_id {
+            Some(user_id) => {
+                let hash = match server.get_authenticator().get_user_texture(user_id).await {
+                    Some(texture) if !texture.is_empty() => server
+                        .get_session_blobs()
+                        .put_content(&texture)
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(
+                                error = %e,
+                                user_id,
+                                "failed to cache authenticator texture blob"
+                            );
+                            e
+                        })
+                        .ok(),
+                    _ => None,
+                };
+                (None, hash)
+            }
+            None => (None, None),
+        },
+    };
+    let (comment_url, comment_hash) = match result.comment_url {
+        Some(url) => {
+            let hash = server
+                .get_session_blobs()
+                .fetch_and_cache(&url)
+                .await
+                .map(|(hash, _)| hash);
+            (Some(url), hash)
+        }
+        None => match result.user_id {
+            Some(user_id) => {
+                let hash = match server.get_authenticator().get_user_comment(user_id).await {
+                    Some(comment) if !comment.is_empty() => server
+                        .get_session_blobs()
+                        .put_content(comment.as_bytes())
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(
+                                error = %e,
+                                user_id,
+                                "failed to cache authenticator comment blob"
+                            );
+                            e
+                        })
+                        .ok(),
+                    _ => None,
+                };
+                (None, hash)
+            }
+            None => (None, None),
+        },
+    };
+
     // ── Store identity on client (single transaction) ─────────────────────
     {
+        sender.set_language(result.language);
         let mut gs = sender.write_global_state(repo);
         gs.set_user_id(result.user_id);
         gs.set_display_name(result.display_name);
         gs.set_groups(result.groups.into_iter().collect());
-        gs.set_texture_blob(result.texture_url, None);
-        gs.set_comment_blob(result.comment_url, None);
+        gs.set_texture_blob(texture_url, texture_hash);
+        gs.set_comment_blob(comment_url, comment_hash);
         // Set access tokens within the same guard
         gs.set_tokens(msg.tokens.into_iter().collect());
     }
@@ -158,7 +250,7 @@ pub async fn handle_authenticate(
                 "Authenticate built outbound Reject payload"
             );
             return Err(AuthRejection::new(RejectType::None)
-                .because("No traverse permission on root channel")
+                .because(text(sender.language(), TextKey::NoRootTraverse))
                 .into());
         }
     }
@@ -167,7 +259,7 @@ pub async fn handle_authenticate(
     if let Err(e) = sender.create_crypt_state("OCB2-AES128") {
         tracing::error!(session = u32::from(session), error = %e, "Failed to create crypt state");
         return Err(AuthRejection::new(RejectType::None)
-            .because("Failed to create crypt state")
+            .because(text(sender.language(), TextKey::CryptSetupFailed))
             .into());
     }
 
@@ -195,6 +287,10 @@ pub async fn handle_authenticate(
         } else {
             0 // fall back to root
         };
+        let target_ch = server
+            .get_channels()
+            .redirect_pending_delete_target(target_ch)
+            .await;
         sender.set_current_channel_id(target_ch, repo, server.get_channels().current_version());
     }
 
@@ -269,14 +365,13 @@ pub async fn handle_authenticate(
 
     // 5. ServerSync
     {
-        // Effective root permissions for the new user: full for now (TODO: ACL eval)
-        let root_perm = 0x0000_FFFF_u32;
+        let root_perm = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
         push_burst(Message::ServerSync(
             ServerSync {
                 session: Some(u32::from(session_id)),
                 max_bandwidth: Some(server.get_max_bandwidth()),
                 welcome_text: server.get_welcome_text(),
-                permissions: Some(root_perm.into()),
+                permissions: Some(root_perm),
             }
             .into(),
         ));

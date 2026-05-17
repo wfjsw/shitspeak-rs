@@ -11,10 +11,13 @@ use parking_lot::{
     MutexGuard as ParkingMutexGuard, RwLock as ParkingRwLock,
     RwLockReadGuard as ParkingRwLockReadGuard, RwLockWriteGuard as ParkingRwLockWriteGuard,
 };
+use rustls::pki_types::CertificateDer;
 use tokio::{
     io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
     net::TcpStream,
-    sync::{mpsc, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard},
+    sync::{
+        mpsc, watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard,
+    },
 };
 use tokio_rustls::server::TlsStream;
 
@@ -59,6 +62,8 @@ pub struct Client {
 
     connection_rx: Option<AsyncMutex<ReadHalf<TlsStream<TcpStream>>>>,
     connection_tx: Option<AsyncMutex<WriteHalf<TlsStream<TcpStream>>>>,
+    disconnect_tx: watch::Sender<bool>,
+    disconnect_rx: watch::Receiver<bool>,
     is_verified: bool,
 
     // Statistics
@@ -69,6 +74,7 @@ pub struct Client {
     stats: RwLock<ClientStats>,
 
     certificate_hash: Option<Bytes>,
+    certificate_chain: Vec<CertificateDer<'static>>,
     user_info_extended: ParkingMutex<Option<UserInfoExtended>>,
 
     options: RwLock<ClientOptions>,
@@ -122,22 +128,23 @@ impl Client {
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
     ) -> Box<Self> {
-        let (certificate_hash, is_verified) = {
+        let (certificate_hash, certificate_chain, is_verified) = {
             let (_, tls_connection) = connection.get_ref();
-            let certificate_hash = match tls_connection.peer_certificates() {
-                Some([cert, ..]) => Some(Bytes::copy_from_slice(
+            let certificate_chain = tls_connection
+                .peer_certificates()
+                .map(|certs| certs.to_vec())
+                .unwrap_or_default();
+            let certificate_hash = certificate_chain.first().map(|cert| {
+                Bytes::copy_from_slice(
                     aws_lc_rs::digest::digest(
                         &aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY,
                         cert.as_ref(),
                     )
                     .as_ref(),
-                )),
-                _ => None,
-            };
-            let is_verified = tls_connection
-                .peer_certificates()
-                .map_or(false, |certs| !certs.is_empty());
-            (certificate_hash, is_verified)
+                )
+            });
+            let is_verified = !certificate_chain.is_empty();
+            (certificate_hash, certificate_chain, is_verified)
         };
 
         let now = Utc::now();
@@ -147,6 +154,7 @@ impl Client {
         let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
 
         let (connection_rx, connection_tx) = tokio::io::split(connection);
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
             session_id,
@@ -156,6 +164,8 @@ impl Client {
             local_address,
             connection_rx: Some(AsyncMutex::new(connection_rx)),
             connection_tx: Some(AsyncMutex::new(connection_tx)),
+            disconnect_tx,
+            disconnect_rx,
             is_verified,
             login_time: now,
             last_active: ParkingMutex::new(now),
@@ -163,6 +173,7 @@ impl Client {
             udp_state: None,
             stats: RwLock::new(ClientStats::default()),
             certificate_hash,
+            certificate_chain,
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
@@ -193,6 +204,7 @@ impl Client {
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
         let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
             session_id,
@@ -202,6 +214,8 @@ impl Client {
             local_address,
             connection_rx: None,
             connection_tx: None,
+            disconnect_tx,
+            disconnect_rx,
             is_verified,
             login_time,
             last_active: ParkingMutex::new(login_time),
@@ -209,6 +223,7 @@ impl Client {
             udp_state: None,
             stats: RwLock::new(ClientStats::default()),
             certificate_hash: cert_hash,
+            certificate_chain: Vec::new(),
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(None),
@@ -287,6 +302,10 @@ impl Client {
         self.certificate_hash.as_deref()
     }
 
+    pub fn get_certificate_chain(&self) -> &[CertificateDer<'static>] {
+        &self.certificate_chain
+    }
+
     pub fn get_session_id(&self) -> ClientSessionIdentifier {
         self.session_id
     }
@@ -309,6 +328,10 @@ impl Client {
 
     pub fn get_current_channel_id(&self) -> u32 {
         self.global_state.read().get_current_channel_id()
+    }
+
+    pub fn get_listening_channel_ids(&self) -> std::collections::HashSet<u32> {
+        self.global_state.read().get_listening_channel_id().clone()
     }
 
     pub fn set_current_channel_id(
@@ -368,6 +391,8 @@ impl Client {
     }
 
     pub async fn disconnect(&self) -> Result<(), WriteProtoMessageError> {
+        let _ = self.disconnect_tx.send(true);
+
         let Some(connection_tx) = &self.connection_tx else {
             return Ok(());
         };
@@ -375,6 +400,14 @@ impl Client {
         let mut guard = connection_tx.lock().await;
         guard.shutdown().await?;
         Ok(())
+    }
+
+    pub async fn disconnected(&self) {
+        let mut rx = self.disconnect_rx.clone();
+        if *rx.borrow() {
+            return;
+        }
+        let _ = rx.changed().await;
     }
 
     pub async fn read_proto_message(&self) -> Result<Message, ReadProtoMessageError> {
@@ -386,7 +419,9 @@ impl Client {
             .into());
         };
         let mut guard = connection_rx.lock().await;
-        guard.read_proto_message().await
+        let message = guard.read_proto_message().await?;
+        self.record_tcp_packets(1, 6 + message.encoded_len()).await;
+        Ok(message)
     }
 
     pub async fn write_proto_message(
@@ -400,8 +435,11 @@ impl Client {
             )
             .into());
         };
+        let bytes = 6 + message.encoded_len();
         let mut guard = connection_tx.lock().await;
-        guard.write_proto_message(message).await
+        guard.write_proto_message(message).await?;
+        self.record_tcp_packets(1, bytes).await;
+        Ok(())
     }
 
     pub async fn write_proto_message_batch(
@@ -415,8 +453,14 @@ impl Client {
             )
             .into());
         };
+        let bytes = messages
+            .iter()
+            .map(|message| 6 + message.encoded_len())
+            .sum();
         let mut guard = connection_tx.lock().await;
-        guard.write_proto_message_batch(messages).await
+        guard.write_proto_message_batch(messages).await?;
+        self.record_tcp_packets(messages.len(), bytes).await;
+        Ok(())
     }
 
     pub fn set_tokens(&self, tokens: HashSet<String>, repo: &ClientRepository) {
@@ -429,9 +473,28 @@ impl Client {
         *last_ping
     }
 
+    pub fn idle_duration(&self) -> chrono::Duration {
+        chrono::Utc::now() - *self.last_active.lock()
+    }
+
+    pub fn touch_activity(&self) {
+        *self.last_active.lock() = Utc::now();
+    }
+
     pub async fn reset_last_ping(&self) {
-        let mut last_ping = self.last_ping.lock();
-        *last_ping = Utc::now();
+        let now = Utc::now();
+        *self.last_ping.lock() = now;
+        *self.last_active.lock() = now;
+    }
+
+    pub async fn record_udp_packet(&self, bytes: usize) {
+        let mut stats = self.stats.write().await;
+        stats.record_udp_packet(bytes);
+    }
+
+    pub async fn record_tcp_packets(&self, packets: usize, bytes: usize) {
+        let mut stats = self.stats.write().await;
+        stats.record_tcp_packets(packets, bytes);
     }
 
     // pub async fn update_from_ping_message(&self, ping_message: &Ping) {
@@ -553,6 +616,20 @@ impl Client {
         match &mut *local_state_guard {
             Some(state) => state.set_authenticated(value),
             None => panic!("Accessing local state on remote user"),
+        }
+    }
+
+    pub fn language(&self) -> crate::localization::Language {
+        self.local_state
+            .read()
+            .as_ref()
+            .map(|state| state.language())
+            .unwrap_or_default()
+    }
+
+    pub fn set_language(&self, language: crate::localization::Language) {
+        if let Some(ref mut state) = *self.local_state.write() {
+            state.set_language(language);
         }
     }
 

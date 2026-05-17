@@ -324,6 +324,23 @@ async fn run_write(
         MaybeInterval::Disabled
     };
 
+    let hello = build_frame(
+        inner.self_id(),
+        peer.node_id(),
+        level,
+        FrameType::Hello,
+        MessageClass::Regular,
+        peer.next_seq(),
+        now_us(),
+        Bytes::new(),
+    );
+    if let Err(e) = send_frame(&conn, &hello, &peer, inner.cfg().udp_mtu()).await {
+        warn!(peer=%peer.node_id(), error=%e, "udp dtls hello failed");
+        closed.cancel();
+        let _ = conn.close().await;
+        return;
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -351,12 +368,12 @@ async fn run_write(
                 let ts = now_us();
                 let frame = build_frame(
                     inner.self_id(), peer.node_id(), level,
-                    FrameType::Ping, MessageClass::Regular,
+                    FrameType::KeepAlive, MessageClass::Regular,
                     peer.next_seq(), ts, Bytes::new(),
                 );
                 match send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
                     Ok(sent) => pending.lock().insert(ts, sent),
-                    Err(e) => { warn!(peer=%peer.node_id(), error=%e, "udp dtls ping failed"); break; }
+                    Err(e) => { warn!(peer=%peer.node_id(), error=%e, "udp dtls keepalive failed"); break; }
                 }
             }
 
@@ -433,7 +450,7 @@ async fn handle_frame(
                 frame.payload,
             ));
         }
-        pb::FrameType::FramePing => {
+        pb::FrameType::FramePing | pb::FrameType::FrameKeepalive => {
             let echo = frame.payload.clone();
             let pong = build_frame(
                 local_id,
@@ -467,7 +484,9 @@ async fn handle_frame(
                 }
             }
         }
-        pb::FrameType::FrameKeepalive | pb::FrameType::FrameHello => {}
+        pb::FrameType::FrameHello => {
+            trace!(peer=%peer.node_id(), seq=frame.seq, "received udp dtls transport hello");
+        }
         pb::FrameType::FrameBye => {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,

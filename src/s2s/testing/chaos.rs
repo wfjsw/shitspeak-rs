@@ -29,7 +29,7 @@ use rand::Rng;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use crate::s2s::overlay::proto::{decode_message, OverlayBody};
+use crate::s2s::overlay::proto::{decode_message, node_from_wire, OverlayBody};
 use crate::s2s::transport::{Inbound, InboundMessage, MessageClass};
 use crate::types::NodeIdentifier;
 
@@ -42,6 +42,7 @@ pub enum MessageType {
     LsdbSync,
     LsdbSyncResp,
     Data,
+    StrictProposeAck,
 }
 
 impl MessageType {
@@ -53,8 +54,36 @@ impl MessageType {
             OverlayBody::LsaFlood(_) => MessageType::LsaFlood,
             OverlayBody::LsdbSync(_) => MessageType::LsdbSync,
             OverlayBody::LsdbSyncResp(_) => MessageType::LsdbSyncResp,
-            OverlayBody::Data(_) => MessageType::Data,
+            OverlayBody::Data(data) => {
+                if data.service_tag == crate::s2s::replications::proto::REPLICATION_SERVICE_TAG {
+                    if let Ok(repl) = crate::s2s::replications::proto::decode(&data.payload) {
+                        if matches!(
+                            repl.body,
+                            Some(crate::s2s::replications::proto::ReplBody::Strict(
+                                crate::s2s::replications::proto::StrictMessage {
+                                    body: Some(
+                                        crate::s2s::replications::proto::StrictBody::ProposeAck(_)
+                                    ),
+                                },
+                            ))
+                        ) {
+                            return Some(MessageType::StrictProposeAck);
+                        }
+                    }
+                }
+                MessageType::Data
+            }
         })
+    }
+}
+
+fn logical_sender(msg: &InboundMessage) -> NodeIdentifier {
+    let Ok(decoded) = decode_message(msg.payload()) else {
+        return msg.from();
+    };
+    match decoded.body {
+        Some(OverlayBody::Data(data)) => node_from_wire(data.src).unwrap_or_else(|| msg.from()),
+        _ => msg.from(),
     }
 }
 
@@ -175,24 +204,25 @@ impl LinkChaos {
     /// re-emitting it; `None` means drop. The chaos rules are mutated
     /// (e.g., type-drop counters decrement) as a side effect.
     fn decide(&self, msg: &InboundMessage) -> Option<Duration> {
-        let from = msg.from();
+        let physical_from = msg.from();
+        let logical_from = logical_sender(msg);
         let (mut delay, jitter_max) = {
             let mut g = self.state.lock();
-            if g.blocked.contains(&from) {
+            if g.blocked.contains(&physical_from) {
                 return None;
             }
             if let Some(t) = MessageType::classify(msg.payload()) {
                 if let Some(c) = g.type_drops.get_mut(&t) {
                     if *c > 0 {
                         *c -= 1;
-                        trace!(?t, %from, "chaos: dropped (type rule)");
+                        trace!(?t, from = %logical_from, "chaos: dropped (type rule)");
                         return None;
                     }
                 }
-                if let Some(c) = g.type_drops_per_sender.get_mut(&(from, t)) {
+                if let Some(c) = g.type_drops_per_sender.get_mut(&(logical_from, t)) {
                     if *c > 0 {
                         *c -= 1;
-                        trace!(?t, %from, "chaos: dropped (per-sender type rule)");
+                        trace!(?t, from = %logical_from, "chaos: dropped (per-sender type rule)");
                         return None;
                     }
                 }
@@ -200,14 +230,14 @@ impl LinkChaos {
             if let Some(bucket) = g.bandwidth.as_mut() {
                 let bytes = msg.payload().len() as u64;
                 if !bucket.try_consume(bytes) {
-                    trace!(%from, bytes, "chaos: dropped (bandwidth)");
+                    trace!(from = %physical_from, bytes, "chaos: dropped (bandwidth)");
                     return None;
                 }
             }
             // Sample jitter_max before releasing the lock so we can apply it
             // outside without holding the chaos lock open longer than needed.
             (
-                g.latency.get(&from).copied().unwrap_or_default(),
+                g.latency.get(&physical_from).copied().unwrap_or_default(),
                 g.jitter_max,
             )
         };

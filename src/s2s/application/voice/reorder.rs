@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use crate::s2s::application::config::VoiceConfig;
-use crate::s2s::application::proto::VoiceFrame;
+use crate::s2s::application::proto::{VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal};
 use crate::types::NodeIdentifier;
 
 /// One emit decision: forward the bundled `(from_immediate, frame)` to
@@ -330,6 +330,11 @@ mod tests {
             target_kind: 0,
             is_terminator: terminator,
             payload: Bytes::from(format!("p-{seq}").into_bytes()),
+            intent: Some(VoiceIntent {
+                kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
+                    source_channel: 0,
+                })),
+            }),
         }
     }
 

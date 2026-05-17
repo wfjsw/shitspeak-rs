@@ -5,6 +5,7 @@ use crate::{
     acl::ACLPermissions,
     client::Client,
     errors::MessageHandlerError,
+    localization::channel_does_not_exist,
     messages::encoder::{DenyType, PermissionDenied},
     server::Server,
 };
@@ -101,6 +102,25 @@ pub async fn handle_user_state(
 
     // ── ACL: Channel move ────────────────────────────────────────────────
     // Check permissions before acquiring the guard, so we can return early.
+    let requested_channel_change = if let Some(new_channel_id) = requested_channel_change {
+        let redirected = if server
+            .get_channels()
+            .get_channel(new_channel_id)
+            .await
+            .is_some()
+        {
+            server
+                .get_channels()
+                .redirect_pending_delete_target(new_channel_id)
+                .await
+        } else {
+            new_channel_id
+        };
+        Some(redirected).filter(|redirected| *redirected != target_current_channel_id)
+    } else {
+        None
+    };
+
     if let Some(new_channel_id) = requested_channel_change {
         let dst_chan = server.get_channels().get_channel(new_channel_id).await;
         if dst_chan.is_none() {
@@ -108,7 +128,7 @@ pub async fn handle_user_state(
                 r#type: DenyType::ChannelName,
                 session: u32::from(sender_id),
                 channel_id: Some(new_channel_id),
-                reason: Some(format!("Channel {} does not exist", new_channel_id).into()),
+                reason: Some(channel_does_not_exist(sender.language(), new_channel_id)),
                 name: None,
                 permission: None,
             }));
@@ -238,11 +258,189 @@ pub async fn handle_user_state(
         }
     }
 
+    if !is_self
+        && (msg.self_mute.is_some()
+            || msg.self_deaf.is_some()
+            || msg.texture.is_some()
+            || msg.plugin_context.is_some()
+            || msg.plugin_identity.is_some()
+            || msg.recording.is_some())
+    {
+        return Err(MessageHandlerError::protocol_violation(
+            "non-self UserState contains self-only fields",
+        ));
+    }
+
+    if !is_self && msg.comment.is_some() {
+        let root_perms =
+            crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
+        if !root_perms.contains(ACLPermissions::Move) {
+            return Err(MessageHandlerError::PermissionDenied(
+                PermissionDenied::for_permission(
+                    u32::from(sender_id),
+                    Some(0),
+                    ACLPermissions::Move,
+                ),
+            ));
+        }
+
+        if msg
+            .comment
+            .as_deref()
+            .is_some_and(|comment| !comment.is_empty())
+        {
+            return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                r#type: DenyType::TextTooLong,
+                session: u32::from(sender_id),
+                channel_id: None,
+                reason: None,
+                name: None,
+                permission: None,
+            }));
+        }
+    }
+
+    let comment_blob_hash = match msg.comment.as_ref() {
+        Some(comment) if comment.is_empty() => {
+            if let Some(user_id) = target.get_user_id() {
+                if server
+                    .get_authenticator()
+                    .set_user_comment(user_id, String::new())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        user_id,
+                        session = u32::from(target_id),
+                        "authenticator rejected comment blob clear"
+                    );
+                }
+            }
+            Some(None)
+        }
+        Some(comment) => {
+            let max_len = server.get_max_text_message_length() as usize;
+            if max_len > 0 && comment.len() > max_len {
+                return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                    r#type: DenyType::TextTooLong,
+                    session: u32::from(sender_id),
+                    channel_id: None,
+                    reason: None,
+                    name: None,
+                    permission: None,
+                }));
+            }
+            let hash = server
+                .get_session_blobs()
+                .put_content(comment.as_bytes())
+                .await
+                .map_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        session = u32::from(target_id),
+                        "failed to store comment blob"
+                    );
+                    MessageHandlerError::PermissionDenied(PermissionDenied {
+                        r#type: DenyType::Text,
+                        session: u32::from(sender_id),
+                        channel_id: None,
+                        reason: Some(format!("Failed to store comment blob: {e}").into()),
+                        name: None,
+                        permission: None,
+                    })
+                })?;
+            if let Some(user_id) = target.get_user_id() {
+                if server
+                    .get_authenticator()
+                    .set_user_comment(user_id, comment.clone())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        user_id,
+                        session = u32::from(target_id),
+                        "authenticator rejected comment blob update"
+                    );
+                }
+            }
+            Some(Some(hash))
+        }
+        None => None,
+    };
+
+    let texture_blob_hash = match msg.texture.as_ref() {
+        Some(texture) if texture.is_empty() => {
+            if let Some(user_id) = target.get_user_id() {
+                if server
+                    .get_authenticator()
+                    .set_user_texture(user_id, bytes::Bytes::new())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        user_id,
+                        session = u32::from(target_id),
+                        "authenticator rejected texture blob clear"
+                    );
+                }
+            }
+            Some(None)
+        }
+        Some(texture) => {
+            let max_len = server.get_max_image_message_length() as usize;
+            if max_len > 0 && texture.len() > max_len {
+                return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                    r#type: DenyType::TextTooLong,
+                    session: u32::from(sender_id),
+                    channel_id: None,
+                    reason: None,
+                    name: None,
+                    permission: None,
+                }));
+            }
+            let hash = server
+                .get_session_blobs()
+                .put_content(texture)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        session = u32::from(target_id),
+                        "failed to store texture blob"
+                    );
+                    MessageHandlerError::PermissionDenied(PermissionDenied {
+                        r#type: DenyType::Text,
+                        session: u32::from(sender_id),
+                        channel_id: None,
+                        reason: Some(format!("Failed to store texture blob: {e}").into()),
+                        name: None,
+                        permission: None,
+                    })
+                })?;
+            if let Some(user_id) = target.get_user_id() {
+                if server
+                    .get_authenticator()
+                    .set_user_texture(user_id, texture.clone())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        user_id,
+                        session = u32::from(target_id),
+                        "authenticator rejected texture blob update"
+                    );
+                }
+            }
+            Some(Some(hash))
+        }
+        None => None,
+    };
+
     // ── Acquire a single transactional guard for all mutations ─────────
     // All changes in this handler are batched into one version bump.
     // Channel-dependent operations (move, mute/deaf by moderator) need the
     // current channel version as a causal dependency.
-    let channel_version_dep = if msg.channel_id.is_some() || !is_self {
+    let channel_version_dep = if requested_channel_change.is_some() || !is_self {
         Some(server.get_channels().current_version())
     } else {
         None
@@ -338,17 +536,19 @@ pub async fn handle_user_state(
     }
 
     // ── Comment update ────────────────────────────────────────────────────
-    if let Some(_comment) = msg.comment {
-        // Store inline if small; store as blob (hash-only) if large.
-        // For now, store small comments inline and clear blob hash.
-        gs.clear_comment_blob();
-        // TODO: push large comments to blob store, set hash
+    if let Some(comment_blob_hash) = comment_blob_hash {
+        match comment_blob_hash {
+            Some(hash) => gs.set_comment_blob(None, Some(hash)),
+            None => gs.clear_comment_blob(),
+        }
     }
 
     // ── Texture update ────────────────────────────────────────────────────
-    if let Some(_texture) = msg.texture {
-        gs.clear_texture_blob();
-        // TODO: push large textures to blob store, set hash
+    if let Some(texture_blob_hash) = texture_blob_hash {
+        match texture_blob_hash {
+            Some(hash) => gs.set_texture_blob(None, Some(hash)),
+            None => gs.clear_texture_blob(),
+        }
     }
 
     // ── Plugin context/identity (self only) ───────────────────────────────

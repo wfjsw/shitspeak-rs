@@ -28,6 +28,7 @@ use crate::server::Server;
 use crate::types::NodeIdentifier;
 
 use self::application::moderation::ModerationApplier;
+use self::application::plugin_data::ServerPluginDataSink;
 use self::application::proto::{
     ModerationCommand, ModerationEnvelope, UserRemovePatch, UserStatePatch, VoiceFrame,
 };
@@ -170,6 +171,7 @@ impl S2SManager {
             version: 0,
             node_id: handle.local_node_id(),
             timestamp: chrono::Utc::now().timestamp(),
+            emits_client_message: true,
             op,
         };
         match handle.propose(operation).await {
@@ -283,6 +285,9 @@ impl S2SManager {
         application
             .voice()
             .set_recipient_index(recipient_index.clone());
+        application
+            .plugin_data()
+            .set_sink(ServerPluginDataSink::new(server.clone()));
 
         let (
             channel_replication,
@@ -291,7 +296,10 @@ impl S2SManager {
             channel_blob_replication,
             bridge_tasks,
         ) = match server.upgrade() {
-            Some(server) => self.register_repositories(&replications, &server).await,
+            Some(server) => {
+                self.register_repositories(&replications, &server, recipient_index.clone())
+                    .await
+            }
             None => {
                 warn!("s2s repository replication skipped: server handle dropped");
                 (None, None, None, None, Vec::new())
@@ -346,6 +354,7 @@ impl S2SManager {
         &self,
         replications: &Arc<ReplicationManager>,
         server: &Arc<Box<Server>>,
+        recipient_index: Arc<RecipientIndex>,
     ) -> (
         Option<replications::StrictHandle<ChannelReplicationAdapter>>,
         Option<replications::StrictHandle<BanReplicationAdapter>>,
@@ -402,6 +411,10 @@ impl S2SManager {
                 handle,
             ));
         }
+        bridge_tasks.push(spawn_voice_recipient_index_bridge(
+            server.get_clients().clone(),
+            recipient_index,
+        ));
 
         (
             channel_handle,
@@ -432,6 +445,28 @@ fn spawn_client_replication_bridge(
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "s2s client replication bridge lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+}
+
+fn spawn_voice_recipient_index_bridge(
+    repo: Arc<ClientRepository>,
+    index: Arc<RecipientIndex>,
+) -> JoinHandle<()> {
+    let mut rx = repo.subscribe();
+    tokio::spawn(async move {
+        index.replace_all(repo.voice_recipient_index_snapshot().await);
+        loop {
+            match rx.recv().await {
+                Ok(_) => {
+                    index.replace_all(repo.voice_recipient_index_snapshot().await);
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "s2s voice recipient index bridge lagged");
+                    index.replace_all(repo.voice_recipient_index_snapshot().await);
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             }
@@ -594,7 +629,15 @@ async fn apply_user_remove_patch(
         );
     }
 
-    server.get_clients().remove_client(target_id).await;
+    let removed = server.get_clients().remove_client(target_id).await;
+    let target = removed.as_ref().unwrap_or(&target);
+    if let Err(e) = target.disconnect().await {
+        trace!(
+            error = %e,
+            target = u32::from(target_id),
+            "s2s moderation failed to gracefully disconnect removed client",
+        );
+    }
 }
 
 struct ServerVoiceSink {

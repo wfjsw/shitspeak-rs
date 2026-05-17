@@ -9,12 +9,10 @@
 //! * [`SessionBlobStore`] — persistent URL-keyed cache for user textures and
 //!   comments.  Blobs are fetched from the URL supplied by the auth server,
 //!   stored on disk indefinitely (no eviction), and keyed by SHA-1 of the
-//!   content.  Full HTTP-fetch implementation is deferred; all methods
-//!   currently return `None`/`Ok(())` stubs that compile and satisfy callers.
+//!   content.
 
 use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
@@ -150,21 +148,6 @@ impl ChannelBlobStore {
         }
         Ok(out)
     }
-
-    // ── S2S readiness stubs ──────────────────────────────────────────────
-
-    /// Push a blob to a peer node over S2S.  Not yet implemented.
-    #[allow(unused_variables)]
-    pub async fn replicate_to(&self, _peer_addr: SocketAddr, _key: &str) {
-        // TODO: S2S replication
-    }
-
-    /// Pull a blob from a peer node over S2S.  Not yet implemented.
-    #[allow(unused_variables)]
-    pub async fn fetch_from_peer(&self, _peer_addr: SocketAddr, _key: &str) -> Option<Bytes> {
-        // TODO: S2S replication
-        None
-    }
 }
 
 /// Persistent URL-keyed cache for user textures and comments.
@@ -196,13 +179,28 @@ impl SessionBlobStore {
         })
     }
 
-    /// Fetch a blob by SHA-1 key from the local cache.  On a cache miss,
-    /// fetches from `source_url` and caches the result.
-    pub async fn get(&self, key: &str, source_url: &str) -> Option<Bytes> {
+    /// Store `data` and return its SHA-1 key. No-op if the blob already exists.
+    pub async fn put_content(&self, data: &[u8]) -> io::Result<String> {
+        let key = sha1_hex(data);
+        self.put(&key, data).await
+    }
+
+    /// Read a blob from the local cache by SHA-1 key.
+    pub async fn get_cached(&self, key: &str) -> Option<Bytes> {
         let path = blob_path(&self.root, key);
 
         if let Ok(bytes) = fs::read(&path).await {
             return Some(Bytes::from(bytes));
+        }
+
+        None
+    }
+
+    /// Fetch a blob by SHA-1 key from the local cache.  On a cache miss,
+    /// fetches from `source_url` and caches the result.
+    pub async fn get(&self, key: &str, source_url: &str) -> Option<Bytes> {
+        if let Some(bytes) = self.get_cached(key).await {
+            return Some(bytes);
         }
 
         let response = match self.http_client.get(source_url).send().await {
@@ -249,6 +247,44 @@ impl SessionBlobStore {
         }
 
         Some(bytes)
+    }
+
+    /// Fetch a URL-backed blob, cache it, and return its SHA-1 key plus bytes.
+    pub async fn fetch_and_cache(&self, source_url: &str) -> Option<(String, Bytes)> {
+        let response = match self.http_client.get(source_url).send().await {
+            Ok(resp) if resp.status().is_success() => resp,
+            Ok(resp) => {
+                tracing::warn!(
+                    "SessionBlobStore fetch failed with status {} for {}",
+                    resp.status(),
+                    source_url
+                );
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!("SessionBlobStore fetch error for {}: {}", source_url, err);
+                return None;
+            }
+        };
+
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!(
+                    "SessionBlobStore read body error for {}: {}",
+                    source_url,
+                    err
+                );
+                return None;
+            }
+        };
+
+        let key = sha1_hex(&bytes);
+        if self.put(&key, &bytes).await.is_err() {
+            return None;
+        }
+
+        Some((key, bytes))
     }
 
     /// Store `data` in the local disk cache under the given `key`.

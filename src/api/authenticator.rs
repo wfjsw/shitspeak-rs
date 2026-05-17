@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 
+use crate::localization::Language;
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -17,6 +18,8 @@ pub struct AuthenticateResult {
     pub user_id: Option<u32>,
     pub display_name: Option<String>,
     pub groups: Vec<String>,
+    /// Preferred language for server-generated messages sent to this client.
+    pub language: Language,
     /// Optional URL for the user's texture/avatar blob.
     /// When present the server fetches this URL, SHA-1s the content,
     /// and stores it in `SessionBlobStore`.
@@ -50,6 +53,17 @@ pub trait Authenticator: Send + Sync + 'static {
         password: Option<&str>,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Result<AuthenticateResult, AuthenticationRejection>;
+
+    /// Select the language for server-generated text sent to this connection.
+    /// Called before `authenticate`, so implementations can localize reject
+    /// messages for known users even when authentication fails.
+    async fn language(
+        &self,
+        _username: Option<&str>,
+        _auxiliary_data: &AuthenticateAuxiliaryData,
+    ) -> Language {
+        Language::default()
+    }
 
     // ── Optional blob helpers (default: no-op) ────────────────────────────
 

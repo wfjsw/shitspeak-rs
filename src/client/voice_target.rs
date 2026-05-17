@@ -1,8 +1,10 @@
+#[derive(Debug, Clone, Default)]
 pub struct VoiceTarget {
     sessions: Vec<u32>,
     channels: Vec<VoiceTargetChannel>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceTargetChannel {
     id: u32,
     sub_channels: bool,
@@ -36,10 +38,7 @@ impl VoiceTargetChannel {
 
 impl VoiceTarget {
     pub fn new() -> Self {
-        VoiceTarget {
-            sessions: Vec::new(),
-            channels: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn add_session(&mut self, session: u32) {

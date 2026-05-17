@@ -80,18 +80,12 @@ pub struct ClientRegister {
 }
 
 impl ClientRegister {
-    /// Look up a client in either local or remote maps.
-    fn get(&self, id: &ClientSessionIdentifier) -> Option<&Arc<Box<Client>>> {
-        if id.node_id == 0 {
-            // FIXME: node_id 0 is ambiguous — need local_node_id context.
-            // For now, fall through to local then remote.
-            self.local_clients
-                .get(id)
-                .or_else(|| self.remote_clients.values().find_map(|m| m.get(id)))
+    /// Look up a client in the local or owning remote map.
+    fn get(&self, id: &ClientSessionIdentifier, local_node_id: u16) -> Option<&Arc<Box<Client>>> {
+        if id.node_id == local_node_id {
+            self.local_clients.get(id)
         } else {
-            self.local_clients
-                .get(id)
-                .or_else(|| self.remote_clients.get(&id.node_id).and_then(|m| m.get(id)))
+            self.remote_clients.get(&id.node_id).and_then(|m| m.get(id))
         }
     }
 
@@ -465,7 +459,11 @@ impl ClientRepository {
     }
 
     pub async fn get_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
-        self.register.read().await.get(&id).cloned()
+        self.register
+            .read()
+            .await
+            .get(&id, self.local_node_id)
+            .cloned()
     }
 
     /// Look up a client by their UDP socket address.
@@ -474,7 +472,11 @@ impl ClientRepository {
             let by_udp = self.clients_by_udp_address.read();
             *by_udp.get(addr)?
         };
-        self.register.read().await.get(&id).cloned()
+        self.register
+            .read()
+            .await
+            .get(&id, self.local_node_id)
+            .cloned()
     }
 
     /// Remove a specific UDP address binding.  Called when decrypt fails for a
@@ -535,7 +537,7 @@ impl ClientRepository {
         };
         let register = self.register.read().await;
         ids.iter()
-            .filter_map(|id| register.get(id).cloned())
+            .filter_map(|id| register.get(id, self.local_node_id).cloned())
             .collect()
     }
 
@@ -591,6 +593,16 @@ impl ClientRepository {
         self.register.read().await.all_clients().cloned().collect()
     }
 
+    /// Return a snapshot of locally connected clients.
+    pub async fn get_local_clients(&self) -> Vec<Arc<Box<Client>>> {
+        self.register
+            .read()
+            .await
+            .local_clients()
+            .cloned()
+            .collect()
+    }
+
     /// Return **local** clients currently in `channel_id` via the channel
     /// index. Remote clients are not tracked here — voice for them is
     /// delivered to their owning node over S2S.
@@ -601,7 +613,7 @@ impl ClientRepository {
             None => return Vec::new(),
         };
         ids.iter()
-            .filter_map(|id| register.get(id).cloned())
+            .filter_map(|id| register.get(id, self.local_node_id).cloned())
             .collect()
     }
 
@@ -616,7 +628,7 @@ impl ClientRepository {
         for &ch_id in channel_ids {
             if let Some(ids) = register.clients_by_channel.get(&ch_id) {
                 for id in ids {
-                    if let Some(c) = register.get(id) {
+                    if let Some(c) = register.get(id, self.local_node_id) {
                         result.push(c.clone());
                     }
                 }
@@ -633,7 +645,7 @@ impl ClientRepository {
             None => return Vec::new(),
         };
         ids.iter()
-            .filter_map(|id| register.get(id).cloned())
+            .filter_map(|id| register.get(id, self.local_node_id).cloned())
             .collect()
     }
 
@@ -648,13 +660,36 @@ impl ClientRepository {
         for &ch_id in channel_ids {
             if let Some(ids) = register.listeners_by_channel.get(&ch_id) {
                 for id in ids {
-                    if let Some(c) = register.get(id) {
+                    if let Some(c) = register.get(id, self.local_node_id) {
                         result.push(c.clone());
                     }
                 }
             }
         }
         result
+    }
+
+    /// Build a channel/listener interest snapshot for S2S voice node targeting.
+    /// Local and replicated remote clients are included by their owning node id.
+    pub async fn voice_recipient_index_snapshot(
+        &self,
+    ) -> std::collections::HashMap<u32, std::collections::BTreeSet<u16>> {
+        let register = self.register.read().await;
+        let mut snapshot: std::collections::HashMap<u32, std::collections::BTreeSet<u16>> =
+            std::collections::HashMap::new();
+        for (id, client) in register.all_entries() {
+            snapshot
+                .entry(client.get_current_channel_id())
+                .or_default()
+                .insert(id.get_node_id());
+            for listener_channel in client.get_listening_channel_ids() {
+                snapshot
+                    .entry(listener_channel)
+                    .or_default()
+                    .insert(id.get_node_id());
+            }
+        }
+        snapshot
     }
 
     pub async fn len(&self) -> usize {
@@ -780,7 +815,7 @@ impl ClientRepository {
     ) -> bool {
         let client = {
             let register = self.register.read().await;
-            register.get(&id).cloned()
+            register.get(&id, self.local_node_id).cloned()
         };
         match client {
             Some(c) => {
@@ -976,7 +1011,7 @@ impl ClientRepository {
                 // Remote-only path: do NOT touch the local channel/listener
                 // index — those exist solely for routing voice to local
                 // recipients on this node.
-                let client = register.get(session_id).cloned();
+                let client = register.get(session_id, remote_node).cloned();
                 if let Some(client) = client {
                     let mut gs = client.write_global_state_direct();
                     apply_delta_to_global_state(&mut gs, delta);

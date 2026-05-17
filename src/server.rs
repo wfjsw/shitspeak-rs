@@ -15,6 +15,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::api::Authenticator;
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
+use crate::channel_handler::SessionChannelShadow;
 use crate::channel_repository::{ChannelOperation, ChannelRepoTuning, ChannelRepository};
 use crate::client::{
     client_session_identifier::ClientSessionIdentifier, state_log::ClientStateBroadcastPayload,
@@ -92,6 +93,7 @@ async fn activate_client_subscriptions(
     client_session_id: ClientSessionIdentifier,
     client_log_rx: &mut Option<ClientLogReceiver>,
     channel_log_rx: &mut Option<ChannelLogReceiver>,
+    session_channel_shadow: &mut SessionChannelShadow,
 ) -> Result<(), HandleIncomingConnectionError> {
     if !client.is_authenticated() || client_log_rx.is_some() {
         return Ok(());
@@ -107,6 +109,14 @@ async fn activate_client_subscriptions(
     *client_log_rx = Some(server.clients.subscribe());
     *channel_log_rx = Some(server.channels.subscribe());
 
+    session_channel_shadow.clear();
+    for visible in server.clients.get_all_clients().await {
+        if visible.is_authenticated() {
+            session_channel_shadow
+                .insert(visible.get_session_id(), visible.get_current_channel_id());
+        }
+    }
+
     let last_seen = client.get_last_client_versions().await;
     let (missed, new_versions) = server
         .clients
@@ -118,6 +128,19 @@ async fn activate_client_subscriptions(
             .write_proto_message(msg)
             .await
             .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+        let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+            server,
+            &server.channels,
+            session_channel_shadow,
+            msg,
+        )
+        .await;
+        for msg in synthetic {
+            client
+                .write_proto_message(&msg)
+                .await
+                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+        }
     }
     client.update_last_client_versions(&new_versions).await;
     Ok(())
@@ -129,6 +152,7 @@ async fn finish_handler_result(
     client_session_id: ClientSessionIdentifier,
     client_log_rx: &mut Option<ClientLogReceiver>,
     channel_log_rx: &mut Option<ChannelLogReceiver>,
+    session_channel_shadow: &mut SessionChannelShadow,
     result: Result<(), MessageHandlerError>,
 ) -> Result<(), HandleIncomingConnectionError> {
     map_handler_result(client_session_id, result)?;
@@ -138,6 +162,7 @@ async fn finish_handler_result(
         client_session_id,
         client_log_rx,
         channel_log_rx,
+        session_channel_shadow,
     )
     .await
 }
@@ -260,6 +285,7 @@ impl Server {
         let udp_voice_enabled = self.read_config().udp_voice_enabled;
         let udp_ping_enabled = self.read_config().udp_ping_enabled;
         let idle_timeout_secs = self.read_config().client_idle_timeout_secs;
+        let pending_delete_timeout_ms = self.read_config().pending_delete_timeout_ms;
 
         // Bounded channel shared between UDP drain and processing tasks.
         let (udp_in, udp_out) =
@@ -283,6 +309,11 @@ impl Server {
         let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx.clone());
         let idle_reaper =
             Self::spawn_idle_reaper(Arc::clone(self), idle_timeout_secs, shutdown_rx.clone());
+        let pending_delete_watchdog = Self::spawn_pending_delete_watchdog(
+            Arc::clone(self),
+            pending_delete_timeout_ms,
+            shutdown_rx.clone(),
+        );
         let _s2s_task = Arc::clone(&self.s2s_manager)
             .spawn_runtime_task(Arc::downgrade(self), shutdown_rx.clone());
 
@@ -298,6 +329,7 @@ impl Server {
             result = udp_process => { let _ = result; }
             result = tcp_accept => { let _ = result; }
             result = idle_reaper => { let _ = result; }
+            result = pending_delete_watchdog => { let _ = result; }
             _ = shutdown_tx.closed() => {
                 tracing::info!("Shutdown signal received.");
             }
@@ -526,6 +558,9 @@ impl Server {
 
                 let Some(client) = client else { continue };
 
+                client.record_udp_packet(packet.len()).await;
+                client.touch_activity();
+
                 // A valid UDP voice packet indicates UDP path is working.
                 client.set_prefer_tcp_tunnel(false);
 
@@ -665,6 +700,49 @@ impl Server {
         })
     }
 
+    /// Spawn a periodic task that rolls back stale pending channel deletes.
+    fn spawn_pending_delete_watchdog(
+        server: Arc<Box<Self>>,
+        timeout_ms: u64,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let timeout_ms = timeout_ms.max(1);
+        let interval = std::time::Duration::from_millis((timeout_ms / 2).max(100));
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = shutdown.changed() => break,
+                }
+
+                let expired = server
+                    .channels
+                    .expired_pending_deletes(timeout_ms as i64)
+                    .await;
+                for (channel_id, nonce) in expired {
+                    let op = crate::channel_repository::ChannelOp::CancelPendingDelete {
+                        id: channel_id,
+                        nonce,
+                    };
+                    if !server.s2s_manager().propose_channel_op(op).await {
+                        if let Err(e) = server
+                            .channels
+                            .cancel_pending_delete(channel_id, nonce)
+                            .await
+                        {
+                            tracing::trace!(
+                                channel_id,
+                                nonce,
+                                error = ?e,
+                                "pending delete rollback failed"
+                            );
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     pub async fn handle_incoming_connection(
         self: &Arc<Box<Self>>,
         tcp_stream: tokio::net::TcpStream,
@@ -709,6 +787,7 @@ impl Server {
         // Subscriptions start as None — they're activated after auth.
         let mut client_log_rx: Option<ClientLogReceiver> = None;
         let mut channel_log_rx: Option<ChannelLogReceiver> = None;
+        let mut session_channel_shadow: SessionChannelShadow = HashMap::new();
 
         // Run the connection loop.  On any unrecoverable error, clean up
         // the client and return the error to the caller.
@@ -717,6 +796,15 @@ impl Server {
 
             loop {
                 tokio::select! {
+                    // ── Local disconnect request ─────────────────────────────
+                    _ = client.disconnected() => {
+                        tracing::debug!(
+                            session = u32::from(client_session_id),
+                            "closing connection after local disconnect request"
+                        );
+                        return Ok(());
+                    }
+
                     // ── Completed client message handler ─────────────────────
                     result = handler_tasks.join_next(), if !handler_tasks.is_empty() => {
                         let Some(result) = result else { continue };
@@ -728,9 +816,11 @@ impl Server {
                             client_session_id,
                             &mut client_log_rx,
                             &mut channel_log_rx,
+                            &mut session_channel_shadow,
                             result,
                         )
                         .await?;
+                        client.touch_activity();
                     }
 
                     // ── Incoming message from this client ────────────────────
@@ -745,9 +835,11 @@ impl Server {
                                         client_session_id,
                                         &mut client_log_rx,
                                         &mut channel_log_rx,
+                                        &mut session_channel_shadow,
                                         result,
                                     )
                                     .await?;
+                                    client.touch_activity();
                                 } else {
                                     let handler_server = Arc::clone(self);
                                     let handler_client = Arc::clone(&client);
@@ -776,21 +868,37 @@ impl Server {
                             Some(Ok(op)) => {
                                 let last = client.get_last_channel_version().await;
                                 replay_channel_log_gap(
-                                    self, &client, &self.channels, client_session_id, last, op.version,
+                                    self, &client, &self.channels, &mut session_channel_shadow, client_session_id, last, op.version,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
 
                                 // Use unified message conversion function
-                                let messages = convert_channel_operation_to_messages(self, &client, &op, &self.channels).await;
+                                let messages = crate::channel_handler::convert_channel_operation_to_messages_with_shadow(
+                                    self,
+                                    &client,
+                                    &op,
+                                    &self.channels,
+                                    Some(&mut session_channel_shadow),
+                                ).await;
                                 for msg in messages {
                                     client.write_proto_message(&msg).await
                                         .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+                                        self,
+                                        &self.channels,
+                                        &mut session_channel_shadow,
+                                        &msg,
+                                    ).await;
+                                    for msg in synthetic {
+                                        client.write_proto_message(&msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
                                 }
                                 client.set_last_channel_version(op.version).await;
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                                 let last = client.get_last_channel_version().await;
                                 replay_channel_log_gap(
-                                    self, &client, &self.channels, client_session_id, last, u64::MAX,
+                                    self, &client, &self.channels, &mut session_channel_shadow, client_session_id, last, u64::MAX,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -815,6 +923,16 @@ impl Server {
                                     for msg in &missed {
                                         client.write_proto_message(msg).await
                                             .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                        let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+                                            self,
+                                            &self.channels,
+                                            &mut session_channel_shadow,
+                                            msg,
+                                        ).await;
+                                        for msg in synthetic {
+                                            client.write_proto_message(&msg).await
+                                                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                        }
                                     }
                                     client.update_last_client_versions(&new_versions).await;
                                 }
@@ -825,7 +943,7 @@ impl Server {
                                     let last_ch = client.get_last_channel_version().await;
                                     if last_ch < dep {
                                         replay_channel_log_gap(
-                                            self, &client, &self.channels, client_session_id, last_ch, dep + 1,
+                                            self, &client, &self.channels, &mut session_channel_shadow, client_session_id, last_ch, dep + 1,
                                         ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
                                     }
                                 }
@@ -833,6 +951,16 @@ impl Server {
                                 if let Some(msg) = entry.to_message(&self.clients).await {
                                     client.write_proto_message(&msg).await
                                         .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+                                        self,
+                                        &self.channels,
+                                        &mut session_channel_shadow,
+                                        &msg,
+                                    ).await;
+                                    for msg in synthetic {
+                                        client.write_proto_message(&msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
                                 }
                                 client.update_last_client_versions(&broadcast.versions).await;
                             }
@@ -843,6 +971,16 @@ impl Server {
                                 for msg in &missed {
                                     client.write_proto_message(msg).await
                                         .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+                                        self,
+                                        &self.channels,
+                                        &mut session_channel_shadow,
+                                        msg,
+                                    ).await;
+                                    for msg in synthetic {
+                                        client.write_proto_message(&msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
                                 }
                                 client.update_last_client_versions(&new_versions).await;
                             }

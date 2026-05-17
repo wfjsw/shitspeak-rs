@@ -37,6 +37,7 @@ fn make_channel_with_acls(n: usize) -> Channel {
         links: Default::default(),
         description_hash: None,
         acls,
+        pending_delete: None,
     }
 }
 

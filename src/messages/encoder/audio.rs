@@ -11,7 +11,7 @@ use crate::messages::errors::AudioProtocolError;
 
 /// Routing context attached by the server to outbound (server→client) audio
 /// packets. Encoded into the `context` variant of `mumble_udp::Audio.Header`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum AudioContext {
     /// Normal channel speech.

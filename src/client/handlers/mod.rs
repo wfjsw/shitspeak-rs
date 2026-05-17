@@ -7,6 +7,7 @@ mod context_action;
 mod crypt_setup;
 mod permission_query;
 mod ping;
+mod plugin_data_transmission;
 mod query_users;
 mod request_blob;
 mod text_message;
@@ -31,6 +32,7 @@ use context_action::handle_context_action;
 use crypt_setup::handle_crypt_setup;
 use permission_query::handle_permission_query;
 use ping::handle_ping;
+use plugin_data_transmission::handle_plugin_data_transmission;
 use query_users::handle_query_users;
 use request_blob::handle_request_blob;
 use text_message::handle_text_message;
@@ -155,8 +157,8 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 handle_crypt_setup(server, self, crypt_setup.into()).await
             }
             Message::ContextActionModify(_) => {
-                tracing::debug!(session, "handling ContextActionModify (no-op)");
-                Ok(())
+                tracing::debug!(session, "rejecting incoming ContextActionModify");
+                Err(MessageTypeNotForIncoming::new(message).into())
             }
             Message::ContextAction(context_action) => {
                 tracing::debug!(session, action = %context_action.action, "handling ContextAction");
@@ -207,6 +209,14 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
                 tracing::debug!(session, "rejecting incoming SuggestConfig");
                 Err(MessageTypeNotForIncoming::new(message).into())
             }
+            Message::PluginDataTransmission(plugin_data) => {
+                tracing::debug!(
+                    session,
+                    receivers = plugin_data.receiver_sessions.len(),
+                    "handling PluginDataTransmission"
+                );
+                handle_plugin_data_transmission(server, self, plugin_data.into()).await
+            }
         };
 
         // Triage the result: auth rejections and permission denials are sent
@@ -215,9 +225,10 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             Err(MessageHandlerError::ProtocolViolation(reason)) => {
                 use crate::messages::WriteMessageExt;
                 tracing::warn!(session, reason = %reason, "Protocol violation");
-                let reject =
-                    crate::errors::AuthRejection::new(crate::messages::encoder::RejectType::None)
-                        .because(reason);
+                let reject = crate::errors::AuthRejection::new_with_language(
+                    crate::messages::encoder::RejectType::None,
+                    self.language(),
+                );
                 let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
                 let msg = crate::messages::Message::Reject(reject_msg.into());
                 self.write_proto_message(&msg).await?;
@@ -225,13 +236,20 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
             }
             Err(MessageHandlerError::AuthRejection(reject)) => {
                 use crate::messages::WriteMessageExt;
-                let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
+                let reject_msg: crate::messages::encoder::Reject =
+                    reject.clone().localized(self.language()).into();
                 let msg = crate::messages::Message::Reject(reject_msg.into());
                 self.write_proto_message(&msg).await?;
                 Err(MessageHandlerError::AuthRejection(reject))
             }
-            Err(MessageHandlerError::PermissionDenied(deny)) => {
+            Err(MessageHandlerError::PermissionDenied(mut deny)) => {
                 use crate::messages::WriteMessageExt;
+                if deny.reason.is_none() {
+                    deny.reason = Some(crate::localization::permission_denied_reason(
+                        self.language(),
+                        deny.r#type,
+                    ));
+                }
                 let msg: crate::messages::Message = deny.into();
                 self.write_proto_message(&msg).await?;
                 Ok(())

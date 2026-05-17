@@ -128,7 +128,9 @@ async fn build_user_stats_payload(target: &Arc<Box<Client>>, stats_only: bool) -
 
     let now = chrono::Utc::now();
     let login_time = target.get_login_time();
-    let onlinesecs = (now - login_time).num_seconds() as u32;
+    let onlinesecs = (now - login_time).num_seconds().max(0) as u32;
+    let idlesecs = target.idle_duration().num_seconds().max(0) as u32;
+    let bandwidth = average_bandwidth_bits_per_second(stats.total_volume(), onlinesecs);
 
     let version = target.protocol_version().map(|v| {
         crate::messages::encoder::Version {
@@ -143,7 +145,11 @@ async fn build_user_stats_payload(target: &Arc<Box<Client>>, stats_only: bool) -
     UserStats {
         session: Some(u32::from(target.get_session_id())),
         stats_only: Some(stats_only),
-        certificates: Vec::new(), // TODO: TLS cert chain
+        certificates: if stats_only {
+            Vec::new()
+        } else {
+            target.get_certificate_chain().to_vec()
+        },
         from_client: None,
         from_server: None,
         udp_packets: Some(stats.udp_packets()),
@@ -155,12 +161,21 @@ async fn build_user_stats_payload(target: &Arc<Box<Client>>, stats_only: bool) -
         version,
         celt_versions: Vec::new(),
         address: Some(target.get_real_ip_address()),
-        bandwidth: Some(0), // TODO: bandwidth tracking
+        bandwidth: Some(bandwidth),
         onlinesecs: Some(onlinesecs),
-        idlesecs: Some(0), // TODO: idle tracking
+        idlesecs: Some(idlesecs),
         strong_certificate: Some(target.is_verified()),
         opus: Some(true),
     }
+}
+
+fn average_bandwidth_bits_per_second(total_bytes: u64, onlinesecs: u32) -> u32 {
+    let elapsed = u64::from(onlinesecs.max(1));
+    total_bytes
+        .saturating_mul(8)
+        .checked_div(elapsed)
+        .unwrap_or(0)
+        .min(u64::from(u32::MAX)) as u32
 }
 
 /// Owner-side responder for the cross-node UserStats RPC.

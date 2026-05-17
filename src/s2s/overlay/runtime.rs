@@ -71,13 +71,7 @@ impl OverlayInner {
         let routing = new_routing_handle();
         let services = Arc::new(ServiceRegistry::new());
 
-        // Discover our own listen addresses from the transport. We use
-        // metrics_snapshot purely to find them — but for Phase 2 we just
-        // pass an empty list. The address book is rebuilt from peers'
-        // own LSAs; our own listen addresses are not strictly needed by
-        // L3 (it routes by node id).
-        // TODO(future): expose listen addrs from transport public API.
-        let self_addresses = Vec::new();
+        let self_addresses = transport.listen_addresses();
         let emitter = Arc::new(LsaEmitter::new(
             self_id,
             boot_epoch,

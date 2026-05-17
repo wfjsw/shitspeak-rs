@@ -37,7 +37,8 @@ pub async fn handle_request_blob(
             let gs = client.read_global_state();
             let texture_hash = gs
                 .get_texture_hash()
-                .map(|h| hex::decode(h).unwrap_or_default());
+                .and_then(|h| hex::decode(h).ok())
+                .filter(|h| h.len() == 20);
             let texture_url = gs.get_texture_url().map(|s| s.to_owned());
             (texture_hash, texture_url)
         };
@@ -48,7 +49,7 @@ pub async fn handle_request_blob(
                 let key = hex::encode(hash);
                 match texture_url.as_deref() {
                     Some(url) => server.get_session_blobs().get(&key, url).await,
-                    None => None,
+                    None => server.get_session_blobs().get_cached(&key).await,
                 }
             }
             None => None,
@@ -74,7 +75,7 @@ pub async fn handle_request_blob(
             plugin_identity: None,
             comment: None,
             hash: None,
-            comment_hash: texture_hash.clone().map(bytes::Bytes::from),
+            comment_hash: None,
             texture_hash: texture_hash.clone().map(bytes::Bytes::from),
             priority_speaker: None,
             recording: None,
@@ -99,7 +100,8 @@ pub async fn handle_request_blob(
             let gs = client.read_global_state();
             let comment_hash = gs
                 .get_comment_hash()
-                .map(|h| hex::decode(h).unwrap_or_default());
+                .and_then(|h| hex::decode(h).ok())
+                .filter(|h| h.len() == 20);
             let comment_url = gs.get_comment_url().map(|s| s.to_owned());
             (comment_hash, comment_url)
         };
@@ -109,7 +111,7 @@ pub async fn handle_request_blob(
                 let key = hex::encode(hash);
                 match comment_url.as_deref() {
                     Some(url) => server.get_session_blobs().get(&key, url).await,
-                    None => None,
+                    None => server.get_session_blobs().get_cached(&key).await,
                 }
             }
             None => None,

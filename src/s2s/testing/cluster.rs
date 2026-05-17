@@ -3,9 +3,10 @@
 //! path.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use super::chaos::LinkChaos;
 use super::pki::{install_provider_once, mint_pki, Pki};
@@ -41,6 +42,14 @@ pub fn overlay_cfg(seeds: Vec<SeedPeer>) -> OverlayConfig {
         .with_anti_entropy_interval(Duration::from_millis(500))
         .with_routing_recompute_debounce(Duration::from_millis(20))
         .with_peer_persistence_interval(Duration::from_secs(1))
+}
+
+static CLUSTER_BUILD_LOCK: std::sync::OnceLock<Arc<Mutex<()>>> = std::sync::OnceLock::new();
+
+fn cluster_build_lock() -> Arc<Mutex<()>> {
+    CLUSTER_BUILD_LOCK
+        .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// One node in an integration-test cluster.
@@ -87,6 +96,9 @@ impl Cluster {
         F: Fn(usize, &[u16], &[u16]) -> Vec<SeedPeer>,
         G: Fn(usize, OverlayConfig) -> OverlayConfig,
     {
+        let lock = cluster_build_lock();
+        let _guard = lock.lock().await;
+
         install_provider_once();
         let pki = mint_pki(node_ids);
 

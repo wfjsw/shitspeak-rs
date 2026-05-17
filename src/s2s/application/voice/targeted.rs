@@ -2,8 +2,9 @@
 //! voice mode.
 //!
 //! Maps `channel_id → set<NodeIdentifier>` so a speaker's node can
-//! compute the set of cross-node recipients for normal channel speech
-//! (and for whisper-to-channel) instead of broadcasting.
+//! choose likely destination nodes for normal channel speech. Frames
+//! still carry unresolved voice intent, never resolved recipient
+//! sessions; each receiving node resolves local recipients itself.
 //!
 //! ## Why this is opt-in
 //!
@@ -13,8 +14,8 @@
 //! 1. Receivers only parse the small envelope — no Opus decode.
 //! 2. Overlay routing pays transit cost on relay nodes whether the
 //!    payload is targeted or broadcast.
-//! 3. Targeted depends on a fresh recipient index; staleness reorders
-//!    risk silently dropping listeners on a re-routed cluster.
+//! 3. Targeted depends on a fresh recipient index; staleness can omit
+//!    a node that would have resolved local recipients.
 //!
 //! Targeted only saves the *leaf* nodes that aren't recipients. For
 //! large clusters with bandwidth-constrained leaf links, that can be

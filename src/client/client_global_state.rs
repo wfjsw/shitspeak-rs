@@ -179,8 +179,7 @@ impl ClientGlobalState {
     }
 
     pub fn clear_texture_blob(&mut self) {
-        self.texture_url = None;
-        self.texture_hash = None;
+        self.set_texture_blob(None, None);
     }
 
     pub fn get_comment_url(&self) -> Option<&str> {
@@ -210,8 +209,7 @@ impl ClientGlobalState {
     }
 
     pub fn clear_comment_blob(&mut self) {
-        self.comment_url = None;
-        self.comment_hash = None;
+        self.set_comment_blob(None, None);
     }
 
     // ── Voice / moderation getters & setters ─────────────────────────────

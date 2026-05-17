@@ -10,8 +10,9 @@ use crate::s2s_application_proto as pb;
 
 pub use pb::{
     moderation_envelope::Command as ModerationCommand, user_stats_envelope::Kind as UserStatsKind,
-    ModerationEnvelope, UserRemovePatch, UserStatePatch, UserStatsEnvelope, UserStatsReply,
-    UserStatsRequest, VoiceFrame,
+    voice_intent::Kind as VoiceIntentKind, ModerationEnvelope, PluginDataEnvelope, UserRemovePatch,
+    UserStatePatch, UserStatsEnvelope, UserStatsReply, UserStatsRequest, VoiceFrame, VoiceIntent,
+    VoiceIntentNormal, VoiceIntentTarget, VoiceTargetChannel,
 };
 
 /// Reserved overlay service tag for moderation envelopes.
@@ -22,6 +23,9 @@ pub const VOICE_SERVICE_TAG: u32 = 3;
 
 /// Reserved overlay service tag for the UserStats request/reply RPC.
 pub const USER_STATS_SERVICE_TAG: u32 = 4;
+
+/// Reserved overlay service tag for plugin-data fanout.
+pub const PLUGIN_DATA_SERVICE_TAG: u32 = 5;
 
 pub fn encode_moderation(env: &ModerationEnvelope) -> Result<Bytes, prost::EncodeError> {
     let mut buf = BytesMut::with_capacity(env.encoded_len());
@@ -51,6 +55,16 @@ pub fn encode_user_stats(env: &UserStatsEnvelope) -> Result<Bytes, prost::Encode
 
 pub fn decode_user_stats(src: &[u8]) -> Result<UserStatsEnvelope, prost::DecodeError> {
     UserStatsEnvelope::decode(src)
+}
+
+pub fn encode_plugin_data(env: &PluginDataEnvelope) -> Result<Bytes, prost::EncodeError> {
+    let mut buf = BytesMut::with_capacity(env.encoded_len());
+    env.encode(&mut buf)?;
+    Ok(buf.freeze())
+}
+
+pub fn decode_plugin_data(src: &[u8]) -> Result<PluginDataEnvelope, prost::DecodeError> {
+    PluginDataEnvelope::decode(src)
 }
 
 #[cfg(test)]
@@ -104,9 +118,28 @@ mod tests {
             target_kind: 0,
             is_terminator: false,
             payload: Bytes::from_static(&[1, 2, 3, 4, 5]),
+            intent: Some(VoiceIntent {
+                kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
+                    source_channel: 7,
+                })),
+            }),
         };
         let bytes = encode_voice(&frame).unwrap();
         let decoded = decode_voice(&bytes).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn plugin_data_envelope_roundtrip() {
+        let env = PluginDataEnvelope {
+            sender_session: 0xABC_12345,
+            receiver_sessions: vec![0xDEF_67890, 0xDEF_67891],
+            data: Bytes::from_static(b"plugin"),
+            data_id: Some("test.plugin".to_string()),
+        };
+
+        let bytes = encode_plugin_data(&env).unwrap();
+        let decoded = decode_plugin_data(&bytes).unwrap();
+        assert_eq!(decoded, env);
     }
 }

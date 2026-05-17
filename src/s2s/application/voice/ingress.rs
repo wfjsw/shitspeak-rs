@@ -1,9 +1,9 @@
 //! Inbound `VoiceFrame` decode + central dispatch task, and the
 //! speaker-side public API (`VoiceService`).
 //!
-//! Phase 1: dispatch task is a no-op stub that only logs.
-//! Phase 2: speaker-side `send_*` API + per-(sender_session) sequence
-//!          counter for the wire envelope's `s2s_seq`.
+//! The dispatch task decodes `VoiceFrame`s, applies the reorder gate, and
+//! hands emitted frames to the installed audio sink. The speaker-side API
+//! wraps already-encoded audio payloads with unresolved routing intent.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,7 +17,9 @@ use tracing::trace;
 
 use crate::s2s::application::config::{DeliveryStrategy, VoiceConfig};
 use crate::s2s::application::error::ApplicationError;
-use crate::s2s::application::proto::{self, VoiceFrame};
+use crate::s2s::application::proto::{
+    self, VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal,
+};
 use crate::s2s::application::voice::reorder::{self, Reorderer};
 use crate::s2s::application::voice::send::{self, OverlayVoiceTransport, VoiceTransport};
 use crate::s2s::application::voice::sink::AudioSink;
@@ -201,8 +203,9 @@ impl VoiceService {
         target_kind: u32,
         is_terminator: bool,
         payload: Bytes,
+        intent: VoiceIntent,
     ) -> Result<(), ApplicationError> {
-        let bytes = self.encode(sender_session, target_kind, is_terminator, payload)?;
+        let bytes = self.encode(sender_session, target_kind, is_terminator, payload, intent)?;
         self.transport.send_broadcast(bytes).await
     }
 
@@ -214,12 +217,13 @@ impl VoiceService {
         target_kind: u32,
         is_terminator: bool,
         payload: Bytes,
+        intent: VoiceIntent,
         dsts: &[NodeIdentifier],
     ) -> Result<(), ApplicationError> {
         if dsts.is_empty() {
             return Ok(());
         }
-        let bytes = self.encode(sender_session, target_kind, is_terminator, payload)?;
+        let bytes = self.encode(sender_session, target_kind, is_terminator, payload, intent)?;
         self.transport.send_multicast(dsts, bytes).await
     }
 
@@ -242,9 +246,10 @@ impl VoiceService {
         is_terminator: bool,
         payload: Bytes,
     ) -> Result<(), ApplicationError> {
+        let intent = normal_intent(channel_id);
         match self.delivery_strategy {
             DeliveryStrategy::Broadcast => {
-                self.send_broadcast(sender_session, 0, is_terminator, payload)
+                self.send_broadcast(sender_session, 0, is_terminator, payload, intent)
                     .await
             }
             DeliveryStrategy::Targeted => {
@@ -263,8 +268,15 @@ impl VoiceService {
                             // channel; nothing to do for cross-node delivery.
                             return Ok(());
                         }
-                        self.send_multicast(sender_session, 0, is_terminator, payload, &dsts)
-                            .await
+                        self.send_multicast(
+                            sender_session,
+                            0,
+                            is_terminator,
+                            payload,
+                            intent,
+                            &dsts,
+                        )
+                        .await
                     }
                     _ => {
                         // No index entry yet — degrade safely to broadcast.
@@ -272,7 +284,7 @@ impl VoiceService {
                             channel_id,
                             "voice targeted: no index entry; falling back to broadcast"
                         );
-                        self.send_broadcast(sender_session, 0, is_terminator, payload)
+                        self.send_broadcast(sender_session, 0, is_terminator, payload, intent)
                             .await
                     }
                 }
@@ -287,10 +299,43 @@ impl VoiceService {
         target_kind: u32,
         is_terminator: bool,
         payload: Bytes,
+        intent: VoiceIntent,
         dst: NodeIdentifier,
     ) -> Result<(), ApplicationError> {
-        let bytes = self.encode(sender_session, target_kind, is_terminator, payload)?;
+        let bytes = self.encode(sender_session, target_kind, is_terminator, payload, intent)?;
         self.transport.send_unicast(dst, bytes).await
+    }
+
+    pub async fn send_intent_broadcast(
+        &self,
+        sender_session: u32,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+    ) -> Result<(), ApplicationError> {
+        self.send_broadcast(sender_session, target_kind, is_terminator, payload, intent)
+            .await
+    }
+
+    pub async fn send_intent_multicast(
+        &self,
+        sender_session: u32,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+        dsts: &[NodeIdentifier],
+    ) -> Result<(), ApplicationError> {
+        self.send_multicast(
+            sender_session,
+            target_kind,
+            is_terminator,
+            payload,
+            intent,
+            dsts,
+        )
+        .await
     }
 
     fn encode(
@@ -299,6 +344,7 @@ impl VoiceService {
         target_kind: u32,
         is_terminator: bool,
         payload: Bytes,
+        intent: VoiceIntent,
     ) -> Result<Bytes, ApplicationError> {
         let seq = self.next_seq(sender_session);
         let bytes = send::build_envelope(
@@ -308,8 +354,17 @@ impl VoiceService {
             target_kind,
             is_terminator,
             payload,
+            intent,
         )?;
         Ok(bytes)
+    }
+}
+
+fn normal_intent(channel_id: u32) -> VoiceIntent {
+    VoiceIntent {
+        kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
+            source_channel: channel_id,
+        })),
     }
 }
 
@@ -394,12 +449,18 @@ mod tests {
         let svc = make_service(transport.clone());
 
         let payload = Bytes::from_static(b"opus-1");
-        svc.send_broadcast(0xABC, 0, false, payload.clone())
+        svc.send_broadcast(0xABC, 0, false, payload.clone(), normal_intent(5))
             .await
             .unwrap();
-        svc.send_broadcast(0xABC, 0, true, Bytes::from_static(b"opus-2"))
-            .await
-            .unwrap();
+        svc.send_broadcast(
+            0xABC,
+            0,
+            true,
+            Bytes::from_static(b"opus-2"),
+            normal_intent(5),
+        )
+        .await
+        .unwrap();
 
         let calls = transport.calls();
         assert_eq!(calls.len(), 2);
@@ -425,9 +486,16 @@ mod tests {
     async fn multicast_skips_when_dsts_empty() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service(transport.clone());
-        svc.send_multicast(0xABC, 2, false, Bytes::from_static(b"x"), &[])
-            .await
-            .unwrap();
+        svc.send_multicast(
+            0xABC,
+            2,
+            false,
+            Bytes::from_static(b"x"),
+            normal_intent(5),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(transport.calls().is_empty());
     }
 
@@ -435,9 +503,16 @@ mod tests {
     async fn multicast_emits_envelope_with_dsts() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service(transport.clone());
-        svc.send_multicast(0xABC, 2, false, Bytes::from_static(b"whisper"), &[1, 3])
-            .await
-            .unwrap();
+        svc.send_multicast(
+            0xABC,
+            2,
+            false,
+            Bytes::from_static(b"whisper"),
+            normal_intent(5),
+            &[1, 3],
+        )
+        .await
+        .unwrap();
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
@@ -455,9 +530,16 @@ mod tests {
     async fn unicast_emits_to_single_dst() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service(transport.clone());
-        svc.send_unicast(0xABC, 2, true, Bytes::from_static(b"end"), 5)
-            .await
-            .unwrap();
+        svc.send_unicast(
+            0xABC,
+            2,
+            true,
+            Bytes::from_static(b"end"),
+            normal_intent(5),
+            5,
+        )
+        .await
+        .unwrap();
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
@@ -552,8 +634,16 @@ mod tests {
 
         // Synthesize an inbound overlay message and feed it through the
         // production decode path.
-        let envelope =
-            send::build_envelope(0xABC, 42, 5, 0, true, Bytes::from_static(b"opus-bytes")).unwrap();
+        let envelope = send::build_envelope(
+            0xABC,
+            42,
+            5,
+            0,
+            true,
+            Bytes::from_static(b"opus-bytes"),
+            normal_intent(5),
+        )
+        .unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 11,
             level: crate::s2s::transport::ServiceLevel::BestEffort,
@@ -582,8 +672,16 @@ mod tests {
     async fn ingress_drops_when_no_sink_installed() {
         let transport = FakeVoiceTransport::new(7, vec![1]);
         let svc = make_service(transport);
-        let envelope =
-            send::build_envelope(0xABC, 42, 0, 0, false, Bytes::from_static(b"x")).unwrap();
+        let envelope = send::build_envelope(
+            0xABC,
+            42,
+            0,
+            0,
+            false,
+            Bytes::from_static(b"x"),
+            normal_intent(5),
+        )
+        .unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 1,
             level: crate::s2s::transport::ServiceLevel::BestEffort,
@@ -600,9 +698,15 @@ mod tests {
         let svc = make_service(transport.clone());
         for session in [0xAAA, 0xBBB] {
             for _ in 0..3 {
-                svc.send_broadcast(session, 0, false, Bytes::from_static(b"x"))
-                    .await
-                    .unwrap();
+                svc.send_broadcast(
+                    session,
+                    0,
+                    false,
+                    Bytes::from_static(b"x"),
+                    normal_intent(5),
+                )
+                .await
+                .unwrap();
             }
         }
         let calls = transport.calls();

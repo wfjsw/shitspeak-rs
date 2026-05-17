@@ -370,14 +370,24 @@ impl ClientStateLogEntry {
                     us.plugin_identity = Some(v.clone());
                 }
                 if let Some(ref v) = delta.texture_hash {
-                    us.texture_hash = v
-                        .as_ref()
-                        .and_then(|h| hex::decode(h).ok().map(Bytes::from));
+                    match v {
+                        Some(hash) => {
+                            us.texture_hash = hex::decode(hash).ok().map(Bytes::from);
+                        }
+                        None => {
+                            us.texture = Some(Bytes::new());
+                        }
+                    }
                 }
                 if let Some(ref v) = delta.comment_hash {
-                    us.comment_hash = v
-                        .as_ref()
-                        .and_then(|h| hex::decode(h).ok().map(Bytes::from));
+                    match v {
+                        Some(hash) => {
+                            us.comment_hash = hex::decode(hash).ok().map(Bytes::from);
+                        }
+                        None => {
+                            us.comment = Some(String::new());
+                        }
+                    }
                 }
                 if let Some(ref v) = delta.listening_channel_add {
                     us.listening_channel_add = v.iter().copied().collect();

@@ -1,24 +1,40 @@
 use std::borrow::Cow;
 
-use crate::messages::encoder::RejectType;
+use crate::{
+    localization::{reject_reason, Language},
+    messages::encoder::RejectType,
+};
 
 #[derive(Debug, Clone)]
 pub struct AuthRejection {
     rejection_type: RejectType,
     reason: Option<Cow<'static, str>>,
+    reason_is_default: bool,
 }
 
 impl AuthRejection {
     pub fn new(rejection_type: RejectType) -> Self {
-        // TODO: populate reason based on type
+        Self::new_with_language(rejection_type, Language::default())
+    }
+
+    pub fn new_with_language(rejection_type: RejectType, language: Language) -> Self {
         Self {
             rejection_type,
-            reason: None,
+            reason: Some(reject_reason(language, rejection_type)),
+            reason_is_default: true,
         }
+    }
+
+    pub fn localized(mut self, language: Language) -> Self {
+        if self.reason_is_default {
+            self.reason = Some(reject_reason(language, self.rejection_type));
+        }
+        self
     }
 
     pub fn because(mut self, reason: impl Into<Cow<'static, str>>) -> Self {
         self.reason = Some(reason.into());
+        self.reason_is_default = false;
         self
     }
 

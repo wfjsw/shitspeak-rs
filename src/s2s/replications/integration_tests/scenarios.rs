@@ -346,12 +346,12 @@ async fn strict_quorum_never_forms_times_out() {
         .cluster
         .node(1)
         .chaos
-        .drop_next_of_type_from(3, MessageType::Data, 1);
+        .drop_next_of_type_from(3, MessageType::StrictProposeAck, 1);
     cluster
         .cluster
         .node(1)
         .chaos
-        .drop_next_of_type_from(4, MessageType::Data, 1);
+        .drop_next_of_type_from(4, MessageType::StrictProposeAck, 1);
 
     let h0 = handles[0].clone();
     let task = tokio::spawn(async move { h0.propose(6666u64).await });

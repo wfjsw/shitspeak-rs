@@ -273,6 +273,26 @@ impl ConnectionManager {
         self.inner.self_id
     }
 
+    pub fn listen_addresses(&self) -> Vec<PeerAddress> {
+        let cfg = self.inner.cfg();
+        let mut addrs = Vec::with_capacity(4);
+
+        if let Some(addr) = cfg.tcp_listen() {
+            addrs.push(PeerAddress::new(addr, TransportKind::Tcp));
+        }
+        if let Some(addr) = cfg.kcp_listen() {
+            addrs.push(PeerAddress::new(addr, TransportKind::Kcp));
+        }
+        if let Some(addr) = cfg.quic_listen() {
+            addrs.push(PeerAddress::new(addr, TransportKind::Quic));
+        }
+        if let Some(addr) = cfg.udp_listen() {
+            addrs.push(PeerAddress::new(addr, TransportKind::Udp));
+        }
+
+        addrs
+    }
+
     pub async fn add_address(&self, node: NodeIdentifier, addr: PeerAddress) {
         if node == self.inner.self_id {
             return;

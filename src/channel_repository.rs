@@ -14,11 +14,12 @@
 //! Every mutation appends one JSON line to the WAL and calls `sync_data()`
 //! before returning.  This ensures durability even if the process crashes.
 //!
-//! # S2S / replication stubs
+//! # S2S / replication
 //!
-//! `subscribe()`, `get_log_since()`, and `apply_remote_operation()` are
-//! present as stubs with the correct signatures so that future S2S code can
-//! call them without touching the repository internals.
+//! `subscribe()`, `get_log_since()`, and `apply_remote_operation()` are the
+//! repository boundary used by strict S2S channel replication. Channel deletes
+//! are two phase: a pending marker is replicated before the nonce-bearing
+//! delete, so stale deletes become semantic no-ops.
 //!
 //! # ACL cache
 //!
@@ -42,7 +43,7 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 use crate::acl::ACLPermissions;
 use crate::acl::ACL;
-use crate::channels::{Channel, ChannelPatch};
+use crate::channels::{Channel, ChannelPatch, PendingDeleteState};
 use crate::config::Config;
 use crate::errors::ChannelRepoError;
 
@@ -73,6 +74,8 @@ pub struct ChannelOperation {
     pub node_id: u16,
     /// Unix timestamp (seconds since epoch) when the operation was created.
     pub timestamp: i64,
+    #[serde(default)]
+    pub emits_client_message: bool,
     #[serde(flatten)]
     pub op: ChannelOp,
 }
@@ -107,9 +110,11 @@ impl ChannelOperation {
                 .into(),
             ),
             ChannelOp::UpdateChannel { id, patch } => Some(channel_to_proto_delta(*id, patch)),
-            ChannelOp::DeleteChannel { id } => {
+            ChannelOp::DeleteChannel { id, .. } if self.emits_client_message => {
                 Some(crate::messages::encoder::ChannelRemove { channel_id: *id }.into())
             }
+            ChannelOp::DeleteChannel { .. } => None,
+            ChannelOp::MarkPendingDelete { .. } | ChannelOp::CancelPendingDelete { .. } => None,
             ChannelOp::AddLink { a, b } => Some(
                 crate::messages::encoder::ChannelState {
                     channel_id: Some(*a),
@@ -187,8 +192,17 @@ pub enum ChannelOp {
         id: u32,
         patch: ChannelPatch,
     },
+    MarkPendingDelete {
+        id: u32,
+        nonce: u64,
+    },
     DeleteChannel {
         id: u32,
+        nonce: u64,
+    },
+    CancelPendingDelete {
+        id: u32,
+        nonce: u64,
     },
     AddLink {
         a: u32,
@@ -356,7 +370,7 @@ impl ChannelRepository {
             if op.version <= base_version {
                 continue; // already reflected in snapshot
             }
-            apply_op_to_map(&mut channels, &op.op);
+            apply_op_to_map(&mut channels, &op.op, op.node_id);
             if op.version > max_version {
                 max_version = op.version;
             }
@@ -419,6 +433,125 @@ impl ChannelRepository {
 
     pub async fn get_channel(&self, id: u32) -> Option<Channel> {
         self.channels.read().get(&id).cloned()
+    }
+
+    /// Returns true if `channel_id` is inside a subtree currently marked for deletion.
+    pub async fn is_pending_delete_subtree(&self, channel_id: u32) -> bool {
+        let channels = self.channels.read();
+        let mut current = Some(channel_id);
+        while let Some(id) = current {
+            let Some(channel) = channels.get(&id) else {
+                return false;
+            };
+            if channel.pending_delete.is_some() {
+                return true;
+            }
+            current = channel.parent_id;
+        }
+        false
+    }
+
+    /// Resolve `channel_id` to the nearest non-pending ancestor, or root.
+    pub async fn redirect_pending_delete_target(&self, channel_id: u32) -> u32 {
+        let channels = self.channels.read();
+        let mut current = Some(channel_id);
+        while let Some(id) = current {
+            let Some(channel) = channels.get(&id) else {
+                return 0;
+            };
+            if channel.pending_delete.is_none() {
+                return id;
+            }
+            current = channel.parent_id;
+        }
+        0
+    }
+
+    /// Return the subtree ids if `id` is currently marked with `nonce`.
+    pub async fn pending_delete_subtree(&self, id: u32, nonce: u64) -> Vec<u32> {
+        let channels = self.channels.read();
+        let Some(channel) = channels.get(&id) else {
+            return Vec::new();
+        };
+        if !channel
+            .pending_delete
+            .as_ref()
+            .is_some_and(|pending| pending.nonce == nonce)
+        {
+            return Vec::new();
+        }
+        collect_subtree(&channels, id)
+            .into_iter()
+            .filter(|channel_id| {
+                channels
+                    .get(channel_id)
+                    .and_then(|ch| ch.pending_delete.as_ref())
+                    .is_some_and(|pending| pending.nonce == nonce)
+            })
+            .collect()
+    }
+
+    /// Return root pending-delete markers that have exceeded `timeout_ms`.
+    pub async fn expired_pending_deletes(&self, timeout_ms: i64) -> Vec<(u32, u64)> {
+        if timeout_ms <= 0 {
+            return Vec::new();
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let channels = self.channels.read();
+        let mut expired = Vec::new();
+        for channel in channels.values() {
+            let Some(pending) = channel.pending_delete.as_ref() else {
+                continue;
+            };
+            if now.saturating_sub(pending.started_at_ms) < timeout_ms {
+                continue;
+            }
+            let parent_pending_same_nonce = channel
+                .parent_id
+                .and_then(|parent_id| channels.get(&parent_id))
+                .and_then(|parent| parent.pending_delete.as_ref())
+                .is_some_and(|parent_pending| parent_pending.nonce == pending.nonce);
+            if !parent_pending_same_nonce {
+                expired.push((channel.id, pending.nonce));
+            }
+        }
+        expired
+    }
+
+    /// Move locally owned clients out of a newly pending delete subtree.
+    ///
+    /// Each node performs this independently when it observes the replicated
+    /// mark-pending operation. The emitted `UserState` messages are local
+    /// client-log entries, so observer sockets see synthetic moves before the
+    /// later nonce-bearing `ChannelRemove`.
+    pub async fn move_local_clients_out_of_pending_delete(
+        &self,
+        id: u32,
+        nonce: u64,
+        parent_id: u32,
+        channel_version: u64,
+    ) -> usize {
+        let Some(client_repo) = self.client_repo.lock().clone() else {
+            return 0;
+        };
+        let subtree: std::collections::HashSet<u32> = self
+            .pending_delete_subtree(id, nonce)
+            .await
+            .into_iter()
+            .collect();
+        if subtree.is_empty() {
+            return 0;
+        }
+
+        let mut moved = 0;
+        for client in client_repo.get_local_clients().await {
+            if !subtree.contains(&client.get_current_channel_id()) {
+                continue;
+            }
+            client.set_current_channel_id(parent_id, &client_repo, channel_version);
+            moved += 1;
+        }
+        moved
     }
 
     pub async fn get_all(&self) -> Vec<Channel> {
@@ -688,25 +821,109 @@ impl ChannelRepository {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
+
+        let nonce = rand::random::<u64>();
+        let to_delete = self.mark_pending_delete(id, nonce).await?;
+        self.apply_delete_channel(id, nonce).await?;
+        Ok(to_delete)
+    }
+
+    /// Mark a channel subtree as pending deletion using a nonce shared by the
+    /// later delete operation. Returns the subtree ids that were marked.
+    pub async fn mark_pending_delete(
+        self: &Arc<Self>,
+        id: u32,
+        nonce: u64,
+    ) -> Result<Vec<u32>, ChannelRepoError> {
+        if id == 0 {
+            return Err(ChannelRepoError::CannotDeleteRoot);
+        }
         let to_delete = {
             let mut channels = self.channels.write();
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
             }
-
-            // Collect all descendants (BFS)
             let to_delete = collect_subtree(&channels, id);
-
+            let started_at_ms = chrono::Utc::now().timestamp_millis();
             for del_id in &to_delete {
-                channels.remove(del_id);
+                if let Some(ch) = channels.get_mut(del_id) {
+                    ch.pending_delete = Some(PendingDeleteState {
+                        nonce,
+                        started_at_ms,
+                        origin_node: self.node_id,
+                    });
+                }
             }
-
             to_delete
         };
-        let op = self.make_op(ChannelOp::DeleteChannel { id });
-        self.bump_channel_acl_generation();
+        let op = self.make_op(ChannelOp::MarkPendingDelete { id, nonce });
         self.commit(op).await?;
         Ok(to_delete)
+    }
+
+    /// Apply a nonce-bearing delete. If the pending nonce no longer matches,
+    /// the operation is committed as a semantic no-op and emits no ChannelRemove.
+    pub async fn apply_delete_channel(
+        self: &Arc<Self>,
+        id: u32,
+        nonce: u64,
+    ) -> Result<bool, ChannelRepoError> {
+        if id == 0 {
+            return Err(ChannelRepoError::CannotDeleteRoot);
+        }
+        let deleted = {
+            let mut channels = self.channels.write();
+            let Some(channel) = channels.get(&id) else {
+                return Err(ChannelRepoError::NotFound(id));
+            };
+            let can_delete = channel
+                .pending_delete
+                .as_ref()
+                .is_some_and(|pending| pending.nonce == nonce);
+            if can_delete {
+                let to_delete = collect_subtree(&channels, id);
+                for del_id in &to_delete {
+                    channels.remove(del_id);
+                }
+            }
+            can_delete
+        };
+        let mut op = self.make_op(ChannelOp::DeleteChannel { id, nonce });
+        op.emits_client_message = deleted;
+        if deleted {
+            self.bump_channel_acl_generation();
+        }
+        self.commit(op).await?;
+        Ok(deleted)
+    }
+
+    /// Cancel a pending delete if the nonce still matches.
+    pub async fn cancel_pending_delete(
+        self: &Arc<Self>,
+        id: u32,
+        nonce: u64,
+    ) -> Result<(), ChannelRepoError> {
+        if id == 0 {
+            return Err(ChannelRepoError::CannotDeleteRoot);
+        }
+        {
+            let mut channels = self.channels.write();
+            let to_cancel = collect_subtree(&channels, id);
+            for cancel_id in &to_cancel {
+                if let Some(ch) = channels.get_mut(cancel_id) {
+                    if ch
+                        .pending_delete
+                        .as_ref()
+                        .is_some_and(|pending| pending.nonce == nonce)
+                    {
+                        ch.pending_delete = None;
+                    }
+                }
+            }
+        }
+        let op = self.make_op(ChannelOp::CancelPendingDelete { id, nonce });
+        self.commit(op).await?;
+        Ok(())
     }
 
     pub async fn add_link(self: &Arc<Self>, a: u32, b: u32) -> Result<(), ChannelRepoError> {
@@ -949,14 +1166,25 @@ impl ChannelRepository {
         if op.version <= self.version.load(Ordering::Acquire) {
             return Ok(());
         }
-        let new_version = {
+        let (new_version, acl_changed) = {
             let mut channels = self.channels.write();
-            apply_op_to_map(&mut channels, &op.op);
+            let mut acl_changed = channel_op_affects_acl_generation(&op.op);
+            if let ChannelOp::DeleteChannel { id, nonce } = &op.op {
+                let can_delete = channels
+                    .get(id)
+                    .and_then(|ch| ch.pending_delete.as_ref())
+                    .is_some_and(|pending| pending.nonce == *nonce);
+                acl_changed = can_delete;
+            }
+            apply_op_to_map(&mut channels, &op.op, op.node_id);
             let new_version = op.version;
             self.version.fetch_max(new_version, Ordering::AcqRel);
-            new_version
+            (new_version, acl_changed)
         };
 
+        if acl_changed {
+            self.bump_channel_acl_generation();
+        }
         self.invalidate_acl_cache_for_op(&op.op).await;
 
         // Notify ClientRepository to drain pending ops whose dep is now satisfied
@@ -972,19 +1200,56 @@ impl ChannelRepository {
     /// repository's native WAL/snapshot pipeline.
     pub async fn apply_committed_operation(
         self: &Arc<Self>,
-        op: ChannelOperation,
+        mut op: ChannelOperation,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
         if op.version <= self.version.load(Ordering::Acquire) {
             return Ok(Arc::new(op));
         }
 
-        {
+        let mut acl_changed = channel_op_affects_acl_generation(&op.op);
+        let pending_delete_move = {
             let mut channels = self.channels.write();
-            apply_op_to_map(&mut channels, &op.op);
+            let pending_delete_move = match &op.op {
+                ChannelOp::MarkPendingDelete { id, nonce } => channels
+                    .get(id)
+                    .map(|channel| (*id, *nonce, channel.parent_id.unwrap_or(0))),
+                ChannelOp::DeleteChannel { id, nonce } => {
+                    let can_delete = channels
+                        .get(id)
+                        .and_then(|ch| ch.pending_delete.as_ref())
+                        .is_some_and(|pending| pending.nonce == *nonce);
+                    op.emits_client_message = can_delete;
+                    acl_changed = can_delete;
+                    None
+                }
+                _ => None,
+            };
+            apply_op_to_map(&mut channels, &op.op, op.node_id);
+            pending_delete_move
+        };
+
+        if acl_changed {
+            self.bump_channel_acl_generation();
+        }
+        self.invalidate_acl_cache_for_op(&op.op).await;
+        let committed = self.commit_assigned_operation(op).await?;
+
+        if let Some((id, nonce, parent_id)) = pending_delete_move {
+            let moved = self
+                .move_local_clients_out_of_pending_delete(id, nonce, parent_id, committed.version)
+                .await;
+            if moved > 0 {
+                tracing::trace!(
+                    channel_id = id,
+                    nonce,
+                    parent_id,
+                    moved,
+                    "moved local clients out of replicated pending-delete subtree"
+                );
+            }
         }
 
-        self.invalidate_acl_cache_for_op(&op.op).await;
-        self.commit_assigned_operation(op).await
+        Ok(committed)
     }
 
     pub async fn install_s2s_snapshot(
@@ -1033,6 +1298,7 @@ impl ChannelRepository {
             version: 0, // assigned by commit()
             node_id: self.node_id,
             timestamp: chrono::Utc::now().timestamp(),
+            emits_client_message: true,
             op,
         }
     }
@@ -1083,12 +1349,25 @@ impl ChannelRepository {
                     }
                 }
             }
-            ChannelOp::DeleteChannel { id } => {
+            ChannelOp::MarkPendingDelete { id, .. } => {
                 if *id == 0 {
                     return Err(ChannelRepoError::CannotDeleteRoot);
                 }
                 if !channels.contains_key(id) {
                     return Err(ChannelRepoError::NotFound(*id));
+                }
+            }
+            ChannelOp::DeleteChannel { id, .. } => {
+                if *id == 0 {
+                    return Err(ChannelRepoError::CannotDeleteRoot);
+                }
+                if !channels.contains_key(id) {
+                    return Err(ChannelRepoError::NotFound(*id));
+                }
+            }
+            ChannelOp::CancelPendingDelete { id, .. } => {
+                if *id == 0 {
+                    return Err(ChannelRepoError::CannotDeleteRoot);
                 }
             }
             ChannelOp::AddLink { a, b } => {
@@ -1169,7 +1448,7 @@ impl ChannelRepository {
 
     async fn invalidate_acl_cache_for_op(&self, op: &ChannelOp) {
         if channel_op_affects_acl_generation(op) {
-            self.bump_channel_acl_generation();
+            self.acl_cache.clear();
         }
     }
 }
@@ -1177,7 +1456,7 @@ impl ChannelRepository {
 // ─── free functions used both by open() replay and by mutation methods ────────
 
 /// Apply a `ChannelOp` to the in-memory channel map.
-fn apply_op_to_map(channels: &mut HashMap<u32, Channel>, op: &ChannelOp) {
+fn apply_op_to_map(channels: &mut HashMap<u32, Channel>, op: &ChannelOp, origin_node: u16) {
     match op {
         ChannelOp::CreateChannel { channel } => {
             channels.insert(channel.id, channel.clone());
@@ -1216,10 +1495,43 @@ fn apply_op_to_map(channels: &mut HashMap<u32, Channel>, op: &ChannelOp) {
                 apply_patch(ch, patch);
             }
         }
-        ChannelOp::DeleteChannel { id } => {
-            let to_delete = collect_subtree(channels, *id);
-            for del_id in to_delete {
-                channels.remove(&del_id);
+        ChannelOp::MarkPendingDelete { id, nonce } => {
+            let started_at_ms = chrono::Utc::now().timestamp_millis();
+            let to_mark = collect_subtree(channels, *id);
+            for mark_id in to_mark {
+                if let Some(ch) = channels.get_mut(&mark_id) {
+                    ch.pending_delete = Some(PendingDeleteState {
+                        nonce: *nonce,
+                        started_at_ms,
+                        origin_node,
+                    });
+                }
+            }
+        }
+        ChannelOp::DeleteChannel { id, nonce } => {
+            let can_delete = channels
+                .get(id)
+                .and_then(|ch| ch.pending_delete.as_ref())
+                .is_some_and(|pending| pending.nonce == *nonce);
+            if can_delete {
+                let to_delete = collect_subtree(channels, *id);
+                for del_id in to_delete {
+                    channels.remove(&del_id);
+                }
+            }
+        }
+        ChannelOp::CancelPendingDelete { id, nonce } => {
+            let to_cancel = collect_subtree(channels, *id);
+            for cancel_id in to_cancel {
+                if let Some(ch) = channels.get_mut(&cancel_id) {
+                    if ch
+                        .pending_delete
+                        .as_ref()
+                        .is_some_and(|pending| pending.nonce == *nonce)
+                    {
+                        ch.pending_delete = None;
+                    }
+                }
             }
         }
         ChannelOp::AddLink { a, b } => {
@@ -1277,7 +1589,10 @@ fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
         ChannelOp::UpdateChannel { patch, .. } | ChannelOp::EditChannel { patch, .. } => {
             patch.parent_id.is_some()
         }
-        ChannelOp::AddLink { .. } | ChannelOp::RemoveLink { .. } => false,
+        ChannelOp::AddLink { .. }
+        | ChannelOp::RemoveLink { .. }
+        | ChannelOp::MarkPendingDelete { .. }
+        | ChannelOp::CancelPendingDelete { .. } => false,
     }
 }
 
@@ -1306,5 +1621,60 @@ fn is_descendant(channels: &HashMap<u32, Channel>, candidate: u32, ancestor_id: 
             Some(pid) => current = pid,
             None => return false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tuning() -> ChannelRepoTuning {
+        ChannelRepoTuning {
+            log_max_entries: 100,
+            snapshot_every_ops: 100,
+            snapshot_every_secs: 60,
+            wal_compaction_expire_count: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_nonce_delete_is_semantic_no_op() {
+        let repo = ChannelRepository::new_in_memory(1, tuning());
+        repo.create_channel(Channel::new(7, "doomed", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        repo.mark_pending_delete(7, 10).await.unwrap();
+        repo.cancel_pending_delete(7, 10).await.unwrap();
+        let deleted = repo.apply_delete_channel(7, 10).await.unwrap();
+
+        assert!(!deleted);
+        assert!(repo.get_channel(7).await.is_some());
+        let last = repo.get_log_since(0).await.pop().unwrap();
+        assert!(last.to_message().is_none());
+    }
+
+    #[tokio::test]
+    async fn matching_nonce_delete_removes_subtree_and_emits_remove() {
+        let repo = ChannelRepository::new_in_memory(1, tuning());
+        repo.create_channel(Channel::new(7, "parent", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(8, "child", 0, 0, Some(7)))
+            .await
+            .unwrap();
+
+        let marked = repo.mark_pending_delete(7, 99).await.unwrap();
+        assert_eq!(marked.len(), 2);
+        let deleted = repo.apply_delete_channel(7, 99).await.unwrap();
+
+        assert!(deleted);
+        assert!(repo.get_channel(7).await.is_none());
+        assert!(repo.get_channel(8).await.is_none());
+        let last = repo.get_log_since(0).await.pop().unwrap();
+        assert!(matches!(
+            last.to_message(),
+            Some(crate::messages::Message::ChannelRemove(_))
+        ));
     }
 }

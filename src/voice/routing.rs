@@ -1,5 +1,6 @@
 //! Voice routing logic — determines recipients and dispatches audio packets.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -11,6 +12,10 @@ use crate::{
     client::{crypt::CryptState, Client},
     constants::PROTOBUF_INTRODUCED_VERSION,
     messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget},
+    s2s::application::proto::{
+        VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal, VoiceIntentTarget,
+        VoiceTargetChannel as S2SVoiceTargetChannel,
+    },
     server::Server,
 };
 
@@ -129,15 +134,276 @@ impl EncodeCache {
     }
 }
 
-/// `target_kind` value used in the S2S envelope for normal channel
-/// speech. Mirrors the Mumble `AudioContext::NORMAL` numbering.
 const S2S_TARGET_NORMAL: u32 = 0;
+const S2S_TARGET_SHOUT: u32 = 1;
+
+fn normal_intent(source_channel: u32) -> VoiceIntent {
+    VoiceIntent {
+        kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
+            source_channel,
+        })),
+    }
+}
+
+fn target_intent(
+    source_channel: u32,
+    vt: &crate::client::voice_target::VoiceTarget,
+) -> VoiceIntent {
+    VoiceIntent {
+        kind: Some(VoiceIntentKind::Target(VoiceIntentTarget {
+            source_channel,
+            sessions: vt.sessions().to_vec(),
+            channels: vt
+                .channels()
+                .iter()
+                .map(|ch| S2SVoiceTargetChannel {
+                    id: ch.id(),
+                    children: ch.sub_channels(),
+                    links: ch.links(),
+                    group: ch.only_group().to_owned(),
+                })
+                .collect(),
+        })),
+    }
+}
+
+fn audio_context_from_target_kind(target_kind: u32) -> AudioContext {
+    match target_kind {
+        1 => AudioContext::Shout,
+        2 => AudioContext::Whisper,
+        3 => AudioContext::Listen,
+        _ => AudioContext::Normal,
+    }
+}
+
+fn client_matches_voice_target_group(
+    client: &Arc<Box<Client>>,
+    source_channel: u32,
+    target_channel: u32,
+    group: &str,
+) -> bool {
+    let group = group.trim();
+    if group.is_empty() {
+        return true;
+    }
+    let groups: Vec<String> = client.get_groups_clone().into_iter().collect();
+    let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
+    let tokens: Vec<String> = client.get_tokens_clone().into_iter().collect();
+    let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+    let membership = crate::client::group::ClientMembershipQuery {
+        groups: &group_refs,
+        authenticated: client.get_user_id().is_some(),
+        access_tokens: &token_refs,
+        cert_hash: client.get_certificate_hash(),
+        has_verified_cert_chain: client.is_verified(),
+        ip_address: Some(client.get_real_ip_address()),
+        asn: None,
+        country_code: None,
+    };
+    crate::client::group::is_member_in_group(
+        group,
+        source_channel,
+        Some(target_channel),
+        &[],
+        &membership,
+    )
+}
+
+fn push_unique_target(
+    targets: &mut Vec<(Arc<Box<Client>>, AudioContext)>,
+    seen: &mut HashSet<(u32, AudioContext)>,
+    sender_id: crate::client::client_session_identifier::ClientSessionIdentifier,
+    client: Arc<Box<Client>>,
+    context: AudioContext,
+) {
+    if client.get_session_id() == sender_id || !client.is_authenticated() {
+        return;
+    }
+    if !client.read_local_state().is_some() {
+        return;
+    }
+    if seen.insert((u32::from(client.get_session_id()), context)) {
+        targets.push((client, context));
+    }
+}
+
+async fn resolve_voice_intent(
+    server: &Arc<Box<Server>>,
+    sender: Option<&Arc<Box<Client>>>,
+    sender_id: crate::client::client_session_identifier::ClientSessionIdentifier,
+    intent: &VoiceIntent,
+    default_context: AudioContext,
+) -> Vec<(Arc<Box<Client>>, AudioContext)> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let local_node_id = server.get_clients().local_node_id();
+
+    match intent.kind.as_ref() {
+        Some(VoiceIntentKind::Normal(normal)) => {
+            let source_channel = normal.source_channel;
+            let channel_clients = server
+                .get_clients()
+                .get_local_clients_in_channel(source_channel)
+                .await;
+            for client in channel_clients {
+                push_unique_target(
+                    &mut targets,
+                    &mut seen,
+                    sender_id,
+                    client,
+                    AudioContext::Normal,
+                );
+            }
+
+            if let Some(sender) = sender {
+                let linked_ids: Vec<u32> = server
+                    .get_channels()
+                    .get_channel(source_channel)
+                    .await
+                    .map(|ch| ch.links.into_iter().collect())
+                    .unwrap_or_default();
+                for linked_id in linked_ids {
+                    let perms = crate::client::acl::compute_permissions_for_client(
+                        server, sender, linked_id,
+                    )
+                    .await;
+                    if !perms.contains(crate::acl::ACLPermissions::Speak) {
+                        continue;
+                    }
+                    let linked_clients = server
+                        .get_clients()
+                        .get_local_clients_in_channel(linked_id)
+                        .await;
+                    for client in linked_clients {
+                        push_unique_target(
+                            &mut targets,
+                            &mut seen,
+                            sender_id,
+                            client,
+                            AudioContext::Normal,
+                        );
+                    }
+                }
+            }
+
+            let listeners = server
+                .get_clients()
+                .get_local_listeners_for_channel(source_channel)
+                .await;
+            for client in listeners {
+                push_unique_target(
+                    &mut targets,
+                    &mut seen,
+                    sender_id,
+                    client,
+                    AudioContext::Listen,
+                );
+            }
+        }
+        Some(VoiceIntentKind::Target(target)) => {
+            for session_raw in &target.sessions {
+                let session_id =
+                    crate::client::client_session_identifier::ClientSessionIdentifier::from(
+                        *session_raw,
+                    );
+                if session_id.node_id != local_node_id {
+                    continue;
+                }
+                if let Some(client) = server.get_clients().get_client(session_id).await {
+                    push_unique_target(
+                        &mut targets,
+                        &mut seen,
+                        sender_id,
+                        client,
+                        AudioContext::Whisper,
+                    );
+                }
+            }
+
+            for ch_target in &target.channels {
+                let mut channel_ids = if ch_target.children {
+                    collect_subtree_ids(server, ch_target.id).await
+                } else {
+                    vec![ch_target.id]
+                };
+
+                if ch_target.links {
+                    let mut linked_ids = Vec::new();
+                    for &ch_id in &channel_ids {
+                        if let Some(ch) = server.get_channels().get_channel(ch_id).await {
+                            for linked_id in ch.links {
+                                if !channel_ids.contains(&linked_id)
+                                    && !linked_ids.contains(&linked_id)
+                                {
+                                    linked_ids.push(linked_id);
+                                }
+                            }
+                        }
+                    }
+                    channel_ids.extend(linked_ids);
+                }
+
+                let channel_clients = server
+                    .get_clients()
+                    .get_local_clients_in_channels(&channel_ids)
+                    .await;
+                for client in channel_clients {
+                    let client_channel = client.get_current_channel_id();
+                    if !channel_ids.contains(&client_channel) {
+                        continue;
+                    }
+                    if !client_matches_voice_target_group(
+                        &client,
+                        target.source_channel,
+                        client_channel,
+                        &ch_target.group,
+                    ) {
+                        continue;
+                    }
+                    push_unique_target(
+                        &mut targets,
+                        &mut seen,
+                        sender_id,
+                        client,
+                        AudioContext::Shout,
+                    );
+                }
+
+                let channel_listeners = server
+                    .get_clients()
+                    .get_local_listeners_for_channels(&channel_ids)
+                    .await;
+                for client in channel_listeners {
+                    push_unique_target(
+                        &mut targets,
+                        &mut seen,
+                        sender_id,
+                        client,
+                        AudioContext::Listen,
+                    );
+                }
+            }
+        }
+        None => {
+            if let Some(sender) = sender {
+                push_unique_target(
+                    &mut targets,
+                    &mut seen,
+                    sender_id,
+                    sender.clone(),
+                    default_context,
+                );
+            }
+        }
+    }
+
+    targets
+}
 
 pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, audio: &Audio) {
     let sender_id = sender.get_session_id();
     let sender_channel = sender.get_current_channel_id();
 
-    // Check if sender is muted/suppressed
     {
         let gs = sender.read_global_state();
         if gs.is_muted() || gs.is_suppressed() || gs.is_self_muted() {
@@ -152,222 +418,74 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         }
     }
 
-    let target = audio.target;
+    tracing::trace!(
+        session = u32::from(sender_id),
+        channel = sender_channel,
+        target = %audio.target,
+        "routing voice packet"
+    );
+
+    let (intent, target_kind, send_s2s) = match audio.target {
+        AudioTarget::Normal => (normal_intent(sender_channel), S2S_TARGET_NORMAL, true),
+        AudioTarget::ServerLoopback => {
+            let targets = vec![(sender.clone(), AudioContext::Normal)];
+            flush_voice_batch(server, audio, &targets).await;
+            return;
+        }
+        AudioTarget::VoiceTarget(slot) => {
+            let udp_state = sender.udp_state().await;
+            let Some(vt) = udp_state.voice_target(slot).cloned() else {
+                return;
+            };
+            if vt.is_empty() {
+                return;
+            }
+            (target_intent(sender_channel, &vt), S2S_TARGET_SHOUT, true)
+        }
+    };
+
+    let default_context = audio_context_from_target_kind(target_kind);
+    let targets =
+        resolve_voice_intent(server, Some(sender), sender_id, &intent, default_context).await;
 
     tracing::trace!(
         session = u32::from(sender_id),
         channel = sender_channel,
-        target = %target,
-        "routing voice packet"
+        count = targets.len(),
+        "resolved local voice recipients"
     );
-
-    // Collect (client, context) pairs for batched sending. The audio payload
-    // is shared via the `outgoing` Arc.
-    let mut targets: Vec<(Arc<Box<Client>>, AudioContext)> = Vec::new();
-
-    // Pre-encoded payload for cross-node delivery (NORMAL channel speech
-    // only). Receivers decode and re-target per local recipient, so we
-    // encode with the speaker's chosen format and Normal context.
-    let mut s2s_payload: Option<bytes::Bytes> = None;
-
-    match target {
-        AudioTarget::Normal => {
-            tracing::trace!(
-                session = u32::from(sender_id),
-                channel = sender_channel,
-                "routing normal channel speech"
-            );
-
-            s2s_payload = Some(encode_s2s_voice_payload(audio));
-
-            // ── Normal speech: channel members (local only) ─────────────
-            // Remote clients in the same channel are reached via S2S
-            // delivery, not by direct UDP/TCP from this node.
-            let channel_clients = server
-                .get_clients()
-                .get_local_clients_in_channel(sender_channel)
-                .await;
-            for client in &channel_clients {
-                if client.get_session_id() == sender_id {
-                    continue;
-                }
-                if !client.is_authenticated() {
-                    continue;
-                }
-                targets.push((client.clone(), AudioContext::Normal));
-            }
-
-            // ── Normal speech: linked channels (local only) ─────────────
-            // Voice fans out to members of channels linked to the sender's
-            // channel. Per Mumble's reference behavior, the speaker must
-            // hold Speak on the linked channel for voice to cross.
-            let linked_ids: Vec<u32> = server
-                .get_channels()
-                .get_channel(sender_channel)
-                .await
-                .map(|ch| ch.links.into_iter().collect())
-                .unwrap_or_default();
-            for linked_id in linked_ids {
-                let perms =
-                    crate::client::acl::compute_permissions_for_client(server, sender, linked_id)
-                        .await;
-                if !perms.contains(crate::acl::ACLPermissions::Speak) {
-                    continue;
-                }
-                let linked_clients = server
-                    .get_clients()
-                    .get_local_clients_in_channel(linked_id)
-                    .await;
-                for client in &linked_clients {
-                    if client.get_session_id() == sender_id {
-                        continue;
-                    }
-                    if !client.is_authenticated() {
-                        continue;
-                    }
-                    targets.push((client.clone(), AudioContext::Normal));
-                }
-            }
-
-            // ── Normal speech: cross-channel listeners (local only) ─────
-            let listeners = server
-                .get_clients()
-                .get_local_listeners_for_channel(sender_channel)
-                .await;
-            for client in &listeners {
-                if client.get_session_id() == sender_id {
-                    continue;
-                }
-                if !client.is_authenticated() {
-                    continue;
-                }
-                targets.push((client.clone(), AudioContext::Listen));
-            }
-
-            tracing::trace!(
-                session = u32::from(sender_id),
-                channel = sender_channel,
-                count = targets.len(),
-                "resolved recipients for normal channel speech"
-            );
-        }
-        AudioTarget::ServerLoopback => {
-            tracing::trace!(
-                session = u32::from(sender_id),
-                channel = sender_channel,
-                "routing server loopback (target=31)"
-            );
-            targets.push((sender.clone(), AudioContext::Normal));
-        }
-        AudioTarget::VoiceTarget(slot) => {
-            // ── Whisper/shout target ─────────────────────────────────────
-            let udp_state = sender.udp_state().await;
-            let voice_target = udp_state.voice_target(slot);
-
-            if let Some(vt) = voice_target {
-                tracing::trace!(
-                    session = u32::from(sender_id),
-                    channel = sender_channel,
-                    slot,
-                    "resolving whisper/shout recipients"
-                );
-
-                // Direct session targets — only deliver to local sessions
-                // on this node. Remote whisper recipients must be reached
-                // via S2S (deferred to a later phase).
-                let local_node_id = server.get_clients().local_node_id();
-                for session_raw in vt.sessions() {
-                    let session_id =
-                        crate::client::client_session_identifier::ClientSessionIdentifier::from(
-                            *session_raw,
-                        );
-                    if session_id.node_id != local_node_id {
-                        continue;
-                    }
-                    if let Some(client) = server.get_clients().get_client(session_id).await {
-                        if client.is_authenticated() {
-                            targets.push((client, AudioContext::Whisper));
-                        }
-                    }
-                }
-
-                // Channel targets — use the index for each target channel subtree
-                for ch_target in vt.channels() {
-                    let mut channel_ids = if ch_target.sub_channels() {
-                        collect_subtree_ids(server, ch_target.id()).await
-                    } else {
-                        vec![ch_target.id()]
-                    };
-
-                    // Expand with linked channels when the links flag is set.
-                    if ch_target.links() {
-                        let mut linked_ids: Vec<u32> = Vec::new();
-                        for &ch_id in &channel_ids {
-                            if let Some(ch) = server.get_channels().get_channel(ch_id).await {
-                                for linked_id in ch.links {
-                                    if !channel_ids.contains(&linked_id)
-                                        && !linked_ids.contains(&linked_id)
-                                    {
-                                        linked_ids.push(linked_id);
-                                    }
-                                }
-                            }
-                        }
-                        channel_ids.extend(linked_ids);
-                    }
-
-                    let channel_clients = server
-                        .get_clients()
-                        .get_local_clients_in_channels(&channel_ids)
-                        .await;
-                    for client in &channel_clients {
-                        if client.get_session_id() == sender_id {
-                            continue;
-                        }
-                        if !client.is_authenticated() {
-                            continue;
-                        }
-                        targets.push((client.clone(), AudioContext::Shout));
-                    }
-
-                    // Listeners for all resolved channels receive the audio
-                    // with Listen context, matching Normal speech behaviour.
-                    let channel_listeners = server
-                        .get_clients()
-                        .get_local_listeners_for_channels(&channel_ids)
-                        .await;
-                    for client in &channel_listeners {
-                        if client.get_session_id() == sender_id {
-                            continue;
-                        }
-                        if !client.is_authenticated() {
-                            continue;
-                        }
-                        targets.push((client.clone(), AudioContext::Listen));
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Flush all targets locally ────────────────────────────────────────
     flush_voice_batch(server, audio, &targets).await;
 
-    // ── Cross-node delivery (NORMAL channel speech only for now) ─────────
-    if let Some(payload) = s2s_payload {
+    if send_s2s {
         if let Some(app) = server.s2s_manager().application() {
-            let result = app
-                .voice()
-                .send_for_channel(
-                    u32::from(sender_id),
-                    sender_channel,
-                    matches!(
-                        &audio.audio_payload,
-                        codec::AudioPayload::Opus(payload) if payload.is_terminator
-                    ),
-                    payload,
-                )
-                .await;
+            let payload = encode_s2s_voice_payload(audio);
+            let is_terminator = matches!(
+                &audio.audio_payload,
+                codec::AudioPayload::Opus(payload) if payload.is_terminator
+            );
+            let result = match intent.kind.as_ref() {
+                Some(VoiceIntentKind::Normal(normal)) => {
+                    app.voice()
+                        .send_for_channel(
+                            u32::from(sender_id),
+                            normal.source_channel,
+                            is_terminator,
+                            payload,
+                        )
+                        .await
+                }
+                _ => {
+                    app.voice()
+                        .send_intent_broadcast(
+                            u32::from(sender_id),
+                            target_kind,
+                            is_terminator,
+                            payload,
+                            intent,
+                        )
+                        .await
+                }
+            };
             if let Err(e) = result {
                 tracing::trace!(error=%e, "voice s2s send failed");
             }
@@ -378,7 +496,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
 pub(crate) async fn route_s2s_voice_frame(
     server: &Arc<Box<Server>>,
     from_immediate: crate::types::NodeIdentifier,
-    frame: crate::s2s::application::proto::VoiceFrame,
+    frame: VoiceFrame,
 ) {
     let sender_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
         frame.sender_session,
@@ -396,42 +514,33 @@ pub(crate) async fn route_s2s_voice_frame(
         }
     };
 
-    let sender_channel = server
-        .get_clients()
-        .get_client(sender_id)
-        .await
-        .map(|client| client.get_current_channel_id())
-        .unwrap_or(0);
-
-    let mut targets: Vec<(Arc<Box<Client>>, AudioContext)> = Vec::new();
-    let channel_clients = server
-        .get_clients()
-        .get_local_clients_in_channel(sender_channel)
-        .await;
-    for client in &channel_clients {
-        if client.get_session_id() == sender_id || !client.is_authenticated() {
-            continue;
+    let replicated_sender = server.get_clients().get_client(sender_id).await;
+    let intent = match frame.intent.clone() {
+        Some(intent) => intent,
+        None => {
+            let source_channel = replicated_sender
+                .as_ref()
+                .map(|client| client.get_current_channel_id())
+                .unwrap_or(0);
+            normal_intent(source_channel)
         }
-        targets.push((client.clone(), AudioContext::Normal));
-    }
+    };
 
-    let listeners = server
-        .get_clients()
-        .get_local_listeners_for_channel(sender_channel)
-        .await;
-    for client in &listeners {
-        if client.get_session_id() == sender_id || !client.is_authenticated() {
-            continue;
-        }
-        targets.push((client.clone(), AudioContext::Listen));
-    }
+    let targets = resolve_voice_intent(
+        server,
+        replicated_sender.as_ref(),
+        sender_id,
+        &intent,
+        audio_context_from_target_kind(frame.target_kind),
+    )
+    .await;
 
     tracing::trace!(
         from = from_immediate,
         sender = frame.sender_session,
-        channel = sender_channel,
+        target_kind = frame.target_kind,
         count = targets.len(),
-        "routing s2s normal voice frame to local recipients"
+        "routing s2s voice frame to local recipients"
     );
     flush_voice_batch(server, &decoded, &targets).await;
 }

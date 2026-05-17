@@ -6,6 +6,7 @@ use crate::{
     channels::{Channel, ChannelPatch},
     client::Client,
     errors::MessageHandlerError,
+    localization::{text, TextKey},
     messages::encoder::{ChannelState, DenyType, PermissionDenied},
     server::Server,
 };
@@ -46,7 +47,7 @@ pub async fn handle_channel_state(
                         r#type: DenyType::ChannelName,
                         session: u32::from(sender.get_session_id()),
                         channel_id: None,
-                        reason: Some("Channel name is required".into()),
+                        reason: Some(text(sender.language(), TextKey::ChannelNameRequired)),
                         name: None,
                         permission: None,
                     }));
@@ -68,14 +69,31 @@ pub async fn handle_channel_state(
 
             let is_temp = msg.temporary.unwrap_or(false);
             let new_id = channels.next_channel_id(is_temp).await;
+            let description_hash = match description_blob_patch(server, msg.description.as_deref())
+                .await
+            {
+                Ok(description_hash) => description_hash.flatten(),
+                Err(e) => {
+                    tracing::warn!(error = %e, channel_id = new_id, "create_channel failed to store description blob");
+                    return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                        r#type: DenyType::Text,
+                        session: u32::from(sender.get_session_id()),
+                        channel_id: None,
+                        reason: Some(format!("Failed to create channel: {e}").into()),
+                        name: None,
+                        permission: None,
+                    }));
+                }
+            };
 
-            let new_ch = Channel::new(
+            let mut new_ch = Channel::new(
                 new_id,
                 name,
                 msg.position.unwrap_or(0),
                 msg.max_users.unwrap_or(0),
                 Some(parent_id),
             );
+            new_ch.description_hash = description_hash;
 
             let op = ChannelOp::CreateChannel {
                 channel: new_ch.clone(),
@@ -131,7 +149,7 @@ pub async fn handle_channel_state(
                         r#type: DenyType::Permission,
                         session: u32::from(session),
                         channel_id: Some(0),
-                        reason: Some("Cannot rename the root channel".into()),
+                        reason: Some(text(sender.language(), TextKey::CannotRenameRootChannel)),
                         name: None,
                         permission: None,
                     }));
@@ -229,11 +247,24 @@ pub async fn handle_channel_state(
                 }
             }
 
+            let description_hash =
+                match description_blob_patch(server, msg.description.as_deref()).await {
+                    Ok(description_hash) => description_hash,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            channel_id,
+                            "update_channel failed to store description blob"
+                        );
+                        return Ok(());
+                    }
+                };
+
             let patch = ChannelPatch {
                 name: msg.name,
                 position: msg.position,
                 max_users: msg.max_users,
-                description_hash: None, // TODO: handle description blob
+                description_hash,
                 parent_id: msg.parent.map(|p| Some(p)),
             };
 
@@ -263,4 +294,19 @@ pub async fn handle_channel_state(
     }
 
     Ok(())
+}
+
+async fn description_blob_patch(
+    server: &Arc<Box<Server>>,
+    description: Option<&str>,
+) -> std::io::Result<Option<Option<String>>> {
+    match description {
+        Some("") => Ok(Some(None)),
+        Some(description) => server
+            .get_channel_blobs()
+            .put(description.as_bytes())
+            .await
+            .map(|hash| Some(Some(hash))),
+        None => Ok(None),
+    }
 }

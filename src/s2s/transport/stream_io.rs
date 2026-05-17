@@ -180,6 +180,22 @@ async fn run_pump<S>(
     let mut pending = PendingPings::new(cfg.max_pending_pings);
     let level_for_metrics = cfg.transport.service_level();
 
+    let hello = build_frame(
+        cfg.local_node,
+        cfg.peer_node,
+        level_for_metrics,
+        FrameType::Hello,
+        MessageClass::Regular,
+        peer.next_seq(),
+        now_us(),
+        Bytes::new(),
+    );
+    if let Err(e) = encode_and_send(&mut framed, &hello, cfg.transport, &peer).await {
+        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "hello write failed");
+        closed.cancel();
+        return;
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -244,7 +260,7 @@ async fn run_pump<S>(
                     cfg.local_node,
                     cfg.peer_node,
                     level_for_metrics,
-                    FrameType::Ping,
+                    FrameType::KeepAlive,
                     MessageClass::Regular,
                     peer.next_seq(),
                     ts,
@@ -253,7 +269,7 @@ async fn run_pump<S>(
                 match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
                     Ok(sent) => pending.insert(ts, sent),
                     Err(e) => {
-                        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "ping write failed");
+                        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "keepalive write failed");
                         break;
                     }
                 }
@@ -349,7 +365,7 @@ where
                 frame.payload,
             ));
         }
-        pb::FrameType::FramePing => {
+        pb::FrameType::FramePing | pb::FrameType::FrameKeepalive => {
             // Echo the payload back so the round trip carries enough bytes
             // for the sender to estimate throughput. Empty pings (latency
             // probes) round-trip a tiny pong; large probes round-trip a
@@ -384,8 +400,8 @@ where
                 }
             }
         }
-        pb::FrameType::FrameKeepalive | pb::FrameType::FrameHello => {
-            // No-op for now; reserved for future use.
+        pb::FrameType::FrameHello => {
+            trace!(peer=%cfg.peer_node, transport=?cfg.transport, seq=frame.seq, "received transport hello");
         }
         pb::FrameType::FrameBye => {
             return Err(std::io::Error::new(

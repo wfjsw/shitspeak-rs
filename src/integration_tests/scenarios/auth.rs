@@ -1,8 +1,11 @@
 //! Auth-flow scenarios: success, wrong password, unknown user, server full,
 //! and `cert_required` rejection.
 
+use crate::acl::{ACLPermissions, ACL};
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
-use crate::messages::encoder::RejectType;
+use crate::localization::Language;
+use crate::messages::encoder::{ContextActionModify, RejectType};
+use crate::messages::Message;
 
 /// Checks that two registered users can authenticate concurrently.
 /// Expected: each client gets a distinct session, its registered user id, and
@@ -38,6 +41,73 @@ async fn auth_two_clients_succeeds() {
     assert_eq!(bob.welcome_text.as_deref(), Some("test-welcome"));
 }
 
+#[tokio::test]
+async fn context_action_modify_from_client_closes_connection() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+
+    alice
+        .send(
+            ContextActionModify {
+                action: "server-only".to_string(),
+                text: Some("Server only".to_string()),
+                context: Some(0),
+                operation: Some(0),
+            }
+            .into(),
+        )
+        .await;
+
+    assert!(
+        alice.recv_closed(std::time::Duration::from_secs(2)).await,
+        "client-sent ContextActionModify should close the connection"
+    );
+}
+
+#[tokio::test]
+async fn auth_server_sync_reports_evaluated_root_permissions() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![ACL {
+                user_id: None,
+                group: Some("all".to_owned()),
+                apply_here: true,
+                apply_subs: true,
+                allow: enumflags2::BitFlags::empty(),
+                deny: ACLPermissions::TextMessage.into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth");
+
+    let expected = (ACLPermissions::Traverse
+        | ACLPermissions::Enter
+        | ACLPermissions::Speak
+        | ACLPermissions::Whisper
+        | ACLPermissions::Listen)
+        .bits();
+    assert_eq!(bob.initial_permissions, Some(u64::from(expected)));
+}
+
 /// Checks that a registered user with the wrong password is rejected.
 /// Expected: authentication fails with `Reject::WrongUserPw`, matching
 /// Mumble's reject mapping in `D:\mumble\src\murmur\Messages.cpp::msgAuthenticate`
@@ -52,6 +122,30 @@ async fn auth_wrong_password_rejected() {
     match TestClient::connect_and_authenticate(&server, "alice", Some("nope")).await {
         Err(crate::integration_tests::harness::test_client::ConnectError::Rejected(r)) => {
             assert_eq!(r.r#type, Some(RejectType::WrongUserPw as i32));
+        }
+        Err(other) => panic!("expected Rejected, got {other:?}"),
+        Ok(_) => panic!("auth should have failed"),
+    }
+}
+
+#[tokio::test]
+async fn auth_wrong_password_uses_authenticator_language() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server.authenticator.register_user_with_language(
+        "alice",
+        Some("hunter2"),
+        Some(1),
+        vec![],
+        Language::Spanish,
+    );
+
+    match TestClient::connect_and_authenticate(&server, "alice", Some("nope")).await {
+        Err(crate::integration_tests::harness::test_client::ConnectError::Rejected(r)) => {
+            assert_eq!(r.r#type, Some(RejectType::WrongUserPw as i32));
+            assert_eq!(
+                r.reason.as_deref(),
+                Some("Usuario o contraseña incorrectos")
+            );
         }
         Err(other) => panic!("expected Rejected, got {other:?}"),
         Ok(_) => panic!("auth should have failed"),
@@ -136,4 +230,34 @@ async fn auth_no_cert_when_required_rejected() {
         Err(other) => panic!("expected Rejected, got {other:?}"),
         Ok(_) => panic!("auth should have failed (no cert)"),
     }
+}
+
+#[tokio::test]
+async fn permission_denied_uses_authenticated_language() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server.authenticator.register_user_with_language(
+        "alice",
+        None,
+        Some(1),
+        vec![],
+        Language::Spanish,
+    );
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    alice.move_to_channel(99).await;
+
+    let denied = alice
+        .recv_until(
+            |m| matches!(m, Message::PermissionDenied(pd) if pd.channel_id == Some(99)),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+    let Some(Message::PermissionDenied(pd)) = denied else {
+        panic!("Alice should receive PermissionDenied");
+    };
+    assert_eq!(pd.reason.as_deref(), Some("El canal 99 no existe"));
 }

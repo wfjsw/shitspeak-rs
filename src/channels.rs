@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::acl::ACL;
 
+/// Replicated two-phase delete marker for a channel subtree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDeleteState {
+    pub nonce: u64,
+    pub started_at_ms: i64,
+    pub origin_node: u16,
+}
+
 /// A single Mumble channel.
 ///
 /// `description_hash` holds the 40-character lowercase SHA-1 hex of the
@@ -22,6 +30,8 @@ pub struct Channel {
     /// SHA-1 hex of description blob; `None` = no description.
     pub description_hash: Option<String>,
     pub acls: Vec<ACL>,
+    #[serde(default)]
+    pub pending_delete: Option<PendingDeleteState>,
 }
 
 impl Channel {
@@ -42,6 +52,7 @@ impl Channel {
             links: HashSet::new(),
             description_hash: None,
             acls: Vec::new(),
+            pending_delete: None,
         }
     }
 
@@ -59,6 +70,10 @@ impl Channel {
 
     pub fn is_root(&self) -> bool {
         self.parent_id.is_none()
+    }
+
+    pub fn is_pending_delete(&self) -> bool {
+        self.pending_delete.is_some()
     }
 }
 

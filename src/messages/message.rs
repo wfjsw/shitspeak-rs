@@ -40,6 +40,7 @@ pub enum Message {
     RequestBlob(RequestBlob),
     ServerConfig(ServerConfig),
     SuggestConfig(SuggestConfig),
+    PluginDataTransmission(PluginDataTransmission),
 }
 
 impl std::fmt::Display for Message {
@@ -69,6 +70,29 @@ mod tests {
         match Message::from_proto(1, payload.clone()).unwrap() {
             Message::UDPTunnel(data) => assert_eq!(data, payload),
             other => panic!("expected UDPTunnel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_data_transmission_uses_mumble_wire_tag_26() {
+        let message =
+            Message::PluginDataTransmission(crate::mumble_proto::PluginDataTransmission {
+                sender_session: Some(7),
+                receiver_sessions: vec![8, 9],
+                data: Some(Bytes::from_static(b"plugin-payload")),
+                data_id: Some("example.plugin".to_string()),
+            });
+
+        assert_eq!(message.proto_tag(), 26);
+        let decoded = Message::from_proto(26, message.to_proto_vec().unwrap()).unwrap();
+        match decoded {
+            Message::PluginDataTransmission(plugin) => {
+                assert_eq!(plugin.sender_session, Some(7));
+                assert_eq!(plugin.receiver_sessions, vec![8, 9]);
+                assert_eq!(plugin.data, Some(Bytes::from_static(b"plugin-payload")));
+                assert_eq!(plugin.data_id.as_deref(), Some("example.plugin"));
+            }
+            other => panic!("expected PluginDataTransmission, got {other:?}"),
         }
     }
 }
