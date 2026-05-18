@@ -10,6 +10,24 @@ const BLOCK_SIZE: usize = 16;
 const MAX_PLAINTEXT_BYTES: usize = 1024;
 const MAX_BLOCKS: usize = MAX_PLAINTEXT_BYTES / BLOCK_SIZE; // 64
 
+fn stage_full_blocks<'a>(
+    dest_ciphertext: &'a mut [u8],
+    data: &[u8],
+    delta_chain: &[[u8; BLOCK_SIZE]],
+    n_main: usize,
+) -> &'a mut [u8] {
+    let bulk_len = n_main * BLOCK_SIZE;
+    let bulk = &mut dest_ciphertext[..bulk_len];
+    for i in 0..n_main {
+        let block = &data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+        let d = &delta_chain[i + 1];
+        for j in 0..BLOCK_SIZE {
+            bulk[i * BLOCK_SIZE + j] = block[j] ^ d[j];
+        }
+    }
+    bulk
+}
+
 pub struct Ocb2 {
     key: Bytes,
     aes: Aes128,
@@ -108,18 +126,10 @@ impl Ocb2 {
         let tag_size = self.overhead();
         let dest_ciphertext = &mut dest[tag_size..];
 
-        let mut bulk = [0u8; MAX_PLAINTEXT_BYTES];
-        let bulk_len = n_main * BLOCK_SIZE;
-        for i in 0..n_main {
-            let block = &data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
-            let d = &delta_chain[i + 1];
-            for j in 0..BLOCK_SIZE {
-                bulk[i * BLOCK_SIZE + j] = block[j] ^ d[j];
-            }
-        }
+        let bulk = stage_full_blocks(dest_ciphertext, data, &delta_chain, n_main);
 
-        if bulk_len > 0 {
-            self.aes.encrypt_blocks(&mut bulk[..bulk_len])?;
+        if !bulk.is_empty() {
+            self.aes.encrypt_blocks(bulk)?;
         }
 
         // ── Phase 5 (post-XOR only). DO NOT FUSE A CHECKSUM XOR INTO THIS
@@ -140,7 +150,7 @@ impl Ocb2 {
         for i in 0..n_main {
             let d = &delta_chain[i + 1];
             for j in 0..BLOCK_SIZE {
-                dest_ciphertext[i * BLOCK_SIZE + j] = bulk[i * BLOCK_SIZE + j] ^ d[j];
+                dest_ciphertext[i * BLOCK_SIZE + j] ^= d[j];
             }
         }
 
@@ -268,19 +278,11 @@ impl CryptoMode for Ocb2 {
 
         // ── Phase 3: pre-XOR every main-loop block with its delta into one
         // contiguous buffer. Pure Rust, no FFI.
-        let mut bulk = [0u8; MAX_PLAINTEXT_BYTES];
-        let bulk_len = n_main * BLOCK_SIZE;
-        for i in 0..n_main {
-            let block = &data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
-            let d = &delta_chain[i + 1];
-            for j in 0..BLOCK_SIZE {
-                bulk[i * BLOCK_SIZE + j] = block[j] ^ d[j];
-            }
-        }
+        let bulk = stage_full_blocks(dest_ciphertext, data, &delta_chain, n_main);
 
         // ── Phase 4: ONE batched ECB encrypt for all main-loop blocks.
-        if bulk_len > 0 {
-            self.aes.encrypt_blocks(&mut bulk[..bulk_len])?;
+        if !bulk.is_empty() {
+            self.aes.encrypt_blocks(bulk)?;
         }
 
         // ── Phase 5: post-XOR to produce ciphertext, accumulate checksum.
@@ -298,7 +300,7 @@ impl CryptoMode for Ocb2 {
         for i in 0..n_main {
             let d = &delta_chain[i + 1];
             for j in 0..BLOCK_SIZE {
-                dest_ciphertext[i * BLOCK_SIZE + j] = bulk[i * BLOCK_SIZE + j] ^ d[j];
+                dest_ciphertext[i * BLOCK_SIZE + j] ^= d[j];
                 checksum[j] ^= data[i * BLOCK_SIZE + j];
             }
         }

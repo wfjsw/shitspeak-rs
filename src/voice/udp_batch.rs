@@ -6,14 +6,115 @@
 //! frequent).  On non-Linux platforms we fall back to a simple loop of
 //! `send_to` calls.
 
-use bytes::Bytes;
+use std::net::SocketAddr;
 
-/// A single datagram queued for batched transmission.
-pub struct QueuedDatagram {
-    /// Destination socket address.
-    pub addr: std::net::SocketAddr,
-    /// Encrypted payload.
-    pub data: Bytes,
+use crate::constants::MTU;
+
+const DATAGRAMS_PER_CHUNK: usize = 64;
+const CHUNK_BYTES: usize = MTU * DATAGRAMS_PER_CHUNK;
+
+struct QueuedDatagram {
+    addr: SocketAddr,
+    chunk: usize,
+    offset: usize,
+    len: usize,
+}
+
+pub struct DatagramBatch {
+    chunks: Vec<Vec<u8>>,
+    datagrams: Vec<QueuedDatagram>,
+}
+
+impl DatagramBatch {
+    pub fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            datagrams: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(datagram_capacity: usize) -> Self {
+        let mut chunks = Vec::new();
+        if datagram_capacity > 0 {
+            let first_chunk_bytes = CHUNK_BYTES
+                .min(datagram_capacity.saturating_mul(MTU))
+                .max(MTU);
+            chunks.push(Vec::with_capacity(first_chunk_bytes));
+        }
+
+        Self {
+            chunks,
+            datagrams: Vec::with_capacity(datagram_capacity),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.datagrams.is_empty()
+    }
+
+    pub fn try_push_zeroed<E>(
+        &mut self,
+        addr: SocketAddr,
+        len: usize,
+        write: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let created_chunk = self.ensure_chunk(len);
+        let chunk = self.chunks.len() - 1;
+        let offset = self.chunks[chunk].len();
+        self.chunks[chunk].resize(offset + len, 0);
+
+        match write(&mut self.chunks[chunk][offset..offset + len]) {
+            Ok(()) => {
+                self.datagrams.push(QueuedDatagram {
+                    addr,
+                    chunk,
+                    offset,
+                    len,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                if created_chunk {
+                    self.chunks.pop();
+                } else {
+                    self.chunks[chunk].truncate(offset);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub fn append(&mut self, mut other: Self) {
+        if other.datagrams.is_empty() {
+            return;
+        }
+
+        let chunk_base = self.chunks.len();
+        self.datagrams.reserve(other.datagrams.len());
+        for datagram in &mut other.datagrams {
+            datagram.chunk += chunk_base;
+        }
+        self.datagrams.append(&mut other.datagrams);
+        self.chunks.append(&mut other.chunks);
+    }
+
+    fn ensure_chunk(&mut self, len: usize) -> bool {
+        let need_new_chunk = match self.chunks.last() {
+            Some(chunk) => chunk.capacity().saturating_sub(chunk.len()) < len,
+            None => true,
+        };
+
+        if need_new_chunk {
+            self.chunks.push(Vec::with_capacity(CHUNK_BYTES.max(len)));
+        }
+
+        need_new_chunk
+    }
+
+    fn data(&self, datagram: &QueuedDatagram) -> &[u8] {
+        let chunk = &self.chunks[datagram.chunk];
+        &chunk[datagram.offset..datagram.offset + datagram.len]
+    }
 }
 
 /// Send all queued datagrams through `socket`.
@@ -22,7 +123,7 @@ pub struct QueuedDatagram {
 /// it loops over `send_to`.
 pub async fn flush_batch(
     socket: &tokio::net::UdpSocket,
-    batch: &[QueuedDatagram],
+    batch: &DatagramBatch,
 ) -> std::io::Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -40,12 +141,9 @@ pub async fn flush_batch(
 }
 
 /// Fallback: one `send_to` per datagram.
-async fn send_each(
-    socket: &tokio::net::UdpSocket,
-    batch: &[QueuedDatagram],
-) -> std::io::Result<()> {
-    for d in batch {
-        socket.send_to(&d.data, d.addr).await?;
+async fn send_each(socket: &tokio::net::UdpSocket, batch: &DatagramBatch) -> std::io::Result<()> {
+    for d in &batch.datagrams {
+        socket.send_to(batch.data(d), d.addr).await?;
     }
     Ok(())
 }
@@ -60,7 +158,7 @@ async fn send_each(
 #[cfg(target_os = "linux")]
 async fn sendmmsg_linux(
     socket: &tokio::net::UdpSocket,
-    batch: &[QueuedDatagram],
+    batch: &DatagramBatch,
 ) -> std::io::Result<()> {
     use std::io;
     use std::os::fd::AsRawFd;
@@ -73,17 +171,18 @@ async fn sendmmsg_linux(
 
     // Convert our batch into libc::mmsghdr structures.
     // We process in chunks to avoid huge stack allocations.
-    for chunk in batch.chunks(CHUNK_SIZE) {
+    for chunk in batch.datagrams.chunks(CHUNK_SIZE) {
         let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(chunk.len());
         let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(chunk.len());
         let mut sockaddrs: Vec<libc::sockaddr_in6> = Vec::with_capacity(chunk.len());
 
         for d in chunk {
             let addr = socket_addr_to_sockaddr_in6(&d.addr);
+            let data = batch.data(d);
 
             iovecs.push(libc::iovec {
-                iov_base: d.data.as_ptr() as *mut libc::c_void,
-                iov_len: d.data.len(),
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
             });
 
             sockaddrs.push(addr);

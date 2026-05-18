@@ -30,6 +30,7 @@ use crate::{
     client_repository::ClientRepository,
     codec_info::CodecInfo,
     config::{Config, UdpPingUserCountScope},
+    constants::MTU,
     s2s::S2SManager,
     types::NodeIdentifier,
 };
@@ -350,7 +351,7 @@ impl Server {
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048];
+            let mut buf = BytesMut::with_capacity(MTU);
             tracing::info!(
                 "UDP drain started, listening on {}",
                 socket
@@ -358,8 +359,10 @@ impl Server {
                     .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
             );
             loop {
+                buf.clear();
+                buf.reserve(MTU);
                 let (len, src_addr) = tokio::select! {
-                    result = socket.recv_from(&mut buf) => match result {
+                    result = socket.recv_buf_from(&mut buf) => match result {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::warn!("UDP recv error: {e}");
@@ -374,11 +377,10 @@ impl Server {
                     continue;
                 }
 
-                let packet = &buf[..len];
                 tracing::trace!("UDP received {} bytes from {}", len, src_addr);
 
                 if ping_enabled {
-                    match crate::voice::ping::PingRequest::decode(packet) {
+                    match crate::voice::ping::PingRequest::decode(&buf) {
                         Ok(ping) => {
                             tracing::debug!(
                                 "UDP ping from {}: timestamp={}, format={}",
@@ -419,7 +421,7 @@ impl Server {
                 }
 
                 if voice_enabled {
-                    let packet = Bytes::copy_from_slice(packet);
+                    let packet = buf.split().freeze();
                     match tx.try_send((packet, src_addr)) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {

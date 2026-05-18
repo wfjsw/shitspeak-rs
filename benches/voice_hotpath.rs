@@ -21,10 +21,12 @@ use shitspeak_rs::messages::encoder::{AudioContext, AudioTarget};
 use shitspeak_rs::voice::codec::{
     Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat,
 };
+use shitspeak_rs::voice::udp_batch::DatagramBatch;
 
 const KEY: [u8; 16] = [0x42; 16];
 const IV_E: [u8; 16] = [0x01; 16];
 const IV_D: [u8; 16] = [0x02; 16];
+const RAYON_DATAGRAM_BATCH_MIN_LEN: usize = 256;
 
 fn make_crypt() -> CryptState {
     CryptState::from_key("OCB2-AES128", &KEY, &IV_E, &IV_D).expect("crypt state")
@@ -379,6 +381,83 @@ fn bench_fanout_seq_cached_vec(c: &mut Criterion) {
     group.finish();
 }
 
+// Mirrors the current production UDP fanout buffer shape: encode once, precompute
+// the OCB2 plaintext checksum once, then encrypt each recipient directly into a
+// DatagramBatch chunk arena.
+fn bench_fanout_seq_datagram_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fanout/seq_datagram_batch_encode_encrypt");
+    let opus_len = 170;
+    let audio = make_audio(opus_len);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 64738));
+
+    for &n in recipient_counts().iter() {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_with_setup(
+                || (0..n).map(|_| make_crypt()).collect::<Vec<_>>(),
+                |mut states| {
+                    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
+                    let checksum = CryptState::compute_plaintext_checksum(&raw);
+                    let mut batch = DatagramBatch::with_capacity(states.len());
+
+                    for state in &mut states {
+                        let encrypted_len = raw.len() + state.overhead();
+                        batch
+                            .try_push_zeroed(addr, encrypted_len, |buf| {
+                                state.encrypt_with_precomputed_checksum(buf, &raw, &checksum)
+                            })
+                            .unwrap();
+                    }
+
+                    black_box(batch);
+                },
+            );
+        });
+    }
+    group.finish();
+}
+
+// Same production-shaped buffer path as above, but using the large-fanout
+// Rayon fold/reduce layout from flush_voice_batch.
+fn bench_fanout_rayon_datagram_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fanout/rayon_datagram_batch_encode_encrypt");
+    let opus_len = 170;
+    let audio = make_audio(opus_len);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 64738));
+
+    for &n in recipient_counts().iter() {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_with_setup(
+                || (0..n).map(|_| make_crypt()).collect::<Vec<_>>(),
+                |states| {
+                    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
+                    let checksum = CryptState::compute_plaintext_checksum(&raw);
+                    let batch = states
+                        .into_par_iter()
+                        .with_min_len(RAYON_DATAGRAM_BATCH_MIN_LEN)
+                        .fold(DatagramBatch::new, |mut batch, mut state| {
+                            let encrypted_len = raw.len() + state.overhead();
+                            batch
+                                .try_push_zeroed(addr, encrypted_len, |buf| {
+                                    state.encrypt_with_precomputed_checksum(buf, &raw, &checksum)
+                                })
+                                .unwrap();
+                            batch
+                        })
+                        .reduce(DatagramBatch::new, |mut left, right| {
+                            left.append(right);
+                            left
+                        });
+
+                    black_box(batch);
+                },
+            );
+        });
+    }
+    group.finish();
+}
+
 // ── 7. spawn_blocking necessity ──────────────────────────────────────────────
 //
 // flush_voice_batch currently wraps the rayon par_iter inside spawn_blocking
@@ -605,6 +684,8 @@ criterion_group!(
     bench_fanout_seq_encrypt_only,
     bench_fanout_seq_cached,
     bench_fanout_seq_cached_vec,
+    bench_fanout_seq_datagram_batch,
+    bench_fanout_rayon_datagram_batch,
     bench_dispatch_strategies,
     bench_multistream,
 );

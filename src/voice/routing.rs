@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 
 use super::codec::{self, Audio, PacketFormat};
 use super::routing_queue::VoiceRoutingPayload;
-use super::udp_batch::{self, QueuedDatagram};
+use super::udp_batch::{self, DatagramBatch};
 use crate::{
     client::{crypt::CryptState, Client},
     constants::PROTOBUF_INTRODUCED_VERSION,
@@ -22,9 +22,11 @@ use crate::{
 /// Recipient count above which the encrypt fan-out is dispatched to rayon
 /// inside `spawn_blocking`. Below this threshold, sequential per-recipient
 /// encrypt on the routing task is faster: the per-recipient unit of work
-/// (~600 ns at 170-byte packet) is too small to amortize rayon's task
-/// scheduling overhead. Measured crossover on a Ryzen 7 5800H is ~256.
-const RAYON_FANOUT_THRESHOLD: usize = 256;
+/// (~450 ns at 170-byte packet) is too small to amortize rayon's task
+/// scheduling overhead. Fresh profiling shows sequential remains faster at
+/// 256 recipients; rayon starts paying off around 512.
+const RAYON_FANOUT_THRESHOLD: usize = 512;
+const RAYON_FANOUT_BATCH_MIN_LEN: usize = 256;
 
 /// Pluck the recipient's preferred wire format. Lock-free read backed by
 /// the per-client `AtomicU64` protocol version on `Client`.
@@ -568,7 +570,7 @@ pub(crate) async fn flush_voice_batch(
 
     if targets.len() < RAYON_FANOUT_THRESHOLD {
         let mut cache = EncodeCache::new();
-        let mut udp_batch: Vec<QueuedDatagram> = Vec::with_capacity(targets.len());
+        let mut udp_batch = DatagramBatch::with_capacity(targets.len());
 
         for (client, context) in targets {
             let format = client_packet_format(client, server_protocol_version);
@@ -588,9 +590,11 @@ pub(crate) async fn flush_voice_batch(
             let Some(state) = crypt.as_mut() else {
                 continue;
             };
-            let mut buf = BytesMut::zeroed(entry.bytes.len() + state.overhead());
-            if state
-                .encrypt_with_precomputed_checksum(&mut buf, &entry.bytes, &entry.checksum)
+            let encrypted_len = entry.bytes.len() + state.overhead();
+            if udp_batch
+                .try_push_zeroed(addr, encrypted_len, |buf| {
+                    state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
+                })
                 .is_err()
             {
                 tracing::trace!(
@@ -600,10 +604,6 @@ pub(crate) async fn flush_voice_batch(
                 client.try_enqueue_voice_tcp(entry.bytes);
                 continue;
             }
-            udp_batch.push(QueuedDatagram {
-                addr,
-                data: buf.freeze(),
-            });
         }
 
         if !udp_batch.is_empty() {
@@ -652,42 +652,50 @@ pub(crate) async fn flush_voice_batch(
         return;
     }
 
-    // Snapshot the cache as a plain Vec for the rayon closure (Send + Sync).
-    let plaintexts: Arc<Vec<((PacketFormat, AudioContext), Encoded)>> = Arc::new(
-        cache
-            .slots
-            .into_iter()
-            .flatten()
-            .chain(cache.overflow.into_iter())
-            .collect(),
-    );
+    // Snapshot the cache as a plain Vec for the rayon closure. The Vec is
+    // moved into `spawn_blocking`; rayon workers only borrow it during the
+    // scoped parallel iteration, so no Arc wrapper is needed here.
+    let plaintexts: Vec<((PacketFormat, AudioContext), Encoded)> = cache
+        .slots
+        .into_iter()
+        .flatten()
+        .chain(cache.overflow.into_iter())
+        .collect();
 
-    let plaintexts_for_task = plaintexts.clone();
-    let batch: Vec<QueuedDatagram> = tokio::task::spawn_blocking(move || {
+    let batch: DatagramBatch = tokio::task::spawn_blocking(move || {
         use rayon::prelude::*;
         udp_items
             .into_par_iter()
-            .filter_map(|(client, addr, format, context)| {
-                let entry = plaintexts_for_task
-                    .iter()
-                    .find_map(|(k, e)| (*k == (format, context)).then(|| e.clone()))?;
-                let mut crypt = client.crypt_state();
-                let state = crypt.as_mut()?;
-                let mut buf = BytesMut::zeroed(entry.bytes.len() + state.overhead());
-                state
-                    .encrypt_with_precomputed_checksum(&mut buf, &entry.bytes, &entry.checksum)
-                    .ok()?;
-                Some(QueuedDatagram {
-                    addr,
-                    data: buf.freeze(),
-                })
+            .with_min_len(RAYON_FANOUT_BATCH_MIN_LEN)
+            .fold(
+                DatagramBatch::new,
+                |mut batch, (client, addr, format, context)| {
+                    let Some(entry) = plaintexts
+                        .iter()
+                        .find_map(|(k, e)| (*k == (format, context)).then_some(e))
+                    else {
+                        return batch;
+                    };
+                    let mut crypt = client.crypt_state();
+                    let Some(state) = crypt.as_mut() else {
+                        return batch;
+                    };
+                    let encrypted_len = entry.bytes.len() + state.overhead();
+                    let _ = batch.try_push_zeroed(addr, encrypted_len, |buf| {
+                        state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
+                    });
+                    batch
+                },
+            )
+            .reduce(DatagramBatch::new, |mut left, right| {
+                left.append(right);
+                left
             })
-            .collect()
     })
     .await
     .unwrap_or_else(|e| {
         tracing::warn!("voice encrypt task join error: {e}");
-        Vec::new()
+        DatagramBatch::new()
     });
 
     if !batch.is_empty() {
