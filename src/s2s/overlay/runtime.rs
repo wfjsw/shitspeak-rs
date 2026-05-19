@@ -77,6 +77,7 @@ impl OverlayInner {
             boot_epoch,
             self_addresses,
             max_users,
+            cfg.route_transit_messages(),
         ));
 
         let shutdown = CancellationToken::new();
@@ -183,6 +184,7 @@ impl OverlayInner {
             self_id: self.self_id,
             shutdown: self.shutdown.clone(),
             cfg: self.cfg.clone(),
+            emitter: self.emitter.clone(),
         });
         super::inbound::spawn_dispatcher(dctx, inbound);
 

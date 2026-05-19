@@ -43,6 +43,8 @@ pub struct LsaEmitter {
     pub max_users: Arc<AtomicU64>,
     force_next_emit: AtomicBool,
     next_seq: AtomicU64,
+    /// Whether this node asks peers not to use it as a transit router.
+    transit_disabled: AtomicBool,
     /// Last `(rtt_us, throughput_bps)` per neighbor we last published. Used
     /// to apply the cost-change-threshold filter.
     last_published: parking_lot::Mutex<std::collections::HashMap<NodeIdentifier, (u64, u64)>>,
@@ -58,12 +60,14 @@ impl LsaEmitter {
         boot_epoch: u64,
         self_addresses: Vec<crate::s2s::transport::PeerAddress>,
         max_users: Arc<AtomicU64>,
+        route_transit_messages: bool,
     ) -> Self {
         Self {
             self_id,
             boot_epoch,
             max_users,
             force_next_emit: AtomicBool::new(false),
+            transit_disabled: AtomicBool::new(!route_transit_messages),
             next_seq: AtomicU64::new(1),
             last_published: parking_lot::Mutex::new(std::collections::HashMap::new()),
             self_addresses,
@@ -84,6 +88,15 @@ impl LsaEmitter {
     pub fn poke_force(&self) {
         self.force_next_emit.store(true, Ordering::Relaxed);
         self.trigger.notify_one();
+    }
+
+    pub fn transit_disabled(&self) -> bool {
+        self.transit_disabled.load(Ordering::Relaxed)
+    }
+
+    pub fn update_route_transit_messages(&self, enabled: bool) {
+        self.transit_disabled.store(!enabled, Ordering::Relaxed);
+        self.poke_force();
     }
 }
 
@@ -122,6 +135,11 @@ pub fn build_local_lsa(
             0
         } else {
             emitter.max_users.load(Ordering::Relaxed)
+        },
+        transit_disabled: if tombstone {
+            false
+        } else {
+            emitter.transit_disabled()
         },
     }
 }

@@ -136,6 +136,12 @@ impl S2SManager {
         }
     }
 
+    pub fn update_route_transit_messages(&self, enabled: bool) {
+        if let Some(overlay) = self.overlay() {
+            overlay.update_route_transit_messages(enabled);
+        }
+    }
+
     pub fn cluster_max_users(&self) -> Option<u64> {
         self.overlay().map(|overlay| overlay.alive_max_users())
     }

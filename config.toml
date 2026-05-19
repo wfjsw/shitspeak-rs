@@ -66,6 +66,9 @@ max_pending_pings = 64
 # Max LSAs per `LsdbSyncResp` frame. Larger = fewer round trips on a
 # big diff but bigger response packets.
 lsdb_sync_max_response_lsas = 256
+# Whether this node may be used as a transit router for other nodes' S2S
+# overlay data. Local delivery and locally originated messages still work.
+route_transit_messages = true
 
 # ── L3 replications tunables ──────────────────────────────────────────
 [s2s.replications]

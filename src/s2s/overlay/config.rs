@@ -80,6 +80,12 @@ pub struct OverlayConfig {
     cost_rerun_rtt_pct: f64, // re-emit when RTT shifts >= this fraction
     cost_rerun_throughput_pct: f64, // re-emit when throughput shifts >= this fraction
 
+    // ── Transit routing ──
+    /// When enabled, inbound overlay data for other nodes may be forwarded
+    /// through this node. Local delivery and locally originated messages are
+    /// unaffected.
+    route_transit_messages: bool,
+
     // ── LSDB sync chunking ──
     /// Max LSAs per `LsdbSyncResp` frame. The responder splits a delta
     /// across multiple frames when it exceeds this cap.
@@ -113,6 +119,7 @@ impl OverlayConfig {
             cost_rerun_rtt_pct: 0.25,
             cost_rerun_throughput_pct: 0.50,
 
+            route_transit_messages: true,
             lsdb_sync_max_response_lsas: 256,
         }
     }
@@ -169,6 +176,10 @@ impl OverlayConfig {
     }
     pub fn cost_rerun_throughput_pct(&self) -> f64 {
         self.cost_rerun_throughput_pct
+    }
+
+    pub fn route_transit_messages(&self) -> bool {
+        self.route_transit_messages
     }
 
     pub fn lsdb_sync_max_response_lsas(&self) -> usize {
@@ -234,6 +245,11 @@ impl OverlayConfig {
         self
     }
 
+    pub fn with_route_transit_messages(mut self, enabled: bool) -> Self {
+        self.route_transit_messages = enabled;
+        self
+    }
+
     pub fn with_lsdb_sync_max_response_lsas(mut self, n: usize) -> Self {
         self.lsdb_sync_max_response_lsas = n;
         self
@@ -268,6 +284,11 @@ impl SeedPeer {
 /// fields (timers, transport masks, etc.) stay Rust-builder-only for now.
 #[derive(Deserialize, Debug, Clone)]
 pub struct OverlayTuning {
+    /// Whether this node forwards inbound overlay data whose final destination
+    /// is another node. Local delivery and local origination are unaffected.
+    #[serde(default = "default_route_transit_messages")]
+    pub route_transit_messages: bool,
+
     /// Max LSAs per `LsdbSyncResp` frame.
     #[serde(default = "default_lsdb_sync_max_response_lsas")]
     pub lsdb_sync_max_response_lsas: usize,
@@ -276,6 +297,7 @@ pub struct OverlayTuning {
 impl Default for OverlayTuning {
     fn default() -> Self {
         Self {
+            route_transit_messages: default_route_transit_messages(),
             lsdb_sync_max_response_lsas: default_lsdb_sync_max_response_lsas(),
         }
     }
@@ -285,8 +307,13 @@ impl OverlayTuning {
     /// Apply the tunables on top of an `OverlayConfig` built from the
     /// existing seed-peer / persistence-dir machinery.
     pub fn apply(&self, cfg: OverlayConfig) -> OverlayConfig {
-        cfg.with_lsdb_sync_max_response_lsas(self.lsdb_sync_max_response_lsas)
+        cfg.with_route_transit_messages(self.route_transit_messages)
+            .with_lsdb_sync_max_response_lsas(self.lsdb_sync_max_response_lsas)
     }
+}
+
+fn default_route_transit_messages() -> bool {
+    true
 }
 
 fn default_lsdb_sync_max_response_lsas() -> usize {

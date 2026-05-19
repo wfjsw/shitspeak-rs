@@ -33,7 +33,9 @@ use tracing::warn;
 
 use crate::s2s::transport::Inbound;
 
-use super::lsdb::{handle_flood, handle_sync_request, handle_sync_response, LinkStateDb};
+use super::lsdb::{
+    handle_flood, handle_sync_request, handle_sync_response, LinkStateDb, LsaEmitter,
+};
 use super::messaging::forward as messaging_forward;
 use super::neighbor::hello::{handle_hello_ack, respond_to_hello, HelloContext};
 use super::neighbor::monitor::NeighborMonitor;
@@ -51,6 +53,7 @@ pub(crate) struct DispatcherCtx {
     pub self_id: crate::types::NodeIdentifier,
     pub shutdown: tokio_util::sync::CancellationToken,
     pub cfg: super::config::OverlayConfig,
+    pub emitter: Arc<LsaEmitter>,
 }
 
 /// Spawn one dispatcher task per priority queue. They run independently
@@ -121,6 +124,7 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
                 ctx.self_id,
                 from,
                 data,
+                !ctx.emitter.transit_disabled(),
             )
             .await
         }

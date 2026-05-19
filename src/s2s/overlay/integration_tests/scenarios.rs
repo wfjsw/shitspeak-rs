@@ -394,6 +394,78 @@ async fn link_down_reroutes() {
     cluster.shutdown_all().await;
 }
 
+/// Checks that a node configured as non-transit remains directly reachable but
+/// is not selected as the next hop for traffic destined to another node.
+#[tokio::test]
+async fn transit_routing_disabled_nodes_are_not_route_intermediates() {
+    let cluster = Cluster::build_with_cfg(&[1, 2, 3], line_seeds, |idx, base| {
+        if idx == 1 {
+            base.with_route_transit_messages(false)
+        } else {
+            base
+        }
+    })
+    .await;
+
+    let a = cluster.node(1);
+    let b = cluster.node(2);
+    let c = cluster.node(3);
+
+    let (tx_b, mut rx_b) = mpsc::channel(8);
+    b.overlay.register_service(100, Arc::new(Capture(tx_b)));
+    let (tx_c, mut rx_c) = mpsc::channel(8);
+    c.overlay.register_service(100, Arc::new(Capture(tx_c)));
+
+    assert!(
+        wait_for_full_alive_mesh(&cluster, Duration::from_secs(15)).await,
+        "line topology did not converge membership"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            a.overlay.route_to(2, ServiceLevel::Reliable) == Some(2)
+                && a.overlay.route_to(3, ServiceLevel::Reliable).is_none()
+        })
+        .await,
+        "A should route directly to B but not through non-transit B to C; route_to(2)={:?}, route_to(3)={:?}",
+        a.overlay.route_to(2, ServiceLevel::Reliable),
+        a.overlay.route_to(3, ServiceLevel::Reliable)
+    );
+
+    a.overlay
+        .send_unicast(
+            2,
+            100,
+            ServiceLevel::Reliable,
+            MessageClass::Regular,
+            Bytes::from_static(b"to-b"),
+        )
+        .await
+        .unwrap();
+    let got_b = timeout(Duration::from_secs(3), rx_b.recv()).await.unwrap();
+    assert_eq!(&got_b.unwrap().body[..], b"to-b");
+
+    let err = a
+        .overlay
+        .send_unicast(
+            3,
+            100,
+            ServiceLevel::Reliable,
+            MessageClass::Regular,
+            Bytes::from_static(b"to-c"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::s2s::overlay::OverlayError::NoRoute { dst: 3, .. }
+    ));
+    assert!(timeout(Duration::from_millis(500), rx_c.recv())
+        .await
+        .is_err());
+
+    cluster.shutdown_all().await;
+}
+
 /// Checks restart detection using Hello boot epochs.
 /// Expected: when B restarts with the same node id and a new boot epoch, A
 /// emits `MembershipEvent::Restarted(2)` before waiting for normal LSA flooding.

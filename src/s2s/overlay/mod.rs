@@ -147,6 +147,11 @@ impl OverlayNetwork {
         self.inner.emitter.poke_force();
     }
 
+    /// Publish a changed local transit-routing policy in the next local LSA.
+    pub fn update_route_transit_messages(&self, enabled: bool) {
+        self.inner.emitter.update_route_transit_messages(enabled);
+    }
+
     /// Subscribe to the membership-event stream. Each subscriber receives
     /// every event independently.
     pub fn subscribe_membership(&self) -> broadcast::Receiver<MembershipEvent> {

@@ -1714,6 +1714,18 @@ impl Server {
                     );
                     self.s2s_manager.update_max_users(new_config.max_users);
                 }
+                if current.s2s.overlay.route_transit_messages
+                    != new_config.s2s.overlay.route_transit_messages
+                {
+                    tracing::info!(
+                        "config reload: s2s.overlay.route_transit_messages {} -> {}",
+                        current.s2s.overlay.route_transit_messages,
+                        new_config.s2s.overlay.route_transit_messages
+                    );
+                    self.s2s_manager.update_route_transit_messages(
+                        new_config.s2s.overlay.route_transit_messages,
+                    );
+                }
                 if current.udp_voice_enabled != new_config.udp_voice_enabled {
                     tracing::info!(
                         "config reload: udp_voice_enabled {} -> {}",

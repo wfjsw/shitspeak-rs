@@ -46,6 +46,7 @@ message LinkStateAdvert {
   repeated AddressEntry addresses = 6;  // origin's own listen addresses
   repeated LinkAdvert links = 7;
   uint64 max_users = 8;     // origin's local max_users capacity
+  bool transit_disabled = 9; // origin should not be used as a transit router
 }
 
 // One advertised edge from `origin` to `neighbor`.

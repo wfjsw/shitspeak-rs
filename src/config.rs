@@ -714,6 +714,19 @@ mod tests {
     }
 
     #[test]
+    fn s2s_overlay_route_transit_messages_parses() {
+        let raw = r#"
+            enabled = false
+
+            [overlay]
+            route_transit_messages = false
+        "#;
+        let cfg: S2sConfig = parse_s2s(raw).expect("s2s config parses");
+        assert!(!cfg.overlay.route_transit_messages);
+        assert!(!cfg.overlay_config().route_transit_messages());
+    }
+
+    #[test]
     fn s2s_enabled_requires_identity_paths() {
         let cfg = S2sConfig {
             enabled: true,

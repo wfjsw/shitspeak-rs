@@ -48,6 +48,7 @@ pub struct LsaEntry {
     pub addresses: Vec<PeerAddress>,
     pub links: Vec<LinkAdvertised>,
     pub max_users: u64,
+    pub transit_disabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +90,7 @@ impl LsaEntry {
             addresses,
             links,
             max_users: pb.max_users,
+            transit_disabled: pb.transit_disabled,
         })
     }
 
@@ -113,6 +115,7 @@ impl LsaEntry {
                 })
                 .collect(),
             max_users: self.max_users,
+            transit_disabled: self.transit_disabled,
         }
     }
 }
@@ -471,6 +474,7 @@ mod tests {
             addresses: vec![],
             links: vec![],
             max_users: 0,
+            transit_disabled: false,
         }
     }
 
@@ -486,9 +490,13 @@ mod tests {
     fn lsa_roundtrips_max_users() {
         let mut lsa = entry(1, 100, 1, false);
         lsa.max_users = 250;
+        lsa.transit_disabled = true;
         let pb = lsa.to_pb();
         assert_eq!(pb.max_users, 250);
-        assert_eq!(LsaEntry::from_pb(&pb).unwrap().max_users, 250);
+        assert!(pb.transit_disabled);
+        let roundtrip = LsaEntry::from_pb(&pb).unwrap();
+        assert_eq!(roundtrip.max_users, 250);
+        assert!(roundtrip.transit_disabled);
     }
 
     #[test]

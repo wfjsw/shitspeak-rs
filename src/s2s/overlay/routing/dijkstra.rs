@@ -47,6 +47,11 @@ pub fn compute(
         .filter(|e| !e.tombstone)
         .map(|e| e.origin)
         .collect();
+    let transit_disabled: HashSet<NodeIdentifier> = lsas
+        .iter()
+        .filter(|e| !e.tombstone && e.transit_disabled)
+        .map(|e| e.origin)
+        .collect();
     if !active.contains(&self_id) {
         // Local LSA hasn't been admitted yet — early return; routing is
         // empty until we publish ourselves.
@@ -85,6 +90,9 @@ pub fn compute(
 
     while let Some(Reverse((d, u))) = heap.pop() {
         if d > *dist.get(&u).unwrap_or(&u64::MAX) {
+            continue;
+        }
+        if u != self_id && transit_disabled.contains(&u) {
             continue;
         }
         let Some(neighbors) = adj.get(&u) else {
@@ -180,6 +188,7 @@ mod tests {
                 })
                 .collect(),
             max_users: 0,
+            transit_disabled: false,
         }
     }
 
@@ -238,6 +247,25 @@ mod tests {
         let table = compute(&db, 1, ServiceLevel::ReliableLowLatency, &cfg());
         assert_eq!(table[&2].next_hop, 3);
         assert_eq!(table[&3].next_hop, 3);
+    }
+
+    #[test]
+    fn non_transit_origin_can_be_destination_but_not_intermediate() {
+        let mut node2 = entry(
+            2,
+            100,
+            1,
+            vec![(1, 5_000, 0, 1_000_000), (3, 5_000, 0, 1_000_000)],
+        );
+        node2.transit_disabled = true;
+        let db = build_db(vec![
+            entry(1, 100, 1, vec![(2, 5_000, 0, 1_000_000)]),
+            node2,
+            entry(3, 100, 1, vec![(2, 5_000, 0, 1_000_000)]),
+        ]);
+        let table = compute(&db, 1, ServiceLevel::ReliableLowLatency, &cfg());
+        assert_eq!(table[&2].next_hop, 2);
+        assert!(!table.contains_key(&3));
     }
 
     #[test]

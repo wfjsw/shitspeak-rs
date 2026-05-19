@@ -266,6 +266,7 @@ mod tests {
             addresses: Vec::new(),
             links: Vec::new(),
             max_users,
+            transit_disabled: false,
         }
     }
 
