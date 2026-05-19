@@ -117,3 +117,29 @@ blob_max_parallel_peers = 3
 blob_decay_interval_ms = 60000
 # Time an unreferenced channel blob must remain unused before deletion.
 blob_unused_grace_ms = 600000
+
+# Browser WebRTC gateway. Disabled until the HTTP/signaling gateway is wired.
+[web]
+enabled = false
+listen = "0.0.0.0:64739"
+public_base_url = "https://localhost:64739"
+allowed_origins = ["https://localhost:64739"]
+
+[web.auth]
+modes = ["password", "sso"]
+password_enabled = true
+
+[web.auth.sso]
+issuer = "https://idp.example.com"
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+audience = "shitspeak-web"
+subject_claim = "sub"
+username_claim = "preferred_username"
+groups_claim = "groups"
+
+[web.webrtc]
+max_speaker_ssrcs = 64
+audio_bitrate = 64000
+ice_servers = [
+  { urls = ["stun:stun.l.google.com:19302"] },
+]

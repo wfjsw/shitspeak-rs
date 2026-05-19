@@ -38,6 +38,14 @@ pub struct AuthenticateAuxiliaryData {
     pub os_version: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExternalAuthClaims {
+    pub subject: u32,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub groups: Vec<String>,
+}
+
 /// A registered user entry returned by [`Authenticator::get_registered_users`].
 #[derive(Debug, Clone)]
 pub struct RegisteredUser {
@@ -53,6 +61,25 @@ pub trait Authenticator: Send + Sync + 'static {
         password: Option<&str>,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Result<AuthenticateResult, AuthenticationRejection>;
+
+    async fn authenticate_external(
+        &self,
+        claims: &ExternalAuthClaims,
+        auxiliary_data: &AuthenticateAuxiliaryData,
+    ) -> Result<AuthenticateResult, AuthenticationRejection> {
+        let _ = auxiliary_data;
+        Ok(AuthenticateResult {
+            user_id: Some(claims.subject),
+            display_name: claims
+                .display_name
+                .clone()
+                .or_else(|| Some(claims.username.clone())),
+            groups: claims.groups.clone(),
+            language: Language::default(),
+            texture_url: None,
+            comment_url: None,
+        })
+    }
 
     /// Select the language for server-generated text sent to this connection.
     /// Called before `authenticate`, so implementations can localize reject

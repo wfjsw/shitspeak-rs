@@ -10,7 +10,9 @@ use cidr::AnyIpCidr;
 use prost::{EncodeError, Message as _};
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
 use rustls::version::{TLS12, TLS13};
+use tokio::net::TcpStream;
 use tokio::task::JoinSet;
+use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::api::Authenticator;
@@ -58,7 +60,7 @@ pub struct Server {
 
     codec_info: Mutex<CodecInfo>,
 
-    authenticator: Box<dyn Authenticator>,
+    authenticator: Arc<dyn Authenticator>,
 
     /// Registry of server-defined context menu actions.
     context_actions: Arc<crate::context_action::ContextActionRegistry>,
@@ -194,9 +196,14 @@ impl Server {
 
         let client_cert_verifier = Arc::new(ClientCertificateVerifier::new());
 
-        let tls_config = rustls::ServerConfig::builder_with_protocol_versions(&[&TLS12, &TLS13])
-            .with_client_cert_verifier(client_cert_verifier)
-            .with_single_cert(certificate, private_key)?;
+        let mut tls_config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&TLS12, &TLS13])
+                .with_client_cert_verifier(client_cert_verifier)
+                .with_single_cert(certificate, private_key)?;
+        tls_config.alpn_protocols = vec![
+            crate::web::signaling::ALPN_HTTP_1_1.to_vec(),
+            crate::web::signaling::ALPN_MUMBLE.to_vec(),
+        ];
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -241,7 +248,7 @@ impl Server {
             session_blobs,
             bans,
             codec_info: Mutex::new(CodecInfo::default()),
-            authenticator: Box::new(authenticator),
+            authenticator: Arc::new(authenticator),
             config,
             context_actions: Arc::new(crate::context_action::ContextActionRegistry::new()),
             s2s_manager,
@@ -315,6 +322,15 @@ impl Server {
             pending_delete_timeout_ms,
             shutdown_rx.clone(),
         );
+        let web_signaling = match self.read_config().web.clone() {
+            web if web.enabled && web.listen.is_some() => Some(
+                crate::web::signaling::SignalingServer::new(web)
+                    .with_authenticator(Arc::clone(&self.authenticator))
+                    .with_server(Arc::clone(self))
+                    .spawn(shutdown_rx.clone())?,
+            ),
+            _ => None,
+        };
         let _s2s_task = Arc::clone(&self.s2s_manager)
             .spawn_runtime_task(Arc::downgrade(self), shutdown_rx.clone());
 
@@ -331,6 +347,12 @@ impl Server {
             result = tcp_accept => { let _ = result; }
             result = idle_reaper => { let _ = result; }
             result = pending_delete_watchdog => { let _ = result; }
+            result = async {
+                match web_signaling {
+                    Some(handle) => handle.await.ok(),
+                    None => std::future::pending::<Option<()>>().await,
+                }
+            } => { let _ = result; }
             _ = shutdown_tx.closed() => {
                 tracing::info!("Shutdown signal received.");
             }
@@ -765,8 +787,38 @@ impl Server {
 
         let local_addr = tcp_stream.local_addr()?;
         let tls_acceptor = self.tls_acceptor.clone();
-        let mut tls_stream = tls_acceptor.accept(tcp_stream).await?;
+        let tls_stream = tls_acceptor.accept(tcp_stream).await?;
+        match tls_stream.get_ref().1.alpn_protocol() {
+            Some(crate::web::signaling::ALPN_HTTP_1_1) => {
+                let web = self.read_config().web.clone();
+                crate::web::signaling::SignalingServer::new(web)
+                    .with_authenticator(Arc::clone(&self.authenticator))
+                    .with_server(Arc::clone(self))
+                    .handle_stream_with_peer(tls_stream, real_ip, remote_addr, local_addr)
+                    .await?;
+                return Ok(());
+            }
+            Some(crate::web::signaling::ALPN_MUMBLE) | None => {}
+            Some(other) => {
+                tracing::warn!(
+                    protocol = %String::from_utf8_lossy(other),
+                    "unsupported ALPN protocol, closing connection"
+                );
+                return Ok(());
+            }
+        }
 
+        self.handle_native_mumble_tls_connection(tls_stream, real_ip, remote_addr, local_addr)
+            .await
+    }
+
+    async fn handle_native_mumble_tls_connection(
+        self: &Arc<Box<Self>>,
+        mut tls_stream: TlsStream<TcpStream>,
+        real_ip: std::net::IpAddr,
+        remote_addr: std::net::SocketAddr,
+        local_addr: std::net::SocketAddr,
+    ) -> Result<(), HandleIncomingConnectionError> {
         // Send server version (these are startup-only, read once)
         let version = {
             let cfg = self.read_config();

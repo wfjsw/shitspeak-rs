@@ -36,6 +36,7 @@ pub mod types;
 pub mod utils;
 pub mod voice;
 pub mod voice_crypto;
+pub mod web;
 
 #[cfg(test)]
 mod integration_tests;

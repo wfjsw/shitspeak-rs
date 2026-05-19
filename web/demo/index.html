@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ShitSpeak Web Demo</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel">
+        <h1>ShitSpeak Web Demo</h1>
+        <label>
+          Signaling URL
+          <input id="signalingUrl" value="wss://localhost:64739/web/signaling">
+        </label>
+        <label>
+          Speaker slots
+          <input id="speakerSlots" type="number" min="1" value="">
+        </label>
+        <label>
+          Username
+          <input id="username" autocomplete="username">
+        </label>
+        <label>
+          Password
+          <input id="password" type="password" autocomplete="current-password">
+        </label>
+        <div class="toolbar">
+          <button id="connect">Connect</button>
+          <button id="mic" disabled>Mic</button>
+          <button id="ptt" disabled>PTT</button>
+        </div>
+        <div class="state">
+          <section>
+            <h2>Channels</h2>
+            <ul id="channels"></ul>
+          </section>
+          <section>
+            <h2>Users</h2>
+            <ul id="users"></ul>
+          </section>
+        </div>
+        <pre id="log"></pre>
+      </section>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

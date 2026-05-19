@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, S2sConfig, S2sSeedAddressConfig, UdpPingUserCountScope};
+use crate::config::{Config, S2sConfig, S2sSeedAddressConfig, UdpPingUserCountScope, WebConfig};
 use crate::constants::APP_PROTO_VER;
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
 use crate::protocol_version::ProtocolVersion;
@@ -166,6 +166,7 @@ async fn spawn_test_server_with_pki(
         required_groups: Vec::new(),
         send_permission_info: opts.send_permission_info,
         s2s,
+        web: WebConfig::default(),
     };
 
     let authenticator = Arc::new(TestAuthenticator::new());

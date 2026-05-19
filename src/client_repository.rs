@@ -273,6 +273,57 @@ impl ClientRepository {
         client
     }
 
+    pub async fn allocate_web_client(
+        &self,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: tokio::sync::mpsc::Sender<crate::messages::Message>,
+    ) -> Arc<Box<Client>> {
+        let mut register = self.register.write().await;
+        let mut client_by_host_guard = self.clients_by_host.write();
+        let mut free_ids_guard = self.free_ids.lock();
+
+        let id = {
+            if let Some(free_id) = free_ids_guard.iter().next().copied() {
+                free_ids_guard.remove(&free_id);
+                free_id
+            } else {
+                let mut allocation_pointer = self.allocation_pointer.lock();
+                let id = *allocation_pointer;
+
+                if id > MAX_LOCAL_SESSION_ID {
+                    panic!("Exceeded maximum number of local session IDs. Consider rearranging the allocation strategy");
+                }
+
+                *allocation_pointer += 1;
+                id
+            }
+        };
+        let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
+        let client = Client::new_web_gateway(
+            client_identifier,
+            real_ip_address,
+            tcp_address,
+            local_address,
+            outbound_tx,
+        );
+
+        let client = Arc::new(client);
+
+        register
+            .local_clients
+            .insert(client_identifier, Arc::clone(&client));
+        register.channel_index_insert(client_identifier, 0);
+
+        client_by_host_guard
+            .entry(tcp_address.ip())
+            .or_default()
+            .insert(client_identifier);
+
+        client
+    }
+
     /// Emit the `AddClient` log entry for a client that has completed
     /// authentication.  Sets the `published` flag so that future
     /// `remove_client` calls will emit a corresponding `RemoveClient`.
@@ -1118,6 +1169,45 @@ impl ClientRepository {
 
         // Broadcast to subscribers (ignore NoSubscribers / Full errors)
         let _ = self.tx.send(broadcast);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use crate::messages::{encoder::TextMessage, Message};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn web_client_allocation_produces_local_writable_client() {
+        let repo = ClientRepository::new(1, 128);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 34567);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+
+        let client = repo.allocate_web_client(peer.ip(), peer, local, tx).await;
+        assert_eq!(client.get_node_id(), 1);
+        assert_eq!(repo.local_len().await, 1);
+
+        let message = Message::TextMessage(
+            TextMessage {
+                actor: Some(12),
+                session: Vec::new(),
+                channel_id: Vec::new(),
+                tree_id: Vec::new(),
+                message: "hello".to_string(),
+            }
+            .into(),
+        );
+        client.write_proto_message(&message).await.unwrap();
+
+        let queued = rx.recv().await.unwrap();
+        match queued {
+            Message::TextMessage(text) => assert_eq!(text.message, "hello"),
+            other => panic!("expected TextMessage, got {other:?}"),
+        }
     }
 }
 

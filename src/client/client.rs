@@ -60,8 +60,7 @@ pub struct Client {
     udp_address: ParkingRwLock<Option<SocketAddr>>,
     local_address: SocketAddr,
 
-    connection_rx: Option<AsyncMutex<ReadHalf<TlsStream<TcpStream>>>>,
-    connection_tx: Option<AsyncMutex<WriteHalf<TlsStream<TcpStream>>>>,
+    transport: ClientTransport,
     disconnect_tx: watch::Sender<bool>,
     disconnect_rx: watch::Receiver<bool>,
     is_verified: bool,
@@ -119,6 +118,17 @@ pub struct Client {
     last_channel_version: ParkingMutex<u64>,
 }
 
+enum ClientTransport {
+    NativeTls {
+        rx: AsyncMutex<ReadHalf<TlsStream<TcpStream>>>,
+        tx: AsyncMutex<WriteHalf<TlsStream<TcpStream>>>,
+    },
+    WebGateway {
+        outbound_tx: mpsc::Sender<Message>,
+    },
+    Remote,
+}
+
 impl Client {
     pub fn new_local(
         session_id: ClientSessionIdentifier,
@@ -162,8 +172,10 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
-            connection_rx: Some(AsyncMutex::new(connection_rx)),
-            connection_tx: Some(AsyncMutex::new(connection_tx)),
+            transport: ClientTransport::NativeTls {
+                rx: AsyncMutex::new(connection_rx),
+                tx: AsyncMutex::new(connection_tx),
+            },
             disconnect_tx,
             disconnect_rx,
             is_verified,
@@ -174,6 +186,53 @@ impl Client {
             stats: RwLock::new(ClientStats::default()),
             certificate_hash,
             certificate_chain,
+            user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
+            options: RwLock::new(ClientOptions::default()),
+            local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
+            global_state: ParkingRwLock::new(ClientGlobalState::new()),
+            crypt_state: ParkingMutex::new(None),
+            voice_routing_tx,
+            voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
+            voice_tcp_tx,
+            voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
+            published: AtomicBool::new(false),
+            prefer_tcp_tunnel: AtomicBool::new(false),
+            protocol_version: AtomicU64::new(0),
+            last_client_version: ParkingMutex::new(HashMap::new()),
+            last_channel_version: ParkingMutex::new(0),
+        })
+    }
+
+    pub fn new_web_gateway(
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: mpsc::Sender<Message>,
+    ) -> Box<Self> {
+        let now = Utc::now();
+        let (voice_routing_tx, voice_routing_rx) =
+            mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
+        let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+
+        Box::new(Client {
+            session_id,
+            real_ip_address,
+            tcp_address,
+            udp_address: ParkingRwLock::new(None),
+            local_address,
+            transport: ClientTransport::WebGateway { outbound_tx },
+            disconnect_tx,
+            disconnect_rx,
+            is_verified: false,
+            login_time: now,
+            last_active: ParkingMutex::new(now),
+            last_ping: ParkingMutex::new(now),
+            udp_state: None,
+            stats: RwLock::new(ClientStats::default()),
+            certificate_hash: None,
+            certificate_chain: Vec::new(),
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
@@ -212,8 +271,7 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
-            connection_rx: None,
-            connection_tx: None,
+            transport: ClientTransport::Remote,
             disconnect_tx,
             disconnect_rx,
             is_verified,
@@ -393,12 +451,10 @@ impl Client {
     pub async fn disconnect(&self) -> Result<(), WriteProtoMessageError> {
         let _ = self.disconnect_tx.send(true);
 
-        let Some(connection_tx) = &self.connection_tx else {
-            return Ok(());
-        };
-
-        let mut guard = connection_tx.lock().await;
-        guard.shutdown().await?;
+        if let ClientTransport::NativeTls { tx, .. } = &self.transport {
+            let mut guard = tx.lock().await;
+            guard.shutdown().await?;
+        }
         Ok(())
     }
 
@@ -411,14 +467,10 @@ impl Client {
     }
 
     pub async fn read_proto_message(&self) -> Result<Message, ReadProtoMessageError> {
-        let Some(connection_rx) = &self.connection_rx else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "remote client has no local connection",
-            )
-            .into());
+        let ClientTransport::NativeTls { rx, .. } = &self.transport else {
+            return Err(transport_not_readable_error().into());
         };
-        let mut guard = connection_rx.lock().await;
+        let mut guard = rx.lock().await;
         let message = guard.read_proto_message().await?;
         self.record_tcp_packets(1, 6 + message.encoded_len()).await;
         Ok(message)
@@ -428,16 +480,20 @@ impl Client {
         &self,
         message: &Message,
     ) -> Result<(), WriteProtoMessageError> {
-        let Some(connection_tx) = &self.connection_tx else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "remote client has no local connection",
-            )
-            .into());
-        };
         let bytes = 6 + message.encoded_len();
-        let mut guard = connection_tx.lock().await;
-        guard.write_proto_message(message).await?;
+        match &self.transport {
+            ClientTransport::NativeTls { tx, .. } => {
+                let mut guard = tx.lock().await;
+                guard.write_proto_message(message).await?;
+            }
+            ClientTransport::WebGateway { outbound_tx } => {
+                outbound_tx
+                    .send(message.clone())
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
         self.record_tcp_packets(1, bytes).await;
         Ok(())
     }
@@ -446,19 +502,25 @@ impl Client {
         &self,
         messages: &[Message],
     ) -> Result<(), WriteProtoMessageError> {
-        let Some(connection_tx) = &self.connection_tx else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "remote client has no local connection",
-            )
-            .into());
-        };
         let bytes = messages
             .iter()
             .map(|message| 6 + message.encoded_len())
             .sum();
-        let mut guard = connection_tx.lock().await;
-        guard.write_proto_message_batch(messages).await?;
+        match &self.transport {
+            ClientTransport::NativeTls { tx, .. } => {
+                let mut guard = tx.lock().await;
+                guard.write_proto_message_batch(messages).await?;
+            }
+            ClientTransport::WebGateway { outbound_tx } => {
+                for message in messages {
+                    outbound_tx
+                        .send(message.clone())
+                        .await
+                        .map_err(|_| transport_closed_error())?;
+                }
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
         self.record_tcp_packets(messages.len(), bytes).await;
         Ok(())
     }
@@ -806,4 +868,25 @@ impl Client {
         }
         ParkingMutexGuard::map(user_info_extended, |opt| opt.as_mut().unwrap())
     }
+}
+
+fn transport_not_readable_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "client transport cannot receive native protobuf messages",
+    )
+}
+
+fn transport_not_writable_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "client transport cannot send native protobuf messages",
+    )
+}
+
+fn transport_closed_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "web gateway client transport is closed",
+    )
 }

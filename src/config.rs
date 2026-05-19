@@ -155,6 +155,120 @@ pub enum UdpPingUserCountScope {
     Local,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebAuthMode {
+    Password,
+    Sso,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebSsoConfig {
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "default_sso_subject_claim")]
+    pub subject_claim: String,
+    #[serde(default = "default_sso_username_claim")]
+    pub username_claim: String,
+    #[serde(default = "default_sso_groups_claim")]
+    pub groups_claim: String,
+}
+
+impl Default for WebSsoConfig {
+    fn default() -> Self {
+        Self {
+            issuer: None,
+            jwks_url: None,
+            audience: None,
+            subject_claim: default_sso_subject_claim(),
+            username_claim: default_sso_username_claim(),
+            groups_claim: default_sso_groups_claim(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebAuthConfig {
+    #[serde(default = "default_web_auth_modes")]
+    pub modes: Vec<WebAuthMode>,
+    #[serde(default = "default_true")]
+    pub password_enabled: bool,
+    #[serde(default)]
+    pub sso: WebSsoConfig,
+}
+
+impl Default for WebAuthConfig {
+    fn default() -> Self {
+        Self {
+            modes: default_web_auth_modes(),
+            password_enabled: true,
+            sso: WebSsoConfig::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebRtcIceServerConfig {
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub credential: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebRtcConfig {
+    #[serde(default)]
+    pub ice_servers: Vec<WebRtcIceServerConfig>,
+    #[serde(default = "default_web_max_speaker_ssrcs")]
+    pub max_speaker_ssrcs: u32,
+    #[serde(default = "default_web_audio_bitrate")]
+    pub audio_bitrate: u32,
+}
+
+impl Default for WebRtcConfig {
+    fn default() -> Self {
+        Self {
+            ice_servers: Vec::new(),
+            max_speaker_ssrcs: default_web_max_speaker_ssrcs(),
+            audio_bitrate: default_web_audio_bitrate(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub auth: WebAuthConfig,
+    #[serde(default)]
+    pub webrtc: WebRtcConfig,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: None,
+            public_base_url: None,
+            allowed_origins: Vec::new(),
+            auth: WebAuthConfig::default(),
+            webrtc: WebRtcConfig::default(),
+        }
+    }
+}
+
 impl From<S2sTransportKindConfig> for TransportKind {
     fn from(value: S2sTransportKindConfig) -> Self {
         match value {
@@ -284,6 +398,10 @@ pub struct Config {
     // ── S2S cluster bootstrap ───────────────────────────────────────────
     #[serde(default)]
     pub s2s: S2sConfig,
+
+    // ── Browser WebRTC gateway ──────────────────────────────────────────
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
 fn default_max_bandwidth() -> u32 {
@@ -328,6 +446,24 @@ fn default_channel_snapshot_every_secs() -> i64 {
 }
 fn default_channel_wal_compaction_expire_count() -> usize {
     2_000
+}
+fn default_sso_subject_claim() -> String {
+    "sub".to_string()
+}
+fn default_sso_username_claim() -> String {
+    "preferred_username".to_string()
+}
+fn default_sso_groups_claim() -> String {
+    "groups".to_string()
+}
+fn default_web_auth_modes() -> Vec<WebAuthMode> {
+    vec![WebAuthMode::Password]
+}
+fn default_web_max_speaker_ssrcs() -> u32 {
+    64
+}
+fn default_web_audio_bitrate() -> u32 {
+    64_000
 }
 
 impl Config {
@@ -390,6 +526,9 @@ mod tests {
         assert!(
             cfg.s2s.replications.propose_ttl_ms >= cfg.s2s.replications.delivery_tick_interval_ms
         );
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.auth.modes.len(), 2);
+        assert_eq!(cfg.web.webrtc.max_speaker_ssrcs, 64);
     }
 
     #[test]
@@ -422,6 +561,60 @@ mod tests {
         let cfg = S2sConfig::default();
         assert!(!cfg.is_enabled());
         assert!(cfg.transport_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn web_config_defaults_to_password_auth() {
+        let cfg = WebConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.auth.modes, vec![WebAuthMode::Password]);
+        assert!(cfg.auth.password_enabled);
+        assert_eq!(cfg.auth.sso.subject_claim, "sub");
+        assert_eq!(cfg.webrtc.max_speaker_ssrcs, 64);
+    }
+
+    #[test]
+    fn web_config_parses_ice_and_sso() {
+        let raw = r#"
+            enabled = true
+            listen = "127.0.0.1:64739"
+            public_base_url = "https://voice.example.test"
+            allowed_origins = ["https://voice.example.test"]
+
+            [auth]
+            modes = ["password", "sso"]
+            password_enabled = true
+
+            [auth.sso]
+            issuer = "https://idp.example.test"
+            jwks_url = "https://idp.example.test/jwks"
+            audience = "shitspeak"
+            subject_claim = "uid"
+            username_claim = "name"
+            groups_claim = "roles"
+
+            [webrtc]
+            max_speaker_ssrcs = 8
+            audio_bitrate = 48000
+            ice_servers = [
+                { urls = ["turn:turn.example.test:3478"], username = "u", credential = "p" },
+            ]
+        "#;
+        let cfg: WebConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+
+        assert!(cfg.enabled);
+        assert_eq!(
+            cfg.auth.modes,
+            vec![WebAuthMode::Password, WebAuthMode::Sso]
+        );
+        assert_eq!(cfg.auth.sso.subject_claim, "uid");
+        assert_eq!(cfg.webrtc.max_speaker_ssrcs, 8);
+        assert_eq!(cfg.webrtc.ice_servers[0].username.as_deref(), Some("u"));
     }
 
     #[test]
