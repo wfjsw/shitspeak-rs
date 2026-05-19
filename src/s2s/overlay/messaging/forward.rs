@@ -67,6 +67,7 @@ pub async fn handle_inbound(
     self_id: NodeIdentifier,
     from: NodeIdentifier,
     data: pb::OverlayData,
+    route_transit_messages: bool,
 ) {
     let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
     let is_for_self = data
@@ -93,6 +94,14 @@ pub async fn handle_inbound(
         .copied()
         .collect();
     if remaining.is_empty() {
+        return;
+    }
+    if !route_transit_messages {
+        debug!(
+            %from,
+            remaining = remaining.len(),
+            "S2S transit routing disabled; dropping overlay data for other nodes"
+        );
         return;
     }
     let mut data2 = data;
