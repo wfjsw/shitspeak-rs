@@ -24,12 +24,17 @@ pub async fn handle_request_blob(
         comments = msg.session_comment.len(),
         "RequestBlob handler"
     );
+    let server_id = sender.server_id();
 
     // ── Session textures ─────────────────────────────────────────────────
     for session_raw in &msg.session_texture {
         let session_id =
             crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw);
-        let Some(client) = server.get_clients().get_client(session_id).await else {
+        let Some(client) = server
+            .get_clients()
+            .get_client_in_server(&server_id, session_id)
+            .await
+        else {
             continue;
         };
 
@@ -92,7 +97,11 @@ pub async fn handle_request_blob(
     for session_raw in &msg.session_comment {
         let session_id =
             crate::client::client_session_identifier::ClientSessionIdentifier::from(*session_raw);
-        let Some(client) = server.get_clients().get_client(session_id).await else {
+        let Some(client) = server
+            .get_clients()
+            .get_client_in_server(&server_id, session_id)
+            .await
+        else {
             continue;
         };
 
@@ -154,13 +163,22 @@ pub async fn handle_request_blob(
 
     // ── Channel descriptions ─────────────────────────────────────────────
     for channel_id in &msg.channel_description {
-        let Some(ch) = server.get_channels().get_channel(*channel_id).await else {
+        let Some(ch) = server
+            .get_channels()
+            .get_channel_in_server(&server_id, *channel_id)
+            .await
+        else {
             continue;
         };
         let desc_data = match ch.description_hash.as_ref() {
             Some(hash) => match server.get_channel_blobs().get(hash).await.ok().flatten() {
                 Some(bytes) => Some(bytes),
-                None => server.s2s_manager().get_channel_blob(hash).await,
+                None => {
+                    server
+                        .s2s_manager()
+                        .get_channel_blob_in_server(&server_id, hash)
+                        .await
+                }
             },
             None => None,
         };

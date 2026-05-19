@@ -32,11 +32,12 @@ pub async fn handle_acl(
         num_acls = msg.acls.len(),
         "ACL handler"
     );
+    let server_id = sender.server_id();
 
     // Verify channel exists
     if server
         .get_channels()
-        .get_channel(channel_id)
+        .get_channel_in_server(&server_id, channel_id)
         .await
         .is_none()
     {
@@ -61,8 +62,15 @@ pub async fn handle_acl(
 
     if msg.query.unwrap_or(false) {
         // ── Query mode: walk tree upward, serialize ACLs ─────────────────
-        let channel = server.get_channels().get_channel(channel_id).await.unwrap();
-        let ancestors = server.get_channels().get_ancestors(channel_id).await;
+        let channel = server
+            .get_channels()
+            .get_channel_in_server(&server_id, channel_id)
+            .await
+            .unwrap();
+        let ancestors = server
+            .get_channels()
+            .get_ancestors_in_server(&server_id, channel_id)
+            .await;
 
         let mut flattened_acls: Vec<ChanAcl> = Vec::with_capacity(ancestors.len() * 5); // heuristic initial capacity
         let mut inherit = true;
@@ -128,7 +136,7 @@ pub async fn handle_acl(
         if sender.is_registered() {
             let (channel, ancestors) = server
                 .get_channels()
-                .get_channel_with_ancestors(channel_id)
+                .get_channel_with_ancestors_in_server(&server_id, channel_id)
                 .await;
             if let Some(mut channel) = channel {
                 channel.inherit_acl = inherit_acl;
@@ -177,14 +185,22 @@ pub async fn handle_acl(
             inherit_acl,
             acls: new_acls.clone(),
         };
-        if let Err(e) = server.get_channels().validate_s2s_op(&op).await {
+        if let Err(e) = server
+            .get_channels()
+            .validate_s2s_op_in_server(&server_id, &op)
+            .await
+        {
             tracing::warn!("set_acls {channel_id} failed: {:?}", e);
             return Ok(());
         }
-        if !server.s2s_manager().propose_channel_op(op).await {
+        if !server
+            .s2s_manager()
+            .propose_channel_op_in_server(&server_id, op)
+            .await
+        {
             if let Err(e) = server
                 .get_channels()
-                .set_acls(channel_id, inherit_acl, new_acls)
+                .set_acls_in_server(&server_id, channel_id, inherit_acl, new_acls)
                 .await
             {
                 tracing::warn!("set_acls {channel_id} failed: {:?}", e);

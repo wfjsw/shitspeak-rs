@@ -105,6 +105,7 @@ impl VoiceTransport for OverlayVoiceTransport {
 /// reach in without a transport.
 pub fn build_envelope(
     sender_session: u32,
+    server_id: String,
     sender_epoch: u64,
     s2s_seq: u64,
     target_kind: u32,
@@ -114,6 +115,7 @@ pub fn build_envelope(
 ) -> Result<Bytes, prost::EncodeError> {
     let frame = proto::VoiceFrame {
         sender_session,
+        server_id,
         sender_epoch,
         s2s_seq,
         target_kind,
@@ -220,6 +222,7 @@ mod tests {
         let payload = Bytes::from_static(b"opus-bytes-here");
         let bytes = build_envelope(
             0xABC_12345,
+            crate::types::default_server_id(),
             1_700_000_000_000_000,
             42,
             0,
@@ -234,6 +237,7 @@ mod tests {
         .unwrap();
         let decoded = proto::decode_voice(&bytes).unwrap();
         assert_eq!(decoded.sender_session, 0xABC_12345);
+        assert_eq!(decoded.server_id, crate::types::default_server_id());
         assert_eq!(decoded.sender_epoch, 1_700_000_000_000_000);
         assert_eq!(decoded.s2s_seq, 42);
         assert_eq!(decoded.target_kind, 0);

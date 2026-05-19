@@ -164,12 +164,14 @@ impl UserStatsService {
         actor_session: u32,
         target_session: u32,
         stats_only: bool,
+        server_id: String,
     ) -> Result<UserStatsReply, ApplicationError> {
         self.dispatch_request_with_timeout(
             owner,
             actor_session,
             target_session,
             stats_only,
+            server_id,
             DEFAULT_REQUEST_TIMEOUT,
         )
         .await
@@ -181,6 +183,7 @@ impl UserStatsService {
         actor_session: u32,
         target_session: u32,
         stats_only: bool,
+        server_id: String,
         timeout: Duration,
     ) -> Result<UserStatsReply, ApplicationError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +192,7 @@ impl UserStatsService {
             actor_session,
             target_session,
             stats_only,
+            server_id,
         };
         let env = UserStatsEnvelope {
             kind: Some(UserStatsKind::Request(req)),
@@ -461,6 +465,7 @@ mod tests {
                 0xABC_12345,
                 0xDEF_67890,
                 false,
+                crate::types::default_server_id(),
                 Duration::from_millis(50),
             )
             .await;
@@ -475,6 +480,7 @@ mod tests {
                 assert_eq!(req.target_session, 0xDEF_67890);
                 assert!(!req.stats_only);
                 assert_eq!(req.request_id, 1);
+                assert_eq!(req.server_id, crate::types::default_server_id());
             }
             other => panic!("expected Request, got {other:?}"),
         }
@@ -532,7 +538,14 @@ mod tests {
         *loopback.originator_inbound.lock() = Some(originator.inbound_handler());
 
         let reply = originator
-            .dispatch_request_with_timeout(99, 1, 2, true, Duration::from_millis(500))
+            .dispatch_request_with_timeout(
+                99,
+                1,
+                2,
+                true,
+                crate::types::default_server_id(),
+                Duration::from_millis(500),
+            )
             .await
             .expect("reply should arrive");
         assert!(reply.found);
@@ -558,6 +571,7 @@ mod tests {
             actor_session: 1,
             target_session: 2,
             stats_only: false,
+            server_id: String::new(),
         };
         let env = UserStatsEnvelope {
             kind: Some(UserStatsKind::Request(req)),

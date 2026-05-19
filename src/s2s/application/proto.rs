@@ -77,6 +77,7 @@ mod tests {
             actor_session: 0xABC_12345,
             target_session: 0xDEF_67890,
             issued_at_ms: 1_700_000_000_000,
+            server_id: crate::types::default_server_id(),
             command: Some(ModerationCommand::UserState(UserStatePatch {
                 channel_id: Some(7),
                 mute: Some(true),
@@ -99,6 +100,7 @@ mod tests {
             actor_session: 1,
             target_session: 2,
             issued_at_ms: 0,
+            server_id: crate::types::default_server_id(),
             command: Some(ModerationCommand::UserRemove(UserRemovePatch {
                 reason: Some("test".to_string()),
                 ban: true,
@@ -113,6 +115,7 @@ mod tests {
     fn voice_frame_roundtrip() {
         let frame = VoiceFrame {
             sender_session: 0xABC_12345,
+            server_id: crate::types::default_server_id(),
             sender_epoch: 1_700_000_000_000_000,
             s2s_seq: 42,
             target_kind: 0,
@@ -136,6 +139,7 @@ mod tests {
             receiver_sessions: vec![0xDEF_67890, 0xDEF_67891],
             data: Bytes::from_static(b"plugin"),
             data_id: Some("test.plugin".to_string()),
+            server_id: crate::types::default_server_id(),
         };
 
         let bytes = encode_plugin_data(&env).unwrap();

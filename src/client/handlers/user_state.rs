@@ -22,6 +22,7 @@ pub async fn handle_user_state(
     }
 
     let sender_id = sender.get_session_id();
+    let server_id = sender.server_id();
     tracing::debug!(
         session = u32::from(sender_id),
         self_mute = msg.self_mute,
@@ -59,7 +60,7 @@ pub async fn handle_user_state(
                 };
                 if let Err(e) = app
                     .moderation()
-                    .dispatch_user_state(sender_id, target_session_id, patch)
+                    .dispatch_user_state_in_server(&server_id, sender_id, target_session_id, patch)
                     .await
                 {
                     tracing::warn!(
@@ -82,7 +83,7 @@ pub async fn handle_user_state(
     // against a *locally-owned* target.
     let target = match msg.session {
         Some(session_id) if session_id != sender_id => {
-            match repo.get_client(session_id).await {
+            match repo.get_client_in_server(&server_id, session_id).await {
                 Some(c) => c,
                 None => return Ok(()), // target gone, ignore
             }
@@ -105,13 +106,13 @@ pub async fn handle_user_state(
     let requested_channel_change = if let Some(new_channel_id) = requested_channel_change {
         let redirected = if server
             .get_channels()
-            .get_channel(new_channel_id)
+            .get_channel_in_server(&server_id, new_channel_id)
             .await
             .is_some()
         {
             server
                 .get_channels()
-                .redirect_pending_delete_target(new_channel_id)
+                .redirect_pending_delete_target_in_server(&server_id, new_channel_id)
                 .await
         } else {
             new_channel_id
@@ -122,7 +123,10 @@ pub async fn handle_user_state(
     };
 
     if let Some(new_channel_id) = requested_channel_change {
-        let dst_chan = server.get_channels().get_channel(new_channel_id).await;
+        let dst_chan = server
+            .get_channels()
+            .get_channel_in_server(&server_id, new_channel_id)
+            .await;
         if dst_chan.is_none() {
             return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                 r#type: DenyType::ChannelName,
@@ -441,7 +445,7 @@ pub async fn handle_user_state(
     // Channel-dependent operations (move, mute/deaf by moderator) need the
     // current channel version as a causal dependency.
     let channel_version_dep = if requested_channel_change.is_some() || !is_self {
-        Some(server.get_channels().current_version())
+        Some(server.get_channels().current_version_in_server(&server_id))
     } else {
         None
     };

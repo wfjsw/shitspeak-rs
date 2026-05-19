@@ -130,6 +130,7 @@ async fn spawn_test_server_with_pki(
     let config = Config {
         node_id,
         listen: "127.0.0.1:0".into(),
+        server_entrypoints: Vec::new(),
         register_name: "test".into(),
         register_password: None,
         register_url: None,

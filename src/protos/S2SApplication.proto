@@ -18,6 +18,7 @@ message ModerationEnvelope {
   uint32 actor_session  = 1;   // composite ClientSessionIdentifier
   uint32 target_session = 2;   // composite ClientSessionIdentifier
   uint64 issued_at_ms   = 3;   // wall-clock at originator; tracing only
+  string server_id      = 6;   // empty/absent means "default" for legacy peers
   oneof command {
     UserStatePatch  user_state  = 4;
     UserRemovePatch user_remove = 5;
@@ -70,6 +71,7 @@ message UserStatsRequest {
   uint32 actor_session = 2;   // composite ClientSessionIdentifier of the moderator
   uint32 target_session = 3;  // composite ClientSessionIdentifier of the target
   bool   stats_only    = 4;   // mirrors UserStats.stats_only
+  string server_id      = 5;   // empty/absent means "default" for legacy peers
 }
 
 message UserStatsReply {
@@ -95,6 +97,7 @@ message PluginDataEnvelope {
   repeated uint32 receiver_sessions = 2;
   bytes data = 3;
   optional string data_id = 4;
+  string server_id = 5;               // empty/absent means "default" for legacy peers
 }
 
 // ── Voice ─────────────────────────────────────────────────────────────────
@@ -119,6 +122,7 @@ message VoiceFrame {
   VoiceIntent intent    = 7;   // unresolved routing intent. Receivers
                                 // resolve this against local/replicated
                                 // client and channel state.
+  string server_id      = 8;   // empty/absent means "default" for legacy peers
 }
 
 message VoiceIntent {

@@ -184,10 +184,18 @@ pub async fn deliver_to_local_recipients(server: &Arc<Box<Server>>, envelope: Pl
     }
     .into();
 
+    let server_id = if envelope.server_id.is_empty() {
+        crate::types::default_server_id()
+    } else {
+        envelope.server_id
+    };
     for receiver in envelope.receiver_sessions {
         let id = ClientSessionIdentifier::from(receiver);
         if id.get_node_id() == server.get_clients().local_node_id() {
-            server.get_clients().send_to(id, &message).await;
+            server
+                .get_clients()
+                .send_to_in_server(&server_id, id, &message)
+                .await;
         }
     }
 }
@@ -241,6 +249,7 @@ mod tests {
             receiver_sessions: vec![2, 3],
             data: Bytes::from_static(b"payload"),
             data_id: Some("id".to_string()),
+            server_id: crate::types::default_server_id(),
         };
 
         svc.dispatch(9, envelope.clone()).await.unwrap();

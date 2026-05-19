@@ -32,6 +32,7 @@ use crate::{
     errors::{ReadProtoMessageError, WriteProtoMessageError},
     messages::{encoder as msg_encoder, Message, ReadMessageExt, WriteMessageExt},
     protocol_version::ProtocolVersion,
+    types::{ScopedSessionId, DEFAULT_SERVER_ID},
     voice::VoiceRoutingPayload,
 };
 
@@ -47,7 +48,8 @@ const PROTOCOL_VERSION_SET_BIT: u64 = 1;
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 
 pub struct Client {
-    session_id: ClientSessionIdentifier,
+    session_id: ParkingRwLock<ClientSessionIdentifier>,
+    server_id: ParkingRwLock<String>,
 
     real_ip_address: IpAddr,
     tcp_address: SocketAddr,
@@ -138,6 +140,26 @@ impl Client {
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
     ) -> Box<Self> {
+        Self::new_local_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            session_id,
+            real_ip_address,
+            tcp_address,
+            udp_address,
+            local_address,
+            connection,
+        )
+    }
+
+    pub fn new_local_in_server(
+        server_id: String,
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        udp_address: Option<SocketAddr>,
+        local_address: SocketAddr,
+        connection: TlsStream<TcpStream>,
+    ) -> Box<Self> {
         let (certificate_hash, certificate_chain, is_verified) = {
             let (_, tls_connection) = connection.get_ref();
             let certificate_chain = tls_connection
@@ -167,7 +189,8 @@ impl Client {
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
-            session_id,
+            session_id: ParkingRwLock::new(session_id),
+            server_id: ParkingRwLock::new(server_id),
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
@@ -210,6 +233,24 @@ impl Client {
         local_address: SocketAddr,
         outbound_tx: mpsc::Sender<Message>,
     ) -> Box<Self> {
+        Self::new_web_gateway_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            session_id,
+            real_ip_address,
+            tcp_address,
+            local_address,
+            outbound_tx,
+        )
+    }
+
+    pub fn new_web_gateway_in_server(
+        server_id: String,
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: mpsc::Sender<Message>,
+    ) -> Box<Self> {
         let now = Utc::now();
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
@@ -217,7 +258,8 @@ impl Client {
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
-            session_id,
+            session_id: ParkingRwLock::new(session_id),
+            server_id: ParkingRwLock::new(server_id),
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(None),
@@ -259,6 +301,28 @@ impl Client {
         cert_hash: Option<Bytes>,
         login_time: DateTime<Utc>,
     ) -> Box<Self> {
+        Self::new_remote_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            session_id,
+            real_ip_address,
+            tcp_address,
+            udp_address,
+            local_address,
+            cert_hash,
+            login_time,
+        )
+    }
+
+    pub fn new_remote_in_server(
+        server_id: String,
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        udp_address: Option<SocketAddr>,
+        local_address: SocketAddr,
+        cert_hash: Option<Bytes>,
+        login_time: DateTime<Utc>,
+    ) -> Box<Self> {
         let is_verified = cert_hash.is_some();
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
@@ -266,7 +330,8 @@ impl Client {
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
-            session_id,
+            session_id: ParkingRwLock::new(session_id),
+            server_id: ParkingRwLock::new(server_id),
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
@@ -365,15 +430,32 @@ impl Client {
     }
 
     pub fn get_session_id(&self) -> ClientSessionIdentifier {
-        self.session_id
+        *self.session_id.read()
+    }
+
+    pub fn scoped_session_id(&self) -> ScopedSessionId {
+        ScopedSessionId::new(self.server_id(), self.get_session_id())
+    }
+
+    pub fn server_id(&self) -> String {
+        self.server_id.read().clone()
+    }
+
+    pub fn set_server_id(&self, server_id: String) {
+        *self.server_id.write() = server_id;
+    }
+
+    pub fn set_scoped_identity(&self, server_id: String, session_id: ClientSessionIdentifier) {
+        *self.server_id.write() = server_id;
+        *self.session_id.write() = session_id;
     }
 
     pub fn get_node_id(&self) -> u16 {
-        self.session_id.get_node_id()
+        self.get_session_id().get_node_id()
     }
 
     pub fn get_local_session_id(&self) -> u32 {
-        self.session_id.get_local_session_id()
+        self.get_session_id().get_local_session_id()
     }
 
     pub fn get_tokens_clone(&self) -> HashSet<String> {
@@ -398,7 +480,8 @@ impl Client {
         repo: &ClientRepository,
         channel_version: u64,
     ) {
-        let mut gs = self.write_global_state_as(repo, Some(self.session_id), Some(channel_version));
+        let mut gs =
+            self.write_global_state_as(repo, Some(self.get_session_id()), Some(channel_version));
         gs.set_current_channel_id(channel_id);
     }
 
@@ -422,6 +505,10 @@ impl Client {
 
     pub fn get_tcp_address(&self) -> SocketAddr {
         self.tcp_address
+    }
+
+    pub fn get_local_address(&self) -> SocketAddr {
+        self.local_address
     }
 
     pub fn get_udp_address(&self) -> Option<SocketAddr> {
@@ -595,7 +682,7 @@ impl Client {
         let payload = VoiceRoutingPayload { decoded_audio };
         if self.voice_routing_tx.try_send(payload).is_err() {
             tracing::trace!(
-                session = u32::from(self.session_id),
+                session = u32::from(self.get_session_id()),
                 "voice routing queue full or closed, dropping packet"
             );
         }
@@ -622,16 +709,16 @@ impl Client {
                 debug_assert!(
                     false,
                     "voice TCP queue full for session {}",
-                    u32::from(self.session_id)
+                    u32::from(self.get_session_id())
                 );
                 tracing::trace!(
-                    session = u32::from(self.session_id),
+                    session = u32::from(self.get_session_id()),
                     "voice TCP queue full, dropping packet"
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::trace!(
-                    session = u32::from(self.session_id),
+                    session = u32::from(self.get_session_id()),
                     "voice TCP queue closed, dropping packet"
                 );
             }
@@ -773,7 +860,7 @@ impl Client {
         &'a self,
         repo: &'a ClientRepository,
     ) -> GlobalStateWriteGuard<'a> {
-        self.write_global_state_as(repo, Some(self.session_id), None)
+        self.write_global_state_as(repo, Some(self.get_session_id()), None)
     }
 
     /// Acquire a transactional write guard for `ClientGlobalState` while
@@ -792,7 +879,8 @@ impl Client {
         GlobalStateWriteGuard::new(
             inner,
             repo,
-            self.session_id,
+            self.server_id(),
+            self.get_session_id(),
             sender_session_id,
             channel_version_dep,
         )
@@ -819,7 +907,7 @@ impl Client {
             .and_then(|h| hex::decode(h).ok().map(Bytes::from));
 
         msg_encoder::UserState {
-            session: Some(self.session_id),
+            session: Some(self.get_session_id()),
             actor: None,
             name: gs.get_display_name_opt().map(|s| s.to_owned()),
             user_id: gs.get_user_id(),

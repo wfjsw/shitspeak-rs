@@ -33,6 +33,7 @@ pub async fn handle_user_stats(
     );
 
     let sender_id = sender.get_session_id();
+    let server_id = sender.server_id();
     let local_node_id = server.get_clients().local_node_id();
 
     // ── Cross-node target ────────────────────────────────────────────────
@@ -54,6 +55,7 @@ pub async fn handle_user_stats(
                         u32::from(sender_id),
                         target_session,
                         msg.stats_only.unwrap_or(false),
+                        server_id.clone(),
                     )
                     .await;
                 match reply {
@@ -102,7 +104,11 @@ pub async fn handle_user_stats(
         Some(session_id) if session_id != u32::from(sender_id) => {
             let target_id =
                 crate::client::client_session_identifier::ClientSessionIdentifier::from(session_id);
-            match server.get_clients().get_client(target_id).await {
+            match server
+                .get_clients()
+                .get_client_in_server(&server_id, target_id)
+                .await
+            {
                 Some(c) => c,
                 None => return Ok(()),
             }
@@ -209,6 +215,11 @@ impl UserStatsResponder for ServerUserStatsResponder {
         let target_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
             request.target_session,
         );
+        let server_id = if request.server_id.is_empty() {
+            crate::types::default_server_id()
+        } else {
+            request.server_id.clone()
+        };
         // Owner-only RPC: target should belong to this node. If for some
         // reason it doesn't (replication / lookup race), reply not_found.
         if target_id.get_node_id() != server.get_clients().local_node_id() {
@@ -217,7 +228,11 @@ impl UserStatsResponder for ServerUserStatsResponder {
                 payload: Bytes::new(),
             };
         }
-        let Some(target) = server.get_clients().get_client(target_id).await else {
+        let Some(target) = server
+            .get_clients()
+            .get_client_in_server(&server_id, target_id)
+            .await
+        else {
             return UserStatsApplyOutcome {
                 found: false,
                 payload: Bytes::new(),

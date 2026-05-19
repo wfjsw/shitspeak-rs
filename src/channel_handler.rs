@@ -25,7 +25,8 @@ pub async fn apply_permission_info_to_channel_state(
 ) -> Option<crate::messages::Message> {
     if let crate::messages::Message::ChannelState(ref cs_proto) = cs_proto {
         if let Some(ch_id) = cs_proto.channel_id {
-            if let Some(ch) = channels.get_channel(ch_id).await {
+            let server_id = client.server_id();
+            if let Some(ch) = channels.get_channel_in_server(&server_id, ch_id).await {
                 let perms =
                     crate::client::acl::compute_permissions_for_client(server, client, ch_id).await;
                 let encoder_cs: crate::messages::encoder::ChannelState = cs_proto.clone().into();
@@ -62,6 +63,10 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
 ) -> Vec<crate::messages::Message> {
     let mut messages = Vec::new();
     let send_permission_info = server.read_config().send_permission_info;
+    let server_id = client.server_id();
+    if op.server_id != server_id {
+        return messages;
+    }
 
     match &op.op {
         ChannelOp::MarkPendingDelete { id, nonce } => {
@@ -73,6 +78,7 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
                     *id,
                     *nonce,
                     false,
+                    &server_id,
                     &mut messages,
                 )
                 .await;
@@ -88,6 +94,7 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
                         *id,
                         *nonce,
                         true,
+                        &server_id,
                         &mut messages,
                     )
                     .await;
@@ -141,6 +148,7 @@ pub async fn sync_shadow_for_client_message(
     server: &Arc<Box<Server>>,
     channels: &Arc<ChannelRepository>,
     shadow: &mut SessionChannelShadow,
+    server_id: &str,
     message: &Message,
 ) -> Vec<Message> {
     match message {
@@ -153,7 +161,10 @@ pub async fn sync_shadow_for_client_message(
             };
 
             shadow.insert(session, channel_id);
-            synthetic_move_if_pending_delete(server, channels, shadow, session, channel_id).await
+            synthetic_move_if_pending_delete(
+                server, channels, shadow, session, channel_id, server_id,
+            )
+            .await
         }
         Message::UserRemove(user_remove) => {
             shadow.remove(&ClientSessionIdentifier::from(user_remove.session));
@@ -169,12 +180,18 @@ async fn synthetic_move_if_pending_delete(
     shadow: &mut SessionChannelShadow,
     session: ClientSessionIdentifier,
     channel_id: u32,
+    server_id: &str,
 ) -> Vec<Message> {
-    if !channels.is_pending_delete_subtree(channel_id).await {
+    if !channels
+        .is_pending_delete_subtree_in_server(server_id, channel_id)
+        .await
+    {
         return Vec::new();
     }
 
-    let target = channels.redirect_pending_delete_target(channel_id).await;
+    let target = channels
+        .redirect_pending_delete_target_in_server(server_id, channel_id)
+        .await;
     if target == channel_id {
         return Vec::new();
     }
@@ -190,13 +207,14 @@ async fn append_pending_delete_synthetic_moves(
     id: u32,
     nonce: u64,
     include_deleted_snapshot: bool,
+    server_id: &str,
     messages: &mut Vec<Message>,
 ) {
     let subtree: std::collections::HashSet<u32> = if include_deleted_snapshot {
-        deleted_subtree_from_shadow(channels, id, shadow).await
+        deleted_subtree_from_shadow(channels, server_id, id, shadow).await
     } else {
         channels
-            .pending_delete_subtree(id, nonce)
+            .pending_delete_subtree_in_server(server_id, id, nonce)
             .await
             .into_iter()
             .collect()
@@ -205,7 +223,9 @@ async fn append_pending_delete_synthetic_moves(
         return;
     }
 
-    let target = channels.redirect_pending_delete_target(id).await;
+    let target = channels
+        .redirect_pending_delete_target_in_server(server_id, id)
+        .await;
     let sessions: Vec<_> = shadow
         .iter()
         .filter_map(|(session, channel_id)| subtree.contains(channel_id).then_some(*session))
@@ -223,11 +243,12 @@ async fn append_pending_delete_synthetic_moves(
 
 async fn deleted_subtree_from_shadow(
     channels: &Arc<ChannelRepository>,
+    server_id: &str,
     id: u32,
     shadow: &SessionChannelShadow,
 ) -> std::collections::HashSet<u32> {
     let channels_by_id: HashMap<u32, _> = channels
-        .get_all()
+        .get_all_in_server(server_id)
         .await
         .into_iter()
         .map(|channel| (channel.id, channel))
@@ -307,7 +328,8 @@ pub async fn replay_channel_log_gap(
         current,
     );
 
-    let missed = channels.get_log_since(last).await;
+    let server_id = client.server_id();
+    let missed = channels.get_log_since_in_server(&server_id, last).await;
     if missed.is_empty() && last > 0 {
         tracing::error!(
             "Client {:?} channel log gap unrecoverable (last={})",

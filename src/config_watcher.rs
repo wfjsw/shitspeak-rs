@@ -1,7 +1,7 @@
 //! Hot config reload via filesystem watcher.
 //!
 //! Spawns a background task that watches `config.toml` for changes and
-//! calls `Server::reload_config()` when a write is detected.
+//! calls `Server::reload_config()` through the Tokio runtime when a write is detected.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ pub fn spawn_config_watcher(
     server: Arc<Box<Server>>,
     mut shutdown: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
+    let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let path = Path::new("config.toml");
 
@@ -110,7 +111,7 @@ pub fn spawn_config_watcher(
 
             if received {
                 tracing::info!("config watcher: config.toml changed, reloading...");
-                if let Err(e) = server.reload_config() {
+                if let Err(e) = runtime.block_on(server.reload_config()) {
                     tracing::error!("config watcher: reload failed: {e}");
                 }
             }

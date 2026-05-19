@@ -26,6 +26,8 @@ pub struct GlobalStateWriteGuard<'a> {
     repo: &'a ClientRepository,
     /// The session that owns this state.
     session_id: ClientSessionIdentifier,
+    /// The server-id scope that owns this state.
+    server_id: String,
     /// The session that initiated this mutation.
     sender_session_id: Option<ClientSessionIdentifier>,
     /// The channel version at the time this guard was acquired.
@@ -39,6 +41,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
     pub(crate) fn new(
         mut inner: RwLockWriteGuard<'a, ClientGlobalState>,
         repo: &'a ClientRepository,
+        server_id: String,
         session_id: ClientSessionIdentifier,
         sender_session_id: Option<ClientSessionIdentifier>,
         channel_version_dep: Option<u64>,
@@ -47,6 +50,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
         Self {
             inner,
             repo,
+            server_id,
             session_id,
             sender_session_id,
             channel_version_dep,
@@ -67,6 +71,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
         }
         self.repo.commit_operation_sync(
             ClientStateOperation::UpdateGlobalState {
+                server_id: self.server_id.clone(),
                 session_id: self.session_id,
                 sender_session_id: self.sender_session_id,
                 delta,
@@ -112,6 +117,7 @@ impl<'a> Drop for GlobalStateWriteGuard<'a> {
             }
             self.repo.commit_operation_sync(
                 ClientStateOperation::UpdateGlobalState {
+                    server_id: self.server_id.clone(),
                     session_id: self.session_id,
                     sender_session_id: self.sender_session_id,
                     delta,

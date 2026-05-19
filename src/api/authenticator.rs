@@ -18,6 +18,9 @@ pub struct AuthenticateResult {
     pub user_id: Option<u32>,
     pub display_name: Option<String>,
     pub groups: Vec<String>,
+    /// Optional server-id scope selected by the authenticator.  Configured
+    /// virtual-server entrypoints do not constrain this value.
+    pub virtual_server_id: Option<String>,
     /// Preferred language for server-generated messages sent to this client.
     pub language: Language,
     /// Optional URL for the user's texture/avatar blob.
@@ -75,6 +78,7 @@ pub trait Authenticator: Send + Sync + 'static {
                 .clone()
                 .or_else(|| Some(claims.username.clone())),
             groups: claims.groups.clone(),
+            virtual_server_id: None,
             language: Language::default(),
             texture_url: None,
             comment_url: None,

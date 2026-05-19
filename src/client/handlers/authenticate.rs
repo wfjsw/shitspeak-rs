@@ -21,7 +21,8 @@ pub async fn handle_authenticate(
     msg: Authenticate,
 ) -> Result<(), MessageHandlerError> {
     let repo = server.get_clients();
-    let session = sender.get_session_id();
+    let mut session = sender.get_session_id();
+    let provisional_server_id = sender.server_id();
     tracing::debug!(
         session = u32::from(session),
         username = msg.username,
@@ -48,7 +49,7 @@ pub async fn handle_authenticate(
 
     // ── Authentication context and language ───────────────────────────────
     let certificate_hash = sender.get_certificate_hash().map(Bytes::copy_from_slice);
-    let session_id = sender.get_session_id();
+    let mut session_id = sender.get_session_id();
     let ip_address = sender.get_real_ip_address();
     let (version, client_name, os_name, os_version) = {
         let protocol_version = sender.protocol_version();
@@ -77,25 +78,6 @@ pub async fn handle_authenticate(
         .language(Some(username.as_str()), &auth_auxiliary)
         .await;
     sender.set_language(pre_auth_language);
-
-    // ── Snapshot all clients + versions (used for max-users, UserState
-    //     broadcast, and last-seen version tracking) ────────────────────────
-    let (all_clients, all_versions) = server.get_clients().snapshot_with_versions().await;
-
-    // ── Max-users check ───────────────────────────────────────────────────
-    {
-        let authenticated_clients = all_clients
-            .iter()
-            .filter(|client| client.is_authenticated())
-            .count() as u64;
-        if authenticated_clients >= server.get_max_users() {
-            return Err(AuthRejection::new_with_language(
-                RejectType::ServerFull,
-                sender.language(),
-            )
-            .into());
-        }
-    }
 
     // ── Certificate required ──────────────────────────────────────────────
     if server.get_cert_required() && !sender.has_certificate() {
@@ -134,6 +116,46 @@ pub async fn handle_authenticate(
             .into())
         }
     };
+
+    if let Some(auth_server_id) = result.virtual_server_id.clone() {
+        if auth_server_id != provisional_server_id {
+            let Some(new_session) = repo
+                .move_local_client_to_server(&provisional_server_id, session, &auth_server_id)
+                .await
+            else {
+                return Err(AuthRejection::new_with_language(
+                    RejectType::ServerFull,
+                    sender.language(),
+                )
+                .into());
+            };
+            session = new_session;
+            session_id = new_session;
+        }
+    }
+    let server_id = sender.server_id();
+
+    // ── Snapshot clients + versions for the selected server scope. These are
+    // used for max-users, the initial UserState burst, and last-seen tracking.
+    let (all_clients, all_versions) = server
+        .get_clients()
+        .snapshot_with_versions_in_server(&server_id)
+        .await;
+
+    // ── Max-users check ───────────────────────────────────────────────────
+    {
+        let authenticated_clients = all_clients
+            .iter()
+            .filter(|client| client.is_authenticated())
+            .count() as u64;
+        if authenticated_clients >= server.get_max_users() {
+            return Err(AuthRejection::new_with_language(
+                RejectType::ServerFull,
+                sender.language(),
+            )
+            .into());
+        }
+    }
 
     // ── Required groups check ─────────────────────────────────────────────
     {
@@ -279,7 +301,7 @@ pub async fn handle_authenticate(
         let default_ch = server.get_default_channel();
         let target_ch = if server
             .get_channels()
-            .get_channel(default_ch)
+            .get_channel_in_server(&server_id, default_ch)
             .await
             .is_some()
         {
@@ -289,9 +311,13 @@ pub async fn handle_authenticate(
         };
         let target_ch = server
             .get_channels()
-            .redirect_pending_delete_target(target_ch)
+            .redirect_pending_delete_target_in_server(&server_id, target_ch)
             .await;
-        sender.set_current_channel_id(target_ch, repo, server.get_channels().current_version());
+        sender.set_current_channel_id(
+            target_ch,
+            repo,
+            server.get_channels().current_version_in_server(&server_id),
+        );
     }
 
     // ── Build the full burst of messages to send to the new client ────────
@@ -320,7 +346,7 @@ pub async fn handle_authenticate(
 
     // 2. Channel tree — BFS from root
     {
-        let all_channels = server.get_channels().get_all().await;
+        let all_channels = server.get_channels().get_all_in_server(&server_id).await;
         // BFS ordering: root first, then children in order
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(0u32); // root channel id
@@ -347,6 +373,9 @@ pub async fn handle_authenticate(
     {
         for client in &all_clients {
             if client.get_session_id() == session_id {
+                continue;
+            }
+            if client.server_id() != server_id {
                 continue;
             }
             if !client.is_authenticated() {

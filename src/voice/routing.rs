@@ -1,6 +1,6 @@
 //! Voice routing logic — determines recipients and dispatches audio packets.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -232,6 +232,7 @@ fn push_unique_target(
 async fn resolve_voice_intent(
     server: &Arc<Box<Server>>,
     sender: Option<&Arc<Box<Client>>>,
+    server_id: &str,
     sender_id: crate::client::client_session_identifier::ClientSessionIdentifier,
     intent: &VoiceIntent,
     default_context: AudioContext,
@@ -245,7 +246,7 @@ async fn resolve_voice_intent(
             let source_channel = normal.source_channel;
             let channel_clients = server
                 .get_clients()
-                .get_local_clients_in_channel(source_channel)
+                .get_local_clients_in_channel_in_server(server_id, source_channel)
                 .await;
             for client in channel_clients {
                 push_unique_target(
@@ -260,7 +261,7 @@ async fn resolve_voice_intent(
             if let Some(sender) = sender {
                 let linked_ids: Vec<u32> = server
                     .get_channels()
-                    .get_channel(source_channel)
+                    .get_channel_in_server(server_id, source_channel)
                     .await
                     .map(|ch| ch.links.into_iter().collect())
                     .unwrap_or_default();
@@ -274,7 +275,7 @@ async fn resolve_voice_intent(
                     }
                     let linked_clients = server
                         .get_clients()
-                        .get_local_clients_in_channel(linked_id)
+                        .get_local_clients_in_channel_in_server(server_id, linked_id)
                         .await;
                     for client in linked_clients {
                         push_unique_target(
@@ -290,7 +291,7 @@ async fn resolve_voice_intent(
 
             let listeners = server
                 .get_clients()
-                .get_local_listeners_for_channel(source_channel)
+                .get_local_listeners_for_channel_in_server(server_id, source_channel)
                 .await;
             for client in listeners {
                 push_unique_target(
@@ -311,7 +312,11 @@ async fn resolve_voice_intent(
                 if session_id.node_id != local_node_id {
                     continue;
                 }
-                if let Some(client) = server.get_clients().get_client(session_id).await {
+                if let Some(client) = server
+                    .get_clients()
+                    .get_client_in_server(server_id, session_id)
+                    .await
+                {
                     push_unique_target(
                         &mut targets,
                         &mut seen,
@@ -324,7 +329,7 @@ async fn resolve_voice_intent(
 
             for ch_target in &target.channels {
                 let mut channel_ids = if ch_target.children {
-                    collect_subtree_ids(server, ch_target.id).await
+                    collect_subtree_ids(server, server_id, ch_target.id).await
                 } else {
                     vec![ch_target.id]
                 };
@@ -332,7 +337,11 @@ async fn resolve_voice_intent(
                 if ch_target.links {
                     let mut linked_ids = Vec::new();
                     for &ch_id in &channel_ids {
-                        if let Some(ch) = server.get_channels().get_channel(ch_id).await {
+                        if let Some(ch) = server
+                            .get_channels()
+                            .get_channel_in_server(server_id, ch_id)
+                            .await
+                        {
                             for linked_id in ch.links {
                                 if !channel_ids.contains(&linked_id)
                                     && !linked_ids.contains(&linked_id)
@@ -347,7 +356,7 @@ async fn resolve_voice_intent(
 
                 let channel_clients = server
                     .get_clients()
-                    .get_local_clients_in_channels(&channel_ids)
+                    .get_local_clients_in_channels_in_server(server_id, &channel_ids)
                     .await;
                 for client in channel_clients {
                     let client_channel = client.get_current_channel_id();
@@ -373,7 +382,7 @@ async fn resolve_voice_intent(
 
                 let channel_listeners = server
                     .get_clients()
-                    .get_local_listeners_for_channels(&channel_ids)
+                    .get_local_listeners_for_channels_in_server(server_id, &channel_ids)
                     .await;
                 for client in channel_listeners {
                     push_unique_target(
@@ -404,6 +413,7 @@ async fn resolve_voice_intent(
 
 pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, audio: &Audio) {
     let sender_id = sender.get_session_id();
+    let server_id = sender.server_id();
     let sender_channel = sender.get_current_channel_id();
 
     {
@@ -447,8 +457,15 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
     };
 
     let default_context = audio_context_from_target_kind(target_kind);
-    let targets =
-        resolve_voice_intent(server, Some(sender), sender_id, &intent, default_context).await;
+    let targets = resolve_voice_intent(
+        server,
+        Some(sender),
+        &server_id,
+        sender_id,
+        &intent,
+        default_context,
+    )
+    .await;
 
     tracing::trace!(
         session = u32::from(sender_id),
@@ -470,6 +487,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
                     app.voice()
                         .send_for_channel(
                             u32::from(sender_id),
+                            server_id.clone(),
                             normal.source_channel,
                             is_terminator,
                             payload,
@@ -480,6 +498,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
                     app.voice()
                         .send_intent_broadcast(
                             u32::from(sender_id),
+                            server_id.clone(),
                             target_kind,
                             is_terminator,
                             payload,
@@ -516,7 +535,15 @@ pub(crate) async fn route_s2s_voice_frame(
         }
     };
 
-    let replicated_sender = server.get_clients().get_client(sender_id).await;
+    let server_id = if frame.server_id.is_empty() {
+        crate::types::default_server_id()
+    } else {
+        frame.server_id.clone()
+    };
+    let replicated_sender = server
+        .get_clients()
+        .get_client_in_server(&server_id, sender_id)
+        .await;
     let intent = match frame.intent.clone() {
         Some(intent) => intent,
         None => {
@@ -531,6 +558,7 @@ pub(crate) async fn route_s2s_voice_frame(
     let targets = resolve_voice_intent(
         server,
         replicated_sender.as_ref(),
+        &server_id,
         sender_id,
         &intent,
         audio_context_from_target_kind(frame.target_kind),
@@ -570,7 +598,7 @@ pub(crate) async fn flush_voice_batch(
 
     if targets.len() < RAYON_FANOUT_THRESHOLD {
         let mut cache = EncodeCache::new();
-        let mut udp_batch = DatagramBatch::with_capacity(targets.len());
+        let mut udp_batches: HashMap<std::net::SocketAddr, DatagramBatch> = HashMap::new();
 
         for (client, context) in targets {
             let format = client_packet_format(client, server_protocol_version);
@@ -585,12 +613,22 @@ pub(crate) async fn flush_voice_batch(
                 client.try_enqueue_voice_tcp(entry.bytes);
                 continue;
             };
+            let Some(local_addr) = server
+                .udp_socket_for_client(client)
+                .and_then(|socket| socket.local_addr().ok())
+            else {
+                client.try_enqueue_voice_tcp(entry.bytes);
+                continue;
+            };
 
             let mut crypt = client.crypt_state();
             let Some(state) = crypt.as_mut() else {
                 continue;
             };
             let encrypted_len = entry.bytes.len() + state.overhead();
+            let udp_batch = udp_batches
+                .entry(local_addr)
+                .or_insert_with(|| DatagramBatch::with_capacity(targets.len()));
             if udp_batch
                 .try_push_zeroed(addr, encrypted_len, |buf| {
                     state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
@@ -606,8 +644,14 @@ pub(crate) async fn flush_voice_batch(
             }
         }
 
-        if !udp_batch.is_empty() {
-            let socket = server.get_udp_socket();
+        for (local_addr, udp_batch) in udp_batches {
+            if udp_batch.is_empty() {
+                continue;
+            }
+            let Some(socket) = server.udp_socket_for_client_addr(local_addr) else {
+                tracing::warn!(%local_addr, "UDP batch has no matching local socket");
+                continue;
+            };
             if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &udp_batch).await {
                 tracing::warn!("UDP batch send error: {e}");
             }
@@ -620,6 +664,7 @@ pub(crate) async fn flush_voice_batch(
     // the encrypt loop to rayon.
     let mut udp_items: Vec<(
         Arc<Box<Client>>,
+        std::net::SocketAddr,
         std::net::SocketAddr,
         PacketFormat,
         AudioContext,
@@ -637,7 +682,16 @@ pub(crate) async fn flush_voice_batch(
             continue;
         }
         match client.get_udp_address() {
-            Some(addr) => udp_items.push((client.clone(), addr, format, *context)),
+            Some(addr) => {
+                if let Some(local_addr) = server
+                    .udp_socket_for_client(client)
+                    .and_then(|socket| socket.local_addr().ok())
+                {
+                    udp_items.push((client.clone(), local_addr, addr, format, *context));
+                } else {
+                    tcp_items.push((client.clone(), format, *context));
+                }
+            }
             None => tcp_items.push((client.clone(), format, *context)),
         }
     }
@@ -662,44 +716,60 @@ pub(crate) async fn flush_voice_batch(
         .chain(cache.overflow.into_iter())
         .collect();
 
-    let batch: DatagramBatch = tokio::task::spawn_blocking(move || {
-        use rayon::prelude::*;
-        udp_items
-            .into_par_iter()
-            .with_min_len(RAYON_FANOUT_BATCH_MIN_LEN)
-            .fold(
-                DatagramBatch::new,
-                |mut batch, (client, addr, format, context)| {
-                    let Some(entry) = plaintexts
-                        .iter()
-                        .find_map(|(k, e)| (*k == (format, context)).then_some(e))
-                    else {
-                        return batch;
-                    };
-                    let mut crypt = client.crypt_state();
-                    let Some(state) = crypt.as_mut() else {
-                        return batch;
-                    };
-                    let encrypted_len = entry.bytes.len() + state.overhead();
-                    let _ = batch.try_push_zeroed(addr, encrypted_len, |buf| {
-                        state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
-                    });
-                    batch
-                },
-            )
-            .reduce(DatagramBatch::new, |mut left, right| {
-                left.append(right);
-                left
-            })
-    })
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!("voice encrypt task join error: {e}");
-        DatagramBatch::new()
-    });
+    let batches: HashMap<std::net::SocketAddr, DatagramBatch> =
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            udp_items
+                .into_par_iter()
+                .with_min_len(RAYON_FANOUT_BATCH_MIN_LEN)
+                .fold(
+                    HashMap::<std::net::SocketAddr, DatagramBatch>::new,
+                    |mut batches, (client, local_addr, addr, format, context)| {
+                        let Some(entry) = plaintexts
+                            .iter()
+                            .find_map(|(k, e)| (*k == (format, context)).then_some(e))
+                        else {
+                            return batches;
+                        };
+                        let mut crypt = client.crypt_state();
+                        let Some(state) = crypt.as_mut() else {
+                            return batches;
+                        };
+                        let encrypted_len = entry.bytes.len() + state.overhead();
+                        let batch = batches.entry(local_addr).or_insert_with(DatagramBatch::new);
+                        let _ = batch.try_push_zeroed(addr, encrypted_len, |buf| {
+                            state.encrypt_with_precomputed_checksum(
+                                buf,
+                                &entry.bytes,
+                                &entry.checksum,
+                            )
+                        });
+                        batches
+                    },
+                )
+                .reduce(HashMap::new, |mut left, right| {
+                    for (local_addr, batch) in right {
+                        left.entry(local_addr)
+                            .or_insert_with(DatagramBatch::new)
+                            .append(batch);
+                    }
+                    left
+                })
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("voice encrypt task join error: {e}");
+            HashMap::new()
+        });
 
-    if !batch.is_empty() {
-        let socket = server.get_udp_socket();
+    for (local_addr, batch) in batches {
+        if batch.is_empty() {
+            continue;
+        }
+        let Some(socket) = server.udp_socket_for_client_addr(local_addr) else {
+            tracing::warn!(%local_addr, "UDP batch has no matching local socket");
+            continue;
+        };
         if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &batch).await {
             tracing::warn!("UDP batch send error: {e}");
         }
@@ -775,8 +845,8 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
 }
 
 /// Collect all channel IDs in the subtree rooted at `root_id`.
-async fn collect_subtree_ids(server: &Arc<Box<Server>>, root_id: u32) -> Vec<u32> {
-    let all_channels = server.get_channels().get_all().await;
+async fn collect_subtree_ids(server: &Arc<Box<Server>>, server_id: &str, root_id: u32) -> Vec<u32> {
+    let all_channels = server.get_channels().get_all_in_server(server_id).await;
     let mut result = Vec::new();
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(root_id);

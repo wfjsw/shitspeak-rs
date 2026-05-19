@@ -6,7 +6,7 @@ pub mod transport;
 #[cfg(test)]
 pub(crate) mod testing;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
@@ -25,7 +25,7 @@ use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::ClientStateLogEntry;
 use crate::client_repository::ClientRepository;
 use crate::server::Server;
-use crate::types::NodeIdentifier;
+use crate::types::{NodeIdentifier, DEFAULT_SERVER_ID};
 
 use self::application::moderation::ModerationApplier;
 use self::application::plugin_data::ServerPluginDataSink;
@@ -57,10 +57,12 @@ struct S2SRuntimeState {
     replications: Option<Arc<ReplicationManager>>,
     application: Option<Arc<application::ApplicationLayer>>,
     recipient_index: Option<Arc<RecipientIndex>>,
-    channel_replication: Option<replications::StrictHandle<ChannelReplicationAdapter>>,
+    server: Option<Weak<Box<Server>>>,
+    channel_replications: HashMap<String, replications::StrictHandle<ChannelReplicationAdapter>>,
     ban_replication: Option<replications::StrictHandle<BanReplicationAdapter>>,
     client_replication: Option<replications::OwnerHandle<ClientReplicationAdapter>>,
-    channel_blob_replication: Option<replications::BlobHandle<ChannelBlobReplicationAdapter>>,
+    channel_blob_replications:
+        HashMap<String, replications::BlobHandle<ChannelBlobReplicationAdapter>>,
     bridge_tasks: Vec<JoinHandle<()>>,
 }
 
@@ -164,10 +166,17 @@ impl S2SManager {
     }
 
     pub async fn propose_channel_op(&self, op: ChannelOp) -> bool {
-        let Some(handle) = self.state.read().channel_replication.clone() else {
-            return false;
+        self.propose_channel_op_in_server(DEFAULT_SERVER_ID, op)
+            .await
+    }
+
+    pub async fn propose_channel_op_in_server(&self, server_id: &str, op: ChannelOp) -> bool {
+        let handle = match self.channel_replication_handle(server_id) {
+            Some(handle) => handle,
+            None => return false,
         };
         let operation = ChannelOperation {
+            server_id: server_id.to_owned(),
             version: 0,
             node_id: handle.local_node_id(),
             timestamp: chrono::Utc::now().timestamp(),
@@ -203,10 +212,67 @@ impl S2SManager {
     }
 
     pub async fn get_channel_blob(&self, key: &str) -> Option<Bytes> {
-        let Some(handle) = self.state.read().channel_blob_replication.clone() else {
-            return None;
-        };
+        self.get_channel_blob_in_server(DEFAULT_SERVER_ID, key)
+            .await
+    }
+
+    pub async fn get_channel_blob_in_server(&self, server_id: &str, key: &str) -> Option<Bytes> {
+        let handle = self.channel_blob_replication_handle(server_id)?;
         handle.get(key).await
+    }
+
+    fn channel_replication_handle(
+        &self,
+        server_id: &str,
+    ) -> Option<replications::StrictHandle<ChannelReplicationAdapter>> {
+        {
+            let state = self.state.read();
+            if let Some(handle) = state.channel_replications.get(server_id).cloned() {
+                return Some(handle);
+            }
+        }
+
+        let (replications, server) = {
+            let state = self.state.read();
+            let replications = state.replications.clone()?;
+            let server = state.server.clone()?.upgrade()?;
+            (replications, server)
+        };
+
+        match self.register_channel_replication_scope(&replications, &server, server_id) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(server_id, error = %e, "failed to register scoped s2s channel replication");
+                None
+            }
+        }
+    }
+
+    fn channel_blob_replication_handle(
+        &self,
+        server_id: &str,
+    ) -> Option<replications::BlobHandle<ChannelBlobReplicationAdapter>> {
+        {
+            let state = self.state.read();
+            if let Some(handle) = state.channel_blob_replications.get(server_id).cloned() {
+                return Some(handle);
+            }
+        }
+
+        let (replications, server) = {
+            let state = self.state.read();
+            let replications = state.replications.clone()?;
+            let server = state.server.clone()?.upgrade()?;
+            (replications, server)
+        };
+
+        match self.register_channel_blob_replication_scope(&replications, &server, server_id) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(server_id, error = %e, "failed to register scoped s2s channel blob replication");
+                None
+            }
+        }
     }
 
     pub fn spawn_runtime_task(
@@ -272,6 +338,50 @@ impl S2SManager {
         let application =
             application::ApplicationLayer::new(overlay.clone(), self.application_config.clone());
         let recipient_index = RecipientIndex::new();
+        let server_handle = server.upgrade();
+        if let Some(server) = server_handle.as_ref() {
+            let channels = server.get_channels().clone();
+            let manager = Arc::clone(&self);
+            replications.set_strict_topic_resolver(Some(Arc::new(move |topic, parts| {
+                let server_id = server_id_from_channel_topic(topic)?;
+                let repo = Arc::new(ChannelReplicationAdapter::new(
+                    server_id.clone(),
+                    channels.clone(),
+                ));
+                let runtime = parts.build_runtime(topic.to_owned(), repo);
+                runtime.start();
+                let handle = replications::StrictHandle::with_runtime(runtime.clone());
+                manager
+                    .state
+                    .write()
+                    .channel_replications
+                    .entry(server_id)
+                    .or_insert(handle);
+                Some(runtime)
+            })));
+
+            let channel_blobs = server.get_channel_blobs().clone();
+            let channels_for_blobs = server.get_channels().clone();
+            let manager = Arc::clone(&self);
+            replications.set_blob_topic_resolver(Some(Arc::new(move |topic, parts| {
+                let server_id = server_id_from_channel_blob_topic(topic)?;
+                let repo = Arc::new(ChannelBlobReplicationAdapter::new(
+                    server_id.clone(),
+                    channel_blobs.clone(),
+                    channels_for_blobs.clone(),
+                ));
+                let runtime = parts.build_runtime(topic.to_owned(), repo);
+                runtime.start();
+                let handle = replications::BlobHandle::with_runtime(runtime.clone());
+                manager
+                    .state
+                    .write()
+                    .channel_blob_replications
+                    .entry(server_id)
+                    .or_insert(handle);
+                Some(runtime)
+            })));
+        }
 
         application.user_stats().set_responder(
             crate::client::handlers::ServerUserStatsResponder::new(server.clone()),
@@ -290,19 +400,19 @@ impl S2SManager {
             .set_sink(ServerPluginDataSink::new(server.clone()));
 
         let (
-            channel_replication,
+            channel_replications,
             ban_replication,
             client_replication,
-            channel_blob_replication,
+            channel_blob_replications,
             bridge_tasks,
-        ) = match server.upgrade() {
+        ) = match server_handle.as_ref() {
             Some(server) => {
-                self.register_repositories(&replications, &server, recipient_index.clone())
+                self.register_repositories(&replications, server, recipient_index.clone())
                     .await
             }
             None => {
                 warn!("s2s repository replication skipped: server handle dropped");
-                (None, None, None, None, Vec::new())
+                (HashMap::new(), None, None, HashMap::new(), Vec::new())
             }
         };
 
@@ -313,10 +423,11 @@ impl S2SManager {
             state.replications = Some(replications.clone());
             state.application = Some(application.clone());
             state.recipient_index = Some(recipient_index);
-            state.channel_replication = channel_replication;
+            state.server = Some(server.clone());
+            state.channel_replications = channel_replications;
             state.ban_replication = ban_replication;
             state.client_replication = client_replication;
-            state.channel_blob_replication = channel_blob_replication;
+            state.channel_blob_replications = channel_blob_replications;
             state.bridge_tasks = bridge_tasks;
         }
 
@@ -327,10 +438,11 @@ impl S2SManager {
         let bridge_tasks = {
             let mut state = self.state.write();
             let bridge_tasks = std::mem::take(&mut state.bridge_tasks);
-            state.channel_replication = None;
+            state.channel_replications.clear();
             state.ban_replication = None;
             state.client_replication = None;
-            state.channel_blob_replication = None;
+            state.channel_blob_replications.clear();
+            state.server = None;
             state.recipient_index = None;
             state.application = None;
             state.replications = None;
@@ -342,6 +454,8 @@ impl S2SManager {
             task.abort();
         }
 
+        replications.set_strict_topic_resolver(None);
+        replications.set_blob_topic_resolver(None);
         application.shutdown().await;
         replications.shutdown().await;
         overlay.shutdown().await;
@@ -356,32 +470,36 @@ impl S2SManager {
         server: &Arc<Box<Server>>,
         recipient_index: Arc<RecipientIndex>,
     ) -> (
-        Option<replications::StrictHandle<ChannelReplicationAdapter>>,
+        HashMap<String, replications::StrictHandle<ChannelReplicationAdapter>>,
         Option<replications::StrictHandle<BanReplicationAdapter>>,
         Option<replications::OwnerHandle<ClientReplicationAdapter>>,
-        Option<replications::BlobHandle<ChannelBlobReplicationAdapter>>,
+        HashMap<String, replications::BlobHandle<ChannelBlobReplicationAdapter>>,
         Vec<JoinHandle<()>>,
     ) {
-        let channels = Arc::new(ChannelReplicationAdapter::new(
-            server.get_channels().clone(),
-        ));
         let bans = Arc::new(BanReplicationAdapter::new(server.get_bans().clone()));
         let clients = Arc::new(ClientReplicationAdapter::new(
             server.get_clients().clone(),
             server.get_channels().clone(),
         ));
-        let channel_blobs = Arc::new(ChannelBlobReplicationAdapter::new(
-            server.get_channel_blobs().clone(),
-            server.get_channels().clone(),
-        ));
 
-        let channel_handle = match replications.register_strict("channels", channels) {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                warn!(error = %e, "failed to register s2s channel replication");
-                None
-            }
-        };
+        let mut channel_handles = HashMap::new();
+        if let Err(e) = self.register_channel_replication_scope_into(
+            replications,
+            server,
+            DEFAULT_SERVER_ID,
+            &mut channel_handles,
+        ) {
+            warn!(error = %e, "failed to register s2s channel replication");
+        }
+        let mut channel_blob_handles = HashMap::new();
+        if let Err(e) = self.register_channel_blob_replication_scope_into(
+            replications,
+            server,
+            DEFAULT_SERVER_ID,
+            &mut channel_blob_handles,
+        ) {
+            warn!(error = %e, "failed to register s2s channel blob replication");
+        }
         let ban_handle = match replications.register_strict("bans", bans) {
             Ok(handle) => Some(handle),
             Err(e) => {
@@ -393,13 +511,6 @@ impl S2SManager {
             Ok(handle) => Some(handle),
             Err(e) => {
                 warn!(error = %e, "failed to register s2s client replication");
-                None
-            }
-        };
-        let channel_blob_handle = match replications.register_blob("channel_blobs", channel_blobs) {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                warn!(error = %e, "failed to register s2s channel blob replication");
                 None
             }
         };
@@ -417,12 +528,105 @@ impl S2SManager {
         ));
 
         (
-            channel_handle,
+            channel_handles,
             ban_handle,
             client_handle,
-            channel_blob_handle,
+            channel_blob_handles,
             bridge_tasks,
         )
+    }
+
+    fn register_channel_replication_scope(
+        &self,
+        replications: &Arc<ReplicationManager>,
+        server: &Arc<Box<Server>>,
+        server_id: &str,
+    ) -> Result<replications::StrictHandle<ChannelReplicationAdapter>, replications::ReplicationError>
+    {
+        let mut state = self.state.write();
+        self.register_channel_replication_scope_into(
+            replications,
+            server,
+            server_id,
+            &mut state.channel_replications,
+        )
+    }
+
+    fn register_channel_replication_scope_into(
+        &self,
+        replications: &Arc<ReplicationManager>,
+        server: &Arc<Box<Server>>,
+        server_id: &str,
+        handles: &mut HashMap<String, replications::StrictHandle<ChannelReplicationAdapter>>,
+    ) -> Result<replications::StrictHandle<ChannelReplicationAdapter>, replications::ReplicationError>
+    {
+        match handles.entry(server_id.to_owned()) {
+            Entry::Occupied(entry) => Ok(entry.get().clone()),
+            Entry::Vacant(entry) => {
+                let topic = channel_topic(server_id);
+                let repo = Arc::new(ChannelReplicationAdapter::new(
+                    server_id.to_owned(),
+                    server.get_channels().clone(),
+                ));
+                let runtime = replications
+                    .strict_topic_parts()
+                    .build_runtime(topic.clone(), repo);
+                runtime.start();
+                replications.install_strict_runtime(topic, runtime.clone())?;
+                let handle = replications::StrictHandle::with_runtime(runtime);
+                entry.insert(handle.clone());
+                Ok(handle)
+            }
+        }
+    }
+
+    fn register_channel_blob_replication_scope(
+        &self,
+        replications: &Arc<ReplicationManager>,
+        server: &Arc<Box<Server>>,
+        server_id: &str,
+    ) -> Result<
+        replications::BlobHandle<ChannelBlobReplicationAdapter>,
+        replications::ReplicationError,
+    > {
+        let mut state = self.state.write();
+        self.register_channel_blob_replication_scope_into(
+            replications,
+            server,
+            server_id,
+            &mut state.channel_blob_replications,
+        )
+    }
+
+    fn register_channel_blob_replication_scope_into(
+        &self,
+        replications: &Arc<ReplicationManager>,
+        server: &Arc<Box<Server>>,
+        server_id: &str,
+        handles: &mut HashMap<String, replications::BlobHandle<ChannelBlobReplicationAdapter>>,
+    ) -> Result<
+        replications::BlobHandle<ChannelBlobReplicationAdapter>,
+        replications::ReplicationError,
+    > {
+        match handles.entry(server_id.to_owned()) {
+            Entry::Occupied(entry) => Ok(entry.get().clone()),
+            Entry::Vacant(entry) => {
+                let topic = channel_blob_topic(server_id);
+                let repo = Arc::new(ChannelBlobReplicationAdapter::new(
+                    server_id.to_owned(),
+                    server.get_channel_blobs().clone(),
+                    server.get_channels().clone(),
+                ));
+                let runtime = replications
+                    .blob_topic_parts()
+                    .build_runtime(topic.clone(), repo);
+                runtime.start();
+                replications.install_blob_runtime(topic, runtime.clone())?;
+                let handle = replications::BlobHandle::with_runtime(runtime);
+                entry.insert(handle.clone());
+                Ok(handle)
+            }
+        }
     }
 }
 
@@ -500,12 +704,31 @@ impl ModerationApplier for ServerModerationApplier {
             return;
         }
 
+        let server_id = if envelope.server_id.is_empty() {
+            crate::types::default_server_id()
+        } else {
+            envelope.server_id.clone()
+        };
         match envelope.command {
             Some(ModerationCommand::UserState(patch)) => {
-                apply_user_state_patch(&server, envelope.actor_session, target_id, patch).await;
+                apply_user_state_patch(
+                    &server,
+                    &server_id,
+                    envelope.actor_session,
+                    target_id,
+                    patch,
+                )
+                .await;
             }
             Some(ModerationCommand::UserRemove(patch)) => {
-                apply_user_remove_patch(&server, envelope.actor_session, target_id, patch).await;
+                apply_user_remove_patch(
+                    &server,
+                    &server_id,
+                    envelope.actor_session,
+                    target_id,
+                    patch,
+                )
+                .await;
             }
             None => {
                 trace!(from, "s2s moderation ignored: empty command");
@@ -516,11 +739,16 @@ impl ModerationApplier for ServerModerationApplier {
 
 async fn apply_user_state_patch(
     server: &Arc<Box<Server>>,
+    server_id: &str,
     actor_session: u32,
     target_id: ClientSessionIdentifier,
     patch: UserStatePatch,
 ) {
-    let Some(target) = server.get_clients().get_client(target_id).await else {
+    let Some(target) = server
+        .get_clients()
+        .get_client_in_server(server_id, target_id)
+        .await
+    else {
         return;
     };
 
@@ -545,7 +773,7 @@ async fn apply_user_state_patch(
         || !patch.listening_channel_add.is_empty()
         || !patch.listening_channel_remove.is_empty();
     let channel_version_dep =
-        has_channel_dependency.then(|| server.get_channels().current_version());
+        has_channel_dependency.then(|| server.get_channels().current_version_in_server(server_id));
 
     let mut gs =
         target.write_global_state_as(server.get_clients(), Some(actor), channel_version_dep);
@@ -592,11 +820,16 @@ async fn apply_user_state_patch(
 
 async fn apply_user_remove_patch(
     server: &Arc<Box<Server>>,
+    server_id: &str,
     actor_session: u32,
     target_id: ClientSessionIdentifier,
     patch: UserRemovePatch,
 ) {
-    let Some(target) = server.get_clients().get_client(target_id).await else {
+    let Some(target) = server
+        .get_clients()
+        .get_client_in_server(server_id, target_id)
+        .await
+    else {
         return;
     };
 
@@ -629,7 +862,10 @@ async fn apply_user_remove_patch(
         );
     }
 
-    let removed = server.get_clients().remove_client(target_id).await;
+    let removed = server
+        .get_clients()
+        .remove_client_in_server(server_id, target_id)
+        .await;
     let target = removed.as_ref().unwrap_or(&target);
     if let Err(e) = target.disconnect().await {
         trace!(
@@ -660,14 +896,53 @@ impl AudioSink for ServerVoiceSink {
     }
 }
 
+fn server_id_from_channel_topic(topic: &str) -> Option<String> {
+    if topic == "channels" {
+        Some(DEFAULT_SERVER_ID.to_owned())
+    } else {
+        topic
+            .strip_prefix("channels:")
+            .filter(|server_id| !server_id.is_empty())
+            .map(str::to_owned)
+    }
+}
+
+fn server_id_from_channel_blob_topic(topic: &str) -> Option<String> {
+    if topic == "channel_blobs" {
+        Some(DEFAULT_SERVER_ID.to_owned())
+    } else {
+        topic
+            .strip_prefix("channel_blobs:")
+            .filter(|server_id| !server_id.is_empty())
+            .map(str::to_owned)
+    }
+}
+
+fn channel_topic(server_id: &str) -> String {
+    if server_id == DEFAULT_SERVER_ID {
+        "channels".to_owned()
+    } else {
+        format!("channels:{server_id}")
+    }
+}
+
+fn channel_blob_topic(server_id: &str) -> String {
+    if server_id == DEFAULT_SERVER_ID {
+        "channel_blobs".to_owned()
+    } else {
+        format!("channel_blobs:{server_id}")
+    }
+}
+
 #[derive(Clone)]
 struct ChannelReplicationAdapter {
+    server_id: String,
     repo: Arc<ChannelRepository>,
 }
 
 impl ChannelReplicationAdapter {
-    fn new(repo: Arc<ChannelRepository>) -> Self {
-        Self { repo }
+    fn new(server_id: String, repo: Arc<ChannelRepository>) -> Self {
+        Self { server_id, repo }
     }
 }
 
@@ -681,14 +956,16 @@ impl StrictReplicable for ChannelReplicationAdapter {
     type Op = ChannelOperation;
 
     fn current_version(&self) -> u64 {
-        self.repo.current_version()
+        self.repo.current_version_in_server(&self.server_id)
     }
 
     fn snapshot(&self) -> (u64, Bytes) {
-        let version = self.repo.current_version();
+        let version = self.repo.current_version_in_server(&self.server_id);
         let repo = self.repo.clone();
+        let server_id = self.server_id.clone();
         let channels =
-            block_in_place_or_current(|handle| handle.block_on(repo.get_all())).unwrap_or_default();
+            block_in_place_or_current(|handle| handle.block_on(repo.get_all_in_server(&server_id)))
+                .unwrap_or_default();
         let bytes =
             Bytes::from(rmp_serde::to_vec(&ChannelSnapshot { channels }).unwrap_or_default());
         (version, bytes)
@@ -696,8 +973,10 @@ impl StrictReplicable for ChannelReplicationAdapter {
 
     fn log_since(&self, since: u64) -> replications::strict::LogSlice<Self::Op> {
         let repo = self.repo.clone();
-        let entries =
-            block_in_place_or_current(|handle| handle.block_on(repo.get_log_since(since)));
+        let server_id = self.server_id.clone();
+        let entries = block_in_place_or_current(|handle| {
+            handle.block_on(repo.get_log_since_in_server(&server_id, since))
+        });
         match entries {
             Some(entries) => replications::strict::LogSlice::Available(
                 entries
@@ -711,6 +990,9 @@ impl StrictReplicable for ChannelReplicationAdapter {
 
     async fn apply_committed(&self, version: u64, mut op: Self::Op) {
         op.version = version;
+        if op.server_id.is_empty() || op.server_id == DEFAULT_SERVER_ID {
+            op.server_id = self.server_id.clone();
+        }
         if let Err(e) = self.repo.apply_committed_operation(op).await {
             warn!(error = ?e, "s2s channel operation apply failed");
         }
@@ -726,7 +1008,7 @@ impl StrictReplicable for ChannelReplicationAdapter {
         };
         if let Err(e) = self
             .repo
-            .install_s2s_snapshot(version, decoded.channels)
+            .install_s2s_snapshot_in_server(&self.server_id, version, decoded.channels)
             .await
         {
             warn!(error = ?e, "s2s channel snapshot install failed");
@@ -736,13 +1018,22 @@ impl StrictReplicable for ChannelReplicationAdapter {
 
 #[derive(Clone)]
 struct ChannelBlobReplicationAdapter {
+    server_id: String,
     blobs: Arc<ChannelBlobStore>,
     channels: Arc<ChannelRepository>,
 }
 
 impl ChannelBlobReplicationAdapter {
-    fn new(blobs: Arc<ChannelBlobStore>, channels: Arc<ChannelRepository>) -> Self {
-        Self { blobs, channels }
+    fn new(
+        server_id: String,
+        blobs: Arc<ChannelBlobStore>,
+        channels: Arc<ChannelRepository>,
+    ) -> Self {
+        Self {
+            server_id,
+            blobs,
+            channels,
+        }
     }
 }
 
@@ -778,7 +1069,7 @@ impl BlobReplicable for ChannelBlobReplicationAdapter {
 
     async fn referenced_keys(&self) -> HashSet<String> {
         self.channels
-            .get_all()
+            .get_all_in_server(&self.server_id)
             .await
             .into_iter()
             .filter_map(|channel| channel.description_hash)
@@ -938,9 +1229,10 @@ impl OwnerReplicable for ClientReplicationAdapter {
     ) {
         op.node_id = origin;
         op.version = version;
+        let current_channel_version = self.channels.current_version_in_server(op.op.server_id());
         if let Err(()) = self
             .clients
-            .apply_remote_operation(Arc::new(op), self.channels.current_version())
+            .apply_remote_operation(Arc::new(op), current_channel_version)
             .await
         {
             warn!(origin, version, "s2s client operation apply failed");
@@ -963,9 +1255,12 @@ impl OwnerReplicable for ClientReplicationAdapter {
         };
         for mut entry in decoded.entries {
             entry.node_id = origin;
+            let current_channel_version = self
+                .channels
+                .current_version_in_server(entry.op.server_id());
             if let Err(()) = self
                 .clients
-                .apply_remote_operation(Arc::new(entry), self.channels.current_version())
+                .apply_remote_operation(Arc::new(entry), current_channel_version)
                 .await
             {
                 warn!(origin, "s2s client snapshot entry apply failed");

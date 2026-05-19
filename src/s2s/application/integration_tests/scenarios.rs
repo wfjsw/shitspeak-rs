@@ -73,6 +73,7 @@ async fn two_node_voice_passthrough_in_order() {
             .voice()
             .send_broadcast(
                 sender_session,
+                crate::types::default_server_id(),
                 0,
                 is_terminator,
                 payload,
@@ -147,6 +148,7 @@ async fn three_node_voice_unicast_delivers_to_transit_node() {
         .voice()
         .send_unicast(
             0xABC_12345,
+            crate::types::default_server_id(),
             0,
             false,
             Bytes::from_static(b"line-frame"),
@@ -299,6 +301,7 @@ async fn two_node_voice_drops_when_sink_missing() {
             .voice()
             .send_broadcast(
                 0xABC,
+                crate::types::default_server_id(),
                 0,
                 false,
                 Bytes::from(format!("frame-{i}").into_bytes()),

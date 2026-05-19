@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::server::Server;
+use crate::types::DEFAULT_SERVER_ID;
 
 /// Default Mumble public server registry URL.
 const DEFAULT_REGISTRY_URL: &str = "https://publist-registration.mumble.info/v1/register";
@@ -27,8 +28,8 @@ const REGISTER_JITTER_SECS: u64 = 300;
 
 /// Build the XML registration payload.
 async fn build_register_xml(server: &Arc<Box<Server>>, config: &Config) -> String {
-    let user_count = server.get_clients().len().await;
-    let channel_count = server.get_channels().len().await;
+    let user_count = server.get_clients().len_in_server(DEFAULT_SERVER_ID).await;
+    let channel_count = server.get_channels().len_in_server(DEFAULT_SERVER_ID).await;
 
     let host = config
         .register_hostname

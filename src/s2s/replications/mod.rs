@@ -43,6 +43,7 @@ mod integration_tests;
 
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use scc::HashMap as SccMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -73,6 +74,64 @@ pub struct ReplicationManager {
     inner: Arc<ManagerInner>,
 }
 
+#[derive(Clone)]
+pub struct StrictTopicRuntimeParts {
+    self_id: NodeIdentifier,
+    self_epoch: u64,
+    net: Arc<dyn StrictNet>,
+    shutdown: CancellationToken,
+    cfg: Arc<ReplicationConfig>,
+}
+
+#[derive(Clone)]
+pub struct BlobTopicRuntimeParts {
+    self_id: NodeIdentifier,
+    net: Arc<dyn BlobNet>,
+    shutdown: CancellationToken,
+    cfg: Arc<ReplicationConfig>,
+}
+
+pub(crate) type StrictTopicResolver = Arc<
+    dyn Fn(&str, StrictTopicRuntimeParts) -> Option<Arc<dyn ErasedStrictRuntime>> + Send + Sync,
+>;
+pub(crate) type BlobTopicResolver =
+    Arc<dyn Fn(&str, BlobTopicRuntimeParts) -> Option<Arc<dyn ErasedBlobRuntime>> + Send + Sync>;
+
+impl StrictTopicRuntimeParts {
+    pub(crate) fn build_runtime<R: StrictReplicable>(
+        &self,
+        topic: String,
+        repo: Arc<R>,
+    ) -> Arc<StrictRuntime<R>> {
+        StrictRuntime::new(
+            repo,
+            self.self_id,
+            self.self_epoch,
+            topic,
+            self.net.clone(),
+            self.shutdown.child_token(),
+            self.cfg.clone(),
+        )
+    }
+}
+
+impl BlobTopicRuntimeParts {
+    pub(crate) fn build_runtime<R: BlobReplicable>(
+        &self,
+        topic: String,
+        repo: Arc<R>,
+    ) -> Arc<BlobRuntime<R>> {
+        BlobRuntime::new(
+            repo,
+            self.self_id,
+            topic,
+            self.net.clone(),
+            self.shutdown.child_token(),
+            self.cfg.clone(),
+        )
+    }
+}
+
 struct ManagerInner {
     overlay: OverlayNetwork,
     self_id: NodeIdentifier,
@@ -85,6 +144,8 @@ struct ManagerInner {
     strict_net: Arc<dyn StrictNet>,
     owner_net: Arc<dyn OwnerNet>,
     blob_net: Arc<dyn BlobNet>,
+    strict_topic_resolver: RwLock<Option<StrictTopicResolver>>,
+    blob_topic_resolver: RwLock<Option<BlobTopicResolver>>,
     cfg: Arc<ReplicationConfig>,
 }
 
@@ -133,6 +194,8 @@ impl ReplicationManager {
             strict_net,
             owner_net,
             blob_net,
+            strict_topic_resolver: RwLock::new(None),
+            blob_topic_resolver: RwLock::new(None),
             cfg,
         });
 
@@ -142,13 +205,7 @@ impl ReplicationManager {
         overlay.register_service(REPLICATION_SERVICE_TAG, handler);
 
         // Spawn the central dispatch task.
-        spawn_dispatch_task(
-            inbox_rx,
-            strict_topics.clone(),
-            owner_topics.clone(),
-            blob_topics.clone(),
-            shutdown.clone(),
-        );
+        spawn_dispatch_task(inbox_rx, inner.clone());
 
         // Spawn the membership-event fan-out task.
         let mut events = overlay.subscribe_membership();
@@ -214,6 +271,35 @@ impl ReplicationManager {
         Ok(StrictHandle { runtime })
     }
 
+    pub fn strict_topic_parts(&self) -> StrictTopicRuntimeParts {
+        StrictTopicRuntimeParts {
+            self_id: self.inner.self_id,
+            self_epoch: self.inner.self_epoch,
+            net: self.inner.strict_net.clone(),
+            shutdown: self.inner.shutdown.clone(),
+            cfg: self.inner.cfg.clone(),
+        }
+    }
+
+    pub fn install_strict_runtime(
+        &self,
+        topic: String,
+        runtime: Arc<dyn ErasedStrictRuntime>,
+    ) -> Result<(), ReplicationError> {
+        if self.inner.strict_topics.contains(&topic)
+            || self.inner.owner_topics.contains(&topic)
+            || self.inner.blob_topics.contains(&topic)
+        {
+            return Err(ReplicationError::TopicAlreadyRegistered(topic));
+        }
+        let _ = self.inner.strict_topics.insert(topic, runtime);
+        Ok(())
+    }
+
+    pub(crate) fn set_strict_topic_resolver(&self, resolver: Option<StrictTopicResolver>) {
+        *self.inner.strict_topic_resolver.write() = resolver;
+    }
+
     /// Register an owner-scoped topic.
     pub fn register_owner<R: OwnerReplicable>(
         &self,
@@ -266,6 +352,34 @@ impl ReplicationManager {
         let erased: Arc<dyn ErasedBlobRuntime> = runtime.clone();
         let _ = self.inner.blob_topics.insert(topic, erased);
         Ok(BlobHandle { runtime })
+    }
+
+    pub fn blob_topic_parts(&self) -> BlobTopicRuntimeParts {
+        BlobTopicRuntimeParts {
+            self_id: self.inner.self_id,
+            net: self.inner.blob_net.clone(),
+            shutdown: self.inner.shutdown.clone(),
+            cfg: self.inner.cfg.clone(),
+        }
+    }
+
+    pub fn install_blob_runtime(
+        &self,
+        topic: String,
+        runtime: Arc<dyn ErasedBlobRuntime>,
+    ) -> Result<(), ReplicationError> {
+        if self.inner.strict_topics.contains(&topic)
+            || self.inner.owner_topics.contains(&topic)
+            || self.inner.blob_topics.contains(&topic)
+        {
+            return Err(ReplicationError::TopicAlreadyRegistered(topic));
+        }
+        let _ = self.inner.blob_topics.insert(topic, runtime);
+        Ok(())
+    }
+
+    pub(crate) fn set_blob_topic_resolver(&self, resolver: Option<BlobTopicResolver>) {
+        *self.inner.blob_topic_resolver.write() = resolver;
     }
 
     /// Cancel all background tasks and unregister the L3 handler.
@@ -365,23 +479,32 @@ impl ReplicationManager {
     }
 }
 
-fn spawn_dispatch_task(
-    mut rx: mpsc::UnboundedReceiver<InboundFrame>,
-    strict_topics: Arc<SccMap<String, Arc<dyn ErasedStrictRuntime>>>,
-    owner_topics: Arc<SccMap<String, Arc<dyn ErasedOwnerRuntime>>>,
-    blob_topics: Arc<SccMap<String, Arc<dyn ErasedBlobRuntime>>>,
-    shutdown: CancellationToken,
-) {
+fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc<ManagerInner>) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return,
+                _ = inner.shutdown.cancelled() => return,
                 next = rx.recv() => {
                     let Some(frame) = next else { return };
                     match frame.body {
                         InboundBody::Strict(b) => {
-                            let rt = strict_topics
+                            let mut rt = inner.strict_topics
                                 .read(&frame.topic, |_, v| v.clone());
+                            if rt.is_none() {
+                                if let Some(resolver) = inner.strict_topic_resolver.read().clone() {
+                                    let parts = StrictTopicRuntimeParts {
+                                        self_id: inner.self_id,
+                                        self_epoch: inner.self_epoch,
+                                        net: inner.strict_net.clone(),
+                                        shutdown: inner.shutdown.clone(),
+                                        cfg: inner.cfg.clone(),
+                                    };
+                                    rt = resolver(&frame.topic, parts);
+                                    if let Some(rt) = rt.as_ref() {
+                                        let _ = inner.strict_topics.insert(frame.topic.clone(), rt.clone());
+                                    }
+                                }
+                            }
                             if let Some(rt) = rt {
                                 rt.dispatch(frame.from, b).await;
                             } else {
@@ -389,7 +512,7 @@ fn spawn_dispatch_task(
                             }
                         }
                         InboundBody::Owner(b) => {
-                            let rt = owner_topics
+                            let rt = inner.owner_topics
                                 .read(&frame.topic, |_, v| v.clone());
                             if let Some(rt) = rt {
                                 rt.dispatch(frame.from, b).await;
@@ -398,8 +521,22 @@ fn spawn_dispatch_task(
                             }
                         }
                         InboundBody::Blob(b) => {
-                            let rt = blob_topics
+                            let mut rt = inner.blob_topics
                                 .read(&frame.topic, |_, v| v.clone());
+                            if rt.is_none() {
+                                if let Some(resolver) = inner.blob_topic_resolver.read().clone() {
+                                    let parts = BlobTopicRuntimeParts {
+                                        self_id: inner.self_id,
+                                        net: inner.blob_net.clone(),
+                                        shutdown: inner.shutdown.clone(),
+                                        cfg: inner.cfg.clone(),
+                                    };
+                                    rt = resolver(&frame.topic, parts);
+                                    if let Some(rt) = rt.as_ref() {
+                                        let _ = inner.blob_topics.insert(frame.topic.clone(), rt.clone());
+                                    }
+                                }
+                            }
                             if let Some(rt) = rt {
                                 rt.dispatch(frame.from, b).await;
                             } else {

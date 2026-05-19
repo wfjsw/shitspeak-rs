@@ -32,6 +32,7 @@ pub async fn handle_channel_state(
     );
 
     let channels = server.get_channels();
+    let server_id = sender.server_id();
 
     // channel_id absent → create new channel
     // channel_id present → update existing channel
@@ -68,7 +69,9 @@ pub async fn handle_channel_state(
             }
 
             let is_temp = msg.temporary.unwrap_or(false);
-            let new_id = channels.next_channel_id(is_temp).await;
+            let new_id = channels
+                .next_channel_id_in_server(&server_id, is_temp)
+                .await;
             let description_hash = match description_blob_patch(server, msg.description.as_deref())
                 .await
             {
@@ -98,7 +101,7 @@ pub async fn handle_channel_state(
             let op = ChannelOp::CreateChannel {
                 channel: new_ch.clone(),
             };
-            if let Err(e) = channels.validate_s2s_op(&op).await {
+            if let Err(e) = channels.validate_s2s_op_in_server(&server_id, &op).await {
                 tracing::warn!("create_channel failed: {:?}", e);
                 return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                     r#type: DenyType::Text,
@@ -109,8 +112,12 @@ pub async fn handle_channel_state(
                     permission: None,
                 }));
             }
-            if !server.s2s_manager().propose_channel_op(op.clone()).await {
-                if let Err(e) = channels.create_channel(new_ch).await {
+            if !server
+                .s2s_manager()
+                .propose_channel_op_in_server(&server_id, op.clone())
+                .await
+            {
+                if let Err(e) = channels.create_channel_in_server(&server_id, new_ch).await {
                     tracing::warn!("create_channel failed: {:?}", e);
                     return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                         r#type: DenyType::Text,
@@ -129,7 +136,7 @@ pub async fn handle_channel_state(
 
         Some(channel_id) => {
             // ── Update existing channel ───────────────────────────────────
-            let channel = match channels.get_channel(channel_id).await {
+            let channel = match channels.get_channel_in_server(&server_id, channel_id).await {
                 Some(ch) => ch,
                 None => return Ok(()),
             };
@@ -274,13 +281,23 @@ pub async fn handle_channel_state(
                 links_add: msg.links_add.clone(),
                 links_remove: msg.links_remove.clone(),
             };
-            if let Err(e) = channels.validate_s2s_op(&op).await {
+            if let Err(e) = channels.validate_s2s_op_in_server(&server_id, &op).await {
                 tracing::warn!("update_channel {channel_id} failed: {:?}", e);
                 return Ok(());
             }
-            if !server.s2s_manager().propose_channel_op(op).await {
+            if !server
+                .s2s_manager()
+                .propose_channel_op_in_server(&server_id, op)
+                .await
+            {
                 if let Err(e) = channels
-                    .edit_channel(channel_id, patch, msg.links_add, msg.links_remove)
+                    .edit_channel_in_server(
+                        &server_id,
+                        channel_id,
+                        patch,
+                        msg.links_add,
+                        msg.links_remove,
+                    )
                     .await
                 {
                     tracing::warn!("update_channel {channel_id} failed: {:?}", e);

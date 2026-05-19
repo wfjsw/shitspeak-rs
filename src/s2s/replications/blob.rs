@@ -99,6 +99,10 @@ pub struct BlobHandle<R: BlobReplicable> {
 }
 
 impl<R: BlobReplicable> BlobHandle<R> {
+    pub(crate) fn with_runtime(runtime: Arc<BlobRuntime<R>>) -> Self {
+        Self { runtime }
+    }
+
     pub async fn get(&self, key: &str) -> Option<Bytes> {
         self.runtime.get_or_fetch(key).await
     }

@@ -46,6 +46,7 @@ use crate::acl::ACL;
 use crate::channels::{Channel, ChannelPatch, PendingDeleteState};
 use crate::config::Config;
 use crate::errors::ChannelRepoError;
+use crate::types::{default_server_id, DEFAULT_SERVER_ID};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ChannelRepoTuning {
@@ -70,6 +71,8 @@ impl From<&Config> for ChannelRepoTuning {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelOperation {
+    #[serde(default = "default_server_id")]
+    pub server_id: String,
     pub version: u64,
     pub node_id: u16,
     /// Unix timestamp (seconds since epoch) when the operation was created.
@@ -222,11 +225,22 @@ pub enum ChannelOp {
 // ─── Snapshot ─────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
+struct SnapshotChannel {
+    #[serde(default = "default_server_id")]
+    server_id: String,
+    #[serde(flatten)]
+    channel: Channel,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
+    #[serde(default)]
     version: u64,
+    #[serde(default)]
+    versions: HashMap<String, u64>,
     saved_at: i64,
     node_id: u16,
-    channels: Vec<Channel>,
+    channels: Vec<SnapshotChannel>,
 }
 
 // ─── ChannelRepository ────────────────────────────────────────────────────────
@@ -240,16 +254,16 @@ struct CachedAclPermissions {
 
 pub struct ChannelRepository {
     node_id: u16,
-    channels: ParkingRwLock<HashMap<u32, Channel>>,
-    version: AtomicU64,
+    channels: ParkingRwLock<HashMap<String, HashMap<u32, Channel>>>,
+    versions: ParkingRwLock<HashMap<String, u64>>,
     /// In-memory log for `get_log_since` and future S2S queries.
     log: ParkingRwLock<std::collections::VecDeque<Arc<ChannelOperation>>>,
     log_max_entries: usize,
     /// Bumped whenever channel state can change effective ACL results.
     channel_acl_generation: AtomicU64,
-    /// Cached effective permissions: (session_id_u64, channel_id) -> entry.
+    /// Cached effective permissions: (server_id, session_id_u64, channel_id) -> entry.
     /// Lock-free concurrent cache using scc::HashCache.
-    acl_cache: HashCache<(u64, u32), CachedAclPermissions>,
+    acl_cache: HashCache<(String, u64, u32), CachedAclPermissions>,
     /// Optional storage directory.
     storage_dir: Option<PathBuf>,
     /// Append-only WAL file handle; `None` when running in-memory.
@@ -279,11 +293,16 @@ impl ChannelRepository {
         let mut channels = HashMap::new();
         // Ensure root channel exists
         let root = Channel::new(0, "Root", 0, 0, None);
-        channels.insert(0, root);
+        channels
+            .entry(DEFAULT_SERVER_ID.to_owned())
+            .or_insert_with(HashMap::new)
+            .insert(0, root);
+        let mut versions = HashMap::new();
+        versions.insert(DEFAULT_SERVER_ID.to_owned(), 0);
         Arc::new(Self {
             node_id,
             channels: ParkingRwLock::new(channels),
-            version: AtomicU64::new(0),
+            versions: ParkingRwLock::new(versions),
             log: ParkingRwLock::new(std::collections::VecDeque::new()),
             log_max_entries: tuning.log_max_entries,
             channel_acl_generation: AtomicU64::new(0),
@@ -318,18 +337,26 @@ impl ChannelRepository {
         let wal_path = storage_dir.join("channels.wal.jsonl");
 
         // ── 1. Load snapshot ─────────────────────────────────────────────
-        let (mut channels, mut base_version) = match tokio::fs::read(&snapshot_path).await {
+        let (mut channels, mut versions) = match tokio::fs::read(&snapshot_path).await {
             Ok(data) => {
                 let snap: Snapshot =
                     serde_json::from_slice(&data).map_err(|e| ChannelRepoError::WalCorrupt {
                         line: 0,
                         reason: format!("snapshot corrupt: {e}"),
                     })?;
-                let map: HashMap<u32, Channel> =
-                    snap.channels.into_iter().map(|c| (c.id, c)).collect();
-                (map, snap.version)
+                let mut map: HashMap<String, HashMap<u32, Channel>> = HashMap::new();
+                for scoped in snap.channels {
+                    map.entry(scoped.server_id)
+                        .or_default()
+                        .insert(scoped.channel.id, scoped.channel);
+                }
+                let mut versions = snap.versions;
+                if versions.is_empty() {
+                    versions.insert(DEFAULT_SERVER_ID.to_owned(), snap.version);
+                }
+                (map, versions)
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0u64),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), HashMap::new()),
             Err(e) => return Err(ChannelRepoError::WalIo(e)),
         };
 
@@ -340,7 +367,6 @@ impl ChannelRepository {
             Err(e) => return Err(ChannelRepoError::WalIo(e)),
         };
 
-        let mut max_version = base_version;
         let mut wal_entry_count: usize = 0;
         let mut log_entries = std::collections::VecDeque::new();
         for (line_no, line) in wal_contents.lines().enumerate() {
@@ -367,13 +393,17 @@ impl ChannelRepository {
                 log_entries.pop_front();
             }
 
+            let base_version = versions.get(&op.server_id).copied().unwrap_or(0);
             if op.version <= base_version {
                 continue; // already reflected in snapshot
             }
-            apply_op_to_map(&mut channels, &op.op, op.node_id);
-            if op.version > max_version {
-                max_version = op.version;
-            }
+            let scoped_channels = channels.entry(op.server_id.clone()).or_default();
+            ensure_root_channel(scoped_channels);
+            apply_op_to_map(scoped_channels, &op.op, op.node_id);
+            versions
+                .entry(op.server_id.clone())
+                .and_modify(|version| *version = (*version).max(op.version))
+                .or_insert(op.version);
         }
 
         // ── 3. Open WAL for appending ────────────────────────────────────
@@ -383,18 +413,21 @@ impl ChannelRepository {
             .open(&wal_path)
             .await?;
 
-        // ── 4. Ensure root channel exists ────────────────────────────────
-        if !channels.contains_key(&0) {
-            let root = Channel::new(0, "Root", 0, 0, None);
-            channels.insert(0, root);
+        // ── 4. Ensure root channel exists per known scope ────────────────
+        if channels.is_empty() {
+            channels.insert(DEFAULT_SERVER_ID.to_owned(), HashMap::new());
         }
+        for scoped_channels in channels.values_mut() {
+            ensure_root_channel(scoped_channels);
+        }
+        versions.entry(DEFAULT_SERVER_ID.to_owned()).or_insert(0);
 
         let (tx, _) = broadcast::channel(256);
 
         Ok(Arc::new(Self {
             node_id,
             channels: ParkingRwLock::new(channels),
-            version: AtomicU64::new(max_version),
+            versions: ParkingRwLock::new(versions),
             log: ParkingRwLock::new(log_entries),
             log_max_entries: tuning.log_max_entries,
             channel_acl_generation: AtomicU64::new(0),
@@ -414,7 +447,11 @@ impl ChannelRepository {
     // ── Version ───────────────────────────────────────────────────────────
 
     pub fn current_version(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
+        self.current_version_in_server(DEFAULT_SERVER_ID)
+    }
+
+    pub fn current_version_in_server(&self, server_id: &str) -> u64 {
+        self.versions.read().get(server_id).copied().unwrap_or(0)
     }
 
     pub(crate) fn channel_acl_generation(&self) -> u64 {
@@ -432,12 +469,33 @@ impl ChannelRepository {
     // ── Read API ──────────────────────────────────────────────────────────
 
     pub async fn get_channel(&self, id: u32) -> Option<Channel> {
-        self.channels.read().get(&id).cloned()
+        self.get_channel_in_server(DEFAULT_SERVER_ID, id).await
+    }
+
+    pub async fn get_channel_in_server(&self, server_id: &str, id: u32) -> Option<Channel> {
+        self.channels
+            .read()
+            .get(server_id)
+            .and_then(|channels| channels.get(&id))
+            .cloned()
+            .or_else(|| (id == 0).then(root_channel))
     }
 
     /// Returns true if `channel_id` is inside a subtree currently marked for deletion.
     pub async fn is_pending_delete_subtree(&self, channel_id: u32) -> bool {
+        self.is_pending_delete_subtree_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await
+    }
+
+    pub async fn is_pending_delete_subtree_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> bool {
         let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return false;
+        };
         let mut current = Some(channel_id);
         while let Some(id) = current {
             let Some(channel) = channels.get(&id) else {
@@ -453,7 +511,19 @@ impl ChannelRepository {
 
     /// Resolve `channel_id` to the nearest non-pending ancestor, or root.
     pub async fn redirect_pending_delete_target(&self, channel_id: u32) -> u32 {
+        self.redirect_pending_delete_target_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await
+    }
+
+    pub async fn redirect_pending_delete_target_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> u32 {
         let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return 0;
+        };
         let mut current = Some(channel_id);
         while let Some(id) = current {
             let Some(channel) = channels.get(&id) else {
@@ -469,7 +539,20 @@ impl ChannelRepository {
 
     /// Return the subtree ids if `id` is currently marked with `nonce`.
     pub async fn pending_delete_subtree(&self, id: u32, nonce: u64) -> Vec<u32> {
+        self.pending_delete_subtree_in_server(DEFAULT_SERVER_ID, id, nonce)
+            .await
+    }
+
+    pub async fn pending_delete_subtree_in_server(
+        &self,
+        server_id: &str,
+        id: u32,
+        nonce: u64,
+    ) -> Vec<u32> {
         let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return Vec::new();
+        };
         let Some(channel) = channels.get(&id) else {
             return Vec::new();
         };
@@ -493,11 +576,23 @@ impl ChannelRepository {
 
     /// Return root pending-delete markers that have exceeded `timeout_ms`.
     pub async fn expired_pending_deletes(&self, timeout_ms: i64) -> Vec<(u32, u64)> {
+        self.expired_pending_deletes_in_server(DEFAULT_SERVER_ID, timeout_ms)
+            .await
+    }
+
+    pub async fn expired_pending_deletes_in_server(
+        &self,
+        server_id: &str,
+        timeout_ms: i64,
+    ) -> Vec<(u32, u64)> {
         if timeout_ms <= 0 {
             return Vec::new();
         }
         let now = chrono::Utc::now().timestamp_millis();
         let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return Vec::new();
+        };
         let mut expired = Vec::new();
         for channel in channels.values() {
             let Some(pending) = channel.pending_delete.as_ref() else {
@@ -531,11 +626,29 @@ impl ChannelRepository {
         parent_id: u32,
         channel_version: u64,
     ) -> usize {
+        self.move_local_clients_out_of_pending_delete_in_server(
+            DEFAULT_SERVER_ID,
+            id,
+            nonce,
+            parent_id,
+            channel_version,
+        )
+        .await
+    }
+
+    pub async fn move_local_clients_out_of_pending_delete_in_server(
+        &self,
+        server_id: &str,
+        id: u32,
+        nonce: u64,
+        parent_id: u32,
+        channel_version: u64,
+    ) -> usize {
         let Some(client_repo) = self.client_repo.lock().clone() else {
             return 0;
         };
         let subtree: std::collections::HashSet<u32> = self
-            .pending_delete_subtree(id, nonce)
+            .pending_delete_subtree_in_server(server_id, id, nonce)
             .await
             .into_iter()
             .collect();
@@ -544,7 +657,7 @@ impl ChannelRepository {
         }
 
         let mut moved = 0;
-        for client in client_repo.get_local_clients().await {
+        for client in client_repo.get_local_clients_in_server(server_id).await {
             if !subtree.contains(&client.get_current_channel_id()) {
                 continue;
             }
@@ -555,27 +668,85 @@ impl ChannelRepository {
     }
 
     pub async fn get_all(&self) -> Vec<Channel> {
-        self.channels.read().values().cloned().collect()
+        self.get_all_in_server(DEFAULT_SERVER_ID).await
+    }
+
+    pub async fn get_all_in_server(&self, server_id: &str) -> Vec<Channel> {
+        let channels = self.channels.read();
+        match channels.get(server_id) {
+            Some(channels) => {
+                let mut channels: Vec<Channel> = channels.values().cloned().collect();
+                if !channels.iter().any(|channel| channel.id == 0) {
+                    channels.push(root_channel());
+                }
+                channels
+            }
+            None => vec![root_channel()],
+        }
     }
 
     /// Return the total number of channels.
     pub async fn len(&self) -> usize {
-        self.channels.read().len()
+        self.len_in_server(DEFAULT_SERVER_ID).await
+    }
+
+    pub async fn len_in_server(&self, server_id: &str) -> usize {
+        self.channels
+            .read()
+            .get(server_id)
+            .map(|channels| channels.len().max(1))
+            .unwrap_or(1)
     }
 
     pub async fn get_children(&self, parent_id: u32) -> Vec<Channel> {
+        self.get_children_in_server(DEFAULT_SERVER_ID, parent_id)
+            .await
+    }
+
+    pub async fn get_children_in_server(&self, server_id: &str, parent_id: u32) -> Vec<Channel> {
         self.channels
             .read()
-            .values()
-            .filter(|c| c.parent_id == Some(parent_id))
-            .cloned()
+            .get(server_id)
+            .map(|channels| {
+                channels
+                    .values()
+                    .filter(|c| c.parent_id == Some(parent_id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn get_all_scoped(&self) -> Vec<(String, Channel)> {
+        self.channels
+            .read()
+            .iter()
+            .flat_map(|(server_id, channels)| {
+                channels
+                    .values()
+                    .cloned()
+                    .map(|channel| (server_id.clone(), channel))
+                    .collect::<Vec<_>>()
+            })
             .collect()
+    }
+
+    pub fn known_server_ids(&self) -> Vec<String> {
+        self.channels.read().keys().cloned().collect()
     }
 
     /// Returns the chain of ancestors for `channel_id`, starting from the
     /// immediate parent up to (and including) the root.
     pub async fn get_ancestors(&self, channel_id: u32) -> Vec<Channel> {
+        self.get_ancestors_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await
+    }
+
+    pub async fn get_ancestors_in_server(&self, server_id: &str, channel_id: u32) -> Vec<Channel> {
         let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return Vec::new();
+        };
         let mut result = Vec::new();
         let mut current_id = channel_id;
         loop {
@@ -598,19 +769,46 @@ impl ChannelRepository {
         &self,
         channel_id: u32,
     ) -> (Option<Channel>, Vec<Channel>) {
+        self.get_channel_with_ancestors_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await
+    }
+
+    pub async fn get_channel_with_ancestors_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> (Option<Channel>, Vec<Channel>) {
         let channels = self.channels.read();
-        let channel = channels.get(&channel_id).cloned();
+        let Some(channels) = channels.get(server_id) else {
+            return if channel_id == 0 {
+                (Some(root_channel()), Vec::new())
+            } else {
+                (None, Vec::new())
+            };
+        };
+        let channel = channels
+            .get(&channel_id)
+            .cloned()
+            .or_else(|| (channel_id == 0).then(root_channel));
         let mut ancestors = Vec::new();
         let mut current_id = channel_id;
         loop {
-            let Some(ch) = channels.get(&current_id) else {
+            let Some(ch) = channels
+                .get(&current_id)
+                .cloned()
+                .or_else(|| (current_id == 0).then(root_channel))
+            else {
                 break;
             };
             let Some(pid) = ch.parent_id else { break };
-            let Some(parent) = channels.get(&pid) else {
+            let Some(parent) = channels
+                .get(&pid)
+                .cloned()
+                .or_else(|| (pid == 0).then(root_channel))
+            else {
                 break;
             };
-            ancestors.push(parent.clone());
+            ancestors.push(parent);
             current_id = pid;
         }
         (channel, ancestors)
@@ -621,9 +819,20 @@ impl ChannelRepository {
         &self,
         channel_id: u32,
     ) -> (u64, Option<Channel>, Vec<Channel>) {
+        self.get_channel_with_ancestors_for_acl_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await
+    }
+
+    pub(crate) async fn get_channel_with_ancestors_for_acl_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> (u64, Option<Channel>, Vec<Channel>) {
         loop {
             let generation = self.channel_acl_generation();
-            let (channel, ancestors) = self.get_channel_with_ancestors(channel_id).await;
+            let (channel, ancestors) = self
+                .get_channel_with_ancestors_in_server(server_id, channel_id)
+                .await;
             if self.channel_acl_generation() == generation {
                 return (generation, channel, ancestors);
             }
@@ -634,7 +843,15 @@ impl ChannelRepository {
 
     /// Allocate a fresh channel ID.  Temporary channels get bit-31 set.
     pub async fn next_channel_id(&self, temporary: bool) -> u32 {
+        self.next_channel_id_in_server(DEFAULT_SERVER_ID, temporary)
+            .await
+    }
+
+    pub async fn next_channel_id_in_server(&self, server_id: &str, temporary: bool) -> u32 {
         let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return if temporary { 0x8000_0001 } else { 1 };
+        };
         // Find the highest non-temporary ID and increment.
         let max_id = channels
             .keys()
@@ -654,8 +871,19 @@ impl ChannelRepository {
         self: &Arc<Self>,
         mut channel: Channel,
     ) -> Result<Channel, ChannelRepoError> {
+        self.create_channel_in_server(DEFAULT_SERVER_ID, channel)
+            .await
+    }
+
+    pub async fn create_channel_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        mut channel: Channel,
+    ) -> Result<Channel, ChannelRepoError> {
         let op = {
             let mut channels = self.channels.write();
+            let channels = channels.entry(server_id.to_owned()).or_default();
+            ensure_root_channel(channels);
 
             // Validate parent exists
             if let Some(pid) = channel.parent_id {
@@ -671,9 +899,12 @@ impl ChannelRepository {
                 return Err(ChannelRepoError::NameConflict(channel.name.clone()));
             }
 
-            let op = self.make_op(ChannelOp::CreateChannel {
-                channel: channel.clone(),
-            });
+            let op = self.make_op_in_server(
+                server_id,
+                ChannelOp::CreateChannel {
+                    channel: channel.clone(),
+                },
+            );
             channels.insert(channel.id, channel.clone());
             op
         };
@@ -688,8 +919,20 @@ impl ChannelRepository {
         id: u32,
         patch: ChannelPatch,
     ) -> Result<Channel, ChannelRepoError> {
+        self.update_channel_in_server(DEFAULT_SERVER_ID, id, patch)
+            .await
+    }
+
+    pub async fn update_channel_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        id: u32,
+        patch: ChannelPatch,
+    ) -> Result<Channel, ChannelRepoError> {
         let parent_changed = patch.parent_id.is_some();
-        let mut channels = self.channels.write();
+        let mut all_channels = self.channels.write();
+        let channels = all_channels.entry(server_id.to_owned()).or_default();
+        ensure_root_channel(channels);
 
         if !channels.contains_key(&id) {
             return Err(ChannelRepoError::NotFound(id));
@@ -720,10 +963,13 @@ impl ChannelRepository {
         }
 
         let (op, updated) = {
-            let op = self.make_op(ChannelOp::UpdateChannel {
-                id,
-                patch: patch.clone(),
-            });
+            let op = self.make_op_in_server(
+                server_id,
+                ChannelOp::UpdateChannel {
+                    id,
+                    patch: patch.clone(),
+                },
+            );
             apply_patch(channels.get_mut(&id).unwrap(), &patch);
             let updated = channels[&id].clone();
             (op, updated)
@@ -743,9 +989,23 @@ impl ChannelRepository {
         links_add: Vec<u32>,
         links_remove: Vec<u32>,
     ) -> Result<Channel, ChannelRepoError> {
+        self.edit_channel_in_server(DEFAULT_SERVER_ID, id, patch, links_add, links_remove)
+            .await
+    }
+
+    pub async fn edit_channel_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        id: u32,
+        patch: ChannelPatch,
+        links_add: Vec<u32>,
+        links_remove: Vec<u32>,
+    ) -> Result<Channel, ChannelRepoError> {
         let parent_changed = patch.parent_id.is_some();
         let updated = {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
+            ensure_root_channel(channels);
 
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
@@ -802,12 +1062,15 @@ impl ChannelRepository {
             channels[&id].clone()
         };
 
-        let op = self.make_op(ChannelOp::EditChannel {
-            id,
-            patch,
-            links_add,
-            links_remove,
-        });
+        let op = self.make_op_in_server(
+            server_id,
+            ChannelOp::EditChannel {
+                id,
+                patch,
+                links_add,
+                links_remove,
+            },
+        );
         if parent_changed {
             self.bump_channel_acl_generation();
         }
@@ -818,13 +1081,24 @@ impl ChannelRepository {
     /// Delete a channel and all its descendants.  Users should be moved to
     /// the parent by the caller before invoking this.
     pub async fn delete_channel(self: &Arc<Self>, id: u32) -> Result<Vec<u32>, ChannelRepoError> {
+        self.delete_channel_in_server(DEFAULT_SERVER_ID, id).await
+    }
+
+    pub async fn delete_channel_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        id: u32,
+    ) -> Result<Vec<u32>, ChannelRepoError> {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
 
         let nonce = rand::random::<u64>();
-        let to_delete = self.mark_pending_delete(id, nonce).await?;
-        self.apply_delete_channel(id, nonce).await?;
+        let to_delete = self
+            .mark_pending_delete_in_server(server_id, id, nonce)
+            .await?;
+        self.apply_delete_channel_in_server(server_id, id, nonce)
+            .await?;
         Ok(to_delete)
     }
 
@@ -835,11 +1109,23 @@ impl ChannelRepository {
         id: u32,
         nonce: u64,
     ) -> Result<Vec<u32>, ChannelRepoError> {
+        self.mark_pending_delete_in_server(DEFAULT_SERVER_ID, id, nonce)
+            .await
+    }
+
+    pub async fn mark_pending_delete_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        id: u32,
+        nonce: u64,
+    ) -> Result<Vec<u32>, ChannelRepoError> {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
         let to_delete = {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
+            ensure_root_channel(channels);
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
             }
@@ -856,7 +1142,7 @@ impl ChannelRepository {
             }
             to_delete
         };
-        let op = self.make_op(ChannelOp::MarkPendingDelete { id, nonce });
+        let op = self.make_op_in_server(server_id, ChannelOp::MarkPendingDelete { id, nonce });
         self.commit(op).await?;
         Ok(to_delete)
     }
@@ -868,11 +1154,23 @@ impl ChannelRepository {
         id: u32,
         nonce: u64,
     ) -> Result<bool, ChannelRepoError> {
+        self.apply_delete_channel_in_server(DEFAULT_SERVER_ID, id, nonce)
+            .await
+    }
+
+    pub async fn apply_delete_channel_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        id: u32,
+        nonce: u64,
+    ) -> Result<bool, ChannelRepoError> {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
         let deleted = {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
+            ensure_root_channel(channels);
             let Some(channel) = channels.get(&id) else {
                 return Err(ChannelRepoError::NotFound(id));
             };
@@ -888,7 +1186,7 @@ impl ChannelRepository {
             }
             can_delete
         };
-        let mut op = self.make_op(ChannelOp::DeleteChannel { id, nonce });
+        let mut op = self.make_op_in_server(server_id, ChannelOp::DeleteChannel { id, nonce });
         op.emits_client_message = deleted;
         if deleted {
             self.bump_channel_acl_generation();
@@ -903,11 +1201,23 @@ impl ChannelRepository {
         id: u32,
         nonce: u64,
     ) -> Result<(), ChannelRepoError> {
+        self.cancel_pending_delete_in_server(DEFAULT_SERVER_ID, id, nonce)
+            .await
+    }
+
+    pub async fn cancel_pending_delete_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        id: u32,
+        nonce: u64,
+    ) -> Result<(), ChannelRepoError> {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
         {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
+            ensure_root_channel(channels);
             let to_cancel = collect_subtree(&channels, id);
             for cancel_id in &to_cancel {
                 if let Some(ch) = channels.get_mut(cancel_id) {
@@ -921,17 +1231,28 @@ impl ChannelRepository {
                 }
             }
         }
-        let op = self.make_op(ChannelOp::CancelPendingDelete { id, nonce });
+        let op = self.make_op_in_server(server_id, ChannelOp::CancelPendingDelete { id, nonce });
         self.commit(op).await?;
         Ok(())
     }
 
     pub async fn add_link(self: &Arc<Self>, a: u32, b: u32) -> Result<(), ChannelRepoError> {
+        self.add_link_in_server(DEFAULT_SERVER_ID, a, b).await
+    }
+
+    pub async fn add_link_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        a: u32,
+        b: u32,
+    ) -> Result<(), ChannelRepoError> {
         if a == b {
             return Ok(()); // no-op; callers should reject same-channel links
         }
         {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
+            ensure_root_channel(channels);
             if !channels.contains_key(&a) {
                 return Err(ChannelRepoError::NotFound(a));
             }
@@ -942,14 +1263,25 @@ impl ChannelRepository {
             channels.get_mut(&b).unwrap().links.insert(a);
         }
 
-        let op = self.make_op(ChannelOp::AddLink { a, b });
+        let op = self.make_op_in_server(server_id, ChannelOp::AddLink { a, b });
         self.commit(op).await?;
         Ok(())
     }
 
     pub async fn remove_link(self: &Arc<Self>, a: u32, b: u32) -> Result<(), ChannelRepoError> {
+        self.remove_link_in_server(DEFAULT_SERVER_ID, a, b).await
+    }
+
+    pub async fn remove_link_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        a: u32,
+        b: u32,
+    ) -> Result<(), ChannelRepoError> {
         {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
+            ensure_root_channel(channels);
             if let Some(ch) = channels.get_mut(&a) {
                 ch.links.remove(&b);
             }
@@ -958,7 +1290,7 @@ impl ChannelRepository {
             }
         }
 
-        let op = self.make_op(ChannelOp::RemoveLink { a, b });
+        let op = self.make_op_in_server(server_id, ChannelOp::RemoveLink { a, b });
         self.commit(op).await?;
         Ok(())
     }
@@ -969,8 +1301,21 @@ impl ChannelRepository {
         inherit_acl: bool,
         acls: Vec<ACL>,
     ) -> Result<(), ChannelRepoError> {
+        self.set_acls_in_server(DEFAULT_SERVER_ID, channel_id, inherit_acl, acls)
+            .await
+    }
+
+    pub async fn set_acls_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        channel_id: u32,
+        inherit_acl: bool,
+        acls: Vec<ACL>,
+    ) -> Result<(), ChannelRepoError> {
         {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
+            ensure_root_channel(channels);
             let ch = channels
                 .get_mut(&channel_id)
                 .ok_or(ChannelRepoError::NotFound(channel_id))?;
@@ -978,11 +1323,14 @@ impl ChannelRepository {
             ch.acls = acls.clone();
         }
 
-        let op = self.make_op(ChannelOp::SetAcls {
-            channel_id,
-            inherit_acl,
-            acls,
-        });
+        let op = self.make_op_in_server(
+            server_id,
+            ChannelOp::SetAcls {
+                channel_id,
+                inherit_acl,
+                acls,
+            },
+        );
         self.bump_channel_acl_generation();
         self.commit(op).await?;
         Ok(())
@@ -997,8 +1345,26 @@ impl ChannelRepository {
         channel_acl_generation: u64,
         client_acl_generation: u64,
     ) -> Option<BitFlags<ACLPermissions>> {
+        self.get_cached_permissions_in_server(
+            DEFAULT_SERVER_ID,
+            session_id,
+            channel_id,
+            channel_acl_generation,
+            client_acl_generation,
+        )
+        .await
+    }
+
+    pub(crate) async fn get_cached_permissions_in_server(
+        &self,
+        server_id: &str,
+        session_id: u64,
+        channel_id: u32,
+        channel_acl_generation: u64,
+        client_acl_generation: u64,
+    ) -> Option<BitFlags<ACLPermissions>> {
         self.acl_cache
-            .get(&(session_id, channel_id))
+            .get(&(server_id.to_owned(), session_id, channel_id))
             .and_then(|entry| {
                 (entry.channel_acl_generation == channel_acl_generation
                     && entry.client_acl_generation == client_acl_generation)
@@ -1014,8 +1380,28 @@ impl ChannelRepository {
         client_acl_generation: u64,
         permissions: BitFlags<ACLPermissions>,
     ) {
+        self.cache_permissions_in_server(
+            DEFAULT_SERVER_ID,
+            session_id,
+            channel_id,
+            channel_acl_generation,
+            client_acl_generation,
+            permissions,
+        )
+        .await;
+    }
+
+    pub(crate) async fn cache_permissions_in_server(
+        &self,
+        server_id: &str,
+        session_id: u64,
+        channel_id: u32,
+        channel_acl_generation: u64,
+        client_acl_generation: u64,
+        permissions: BitFlags<ACLPermissions>,
+    ) {
         self.acl_cache.put(
-            (session_id, channel_id),
+            (server_id.to_owned(), session_id, channel_id),
             CachedAclPermissions {
                 channel_acl_generation,
                 client_acl_generation,
@@ -1043,11 +1429,27 @@ impl ChannelRepository {
         let wal_path = dir.join("channels.wal.jsonl");
         let wal_tmp = dir.join("channels.wal.jsonl.tmp");
 
-        let version = self.version.load(Ordering::Acquire);
-        let channels: Vec<Channel> = self.channels.read().values().cloned().collect();
+        let versions = self.versions.read().clone();
+        let version = versions.get(DEFAULT_SERVER_ID).copied().unwrap_or_default();
+        let channels: Vec<SnapshotChannel> = self
+            .channels
+            .read()
+            .iter()
+            .flat_map(|(server_id, channels)| {
+                channels
+                    .values()
+                    .cloned()
+                    .map(|channel| SnapshotChannel {
+                        server_id: server_id.clone(),
+                        channel,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         let snap = Snapshot {
             version,
+            versions,
             saved_at: chrono::Utc::now().timestamp(),
             node_id: self.node_id,
             channels,
@@ -1145,10 +1547,19 @@ impl ChannelRepository {
 
     /// Return all log entries with `version > since_version`.
     pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<ChannelOperation>> {
+        self.get_log_since_in_server(DEFAULT_SERVER_ID, since_version)
+            .await
+    }
+
+    pub async fn get_log_since_in_server(
+        &self,
+        server_id: &str,
+        since_version: u64,
+    ) -> Vec<Arc<ChannelOperation>> {
         self.log
             .read()
             .iter()
-            .filter(|op| op.version > since_version)
+            .filter(|op| op.server_id == server_id && op.version > since_version)
             .cloned()
             .collect()
     }
@@ -1163,11 +1574,13 @@ impl ChannelRepository {
         &self,
         op: Arc<ChannelOperation>,
     ) -> Result<(), ChannelRepoError> {
-        if op.version <= self.version.load(Ordering::Acquire) {
+        if op.version <= self.current_version_in_server(&op.server_id) {
             return Ok(());
         }
         let (new_version, acl_changed) = {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(op.server_id.clone()).or_default();
+            ensure_root_channel(channels);
             let mut acl_changed = channel_op_affects_acl_generation(&op.op);
             if let ChannelOp::DeleteChannel { id, nonce } = &op.op {
                 let can_delete = channels
@@ -1176,9 +1589,13 @@ impl ChannelRepository {
                     .is_some_and(|pending| pending.nonce == *nonce);
                 acl_changed = can_delete;
             }
-            apply_op_to_map(&mut channels, &op.op, op.node_id);
+            apply_op_to_map(channels, &op.op, op.node_id);
             let new_version = op.version;
-            self.version.fetch_max(new_version, Ordering::AcqRel);
+            self.versions
+                .write()
+                .entry(op.server_id.clone())
+                .and_modify(|version| *version = (*version).max(new_version))
+                .or_insert(new_version);
             (new_version, acl_changed)
         };
 
@@ -1190,7 +1607,9 @@ impl ChannelRepository {
         // Notify ClientRepository to drain pending ops whose dep is now satisfied
         let client_repo = self.client_repo.lock().clone();
         if let Some(client_repo) = client_repo {
-            client_repo.drain_pending_ops(new_version).await;
+            client_repo
+                .drain_pending_ops(&op.server_id, new_version)
+                .await;
         }
 
         Ok(())
@@ -1202,13 +1621,19 @@ impl ChannelRepository {
         self: &Arc<Self>,
         mut op: ChannelOperation,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
-        if op.version <= self.version.load(Ordering::Acquire) {
+        if op.server_id.is_empty() {
+            op.server_id = default_server_id();
+        }
+        if op.version <= self.current_version_in_server(&op.server_id) {
             return Ok(Arc::new(op));
         }
 
         let mut acl_changed = channel_op_affects_acl_generation(&op.op);
+        let server_id = op.server_id.clone();
         let pending_delete_move = {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.clone()).or_default();
+            ensure_root_channel(channels);
             let pending_delete_move = match &op.op {
                 ChannelOp::MarkPendingDelete { id, nonce } => channels
                     .get(id)
@@ -1224,7 +1649,7 @@ impl ChannelRepository {
                 }
                 _ => None,
             };
-            apply_op_to_map(&mut channels, &op.op, op.node_id);
+            apply_op_to_map(channels, &op.op, op.node_id);
             pending_delete_move
         };
 
@@ -1236,7 +1661,13 @@ impl ChannelRepository {
 
         if let Some((id, nonce, parent_id)) = pending_delete_move {
             let moved = self
-                .move_local_clients_out_of_pending_delete(id, nonce, parent_id, committed.version)
+                .move_local_clients_out_of_pending_delete_in_server(
+                    &server_id,
+                    id,
+                    nonce,
+                    parent_id,
+                    committed.version,
+                )
                 .await;
             if moved > 0 {
                 tracing::trace!(
@@ -1257,21 +1688,33 @@ impl ChannelRepository {
         version: u64,
         channels_snapshot: Vec<Channel>,
     ) -> Result<(), ChannelRepoError> {
+        self.install_s2s_snapshot_in_server(DEFAULT_SERVER_ID, version, channels_snapshot)
+            .await
+    }
+
+    pub async fn install_s2s_snapshot_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        version: u64,
+        channels_snapshot: Vec<Channel>,
+    ) -> Result<(), ChannelRepoError> {
         {
-            let mut channels = self.channels.write();
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
             channels.clear();
             for channel in channels_snapshot {
                 channels.insert(channel.id, channel);
             }
-            self.version.store(version, Ordering::Release);
-            self.log.write().clear();
+            ensure_root_channel(channels);
+            self.versions.write().insert(server_id.to_owned(), version);
+            self.log.write().retain(|op| op.server_id != server_id);
         }
         self.channel_acl_generation.fetch_add(1, Ordering::AcqRel);
         self.acl_cache.clear();
 
         let client_repo = self.client_repo.lock().clone();
         if let Some(client_repo) = client_repo {
-            client_repo.drain_pending_ops(version).await;
+            client_repo.drain_pending_ops(server_id, version).await;
         }
 
         if self.storage_dir.is_some() {
@@ -1294,7 +1737,12 @@ impl ChannelRepository {
     // ── Internal helpers ──────────────────────────────────────────────────
 
     fn make_op(&self, op: ChannelOp) -> ChannelOperation {
+        self.make_op_in_server(DEFAULT_SERVER_ID, op)
+    }
+
+    fn make_op_in_server(&self, server_id: &str, op: ChannelOp) -> ChannelOperation {
         ChannelOperation {
+            server_id: server_id.to_owned(),
             version: 0, // assigned by commit()
             node_id: self.node_id,
             timestamp: chrono::Utc::now().timestamp(),
@@ -1304,7 +1752,18 @@ impl ChannelRepository {
     }
 
     pub async fn validate_s2s_op(&self, op: &ChannelOp) -> Result<(), ChannelRepoError> {
+        self.validate_s2s_op_in_server(DEFAULT_SERVER_ID, op).await
+    }
+
+    pub async fn validate_s2s_op_in_server(
+        &self,
+        server_id: &str,
+        op: &ChannelOp,
+    ) -> Result<(), ChannelRepoError> {
         let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return Ok(());
+        };
         match op {
             ChannelOp::CreateChannel { channel } => {
                 if let Some(pid) = channel.parent_id {
@@ -1397,7 +1856,11 @@ impl ChannelRepository {
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
         let op = {
             let mut log = self.log.write();
-            self.version.fetch_max(op.version, Ordering::AcqRel);
+            self.versions
+                .write()
+                .entry(op.server_id.clone())
+                .and_modify(|version| *version = (*version).max(op.version))
+                .or_insert(op.version);
             let op = Arc::new(op);
             log.push_back(Arc::clone(&op));
             while log.len() > self.log_max_entries {
@@ -1420,7 +1883,15 @@ impl ChannelRepository {
         }
 
         let committed_version = op.version;
+        let committed_server_id = op.server_id.clone();
         let _ = self.tx.send(Arc::clone(&op));
+
+        let client_repo = self.client_repo.lock().clone();
+        if let Some(client_repo) = client_repo {
+            client_repo
+                .drain_pending_ops(&committed_server_id, committed_version)
+                .await;
+        }
 
         let now = chrono::Utc::now().timestamp();
         let last_snapshot = self.last_snapshot_at.load(Ordering::Acquire);
@@ -1436,7 +1907,12 @@ impl ChannelRepository {
     }
 
     async fn commit(&self, mut op: ChannelOperation) -> Result<(), ChannelRepoError> {
-        let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+        let version = {
+            let mut versions = self.versions.write();
+            let version = versions.entry(op.server_id.clone()).or_insert(0);
+            *version += 1;
+            *version
+        };
         debug_assert!(
             version < u64::MAX - 1_000_000,
             "ChannelRepository version counter approaching u64::MAX — likely a bug"
@@ -1581,6 +2057,14 @@ fn apply_patch(ch: &mut Channel, patch: &ChannelPatch) {
     }
 }
 
+fn ensure_root_channel(channels: &mut HashMap<u32, Channel>) {
+    channels.entry(0).or_insert_with(root_channel);
+}
+
+fn root_channel() -> Channel {
+    Channel::new(0, "Root", 0, 0, None)
+}
+
 fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
     match op {
         ChannelOp::CreateChannel { .. }
@@ -1676,5 +2160,28 @@ mod tests {
             last.to_message(),
             Some(crate::messages::Message::ChannelRemove(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_channel_ids_are_isolated_by_server_id() {
+        let repo = ChannelRepository::new_in_memory(1, tuning());
+
+        repo.create_channel_in_server("alpha", Channel::new(7, "alpha", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel_in_server("beta", Channel::new(7, "beta", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_channel_in_server("alpha", 7).await.unwrap().name,
+            "alpha"
+        );
+        assert_eq!(
+            repo.get_channel_in_server("beta", 7).await.unwrap().name,
+            "beta"
+        );
+        assert_eq!(repo.len_in_server("alpha").await, 2);
+        assert_eq!(repo.len_in_server("beta").await, 2);
     }
 }

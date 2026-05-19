@@ -33,6 +33,7 @@ pub async fn handle_user_remove(
     }
     let target_session =
         crate::client::client_session_identifier::ClientSessionIdentifier::from(target_raw);
+    let server_id = sender.server_id();
     let is_ban = msg.ban.unwrap_or(false);
     let required_permission = if is_ban {
         ACLPermissions::Ban
@@ -66,7 +67,12 @@ pub async fn handle_user_remove(
             };
             if let Err(e) = app
                 .moderation()
-                .dispatch_user_remove(sender.get_session_id(), target_session, patch)
+                .dispatch_user_remove_in_server(
+                    &server_id,
+                    sender.get_session_id(),
+                    target_session,
+                    patch,
+                )
                 .await
             {
                 tracing::warn!(
@@ -84,7 +90,11 @@ pub async fn handle_user_remove(
         return Ok(());
     }
 
-    let target = match server.get_clients().get_client(target_session).await {
+    let target = match server
+        .get_clients()
+        .get_client_in_server(&server_id, target_session)
+        .await
+    {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -132,7 +142,10 @@ pub async fn handle_user_remove(
     // drive the UserRemove broadcast to all per-client subscribers.
     // No need to broadcast manually.
 
-    let removed = server.get_clients().remove_client(target_session).await;
+    let removed = server
+        .get_clients()
+        .remove_client_in_server(&server_id, target_session)
+        .await;
     let target = removed.as_ref().unwrap_or(&target);
     if let Err(e) = target.disconnect().await {
         tracing::debug!(

@@ -42,6 +42,47 @@ async fn auth_two_clients_succeeds() {
 }
 
 #[tokio::test]
+async fn auth_selected_server_id_absent_from_config_scopes_client() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server.authenticator.register_user_in_server(
+        "alice",
+        None,
+        Some(1),
+        vec![],
+        Language::default(),
+        Some("tenant-auth"),
+    );
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+
+    assert_eq!(server.server.get_clients().local_len().await, 1);
+    assert_eq!(
+        server
+            .server
+            .get_clients()
+            .local_len_in_server("tenant-auth")
+            .await,
+        1
+    );
+    assert_eq!(
+        server
+            .server
+            .get_clients()
+            .local_len_in_server(crate::types::DEFAULT_SERVER_ID)
+            .await,
+        0
+    );
+    assert!(server
+        .server
+        .get_clients()
+        .get_client_in_server("tenant-auth", alice.server_session)
+        .await
+        .is_some());
+}
+
+#[tokio::test]
 async fn context_action_modify_from_client_closes_connection() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

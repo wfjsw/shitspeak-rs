@@ -85,6 +85,10 @@ impl<R: StrictReplicable> Clone for StrictHandle<R> {
 }
 
 impl<R: StrictReplicable> StrictHandle<R> {
+    pub(crate) fn with_runtime(runtime: Arc<runtime::StrictRuntime<R>>) -> Self {
+        Self { runtime }
+    }
+
     /// Propose an op. Resolves once the op has been delivered locally
     /// (post-`apply_committed`). The returned `u64` is the `version` the
     /// op was applied at.

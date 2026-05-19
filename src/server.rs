@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use bytes::{Bytes, BytesMut};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock as ParkingRwLock};
 
 use cidr::AnyIpCidr;
 use prost::{EncodeError, Message as _};
@@ -31,26 +31,336 @@ use crate::proxy_protocol::get_proxy_protocol_real_ip;
 use crate::{
     client_repository::ClientRepository,
     codec_info::CodecInfo,
-    config::{Config, UdpPingUserCountScope},
+    config::{Config, ServerEntrypointConfig, UdpPingUserCountScope},
     constants::MTU,
     s2s::S2SManager,
-    types::NodeIdentifier,
+    types::{default_server_id, NodeIdentifier, DEFAULT_SERVER_ID},
 };
 
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
+type UdpPacket = (Bytes, std::net::SocketAddr, std::net::SocketAddr);
+
+fn first_socket_addr(address: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    address.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid listen address: {address}"),
+        )
+        .into()
+    })
+}
+
+async fn bind_entrypoint_socket_pair(
+    address: SocketAddr,
+) -> Result<(tokio::net::TcpListener, Arc<tokio::net::UdpSocket>), Box<dyn std::error::Error>> {
+    let tcp_listener = tokio::net::TcpListener::bind(address).await?;
+    let bound_address = tcp_listener.local_addr()?;
+    let udp_socket = Arc::new(tokio::net::UdpSocket::bind(bound_address).await?);
+    Ok((tcp_listener, udp_socket))
+}
+
+fn normalize_sni_name(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+async fn bind_entrypoints(
+    config: &Config,
+) -> Result<EntrypointBindings, Box<dyn std::error::Error>> {
+    let mut tcp_listeners = Vec::new();
+    let mut udp_sockets = Vec::new();
+    let mut udp_socket_by_port = HashMap::new();
+    let mut server_id_by_port = HashMap::new();
+
+    let (server_id_by_sni, listen_specs) = entrypoint_config_routes(config)?;
+
+    let listen_address = first_socket_addr(&config.listen)?;
+    let (listener, udp_socket) = bind_entrypoint_socket_pair(listen_address).await?;
+    let default_port = listener.local_addr()?.port();
+    udp_socket_by_port.insert(default_port, Arc::clone(&udp_socket));
+    udp_sockets.push(udp_socket);
+    tcp_listeners.push(ServerTcpListener {
+        listener: Arc::new(listener),
+    });
+
+    for (address, server_id) in listen_specs {
+        let (listener, udp_socket) = bind_entrypoint_socket_pair(address).await?;
+        let port = listener.local_addr()?.port();
+        if port == default_port {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("server entrypoint for {server_id} reuses the default TCP/UDP port {port}"),
+            )
+            .into());
+        }
+        if let Some(existing) = server_id_by_port.insert(port, server_id.clone()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "multiple server entrypoints bind TCP/UDP port {port}: {existing} and {server_id}"
+                ),
+            )
+            .into());
+        }
+        udp_socket_by_port.insert(port, Arc::clone(&udp_socket));
+        udp_sockets.push(udp_socket);
+        tcp_listeners.push(ServerTcpListener {
+            listener: Arc::new(listener),
+        });
+    }
+
+    Ok(EntrypointBindings {
+        default_port,
+        tcp_listeners,
+        udp_sockets,
+        udp_socket_by_port,
+        server_id_by_port,
+        server_id_by_sni,
+    })
+}
+
+fn register_sni_entrypoints(
+    server_id_by_sni: &mut HashMap<String, String>,
+    entrypoint: &ServerEntrypointConfig,
+    server_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for sni in &entrypoint.sni {
+        let sni = normalize_sni_name(sni);
+        if sni.is_empty() {
+            continue;
+        }
+        if let Some(existing) = server_id_by_sni.insert(sni.clone(), server_id.to_owned()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("SNI name {sni} is mapped to both {existing} and {server_id}"),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn entrypoint_config_routes(
+    config: &Config,
+) -> Result<(HashMap<String, String>, Vec<(SocketAddr, String)>), Box<dyn std::error::Error>> {
+    let mut server_id_by_sni = HashMap::new();
+    let mut listen_specs = Vec::new();
+    let mut fixed_port_owners: HashMap<u16, String> = HashMap::new();
+
+    for entrypoint in &config.server_entrypoints {
+        let server_id = entrypoint.server_id.trim();
+        if server_id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "server_entrypoints entries require non-empty server_id",
+            )
+            .into());
+        }
+
+        register_sni_entrypoints(&mut server_id_by_sni, entrypoint, server_id)?;
+
+        let Some(listen) = entrypoint.listen.as_deref() else {
+            continue;
+        };
+        let address = first_socket_addr(listen)?;
+        if address.port() != 0 {
+            if let Some(existing) = fixed_port_owners.insert(address.port(), server_id.to_owned()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "multiple server entrypoints bind TCP/UDP port {}: {} and {}",
+                        address.port(),
+                        existing,
+                        server_id
+                    ),
+                )
+                .into());
+            }
+        }
+        listen_specs.push((address, server_id.to_owned()));
+    }
+
+    Ok((server_id_by_sni, listen_specs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{
+        AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
+    };
+    use crate::localization::Language;
+
+    struct TestAuthenticator;
+
+    fn install_default_provider() {
+        static CRYPTO_PROVIDER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        CRYPTO_PROVIDER.get_or_init(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    #[async_trait::async_trait]
+    impl Authenticator for TestAuthenticator {
+        async fn authenticate(
+            &self,
+            username: &str,
+            _password: Option<&str>,
+            _auxiliary_data: &AuthenticateAuxiliaryData,
+        ) -> Result<AuthenticateResult, AuthenticationRejection> {
+            Ok(AuthenticateResult {
+                user_id: None,
+                display_name: Some(username.to_owned()),
+                groups: Vec::new(),
+                virtual_server_id: None,
+                language: Language::default(),
+                texture_url: None,
+                comment_url: None,
+            })
+        }
+    }
+
+    fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
+        Config {
+            node_id: 1,
+            listen: "127.0.0.1:0".to_owned(),
+            server_entrypoints: entrypoints,
+            register_name: "test".to_owned(),
+            register_password: None,
+            register_url: None,
+            register_hostname: None,
+            register_location: None,
+            cert_path: "cert.pem".to_owned(),
+            key_path: "key.pem".to_owned(),
+            send_version: false,
+            send_build_info: false,
+            send_os_info: false,
+            server_protocol_version: crate::constants::APP_PROTO_VER,
+            allowed_proxies: Vec::new(),
+            min_client_version: 0,
+            max_users: 100,
+            welcome_text: None,
+            max_bandwidth: 72_000,
+            allow_html: true,
+            max_text_message_length: 5_000,
+            max_image_message_length: 131_072,
+            default_channel: 0,
+            cert_required: false,
+            blob_storage_dir: None,
+            channel_log_max_entries: 10_000,
+            client_log_max_entries: 10_000,
+            channel_snapshot_every_ops: 10,
+            channel_snapshot_every_secs: 60,
+            channel_wal_compaction_expire_count: 2_000,
+            udp_voice_enabled: false,
+            udp_ping_enabled: false,
+            udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
+            udp_channel_size: 2_048,
+            client_idle_timeout_secs: 30,
+            pending_delete_timeout_ms: 5_000,
+            required_groups: Vec::new(),
+            send_permission_info: false,
+            s2s: crate::config::S2sConfig::default(),
+            web: crate::config::WebConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_entrypoints_maps_default_and_extra_ports() {
+        let config = test_config(vec![ServerEntrypointConfig {
+            server_id: "tenant-a".to_owned(),
+            listen: Some("127.0.0.1:0".to_owned()),
+            sni: Vec::new(),
+        }]);
+
+        let bindings = bind_entrypoints(&config).await.expect("entrypoints bind");
+
+        assert_eq!(bindings.tcp_listeners.len(), 2);
+        assert_eq!(bindings.udp_sockets.len(), 2);
+        assert!(!bindings.server_id_by_port.contains_key(
+            &bindings.tcp_listeners[0]
+                .listener
+                .local_addr()
+                .unwrap()
+                .port()
+        ));
+        assert_eq!(
+            bindings
+                .server_id_by_port
+                .get(
+                    &bindings.tcp_listeners[1]
+                        .listener
+                        .local_addr()
+                        .unwrap()
+                        .port()
+                )
+                .map(String::as_str),
+            Some("tenant-a")
+        );
+    }
+
+    #[test]
+    fn register_sni_entrypoints_normalizes_names() {
+        let entrypoint = ServerEntrypointConfig {
+            server_id: "tenant-a".to_owned(),
+            listen: None,
+            sni: vec!["Tenant-A.Example.Test.".to_owned()],
+        };
+        let mut map = HashMap::new();
+
+        register_sni_entrypoints(&mut map, &entrypoint, &entrypoint.server_id)
+            .expect("SNI entrypoint");
+
+        assert_eq!(
+            map.get("tenant-a.example.test").map(String::as_str),
+            Some("tenant-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_entrypoint_config_accepts_config_absent_server_id_scope() {
+        install_default_provider();
+        let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+            .await
+            .expect("server");
+        let new_config = test_config(vec![ServerEntrypointConfig {
+            server_id: "tenant-from-existing-state".to_owned(),
+            listen: Some("127.0.0.1:0".to_owned()),
+            sni: vec!["Tenant.Example.Test".to_owned()],
+        }]);
+
+        server
+            .apply_entrypoint_config(&new_config)
+            .await
+            .expect("apply entrypoint config");
+
+        let entrypoints = server.entrypoints.read();
+        assert_eq!(
+            entrypoints
+                .server_id_by_sni
+                .get("tenant.example.test")
+                .map(String::as_str),
+            Some("tenant-from-existing-state")
+        );
+        assert!(entrypoints
+            .server_id_by_port
+            .values()
+            .any(|server_id| { server_id == "tenant-from-existing-state" }));
+    }
+}
 
 pub struct Server {
     node_identifier: NodeIdentifier,
 
     // Shared config — can be hot-reloaded at runtime
-    config: Arc<RwLock<Config>>,
+    config: Arc<StdRwLock<Config>>,
 
     allowed_proxies: Vec<AnyIpCidr>,
 
-    tcp_listener: tokio::net::TcpListener,
     tls_acceptor: TlsAcceptor,
-    udp_socket: Arc<tokio::net::UdpSocket>,
+    entrypoints: Arc<ParkingRwLock<EntrypointBindings>>,
+    entrypoint_runtime: Mutex<Option<EntrypointRuntime>>,
+    entrypoint_reload_lock: tokio::sync::Mutex<()>,
 
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
@@ -66,6 +376,28 @@ pub struct Server {
     context_actions: Arc<crate::context_action::ContextActionRegistry>,
 
     s2s_manager: Arc<S2SManager>,
+}
+
+#[derive(Clone)]
+struct ServerTcpListener {
+    listener: Arc<tokio::net::TcpListener>,
+}
+
+struct EntrypointBindings {
+    default_port: u16,
+    tcp_listeners: Vec<ServerTcpListener>,
+    udp_sockets: Vec<Arc<tokio::net::UdpSocket>>,
+    udp_socket_by_port: HashMap<u16, Arc<tokio::net::UdpSocket>>,
+    server_id_by_port: HashMap<u16, String>,
+    server_id_by_sni: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct EntrypointRuntime {
+    udp_in: tokio::sync::mpsc::Sender<UdpPacket>,
+    udp_voice_enabled: bool,
+    udp_ping_enabled: bool,
+    shutdown: tokio::sync::watch::Receiver<()>,
 }
 
 fn is_realtime_client_message(message: &Message) -> bool {
@@ -101,19 +433,24 @@ async fn activate_client_subscriptions(
     if !client.is_authenticated() || client_log_rx.is_some() {
         return Ok(());
     }
+    let server_id = client.server_id();
+    let client_session_id = client.get_session_id();
 
-    let channel_snapshot_version = server.channels.current_version();
+    let channel_snapshot_version = server.channels.current_version_in_server(&server_id);
     client
         .set_last_channel_version(channel_snapshot_version)
         .await;
 
-    server.clients.publish_client(client_session_id).await;
+    server
+        .clients
+        .publish_client_in_server(&server_id, client_session_id)
+        .await;
 
     *client_log_rx = Some(server.clients.subscribe());
     *channel_log_rx = Some(server.channels.subscribe());
 
     session_channel_shadow.clear();
-    for visible in server.clients.get_all_clients().await {
+    for visible in server.clients.get_all_clients_in_server(&server_id).await {
         if visible.is_authenticated() {
             session_channel_shadow
                 .insert(visible.get_session_id(), visible.get_current_channel_id());
@@ -123,7 +460,7 @@ async fn activate_client_subscriptions(
     let last_seen = client.get_last_client_versions().await;
     let (missed, new_versions) = server
         .clients
-        .replay_since(&last_seen)
+        .replay_since_in_server(&server_id, &last_seen)
         .await
         .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
     for msg in &missed {
@@ -135,6 +472,7 @@ async fn activate_client_subscriptions(
             server,
             &server.channels,
             session_channel_shadow,
+            &server_id,
             msg,
         )
         .await;
@@ -175,12 +513,6 @@ impl Server {
         config: Config,
         authenticator: A,
     ) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
-        let listen_address = config
-            .listen
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| "Invalid listen address")?;
-
         let allowed_proxies = config
             .allowed_proxies
             .iter()
@@ -191,8 +523,7 @@ impl Server {
             CertificateDer::pem_file_iter(&config.cert_path)?.collect::<Result<Vec<_>, _>>()?;
         let private_key = PrivateKeyDer::from_pem_file(&config.key_path)?;
 
-        let tcp_listener = tokio::net::TcpListener::bind(&listen_address).await?;
-        let udp_socket = Arc::new(tokio::net::UdpSocket::bind(&listen_address).await?);
+        let entrypoints = bind_entrypoints(&config).await?;
 
         let client_cert_verifier = Arc::new(ClientCertificateVerifier::new());
 
@@ -231,7 +562,7 @@ impl Server {
             }
         };
 
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(StdRwLock::new(config));
         let s2s_manager = Arc::new(S2SManager::initialize(
             &config.read().expect("Config RwLock poisoned"),
         ));
@@ -239,9 +570,10 @@ impl Server {
         let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
             allowed_proxies,
-            tcp_listener,
             tls_acceptor,
-            udp_socket,
+            entrypoints: Arc::new(ParkingRwLock::new(entrypoints)),
+            entrypoint_runtime: Mutex::new(None),
+            entrypoint_reload_lock: tokio::sync::Mutex::new(()),
             clients: Arc::new(ClientRepository::new(node_id, client_log_max_entries)),
             channels,
             channel_blobs,
@@ -271,19 +603,39 @@ impl Server {
 
     /// Local TCP listen address. Useful for tests that bind to `127.0.0.1:0`.
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.tcp_listener.local_addr()
+        let entrypoints = self.entrypoints.read();
+        entrypoints
+            .tcp_listeners
+            .first()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no TCP listeners"))?
+            .listener
+            .local_addr()
     }
 
     /// Local UDP listen address. Useful for tests that bind to `127.0.0.1:0`.
     pub fn local_udp_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.udp_socket.local_addr()
+        let entrypoints = self.entrypoints.read();
+        entrypoints
+            .udp_sockets
+            .first()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no UDP sockets"))?
+            .local_addr()
     }
 
     pub async fn run(
         self: &Arc<Box<Self>>,
         shutdown_tx: tokio::sync::watch::Sender<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        tracing::info!("Server is running on {}", self.tcp_listener.local_addr()?);
+        let listen_addrs: Vec<String> = {
+            let entrypoints = self.entrypoints.read();
+            entrypoints
+                .tcp_listeners
+                .iter()
+                .filter_map(|entry| entry.listener.local_addr().ok())
+                .map(|addr| addr.to_string())
+                .collect()
+        };
+        tracing::info!("Server is running on {}", listen_addrs.join(", "));
         self.s2s_manager.log_startup_summary();
 
         let shutdown_rx = shutdown_tx.subscribe();
@@ -296,25 +648,25 @@ impl Server {
         let pending_delete_timeout_ms = self.read_config().pending_delete_timeout_ms;
 
         // Bounded channel shared between UDP drain and processing tasks.
-        let (udp_in, udp_out) =
-            tokio::sync::mpsc::channel::<(Bytes, std::net::SocketAddr)>(udp_channel_size);
+        let (udp_in, udp_out) = tokio::sync::mpsc::channel::<UdpPacket>(udp_channel_size);
 
-        let udp_drain = Self::spawn_udp_drain(
-            Arc::clone(self),
-            Arc::clone(&self.udp_socket),
-            udp_in,
-            udp_voice_enabled,
-            udp_ping_enabled,
-            shutdown_rx.clone(),
-        );
+        {
+            let mut runtime = self.entrypoint_runtime.lock();
+            *runtime = Some(EntrypointRuntime {
+                udp_in: udp_in.clone(),
+                udp_voice_enabled,
+                udp_ping_enabled,
+                shutdown: shutdown_rx.clone(),
+            });
+        }
         let udp_process = Self::spawn_udp_process(
             Arc::clone(self),
-            Arc::clone(&self.udp_socket),
             udp_out,
             udp_ping_enabled,
             shutdown_rx.clone(),
         );
-        let tcp_accept = Self::spawn_tcp_accept(Arc::clone(self), shutdown_rx.clone());
+        self.spawn_entrypoint_tasks_for_existing_bindings(&udp_in, &shutdown_rx);
+        drop(udp_in);
         let idle_reaper =
             Self::spawn_idle_reaper(Arc::clone(self), idle_timeout_secs, shutdown_rx.clone());
         let pending_delete_watchdog = Self::spawn_pending_delete_watchdog(
@@ -342,9 +694,7 @@ impl Server {
         // Wait for any task to finish (error) or for the shutdown signal
         // to be dropped by the caller (main.rs drops shutdown_tx on Ctrl-C).
         tokio::select! {
-            result = udp_drain => { let _ = result; }
             result = udp_process => { let _ = result; }
-            result = tcp_accept => { let _ = result; }
             result = idle_reaper => { let _ = result; }
             result = pending_delete_watchdog => { let _ = result; }
             result = async {
@@ -367,19 +717,17 @@ impl Server {
     fn spawn_udp_drain(
         server: Arc<Box<Self>>,
         socket: Arc<tokio::net::UdpSocket>,
-        tx: tokio::sync::mpsc::Sender<(Bytes, std::net::SocketAddr)>,
+        tx: tokio::sync::mpsc::Sender<UdpPacket>,
         voice_enabled: bool,
         ping_enabled: bool,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = BytesMut::with_capacity(MTU);
-            tracing::info!(
-                "UDP drain started, listening on {}",
-                socket
-                    .local_addr()
-                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
-            );
+            let local_addr = socket
+                .local_addr()
+                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            tracing::info!("UDP drain started, listening on {}", local_addr);
             loop {
                 buf.clear();
                 buf.reserve(MTU);
@@ -444,7 +792,7 @@ impl Server {
 
                 if voice_enabled {
                     let packet = buf.split().freeze();
-                    match tx.try_send((packet, src_addr)) {
+                    match tx.try_send((packet, src_addr, local_addr)) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             tracing::warn!(
@@ -466,14 +814,13 @@ impl Server {
     /// packets from the channel.  Ping packets are handled directly.
     fn spawn_udp_process(
         server: Arc<Box<Self>>,
-        socket: Arc<tokio::net::UdpSocket>,
-        mut rx: tokio::sync::mpsc::Receiver<(Bytes, std::net::SocketAddr)>,
+        mut rx: tokio::sync::mpsc::Receiver<UdpPacket>,
         ping_enabled: bool,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let (packet, src_addr) = tokio::select! {
+                let (packet, src_addr, local_addr) = tokio::select! {
                     msg = rx.recv() => match msg {
                         Some(m) => m,
                         None => break,
@@ -488,7 +835,10 @@ impl Server {
                 let mut matched_via_ip_fallback = false;
 
                 let client = {
-                    let address_match = server.clients.get_client_by_udp_address(&src_addr).await;
+                    let address_match = server
+                        .clients
+                        .get_client_by_udp_endpoint(local_addr, src_addr)
+                        .await;
                     let mut found = None;
 
                     if let Some(c) = address_match {
@@ -497,7 +847,9 @@ impl Server {
                                 "UDP client {:?} matched by address is not authenticated, skipping",
                                 c.get_session_id()
                             );
-                            server.clients.unbind_client_udp_address(&src_addr);
+                            server
+                                .clients
+                                .unbind_client_udp_endpoint(local_addr, src_addr);
                         } else {
                             let decrypt_result: Option<Result<BytesMut, _>> = {
                                 let mut crypt = c.crypt_state();
@@ -519,11 +871,15 @@ impl Server {
                                 }
                                 Some(Err(e)) => {
                                     tracing::trace!("UDP address-match decrypt failed for {:?} from {}: {:?}, removing stale binding", c.get_session_id(), src_addr, e);
-                                    server.clients.unbind_client_udp_address(&src_addr);
+                                    server
+                                        .clients
+                                        .unbind_client_udp_endpoint(local_addr, src_addr);
                                 }
                                 None => {
                                     tracing::trace!("UDP address-matched client {:?} has no crypt state, removing stale binding", c.get_session_id());
-                                    server.clients.unbind_client_udp_address(&src_addr);
+                                    server
+                                        .clients
+                                        .unbind_client_udp_endpoint(local_addr, src_addr);
                                 }
                             }
                         }
@@ -597,7 +953,12 @@ impl Server {
 
                     server
                         .clients
-                        .bind_client_udp_address(client.get_session_id(), src_addr)
+                        .bind_client_udp_endpoint_in_server(
+                            &client.server_id(),
+                            client.get_session_id(),
+                            Some(local_addr),
+                            src_addr,
+                        )
                         .await;
                 }
 
@@ -629,6 +990,13 @@ impl Server {
                                 continue;
                             }
                         };
+                        let socket = server
+                            .udp_socket_for_local_addr(local_addr)
+                            .or_else(|| server.default_udp_socket());
+                        let Some(socket) = socket else {
+                            tracing::warn!("no UDP socket available for ping reply");
+                            continue;
+                        };
                         match socket.send_to(&reply, src_addr).await {
                             Ok(sent) => tracing::trace!(
                                 "UDP ping reply sent to {}: {} bytes",
@@ -654,15 +1022,47 @@ impl Server {
         })
     }
 
-    /// Spawn the TCP accept loop.
+    fn udp_socket_for_local_addr(
+        &self,
+        local_addr: SocketAddr,
+    ) -> Option<Arc<tokio::net::UdpSocket>> {
+        self.entrypoints
+            .read()
+            .udp_socket_by_port
+            .get(&local_addr.port())
+            .cloned()
+    }
+
+    pub fn udp_socket_for_client_addr(
+        &self,
+        local_addr: SocketAddr,
+    ) -> Option<Arc<tokio::net::UdpSocket>> {
+        self.udp_socket_for_local_addr(local_addr)
+            .or_else(|| self.default_udp_socket())
+    }
+
+    pub fn udp_socket_for_client(&self, client: &Client) -> Option<Arc<tokio::net::UdpSocket>> {
+        self.udp_socket_for_client_addr(client.get_local_address())
+    }
+
+    fn default_udp_socket(&self) -> Option<Arc<tokio::net::UdpSocket>> {
+        self.entrypoints.read().udp_sockets.first().cloned()
+    }
+
+    /// Spawn the TCP accept loop for one listener.
     fn spawn_tcp_accept(
         server: Arc<Box<Self>>,
+        listener: Arc<tokio::net::TcpListener>,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let local_addr = listener
+                .local_addr()
+                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            tracing::info!("TCP accept started, listening on {}", local_addr);
             loop {
                 let (tcp_stream, remote_addr) = tokio::select! {
-                    result = server.tcp_listener.accept() => match result {
+                    result = listener.accept() => match result {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::warn!("TCP accept error: {e}");
@@ -672,9 +1072,11 @@ impl Server {
                     _ = shutdown.changed() => break,
                 };
                 let conn_server = Arc::clone(&server);
+                let provisional_server_id =
+                    conn_server.provisional_server_id_for_port(local_addr.port());
                 tokio::spawn(async move {
                     if let Err(e) = conn_server
-                        .handle_incoming_connection(tcp_stream, remote_addr)
+                        .handle_incoming_connection(tcp_stream, remote_addr, provisional_server_id)
                         .await
                     {
                         if e.is_clean_disconnect() {
@@ -685,7 +1087,166 @@ impl Server {
                     }
                 });
             }
+            tracing::info!("TCP accept stopped for {}", local_addr);
         })
+    }
+
+    fn provisional_server_id_for_port(&self, port: u16) -> String {
+        self.entrypoints
+            .read()
+            .server_id_by_port
+            .get(&port)
+            .cloned()
+            .unwrap_or_else(default_server_id)
+    }
+
+    fn spawn_entrypoint_tasks_for_existing_bindings(
+        self: &Arc<Box<Self>>,
+        udp_in: &tokio::sync::mpsc::Sender<UdpPacket>,
+        shutdown: &tokio::sync::watch::Receiver<()>,
+    ) {
+        let (listeners, sockets) = {
+            let entrypoints = self.entrypoints.read();
+            (
+                entrypoints.tcp_listeners.clone(),
+                entrypoints.udp_sockets.clone(),
+            )
+        };
+
+        for entrypoint in listeners {
+            Self::spawn_tcp_accept(Arc::clone(self), entrypoint.listener, shutdown.clone());
+        }
+        for socket in sockets {
+            Self::spawn_udp_drain(
+                Arc::clone(self),
+                socket,
+                udp_in.clone(),
+                self.read_config().udp_voice_enabled,
+                self.read_config().udp_ping_enabled,
+                shutdown.clone(),
+            );
+        }
+    }
+
+    fn spawn_entrypoint_tasks_for_new_binding(
+        self: &Arc<Box<Self>>,
+        listener: Arc<tokio::net::TcpListener>,
+        udp_socket: Arc<tokio::net::UdpSocket>,
+    ) {
+        let Some(runtime) = self.entrypoint_runtime.lock().clone() else {
+            return;
+        };
+
+        Self::spawn_tcp_accept(Arc::clone(self), listener, runtime.shutdown.clone());
+        Self::spawn_udp_drain(
+            Arc::clone(self),
+            udp_socket,
+            runtime.udp_in,
+            runtime.udp_voice_enabled,
+            runtime.udp_ping_enabled,
+            runtime.shutdown,
+        );
+    }
+
+    async fn apply_entrypoint_config(
+        self: &Arc<Box<Self>>,
+        new_config: &Config,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _reload_guard = self.entrypoint_reload_lock.lock().await;
+        let (server_id_by_sni, listen_specs) = entrypoint_config_routes(new_config)?;
+        let default_port = self.entrypoints.read().default_port;
+
+        let mut new_bindings = Vec::new();
+        for (address, server_id) in listen_specs {
+            if address.port() == default_port {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "server entrypoint for {server_id} reuses the default TCP/UDP port {default_port}"
+                    ),
+                )
+                .into());
+            }
+
+            if address.port() != 0 {
+                let existing = self
+                    .entrypoints
+                    .read()
+                    .server_id_by_port
+                    .get(&address.port())
+                    .cloned();
+                if let Some(existing) = existing {
+                    if existing != server_id {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "TCP/UDP port {} is already mapped to {}, cannot remap to {} during hot reload",
+                                address.port(),
+                                existing,
+                                server_id
+                            ),
+                        )
+                        .into());
+                    }
+                    continue;
+                }
+            }
+
+            let (listener, udp_socket) = bind_entrypoint_socket_pair(address).await?;
+            let port = listener.local_addr()?.port();
+            if port == default_port {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "server entrypoint for {server_id} reuses the default TCP/UDP port {port}"
+                    ),
+                )
+                .into());
+            }
+
+            {
+                let entrypoints = self.entrypoints.read();
+                if let Some(existing) = entrypoints.server_id_by_port.get(&port) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "TCP/UDP port {port} is already mapped to {existing}, cannot map to {server_id} during hot reload"
+                        ),
+                    )
+                    .into());
+                }
+            }
+
+            new_bindings.push((server_id, Arc::new(listener), udp_socket, port));
+        }
+
+        {
+            let mut entrypoints = self.entrypoints.write();
+            entrypoints.server_id_by_sni = server_id_by_sni;
+            for (server_id, listener, udp_socket, port) in &new_bindings {
+                entrypoints
+                    .server_id_by_port
+                    .insert(*port, server_id.clone());
+                entrypoints
+                    .udp_socket_by_port
+                    .insert(*port, Arc::clone(udp_socket));
+                entrypoints.udp_sockets.push(Arc::clone(udp_socket));
+                entrypoints.tcp_listeners.push(ServerTcpListener {
+                    listener: Arc::clone(listener),
+                });
+            }
+        }
+
+        for (server_id, listener, udp_socket, port) in new_bindings {
+            tracing::info!(
+                "config reload: added client entrypoint {} for server_id {}",
+                port,
+                server_id
+            );
+            self.spawn_entrypoint_tasks_for_new_binding(listener, udp_socket);
+        }
+
+        Ok(())
     }
 
     /// Spawn a periodic task that disconnects clients who haven't sent a
@@ -711,13 +1272,17 @@ impl Server {
                     let last_ping = client.get_last_ping().await;
                     if now - last_ping > timeout {
                         let sid = client.get_session_id();
+                        let server_id = client.server_id();
                         tracing::info!(
                             "Disconnecting idle client {:?} (last ping: {}, timeout: {}s)",
                             sid,
                             last_ping,
                             timeout_secs,
                         );
-                        server.clients.remove_client(sid).await;
+                        server
+                            .clients
+                            .remove_client_in_server(&server_id, sid)
+                            .await;
                     }
                 }
             }
@@ -739,27 +1304,35 @@ impl Server {
                     _ = shutdown.changed() => break,
                 }
 
-                let expired = server
-                    .channels
-                    .expired_pending_deletes(timeout_ms as i64)
-                    .await;
-                for (channel_id, nonce) in expired {
-                    let op = crate::channel_repository::ChannelOp::CancelPendingDelete {
-                        id: channel_id,
-                        nonce,
-                    };
-                    if !server.s2s_manager().propose_channel_op(op).await {
-                        if let Err(e) = server
-                            .channels
-                            .cancel_pending_delete(channel_id, nonce)
+                let server_ids = server.channels.known_server_ids();
+                for server_id in server_ids {
+                    let expired = server
+                        .channels
+                        .expired_pending_deletes_in_server(&server_id, timeout_ms as i64)
+                        .await;
+                    for (channel_id, nonce) in expired {
+                        let op = crate::channel_repository::ChannelOp::CancelPendingDelete {
+                            id: channel_id,
+                            nonce,
+                        };
+                        if !server
+                            .s2s_manager()
+                            .propose_channel_op_in_server(&server_id, op)
                             .await
                         {
-                            tracing::trace!(
-                                channel_id,
-                                nonce,
-                                error = ?e,
-                                "pending delete rollback failed"
-                            );
+                            if let Err(e) = server
+                                .channels
+                                .cancel_pending_delete_in_server(&server_id, channel_id, nonce)
+                                .await
+                            {
+                                tracing::trace!(
+                                    server_id,
+                                    channel_id,
+                                    nonce,
+                                    error = ?e,
+                                    "pending delete rollback failed"
+                                );
+                            }
                         }
                     }
                 }
@@ -771,6 +1344,7 @@ impl Server {
         self: &Arc<Box<Self>>,
         tcp_stream: tokio::net::TcpStream,
         remote_addr: std::net::SocketAddr,
+        provisional_server_id: String,
     ) -> Result<(), HandleIncomingConnectionError> {
         let real_ip = if self
             .allowed_proxies
@@ -788,12 +1362,14 @@ impl Server {
         let local_addr = tcp_stream.local_addr()?;
         let tls_acceptor = self.tls_acceptor.clone();
         let tls_stream = tls_acceptor.accept(tcp_stream).await?;
+        let server_id = self.resolve_tls_server_id(&provisional_server_id, local_addr, &tls_stream);
         match tls_stream.get_ref().1.alpn_protocol() {
             Some(crate::web::signaling::ALPN_HTTP_1_1) => {
                 let web = self.read_config().web.clone();
                 crate::web::signaling::SignalingServer::new(web)
                     .with_authenticator(Arc::clone(&self.authenticator))
                     .with_server(Arc::clone(self))
+                    .with_provisional_server_id(server_id)
                     .handle_stream_with_peer(tls_stream, real_ip, remote_addr, local_addr)
                     .await?;
                 return Ok(());
@@ -808,8 +1384,40 @@ impl Server {
             }
         }
 
-        self.handle_native_mumble_tls_connection(tls_stream, real_ip, remote_addr, local_addr)
-            .await
+        self.handle_native_mumble_tls_connection(
+            tls_stream,
+            real_ip,
+            remote_addr,
+            local_addr,
+            server_id,
+        )
+        .await
+    }
+
+    fn resolve_tls_server_id(
+        &self,
+        provisional_server_id: &str,
+        local_addr: SocketAddr,
+        tls_stream: &TlsStream<TcpStream>,
+    ) -> String {
+        let entrypoints = self.entrypoints.read();
+        if let Some(port_server_id) = entrypoints.server_id_by_port.get(&local_addr.port()) {
+            return port_server_id.clone();
+        }
+
+        let (_, connection) = tls_stream.get_ref();
+        if let Some(server_name) = connection.server_name() {
+            let name = normalize_sni_name(server_name);
+            if let Some(server_id) = entrypoints.server_id_by_sni.get(&name) {
+                return server_id.clone();
+            }
+        }
+
+        if provisional_server_id.is_empty() {
+            default_server_id()
+        } else {
+            provisional_server_id.to_owned()
+        }
     }
 
     async fn handle_native_mumble_tls_connection(
@@ -818,6 +1426,7 @@ impl Server {
         real_ip: std::net::IpAddr,
         remote_addr: std::net::SocketAddr,
         local_addr: std::net::SocketAddr,
+        server_id: String,
     ) -> Result<(), HandleIncomingConnectionError> {
         // Send server version (these are startup-only, read once)
         let version = {
@@ -833,7 +1442,14 @@ impl Server {
 
         let client = self
             .clients
-            .allocate_local_client(real_ip, remote_addr, None, local_addr, tls_stream)
+            .allocate_local_client_in_server(
+                server_id,
+                real_ip,
+                remote_addr,
+                None,
+                local_addr,
+                tls_stream,
+            )
             .await;
 
         let client_session_id = client.get_session_id();
@@ -867,7 +1483,7 @@ impl Server {
                         finish_handler_result(
                             self,
                             &client,
-                            client_session_id,
+                            client.get_session_id(),
                             &mut client_log_rx,
                             &mut channel_log_rx,
                             &mut session_channel_shadow,
@@ -886,7 +1502,7 @@ impl Server {
                                     finish_handler_result(
                                         self,
                                         &client,
-                                        client_session_id,
+                                        client.get_session_id(),
                                         &mut client_log_rx,
                                         &mut channel_log_rx,
                                         &mut session_channel_shadow,
@@ -919,8 +1535,11 @@ impl Server {
                     // channel updates are delivered before client state updates.
                     result = recv_optional(channel_log_rx.as_mut()), if channel_log_rx.is_some() => {
                         match result {
-                            Some(Ok(op)) => {
-                                let last = client.get_last_channel_version().await;
+            Some(Ok(op)) => {
+                if op.server_id != client.server_id() {
+                    continue;
+                }
+                let last = client.get_last_channel_version().await;
                                 replay_channel_log_gap(
                                     self, &client, &self.channels, &mut session_channel_shadow, client_session_id, last, op.version,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
@@ -940,6 +1559,7 @@ impl Server {
                                         self,
                                         &self.channels,
                                         &mut session_channel_shadow,
+                                        &client.server_id(),
                                         &msg,
                                     ).await;
                                     for msg in synthetic {
@@ -969,10 +1589,14 @@ impl Server {
                                 tracing::trace!("Received client log broadcast: {:?}", broadcast);
 
                                 let entry = &broadcast.entry;
+                                if entry.op.server_id() != client.server_id() {
+                                    continue;
+                                }
                                 let last_seen = client.get_last_client_versions().await;
                                 let last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
                                 if entry.version > last_for_node + 1 {
-                                    let (missed, new_versions) = self.clients.replay_since(&last_seen).await
+                                    let server_id = client.server_id();
+                                    let (missed, new_versions) = self.clients.replay_since_in_server(&server_id, &last_seen).await
                                         .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
                                     for msg in &missed {
                                         client.write_proto_message(msg).await
@@ -981,6 +1605,7 @@ impl Server {
                                             self,
                                             &self.channels,
                                             &mut session_channel_shadow,
+                                            &server_id,
                                             msg,
                                         ).await;
                                         for msg in synthetic {
@@ -1009,6 +1634,7 @@ impl Server {
                                         self,
                                         &self.channels,
                                         &mut session_channel_shadow,
+                                        &client.server_id(),
                                         &msg,
                                     ).await;
                                     for msg in synthetic {
@@ -1020,7 +1646,8 @@ impl Server {
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                                 let last_seen = client.get_last_client_versions().await;
-                                let (missed, new_versions) = self.clients.replay_since(&last_seen).await
+                                let server_id = client.server_id();
+                                let (missed, new_versions) = self.clients.replay_since_in_server(&server_id, &last_seen).await
                                     .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
                                 for msg in &missed {
                                     client.write_proto_message(msg).await
@@ -1029,6 +1656,7 @@ impl Server {
                                         self,
                                         &self.channels,
                                         &mut session_channel_shadow,
+                                        &server_id,
                                         msg,
                                     ).await;
                                     for msg in synthetic {
@@ -1050,17 +1678,22 @@ impl Server {
 
         // Single cleanup point: remove the client on any error.
         if result.is_err() {
-            self.clients.remove_client(client_session_id).await;
+            self.clients
+                .remove_client_in_server(&client.server_id(), client.get_session_id())
+                .await;
         }
         result
     }
 
-    /// Attempt to reload config from disk.  On success, atomically swaps
-    /// the shared config and logs the changed keys.  Returns an error only
-    /// if the config file is malformed (the old config stays in place).
-    pub fn reload_config(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Attempt to reload config from disk. On success, applies live entrypoint
+    /// bindings, atomically swaps the shared config, and logs changed keys.
+    /// Returns an error only if the config file is malformed or an added
+    /// entrypoint cannot be bound; the old config stays in place.
+    pub async fn reload_config(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
         match Config::reload() {
             Ok(Some(new_config)) => {
+                self.apply_entrypoint_config(&new_config).await?;
+
                 let mut current = self.config.write().expect("Config RwLock poisoned");
                 // Log notable changes
                 if current.welcome_text != new_config.welcome_text {
@@ -1119,6 +1752,9 @@ impl Server {
                         new_config.send_permission_info
                     );
                 }
+                if current.server_entrypoints != new_config.server_entrypoints {
+                    tracing::info!("config reload: server_entrypoints changed");
+                }
                 *current = new_config;
                 tracing::info!("config reload: successfully applied new configuration");
                 Ok(())
@@ -1158,8 +1794,8 @@ impl Server {
         &self.session_blobs
     }
 
-    pub fn get_udp_socket(&self) -> &Arc<tokio::net::UdpSocket> {
-        &self.udp_socket
+    pub fn get_udp_socket(&self) -> Option<Arc<tokio::net::UdpSocket>> {
+        self.default_udp_socket()
     }
 
     pub fn s2s_manager(&self) -> &Arc<S2SManager> {
@@ -1241,7 +1877,7 @@ impl Server {
 
         let (user_count, max_user_count) = match user_count_scope {
             UdpPingUserCountScope::Cluster => {
-                let users = server.clients.len().await;
+                let users = server.clients.len_in_server(DEFAULT_SERVER_ID).await;
                 let max_users = server
                     .s2s_manager
                     .cluster_max_users()
@@ -1250,7 +1886,7 @@ impl Server {
                 (users as u64, max_users)
             }
             UdpPingUserCountScope::Local => {
-                let users = server.clients.local_len().await;
+                let users = server.clients.local_len_in_server(DEFAULT_SERVER_ID).await;
                 (users as u64, local_max_users)
             }
         };

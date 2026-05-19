@@ -147,10 +147,22 @@ impl ModerationService {
         target: ClientSessionIdentifier,
         patch: UserStatePatch,
     ) -> Result<(), ApplicationError> {
+        self.dispatch_user_state_in_server(crate::types::DEFAULT_SERVER_ID, actor, target, patch)
+            .await
+    }
+
+    pub async fn dispatch_user_state_in_server(
+        &self,
+        server_id: &str,
+        actor: ClientSessionIdentifier,
+        target: ClientSessionIdentifier,
+        patch: UserStatePatch,
+    ) -> Result<(), ApplicationError> {
         let env = ModerationEnvelope {
             actor_session: actor.to_u32(),
             target_session: target.to_u32(),
             issued_at_ms: now_ms(),
+            server_id: server_id.to_owned(),
             command: Some(ModerationCommand::UserState(patch)),
         };
         self.dispatch_envelope(target.get_node_id(), env).await
@@ -163,10 +175,22 @@ impl ModerationService {
         target: ClientSessionIdentifier,
         patch: UserRemovePatch,
     ) -> Result<(), ApplicationError> {
+        self.dispatch_user_remove_in_server(crate::types::DEFAULT_SERVER_ID, actor, target, patch)
+            .await
+    }
+
+    pub async fn dispatch_user_remove_in_server(
+        &self,
+        server_id: &str,
+        actor: ClientSessionIdentifier,
+        target: ClientSessionIdentifier,
+        patch: UserRemovePatch,
+    ) -> Result<(), ApplicationError> {
         let env = ModerationEnvelope {
             actor_session: actor.to_u32(),
             target_session: target.to_u32(),
             issued_at_ms: now_ms(),
+            server_id: server_id.to_owned(),
             command: Some(ModerationCommand::UserRemove(patch)),
         };
         self.dispatch_envelope(target.get_node_id(), env).await
@@ -374,6 +398,7 @@ mod tests {
             actor_session: 1,
             target_session: 2,
             issued_at_ms: 0,
+            server_id: crate::types::default_server_id(),
             command: Some(ModerationCommand::UserRemove(UserRemovePatch {
                 reason: None,
                 ban: false,

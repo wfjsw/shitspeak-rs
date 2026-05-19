@@ -37,6 +37,7 @@ mod types;
 mod utils;
 mod voice;
 mod voice_crypto;
+mod web;
 
 mod mumble_proto {
     include!(concat!(env!("OUT_DIR"), "/mumble_proto.rs"));
@@ -84,6 +85,7 @@ impl api::Authenticator for NoopAuthenticator {
             user_id: None,
             display_name: Some(username.to_owned()),
             groups,
+            virtual_server_id: None,
             language: localization::Language::default(),
             texture_url: None,
             comment_url: None,

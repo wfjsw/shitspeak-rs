@@ -162,6 +162,15 @@ pub enum WebAuthMode {
     Sso,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerEntrypointConfig {
+    pub server_id: String,
+    #[serde(default)]
+    pub listen: Option<String>,
+    #[serde(default)]
+    pub sni: Vec<String>,
+}
+
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WebSsoConfig {
     #[serde(default)]
@@ -284,6 +293,8 @@ impl From<S2sTransportKindConfig> for TransportKind {
 pub struct Config {
     pub node_id: u16,
     pub listen: String,
+    #[serde(default)]
+    pub server_entrypoints: Vec<ServerEntrypointConfig>,
     pub register_name: String,
 
     // ── Public server registration ────────────────────────────────────────
@@ -554,6 +565,48 @@ mod tests {
             .try_deserialize()
             .expect("config deserialize");
         assert_eq!(cfg.udp_ping_user_count_scope, UdpPingUserCountScope::Local);
+    }
+
+    #[test]
+    fn server_entrypoints_parse_port_and_sni_scopes() {
+        let raw = r#"
+            node_id = 1
+            listen = "127.0.0.1:64738"
+            register_name = "test"
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            send_version = true
+            send_build_info = true
+            send_os_info = true
+            allowed_proxies = []
+            min_client_version = 0
+            max_users = 100
+
+            [[server_entrypoints]]
+            server_id = "tenant-a"
+            listen = "127.0.0.1:64748"
+            sni = ["tenant-a.example.test", "TENANT-A-ALT.example.test"]
+
+            [[server_entrypoints]]
+            server_id = "tenant-b"
+            sni = ["tenant-b.example.test"]
+        "#;
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+
+        assert_eq!(cfg.server_entrypoints.len(), 2);
+        assert_eq!(cfg.server_entrypoints[0].server_id, "tenant-a");
+        assert_eq!(
+            cfg.server_entrypoints[0].listen.as_deref(),
+            Some("127.0.0.1:64748")
+        );
+        assert_eq!(cfg.server_entrypoints[0].sni.len(), 2);
+        assert_eq!(cfg.server_entrypoints[1].server_id, "tenant-b");
+        assert!(cfg.server_entrypoints[1].listen.is_none());
     }
 
     #[test]

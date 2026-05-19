@@ -325,6 +325,7 @@ mod tests {
     fn frame(session: u32, epoch: u64, seq: u64, terminator: bool) -> VoiceFrame {
         VoiceFrame {
             sender_session: session,
+            server_id: crate::types::default_server_id(),
             sender_epoch: epoch,
             s2s_seq: seq,
             target_kind: 0,

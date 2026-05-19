@@ -40,6 +40,7 @@ pub struct SignalingServer {
     config: WebConfig,
     authenticator: Option<Arc<dyn Authenticator>>,
     server: Option<Arc<Box<Server>>>,
+    provisional_server_id: Option<String>,
 }
 
 impl SignalingServer {
@@ -48,6 +49,7 @@ impl SignalingServer {
             config,
             authenticator: None,
             server: None,
+            provisional_server_id: None,
         }
     }
 
@@ -58,6 +60,11 @@ impl SignalingServer {
 
     pub fn with_server(mut self, server: Arc<Box<Server>>) -> Self {
         self.server = Some(server);
+        self
+    }
+
+    pub fn with_provisional_server_id(mut self, server_id: String) -> Self {
+        self.provisional_server_id = Some(server_id);
         self
     }
 
@@ -207,6 +214,7 @@ impl SignalingServer {
                         self.config.clone(),
                         self.authenticator.clone(),
                         self.server.clone(),
+                        self.provisional_server_id.clone(),
                         real_ip,
                         peer_addr,
                         local_addr,
@@ -393,6 +401,7 @@ struct SignalingContext {
     config: WebConfig,
     authenticator: Option<Arc<dyn Authenticator>>,
     server: Option<Arc<Box<Server>>>,
+    provisional_server_id: String,
     real_ip: IpAddr,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
@@ -403,6 +412,7 @@ impl SignalingContext {
         config: WebConfig,
         authenticator: Option<Arc<dyn Authenticator>>,
         server: Option<Arc<Box<Server>>>,
+        provisional_server_id: Option<String>,
         real_ip: IpAddr,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
@@ -411,6 +421,8 @@ impl SignalingContext {
             config,
             authenticator,
             server,
+            provisional_server_id: provisional_server_id
+                .unwrap_or_else(crate::types::default_server_id),
             real_ip,
             peer_addr,
             local_addr,
@@ -504,7 +516,13 @@ where
                         }
                         if let Some(server) = context.server.as_ref() {
                             if let Some(client) = session.client.as_ref() {
-                                server.get_clients().remove_client(client.get_session_id()).await;
+                                server
+                                    .get_clients()
+                                    .remove_client_in_server(
+                                        &client.server_id(),
+                                        client.get_session_id(),
+                                    )
+                                    .await;
                             }
                         }
                         write_websocket_frame(&mut stream, WebSocketOpcode::Close, &[]).await?;
@@ -1129,7 +1147,11 @@ async fn handle_successful_password_auth(
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<Message>(256);
         let client = server
             .get_clients()
-            .allocate_web_client(
+            .allocate_web_client_in_server(
+                result
+                    .virtual_server_id
+                    .clone()
+                    .unwrap_or_else(|| context.provisional_server_id.clone()),
                 context.real_ip,
                 context.peer_addr,
                 context.local_addr,
@@ -1149,9 +1171,10 @@ async fn handle_successful_password_auth(
         }
 
         let default_ch = server.get_default_channel();
+        let server_id = client.server_id();
         let target_ch = if server
             .get_channels()
-            .get_channel(default_ch)
+            .get_channel_in_server(&server_id, default_ch)
             .await
             .is_some()
         {
@@ -1161,17 +1184,17 @@ async fn handle_successful_password_auth(
         };
         let target_ch = server
             .get_channels()
-            .redirect_pending_delete_target(target_ch)
+            .redirect_pending_delete_target_in_server(&server_id, target_ch)
             .await;
         client.set_current_channel_id(
             target_ch,
             server.get_clients(),
-            server.get_channels().current_version(),
+            server.get_channels().current_version_in_server(&server_id),
         );
         client.set_authenticated(true);
         server
             .get_clients()
-            .publish_client(client.get_session_id())
+            .publish_client_in_server(&server_id, client.get_session_id())
             .await;
         crate::voice::spawn_voice_routing_task(Arc::clone(server), Arc::clone(&client));
         initial_state_client = Some((Arc::clone(server), Arc::clone(&client)));
@@ -1183,9 +1206,16 @@ async fn handle_successful_password_auth(
     if let Some((server, client)) = initial_state_client {
         send_initial_server_state(stream, &server, &client, &mut session.channel_shadow).await?;
         client
-            .set_last_channel_version(server.get_channels().current_version())
+            .set_last_channel_version(
+                server
+                    .get_channels()
+                    .current_version_in_server(&client.server_id()),
+            )
             .await;
-        let (_, versions) = server.get_clients().snapshot_with_versions().await;
+        let (_, versions) = server
+            .get_clients()
+            .snapshot_with_versions_in_server(&client.server_id())
+            .await;
         client.update_last_client_versions(&versions).await;
         session.client_log_rx = Some(server.get_clients().subscribe());
         session.channel_log_rx = Some(server.get_channels().subscribe());
@@ -1199,7 +1229,8 @@ async fn send_initial_server_state(
     client: &Arc<Box<Client>>,
     channel_shadow: &mut SessionChannelShadow,
 ) -> io::Result<()> {
-    let channels = server.get_channels().get_all().await;
+    let server_id = client.server_id();
+    let channels = server.get_channels().get_all_in_server(&server_id).await;
     let channels_by_id = channels
         .into_iter()
         .map(|channel| (channel.id, channel))
@@ -1232,7 +1263,11 @@ async fn send_initial_server_state(
     }
 
     let session_id = client.get_session_id();
-    for visible in server.get_clients().get_all_clients().await {
+    for visible in server
+        .get_clients()
+        .get_all_clients_in_server(&server_id)
+        .await
+    {
         if !visible.is_authenticated() {
             continue;
         }
@@ -1240,13 +1275,27 @@ async fn send_initial_server_state(
             continue;
         }
         let user_state: Message = visible.build_user_state_for_broadcast().into();
-        send_web_outbound_message_with_synthetic(stream, server, None, channel_shadow, &user_state)
-            .await?;
+        send_web_outbound_message_with_synthetic(
+            stream,
+            server,
+            None,
+            channel_shadow,
+            &server_id,
+            &user_state,
+        )
+        .await?;
     }
 
     let self_state: Message = client.build_user_state_for_broadcast().into();
-    send_web_outbound_message_with_synthetic(stream, server, None, channel_shadow, &self_state)
-        .await?;
+    send_web_outbound_message_with_synthetic(
+        stream,
+        server,
+        None,
+        channel_shadow,
+        &server_id,
+        &self_state,
+    )
+    .await?;
 
     let root_permissions =
         crate::client::acl::compute_permissions_for_client(server, client, 0).await;
@@ -1306,6 +1355,10 @@ async fn send_web_channel_log_update(
     };
 
     let last = client.get_last_channel_version().await;
+    let server_id = client.server_id();
+    if op.server_id != server_id {
+        return Ok(());
+    }
     if op.version <= last {
         return Ok(());
     }
@@ -1345,7 +1398,11 @@ async fn send_web_channel_log_gap(
     };
 
     let last = client.get_last_channel_version().await;
-    let missed = server.get_channels().get_log_since(last).await;
+    let server_id = client.server_id();
+    let missed = server
+        .get_channels()
+        .get_log_since_in_server(&server_id, last)
+        .await;
     if missed.is_empty() && last > 0 {
         send_websocket_error(stream, "web channel update gap is unrecoverable").await?;
         return Ok(());
@@ -1382,6 +1439,10 @@ async fn send_web_client_log_update(
     };
 
     let entry = &payload.entry;
+    let server_id = client.server_id();
+    if entry.op.server_id() != server_id {
+        return Ok(());
+    }
     let last_seen = client.get_last_client_versions().await;
     let last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
     if entry.version <= last_for_node {
@@ -1406,6 +1467,7 @@ async fn send_web_client_log_update(
             &server,
             session.peer.as_ref(),
             &mut session.channel_shadow,
+            &server_id,
             &message,
         )
         .await?;
@@ -1431,7 +1493,12 @@ async fn send_web_client_log_gap(
     };
 
     let last_seen = client.get_last_client_versions().await;
-    let (missed, versions) = match server.get_clients().replay_since(&last_seen).await {
+    let server_id = client.server_id();
+    let (missed, versions) = match server
+        .get_clients()
+        .replay_since_in_server(&server_id, &last_seen)
+        .await
+    {
         Ok(replay) => replay,
         Err(()) => {
             send_websocket_error(stream, "web client update gap is unrecoverable").await?;
@@ -1444,6 +1511,7 @@ async fn send_web_client_log_gap(
             &server,
             session.peer.as_ref(),
             &mut session.channel_shadow,
+            &server_id,
             &message,
         )
         .await?;
@@ -1457,6 +1525,7 @@ async fn send_web_outbound_message_with_synthetic(
     server: &Arc<Box<Server>>,
     peer: Option<&WebRtcPeer>,
     channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
     message: &Message,
 ) -> io::Result<()> {
     send_web_outbound_message(stream, peer, message.clone()).await?;
@@ -1464,6 +1533,7 @@ async fn send_web_outbound_message_with_synthetic(
         server,
         server.get_channels(),
         channel_shadow,
+        server_id,
         message,
     )
     .await;
@@ -2315,6 +2385,7 @@ mod tests {
                 user_id: Some(7),
                 display_name: Some("Alice".to_string()),
                 groups: vec!["web".to_string()],
+                virtual_server_id: None,
                 language: Language::default(),
                 texture_url: None,
                 comment_url: None,
@@ -2340,6 +2411,7 @@ mod tests {
         let config = crate::config::Config {
             node_id: 1,
             listen: "127.0.0.1:0".into(),
+            server_entrypoints: Vec::new(),
             register_name: "test".into(),
             register_password: None,
             register_url: None,

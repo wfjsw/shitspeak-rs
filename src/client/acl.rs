@@ -24,12 +24,14 @@ pub(crate) async fn compute_permissions_for_client(
     }
 
     let channels = server.get_channels();
+    let server_id = client.server_id();
     let client_acl_generation = client.get_acl_generation();
     let channel_acl_generation = channels.channel_acl_generation();
     let cache_session = u64::from(session);
 
     if let Some(permissions) = channels
-        .get_cached_permissions(
+        .get_cached_permissions_in_server(
+            &server_id,
             cache_session,
             channel_id,
             channel_acl_generation,
@@ -47,7 +49,7 @@ pub(crate) async fn compute_permissions_for_client(
     }
 
     let (channel_acl_generation, channel, ancestors) = channels
-        .get_channel_with_ancestors_for_acl(channel_id)
+        .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
         .await;
     let Some(channel) = channel else {
         tracing::trace!(session, channel_id, "ACL compute found no channel");
@@ -97,7 +99,8 @@ pub(crate) async fn compute_permissions_for_client(
         && client.get_acl_generation() == client_acl_generation
     {
         channels
-            .cache_permissions(
+            .cache_permissions_in_server(
+                &server_id,
                 cache_session,
                 channel_id,
                 channel_acl_generation,

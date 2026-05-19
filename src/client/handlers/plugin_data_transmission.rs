@@ -22,6 +22,7 @@ pub async fn handle_plugin_data_transmission(
     }
 
     let sender_session = u32::from(sender.get_session_id());
+    let server_id = sender.server_id();
     tracing::debug!(
         session = sender_session,
         receivers = msg.receiver_sessions.len(),
@@ -52,7 +53,10 @@ pub async fn handle_plugin_data_transmission(
     for receiver in &relay.receiver_sessions {
         let id = ClientSessionIdentifier::from(*receiver);
         if id.get_node_id() == local_node_id {
-            server.get_clients().send_to(id, &relay_message).await;
+            server
+                .get_clients()
+                .send_to_in_server(&server_id, id, &relay_message)
+                .await;
         } else {
             remote_by_node
                 .entry(id.get_node_id())
@@ -72,6 +76,7 @@ pub async fn handle_plugin_data_transmission(
                 receiver_sessions,
                 data: relay.data.clone().unwrap_or_default(),
                 data_id: relay.data_id.clone(),
+                server_id: server_id.clone(),
             };
             if let Err(e) = app.plugin_data().dispatch(node_id, envelope).await {
                 tracing::warn!(

@@ -15,6 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client_repository::ClientRepository;
+use crate::types::default_server_id;
 
 // ─── Macros ──────────────────────────────────────────────────────────────────
 
@@ -216,6 +217,8 @@ mod opt_socket_addr_string {
 #[serde(tag = "type")]
 pub enum ClientStateOperation {
     AddClient {
+        #[serde(default = "default_server_id")]
+        server_id: String,
         session_id: ClientSessionIdentifier,
         #[serde(with = "ip_addr_string")]
         real_ip: IpAddr,
@@ -230,9 +233,13 @@ pub enum ClientStateOperation {
         initial_state: ClientGlobalStateDelta,
     },
     RemoveClient {
+        #[serde(default = "default_server_id")]
+        server_id: String,
         session_id: ClientSessionIdentifier,
     },
     UpdateGlobalState {
+        #[serde(default = "default_server_id")]
+        server_id: String,
         session_id: ClientSessionIdentifier,
         sender_session_id: Option<ClientSessionIdentifier>,
         delta: ClientGlobalStateDelta,
@@ -244,8 +251,16 @@ impl ClientStateOperation {
     pub fn session_id(&self) -> Option<ClientSessionIdentifier> {
         match self {
             ClientStateOperation::AddClient { session_id, .. } => Some(*session_id),
-            ClientStateOperation::RemoveClient { session_id } => Some(*session_id),
+            ClientStateOperation::RemoveClient { session_id, .. } => Some(*session_id),
             ClientStateOperation::UpdateGlobalState { session_id, .. } => Some(*session_id),
+        }
+    }
+
+    pub fn server_id(&self) -> &str {
+        match self {
+            ClientStateOperation::AddClient { server_id, .. } => server_id,
+            ClientStateOperation::RemoveClient { server_id, .. } => server_id,
+            ClientStateOperation::UpdateGlobalState { server_id, .. } => server_id,
         }
     }
 }
@@ -284,13 +299,17 @@ impl ClientStateLogEntry {
     /// * `UpdateGlobalState` → `UserState` delta (only changed fields)
     pub async fn to_message(&self, repo: &ClientRepository) -> Option<crate::messages::Message> {
         match &self.op {
-            ClientStateOperation::AddClient { session_id, .. } => {
-                let client = repo.get_client(*session_id).await?;
+            ClientStateOperation::AddClient {
+                server_id,
+                session_id,
+                ..
+            } => {
+                let client = repo.get_client_in_server(server_id, *session_id).await?;
                 let us: crate::messages::encoder::UserState =
                     client.build_user_state_for_broadcast();
                 Some(crate::messages::Message::UserState(us.into()))
             }
-            ClientStateOperation::RemoveClient { session_id } => Some(
+            ClientStateOperation::RemoveClient { session_id, .. } => Some(
                 crate::messages::encoder::UserRemove {
                     session: u32::from(*session_id),
                     actor: None,
@@ -300,6 +319,7 @@ impl ClientStateLogEntry {
                 .into(),
             ),
             ClientStateOperation::UpdateGlobalState {
+                server_id: _,
                 session_id,
                 sender_session_id,
                 delta,
@@ -414,6 +434,7 @@ mod tests {
             timestamp: 123,
             channel_version_dep: None,
             op: ClientStateOperation::AddClient {
+                server_id: default_server_id(),
                 session_id: ClientSessionIdentifier::new(1, 42).unwrap(),
                 real_ip: "203.0.113.17".parse().unwrap(),
                 tcp_addr: "203.0.113.17:64738".parse().unwrap(),
@@ -438,6 +459,7 @@ mod tests {
         assert_eq!(decoded.node_id, entry.node_id);
         match decoded.op {
             ClientStateOperation::AddClient {
+                server_id,
                 session_id,
                 real_ip,
                 tcp_addr,
@@ -447,6 +469,7 @@ mod tests {
                 initial_state,
                 ..
             } => {
+                assert_eq!(server_id, default_server_id());
                 assert_eq!(
                     u32::from(session_id),
                     u32::from(ClientSessionIdentifier::new(1, 42).unwrap())

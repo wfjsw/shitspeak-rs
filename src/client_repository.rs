@@ -19,7 +19,30 @@ use crate::{
         Client,
     },
     constants::MAX_LOCAL_SESSION_ID,
+    types::{default_server_id, ScopedChannelId, ScopedSessionId, DEFAULT_SERVER_ID},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UdpBindingKey {
+    remote_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+}
+
+impl UdpBindingKey {
+    fn legacy(remote_addr: SocketAddr) -> Self {
+        Self {
+            remote_addr,
+            local_addr: None,
+        }
+    }
+
+    fn scoped(local_addr: SocketAddr, remote_addr: SocketAddr) -> Self {
+        Self {
+            remote_addr,
+            local_addr: Some(local_addr),
+        }
+    }
+}
 
 pub struct ClientRepository {
     local_node_id: u16,
@@ -31,12 +54,12 @@ pub struct ClientRepository {
     /// serialised.
     register: AsyncRwLock<ClientRegister>,
 
-    clients_by_host: ParkingRwLock<HashMap<IpAddr, HashSet<ClientSessionIdentifier>>>,
-    clients_by_udp_address: ParkingRwLock<HashMap<SocketAddr, ClientSessionIdentifier>>,
+    clients_by_host: ParkingRwLock<HashMap<IpAddr, HashSet<ScopedSessionId>>>,
+    clients_by_udp_address: ParkingRwLock<HashMap<UdpBindingKey, ScopedSessionId>>,
 
-    // The pointer only store local_session_id part
-    allocation_pointer: ParkingMutex<u32>,
-    free_ids: ParkingMutex<HashSet<u32>>,
+    // These pools store only the local_session_id part, independently per server_id.
+    allocation_pointers: ParkingMutex<HashMap<String, u32>>,
+    free_ids: ParkingMutex<HashMap<String, HashSet<u32>>>,
 
     /// Broadcast channel for per-client subscribers and future S2S peers.
     tx: broadcast::Sender<Arc<ClientStateBroadcastPayload>>,
@@ -45,13 +68,13 @@ pub struct ClientRepository {
 pub struct ClientRegister {
     // ── Local state ────────────────────────────────────────────────────
     /// Clients homed on this node.
-    local_clients: HashMap<ClientSessionIdentifier, Arc<Box<Client>>>,
+    local_clients: HashMap<ScopedSessionId, Arc<Box<Client>>>,
     /// Ring buffer of local log entries.
     local_log: VecDeque<Arc<ClientStateLogEntry>>,
 
     // ── Remote state (per peer node) ────────────────────────────────────
     /// Remote clients, keyed by node_id then session identifier.
-    remote_clients: HashMap<u16, HashMap<ClientSessionIdentifier, Arc<Box<Client>>>>,
+    remote_clients: HashMap<u16, HashMap<ScopedSessionId, Arc<Box<Client>>>>,
     /// Ring buffer per remote node.
     remote_logs: HashMap<u16, VecDeque<Arc<ClientStateLogEntry>>>,
 
@@ -62,30 +85,34 @@ pub struct ClientRegister {
 
     // ── Causal consistency ─────────────────────────────────────────────
     /// Remote client log entries waiting for channel state to catch up.
-    /// Each entry is stored with its precomputed effective dep.
+    /// Entries remain in remote-log version order; each stores its server-scoped effective dep.
     pending_remote_ops: VecDeque<(Arc<ClientStateLogEntry>, u64)>,
-    /// The effective dep of the last entry in `pending_remote_ops` (0 if empty).
-    last_pending_effective_dep: u64,
+    /// Last pending effective dependency per server scope.
+    last_pending_effective_dep_by_server: HashMap<String, u64>,
+    /// Latest known channel version per server scope, used to release pending ops in order.
+    pending_channel_versions: HashMap<String, u64>,
 
     // ── Channel membership index (LOCAL clients only) ───────────────────
     // Used by voice routing to find recipients on this node.  Remote
     // clients are deliberately excluded — they receive voice via S2S
     // cross-node delivery routed by their owning node.
-    /// Maps channel_id → set of local session IDs currently in that channel.
-    clients_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
-    /// Reverse map: local session_id → current channel_id, for O(1) index moves.
-    client_channel: HashMap<ClientSessionIdentifier, u32>,
-    /// Maps channel_id → set of local session IDs listening to that channel.
-    listeners_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
+    /// Maps (server_id, channel_id) → set of local session IDs currently in that channel.
+    clients_by_channel: HashMap<ScopedChannelId, HashSet<ScopedSessionId>>,
+    /// Reverse map: local session key → current channel key, for O(1) index moves.
+    client_channel: HashMap<ScopedSessionId, ScopedChannelId>,
+    /// Maps (server_id, channel_id) → set of local session IDs listening to that channel.
+    listeners_by_channel: HashMap<ScopedChannelId, HashSet<ScopedSessionId>>,
 }
 
 impl ClientRegister {
     /// Look up a client in the local or owning remote map.
-    fn get(&self, id: &ClientSessionIdentifier, local_node_id: u16) -> Option<&Arc<Box<Client>>> {
-        if id.node_id == local_node_id {
+    fn get(&self, id: &ScopedSessionId, local_node_id: u16) -> Option<&Arc<Box<Client>>> {
+        if id.session_id().node_id == local_node_id {
             self.local_clients.get(id)
         } else {
-            self.remote_clients.get(&id.node_id).and_then(|m| m.get(id))
+            self.remote_clients
+                .get(&id.session_id().node_id)
+                .and_then(|m| m.get(id))
         }
     }
 
@@ -102,18 +129,20 @@ impl ClientRegister {
     }
 
     /// Insert a client into the channel index.
-    fn channel_index_insert(&mut self, id: ClientSessionIdentifier, channel_id: u32) {
-        self.client_channel.insert(id, channel_id);
+    fn channel_index_insert(&mut self, id: ScopedSessionId, channel_id: u32) {
+        let channel_key = ScopedChannelId::new(id.server_id().to_owned(), channel_id);
+        self.client_channel.insert(id.clone(), channel_key.clone());
         self.clients_by_channel
-            .entry(channel_id)
+            .entry(channel_key)
             .or_default()
             .insert(id);
     }
 
     /// Move a client from its current channel to `new_channel` in the index.
-    fn channel_index_move(&mut self, id: ClientSessionIdentifier, new_channel: u32) {
-        let old = self.client_channel.get(&id).copied();
-        if old == Some(new_channel) {
+    fn channel_index_move(&mut self, id: ScopedSessionId, new_channel: u32) {
+        let new_channel_key = ScopedChannelId::new(id.server_id().to_owned(), new_channel);
+        let old = self.client_channel.get(&id).cloned();
+        if old.as_ref() == Some(&new_channel_key) {
             return;
         }
         if let Some(old_ch) = old {
@@ -124,15 +153,16 @@ impl ClientRegister {
                 }
             }
         }
-        self.client_channel.insert(id, new_channel);
+        self.client_channel
+            .insert(id.clone(), new_channel_key.clone());
         self.clients_by_channel
-            .entry(new_channel)
+            .entry(new_channel_key)
             .or_default()
             .insert(id);
     }
 
     /// Remove a client from the channel index entirely.
-    fn channel_index_remove(&mut self, id: &ClientSessionIdentifier) {
+    fn channel_index_remove(&mut self, id: &ScopedSessionId) {
         if let Some(old_ch) = self.client_channel.remove(id) {
             if let Some(set) = self.clients_by_channel.get_mut(&old_ch) {
                 set.remove(id);
@@ -144,25 +174,27 @@ impl ClientRegister {
     }
 
     /// Add `id` as a listener for `channel_id`.
-    fn listener_index_add(&mut self, id: ClientSessionIdentifier, channel_id: u32) {
+    fn listener_index_add(&mut self, id: ScopedSessionId, channel_id: u32) {
+        let channel_key = ScopedChannelId::new(id.server_id().to_owned(), channel_id);
         self.listeners_by_channel
-            .entry(channel_id)
+            .entry(channel_key)
             .or_default()
             .insert(id);
     }
 
     /// Remove `id` from the listener set for a specific channel.
-    fn listener_index_remove_channel(&mut self, id: &ClientSessionIdentifier, channel_id: u32) {
-        if let Some(set) = self.listeners_by_channel.get_mut(&channel_id) {
+    fn listener_index_remove_channel(&mut self, id: &ScopedSessionId, channel_id: u32) {
+        let channel_key = ScopedChannelId::new(id.server_id().to_owned(), channel_id);
+        if let Some(set) = self.listeners_by_channel.get_mut(&channel_key) {
             set.remove(id);
             if set.is_empty() {
-                self.listeners_by_channel.remove(&channel_id);
+                self.listeners_by_channel.remove(&channel_key);
             }
         }
     }
 
     /// Remove `id` from all listener sets (called on disconnect).
-    fn listener_index_remove_all(&mut self, id: &ClientSessionIdentifier) {
+    fn listener_index_remove_all(&mut self, id: &ScopedSessionId) {
         self.listeners_by_channel.retain(|_, set| {
             set.remove(id);
             !set.is_empty()
@@ -170,7 +202,7 @@ impl ClientRegister {
     }
 
     /// Iterate over all client entries (local + remote).
-    fn all_entries(&self) -> impl Iterator<Item = (&ClientSessionIdentifier, &Arc<Box<Client>>)> {
+    fn all_entries(&self) -> impl Iterator<Item = (&ScopedSessionId, &Arc<Box<Client>>)> {
         self.local_clients
             .iter()
             .chain(self.remote_clients.values().flat_map(|m| m.iter()))
@@ -191,15 +223,16 @@ impl ClientRepository {
                 remote_logs: HashMap::new(),
                 versions: HashMap::new(),
                 pending_remote_ops: VecDeque::new(),
-                last_pending_effective_dep: 0,
+                last_pending_effective_dep_by_server: HashMap::new(),
+                pending_channel_versions: HashMap::new(),
                 clients_by_channel: HashMap::new(),
                 client_channel: HashMap::new(),
                 listeners_by_channel: HashMap::new(),
             }),
             clients_by_host: ParkingRwLock::new(HashMap::new()),
             clients_by_udp_address: ParkingRwLock::new(HashMap::new()),
-            allocation_pointer: ParkingMutex::new(0),
-            free_ids: ParkingMutex::new(HashSet::new()),
+            allocation_pointers: ParkingMutex::new(HashMap::new()),
+            free_ids: ParkingMutex::new(HashMap::new()),
             tx,
         }
     }
@@ -207,6 +240,96 @@ impl ClientRepository {
     /// The node ID of this repository.
     pub fn local_node_id(&self) -> u16 {
         self.local_node_id
+    }
+
+    fn allocate_local_session_id(&self, server_id: &str) -> u32 {
+        let mut free_ids_guard = self.free_ids.lock();
+        if let Some(free_ids) = free_ids_guard.get_mut(server_id) {
+            if let Some(free_id) = free_ids.iter().next().copied() {
+                free_ids.remove(&free_id);
+                return free_id;
+            }
+        }
+        drop(free_ids_guard);
+
+        let mut pointers = self.allocation_pointers.lock();
+        let allocation_pointer = pointers.entry(server_id.to_owned()).or_insert(0);
+        let id = *allocation_pointer;
+
+        if id > MAX_LOCAL_SESSION_ID {
+            panic!("Exceeded maximum number of local session IDs for server_id={server_id}. Consider rearranging the allocation strategy");
+        }
+
+        *allocation_pointer += 1;
+        id
+    }
+
+    fn release_local_session_id(&self, server_id: &str, local_session_id: u32) {
+        self.free_ids
+            .lock()
+            .entry(server_id.to_owned())
+            .or_default()
+            .insert(local_session_id);
+    }
+
+    pub async fn move_local_client_to_server(
+        &self,
+        old_server_id: &str,
+        old_id: ClientSessionIdentifier,
+        new_server_id: &str,
+    ) -> Option<ClientSessionIdentifier> {
+        if old_server_id == new_server_id {
+            return Some(old_id);
+        }
+
+        let old_scoped_id = ScopedSessionId::new(old_server_id.to_owned(), old_id);
+        let new_local_id = self.allocate_local_session_id(new_server_id);
+        let new_id = ClientSessionIdentifier::new(self.local_node_id, new_local_id).ok()?;
+        let new_scoped_id = ScopedSessionId::new(new_server_id.to_owned(), new_id);
+
+        let moved = {
+            let mut register = self.register.write().await;
+            let mut client_by_udp_address_guard = self.clients_by_udp_address.write();
+            let mut client_by_host_guard = self.clients_by_host.write();
+
+            let client = register.local_clients.remove(&old_scoped_id)?;
+            register.channel_index_remove(&old_scoped_id);
+            register.listener_index_remove_all(&old_scoped_id);
+
+            let tcp_address = client.get_tcp_address();
+            if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
+                set.remove(&old_scoped_id);
+                set.insert(new_scoped_id.clone());
+            }
+
+            let stale_udp: Vec<UdpBindingKey> = client_by_udp_address_guard
+                .iter()
+                .filter_map(|(key, scoped)| (*scoped == old_scoped_id).then_some(*key))
+                .collect();
+            for key in stale_udp {
+                client_by_udp_address_guard.insert(key, new_scoped_id.clone());
+            }
+
+            client.set_scoped_identity(new_server_id.to_owned(), new_id);
+            register
+                .local_clients
+                .insert(new_scoped_id.clone(), Arc::clone(&client));
+            register.channel_index_insert(new_scoped_id, 0);
+            client
+        };
+
+        self.release_local_session_id(old_server_id, old_id.local_session_id);
+
+        if moved.is_published() {
+            tracing::warn!(
+                old_server_id,
+                new_server_id,
+                session = u32::from(old_id),
+                "moved already-published local client across server scopes"
+            );
+        }
+
+        Some(new_id)
     }
 
     pub async fn allocate_local_client(
@@ -217,29 +340,36 @@ impl ClientRepository {
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
     ) -> Arc<Box<Client>> {
+        self.allocate_local_client_in_server(
+            DEFAULT_SERVER_ID,
+            real_ip_address,
+            tcp_address,
+            udp_address,
+            local_address,
+            connection,
+        )
+        .await
+    }
+
+    pub async fn allocate_local_client_in_server(
+        &self,
+        server_id: impl Into<String>,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        udp_address: Option<SocketAddr>,
+        local_address: SocketAddr,
+        connection: TlsStream<TcpStream>,
+    ) -> Arc<Box<Client>> {
+        let server_id = server_id.into();
         let mut register = self.register.write().await;
         let mut client_by_udp_address_guard = self.clients_by_udp_address.write();
         let mut client_by_host_guard = self.clients_by_host.write();
-        let mut free_ids_guard = self.free_ids.lock();
 
-        let id = {
-            if let Some(free_id) = free_ids_guard.iter().next().copied() {
-                free_ids_guard.remove(&free_id);
-                free_id
-            } else {
-                let mut allocation_pointer = self.allocation_pointer.lock();
-                let id = *allocation_pointer;
-
-                if id > MAX_LOCAL_SESSION_ID {
-                    panic!("Exceeded maximum number of local session IDs. Consider rearranging the allocation strategy");
-                }
-
-                *allocation_pointer += 1;
-                id
-            }
-        };
+        let id = self.allocate_local_session_id(&server_id);
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
-        let client = Client::new_local(
+        let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
+        let client = Client::new_local_in_server(
+            server_id,
             client_identifier,
             real_ip_address,
             tcp_address,
@@ -252,18 +382,21 @@ impl ClientRepository {
 
         register
             .local_clients
-            .insert(client_identifier, Arc::clone(&client));
-        register.channel_index_insert(client_identifier, 0); // root channel until auth sets it
+            .insert(scoped_id.clone(), Arc::clone(&client));
+        register.channel_index_insert(scoped_id.clone(), 0); // root channel until auth sets it
 
         if let Some(udp_address) = udp_address {
-            client_by_udp_address_guard.insert(udp_address, client_identifier);
+            client_by_udp_address_guard.insert(
+                UdpBindingKey::scoped(local_address, udp_address),
+                scoped_id.clone(),
+            );
         }
 
         if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
-            set.insert(client_identifier);
+            set.insert(scoped_id);
         } else {
             let mut set = HashSet::new();
-            set.insert(client_identifier);
+            set.insert(scoped_id);
             client_by_host_guard.insert(tcp_address.ip(), set);
         }
 
@@ -280,28 +413,33 @@ impl ClientRepository {
         local_address: SocketAddr,
         outbound_tx: tokio::sync::mpsc::Sender<crate::messages::Message>,
     ) -> Arc<Box<Client>> {
+        self.allocate_web_client_in_server(
+            DEFAULT_SERVER_ID,
+            real_ip_address,
+            tcp_address,
+            local_address,
+            outbound_tx,
+        )
+        .await
+    }
+
+    pub async fn allocate_web_client_in_server(
+        &self,
+        server_id: impl Into<String>,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: tokio::sync::mpsc::Sender<crate::messages::Message>,
+    ) -> Arc<Box<Client>> {
+        let server_id = server_id.into();
         let mut register = self.register.write().await;
         let mut client_by_host_guard = self.clients_by_host.write();
-        let mut free_ids_guard = self.free_ids.lock();
 
-        let id = {
-            if let Some(free_id) = free_ids_guard.iter().next().copied() {
-                free_ids_guard.remove(&free_id);
-                free_id
-            } else {
-                let mut allocation_pointer = self.allocation_pointer.lock();
-                let id = *allocation_pointer;
-
-                if id > MAX_LOCAL_SESSION_ID {
-                    panic!("Exceeded maximum number of local session IDs. Consider rearranging the allocation strategy");
-                }
-
-                *allocation_pointer += 1;
-                id
-            }
-        };
+        let id = self.allocate_local_session_id(&server_id);
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
-        let client = Client::new_web_gateway(
+        let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
+        let client = Client::new_web_gateway_in_server(
+            server_id,
             client_identifier,
             real_ip_address,
             tcp_address,
@@ -313,13 +451,13 @@ impl ClientRepository {
 
         register
             .local_clients
-            .insert(client_identifier, Arc::clone(&client));
-        register.channel_index_insert(client_identifier, 0);
+            .insert(scoped_id.clone(), Arc::clone(&client));
+        register.channel_index_insert(scoped_id.clone(), 0);
 
         client_by_host_guard
             .entry(tcp_address.ip())
             .or_default()
-            .insert(client_identifier);
+            .insert(scoped_id);
 
         client
     }
@@ -328,7 +466,19 @@ impl ClientRepository {
     /// authentication.  Sets the `published` flag so that future
     /// `remove_client` calls will emit a corresponding `RemoveClient`.
     pub async fn publish_client(&self, id: ClientSessionIdentifier) {
-        let client = match self.register.read().await.local_clients.get(&id).cloned() {
+        self.publish_client_in_server(DEFAULT_SERVER_ID, id).await;
+    }
+
+    pub async fn publish_client_in_server(&self, server_id: &str, id: ClientSessionIdentifier) {
+        let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
+        let client = match self
+            .register
+            .read()
+            .await
+            .local_clients
+            .get(&scoped_id)
+            .cloned()
+        {
             Some(c) => c,
             None => return,
         };
@@ -337,6 +487,7 @@ impl ClientRepository {
 
         self.commit_operation(
             ClientStateOperation::AddClient {
+                server_id: server_id.to_owned(),
                 session_id: id,
                 real_ip: client.get_real_ip_address(),
                 tcp_addr: client.get_tcp_address(),
@@ -360,6 +511,8 @@ impl ClientRepository {
         if node_id == self.local_node_id {
             panic!("Not supposed to add a remote client with the local node ID");
         }
+        let server_id = client.server_id();
+        let scoped_id = ScopedSessionId::new(server_id.clone(), id);
 
         // Snapshot fields before moving into the map
         let real_ip = client.get_real_ip_address();
@@ -377,7 +530,7 @@ impl ClientRepository {
                 .remote_clients
                 .entry(node_id)
                 .or_default()
-                .insert(id, client);
+                .insert(scoped_id, client);
             // Ensure version/log entries exist for this node
             register.versions.entry(node_id).or_insert(0);
             register.remote_logs.entry(node_id).or_default();
@@ -389,6 +542,7 @@ impl ClientRepository {
         // ── Log the operation ───────────────────────────────────────────
         self.commit_operation(
             ClientStateOperation::AddClient {
+                server_id,
                 session_id: id,
                 real_ip,
                 tcp_addr,
@@ -404,17 +558,25 @@ impl ClientRepository {
     }
 
     pub async fn remove_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
+        self.remove_client_in_server(DEFAULT_SERVER_ID, id).await
+    }
+
+    pub async fn remove_client_in_server(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+    ) -> Option<Arc<Box<Client>>> {
+        let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
         let client = {
             let mut register = self.register.write().await;
             let mut client_by_udp_address_guard = self.clients_by_udp_address.write();
             let mut client_by_host_guard = self.clients_by_host.write();
-            let mut free_ids_guard = self.free_ids.lock();
 
             // Try local first, then remote
-            let client = if let Some(c) = register.local_clients.remove(&id) {
+            let client = if let Some(c) = register.local_clients.remove(&scoped_id) {
                 c
             } else if let Some(remote_map) = register.remote_clients.get_mut(&id.node_id) {
-                match remote_map.remove(&id) {
+                match remote_map.remove(&scoped_id) {
                     Some(c) => {
                         // Clean up empty remote node entries
                         if remote_map.is_empty() {
@@ -432,38 +594,44 @@ impl ClientRepository {
 
             // The index only tracks local clients — these calls are no-ops
             // for remote clients but still safe to run unconditionally.
-            register.channel_index_remove(&id);
-            register.listener_index_remove_all(&id);
+            register.channel_index_remove(&scoped_id);
+            register.listener_index_remove_all(&scoped_id);
 
             if client.get_node_id() == self.local_node_id {
                 // Remove any UDP address dynamically bound to this session (may
                 // differ from the initial udp_address field if the client's port
                 // was discovered later via IP-fallback matching).
-                let stale_udp: Vec<SocketAddr> = client_by_udp_address_guard
+                let stale_udp: Vec<UdpBindingKey> = client_by_udp_address_guard
                     .iter()
-                    .filter_map(|(k, v)| if *v == id { Some(*k) } else { None })
+                    .filter_map(|(k, v)| if *v == scoped_id { Some(*k) } else { None })
                     .collect();
-                for addr in stale_udp {
-                    client_by_udp_address_guard.remove(&addr);
+                for key in stale_udp {
+                    client_by_udp_address_guard.remove(&key);
                 }
 
                 let tcp_address = client.get_tcp_address();
 
                 if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
-                    set.remove(&id);
+                    set.remove(&scoped_id);
                     if set.is_empty() {
                         client_by_host_guard.remove(&tcp_address.ip());
                     }
                 }
 
-                free_ids_guard.insert(id.local_session_id);
+                self.release_local_session_id(scoped_id.server_id(), id.local_session_id);
             }
             client
         };
 
         if client.is_published() {
-            self.commit_operation(ClientStateOperation::RemoveClient { session_id: id }, None)
-                .await;
+            self.commit_operation(
+                ClientStateOperation::RemoveClient {
+                    server_id: server_id.to_owned(),
+                    session_id: id,
+                },
+                None,
+            )
+            .await;
         }
 
         Some(client)
@@ -474,14 +642,13 @@ impl ClientRepository {
             panic!("Not supposed to clear clients from the local node");
         }
 
-        let (ids_to_remove, published): (Vec<ClientSessionIdentifier>, Vec<bool>) = {
+        let (ids_to_remove, published): (Vec<ScopedSessionId>, Vec<bool>) = {
             let mut register = self.register.write().await;
-            let mut free_ids = self.free_ids.lock();
 
             // Collect published status before removing from map
             let result = match register.remote_clients.get(&node_id) {
                 Some(remote_map) => {
-                    let ids: Vec<ClientSessionIdentifier> = remote_map.keys().copied().collect();
+                    let ids: Vec<ScopedSessionId> = remote_map.keys().cloned().collect();
                     let pub_flags: Vec<bool> = ids
                         .iter()
                         .filter_map(|id| remote_map.get(id))
@@ -503,25 +670,61 @@ impl ClientRepository {
         // ── Log each removal (only if client was published) ─────────────
         for (id, was_published) in ids_to_remove.iter().zip(published.iter()) {
             if *was_published {
-                self.commit_operation(ClientStateOperation::RemoveClient { session_id: *id }, None)
-                    .await;
+                self.commit_operation(
+                    ClientStateOperation::RemoveClient {
+                        server_id: id.server_id().to_owned(),
+                        session_id: id.session_id(),
+                    },
+                    None,
+                )
+                .await;
             }
         }
     }
 
     pub async fn get_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
+        self.get_client_in_server(DEFAULT_SERVER_ID, id).await
+    }
+
+    pub async fn get_client_in_server(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+    ) -> Option<Arc<Box<Client>>> {
+        let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
         self.register
             .read()
             .await
-            .get(&id, self.local_node_id)
+            .get(&scoped_id, self.local_node_id)
             .cloned()
     }
 
     /// Look up a client by their UDP socket address.
     pub async fn get_client_by_udp_address(&self, addr: &SocketAddr) -> Option<Arc<Box<Client>>> {
+        self.get_client_by_udp_address_key(UdpBindingKey::legacy(*addr))
+            .await
+    }
+
+    pub async fn get_client_by_udp_endpoint(
+        &self,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> Option<Arc<Box<Client>>> {
+        let scoped = self
+            .get_client_by_udp_address_key(UdpBindingKey::scoped(local_addr, remote_addr))
+            .await;
+        if scoped.is_some() {
+            scoped
+        } else {
+            self.get_client_by_udp_address_key(UdpBindingKey::legacy(remote_addr))
+                .await
+        }
+    }
+
+    async fn get_client_by_udp_address_key(&self, key: UdpBindingKey) -> Option<Arc<Box<Client>>> {
         let id = {
             let by_udp = self.clients_by_udp_address.read();
-            *by_udp.get(addr)?
+            by_udp.get(&key)?.clone()
         };
         self.register
             .read()
@@ -533,9 +736,17 @@ impl ClientRepository {
     /// Remove a specific UDP address binding.  Called when decrypt fails for a
     /// cached address so the UDP process loop can re-probe via IP.
     pub fn unbind_client_udp_address(&self, addr: &SocketAddr) {
+        self.unbind_client_udp_address_key(UdpBindingKey::legacy(*addr));
+    }
+
+    pub fn unbind_client_udp_endpoint(&self, local_addr: SocketAddr, remote_addr: SocketAddr) {
+        self.unbind_client_udp_address_key(UdpBindingKey::scoped(local_addr, remote_addr));
+    }
+
+    fn unbind_client_udp_address_key(&self, key: UdpBindingKey) {
         let removed_id = {
             let mut by_udp = self.clients_by_udp_address.write();
-            by_udp.remove(addr)
+            by_udp.remove(&key)
         };
         if let Some(id) = removed_id {
             // Best-effort: clear the corresponding Client field so the
@@ -555,25 +766,51 @@ impl ClientRepository {
 
     /// Bind/update the UDP address for a client session for fast future lookup.
     pub async fn bind_client_udp_address(&self, id: ClientSessionIdentifier, addr: SocketAddr) {
+        self.bind_client_udp_address_in_server(DEFAULT_SERVER_ID, id, addr)
+            .await;
+    }
+
+    pub async fn bind_client_udp_address_in_server(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+        addr: SocketAddr,
+    ) {
+        self.bind_client_udp_endpoint_in_server(server_id, id, None, addr)
+            .await;
+    }
+
+    pub async fn bind_client_udp_endpoint_in_server(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+        local_addr: Option<SocketAddr>,
+        remote_addr: SocketAddr,
+    ) {
+        let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
+        let key = match local_addr {
+            Some(local_addr) => UdpBindingKey::scoped(local_addr, remote_addr),
+            None => UdpBindingKey::legacy(remote_addr),
+        };
         {
             let mut by_udp = self.clients_by_udp_address.write();
             // Remove stale mappings for this session to keep map one-to-one.
-            let stale: Vec<SocketAddr> = by_udp
+            let stale: Vec<UdpBindingKey> = by_udp
                 .iter()
-                .filter_map(|(k, v)| if *v == id { Some(*k) } else { None })
+                .filter_map(|(k, v)| if *v == scoped_id { Some(*k) } else { None })
                 .collect();
             for old in stale {
                 by_udp.remove(&old);
             }
-            by_udp.insert(addr, id);
+            by_udp.insert(key, scoped_id.clone());
         }
         // Mirror the binding onto the Client itself so the routing layer's
         // `client.get_udp_address()` returns it. Without this, `flush_voice_batch`
         // would always fall back to the TCP tunnel even though we just
         // confirmed the client is reachable by UDP.
         let register = self.register.read().await;
-        if let Some(client) = register.local_clients.get(&id) {
-            client.set_udp_address(Some(addr));
+        if let Some(client) = register.local_clients.get(&scoped_id) {
+            client.set_udp_address(Some(remote_addr));
         }
     }
 
@@ -582,7 +819,7 @@ impl ClientRepository {
         let ids = {
             let by_host = self.clients_by_host.read();
             match by_host.get(ip) {
-                Some(ids) => ids.iter().copied().collect::<Vec<_>>(),
+                Some(ids) => ids.iter().cloned().collect::<Vec<_>>(),
                 None => return Vec::new(),
             }
         };
@@ -596,8 +833,20 @@ impl ClientRepository {
 
     /// Send `message` to every connected client.
     pub async fn broadcast_all(&self, message: &crate::messages::Message) {
+        self.broadcast_all_in_server(DEFAULT_SERVER_ID, message)
+            .await;
+    }
+
+    pub async fn broadcast_all_in_server(
+        &self,
+        server_id: &str,
+        message: &crate::messages::Message,
+    ) {
         let register = self.register.read().await;
         for client in register.local_clients() {
+            if client.server_id() != server_id {
+                continue;
+            }
             if let Err(e) = client.write_proto_message(message).await {
                 tracing::warn!("broadcast_all write error: {e}");
             }
@@ -610,9 +859,20 @@ impl ClientRepository {
         exclude: ClientSessionIdentifier,
         message: &crate::messages::Message,
     ) {
+        self.broadcast_except_in_server(DEFAULT_SERVER_ID, exclude, message)
+            .await;
+    }
+
+    pub async fn broadcast_except_in_server(
+        &self,
+        server_id: &str,
+        exclude: ClientSessionIdentifier,
+        message: &crate::messages::Message,
+    ) {
         let register = self.register.read().await;
+        let exclude_key = ScopedSessionId::new(server_id.to_owned(), exclude);
         for (id, client) in &register.local_clients {
-            if *id == exclude {
+            if *id == exclude_key || id.server_id() != server_id {
                 continue;
             }
             if let Err(e) = client.write_proto_message(message).await {
@@ -628,9 +888,20 @@ impl ClientRepository {
         exclude: ClientSessionIdentifier,
         messages: &[crate::messages::Message],
     ) {
+        self.broadcast_batch_except_in_server(DEFAULT_SERVER_ID, exclude, messages)
+            .await;
+    }
+
+    pub async fn broadcast_batch_except_in_server(
+        &self,
+        server_id: &str,
+        exclude: ClientSessionIdentifier,
+        messages: &[crate::messages::Message],
+    ) {
         let register = self.register.read().await;
+        let exclude_key = ScopedSessionId::new(server_id.to_owned(), exclude);
         for (id, client) in &register.local_clients {
-            if *id == exclude {
+            if *id == exclude_key || id.server_id() != server_id {
                 continue;
             }
             if let Err(e) = client.write_proto_message_batch(messages).await {
@@ -644,6 +915,16 @@ impl ClientRepository {
         self.register.read().await.all_clients().cloned().collect()
     }
 
+    pub async fn get_all_clients_in_server(&self, server_id: &str) -> Vec<Arc<Box<Client>>> {
+        self.register
+            .read()
+            .await
+            .all_clients()
+            .filter(|client| client.server_id() == server_id)
+            .cloned()
+            .collect()
+    }
+
     /// Return a snapshot of locally connected clients.
     pub async fn get_local_clients(&self) -> Vec<Arc<Box<Client>>> {
         self.register
@@ -654,12 +935,32 @@ impl ClientRepository {
             .collect()
     }
 
+    pub async fn get_local_clients_in_server(&self, server_id: &str) -> Vec<Arc<Box<Client>>> {
+        self.register
+            .read()
+            .await
+            .local_clients()
+            .filter(|client| client.server_id() == server_id)
+            .cloned()
+            .collect()
+    }
+
     /// Return **local** clients currently in `channel_id` via the channel
     /// index. Remote clients are not tracked here — voice for them is
     /// delivered to their owning node over S2S.
     pub async fn get_local_clients_in_channel(&self, channel_id: u32) -> Vec<Arc<Box<Client>>> {
+        self.get_local_clients_in_channel_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await
+    }
+
+    pub async fn get_local_clients_in_channel_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> Vec<Arc<Box<Client>>> {
         let register = self.register.read().await;
-        let ids = match register.clients_by_channel.get(&channel_id) {
+        let channel_key = ScopedChannelId::new(server_id.to_owned(), channel_id);
+        let ids = match register.clients_by_channel.get(&channel_key) {
             Some(s) => s.iter().cloned().collect::<Vec<_>>(),
             None => return Vec::new(),
         };
@@ -674,10 +975,20 @@ impl ClientRepository {
         &self,
         channel_ids: &[u32],
     ) -> Vec<Arc<Box<Client>>> {
+        self.get_local_clients_in_channels_in_server(DEFAULT_SERVER_ID, channel_ids)
+            .await
+    }
+
+    pub async fn get_local_clients_in_channels_in_server(
+        &self,
+        server_id: &str,
+        channel_ids: &[u32],
+    ) -> Vec<Arc<Box<Client>>> {
         let register = self.register.read().await;
         let mut result = Vec::new();
         for &ch_id in channel_ids {
-            if let Some(ids) = register.clients_by_channel.get(&ch_id) {
+            let channel_key = ScopedChannelId::new(server_id.to_owned(), ch_id);
+            if let Some(ids) = register.clients_by_channel.get(&channel_key) {
                 for id in ids {
                     if let Some(c) = register.get(id, self.local_node_id) {
                         result.push(c.clone());
@@ -690,8 +1001,18 @@ impl ClientRepository {
 
     /// Return **local** clients that have subscribed to listen to `channel_id`.
     pub async fn get_local_listeners_for_channel(&self, channel_id: u32) -> Vec<Arc<Box<Client>>> {
+        self.get_local_listeners_for_channel_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await
+    }
+
+    pub async fn get_local_listeners_for_channel_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> Vec<Arc<Box<Client>>> {
         let register = self.register.read().await;
-        let ids = match register.listeners_by_channel.get(&channel_id) {
+        let channel_key = ScopedChannelId::new(server_id.to_owned(), channel_id);
+        let ids = match register.listeners_by_channel.get(&channel_key) {
             Some(s) => s.iter().cloned().collect::<Vec<_>>(),
             None => return Vec::new(),
         };
@@ -706,10 +1027,20 @@ impl ClientRepository {
         &self,
         channel_ids: &[u32],
     ) -> Vec<Arc<Box<Client>>> {
+        self.get_local_listeners_for_channels_in_server(DEFAULT_SERVER_ID, channel_ids)
+            .await
+    }
+
+    pub async fn get_local_listeners_for_channels_in_server(
+        &self,
+        server_id: &str,
+        channel_ids: &[u32],
+    ) -> Vec<Arc<Box<Client>>> {
         let register = self.register.read().await;
         let mut result = Vec::new();
         for &ch_id in channel_ids {
-            if let Some(ids) = register.listeners_by_channel.get(&ch_id) {
+            let channel_key = ScopedChannelId::new(server_id.to_owned(), ch_id);
+            if let Some(ids) = register.listeners_by_channel.get(&channel_key) {
                 for id in ids {
                     if let Some(c) = register.get(id, self.local_node_id) {
                         result.push(c.clone());
@@ -729,15 +1060,18 @@ impl ClientRepository {
         let mut snapshot: std::collections::HashMap<u32, std::collections::BTreeSet<u16>> =
             std::collections::HashMap::new();
         for (id, client) in register.all_entries() {
+            if id.server_id() != DEFAULT_SERVER_ID {
+                continue;
+            }
             snapshot
                 .entry(client.get_current_channel_id())
                 .or_default()
-                .insert(id.get_node_id());
+                .insert(id.session_id().get_node_id());
             for listener_channel in client.get_listening_channel_ids() {
                 snapshot
                     .entry(listener_channel)
                     .or_default()
-                    .insert(id.get_node_id());
+                    .insert(id.session_id().get_node_id());
             }
         }
         snapshot
@@ -753,8 +1087,25 @@ impl ClientRepository {
                 .sum::<usize>()
     }
 
+    pub async fn len_in_server(&self, server_id: &str) -> usize {
+        let register = self.register.read().await;
+        register
+            .all_clients()
+            .filter(|client| client.server_id() == server_id)
+            .count()
+    }
+
     pub async fn local_len(&self) -> usize {
         self.register.read().await.local_clients.len()
+    }
+
+    pub async fn local_len_in_server(&self, server_id: &str) -> usize {
+        self.register
+            .read()
+            .await
+            .local_clients()
+            .filter(|client| client.server_id() == server_id)
+            .count()
     }
 
     /// Return a snapshot of all clients along with the current version
@@ -764,6 +1115,19 @@ impl ClientRepository {
     pub async fn snapshot_with_versions(&self) -> (Vec<Arc<Box<Client>>>, HashMap<u16, u64>) {
         let register = self.register.read().await;
         let clients: Vec<_> = register.all_clients().cloned().collect();
+        (clients, register.versions.clone())
+    }
+
+    pub async fn snapshot_with_versions_in_server(
+        &self,
+        server_id: &str,
+    ) -> (Vec<Arc<Box<Client>>>, HashMap<u16, u64>) {
+        let register = self.register.read().await;
+        let clients: Vec<_> = register
+            .all_clients()
+            .filter(|client| client.server_id() == server_id)
+            .cloned()
+            .collect();
         (clients, register.versions.clone())
     }
 
@@ -782,6 +1146,15 @@ impl ClientRepository {
     /// `last_seen` version, meaning the gap is unrecoverable.
     pub async fn replay_since(
         &self,
+        last_seen: &HashMap<u16, u64>,
+    ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
+        self.replay_since_in_server(DEFAULT_SERVER_ID, last_seen)
+            .await
+    }
+
+    pub async fn replay_since_in_server(
+        &self,
+        server_id: &str,
         last_seen: &HashMap<u16, u64>,
     ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
         let register = self.register.read().await;
@@ -820,7 +1193,7 @@ impl ClientRepository {
         let mut entries: Vec<&Arc<ClientStateLogEntry>> = Vec::new();
 
         for entry in &register.local_log {
-            if entry.version > local_since {
+            if entry.version > local_since && entry.op.server_id() == server_id {
                 entries.push(entry);
             }
         }
@@ -828,7 +1201,7 @@ impl ClientRepository {
         for (node_id, log) in &register.remote_logs {
             let since = last_seen.get(node_id).copied().unwrap_or(0);
             for entry in log {
-                if entry.version > since {
+                if entry.version > since && entry.op.server_id() == server_id {
                     entries.push(entry);
                 }
             }
@@ -864,9 +1237,19 @@ impl ClientRepository {
         id: ClientSessionIdentifier,
         message: &crate::messages::Message,
     ) -> bool {
+        self.send_to_in_server(DEFAULT_SERVER_ID, id, message).await
+    }
+
+    pub async fn send_to_in_server(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+        message: &crate::messages::Message,
+    ) -> bool {
+        let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
         let client = {
             let register = self.register.read().await;
-            register.get(&id, self.local_node_id).cloned()
+            register.get(&scoped_id, self.local_node_id).cloned()
         };
         match client {
             Some(c) => {
@@ -918,8 +1301,8 @@ impl ClientRepository {
     /// `op.version <= current_version` for that remote node, the op is dropped.
     ///
     /// `current_channel_version` is the local channel repository's current
-    /// version. If the op has a `channel_version_dep` that exceeds this, it is
-    /// buffered in `pending_remote_ops` until the channel catches up.
+    /// version for `op.op.server_id()`. If the op has a `channel_version_dep`
+    /// that exceeds this, it is buffered until that server scope catches up.
     pub async fn apply_remote_operation(
         &self,
         op: Arc<ClientStateLogEntry>,
@@ -928,27 +1311,49 @@ impl ClientRepository {
         let broadcast = {
             let mut register = self.register.write().await;
             let remote_node = op.node_id;
+            let server_id = op.op.server_id().to_owned();
 
-            // Check version against the remote node's tracked version
+            // Check version against the remote node's tracked version and pending window.
             let current_ver = register.versions.get(&remote_node).copied().unwrap_or(0);
-            if op.version <= current_ver {
+            let pending_max_ver = register
+                .pending_remote_ops
+                .iter()
+                .filter(|(pending, _)| pending.node_id == remote_node)
+                .map(|(pending, _)| pending.version)
+                .max()
+                .unwrap_or(current_ver);
+            if op.version <= pending_max_ver {
                 return Ok(());
             }
+            let must_wait_for_pending = !register.pending_remote_ops.is_empty();
 
-            // Compute effective dep using the monotonic rule
+            register
+                .pending_channel_versions
+                .entry(server_id.clone())
+                .and_modify(|version| *version = (*version).max(current_channel_version))
+                .or_insert(current_channel_version);
+
+            let previous_effective_dep = register
+                .last_pending_effective_dep_by_server
+                .get(&server_id)
+                .copied()
+                .unwrap_or(0);
             let own_dep = op.channel_version_dep.unwrap_or(0);
-            let effective_dep = own_dep.max(register.last_pending_effective_dep);
+            let effective_dep = own_dep.max(previous_effective_dep);
 
-            if effective_dep > current_channel_version {
-                // Buffer for later — channel state isn't caught up yet
+            if must_wait_for_pending || effective_dep > current_channel_version {
                 tracing::debug!(
+                    server_id = %server_id,
+                    waiting_for_pending = must_wait_for_pending,
                     "Buffering remote client op v{} (node {}) — waiting for channel v{} (have v{})",
                     op.version,
                     remote_node,
                     effective_dep,
                     current_channel_version,
                 );
-                register.last_pending_effective_dep = effective_dep;
+                register
+                    .last_pending_effective_dep_by_server
+                    .insert(server_id, effective_dep);
                 register.pending_remote_ops.push_back((op, effective_dep));
                 return Ok(());
             }
@@ -966,23 +1371,40 @@ impl ClientRepository {
         Ok(())
     }
 
-    /// Drain pending remote ops whose effective dep <= `channel_version`.
-    /// Called after each channel op is applied.
-    pub async fn drain_pending_ops(&self, channel_version: u64) {
+    /// Drain pending remote ops for `server_id` whose effective dependency is <= `channel_version`.
+    /// Called after channel state in that server scope is advanced.
+    pub async fn drain_pending_ops(&self, server_id: &str, channel_version: u64) {
         let mut broadcasts = Vec::new();
         {
             let mut register = self.register.write().await;
-            while let Some((op, effective_dep)) = register.pending_remote_ops.front() {
-                if *effective_dep > channel_version {
+            register
+                .pending_channel_versions
+                .entry(server_id.to_owned())
+                .and_modify(|version| *version = (*version).max(channel_version))
+                .or_insert(channel_version);
+
+            loop {
+                let Some((op, effective_dep)) = register.pending_remote_ops.front() else {
+                    break;
+                };
+                let op_server_id = op.op.server_id().to_owned();
+                let available_channel_version = register
+                    .pending_channel_versions
+                    .get(&op_server_id)
+                    .copied()
+                    .unwrap_or(0);
+                if *effective_dep > available_channel_version {
                     break;
                 }
+
                 let (op, _) = register.pending_remote_ops.pop_front().unwrap();
                 let remote_node = op.node_id;
                 tracing::debug!(
+                    server_id = %op_server_id,
                     "Draining buffered remote client op v{} (node {}) at channel v{}",
                     op.version,
                     remote_node,
-                    channel_version,
+                    available_channel_version,
                 );
                 Self::apply_op_inner(&mut register, &op, remote_node);
                 broadcasts.push(Arc::new(ClientStateBroadcastPayload {
@@ -990,12 +1412,20 @@ impl ClientRepository {
                     versions: register.versions.clone(),
                 }));
             }
-            // Update last_pending_effective_dep from the new front (or 0 if empty)
-            register.last_pending_effective_dep = register
+
+            register.last_pending_effective_dep_by_server.clear();
+            let pending: Vec<(String, u64)> = register
                 .pending_remote_ops
-                .front()
-                .map(|(_, d)| *d)
-                .unwrap_or(0);
+                .iter()
+                .map(|(op, effective_dep)| (op.op.server_id().to_owned(), *effective_dep))
+                .collect();
+            for (pending_server_id, effective_dep) in pending {
+                register
+                    .last_pending_effective_dep_by_server
+                    .entry(pending_server_id)
+                    .and_modify(|dep| *dep = (*dep).max(effective_dep))
+                    .or_insert(effective_dep);
+            }
         }
 
         for broadcast in broadcasts {
@@ -1007,6 +1437,7 @@ impl ClientRepository {
     fn apply_op_inner(register: &mut ClientRegister, op: &ClientStateLogEntry, remote_node: u16) {
         match &op.op {
             ClientStateOperation::AddClient {
+                server_id,
                 session_id,
                 real_ip,
                 tcp_addr,
@@ -1024,7 +1455,9 @@ impl ClientRepository {
                         "remote AddClient ignored: session node does not match operation origin"
                     );
                 } else {
-                    let client = Arc::new(Client::new_remote(
+                    let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
+                    let client = Arc::new(Client::new_remote_in_server(
+                        server_id.clone(),
                         *session_id,
                         *real_ip,
                         *tcp_addr,
@@ -1041,20 +1474,25 @@ impl ClientRepository {
                         .remote_clients
                         .entry(remote_node)
                         .or_default()
-                        .insert(*session_id, client);
+                        .insert(scoped_id, client);
                 }
             }
-            ClientStateOperation::RemoveClient { session_id } => {
+            ClientStateOperation::RemoveClient {
+                server_id,
+                session_id,
+            } => {
                 // Remote clients are not in the channel/listener index, so
                 // no index cleanup is necessary here.
+                let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
                 if let Some(remote_map) = register.remote_clients.get_mut(&remote_node) {
-                    remote_map.remove(session_id);
+                    remote_map.remove(&scoped_id);
                     if remote_map.is_empty() {
                         register.remote_clients.remove(&remote_node);
                     }
                 }
             }
             ClientStateOperation::UpdateGlobalState {
+                server_id,
                 session_id,
                 sender_session_id: _,
                 delta,
@@ -1062,7 +1500,8 @@ impl ClientRepository {
                 // Remote-only path: do NOT touch the local channel/listener
                 // index — those exist solely for routing voice to local
                 // recipients on this node.
-                let client = register.get(session_id, remote_node).cloned();
+                let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
+                let client = register.get(&scoped_id, remote_node).cloned();
                 if let Some(client) = client {
                     let mut gs = client.write_global_state_direct();
                     apply_delta_to_global_state(&mut gs, delta);
@@ -1106,20 +1545,24 @@ impl ClientRepository {
             // early-return for unpublished clients (the index is local state,
             // not propagated over the log).
             if let ClientStateOperation::UpdateGlobalState {
-                session_id, delta, ..
+                server_id,
+                session_id,
+                delta,
+                ..
             } = &op
             {
+                let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
                 if let Some(new_ch) = delta.current_channel_id {
-                    register.channel_index_move(*session_id, new_ch);
+                    register.channel_index_move(scoped_id.clone(), new_ch);
                 }
                 if let Some(ref adds) = delta.listening_channel_add {
                     for &ch in adds {
-                        register.listener_index_add(*session_id, ch);
+                        register.listener_index_add(scoped_id.clone(), ch);
                     }
                 }
                 if let Some(ref removes) = delta.listening_channel_remove {
                     for &ch in removes {
-                        register.listener_index_remove_channel(session_id, ch);
+                        register.listener_index_remove_channel(&scoped_id, ch);
                     }
                 }
             }
@@ -1129,10 +1572,16 @@ impl ClientRepository {
             // the subsequent AddClient (from publish_client) will snapshot the
             // full current state.  This prevents unauthenticated clients from
             // appearing to other users before auth completes.
-            if let ClientStateOperation::UpdateGlobalState { session_id, .. } = &op {
+            if let ClientStateOperation::UpdateGlobalState {
+                server_id,
+                session_id,
+                ..
+            } = &op
+            {
+                let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
                 let is_published = register
                     .local_clients
-                    .get(session_id)
+                    .get(&scoped_id)
                     .map(|c| c.is_published())
                     .unwrap_or(false);
                 if !is_published {
@@ -1177,6 +1626,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use crate::messages::{encoder::TextMessage, Message};
+    use chrono::Utc;
 
     use super::*;
 
@@ -1208,6 +1658,147 @@ mod tests {
             Message::TextMessage(text) => assert_eq!(text.message, "hello"),
             other => panic!("expected TextMessage, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_numeric_session_ids_are_isolated_by_server_id() {
+        let repo_a = ClientRepository::new(1, 128);
+        let repo_b = ClientRepository::new(1, 128);
+        let peer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30002);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(8);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(8);
+
+        let alpha = repo_a
+            .allocate_web_client_in_server("alpha", peer_a.ip(), peer_a, local, tx_a)
+            .await;
+        let beta = repo_b
+            .allocate_web_client_in_server("beta", peer_b.ip(), peer_b, local, tx_b)
+            .await;
+
+        assert_eq!(alpha.get_session_id(), beta.get_session_id());
+        assert_eq!(alpha.server_id(), "alpha");
+        assert_eq!(beta.server_id(), "beta");
+        assert_eq!(repo_a.local_len_in_server("alpha").await, 1);
+        assert_eq!(repo_a.local_len_in_server("beta").await, 0);
+        assert!(repo_a
+            .get_client_in_server("alpha", alpha.get_session_id())
+            .await
+            .is_some());
+        assert!(repo_a
+            .get_client_in_server("beta", alpha.get_session_id())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_bindings_are_scoped_by_local_endpoint() {
+        let repo = ClientRepository::new(1, 128);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let local_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let local_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64748);
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(8);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(8);
+
+        let alpha = repo
+            .allocate_web_client_in_server("alpha", remote.ip(), remote, local_a, tx_a)
+            .await;
+        let beta = repo
+            .allocate_web_client_in_server("beta", remote.ip(), remote, local_b, tx_b)
+            .await;
+
+        repo.bind_client_udp_endpoint_in_server(
+            "alpha",
+            alpha.get_session_id(),
+            Some(local_a),
+            remote,
+        )
+        .await;
+        repo.bind_client_udp_endpoint_in_server(
+            "beta",
+            beta.get_session_id(),
+            Some(local_b),
+            remote,
+        )
+        .await;
+
+        assert_eq!(
+            repo.get_client_by_udp_endpoint(local_a, remote)
+                .await
+                .unwrap()
+                .server_id(),
+            "alpha"
+        );
+        assert_eq!(
+            repo.get_client_by_udp_endpoint(local_b, remote)
+                .await
+                .unwrap()
+                .server_id(),
+            "beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_remote_client_ops_wait_on_matching_server_channel_version() {
+        let repo = ClientRepository::new(1, 128);
+        let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+
+        let alpha_add = Arc::new(ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: Some(5),
+            op: ClientStateOperation::AddClient {
+                server_id: "alpha".to_string(),
+                session_id: remote_session,
+                real_ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+        });
+        let beta_update = Arc::new(ClientStateLogEntry {
+            version: 2,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: Some(5),
+            op: ClientStateOperation::UpdateGlobalState {
+                server_id: "beta".to_string(),
+                session_id: remote_session,
+                sender_session_id: None,
+                delta: ClientGlobalStateDelta {
+                    display_name: Some(Some("beta user".to_string())),
+                    ..Default::default()
+                },
+            },
+        });
+
+        repo.apply_remote_operation(alpha_add, 4).await.unwrap();
+        repo.apply_remote_operation(beta_update, 5).await.unwrap();
+
+        assert!(repo
+            .get_client_in_server("alpha", remote_session)
+            .await
+            .is_none());
+
+        repo.drain_pending_ops("beta", 5).await;
+        assert!(repo
+            .get_client_in_server("alpha", remote_session)
+            .await
+            .is_none());
+
+        repo.drain_pending_ops("alpha", 5).await;
+        assert!(repo
+            .get_client_in_server("alpha", remote_session)
+            .await
+            .is_some());
     }
 }
 

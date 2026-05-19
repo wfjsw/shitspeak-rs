@@ -19,6 +19,7 @@ pub async fn handle_text_message(
     }
 
     let sender_session = u32::from(sender.get_session_id());
+    let server_id = sender.server_id();
     tracing::debug!(session = sender_session, channels = ?msg.channel_id, trees = ?msg.tree_id, targets = ?msg.session, "TextMessage handler");
 
     // Relay as-is but stamp the actor session. `msg` is owned, so move the
@@ -50,12 +51,18 @@ pub async fn handle_text_message(
         let session_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
             *target_session,
         );
-        server.get_clients().send_to(session_id, &relay).await;
+        server
+            .get_clients()
+            .send_to_in_server(&server_id, session_id, &relay)
+            .await;
     }
 
     // Channel messages: send to all users in the target channels
     for channel_id in &relay_inner.channel_id {
-        let all_clients = server.get_clients().get_all_clients().await;
+        let all_clients = server
+            .get_clients()
+            .get_all_clients_in_server(&server_id)
+            .await;
         for client in &all_clients {
             if client.get_session_id() == sender.get_session_id() {
                 continue; // don't echo back to sender
@@ -68,8 +75,11 @@ pub async fn handle_text_message(
 
     // Tree messages: send to all users in channel subtrees
     for root_channel_id in &relay_inner.tree_id {
-        let channel_ids = collect_subtree_ids(server, *root_channel_id).await;
-        let all_clients = server.get_clients().get_all_clients().await;
+        let channel_ids = collect_subtree_ids(server, &server_id, *root_channel_id).await;
+        let all_clients = server
+            .get_clients()
+            .get_all_clients_in_server(&server_id)
+            .await;
         for client in &all_clients {
             if client.get_session_id() == sender.get_session_id() {
                 continue;
@@ -86,9 +96,10 @@ pub async fn handle_text_message(
 /// Collect all channel IDs in the subtree rooted at `root_id`.
 async fn collect_subtree_ids(
     server: &Arc<Box<Server>>,
+    server_id: &str,
     root_id: u32,
 ) -> std::collections::HashSet<u32> {
-    let all_channels = server.get_channels().get_all().await;
+    let all_channels = server.get_channels().get_all_in_server(server_id).await;
     let mut result = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(root_id);

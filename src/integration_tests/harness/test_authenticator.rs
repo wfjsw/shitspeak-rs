@@ -20,6 +20,7 @@ struct ScriptedUser {
     user_id: Option<u32>,
     groups: Vec<String>,
     language: Language,
+    virtual_server_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -52,6 +53,18 @@ impl TestAuthenticator {
         groups: Vec<String>,
         language: Language,
     ) {
+        self.register_user_in_server(name, password, user_id, groups, language, None);
+    }
+
+    pub fn register_user_in_server(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+        language: Language,
+        virtual_server_id: Option<&str>,
+    ) {
         self.users.lock().unwrap().insert(
             name.to_owned(),
             ScriptedUser {
@@ -59,6 +72,7 @@ impl TestAuthenticator {
                 user_id,
                 groups,
                 language,
+                virtual_server_id: virtual_server_id.map(str::to_owned),
             },
         );
     }
@@ -92,6 +106,7 @@ impl Authenticator for AuthenticatorAdapter {
             user_id: entry.user_id,
             display_name: Some(username.to_owned()),
             groups: entry.groups,
+            virtual_server_id: entry.virtual_server_id,
             language: entry.language,
             texture_url: None,
             comment_url: None,
