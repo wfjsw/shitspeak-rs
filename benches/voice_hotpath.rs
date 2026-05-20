@@ -12,7 +12,9 @@
 //! per-recipient fan-out scales.
 
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rayon::prelude::*;
 
 use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;

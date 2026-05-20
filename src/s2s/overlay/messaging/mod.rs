@@ -49,16 +49,16 @@ impl ServiceRegistry {
 
     pub fn register(&self, tag: u32, h: Arc<dyn ServiceInbound>) {
         // Insert/replace.
-        let _ = self.inner.remove(&tag);
-        let _ = self.inner.insert(tag, h);
+        let _ = self.inner.remove_sync(&tag);
+        let _ = self.inner.insert_sync(tag, h);
     }
 
     pub fn unregister(&self, tag: u32) {
-        let _ = self.inner.remove(&tag);
+        let _ = self.inner.remove_sync(&tag);
     }
 
     pub fn get(&self, tag: u32) -> Option<Arc<dyn ServiceInbound>> {
-        self.inner.get(&tag).map(|e| e.get().clone())
+        self.inner.get_sync(&tag).map(|e| e.get().clone())
     }
 }
 

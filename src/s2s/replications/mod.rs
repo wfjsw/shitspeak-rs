@@ -220,9 +220,18 @@ impl ReplicationManager {
                     ev = events.recv() => {
                         match ev {
                             Ok(ev) => {
-                                strict_for_ev.scan(|_, rt| rt.on_membership(&ev));
-                                owner_for_ev.scan(|_, rt| rt.on_membership(&ev));
-                                blob_for_ev.scan(|_, rt| rt.on_membership(&ev));
+                                strict_for_ev.iter_sync(|_, rt| {
+                                    rt.on_membership(&ev);
+                                    true
+                                });
+                                owner_for_ev.iter_sync(|_, rt| {
+                                    rt.on_membership(&ev);
+                                    true
+                                });
+                                blob_for_ev.iter_sync(|_, rt| {
+                                    rt.on_membership(&ev);
+                                    true
+                                });
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!(skipped = n, "membership event subscriber lagged");
@@ -250,9 +259,9 @@ impl ReplicationManager {
         repo: Arc<R>,
     ) -> Result<StrictHandle<R>, ReplicationError> {
         let topic = topic.into();
-        if self.inner.strict_topics.contains(&topic)
-            || self.inner.owner_topics.contains(&topic)
-            || self.inner.blob_topics.contains(&topic)
+        if self.inner.strict_topics.contains_sync(&topic)
+            || self.inner.owner_topics.contains_sync(&topic)
+            || self.inner.blob_topics.contains_sync(&topic)
         {
             return Err(ReplicationError::TopicAlreadyRegistered(topic));
         }
@@ -267,7 +276,7 @@ impl ReplicationManager {
         );
         runtime.start();
         let erased: Arc<dyn ErasedStrictRuntime> = runtime.clone();
-        let _ = self.inner.strict_topics.insert(topic, erased);
+        let _ = self.inner.strict_topics.insert_sync(topic, erased);
         Ok(StrictHandle { runtime })
     }
 
@@ -286,13 +295,13 @@ impl ReplicationManager {
         topic: String,
         runtime: Arc<dyn ErasedStrictRuntime>,
     ) -> Result<(), ReplicationError> {
-        if self.inner.strict_topics.contains(&topic)
-            || self.inner.owner_topics.contains(&topic)
-            || self.inner.blob_topics.contains(&topic)
+        if self.inner.strict_topics.contains_sync(&topic)
+            || self.inner.owner_topics.contains_sync(&topic)
+            || self.inner.blob_topics.contains_sync(&topic)
         {
             return Err(ReplicationError::TopicAlreadyRegistered(topic));
         }
-        let _ = self.inner.strict_topics.insert(topic, runtime);
+        let _ = self.inner.strict_topics.insert_sync(topic, runtime);
         Ok(())
     }
 
@@ -307,9 +316,9 @@ impl ReplicationManager {
         repo: Arc<R>,
     ) -> Result<OwnerHandle<R>, ReplicationError> {
         let topic = topic.into();
-        if self.inner.strict_topics.contains(&topic)
-            || self.inner.owner_topics.contains(&topic)
-            || self.inner.blob_topics.contains(&topic)
+        if self.inner.strict_topics.contains_sync(&topic)
+            || self.inner.owner_topics.contains_sync(&topic)
+            || self.inner.blob_topics.contains_sync(&topic)
         {
             return Err(ReplicationError::TopicAlreadyRegistered(topic));
         }
@@ -323,7 +332,7 @@ impl ReplicationManager {
             self.inner.cfg.clone(),
         );
         let erased: Arc<dyn ErasedOwnerRuntime> = runtime.clone();
-        let _ = self.inner.owner_topics.insert(topic, erased);
+        let _ = self.inner.owner_topics.insert_sync(topic, erased);
         Ok(OwnerHandle { runtime })
     }
 
@@ -334,9 +343,9 @@ impl ReplicationManager {
         repo: Arc<R>,
     ) -> Result<BlobHandle<R>, ReplicationError> {
         let topic = topic.into();
-        if self.inner.strict_topics.contains(&topic)
-            || self.inner.owner_topics.contains(&topic)
-            || self.inner.blob_topics.contains(&topic)
+        if self.inner.strict_topics.contains_sync(&topic)
+            || self.inner.owner_topics.contains_sync(&topic)
+            || self.inner.blob_topics.contains_sync(&topic)
         {
             return Err(ReplicationError::TopicAlreadyRegistered(topic));
         }
@@ -350,7 +359,7 @@ impl ReplicationManager {
         );
         runtime.start();
         let erased: Arc<dyn ErasedBlobRuntime> = runtime.clone();
-        let _ = self.inner.blob_topics.insert(topic, erased);
+        let _ = self.inner.blob_topics.insert_sync(topic, erased);
         Ok(BlobHandle { runtime })
     }
 
@@ -368,13 +377,13 @@ impl ReplicationManager {
         topic: String,
         runtime: Arc<dyn ErasedBlobRuntime>,
     ) -> Result<(), ReplicationError> {
-        if self.inner.strict_topics.contains(&topic)
-            || self.inner.owner_topics.contains(&topic)
-            || self.inner.blob_topics.contains(&topic)
+        if self.inner.strict_topics.contains_sync(&topic)
+            || self.inner.owner_topics.contains_sync(&topic)
+            || self.inner.blob_topics.contains_sync(&topic)
         {
             return Err(ReplicationError::TopicAlreadyRegistered(topic));
         }
-        let _ = self.inner.blob_topics.insert(topic, runtime);
+        let _ = self.inner.blob_topics.insert_sync(topic, runtime);
         Ok(())
     }
 
@@ -385,9 +394,18 @@ impl ReplicationManager {
     /// Cancel all background tasks and unregister the L3 handler.
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
-        self.inner.strict_topics.scan(|_, rt| rt.shutdown());
-        self.inner.owner_topics.scan(|_, rt| rt.shutdown());
-        self.inner.blob_topics.scan(|_, rt| rt.shutdown());
+        self.inner.strict_topics.iter_sync(|_, rt| {
+            rt.shutdown();
+            true
+        });
+        self.inner.owner_topics.iter_sync(|_, rt| {
+            rt.shutdown();
+            true
+        });
+        self.inner.blob_topics.iter_sync(|_, rt| {
+            rt.shutdown();
+            true
+        });
         self.inner
             .overlay
             .unregister_service(REPLICATION_SERVICE_TAG);
@@ -489,7 +507,7 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                     match frame.body {
                         InboundBody::Strict(b) => {
                             let mut rt = inner.strict_topics
-                                .read(&frame.topic, |_, v| v.clone());
+                                .read_sync(&frame.topic, |_, v| v.clone());
                             if rt.is_none() {
                                 if let Some(resolver) = inner.strict_topic_resolver.read().clone() {
                                     let parts = StrictTopicRuntimeParts {
@@ -501,7 +519,7 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                                     };
                                     rt = resolver(&frame.topic, parts);
                                     if let Some(rt) = rt.as_ref() {
-                                        let _ = inner.strict_topics.insert(frame.topic.clone(), rt.clone());
+                                        let _ = inner.strict_topics.insert_sync(frame.topic.clone(), rt.clone());
                                     }
                                 }
                             }
@@ -513,7 +531,7 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                         }
                         InboundBody::Owner(b) => {
                             let rt = inner.owner_topics
-                                .read(&frame.topic, |_, v| v.clone());
+                                .read_sync(&frame.topic, |_, v| v.clone());
                             if let Some(rt) = rt {
                                 rt.dispatch(frame.from, b).await;
                             } else {
@@ -522,7 +540,7 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                         }
                         InboundBody::Blob(b) => {
                             let mut rt = inner.blob_topics
-                                .read(&frame.topic, |_, v| v.clone());
+                                .read_sync(&frame.topic, |_, v| v.clone());
                             if rt.is_none() {
                                 if let Some(resolver) = inner.blob_topic_resolver.read().clone() {
                                     let parts = BlobTopicRuntimeParts {
@@ -533,7 +551,7 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                                     };
                                     rt = resolver(&frame.topic, parts);
                                     if let Some(rt) = rt.as_ref() {
-                                        let _ = inner.blob_topics.insert(frame.topic.clone(), rt.clone());
+                                        let _ = inner.blob_topics.insert_sync(frame.topic.clone(), rt.clone());
                                     }
                                 }
                             }

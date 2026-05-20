@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tokio::time::timeout;
 
 use super::super::config::ReplicationConfig;
@@ -461,10 +461,10 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
     let mut blocked_pairs = Vec::new();
     for round in 0..10u64 {
         while blocked_pairs.len() < 5 {
-            let a = rng.gen_range(1..=7);
-            let mut b = rng.gen_range(1..=7);
+            let a = rng.random_range(1..=7);
+            let mut b = rng.random_range(1..=7);
             while b == a {
-                b = rng.gen_range(1..=7);
+                b = rng.random_range(1..=7);
             }
             let pair = if a < b { (a, b) } else { (b, a) };
             if is_backbone(pair.0, pair.1) || blocked_pairs.contains(&pair) {
@@ -501,7 +501,7 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
             "routing did not converge while hostile links were failing"
         );
 
-        let proposer = rng.gen_range(0..handles.len());
+        let proposer = rng.random_range(0..handles.len());
         let handle = handles[proposer].clone();
         let expected_version = round + 1;
         let task = tokio::spawn(async move { handle.propose(9000 + round).await });

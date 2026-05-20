@@ -436,7 +436,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             .collect();
         let pick = if !candidates.is_empty() {
             use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             candidates.shuffle(&mut rng);
             candidates[0]
         } else if alive.contains(&origin) {

@@ -2,7 +2,7 @@
 //!
 //! Every UDP datagram is encrypted under a DTLS 1.2 session that uses the
 //! same CA + node certificate as the stream transports — peer identity is
-//! the X.509 Subject CN, parsed as `NodeIdentifier`. webrtc-dtls's
+//! the X.509 Subject CN, parsed as `NodeIdentifier`. dtls's
 //! `Listener` does the per-source demultiplex on a single bound socket and
 //! drives the handshake; for outbound dials we open a fresh ephemeral UDP
 //! socket per peer and run the DTLS client side over it.
@@ -15,13 +15,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use dtls::conn::DTLSConn;
 use prost::Message as _;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
-use webrtc_dtls::conn::DTLSConn;
 use webrtc_util::conn::Listener as UtilListener;
 use webrtc_util::Conn as UtilConn;
 
@@ -67,7 +67,7 @@ impl Endpoint for UdpEndpoint {
             };
             let server_cfg = build_server_dtls_config(&self.identity, inner.cfg().udp_mtu())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
-            let listener = webrtc_dtls::listener::listen(addr, server_cfg)
+            let listener = dtls::listener::listen(addr, server_cfg)
                 .await
                 .map_err(|e| io::Error::other(format!("udp dtls listen: {e}")))?;
             debug!(%addr, "udp dtls listener up");

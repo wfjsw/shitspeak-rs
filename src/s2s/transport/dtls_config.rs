@@ -1,19 +1,19 @@
 //! Bridge between our shared `NodeIdentity` (loaded from PEM) and the config
-//! types `webrtc-dtls` expects, so the DTLS UDP path uses exactly the same CA
+//! types `dtls` expects, so the DTLS UDP path uses exactly the same CA
 //! trust root, certificate, and private key as the stream transports.
 
 use std::time::Duration;
 
+use dtls::config::{ClientAuthType, Config as DtlsConfig, ExtendedMasterSecretType};
+use dtls::crypto::{Certificate as DtlsCertificate, CryptoPrivateKey};
 use rustls::RootCertStore;
-use webrtc_dtls::config::{ClientAuthType, Config as DtlsConfig, ExtendedMasterSecretType};
-use webrtc_dtls::crypto::{Certificate as DtlsCertificate, CryptoPrivateKey};
 
 use super::error::ConfigError;
 use super::identity::NodeIdentity;
 
-/// Build a `webrtc-dtls` `Certificate` from our loaded identity. The cert
+/// Build a `dtls` `Certificate` from our loaded identity. The cert
 /// chain is reused as-is and the private key is converted via `rcgen::KeyPair`,
-/// which webrtc-dtls accepts directly.
+/// which dtls accepts directly.
 pub(crate) fn make_dtls_certificate(
     identity: &NodeIdentity,
 ) -> Result<DtlsCertificate, ConfigError> {
@@ -81,7 +81,7 @@ fn clone_root_store(roots: &RootCertStore) -> RootCertStore {
 /// state. The cert chain is `Vec<Vec<u8>>` of DER-encoded X.509 certs;
 /// we parse the leaf and read its CN.
 pub(crate) async fn peer_node_id_from_dtls(
-    conn: &webrtc_dtls::conn::DTLSConn,
+    conn: &dtls::conn::DTLSConn,
 ) -> Result<crate::types::NodeIdentifier, ConfigError> {
     let state = conn.connection_state().await;
     let chain_der: Vec<rustls_pki_types::CertificateDer<'static>> = state

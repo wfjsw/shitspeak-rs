@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::mpsc;
 use tracing::trace;
 
@@ -244,7 +244,7 @@ impl LinkChaos {
         if let Some(max) = jitter_max {
             let max_us = max.as_micros() as u64;
             if max_us > 0 {
-                let extra_us = rand::thread_rng().gen_range(0..=max_us);
+                let extra_us = rand::rng().random_range(0..=max_us);
                 delay = delay.saturating_add(Duration::from_micros(extra_us));
             }
             return Some(delay);

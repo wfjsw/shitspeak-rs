@@ -21,6 +21,19 @@ use tokio::sync::broadcast;
 
 // ─── Ban entry ───────────────────────────────────────────────────────────────
 
+fn sql_i64_from_u64(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+}
+
+fn sql_i64_from_u64_io(value: u64) -> Result<i64, io::Error> {
+    sql_i64_from_u64(value)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+}
+
+fn sql_u64_from_i64(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
 /// A single ban entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BanEntry {
@@ -167,12 +180,13 @@ impl BanRepository {
         .expect("table creation should succeed");
 
         // Determine current version from the operations table
-        let max_version: u64 = conn
+        let max_version = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM ban_operations",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
+            .map(sql_u64_from_i64)
             .unwrap_or(0);
 
         let (tx, _) = broadcast::channel(256);
@@ -220,7 +234,7 @@ impl BanRepository {
                     hash: row.get(3)?,
                     reason: row.get(4)?,
                     start: row.get(5)?,
-                    duration: row.get(6)?,
+                    duration: sql_u64_from_i64(row.get::<_, i64>(6)?),
                 })
             })
             .expect("query should succeed");
@@ -289,7 +303,7 @@ impl BanRepository {
                         entry.hash,
                         entry.reason,
                         entry.start,
-                        entry.duration,
+                        sql_i64_from_u64_io(entry.duration)?,
                     ])
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                 }
@@ -316,7 +330,7 @@ impl BanRepository {
                     entry.hash,
                     entry.reason,
                     entry.start,
-                    entry.duration,
+                    sql_i64_from_u64_io(entry.duration)?,
                 ],
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -350,6 +364,7 @@ impl BanRepository {
 
     /// Return all log entries with `version > since_version`.
     pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<BanOperation>> {
+        let since_version = i64::try_from(since_version).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
@@ -362,7 +377,7 @@ impl BanRepository {
 
         let rows = stmt
             .query_map(params![since_version], |row| {
-                let version: u64 = row.get(0)?;
+                let version = sql_u64_from_i64(row.get::<_, i64>(0)?);
                 let node_id: u16 = row.get(1)?;
                 let timestamp: i64 = row.get(2)?;
                 let op_type: String = row.get(3)?;
@@ -389,6 +404,9 @@ impl BanRepository {
         if op.version <= self.version.load(Ordering::Acquire) {
             return;
         }
+        let Ok(sql_version) = sql_i64_from_u64(op.version) else {
+            return;
+        };
         let conn = self.conn.lock();
         apply_op_to_db(&conn, &op.op).ok();
         // Record the operation in the log
@@ -397,7 +415,7 @@ impl BanRepository {
             "INSERT OR IGNORE INTO ban_operations (version, node_id, timestamp, op_type, op_data)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                op.version,
+                sql_version,
                 op.node_id,
                 op.timestamp,
                 op_type_str(&op.op),
@@ -447,6 +465,7 @@ impl BanRepository {
     ) -> Result<Arc<BanOperation>, io::Error> {
         let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
         op.version = version;
+        let sql_version = sql_i64_from_u64_io(version)?;
 
         let op_data = serde_json::to_string(&op.op).map_err(|e| {
             io::Error::new(
@@ -459,7 +478,7 @@ impl BanRepository {
             "INSERT INTO ban_operations (version, node_id, timestamp, op_type, op_data)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                version,
+                sql_version,
                 op.node_id,
                 op.timestamp,
                 op_type_str(&op.op),
@@ -492,7 +511,7 @@ fn apply_op_to_db(conn: &Connection, op: &BanOp) -> Result<(), rusqlite::Error> 
                     entry.hash,
                     entry.reason,
                     entry.start,
-                    entry.duration,
+                    sql_i64_from_u64(entry.duration)?,
                 ])?;
             }
         }
@@ -507,7 +526,7 @@ fn apply_op_to_db(conn: &Connection, op: &BanOp) -> Result<(), rusqlite::Error> 
                     entry.hash,
                     entry.reason,
                     entry.start,
-                    entry.duration,
+                    sql_i64_from_u64(entry.duration)?,
                 ],
             )?;
         }

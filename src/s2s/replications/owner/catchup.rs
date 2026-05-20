@@ -176,7 +176,7 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             .filter(|n| *n != rt.self_id && *n != origin)
             .collect();
         let dst = if !peers.is_empty() {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             peers.shuffle(&mut rng);
             peers[0]
         } else {

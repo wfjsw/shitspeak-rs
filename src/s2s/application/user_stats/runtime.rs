@@ -249,7 +249,7 @@ struct PendingGuard {
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.pending.remove(&self.request_id);
+            self.pending.remove_sync(&self.request_id);
         }
     }
 }
@@ -357,7 +357,7 @@ fn handle_reply(
     reply: UserStatsReply,
 ) {
     let request_id = reply.request_id;
-    let removed = pending.remove(&request_id);
+    let removed = pending.remove_sync(&request_id);
     match removed {
         Some((_, tx)) => {
             // Receiver may have already been dropped if the awaiting

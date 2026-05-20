@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use enumflags2::BitFlags;
 use shitspeak_rs::acl::{evaluate_permission, ACLPermissions, ACL};
 use shitspeak_rs::channels::Channel;

@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::hint::black_box;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::{BufMut as _, Bytes, BytesMut};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use parking_lot::Mutex as PMutex;
 use prost::Message as _;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
@@ -192,6 +193,7 @@ impl Authenticator for AuthenticatorAdapter {
             user_id: user.user_id,
             display_name: Some(username.to_owned()),
             groups: user.groups,
+            virtual_server_id: None,
             language: shitspeak_rs::localization::Language::default(),
             texture_url: None,
             comment_url: None,
@@ -263,6 +265,7 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
     Config {
         node_id: 1,
         listen: "127.0.0.1:0".into(),
+        server_entrypoints: Vec::new(),
         register_name: "voice-e2e-bench".into(),
         register_password: None,
         register_url: None,
@@ -299,6 +302,7 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         required_groups: Vec::new(),
         send_permission_info: false,
         s2s: S2sConfig::default(),
+        web: shitspeak_rs::config::WebConfig::default(),
     }
 }
 

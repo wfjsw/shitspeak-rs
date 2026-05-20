@@ -182,7 +182,7 @@ impl VoiceService {
     /// Mumble `frame_number`.
     pub fn next_seq(&self, sender_session: u32) -> u64 {
         self.seq_counters
-            .entry(sender_session)
+            .entry_sync(sender_session)
             .or_insert_with(|| AtomicU64::new(0))
             .get()
             .fetch_add(1, Ordering::Relaxed)
@@ -191,7 +191,7 @@ impl VoiceService {
     /// Reset the per-session counter when a local client disconnects.
     /// Optional; harmless to skip — the counter just stays around.
     pub fn drop_session(&self, sender_session: u32) {
-        let _ = self.seq_counters.remove(&sender_session);
+        let _ = self.seq_counters.remove_sync(&sender_session);
     }
 
     /// Broadcast a voice frame to every alive node (other than self).

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use rand::SeedableRng;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
@@ -153,7 +153,10 @@ pub fn spawn_anti_entropy(
         // the cluster is even up.
         tick.tick().await;
 
-        let mut rng = rand::rngs::SmallRng::from_entropy();
+        let mut rng = {
+            let mut seed_rng = rand::rng();
+            rand::rngs::SmallRng::from_rng(&mut seed_rng)
+        };
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,

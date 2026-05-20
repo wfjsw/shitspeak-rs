@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
-use rand::{thread_rng, Rng};
+use rand::{rng, RngExt};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -400,7 +400,7 @@ impl<R: BlobReplicable> BlobRuntime<R> {
         shutdown: CancellationToken,
         cfg: Arc<super::ReplicationConfig>,
     ) -> Arc<Self> {
-        let start = thread_rng().r#gen::<u64>().max(1);
+        let start = rng().random::<u64>().max(1);
         Arc::new(Self {
             repo,
             self_id,

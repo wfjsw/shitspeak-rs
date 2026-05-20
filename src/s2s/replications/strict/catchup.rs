@@ -115,7 +115,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             return;
         }
         let dst = {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             peers.shuffle(&mut rng);
             peers[0]
         };

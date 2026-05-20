@@ -1364,7 +1364,7 @@ impl ChannelRepository {
         client_acl_generation: u64,
     ) -> Option<BitFlags<ACLPermissions>> {
         self.acl_cache
-            .get(&(server_id.to_owned(), session_id, channel_id))
+            .get_sync(&(server_id.to_owned(), session_id, channel_id))
             .and_then(|entry| {
                 (entry.channel_acl_generation == channel_acl_generation
                     && entry.client_acl_generation == client_acl_generation)
@@ -1400,7 +1400,7 @@ impl ChannelRepository {
         client_acl_generation: u64,
         permissions: BitFlags<ACLPermissions>,
     ) {
-        self.acl_cache.put(
+        let _ = self.acl_cache.put_sync(
             (server_id.to_owned(), session_id, channel_id),
             CachedAclPermissions {
                 channel_acl_generation,
@@ -1710,7 +1710,7 @@ impl ChannelRepository {
             self.log.write().retain(|op| op.server_id != server_id);
         }
         self.channel_acl_generation.fetch_add(1, Ordering::AcqRel);
-        self.acl_cache.clear();
+        self.acl_cache.clear_sync();
 
         let client_repo = self.client_repo.lock().clone();
         if let Some(client_repo) = client_repo {
@@ -1924,7 +1924,7 @@ impl ChannelRepository {
 
     async fn invalidate_acl_cache_for_op(&self, op: &ChannelOp) {
         if channel_op_affects_acl_generation(op) {
-            self.acl_cache.clear();
+            self.acl_cache.clear_sync();
         }
     }
 }

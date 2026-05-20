@@ -610,7 +610,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             return;
         }
         {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             peers.shuffle(&mut rng);
         }
         for dst in peers {
