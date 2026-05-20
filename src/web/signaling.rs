@@ -23,8 +23,8 @@ use crate::server::Server;
 use crate::web::peer::{PeerSignal, WebRtcPeer};
 use crate::web::protocol::{
     encode_server_event, AuthRequest, ClientCommand, ServerEvent, VoiceTarget, WebChannelState,
-    WebCodecVersion, WebGatewayConfig, WebPermissionDenied, WebServerConfig, WebServerSync,
-    WebUserRemove, WebUserState, WebVolumeAdjustment,
+    WebCodecVersion, WebGatewayConfig, WebMoqGatewayConfig, WebPermissionDenied, WebServerConfig,
+    WebServerSync, WebTransportKind, WebUserRemove, WebUserState, WebVolumeAdjustment,
 };
 
 pub const ALPN_HTTP_1_1: &[u8] = b"http/1.1";
@@ -957,9 +957,80 @@ async fn send_gateway_config(
         &ServerEvent::GatewayConfig(WebGatewayConfig {
             max_speaker_slots: context.config.webrtc.max_speaker_ssrcs.max(1),
             audio_bitrate: context.config.webrtc.audio_bitrate,
+            transports: gateway_transports(&context.config),
+            moq: gateway_moq_config(&context.config),
         }),
     )
     .await
+}
+
+fn gateway_transports(config: &WebConfig) -> Vec<WebTransportKind> {
+    let mut transports = vec![WebTransportKind::WebRtc];
+    if moq_gateway_available(config) {
+        transports.push(WebTransportKind::Moq);
+    }
+    transports
+}
+
+fn gateway_moq_config(config: &WebConfig) -> Option<WebMoqGatewayConfig> {
+    moq_gateway_available(config).then(|| WebMoqGatewayConfig {
+        url: config.moq.public_url.clone(),
+        max_speaker_tracks: config.moq.max_speaker_tracks.max(1),
+        audio_bitrate: config.moq.audio_bitrate,
+    })
+}
+
+fn moq_gateway_available(config: &WebConfig) -> bool {
+    config.moq.enabled && config.moq.listen.is_some()
+}
+
+#[cfg(test)]
+mod gateway_config_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn config_with_moq(enabled: bool, listen: Option<SocketAddr>) -> WebConfig {
+        WebConfig {
+            enabled: true,
+            moq: crate::config::WebMoqConfig {
+                enabled,
+                listen,
+                public_url: Some("https://voice.example.test/web/moq".to_string()),
+                cert_path: None,
+                key_path: None,
+                max_speaker_tracks: 6,
+                audio_bitrate: 32_000,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gateway_config_advertises_moq_only_when_listener_exists() {
+        let config = config_with_moq(
+            true,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64740)),
+        );
+        assert_eq!(
+            gateway_transports(&config),
+            vec![WebTransportKind::WebRtc, WebTransportKind::Moq]
+        );
+        assert_eq!(
+            gateway_moq_config(&config),
+            Some(WebMoqGatewayConfig {
+                url: Some("https://voice.example.test/web/moq".to_string()),
+                max_speaker_tracks: 6,
+                audio_bitrate: 32_000,
+            })
+        );
+
+        let missing_listener = config_with_moq(true, None);
+        assert_eq!(
+            gateway_transports(&missing_listener),
+            vec![WebTransportKind::WebRtc]
+        );
+        assert_eq!(gateway_moq_config(&missing_listener), None);
+    }
 }
 
 async fn handle_signaling_ice_candidate(
@@ -2359,6 +2430,8 @@ mod tests {
             ServerEvent::GatewayConfig(WebGatewayConfig {
                 max_speaker_slots: 64,
                 audio_bitrate: 64_000,
+                transports: vec![WebTransportKind::WebRtc],
+                moq: None,
             })
         );
     }

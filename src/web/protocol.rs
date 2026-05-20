@@ -221,9 +221,27 @@ pub struct WebCodecVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebTransportKind {
+    WebRtc,
+    Moq,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebMoqGatewayConfig {
+    pub url: Option<String>,
+    pub max_speaker_tracks: u32,
+    pub audio_bitrate: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebGatewayConfig {
     pub max_speaker_slots: u32,
     pub audio_bitrate: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transports: Vec<WebTransportKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moq: Option<WebMoqGatewayConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -316,11 +334,19 @@ mod tests {
         let event = ServerEvent::GatewayConfig(WebGatewayConfig {
             max_speaker_slots: 8,
             audio_bitrate: 48_000,
+            transports: vec![WebTransportKind::WebRtc, WebTransportKind::Moq],
+            moq: Some(WebMoqGatewayConfig {
+                url: Some("https://voice.example.test/web/moq".to_string()),
+                max_speaker_tracks: 6,
+                audio_bitrate: 32_000,
+            }),
         });
 
         let wire = encode_server_event(&event).unwrap();
         assert!(wire.contains(r#""type":"gateway_config""#));
         assert!(wire.contains(r#""max_speaker_slots":8"#));
+        assert!(wire.contains(r#""transports":["web_rtc","moq"]"#));
+        assert!(wire.contains(r#""max_speaker_tracks":6"#));
     }
 
     #[test]

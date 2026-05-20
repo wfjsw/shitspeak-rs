@@ -34,7 +34,8 @@ label {
   color: #cbd2e1;
 }
 
-input {
+input,
+select {
   width: 100%;
   border: 1px solid #384157;
   border-radius: 6px;

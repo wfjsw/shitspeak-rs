@@ -47,6 +47,14 @@ const PROTOCOL_VERSION_SET_BIT: u64 = 1;
 
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientTransportKind {
+    NativeMumble,
+    WebRtc,
+    Moq,
+    Remote,
+}
+
 pub struct Client {
     session_id: ParkingRwLock<ClientSessionIdentifier>,
     server_id: ParkingRwLock<String>,
@@ -126,9 +134,20 @@ enum ClientTransport {
         tx: AsyncMutex<WriteHalf<TlsStream<TcpStream>>>,
     },
     WebGateway {
+        kind: ClientTransportKind,
         outbound_tx: mpsc::Sender<Message>,
     },
     Remote,
+}
+
+impl ClientTransport {
+    fn kind(&self) -> ClientTransportKind {
+        match self {
+            ClientTransport::NativeTls { .. } => ClientTransportKind::NativeMumble,
+            ClientTransport::WebGateway { kind, .. } => *kind,
+            ClientTransport::Remote => ClientTransportKind::Remote,
+        }
+    }
 }
 
 impl Client {
@@ -233,13 +252,14 @@ impl Client {
         local_address: SocketAddr,
         outbound_tx: mpsc::Sender<Message>,
     ) -> Box<Self> {
-        Self::new_web_gateway_in_server(
+        Self::new_web_gateway_with_kind_in_server(
             DEFAULT_SERVER_ID.to_owned(),
             session_id,
             real_ip_address,
             tcp_address,
             local_address,
             outbound_tx,
+            ClientTransportKind::WebRtc,
         )
     }
 
@@ -250,6 +270,45 @@ impl Client {
         tcp_address: SocketAddr,
         local_address: SocketAddr,
         outbound_tx: mpsc::Sender<Message>,
+    ) -> Box<Self> {
+        Self::new_web_gateway_with_kind_in_server(
+            server_id,
+            session_id,
+            real_ip_address,
+            tcp_address,
+            local_address,
+            outbound_tx,
+            ClientTransportKind::WebRtc,
+        )
+    }
+
+    pub fn new_moq_gateway_in_server(
+        server_id: String,
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: mpsc::Sender<Message>,
+    ) -> Box<Self> {
+        Self::new_web_gateway_with_kind_in_server(
+            server_id,
+            session_id,
+            real_ip_address,
+            tcp_address,
+            local_address,
+            outbound_tx,
+            ClientTransportKind::Moq,
+        )
+    }
+
+    fn new_web_gateway_with_kind_in_server(
+        server_id: String,
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: mpsc::Sender<Message>,
+        kind: ClientTransportKind,
     ) -> Box<Self> {
         let now = Utc::now();
         let (voice_routing_tx, voice_routing_rx) =
@@ -264,7 +323,7 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(None),
             local_address,
-            transport: ClientTransport::WebGateway { outbound_tx },
+            transport: ClientTransport::WebGateway { kind, outbound_tx },
             disconnect_tx,
             disconnect_rx,
             is_verified: false,
@@ -563,6 +622,10 @@ impl Client {
         Ok(message)
     }
 
+    pub fn transport_kind(&self) -> ClientTransportKind {
+        self.transport.kind()
+    }
+
     pub async fn write_proto_message(
         &self,
         message: &Message,
@@ -573,7 +636,7 @@ impl Client {
                 let mut guard = tx.lock().await;
                 guard.write_proto_message(message).await?;
             }
-            ClientTransport::WebGateway { outbound_tx } => {
+            ClientTransport::WebGateway { outbound_tx, .. } => {
                 outbound_tx
                     .send(message.clone())
                     .await
@@ -598,7 +661,7 @@ impl Client {
                 let mut guard = tx.lock().await;
                 guard.write_proto_message_batch(messages).await?;
             }
-            ClientTransport::WebGateway { outbound_tx } => {
+            ClientTransport::WebGateway { outbound_tx, .. } => {
                 for message in messages {
                     outbound_tx
                         .send(message.clone())

@@ -239,6 +239,38 @@ pub struct WebRtcConfig {
     pub audio_bitrate: u32,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebMoqConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    #[serde(default = "default_web_max_speaker_ssrcs")]
+    pub max_speaker_tracks: u32,
+    #[serde(default = "default_web_audio_bitrate")]
+    pub audio_bitrate: u32,
+}
+
+impl Default for WebMoqConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: None,
+            public_url: None,
+            cert_path: None,
+            key_path: None,
+            max_speaker_tracks: default_web_max_speaker_ssrcs(),
+            audio_bitrate: default_web_audio_bitrate(),
+        }
+    }
+}
+
 impl Default for WebRtcConfig {
     fn default() -> Self {
         Self {
@@ -263,6 +295,8 @@ pub struct WebConfig {
     pub auth: WebAuthConfig,
     #[serde(default)]
     pub webrtc: WebRtcConfig,
+    #[serde(default)]
+    pub moq: WebMoqConfig,
 }
 
 impl Default for WebConfig {
@@ -274,6 +308,7 @@ impl Default for WebConfig {
             allowed_origins: Vec::new(),
             auth: WebAuthConfig::default(),
             webrtc: WebRtcConfig::default(),
+            moq: WebMoqConfig::default(),
         }
     }
 }
@@ -507,6 +542,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn parse_s2s(raw: &str) -> Result<S2sConfig, ::config::ConfigError> {
         ::config::Config::builder()
@@ -540,6 +576,8 @@ mod tests {
         assert!(!cfg.web.enabled);
         assert_eq!(cfg.web.auth.modes.len(), 2);
         assert_eq!(cfg.web.webrtc.max_speaker_ssrcs, 64);
+        assert!(!cfg.web.moq.enabled);
+        assert_eq!(cfg.web.moq.max_speaker_tracks, 64);
     }
 
     #[test]
@@ -624,6 +662,8 @@ mod tests {
         assert!(cfg.auth.password_enabled);
         assert_eq!(cfg.auth.sso.subject_claim, "sub");
         assert_eq!(cfg.webrtc.max_speaker_ssrcs, 64);
+        assert!(!cfg.moq.enabled);
+        assert_eq!(cfg.moq.max_speaker_tracks, 64);
     }
 
     #[test]
@@ -652,6 +692,15 @@ mod tests {
             ice_servers = [
                 { urls = ["turn:turn.example.test:3478"], username = "u", credential = "p" },
             ]
+
+            [moq]
+            enabled = true
+            listen = "127.0.0.1:64740"
+            public_url = "https://voice.example.test/web/moq"
+            cert_path = "moq-cert.pem"
+            key_path = "moq-key.pem"
+            max_speaker_tracks = 6
+            audio_bitrate = 32000
         "#;
         let cfg: WebConfig = ::config::Config::builder()
             .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
@@ -668,6 +717,19 @@ mod tests {
         assert_eq!(cfg.auth.sso.subject_claim, "uid");
         assert_eq!(cfg.webrtc.max_speaker_ssrcs, 8);
         assert_eq!(cfg.webrtc.ice_servers[0].username.as_deref(), Some("u"));
+        assert!(cfg.moq.enabled);
+        assert_eq!(cfg.moq.listen.unwrap().to_string(), "127.0.0.1:64740");
+        assert_eq!(
+            cfg.moq.public_url.as_deref(),
+            Some("https://voice.example.test/web/moq")
+        );
+        assert_eq!(
+            cfg.moq.cert_path.as_deref(),
+            Some(Path::new("moq-cert.pem"))
+        );
+        assert_eq!(cfg.moq.key_path.as_deref(), Some(Path::new("moq-key.pem")));
+        assert_eq!(cfg.moq.max_speaker_tracks, 6);
+        assert_eq!(cfg.moq.audio_bitrate, 32000);
     }
 
     #[test]

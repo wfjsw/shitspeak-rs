@@ -462,6 +462,45 @@ impl ClientRepository {
         client
     }
 
+    pub async fn allocate_moq_client_in_server(
+        &self,
+        server_id: impl Into<String>,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: tokio::sync::mpsc::Sender<crate::messages::Message>,
+    ) -> Arc<Box<Client>> {
+        let server_id = server_id.into();
+        let mut register = self.register.write().await;
+        let mut client_by_host_guard = self.clients_by_host.write();
+
+        let id = self.allocate_local_session_id(&server_id);
+        let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
+        let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
+        let client = Client::new_moq_gateway_in_server(
+            server_id,
+            client_identifier,
+            real_ip_address,
+            tcp_address,
+            local_address,
+            outbound_tx,
+        );
+
+        let client = Arc::new(client);
+
+        register
+            .local_clients
+            .insert(scoped_id.clone(), Arc::clone(&client));
+        register.channel_index_insert(scoped_id.clone(), 0);
+
+        client_by_host_guard
+            .entry(tcp_address.ip())
+            .or_default()
+            .insert(scoped_id);
+
+        client
+    }
+
     /// Emit the `AddClient` log entry for a client that has completed
     /// authentication.  Sets the `published` flag so that future
     /// `remove_client` calls will emit a corresponding `RemoveClient`.
@@ -485,6 +524,7 @@ impl ClientRepository {
 
         client.set_published(true);
 
+        let initial_state = ClientGlobalStateDelta::from_global_state(&client.read_global_state());
         self.commit_operation(
             ClientStateOperation::AddClient {
                 server_id: server_id.to_owned(),
@@ -497,9 +537,7 @@ impl ClientRepository {
                     .get_certificate_hash()
                     .map(bytes::Bytes::copy_from_slice),
                 login_time: client.get_login_time(),
-                initial_state: ClientGlobalStateDelta::from_global_state(
-                    &client.read_global_state(),
-                ),
+                initial_state,
             },
             None,
         )

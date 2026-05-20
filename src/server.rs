@@ -649,7 +649,6 @@ impl Server {
 
         // Bounded channel shared between UDP drain and processing tasks.
         let (udp_in, udp_out) = tokio::sync::mpsc::channel::<UdpPacket>(udp_channel_size);
-
         {
             let mut runtime = self.entrypoint_runtime.lock();
             *runtime = Some(EntrypointRuntime {
@@ -666,7 +665,6 @@ impl Server {
             shutdown_rx.clone(),
         );
         self.spawn_entrypoint_tasks_for_existing_bindings(&udp_in, &shutdown_rx);
-        drop(udp_in);
         let idle_reaper =
             Self::spawn_idle_reaper(Arc::clone(self), idle_timeout_secs, shutdown_rx.clone());
         let pending_delete_watchdog = Self::spawn_pending_delete_watchdog(
@@ -674,9 +672,24 @@ impl Server {
             pending_delete_timeout_ms,
             shutdown_rx.clone(),
         );
-        let web_signaling = match self.read_config().web.clone() {
+        let startup_config = self.read_config().clone();
+        let web_config = startup_config.web.clone();
+        let web_signaling = match web_config.clone() {
             web if web.enabled && web.listen.is_some() => Some(
                 crate::web::signaling::SignalingServer::new(web)
+                    .with_authenticator(Arc::clone(&self.authenticator))
+                    .with_server(Arc::clone(self))
+                    .spawn(shutdown_rx.clone())?,
+            ),
+            _ => None,
+        };
+        let web_moq = match web_config {
+            web if web.enabled && web.moq.enabled && web.moq.listen.is_some() => Some(
+                crate::web::moq::MoqServer::new(web)
+                    .with_tls_fallback(
+                        startup_config.cert_path.clone(),
+                        startup_config.key_path.clone(),
+                    )
                     .with_authenticator(Arc::clone(&self.authenticator))
                     .with_server(Arc::clone(self))
                     .spawn(shutdown_rx.clone())?,
@@ -699,6 +712,12 @@ impl Server {
             result = pending_delete_watchdog => { let _ = result; }
             result = async {
                 match web_signaling {
+                    Some(handle) => handle.await.ok(),
+                    None => std::future::pending::<Option<()>>().await,
+                }
+            } => { let _ = result; }
+            result = async {
+                match web_moq {
                     Some(handle) => handle.await.ok(),
                     None => std::future::pending::<Option<()>>().await,
                 }

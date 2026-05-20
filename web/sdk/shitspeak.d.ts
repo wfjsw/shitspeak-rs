@@ -1,11 +1,39 @@
 export interface ShitSpeakClientOptions {
   signalingUrl: string;
+  transport?: "auto" | "webrtc" | "moq";
+  moqUrl?: string;
+  moqAdapterFactory?: (options: MoqAdapterOptions) => MoqAdapter;
+  moqLiteModule?: unknown;
+  moqHangModule?: unknown;
+  moqLiteModuleUrl?: string;
+  moqHangModuleUrl?: string;
   iceServers?: RTCIceServer[];
   controlLabel?: string;
   maxSpeakerSlots?: number;
 }
 
 export type VoiceTargetInput = "normal" | "server_loopback" | number | { slot: number };
+export type ShitSpeakTransport = "auto" | "webrtc" | "moq";
+export type SelectedShitSpeakTransport = "webrtc" | "moq";
+
+export interface MoqAdapterOptions {
+  client: ShitSpeakClient;
+  url: string;
+  maxSpeakerSlots: number;
+  audioBitrate?: number;
+  moqLiteModule?: unknown;
+  moqHangModule?: unknown;
+  moqLiteModuleUrl?: string;
+  moqHangModuleUrl?: string;
+}
+
+export interface MoqAdapter extends EventTarget {
+  connect?(): Promise<void>;
+  sendCommand(command: unknown): void;
+  useMicrophone?(constraints?: MediaStreamConstraints): Promise<MediaStream>;
+  startMicrophone?(stream: MediaStream): Promise<void>;
+  close?(): void;
+}
 
 export interface SpeakerAssignedEvent {
   type: "speaker_assigned";
@@ -19,6 +47,12 @@ export interface GatewayConfigEvent {
   type: "gateway_config";
   max_speaker_slots: number;
   audio_bitrate: number;
+  transports?: Array<"web_rtc" | "moq">;
+  moq?: {
+    url?: string;
+    max_speaker_tracks: number;
+    audio_bitrate: number;
+  };
 }
 
 export interface VoiceSegmentEvent {
@@ -129,6 +163,8 @@ export class ShitSpeakClient extends EventTarget {
   readonly localStream: MediaStream | null;
   readonly remoteStream: MediaStream | null;
   readonly maxSpeakerSlots: number;
+  readonly selectedTransport: SelectedShitSpeakTransport | null;
+  readonly moqStatus: string;
   readonly gatewayConfig: GatewayConfigEvent | null;
   readonly serverSync: ServerSyncEvent | null;
   readonly serverConfig: ServerConfigEvent | null;

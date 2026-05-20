@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ShitSpeak MoQ Smoke</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel">
+        <h1>ShitSpeak MoQ Smoke</h1>
+        <label>
+          MoQ URL
+          <input id="moqUrl" value="https://localhost:64740/web/moq">
+        </label>
+        <label>
+          Signaling URL
+          <input id="signalingUrl" value="wss://localhost:64739/web/signaling">
+        </label>
+        <label>
+          Username
+          <input id="username" autocomplete="username">
+        </label>
+        <label>
+          Password
+          <input id="password" type="password" autocomplete="current-password">
+        </label>
+        <div class="toolbar">
+          <button id="capabilities">Capabilities</button>
+          <button id="connect">Connect MoQ</button>
+          <button id="mic" disabled>Mic</button>
+          <button id="ptt" disabled>PTT</button>
+        </div>
+        <pre id="log"></pre>
+      </section>
+    </main>
+    <script type="module" src="./moq-smoke.js"></script>
+  </body>
+</html>

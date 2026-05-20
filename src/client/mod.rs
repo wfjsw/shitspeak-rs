@@ -16,5 +16,5 @@ pub mod user_info;
 pub mod user_version;
 pub mod voice_target;
 
-pub use client::Client;
+pub use client::{Client, ClientTransportKind};
 pub use handlers::AsyncMessageHandlerExt;

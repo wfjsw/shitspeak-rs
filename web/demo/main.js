@@ -6,6 +6,7 @@ const micButton = document.querySelector("#mic");
 const pttButton = document.querySelector("#ptt");
 const signalingUrl = document.querySelector("#signalingUrl");
 const speakerSlots = document.querySelector("#speakerSlots");
+const transport = document.querySelector("#transport");
 const username = document.querySelector("#username");
 const password = document.querySelector("#password");
 const channels = document.querySelector("#channels");
@@ -19,6 +20,7 @@ connectButton.addEventListener("click", async () => {
   const requestedSlots = Number(speakerSlots.value);
   client = new ShitSpeakClient({
     signalingUrl: signalingUrl.value,
+    transport: transport.value,
     ...(requestedSlots > 0 ? { maxSpeakerSlots: requestedSlots } : {}),
   });
   bindClient(client);

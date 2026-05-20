@@ -146,3 +146,16 @@ audio_bitrate = 64000
 ice_servers = [
   { urls = ["stun:stun.l.google.com:19302"] },
 ]
+
+[web.moq]
+enabled = false
+# Separate QUIC/WebTransport listener; WebTransport cannot be served through
+# the existing TCP/TLS Mumble ALPN path.
+listen = "0.0.0.0:64740"
+public_url = "https://localhost:64740/web/moq"
+# Defaults to the main server cert_path/key_path when omitted. WebTransport
+# clients need a certificate they can validate for this origin.
+# cert_path = "cert.pem"
+# key_path = "key.pem"
+max_speaker_tracks = 64
+audio_bitrate = 64000
