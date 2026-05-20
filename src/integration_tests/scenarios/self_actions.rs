@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
+use crate::acl::ACLPermissions;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
+use crate::messages::encoder::UserState;
 use crate::messages::Message;
 
 /// Checks that self-mute changes are broadcast to peers.
@@ -84,6 +86,62 @@ async fn self_deaf_broadcasts() {
         msg.is_some(),
         "Bob should have seen Alice's self_deaf=true UserState"
     );
+}
+
+#[tokio::test]
+async fn self_priority_speaker_is_denied() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    let mut state = UserState::default();
+    state.session = Some(alice.server_session);
+    state.priority_speaker = Some(true);
+    alice.send(state.into()).await;
+
+    let denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionDenied(pd)
+                    if pd.permission == Some(ACLPermissions::MuteDeafen as u32))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(denied.is_some(), "Self priority speaker should be denied");
+}
+
+#[tokio::test]
+async fn client_suppress_update_is_denied() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    let mut state = UserState::default();
+    state.session = Some(alice.server_session);
+    state.suppress = Some(true);
+    alice.send(state.into()).await;
+
+    let denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionDenied(pd)
+                    if pd.permission == Some(ACLPermissions::MuteDeafen as u32))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(denied.is_some(), "Client suppress updates should be denied");
 }
 
 /// Checks that comment updates are advertised by blob hash and retrievable.

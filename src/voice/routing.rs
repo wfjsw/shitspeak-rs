@@ -317,6 +317,17 @@ async fn resolve_voice_intent(
                     .get_client_in_server(server_id, session_id)
                     .await
                 {
+                    if let Some(sender) = sender {
+                        let perms = crate::client::acl::compute_permissions_for_client(
+                            server,
+                            sender,
+                            client.get_current_channel_id(),
+                        )
+                        .await;
+                        if !perms.contains(crate::acl::ACLPermissions::Whisper) {
+                            continue;
+                        }
+                    }
                     push_unique_target(
                         &mut targets,
                         &mut seen,
@@ -352,6 +363,23 @@ async fn resolve_voice_intent(
                         }
                     }
                     channel_ids.extend(linked_ids);
+                }
+
+                if let Some(sender) = sender {
+                    let mut allowed_channels = Vec::new();
+                    for channel_id in channel_ids {
+                        let perms = crate::client::acl::compute_permissions_for_client(
+                            server, sender, channel_id,
+                        )
+                        .await;
+                        if perms.contains(crate::acl::ACLPermissions::Whisper) {
+                            allowed_channels.push(channel_id);
+                        }
+                    }
+                    channel_ids = allowed_channels;
+                }
+                if channel_ids.is_empty() {
+                    continue;
                 }
 
                 let channel_clients = server

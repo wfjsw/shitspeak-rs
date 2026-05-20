@@ -5,7 +5,7 @@ use crate::{
 };
 
 pub async fn handle_voice_target(
-    _server: &Arc<Box<Server>>,
+    server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
     msg: VoiceTarget,
 ) -> Result<(), MessageHandlerError> {
@@ -22,29 +22,53 @@ pub async fn handle_voice_target(
         num_targets = msg.targets.len(),
         "VoiceTarget handler"
     );
-    // Valid target IDs are 1..30
     if target_id == 0 || target_id > 30 {
         return Ok(());
     }
 
-    let mut udp_state = sender.udp_state().await;
-    let target = udp_state.voice_target_mut(target_id);
-
-    // Clear existing target and rebuild from message
-    target.clear();
+    let server_id = sender.server_id();
+    let mut valid_sessions = Vec::new();
+    let mut valid_channels = Vec::new();
 
     for t in &msg.targets {
         for session in &t.session {
-            target.add_session(*session);
+            let session_id =
+                crate::client::client_session_identifier::ClientSessionIdentifier::from(*session);
+            if server
+                .get_clients()
+                .get_client_in_server(&server_id, session_id)
+                .await
+                .is_some()
+            {
+                valid_sessions.push(*session);
+            }
         }
         if let Some(channel_id) = t.channel_id {
-            target.add_channel(crate::client::voice_target::VoiceTargetChannel::new(
-                channel_id,
-                t.children.unwrap_or(false),
-                t.links.unwrap_or(false),
-                t.group.clone().unwrap_or_default(),
-            ));
+            if server
+                .get_channels()
+                .get_channel_in_server(&server_id, channel_id)
+                .await
+                .is_some()
+            {
+                valid_channels.push(crate::client::voice_target::VoiceTargetChannel::new(
+                    channel_id,
+                    t.children.unwrap_or(false),
+                    t.links.unwrap_or(false),
+                    t.group.clone().unwrap_or_default(),
+                ));
+            }
         }
+    }
+
+    let mut udp_state = sender.udp_state().await;
+    let target = udp_state.voice_target_mut(target_id);
+    target.clear();
+
+    for session in valid_sessions {
+        target.add_session(session);
+    }
+    for channel in valid_channels {
+        target.add_channel(channel);
     }
 
     Ok(())

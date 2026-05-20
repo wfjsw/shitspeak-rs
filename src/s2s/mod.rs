@@ -803,11 +803,6 @@ async fn apply_user_state_patch(
             }
         }
     }
-    if let Some(suppress) = patch.suppress {
-        if gs.is_suppressed() != suppress {
-            gs.set_suppress(suppress);
-        }
-    }
     if let Some(priority_speaker) = patch.priority_speaker {
         if gs.is_priority_speaker() != priority_speaker {
             gs.set_priority_speaker(priority_speaker);
@@ -815,6 +810,11 @@ async fn apply_user_state_patch(
     }
     if let Some(channel_id) = patch.channel_id {
         gs.set_current_channel_id(channel_id);
+    }
+    if let Some(suppress) = patch.suppress {
+        if gs.is_suppressed() != suppress {
+            gs.set_suppress(suppress);
+        }
     }
     for channel_id in patch.listening_channel_add {
         gs.listen_channel(channel_id);

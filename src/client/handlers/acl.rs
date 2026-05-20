@@ -46,7 +46,8 @@ pub async fn handle_acl(
 
     let target_perm =
         crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
-    if !target_perm.contains(ACLPermissions::Write) {
+    let root_perm = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
+    if !target_perm.contains(ACLPermissions::Write) && !root_perm.contains(ACLPermissions::Write) {
         return Err(MessageHandlerError::PermissionDenied(
             crate::messages::encoder::PermissionDenied {
                 r#type: crate::messages::encoder::DenyType::Permission,
@@ -116,6 +117,20 @@ pub async fn handle_acl(
             .await?;
     } else {
         // ── Update mode: apply new ACLs ──────────────────────────────────
+
+        if !msg.groups.is_empty() {
+            return Err(MessageHandlerError::PermissionDenied(
+                crate::messages::encoder::PermissionDenied {
+                    r#type: crate::messages::encoder::DenyType::Permission,
+                    session: u32::from(sender.get_session_id()),
+                    channel_id: Some(channel_id),
+                    reason: Some("ACL group updates are not supported".into()),
+                    name: None,
+                    permission: Some(ACLPermissions::Write.bits()),
+                }
+                .into(),
+            ));
+        }
 
         let mut new_acls = Vec::new();
         for proto_acl in &msg.acls {

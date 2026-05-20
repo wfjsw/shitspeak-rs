@@ -35,88 +35,105 @@ pub async fn handle_user_stats(
     let sender_id = sender.get_session_id();
     let server_id = sender.server_id();
     let local_node_id = server.get_clients().local_node_id();
+    let stats_only = msg.stats_only.unwrap_or(false);
+    let sender_raw = u32::from(sender_id);
 
-    // ── Cross-node target ────────────────────────────────────────────────
-    // The target lives on a different node — its real-time stats (TCP/UDP
-    // counters, ping windows, login_time, etc) are *not* replicated, so
-    // the originator can't build the reply locally. Round-trip through the
-    // L3 UserStats RPC: dispatch a request to the owner, await an encoded
-    // `MumbleProto.UserStats` payload, forward it to the moderator's TLS
-    // stream as-is.
-    if let Some(target_session) = msg.session {
-        let target_id =
-            crate::client::client_session_identifier::ClientSessionIdentifier::from(target_session);
-        if target_id != sender_id && target_id.get_node_id() != local_node_id {
-            if let Some(app) = server.s2s_manager().application() {
-                let reply = app
-                    .user_stats()
-                    .dispatch_request(
-                        target_id.get_node_id(),
-                        u32::from(sender_id),
-                        target_session,
-                        msg.stats_only.unwrap_or(false),
-                        server_id.clone(),
-                    )
-                    .await;
-                match reply {
-                    Ok(r) if r.found && !r.payload.is_empty() => {
-                        let proto = match crate::mumble_proto::UserStats::decode(r.payload.as_ref())
-                        {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    target = target_session,
-                                    "user_stats: owner returned undecodable payload",
-                                );
-                                return Ok(());
-                            }
-                        };
-                        let user_stats: UserStats = proto.into();
-                        let outbound: Message = user_stats.into();
-                        sender.write_proto_message(&outbound).await?;
-                    }
-                    Ok(_) => {
-                        // not_found / empty payload: target gone on the
-                        // owner side; mirror local-only "drop silently".
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            target = target_session,
-                            "user_stats: dispatch_request failed",
-                        );
-                    }
+    let target_session_raw = msg.session.unwrap_or(sender_raw);
+    let target_session =
+        crate::client::client_session_identifier::ClientSessionIdentifier::from(target_session_raw);
+
+    let mut effective_stats_only = stats_only;
+    if target_session != sender_id {
+        if let Some(target_state) = server
+            .get_clients()
+            .get_client_in_server(&server_id, target_session)
+            .await
+        {
+            let target_channel = target_state.get_current_channel_id();
+            let root_perms =
+                crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
+            if !root_perms.contains(crate::acl::ACLPermissions::Ban) {
+                let target_channel_perms = crate::client::acl::compute_permissions_for_client(
+                    server,
+                    sender,
+                    target_channel,
+                )
+                .await;
+                if !target_channel_perms.contains(crate::acl::ACLPermissions::Enter) {
+                    return Err(MessageHandlerError::PermissionDenied(
+                        crate::messages::encoder::PermissionDenied::for_permission(
+                            sender_raw,
+                            Some(target_channel),
+                            crate::acl::ACLPermissions::Enter,
+                        ),
+                    ));
                 }
-            } else {
-                tracing::trace!(
-                    target = target_session,
-                    "cross-owner UserStats dropped: ApplicationLayer not attached",
-                );
+                effective_stats_only = true;
             }
-            return Ok(());
         }
     }
 
-    // ── Same-node target / self-stats ─────────────────────────────────────
-    // Look up the target locally.
-    let target = match msg.session {
-        Some(session_id) if session_id != u32::from(sender_id) => {
-            let target_id =
-                crate::client::client_session_identifier::ClientSessionIdentifier::from(session_id);
-            match server
-                .get_clients()
-                .get_client_in_server(&server_id, target_id)
-                .await
-            {
-                Some(c) => c,
-                None => return Ok(()),
+    if target_session != sender_id && target_session.get_node_id() != local_node_id {
+        if let Some(app) = server.s2s_manager().application() {
+            let reply = app
+                .user_stats()
+                .dispatch_request(
+                    target_session.get_node_id(),
+                    sender_raw,
+                    target_session_raw,
+                    effective_stats_only,
+                    server_id.clone(),
+                )
+                .await;
+            match reply {
+                Ok(r) if r.found && !r.payload.is_empty() => {
+                    let proto = match crate::mumble_proto::UserStats::decode(r.payload.as_ref()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                target = target_session_raw,
+                                "user_stats: owner returned undecodable payload",
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let user_stats: UserStats = proto.into();
+                    let outbound: Message = user_stats.into();
+                    sender.write_proto_message(&outbound).await?;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        target = target_session_raw,
+                        "user_stats: dispatch_request failed",
+                    );
+                }
             }
+        } else {
+            tracing::trace!(
+                target = target_session_raw,
+                "cross-owner UserStats dropped: ApplicationLayer not attached",
+            );
         }
-        _ => sender.clone(),
+        return Ok(());
+    }
+
+    let target = if target_session != sender_id {
+        match server
+            .get_clients()
+            .get_client_in_server(&server_id, target_session)
+            .await
+        {
+            Some(c) => c,
+            None => return Ok(()),
+        }
+    } else {
+        sender.clone()
     };
 
-    let user_stats = build_user_stats_payload(&target, msg.stats_only.unwrap_or(false)).await;
+    let user_stats = build_user_stats_payload(&target, effective_stats_only).await;
     let reply: Message = user_stats.into();
     sender.write_proto_message(&reply).await?;
     Ok(())
@@ -238,7 +255,41 @@ impl UserStatsResponder for ServerUserStatsResponder {
                 payload: Bytes::new(),
             };
         };
-        let user_stats = build_user_stats_payload(&target, request.stats_only).await;
+        let mut stats_only = request.stats_only;
+        let actor_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
+            request.actor_session,
+        );
+        if actor_id != target_id {
+            let Some(actor) = server
+                .get_clients()
+                .get_client_in_server(&server_id, actor_id)
+                .await
+            else {
+                return UserStatsApplyOutcome {
+                    found: false,
+                    payload: Bytes::new(),
+                };
+            };
+            let target_channel = target.get_current_channel_id();
+            let root_perms =
+                crate::client::acl::compute_permissions_for_client(&server, &actor, 0).await;
+            if !root_perms.contains(crate::acl::ACLPermissions::Ban) {
+                let target_channel_perms = crate::client::acl::compute_permissions_for_client(
+                    &server,
+                    &actor,
+                    target_channel,
+                )
+                .await;
+                if !target_channel_perms.contains(crate::acl::ACLPermissions::Enter) {
+                    return UserStatsApplyOutcome {
+                        found: false,
+                        payload: Bytes::new(),
+                    };
+                }
+                stats_only = true;
+            }
+        }
+        let user_stats = build_user_stats_payload(&target, stats_only).await;
         let proto: crate::mumble_proto::UserStats = user_stats.into();
         let mut buf = BytesMut::with_capacity(proto.encoded_len());
         if let Err(e) = proto.encode(&mut buf) {

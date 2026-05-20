@@ -34,12 +34,8 @@ pub async fn handle_channel_state(
     let channels = server.get_channels();
     let server_id = sender.server_id();
 
-    // channel_id absent → create new channel
-    // channel_id present → update existing channel
-
     match msg.channel_id {
         None => {
-            // ── Create channel ────────────────────────────────────────────
             let parent_id = msg.parent.unwrap_or(0);
             let name = match msg.name {
                 Some(n) if !n.is_empty() => n,
@@ -55,20 +51,39 @@ pub async fn handle_channel_state(
                 }
             };
 
-            // ACL: need MakeChannel on parent
+            if let Some(parent) = channels.get_channel_in_server(&server_id, parent_id).await {
+                if parent.is_temporary() {
+                    return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                        r#type: DenyType::TemporaryChannel,
+                        session: u32::from(session),
+                        channel_id: Some(parent_id),
+                        reason: None,
+                        name: None,
+                        permission: None,
+                    }));
+                }
+            } else {
+                return Ok(());
+            }
+
+            let is_temp = msg.temporary.unwrap_or(false);
+            let required_permission = if is_temp {
+                ACLPermissions::TempChannel
+            } else {
+                ACLPermissions::MakeChannel
+            };
             let parent_perms =
                 crate::client::acl::compute_permissions_for_client(server, sender, parent_id).await;
-            if !parent_perms.contains(ACLPermissions::MakeChannel) {
+            if !parent_perms.contains(required_permission) {
                 return Err(MessageHandlerError::PermissionDenied(
                     PermissionDenied::for_permission(
                         u32::from(session),
                         Some(parent_id),
-                        ACLPermissions::MakeChannel,
+                        required_permission,
                     ),
                 ));
             }
 
-            let is_temp = msg.temporary.unwrap_or(false);
             let new_id = channels
                 .next_channel_id_in_server(&server_id, is_temp)
                 .await;
@@ -129,27 +144,19 @@ pub async fn handle_channel_state(
                     }));
                 }
             }
-
-            // Channel creation is logged and broadcast via the repository or S2S strict replication.
-            // Per-client subscribers will pick up the ChannelState delta.
         }
 
         Some(channel_id) => {
-            // ── Update existing channel ───────────────────────────────────
             let channel = match channels.get_channel_in_server(&server_id, channel_id).await {
                 Some(ch) => ch,
                 None => return Ok(()),
             };
 
-            // ACL: need Write on the channel for name/description/position changes
-            let has_write = {
-                let perms =
-                    crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
-                        .await;
-                perms.contains(ACLPermissions::Write)
-            };
+            let perms =
+                crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
+                    .await;
+            let has_write = perms.contains(ACLPermissions::Write);
 
-            // Name change requires Write (root channel cannot be renamed)
             if msg.name.is_some() {
                 if channel_id == 0 {
                     return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
@@ -172,8 +179,9 @@ pub async fn handle_channel_state(
                 }
             }
 
-            // Description change requires Write
-            if msg.description.is_some() && !has_write {
+            if (msg.description.is_some() || msg.position.is_some() || msg.max_users.is_some())
+                && !has_write
+            {
                 return Err(MessageHandlerError::PermissionDenied(
                     PermissionDenied::for_permission(
                         u32::from(session),
@@ -183,18 +191,6 @@ pub async fn handle_channel_state(
                 ));
             }
 
-            // Position change requires Write
-            if msg.position.is_some() && !has_write {
-                return Err(MessageHandlerError::PermissionDenied(
-                    PermissionDenied::for_permission(
-                        u32::from(session),
-                        Some(channel_id),
-                        ACLPermissions::Write,
-                    ),
-                ));
-            }
-
-            // Channel move (reparent): need Write on channel AND MakeChannel on new parent
             if let Some(new_parent) = msg.parent {
                 if Some(new_parent) != channel.parent_id {
                     if !has_write {
@@ -206,28 +202,47 @@ pub async fn handle_channel_state(
                             ),
                         ));
                     }
+
+                    if let Some(parent) =
+                        channels.get_channel_in_server(&server_id, new_parent).await
+                    {
+                        if parent.is_temporary() {
+                            return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                                r#type: DenyType::TemporaryChannel,
+                                session: u32::from(session),
+                                channel_id: Some(new_parent),
+                                reason: None,
+                                name: None,
+                                permission: None,
+                            }));
+                        }
+                    } else {
+                        return Ok(());
+                    }
+
+                    let required_permission = if channel.is_temporary() {
+                        ACLPermissions::TempChannel
+                    } else {
+                        ACLPermissions::MakeChannel
+                    };
                     let parent_perms = crate::client::acl::compute_permissions_for_client(
                         server, sender, new_parent,
                     )
                     .await;
-                    if !parent_perms.contains(ACLPermissions::MakeChannel) {
+                    if !parent_perms.contains(required_permission) {
                         return Err(MessageHandlerError::PermissionDenied(
                             PermissionDenied::for_permission(
                                 u32::from(session),
                                 Some(new_parent),
-                                ACLPermissions::MakeChannel,
+                                required_permission,
                             ),
                         ));
                     }
                 }
             }
 
-            // Links: need LinkChannel on the channel
             if !msg.links_add.is_empty() || !msg.links_remove.is_empty() {
-                let link_perms =
-                    crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
-                        .await;
-                if !link_perms.contains(ACLPermissions::LinkChannel) {
+                if !perms.contains(ACLPermissions::LinkChannel) {
                     return Err(MessageHandlerError::PermissionDenied(
                         PermissionDenied::for_permission(
                             u32::from(session),
@@ -236,7 +251,6 @@ pub async fn handle_channel_state(
                         ),
                     ));
                 }
-                // For link additions, also check LinkChannel on the target
                 for link_add in &msg.links_add {
                     let target_perms = crate::client::acl::compute_permissions_for_client(
                         server, sender, *link_add,
@@ -304,9 +318,6 @@ pub async fn handle_channel_state(
                     return Ok(());
                 }
             }
-
-            // Channel update is logged and broadcast via the repository or S2S strict replication.
-            // Per-client subscribers will pick up the ChannelState delta.
         }
     }
 

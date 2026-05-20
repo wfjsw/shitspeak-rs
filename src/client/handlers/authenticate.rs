@@ -318,6 +318,12 @@ pub async fn handle_authenticate(
             repo,
             server.get_channels().current_version_in_server(&server_id),
         );
+        let initial_perms =
+            crate::client::acl::compute_permissions_for_client(server, sender, target_ch).await;
+        {
+            let mut gs = sender.write_global_state(repo);
+            gs.set_suppress(!initial_perms.contains(crate::acl::ACLPermissions::Speak));
+        }
     }
 
     // ── Build the full burst of messages to send to the new client ────────

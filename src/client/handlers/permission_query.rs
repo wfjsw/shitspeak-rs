@@ -38,8 +38,7 @@ pub async fn handle_permission_query(
 
         let reply: Message = PermissionQuery {
             channel_id: Some(channel_id),
-            // permissions: Some(perms.bits()),
-            permissions: Some(0x1F0FFFu32),
+            permissions: Some(perms.bits()),
             flush: None,
         }
         .into();

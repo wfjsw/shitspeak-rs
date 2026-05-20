@@ -17,10 +17,21 @@ pub(crate) async fn compute_permissions_for_client(
 ) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
     let session = u32::from(client.get_session_id());
 
-    // Superuser bypasses all ACL checks.
+    // Superuser bypasses ACLs but cannot speak or whisper, matching Murmur.
     if client.is_superuser() {
-        tracing::trace!(session, channel_id, "ACL compute bypassed for superuser");
-        return enumflags2::BitFlags::all();
+        tracing::trace!(session, channel_id, "ACL compute bypassed for SuperUser");
+        let mut permissions = enumflags2::BitFlags::all();
+        permissions.remove(crate::acl::ACLPermissions::Speak | crate::acl::ACLPermissions::Whisper);
+        if channel_id != 0 {
+            permissions.remove(
+                crate::acl::ACLPermissions::Kick
+                    | crate::acl::ACLPermissions::Ban
+                    | crate::acl::ACLPermissions::Register
+                    | crate::acl::ACLPermissions::SelfRegister
+                    | crate::acl::ACLPermissions::ResetUserContent,
+            );
+        }
+        return permissions;
     }
 
     let channels = server.get_channels();

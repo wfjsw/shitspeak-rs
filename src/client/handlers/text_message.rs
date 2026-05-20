@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
+    acl::ACLPermissions,
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::TextMessage, Message},
+    messages::{encoder::TextMessage, Message, WriteMessageExt},
     server::Server,
 };
 
@@ -22,8 +23,6 @@ pub async fn handle_text_message(
     let server_id = sender.server_id();
     tracing::debug!(session = sender_session, channels = ?msg.channel_id, trees = ?msg.tree_id, targets = ?msg.session, "TextMessage handler");
 
-    // Relay as-is but stamp the actor session. `msg` is owned, so move the
-    // routing fields and message body into the relay rather than cloning.
     let TextMessage {
         session,
         channel_id,
@@ -31,60 +30,121 @@ pub async fn handle_text_message(
         message,
         ..
     } = msg;
+
+    let mut direct_sessions = Vec::new();
+    for target_session in session {
+        let session_id =
+            crate::client::client_session_identifier::ClientSessionIdentifier::from(target_session);
+        let Some(target) = server
+            .get_clients()
+            .get_client_in_server(&server_id, session_id)
+            .await
+        else {
+            continue;
+        };
+        let target_channel = target.get_current_channel_id();
+        let perms =
+            crate::client::acl::compute_permissions_for_client(server, sender, target_channel)
+                .await;
+        if !perms.contains(ACLPermissions::TextMessage) {
+            return Err(MessageHandlerError::PermissionDenied(
+                crate::messages::encoder::PermissionDenied::for_permission(
+                    sender_session,
+                    Some(target_channel),
+                    ACLPermissions::TextMessage,
+                ),
+            ));
+        }
+        direct_sessions.push(target_session);
+    }
+
+    let mut channel_ids = Vec::new();
+    for target_channel in channel_id {
+        let perms =
+            crate::client::acl::compute_permissions_for_client(server, sender, target_channel)
+                .await;
+        if !perms.contains(ACLPermissions::TextMessage) {
+            return Err(MessageHandlerError::PermissionDenied(
+                crate::messages::encoder::PermissionDenied::for_permission(
+                    sender_session,
+                    Some(target_channel),
+                    ACLPermissions::TextMessage,
+                ),
+            ));
+        }
+        channel_ids.push(target_channel);
+    }
+
+    let mut tree_roots = Vec::new();
+    let mut tree_deliverable_channels = std::collections::HashSet::new();
+    for root_channel_id in tree_id {
+        let root_perms =
+            crate::client::acl::compute_permissions_for_client(server, sender, root_channel_id)
+                .await;
+        if !root_perms.contains(ACLPermissions::TextMessage) {
+            return Err(MessageHandlerError::PermissionDenied(
+                crate::messages::encoder::PermissionDenied::for_permission(
+                    sender_session,
+                    Some(root_channel_id),
+                    ACLPermissions::TextMessage,
+                ),
+            ));
+        }
+
+        let subtree = collect_subtree_ids(server, &server_id, root_channel_id).await;
+        for channel_id in subtree {
+            let perms =
+                crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
+                    .await;
+            if perms.contains(ACLPermissions::TextMessage) {
+                tree_deliverable_channels.insert(channel_id);
+            }
+        }
+        tree_roots.push(root_channel_id);
+    }
+
     let relay: Message = TextMessage {
         actor: Some(sender_session),
-        session,
-        channel_id,
-        tree_id,
+        session: direct_sessions.clone(),
+        channel_id: channel_ids.clone(),
+        tree_id: tree_roots,
         message,
     }
     .into();
 
-    // Pull the routing target slices back out of the relay so we can iterate
-    // them without re-cloning.
-    let Message::TextMessage(ref relay_inner) = relay else {
-        unreachable!("relay was just constructed from TextMessage");
-    };
-
-    // Direct messages: send to each target session
-    for target_session in &relay_inner.session {
-        let session_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
-            *target_session,
-        );
+    for target_session in direct_sessions {
+        let session_id =
+            crate::client::client_session_identifier::ClientSessionIdentifier::from(target_session);
         server
             .get_clients()
             .send_to_in_server(&server_id, session_id, &relay)
             .await;
     }
 
-    // Channel messages: send to all users in the target channels
-    for channel_id in &relay_inner.channel_id {
-        let all_clients = server
-            .get_clients()
-            .get_all_clients_in_server(&server_id)
-            .await;
+    let all_clients = server
+        .get_clients()
+        .get_all_clients_in_server(&server_id)
+        .await;
+
+    for target_channel in channel_ids {
         for client in &all_clients {
             if client.get_session_id() == sender.get_session_id() {
-                continue; // don't echo back to sender
+                continue;
             }
-            if client.get_current_channel_id() == *channel_id && client.is_authenticated() {
+            if client.get_current_channel_id() == target_channel && client.is_authenticated() {
                 let _ = client.write_proto_message(&relay).await;
             }
         }
     }
 
-    // Tree messages: send to all users in channel subtrees
-    for root_channel_id in &relay_inner.tree_id {
-        let channel_ids = collect_subtree_ids(server, &server_id, *root_channel_id).await;
-        let all_clients = server
-            .get_clients()
-            .get_all_clients_in_server(&server_id)
-            .await;
+    if !tree_deliverable_channels.is_empty() {
         for client in &all_clients {
             if client.get_session_id() == sender.get_session_id() {
                 continue;
             }
-            if channel_ids.contains(&client.get_current_channel_id()) && client.is_authenticated() {
+            if tree_deliverable_channels.contains(&client.get_current_channel_id())
+                && client.is_authenticated()
+            {
                 let _ = client.write_proto_message(&relay).await;
             }
         }

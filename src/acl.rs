@@ -94,37 +94,40 @@ impl Default for ACL {
     }
 }
 
-fn implicit_root_acl() -> ACL {
-    ACL {
-        user_id: None,
-        group: Some("all".to_owned()),
-        apply_here: true,
-        apply_subs: true,
-        allow: ACLPermissions::Traverse
-            | ACLPermissions::Enter
-            | ACLPermissions::Speak
-            | ACLPermissions::Whisper
-            | ACLPermissions::TextMessage
-            | ACLPermissions::Listen,
-        deny: ACLPermissions::Write
-            | ACLPermissions::MuteDeafen
-            | ACLPermissions::Move
-            | ACLPermissions::MakeChannel
-            | ACLPermissions::LinkChannel
-            | ACLPermissions::TempChannel
-            | ACLPermissions::Kick
-            | ACLPermissions::Ban
-            | ACLPermissions::Register
-            | ACLPermissions::SelfRegister
-            | ACLPermissions::ResetUserContent,
-    }
+fn default_permissions() -> BitFlags<ACLPermissions> {
+    ACLPermissions::Traverse
+        | ACLPermissions::Enter
+        | ACLPermissions::Speak
+        | ACLPermissions::Whisper
+        | ACLPermissions::TextMessage
+        | ACLPermissions::Listen
+}
+
+fn write_implied_permissions() -> BitFlags<ACLPermissions> {
+    ACLPermissions::Traverse
+        | ACLPermissions::Enter
+        | ACLPermissions::MuteDeafen
+        | ACLPermissions::Move
+        | ACLPermissions::MakeChannel
+        | ACLPermissions::LinkChannel
+        | ACLPermissions::TextMessage
+        | ACLPermissions::TempChannel
+        | ACLPermissions::Listen
+}
+
+fn root_only_permissions() -> BitFlags<ACLPermissions> {
+    ACLPermissions::Kick
+        | ACLPermissions::Ban
+        | ACLPermissions::Register
+        | ACLPermissions::SelfRegister
+        | ACLPermissions::ResetUserContent
 }
 
 /// Evaluate the effective permissions for a user on a given channel.
 ///
-/// Walks the channel tree from `channel_id` up to the root, applying ACLs
-/// at each level.  `inherit_acl` controls whether parent ACLs are considered.
-/// Returns the effective permission bitmask.
+/// Walks the ACL chain in Mumble order: root to target, applying each channel's
+/// ACL entries in list order. Later ACL entries overwrite earlier decisions for
+/// the same permission bit.
 pub fn evaluate_permission(
     channel: &crate::channels::Channel,
     ancestors: &[crate::channels::Channel],
@@ -132,70 +135,69 @@ pub fn evaluate_permission(
     client: &ClientMembershipQuery,
     current_channel_id: u32,
 ) -> BitFlags<ACLPermissions> {
-    let mut allowed = BitFlags::empty();
-    let mut denied = BitFlags::empty();
+    let mut permissions = default_permissions();
 
-    // Apply ACLs from the target channel first, then walk up ancestors
-    let mut chain: Vec<&crate::channels::Channel> = vec![channel];
-    for a in ancestors {
-        chain.push(a);
+    let mut inherited: Vec<&crate::channels::Channel> = Vec::new();
+    for ancestor in ancestors.iter().rev() {
+        inherited.push(ancestor);
+        if !ancestor.inherit_acl {
+            inherited.clear();
+            inherited.push(ancestor);
+        }
     }
 
-    for ch in &chain {
-        let applies_to_target_channel = ch.id == channel.id;
+    let target_id = channel.id;
+    if !channel.inherit_acl {
+        inherited.clear();
+    }
+    let mut chain = inherited;
+    chain.push(channel);
+
+    for ch in chain {
+        let is_target_channel = ch.id == target_id;
 
         for acl in &ch.acls {
-            let applies = if applies_to_target_channel {
+            let applies = if is_target_channel {
                 acl.apply_here
             } else {
                 acl.apply_subs
             };
-
             if !applies {
                 continue;
             }
 
             let matches = if let Some(uid) = acl.user_id {
-                // User-specific ACL: match by user_id
-                user_id.map_or(false, |u| u as i32 == uid)
+                user_id.is_some_and(|u| u as i32 == uid)
             } else {
-                // Group ACL
-                acl.match_group(
-                    current_channel_id,
-                    Some(ch.id),
-                    &[], // join_passwords — not available here
-                    client,
-                )
+                acl.match_group(current_channel_id, Some(ch.id), &[], client)
             };
-
-            if matches {
-                allowed |= acl.allow;
-                denied |= acl.deny;
+            if !matches {
+                continue;
             }
+
+            permissions.insert(acl.allow);
+            permissions.remove(acl.deny);
         }
 
-        if ch.id == 0 {
-            let implicit_root = implicit_root_acl();
-            let applies = if applies_to_target_channel {
-                implicit_root.apply_here
-            } else {
-                implicit_root.apply_subs
-            };
-
-            if applies && implicit_root.match_group(current_channel_id, Some(ch.id), &[], client) {
-                allowed |= implicit_root.allow;
-                denied |= implicit_root.deny;
-            }
-        }
-
-        // Stop if this channel doesn't inherit from parent
-        if !ch.inherit_acl {
-            break;
+        if !permissions.contains(ACLPermissions::Traverse)
+            && !permissions.contains(ACLPermissions::Write)
+        {
+            return BitFlags::empty();
         }
     }
 
-    // Deny takes precedence over allow
-    allowed & !denied
+    if permissions.contains(ACLPermissions::Write) {
+        permissions.insert(write_implied_permissions());
+        if target_id == 0 {
+            permissions.insert(root_only_permissions());
+        }
+    }
+
+    if target_id != 0 {
+        permissions.remove(root_only_permissions());
+    }
+
+    permissions
 }
 
 /// Check whether a channel has any deny rules on the given permission.

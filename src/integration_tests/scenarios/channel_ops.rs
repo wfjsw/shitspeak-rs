@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::acl::{ACLPermissions, ACL};
 use crate::channels::Channel;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::Message;
@@ -44,6 +45,53 @@ async fn create_permanent_channel_propagates() {
         .await;
     assert!(saw_alice.is_some(), "Alice should observe her own creation");
     assert!(saw_bob.is_some(), "Bob should observe Alice's creation");
+}
+
+#[tokio::test]
+async fn temp_channel_create_requires_temp_channel_permission() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![ACL {
+                user_id: Some(1),
+                group: None,
+                apply_here: true,
+                apply_subs: false,
+                allow: ACLPermissions::MakeChannel.into(),
+                deny: ACLPermissions::TempChannel.into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    alice.create_channel(0, "DeniedTemp", true).await;
+
+    let denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionDenied(pd)
+                    if pd.channel_id == Some(0)
+                        && pd.permission == Some(ACLPermissions::TempChannel as u32))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        denied.is_some(),
+        "Temporary channel creation should require TempChannel"
+    );
 }
 
 /// Checks that renaming an existing channel propagates to peers.

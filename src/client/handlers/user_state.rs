@@ -35,52 +35,8 @@ pub async fn handle_user_state(
     let repo = server.get_clients();
     let local_node_id = repo.local_node_id();
 
-    // Cross-owner moderation: target lives on a different node. Wrap
-    // the moderator-driven fields in a `ModerationEnvelope` and ship
-    // it to the owner. Fire-and-forget: success propagates back via
-    // owner-scoped replication of `ClientGlobalState`.
-    //
-    // ACL evaluation: today this branch defers validation to the
-    // owner (via `expected_from_channel = None` until we add a way to
-    // look up replicated remote-client state on the originator). The
-    // owner's apply path still enforces permissions; we just don't
-    // short-circuit `PermissionDenied` on the originator yet.
-    if let Some(target_session_id) = msg.session {
-        if target_session_id != sender_id && target_session_id.get_node_id() != local_node_id {
-            if let Some(app) = server.s2s_manager().application() {
-                let patch = crate::s2s::application::proto::UserStatePatch {
-                    channel_id: msg.channel_id,
-                    mute: msg.mute,
-                    deaf: msg.deaf,
-                    suppress: msg.suppress,
-                    priority_speaker: msg.priority_speaker,
-                    listening_channel_add: msg.listening_channel_add.clone(),
-                    listening_channel_remove: msg.listening_channel_remove.clone(),
-                    expected_from_channel: None,
-                };
-                if let Err(e) = app
-                    .moderation()
-                    .dispatch_user_state_in_server(&server_id, sender_id, target_session_id, patch)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        target = u32::from(target_session_id),
-                        "moderation dispatch_user_state failed",
-                    );
-                }
-            } else {
-                tracing::trace!(
-                    target = u32::from(target_session_id),
-                    "cross-owner UserState dropped: ApplicationLayer not attached",
-                );
-            }
-            return Ok(());
-        }
-    }
-
     // Determine whether this is a self-update or a moderator action
-    // against a *locally-owned* target.
+    // against a known local or replicated target.
     let target = match msg.session {
         Some(session_id) if session_id != sender_id => {
             match repo.get_client_in_server(&server_id, session_id).await {
@@ -127,6 +83,20 @@ pub async fn handle_user_state(
             .get_channels()
             .get_channel_in_server(&server_id, new_channel_id)
             .await;
+        if dst_chan
+            .as_ref()
+            .is_some_and(|channel| channel.is_temporary())
+            && !is_self
+        {
+            return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                r#type: DenyType::TemporaryChannel,
+                session: u32::from(sender_id),
+                channel_id: Some(new_channel_id),
+                reason: None,
+                name: None,
+                permission: None,
+            }));
+        }
         if dst_chan.is_none() {
             return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                 r#type: DenyType::ChannelName,
@@ -214,12 +184,19 @@ pub async fn handle_user_state(
         }
     }
 
-    // ── ACL: Mute/deaf/suppress/priority_speaker (moderator actions) ──────
-    if !is_self
-        && (msg.mute.is_some()
-            || msg.deaf.is_some()
-            || msg.suppress.is_some()
-            || msg.priority_speaker.is_some())
+    if msg.suppress.is_some() {
+        return Err(MessageHandlerError::PermissionDenied(
+            PermissionDenied::for_permission(
+                u32::from(sender_id),
+                Some(target_current_channel_id),
+                ACLPermissions::MuteDeafen,
+            ),
+        ));
+    }
+
+    // ── ACL: Mute/deaf/priority_speaker (moderator actions) ──────
+    if (msg.mute.is_some() || msg.deaf.is_some() || msg.priority_speaker.is_some())
+        && (!is_self || msg.priority_speaker.is_some())
     {
         let perms = match actor_source_perms {
             Some(perms) => perms,
@@ -241,6 +218,14 @@ pub async fn handle_user_state(
                 ),
             ));
         }
+    }
+
+    if !is_self
+        && (!msg.listening_channel_add.is_empty() || !msg.listening_channel_remove.is_empty())
+    {
+        return Err(MessageHandlerError::protocol_violation(
+            "non-self UserState contains self-only listening channel fields",
+        ));
     }
 
     // ── ACL: Listening channel add ────────────────────────────────────────
@@ -265,25 +250,26 @@ pub async fn handle_user_state(
     if !is_self
         && (msg.self_mute.is_some()
             || msg.self_deaf.is_some()
-            || msg.texture.is_some()
             || msg.plugin_context.is_some()
             || msg.plugin_identity.is_some()
-            || msg.recording.is_some())
+            || msg.recording.is_some()
+            || msg.temporary_access_tokens.len() > 0
+            || msg.listening_volume_adjustment.len() > 0)
     {
         return Err(MessageHandlerError::protocol_violation(
             "non-self UserState contains self-only fields",
         ));
     }
 
-    if !is_self && msg.comment.is_some() {
+    if !is_self && (msg.comment.is_some() || msg.texture.is_some()) {
         let root_perms =
             crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
-        if !root_perms.contains(ACLPermissions::Move) {
+        if !root_perms.contains(ACLPermissions::ResetUserContent) {
             return Err(MessageHandlerError::PermissionDenied(
                 PermissionDenied::for_permission(
                     u32::from(sender_id),
                     Some(0),
-                    ACLPermissions::Move,
+                    ACLPermissions::ResetUserContent,
                 ),
             ));
         }
@@ -292,6 +278,10 @@ pub async fn handle_user_state(
             .comment
             .as_deref()
             .is_some_and(|comment| !comment.is_empty())
+            || msg
+                .texture
+                .as_ref()
+                .is_some_and(|texture| !texture.is_empty())
         {
             return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                 r#type: DenyType::TextTooLong,
@@ -440,6 +430,42 @@ pub async fn handle_user_state(
         None => None,
     };
 
+    if let Some(target_session_id) = msg.session {
+        if target_session_id != sender_id && target_session_id.get_node_id() != local_node_id {
+            if let Some(app) = server.s2s_manager().application() {
+                let patch = crate::s2s::application::proto::UserStatePatch {
+                    channel_id: requested_channel_change,
+                    mute: msg.mute,
+                    deaf: msg.deaf,
+                    suppress: requested_channel_change.and_then(|_| {
+                        target_destination_perms.map(|perms| !perms.contains(ACLPermissions::Speak))
+                    }),
+                    priority_speaker: msg.priority_speaker,
+                    listening_channel_add: msg.listening_channel_add.clone(),
+                    listening_channel_remove: msg.listening_channel_remove.clone(),
+                    expected_from_channel: Some(target_current_channel_id),
+                };
+                if let Err(e) = app
+                    .moderation()
+                    .dispatch_user_state_in_server(&server_id, sender_id, target_session_id, patch)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        target = u32::from(target_session_id),
+                        "moderation dispatch_user_state failed",
+                    );
+                }
+            } else {
+                tracing::trace!(
+                    target = u32::from(target_session_id),
+                    "cross-owner UserState dropped: ApplicationLayer not attached",
+                );
+            }
+            return Ok(());
+        }
+    }
+
     // ── Acquire a single transactional guard for all mutations ─────────
     // All changes in this handler are batched into one version bump.
     // Channel-dependent operations (move, mute/deaf by moderator) need the
@@ -497,17 +523,13 @@ pub async fn handle_user_state(
                 }
             }
         }
-
-        if let Some(suppress) = msg.suppress {
-            if gs.is_suppressed() != suppress {
-                gs.set_suppress(suppress);
-            }
-        }
     }
 
-    if let Some(priority_speaker) = msg.priority_speaker {
-        if gs.is_priority_speaker() != priority_speaker {
-            gs.set_priority_speaker(priority_speaker);
+    if !is_self {
+        if let Some(priority_speaker) = msg.priority_speaker {
+            if gs.is_priority_speaker() != priority_speaker {
+                gs.set_priority_speaker(priority_speaker);
+            }
         }
     }
 

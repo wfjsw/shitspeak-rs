@@ -295,6 +295,161 @@ async fn acl_cache_inherit_toggle_updates_child_permissions() {
 }
 
 #[tokio::test]
+async fn acl_child_allow_overrides_parent_deny() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(60, "Parent".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(61, "Child".to_owned(), 0, 0, Some(60)))
+        .await
+        .unwrap();
+
+    chans
+        .set_acls(
+            60,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::TextMessage.into(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            61,
+            true,
+            vec![acl_for_group(
+                "all",
+                ACLPermissions::TextMessage.into(),
+                enumflags2::BitFlags::empty(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let parent = cached_permissions(&server, &bob, 60).await;
+    assert!(!parent.contains(ACLPermissions::TextMessage));
+
+    let child = cached_permissions(&server, &bob, 61).await;
+    assert!(
+        child.contains(ACLPermissions::TextMessage),
+        "Child ACL allow should override inherited parent deny"
+    );
+}
+
+#[tokio::test]
+async fn acl_target_inherit_false_drops_parent_denies() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(63, "Parent".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(64, "Child".to_owned(), 0, 0, Some(63)))
+        .await
+        .unwrap();
+
+    chans
+        .set_acls(
+            63,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::TextMessage.into(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+    chans.set_acls(64, false, Vec::new()).await.unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let child = cached_permissions(&server, &bob, 64).await;
+    assert!(
+        child.contains(ACLPermissions::TextMessage),
+        "Target inherit_acl=false should drop inherited parent deny rules"
+    );
+}
+
+#[tokio::test]
+async fn permission_query_reports_evaluated_bits() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(62, "NoText".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            62,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::TextMessage.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    bob.send(
+        crate::messages::encoder::PermissionQuery {
+            channel_id: Some(62),
+            permissions: None,
+            flush: None,
+        }
+        .into(),
+    )
+    .await;
+
+    let msg = bob
+        .recv_until(
+            |m| matches!(m, Message::PermissionQuery(pq) if pq.channel_id == Some(62)),
+            Duration::from_secs(2),
+        )
+        .await;
+
+    let Some(Message::PermissionQuery(reply)) = msg else {
+        panic!("Bob should receive PermissionQuery response");
+    };
+    let permissions = reply.permissions.expect("permissions");
+    assert_eq!(permissions & ACLPermissions::TextMessage as u32, 0);
+}
+
+#[tokio::test]
 async fn acl_cache_parent_move_updates_inherited_permissions() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
@@ -424,13 +579,13 @@ async fn acl_cache_group_and_user_id_changes_update_permissions() {
     let after_group = cached_permissions(&server, &bob, 58).await;
     assert!(!after_group.contains(ACLPermissions::Enter));
 
-    let admin_before = cached_permissions(&server, &bob, 58).await;
+    let admin_before = cached_permissions(&server, &bob, 0).await;
     assert!(!admin_before.contains(ACLPermissions::Ban));
     {
         let mut gs = client.write_global_state_direct();
         gs.set_groups(["admin".to_owned()].into_iter().collect());
     }
-    let admin_after = cached_permissions(&server, &bob, 58).await;
+    let admin_after = cached_permissions(&server, &bob, 0).await;
     assert!(admin_after.contains(ACLPermissions::Ban));
     {
         let mut gs = client.write_global_state_direct();

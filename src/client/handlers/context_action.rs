@@ -23,6 +23,12 @@ pub async fn handle_context_action(
     sender: &Arc<Box<crate::client::Client>>,
     msg: ContextAction,
 ) -> Result<(), MessageHandlerError> {
+    if !sender.is_authenticated() {
+        return Err(MessageHandlerError::protocol_violation(
+            "ContextAction message received before authentication",
+        ));
+    }
+
     let actor_session = u32::from(sender.get_session_id());
 
     let payload = ContextActionPayload {

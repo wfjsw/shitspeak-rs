@@ -229,6 +229,19 @@ async fn s2s_cross_node_moderation_applies_to_owner() {
         .await
         .expect("bob");
 
+    let bob_known_on_a = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(a.server.get_clients().get_client(bob.server_session.into()))
+                .is_some()
+        })
+    })
+    .await;
+    assert!(
+        bob_known_on_a,
+        "Server A should materialize Bob before dispatching moderated UserState"
+    );
+
     alice.mute_other(bob.session_id, true).await;
 
     let msg = bob

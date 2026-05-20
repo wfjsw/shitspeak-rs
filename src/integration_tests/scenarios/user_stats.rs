@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::acl::{ACLPermissions, ACL};
+use crate::channels::Channel;
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::encoder::UserStats;
 use crate::messages::Message;
@@ -88,5 +90,73 @@ async fn user_stats_reports_bandwidth_and_idle_time() {
     assert!(
         stats.idlesecs.unwrap_or_default() >= 1,
         "UserStats idle seconds should track time since last client activity"
+    );
+}
+
+#[tokio::test]
+async fn user_stats_requires_enter_on_target_channel_without_root_ban() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(80, "Hidden".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            80,
+            true,
+            vec![ACL {
+                user_id: Some(1),
+                group: None,
+                apply_here: true,
+                apply_subs: false,
+                allow: enumflags2::BitFlags::empty(),
+                deny: ACLPermissions::Enter.into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    bob.move_to_channel(80).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    alice
+        .send(
+            UserStats {
+                session: Some(bob.session_id),
+                stats_only: Some(false),
+                ..UserStats::default()
+            }
+            .into(),
+        )
+        .await;
+
+    let denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionDenied(pd)
+                    if pd.channel_id == Some(80)
+                        && pd.permission == Some(ACLPermissions::Enter as u32))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        denied.is_some(),
+        "UserStats should require Enter on the target user's channel"
     );
 }

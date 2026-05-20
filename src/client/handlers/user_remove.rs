@@ -35,18 +35,25 @@ pub async fn handle_user_remove(
         crate::client::client_session_identifier::ClientSessionIdentifier::from(target_raw);
     let server_id = sender.server_id();
     let is_ban = msg.ban.unwrap_or(false);
-    let required_permission = if is_ban {
-        ACLPermissions::Ban
-    } else {
-        ACLPermissions::Kick
-    };
     let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
-    if !root_perms.contains(required_permission) {
+    if is_ban {
+        if !root_perms.contains(ACLPermissions::Ban) {
+            return Err(MessageHandlerError::PermissionDenied(
+                PermissionDenied::for_permission(
+                    u32::from(sender.get_session_id()),
+                    Some(0),
+                    ACLPermissions::Ban,
+                ),
+            ));
+        }
+    } else if !root_perms.contains(ACLPermissions::Kick)
+        && !root_perms.contains(ACLPermissions::Ban)
+    {
         return Err(MessageHandlerError::PermissionDenied(
             PermissionDenied::for_permission(
                 u32::from(sender.get_session_id()),
                 Some(0),
-                required_permission,
+                ACLPermissions::Kick,
             ),
         ));
     }
