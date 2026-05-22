@@ -112,6 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(env_filter)
+        .with_line_number(true)
         .init();
 
     // Probe the AES + GF(2^128) backends once at launch (each logs its
@@ -122,21 +123,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load();
     let server = Server::new(config, NoopAuthenticator).await?;
 
-    // Shutdown signal: dropping the sender notifies all spawned tasks.
+    // Shutdown signal: sending a value notifies all spawned tasks.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
     // Spawn the hot config reload watcher.
-    let _watcher = config_watcher::spawn_config_watcher(server.clone(), shutdown_rx);
+    let _watcher = config_watcher::spawn_config_watcher(server.clone(), shutdown_rx.clone());
 
-    // Graceful shutdown: wait for Ctrl-C while the server runs.
+    // Graceful shutdown: wait for Ctrl-C while the server runs.  On Ctrl-C,
+    // signal shutdown and then wait for Server::run to reach its cleanup path.
+    let server_run = server.run(shutdown_rx);
+    tokio::pin!(server_run);
+
     tokio::select! {
-        result = server.run(shutdown_tx) => {
+        result = &mut server_run => {
+            if let Err(e) = result {
+                tracing::error!("Server exited with error: {e}");
+            }
+            return Ok(());
+        }
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => tracing::info!("Received Ctrl-C, shutting down."),
+                Err(e) => tracing::error!("Failed to listen for Ctrl-C: {e}"),
+            }
+            let _ = shutdown_tx.send(());
+        }
+    }
+
+    tokio::select! {
+        result = &mut server_run => {
             if let Err(e) = result {
                 tracing::error!("Server exited with error: {e}");
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received Ctrl-C, shutting down.");
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => tracing::warn!("Received Ctrl-C again, forcing shutdown."),
+                Err(e) => tracing::error!("Failed to listen for additional Ctrl-C: {e}"),
+            }
+            std::process::exit(130);
         }
     }
 

@@ -174,10 +174,10 @@ async fn sendmmsg_linux(
     for chunk in batch.datagrams.chunks(CHUNK_SIZE) {
         let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(chunk.len());
         let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(chunk.len());
-        let mut sockaddrs: Vec<libc::sockaddr_in6> = Vec::with_capacity(chunk.len());
+        let mut sockaddrs: Vec<SocketAddrStorage> = Vec::with_capacity(chunk.len());
 
         for d in chunk {
-            let addr = socket_addr_to_sockaddr_in6(&d.addr);
+            let addr = socket_addr_to_storage(&d.addr);
             let data = batch.data(d);
 
             iovecs.push(libc::iovec {
@@ -190,8 +190,8 @@ async fn sendmmsg_linux(
 
         for i in 0..chunk.len() {
             let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-            msg.msg_hdr.msg_name = &sockaddrs[i] as *const _ as *mut libc::c_void;
-            msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+            msg.msg_hdr.msg_name = &sockaddrs[i].storage as *const _ as *mut libc::c_void;
+            msg.msg_hdr.msg_namelen = sockaddrs[i].len;
             msg.msg_hdr.msg_iov = &iovecs[i] as *const _ as *mut libc::iovec;
             msg.msg_hdr.msg_iovlen = 1;
             msg.msg_hdr.msg_control = std::ptr::null_mut();
@@ -201,7 +201,7 @@ async fn sendmmsg_linux(
         }
 
         // Safety: sendmmsg operates on UDP datagram sockets and is non-blocking.
-        // The buffers (iovecs, sockaddrs, msgs) are stack-pinned for this call.
+        // The buffers (iovecs, sockaddrs, msgs) are kept alive for this call.
         let ret = unsafe {
             libc::sendmmsg(
                 fd,
@@ -226,31 +226,75 @@ async fn sendmmsg_linux(
     Ok(())
 }
 
-/// Convert a `SocketAddr` to a `libc::sockaddr_in6` (supports both IPv4-mapped
-/// IPv6 and native IPv6).
 #[cfg(target_os = "linux")]
-fn socket_addr_to_sockaddr_in6(addr: &std::net::SocketAddr) -> libc::sockaddr_in6 {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+struct SocketAddrStorage {
+    storage: libc::sockaddr_storage,
+    len: libc::socklen_t,
+}
 
-    let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-    sa.sin6_family = libc::AF_INET6 as u16;
+#[cfg(target_os = "linux")]
+fn socket_addr_to_storage(addr: &std::net::SocketAddr) -> SocketAddrStorage {
+    use std::net::SocketAddr;
 
-    match addr.ip() {
-        IpAddr::V4(v4) => {
-            // IPv4-mapped IPv6: ::ffff:a.b.c.d
-            let octets = v4.octets();
-            sa.sin6_addr.s6_addr[10] = 0xff;
-            sa.sin6_addr.s6_addr[11] = 0xff;
-            sa.sin6_addr.s6_addr[12] = octets[0];
-            sa.sin6_addr.s6_addr[13] = octets[1];
-            sa.sin6_addr.s6_addr[14] = octets[2];
-            sa.sin6_addr.s6_addr[15] = octets[3];
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(v4) => {
+            let sa = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = v4.port().to_be();
+            sa.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            };
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
         }
-        IpAddr::V6(v6) => {
-            sa.sin6_addr.s6_addr = v6.octets();
+        SocketAddr::V6(v6) => {
+            let sa = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = v6.port().to_be();
+            sa.sin6_flowinfo = v6.flowinfo();
+            sa.sin6_addr.s6_addr = v6.ip().octets();
+            sa.sin6_scope_id = v6.scope_id();
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
         }
+    };
+
+    SocketAddrStorage { storage, len }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn flush_batch_sends_to_ipv4_destination() {
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sender");
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind receiver");
+        let receiver_addr = receiver.local_addr().expect("receiver local addr");
+        let sender_addr = sender.local_addr().expect("sender local addr");
+        let payload = b"voice";
+
+        let mut batch = DatagramBatch::new();
+        batch
+            .try_push_zeroed(receiver_addr, payload.len(), |buf| {
+                buf.copy_from_slice(payload);
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .expect("queue datagram");
+
+        flush_batch(&sender, &batch).await.expect("flush batch");
+
+        let mut buf = [0; 16];
+        let (len, from_addr) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .expect("receive timeout")
+            .expect("receive datagram");
+
+        assert_eq!(&buf[..len], payload);
+        assert_eq!(from_addr, sender_addr);
     }
-
-    sa.sin6_port = addr.port().to_be();
-    sa
 }

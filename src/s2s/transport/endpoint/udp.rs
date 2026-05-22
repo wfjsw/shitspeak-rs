@@ -7,12 +7,12 @@
 //! drives the handshake; for outbound dials we open a fresh ephemeral UDP
 //! socket per peer and run the DTLS client side over it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use dtls::conn::DTLSConn;
@@ -385,18 +385,17 @@ async fn run_write(
             }
 
             _ = probe_tick.tick() => {
-                let ts = now_us();
-                let max_probe_payload = inner.cfg().udp_mtu().saturating_sub(128).min(inner.cfg().bandwidth_probe_size());
-                if max_probe_payload == 0 { continue; }
-                let payload = bytes::BytesMut::zeroed(max_probe_payload).freeze();
-                let frame = build_frame(
-                    inner.self_id(), peer.node_id(), level,
-                    FrameType::Ping, MessageClass::Regular,
-                    peer.next_seq(), ts, payload,
-                );
-                match send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
-                    Ok(sent) => pending.lock().insert(ts, sent),
-                    Err(e) => { warn!(peer=%peer.node_id(), error=%e, "udp dtls probe failed"); break; }
+                if let Err(e) = send_probe_burst(
+                    &conn,
+                    &peer,
+                    inner.self_id(),
+                    level,
+                    inner.cfg().bandwidth_probe_size(),
+                    inner.cfg().udp_mtu(),
+                    &pending,
+                ).await {
+                    warn!(peer=%peer.node_id(), error=%e, "udp dtls probe failed");
+                    break;
                 }
             }
         }
@@ -412,6 +411,11 @@ async fn send_frame(
     peer: &PeerState,
     udp_mtu: usize,
 ) -> io::Result<usize> {
+    let buf = encode_frame_datagram(frame, udp_mtu)?;
+    send_datagram(conn, &buf, peer).await
+}
+
+fn encode_frame_datagram(frame: &pb::Frame, udp_mtu: usize) -> io::Result<bytes::BytesMut> {
     let mut buf = bytes::BytesMut::with_capacity(frame.encoded_len());
     frame
         .encode(&mut buf)
@@ -422,12 +426,76 @@ async fn send_frame(
             format!("frame {} > udp_mtu {}", buf.len(), udp_mtu),
         ));
     }
+    Ok(buf)
+}
+
+async fn send_datagram(
+    conn: &Arc<dyn UtilConn + Send + Sync>,
+    buf: &[u8],
+    peer: &PeerState,
+) -> io::Result<usize> {
     let n = conn
-        .send(&buf)
+        .send(buf)
         .await
         .map_err(|e| io::Error::other(format!("dtls send: {e}")))?;
     peer.metrics().record_sent(TransportKind::Udp, n);
     Ok(n)
+}
+
+async fn send_probe_burst(
+    conn: &Arc<dyn UtilConn + Send + Sync>,
+    peer: &PeerState,
+    local_id: NodeIdentifier,
+    level: ServiceLevel,
+    target_payload_bytes: usize,
+    udp_mtu: usize,
+    pending: &Arc<parking_lot::Mutex<PendingPings>>,
+) -> io::Result<()> {
+    let max_payload = udp_mtu.saturating_sub(128);
+    if target_payload_bytes == 0 || max_payload == 0 {
+        return Ok(());
+    }
+
+    let burst_id = now_us();
+    let mut remaining = target_payload_bytes;
+    let mut sent_total = 0usize;
+    let mut packets = Vec::new();
+    let mut next_ts = burst_id;
+
+    while remaining > 0 {
+        let payload_len = remaining.min(max_payload);
+        let ts = next_ts;
+        next_ts = next_ts.saturating_add(1);
+        let payload = bytes::BytesMut::zeroed(payload_len).freeze();
+        let frame = build_frame(
+            local_id,
+            peer.node_id(),
+            level,
+            FrameType::Ping,
+            MessageClass::Regular,
+            peer.next_seq(),
+            ts,
+            payload,
+        );
+        let buf = encode_frame_datagram(&frame, udp_mtu)?;
+        sent_total += buf.len();
+        packets.push((ts, buf));
+        remaining -= payload_len;
+    }
+
+    let started_at = Instant::now();
+    {
+        let mut g = pending.lock();
+        g.insert_burst(burst_id, started_at, sent_total, packets.len());
+        for (ts, _) in &packets {
+            g.insert_burst_packet(*ts, burst_id);
+        }
+    }
+
+    for (_, buf) in packets {
+        send_datagram(conn, &buf, peer).await?;
+    }
+    Ok(())
 }
 
 async fn handle_frame(
@@ -483,11 +551,19 @@ async fn handle_frame(
             if now > frame.ts_us {
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(TransportKind::Udp, rtt);
-                if let Some(sent_size) = pending.lock().take(frame.ts_us) {
-                    let total = sent_size + incoming_wire_size;
-                    if total >= 256 {
-                        peer.metrics().record_probe(TransportKind::Udp, total, rtt);
+                match pending.lock().take(frame.ts_us, incoming_wire_size) {
+                    Some(ProbeObservation::Single { bytes }) => {
+                        if bytes >= 256 {
+                            peer.metrics().record_probe(TransportKind::Udp, bytes, rtt);
+                        }
                     }
+                    Some(ProbeObservation::BurstComplete { bytes, elapsed }) => {
+                        if bytes >= 256 {
+                            peer.metrics()
+                                .record_probe(TransportKind::Udp, bytes, elapsed);
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -505,25 +581,115 @@ async fn handle_frame(
 }
 
 struct PendingPings {
-    inner: VecDeque<(u64, usize)>,
+    inner: VecDeque<(u64, PendingPing)>,
+    bursts: HashMap<u64, PendingProbeBurst>,
     cap: usize,
 }
+
+enum PendingPing {
+    Single { sent: usize },
+    Burst { burst_id: u64 },
+}
+
+struct PendingProbeBurst {
+    started_at: Instant,
+    sent_bytes: usize,
+    recv_bytes: usize,
+    remaining: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeObservation {
+    Single { bytes: usize },
+    BurstComplete { bytes: usize, elapsed: Duration },
+}
+
 impl PendingPings {
     fn new(cap: usize) -> Self {
         Self {
             inner: VecDeque::with_capacity(cap),
+            bursts: HashMap::new(),
             cap,
         }
     }
+
     fn insert(&mut self, ts: u64, sent: usize) {
-        if self.inner.len() >= self.cap {
-            self.inner.pop_front();
-        }
-        self.inner.push_back((ts, sent));
+        self.insert_entry(ts, PendingPing::Single { sent });
     }
-    fn take(&mut self, ts: u64) -> Option<usize> {
+
+    fn insert_burst(
+        &mut self,
+        burst_id: u64,
+        started_at: Instant,
+        sent_bytes: usize,
+        expected_replies: usize,
+    ) {
+        if expected_replies == 0 {
+            return;
+        }
+        self.bursts.insert(
+            burst_id,
+            PendingProbeBurst {
+                started_at,
+                sent_bytes,
+                recv_bytes: 0,
+                remaining: expected_replies,
+            },
+        );
+    }
+
+    fn insert_burst_packet(&mut self, ts: u64, burst_id: u64) {
+        self.insert_entry(ts, PendingPing::Burst { burst_id });
+    }
+
+    fn insert_entry(&mut self, ts: u64, ping: PendingPing) {
+        if self.cap == 0 {
+            return;
+        }
+        if self.inner.len() >= self.cap {
+            if let Some((_, evicted)) = self.inner.pop_front() {
+                self.drop_entry(evicted);
+            }
+        }
+        self.inner.push_back((ts, ping));
+    }
+
+    fn take(&mut self, ts: u64, incoming_wire_size: usize) -> Option<ProbeObservation> {
         let pos = self.inner.iter().position(|(t, _)| *t == ts)?;
-        self.inner.remove(pos).map(|(_, b)| b)
+        match self.inner.remove(pos).map(|(_, ping)| ping)? {
+            PendingPing::Single { sent } => Some(ProbeObservation::Single {
+                bytes: sent + incoming_wire_size,
+            }),
+            PendingPing::Burst { burst_id } => {
+                let burst = self.bursts.get_mut(&burst_id)?;
+                burst.recv_bytes += incoming_wire_size;
+                burst.remaining = burst.remaining.saturating_sub(1);
+                if burst.remaining == 0 {
+                    let burst = self.bursts.remove(&burst_id)?;
+                    Some(ProbeObservation::BurstComplete {
+                        bytes: burst.sent_bytes + burst.recv_bytes,
+                        elapsed: burst.started_at.elapsed().max(Duration::from_micros(1)),
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn drop_entry(&mut self, ping: PendingPing) {
+        if let PendingPing::Burst { burst_id } = ping {
+            let remove_burst = match self.bursts.get_mut(&burst_id) {
+                Some(burst) => {
+                    burst.remaining = burst.remaining.saturating_sub(1);
+                    burst.remaining == 0
+                }
+                None => false,
+            };
+            if remove_burst {
+                self.bursts.remove(&burst_id);
+            }
+        }
     }
 }
 
@@ -557,4 +723,39 @@ fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_single_reports_round_trip_bytes() {
+        let mut pending = PendingPings::new(8);
+        pending.insert(7, 100);
+
+        assert_eq!(
+            pending.take(7, 50),
+            Some(ProbeObservation::Single { bytes: 150 })
+        );
+        assert_eq!(pending.take(7, 50), None);
+    }
+
+    #[test]
+    fn pending_burst_reports_one_aggregate_sample() {
+        let mut pending = PendingPings::new(8);
+        pending.insert_burst(42, Instant::now(), 300, 2);
+        pending.insert_burst_packet(10, 42);
+        pending.insert_burst_packet(11, 42);
+
+        assert_eq!(pending.take(10, 100), None);
+
+        match pending.take(11, 100) {
+            Some(ProbeObservation::BurstComplete { bytes, elapsed }) => {
+                assert_eq!(bytes, 500);
+                assert!(elapsed >= Duration::from_micros(1));
+            }
+            other => panic!("unexpected observation: {other:?}"),
+        }
+    }
 }

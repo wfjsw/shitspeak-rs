@@ -479,10 +479,43 @@ let network;
 let graphNodes;
 let graphEdges;
 let currentLocalNode = null;
+let graphTopologyKey = '';
 function fmtUs(v) { return v ? (v / 1000).toFixed(1) + ' ms' : '-'; }
 function fmtBps(v) { if (!v) return '-'; const u = ['B/s','KB/s','MB/s','GB/s']; let i = 0; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return v.toFixed(i ? 1 : 0) + ' ' + u[i]; }
 function fmtLoss(v) { return v ? (v / 10000).toFixed(2) + '%' : '0%'; }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function tooltipHtml(lines) {
+  const el = document.createElement('div');
+  el.innerHTML = lines.join('<br>');
+  return el;
+}
+function topologyKeyFor(data) {
+  const nodes = data.nodes.map(n => String(n.node_id)).sort().join(',');
+  const edges = data.links
+    .map(l => `${l.source}->${l.target}:${(l.transports || []).join('/')}`)
+    .sort()
+    .join(',');
+  return `${nodes}|${edges}`;
+}
+function graphPhysicsOptions() {
+  return {
+    enabled: true,
+    solver: 'repulsion',
+    stabilization: { enabled: true, iterations: 220, fit: true },
+    repulsion: {
+      nodeDistance: 285,
+      centralGravity: 0.004,
+      springLength: 260,
+      springConstant: 0.025,
+      damping: 0.09
+    },
+    minVelocity: 0.6
+  };
+}
+function settleGraph() {
+  network.setOptions({ physics: graphPhysicsOptions() });
+  network.stabilize(220);
+}
 function nodeColor(n) {
   if (n.node_id === currentLocalNode) return { background: '#18202b', border: '#18202b', highlight: { background: '#263244', border: '#18202b' } };
   if (n.status === 'alive') return { background: '#237b4b', border: '#185b38', highlight: { background: '#2f9360', border: '#185b38' } };
@@ -515,19 +548,14 @@ function ensureNetwork() {
   network = new vis.Network(graph, { nodes: graphNodes, edges: graphEdges }, {
     autoResize: true,
     layout: { improvedLayout: true },
-    interaction: { hover: true, tooltipDelay: 120, navigationButtons: false, keyboard: true },
-    physics: {
-      enabled: true,
-      solver: 'forceAtlas2Based',
-      stabilization: { enabled: true, iterations: 140, fit: true },
-      forceAtlas2Based: { gravitationalConstant: -55, centralGravity: 0.012, springLength: 135, springConstant: 0.08, avoidOverlap: 0.55 }
-    },
+    interaction: { hover: true, tooltipDelay: 120, dragNodes: true, dragView: true, zoomView: true, navigationButtons: false, keyboard: true },
+    physics: graphPhysicsOptions(),
     nodes: {
       shape: 'dot', size: 22, borderWidth: 2,
       font: { color: '#18202b', size: 13, face: 'ui-sans-serif, system-ui, sans-serif', vadjust: -33 }
     },
     edges: {
-      smooth: { enabled: true, type: 'dynamic', roundness: 0.35 },
+      smooth: { enabled: true, type: 'continuous', roundness: 0.2 },
       arrows: { to: { enabled: true, scaleFactor: 0.55 } },
       font: { color: '#4f5b6e', size: 10, strokeWidth: 3, strokeColor: '#fbfcfe' },
       color: { inherit: false },
@@ -535,15 +563,27 @@ function ensureNetwork() {
       hoverWidth: 1.5
     }
   });
+  network.on('stabilizationIterationsDone', () => network.setOptions({ physics: false }));
+  network.on('dragStart', () => network.setOptions({ physics: false }));
   return true;
 }
 function renderGraph(data) {
   currentLocalNode = data.local_node;
   if (!ensureNetwork()) return;
+  const topologyKey = topologyKeyFor(data);
+  const topologyChanged = topologyKey !== graphTopologyKey;
   const nodes = data.nodes.map(n => ({
     id: String(n.node_id),
     label: String(n.node_id),
-    title: `<strong>node ${n.node_id}</strong><br>Status: ${esc(n.status)}<br>Transit: ${n.transit_enabled ? 'enabled' : 'disabled'}<br>Boot epoch: ${n.boot_epoch}<br>LSA seq: ${n.lsa_seq ?? '-'}<br>LSA age: ${n.lsa_age_ms ?? '-'} ms<br>${n.addresses.map(a => `${esc(a.transport)} ${esc(a.addr)}`).join('<br>')}`,
+    title: tooltipHtml([
+      `<strong>node ${esc(n.node_id)}</strong>`,
+      `Status: ${esc(n.status)}`,
+      `Transit: ${n.transit_enabled ? 'enabled' : 'disabled'}`,
+      `Boot epoch: ${esc(n.boot_epoch)}`,
+      `LSA seq: ${esc(n.lsa_seq ?? '-')}`,
+      `LSA age: ${esc(n.lsa_age_ms ?? '-')} ms`,
+      ...n.addresses.map(a => `${esc(a.transport)} ${esc(a.addr)}`)
+    ]),
     color: nodeColor(n),
     borderWidth: n.node_id === data.local_node ? 4 : 2,
     font: { color: n.node_id === data.local_node ? '#18202b' : '#263244' }
@@ -555,7 +595,15 @@ function renderGraph(data) {
       from: String(link.source),
       to: String(link.target),
       label: fmtUs(link.rtt_us),
-      title: `<strong>${link.source} -> ${link.target}</strong><br>Status: ${esc(link.status)}<br>Transports: ${esc(transports)}<br>RTT: ${fmtUs(link.rtt_us)}<br>Jitter: ${fmtUs(link.jitter_us)}<br>Loss: ${fmtLoss(link.loss_ppm)}<br>Throughput: ${fmtBps(link.throughput_bps)}`,
+      title: tooltipHtml([
+        `<strong>${esc(link.source)} -> ${esc(link.target)}</strong>`,
+        `Status: ${esc(link.status)}`,
+        `Transports: ${esc(transports)}`,
+        `RTT: ${fmtUs(link.rtt_us)}`,
+        `Jitter: ${fmtUs(link.jitter_us)}`,
+        `Loss: ${fmtLoss(link.loss_ppm)}`,
+        `Throughput: ${fmtBps(link.throughput_bps)}`
+      ]),
       color: linkColor(link.status),
       width: edgeWidth(link.throughput_bps),
       dashes: link.status !== 'active'
@@ -563,6 +611,10 @@ function renderGraph(data) {
   });
   syncDataSet(graphNodes, nodes);
   syncDataSet(graphEdges, edges);
+  if (topologyChanged) {
+    graphTopologyKey = topologyKey;
+    settleGraph();
+  }
 }
 function renderTables(data) {
   nodesTbody.innerHTML = data.nodes.map(n => `<tr><td>${n.node_id}</td><td><span class="pill ${n.status}">${n.status}</span></td><td>seq ${n.lsa_seq ?? '-'}<br>${n.lsa_age_ms ?? '-'} ms</td><td>${n.addresses.map(a => `<span class="transport">${esc(a.transport)}</span> ${esc(a.addr)}`).join('<br>')}</td></tr>`).join('');
@@ -614,5 +666,9 @@ mod tests {
         assert!(STATUS_HTML.contains("sha512-5qYRU42HLweh0Ehlsu9bVWc13gwZviSNGsnfx+PqGRQRM4NltzGzb8dO3WY20CTsbkTBzhyKlso9cfYz2A5lOQ=="));
         assert!(STATUS_HTML.contains("referrerpolicy=\"no-referrer\""));
         assert!(STATUS_HTML.contains("new vis.Network"));
+        assert!(STATUS_HTML.contains("dragNodes: true"));
+        assert!(STATUS_HTML.contains("solver: 'repulsion'"));
+        assert!(STATUS_HTML.contains("tooltipHtml(["));
+        assert!(STATUS_HTML.contains("network.setOptions({ physics: false })"));
     }
 }

@@ -9,6 +9,7 @@ use crate::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
 };
 use crate::channel_handler::SessionChannelShadow;
+use crate::client::visibility::UserVisibilityState;
 use crate::client::{AsyncMessageHandlerExt, Client};
 use crate::config::{WebAuthMode, WebConfig};
 use crate::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
@@ -410,6 +411,7 @@ pub async fn initial_server_events(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
 ) -> Vec<ServerEvent> {
     let server_id = client.server_id();
     let channels = server.get_channels().get_all_in_server(&server_id).await;
@@ -460,12 +462,33 @@ pub async fn initial_server_events(
             continue;
         }
         let user_state: Message = visible.build_user_state_for_broadcast().into();
-        push_message_with_synthetic(&mut events, server, channel_shadow, &server_id, &user_state)
-            .await;
+        for message in crate::client::visibility::project_message_with_shadow(
+            server,
+            client,
+            user_visibility,
+            channel_shadow,
+            &server_id,
+            &user_state,
+        )
+        .await
+        {
+            push_message_event(&mut events, message);
+        }
     }
 
     let self_state: Message = client.build_user_state_for_broadcast().into();
-    push_message_with_synthetic(&mut events, server, channel_shadow, &server_id, &self_state).await;
+    for message in crate::client::visibility::project_message_with_shadow(
+        server,
+        client,
+        user_visibility,
+        channel_shadow,
+        &server_id,
+        &self_state,
+    )
+    .await
+    {
+        push_message_event(&mut events, message);
+    }
 
     let root_permissions =
         crate::client::acl::compute_permissions_for_client(server, client, 0).await;
@@ -512,8 +535,9 @@ pub async fn send_initial_server_state_with(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
 ) -> io::Result<()> {
-    for event in initial_server_events(server, client, channel_shadow).await {
+    for event in initial_server_events(server, client, channel_shadow, user_visibility).await {
         send(event)?;
     }
     Ok(())

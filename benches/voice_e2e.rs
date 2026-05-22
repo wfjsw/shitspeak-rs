@@ -317,12 +317,11 @@ async fn spawn_bench_server(server_protocol_version: ProtocolVersion) -> BenchSe
         .expect("Server::new");
     let addr = server.local_addr().expect("tcp addr");
     let udp_addr = server.local_udp_addr().expect("udp addr");
-    let (shutdown_tx, _rx) = watch::channel(());
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
     let run_handle = tokio::spawn({
         let server = Arc::clone(&server);
-        let shutdown_tx = shutdown_tx.clone();
         async move {
-            let _ = server.run(shutdown_tx).await;
+            let _ = server.run(shutdown_rx).await;
         }
     });
 

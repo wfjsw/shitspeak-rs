@@ -62,8 +62,8 @@ pub struct TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        // Closing the watch sender triggers Server::run's `shutdown_tx.closed()`
-        // branch, which stops the accept loops and lets the run task exit.
+        // Sending on the watch channel triggers Server::run's shutdown branch,
+        // which stops the accept loops and lets the run task exit.
         // We can't await the JoinHandle from Drop, so we abort it as a fallback;
         // the run task will already have noticed the shutdown signal.
         let _ = self.shutdown_tx.send(());
@@ -183,13 +183,12 @@ async fn spawn_test_server_with_pki(
     let addr = server.local_addr().expect("local_addr");
     let udp_addr = server.local_udp_addr().expect("local_udp_addr");
 
-    let (shutdown_tx, _shutdown_rx) = watch::channel(());
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let run_handle = tokio::spawn({
         let server = Arc::clone(&server);
-        let tx = shutdown_tx.clone();
         async move {
-            let _ = server.run(tx).await;
+            let _ = server.run(shutdown_rx).await;
         }
     });
 

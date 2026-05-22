@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(env_filter)
+        .with_line_number(true)
         .init();
 
     run().await

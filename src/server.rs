@@ -360,6 +360,59 @@ mod tests {
             .values()
             .any(|server_id| { server_id == "tenant-from-existing-state" }));
     }
+
+    #[tokio::test]
+    async fn idle_reaper_only_disconnects_local_clients() {
+        install_default_provider();
+        let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+            .await
+            .expect("server");
+
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+        let local_client = server
+            .clients
+            .allocate_web_client_in_server(
+                DEFAULT_SERVER_ID,
+                "127.0.0.1".parse().unwrap(),
+                "127.0.0.1:50000".parse().unwrap(),
+                "127.0.0.1:50001".parse().unwrap(),
+                outbound_tx,
+            )
+            .await;
+        let local_sid = local_client.get_session_id();
+
+        let remote_sid = ClientSessionIdentifier::new(2, 1).unwrap();
+        let remote_client = Arc::new(Client::new_remote_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            remote_sid,
+            "127.0.0.2".parse().unwrap(),
+            "127.0.0.2:50000".parse().unwrap(),
+            None,
+            "127.0.0.1:50000".parse().unwrap(),
+            None,
+            chrono::Utc::now() - chrono::Duration::seconds(60),
+            7,
+        ));
+        server
+            .clients
+            .add_remote_client(remote_sid, Arc::clone(&remote_client))
+            .await;
+
+        server
+            .disconnect_idle_local_clients(chrono::Utc::now() + chrono::Duration::seconds(1), 0)
+            .await;
+
+        assert!(server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, local_sid)
+            .await
+            .is_none());
+        assert!(server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, remote_sid)
+            .await
+            .is_some());
+    }
 }
 
 pub struct Server {
@@ -642,7 +695,7 @@ impl Server {
 
     pub async fn run(
         self: &Arc<Box<Self>>,
-        shutdown_tx: tokio::sync::watch::Sender<()>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let listen_addrs: Vec<String> = {
             let entrypoints = self.entrypoints.read();
@@ -655,8 +708,6 @@ impl Server {
         };
         tracing::info!("Server is running on {}", listen_addrs.join(", "));
         self.s2s_manager.log_startup_summary();
-
-        let shutdown_rx = shutdown_tx.subscribe();
 
         // Snapshot startup-only config values (cannot be hot-reloaded).
         let udp_channel_size = self.read_config().udp_channel_size;
@@ -720,10 +771,11 @@ impl Server {
         // Public server registration (periodic HTTP POST to registry).
         // This task is optional and may exit early when registration is disabled;
         // it must never terminate the main server loop.
-        let _register_task = crate::register::spawn_register_task(Arc::clone(self), shutdown_rx);
+        let _register_task =
+            crate::register::spawn_register_task(Arc::clone(self), shutdown_rx.clone());
 
-        // Wait for any task to finish (error) or for the shutdown signal
-        // to be dropped by the caller (main.rs drops shutdown_tx on Ctrl-C).
+        // Wait for any task to finish (error) or for the caller to request
+        // shutdown by sending on the shared watch channel.
         tokio::select! {
             result = udp_process => { let _ = result; }
             result = idle_reaper => { let _ = result; }
@@ -740,7 +792,7 @@ impl Server {
                     None => std::future::pending::<Option<()>>().await,
                 }
             } => { let _ = result; }
-            _ = shutdown_tx.closed() => {
+            _ = shutdown_rx.changed() => {
                 tracing::info!("Shutdown signal received.");
             }
         }
@@ -1286,7 +1338,7 @@ impl Server {
         Ok(())
     }
 
-    /// Spawn a periodic task that disconnects clients who haven't sent a
+    /// Spawn a periodic task that disconnects local clients who haven't sent a
     /// ping within `timeout_secs`.
     fn spawn_idle_reaper(
         server: Arc<Box<Self>>,
@@ -1301,29 +1353,35 @@ impl Server {
                     _ = shutdown.changed() => break,
                 }
 
-                let now = chrono::Utc::now();
-                let timeout = chrono::Duration::seconds(timeout_secs as i64);
-                let clients = server.clients.get_all_clients().await;
-
-                for client in &clients {
-                    let last_ping = client.get_last_ping().await;
-                    if now - last_ping > timeout {
-                        let sid = client.get_session_id();
-                        let server_id = client.server_id();
-                        tracing::info!(
-                            "Disconnecting idle client {:?} (last ping: {}, timeout: {}s)",
-                            sid,
-                            last_ping,
-                            timeout_secs,
-                        );
-                        server
-                            .clients
-                            .remove_client_in_server(&server_id, sid)
-                            .await;
-                    }
-                }
+                server
+                    .disconnect_idle_local_clients(chrono::Utc::now(), timeout_secs)
+                    .await;
             }
         })
+    }
+
+    async fn disconnect_idle_local_clients(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        timeout_secs: u64,
+    ) {
+        let timeout = chrono::Duration::seconds(timeout_secs as i64);
+        let clients = self.clients.get_local_clients().await;
+
+        for client in &clients {
+            let last_ping = client.get_last_ping().await;
+            if now - last_ping > timeout {
+                let sid = client.get_session_id();
+                let server_id = client.server_id();
+                tracing::info!(
+                    "Disconnecting idle local client {:?} (last ping: {}, timeout: {}s)",
+                    sid,
+                    last_ping,
+                    timeout_secs,
+                );
+                self.clients.remove_client_in_server(&server_id, sid).await;
+            }
+        }
     }
 
     /// Spawn a periodic task that rolls back stale pending channel deletes.
