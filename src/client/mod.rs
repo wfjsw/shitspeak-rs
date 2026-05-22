@@ -14,7 +14,9 @@ pub mod state_log;
 pub mod udp_state;
 pub mod user_info;
 pub mod user_version;
+pub(crate) mod visibility;
 pub mod voice_target;
 
-pub use client::{Client, ClientTransportKind};
+pub(crate) use client::random_client_instance_id;
+pub use client::{Client, ClientInstanceId, ClientTransportKind};
 pub use handlers::AsyncMessageHandlerExt;

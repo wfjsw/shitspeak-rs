@@ -64,6 +64,7 @@ message StrictCatchupReq {
   uint32 src_node      = 1;
   uint64 since_version = 2;
   uint64 chunk_token   = 3;   // 0 = first chunk; >0 = continuation
+  bool   force_snapshot = 4;  // true for startup history election
 }
 
 message StrictCatchupResp {
@@ -73,6 +74,10 @@ message StrictCatchupResp {
   bool   has_more               = 4;
   uint64 next_chunk_token       = 5;
   bool   too_old_use_snapshot   = 6;
+  uint64 history_version        = 7;
+  int64  history_freshness      = 8;  // unix seconds of newest known op/snapshot
+  uint64 runtime_started_at     = 9;  // overlay boot_epoch; lower = longer running
+  uint32 history_node           = 10;
 }
 
 message CatchupOp {

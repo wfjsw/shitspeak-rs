@@ -15,24 +15,10 @@ pub(crate) async fn compute_permissions_for_client(
     client: &Arc<Box<Client>>,
     channel_id: u32,
 ) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
-    let session = u32::from(client.get_session_id());
+    use crate::acl::ACLPermissions;
 
-    // Superuser bypasses ACLs but cannot speak or whisper, matching Murmur.
-    if client.is_superuser() {
-        tracing::trace!(session, channel_id, "ACL compute bypassed for SuperUser");
-        let mut permissions = enumflags2::BitFlags::all();
-        permissions.remove(crate::acl::ACLPermissions::Speak | crate::acl::ACLPermissions::Whisper);
-        if channel_id != 0 {
-            permissions.remove(
-                crate::acl::ACLPermissions::Kick
-                    | crate::acl::ACLPermissions::Ban
-                    | crate::acl::ACLPermissions::Register
-                    | crate::acl::ACLPermissions::SelfRegister
-                    | crate::acl::ACLPermissions::ResetUserContent,
-            );
-        }
-        return permissions;
-    }
+    let session = u32::from(client.get_session_id());
+    let is_superuser = client.is_superuser();
 
     let channels = server.get_channels();
     let server_id = client.server_id();
@@ -92,16 +78,41 @@ pub(crate) async fn compute_permissions_for_client(
         groups = ?group_refs,
         tokens = ?token_refs,
         ancestors = ancestors.len(),
+        is_superuser,
         "Computing ACL permissions"
     );
 
-    let permissions =
+    let mut permissions =
         crate::acl::evaluate_permission(&channel, &ancestors, user_id, &membership, channel_id);
+
+    if is_superuser {
+        let allow_speak = permissions.contains(ACLPermissions::Speak);
+        let allow_whisper = permissions.contains(ACLPermissions::Whisper);
+        let mut elevated: enumflags2::BitFlags<ACLPermissions> = enumflags2::BitFlags::all();
+        elevated.remove(ACLPermissions::Speak | ACLPermissions::Whisper);
+        if allow_speak {
+            elevated.insert(ACLPermissions::Speak);
+        }
+        if allow_whisper {
+            elevated.insert(ACLPermissions::Whisper);
+        }
+        if channel_id != 0 {
+            elevated.remove(
+                ACLPermissions::Kick
+                    | ACLPermissions::Ban
+                    | ACLPermissions::Register
+                    | ACLPermissions::SelfRegister
+                    | ACLPermissions::ResetUserContent,
+            );
+        }
+        permissions = elevated;
+    }
 
     tracing::trace!(
         session,
         channel_id,
         user_id,
+        is_superuser,
         permissions = ?permissions,
         "Computed ACL permissions"
     );

@@ -249,6 +249,11 @@ async fn resolve_voice_intent(
                 .get_local_clients_in_channel_in_server(server_id, source_channel)
                 .await;
             for client in channel_clients {
+                if let Some(sender) = sender {
+                    if !crate::client::visibility::can_view_user(server, &client, sender).await {
+                        continue;
+                    }
+                }
                 push_unique_target(
                     &mut targets,
                     &mut seen,
@@ -278,6 +283,10 @@ async fn resolve_voice_intent(
                         .get_local_clients_in_channel_in_server(server_id, linked_id)
                         .await;
                     for client in linked_clients {
+                        if !crate::client::visibility::can_view_user(server, &client, sender).await
+                        {
+                            continue;
+                        }
                         push_unique_target(
                             &mut targets,
                             &mut seen,
@@ -294,6 +303,11 @@ async fn resolve_voice_intent(
                 .get_local_listeners_for_channel_in_server(server_id, source_channel)
                 .await;
             for client in listeners {
+                if let Some(sender) = sender {
+                    if !crate::client::visibility::can_view_user(server, &client, sender).await {
+                        continue;
+                    }
+                }
                 push_unique_target(
                     &mut targets,
                     &mut seen,
@@ -318,6 +332,14 @@ async fn resolve_voice_intent(
                     .await
                 {
                     if let Some(sender) = sender {
+                        if !crate::client::visibility::can_view_user(server, sender, &client).await
+                        {
+                            continue;
+                        }
+                        if !crate::client::visibility::can_view_user(server, &client, sender).await
+                        {
+                            continue;
+                        }
                         let perms = crate::client::acl::compute_permissions_for_client(
                             server,
                             sender,
@@ -399,6 +421,12 @@ async fn resolve_voice_intent(
                     ) {
                         continue;
                     }
+                    if let Some(sender) = sender {
+                        if !crate::client::visibility::can_view_user(server, &client, sender).await
+                        {
+                            continue;
+                        }
+                    }
                     push_unique_target(
                         &mut targets,
                         &mut seen,
@@ -413,6 +441,12 @@ async fn resolve_voice_intent(
                     .get_local_listeners_for_channels_in_server(server_id, &channel_ids)
                     .await;
                 for client in channel_listeners {
+                    if let Some(sender) = sender {
+                        if !crate::client::visibility::can_view_user(server, &client, sender).await
+                        {
+                            continue;
+                        }
+                    }
                     push_unique_target(
                         &mut targets,
                         &mut seen,
@@ -572,6 +606,14 @@ pub(crate) async fn route_s2s_voice_frame(
         .get_clients()
         .get_client_in_server(&server_id, sender_id)
         .await;
+    if server.get_hide_users_without_traverse() && replicated_sender.is_none() {
+        tracing::trace!(
+            from = from_immediate,
+            sender = frame.sender_session,
+            "dropping s2s voice frame from unknown sender under traverse visibility gate"
+        );
+        return;
+    }
     let intent = match frame.intent.clone() {
         Some(intent) => intent,
         None => {

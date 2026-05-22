@@ -6,18 +6,128 @@ use std::time::Duration;
 use bytes::Bytes;
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
+use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::proto::{self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG};
+use super::super::strict::{HistoryMetadata, LogSlice};
 use super::super::test_support::{CountingOwnerRepo, CountingStrictRepo};
 use super::super::topic::{InboundBody, InboundFrame};
 use super::super::{OwnerReplicable, StrictReplicable};
 use super::harness::ReplCluster;
+use crate::channel_repository::{
+    ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository,
+};
+use crate::channels::Channel;
 use crate::s2s::testing::chaos::MessageType;
 use crate::s2s::testing::{wait_for_full_routing, wait_until};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
+
+#[derive(Clone)]
+struct TestChannelReplicationAdapter {
+    repo: Arc<ChannelRepository>,
+}
+
+impl TestChannelReplicationAdapter {
+    fn new(repo: Arc<ChannelRepository>) -> Self {
+        Self { repo }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct TestChannelSnapshot {
+    channels: Vec<Channel>,
+    freshness: i64,
+}
+
+#[async_trait::async_trait]
+impl StrictReplicable for TestChannelReplicationAdapter {
+    type Op = ChannelOperation;
+
+    fn current_version(&self) -> u64 {
+        self.repo.current_version()
+    }
+
+    fn history_metadata(&self) -> HistoryMetadata {
+        HistoryMetadata {
+            version: self.repo.current_version(),
+            freshness: self
+                .repo
+                .latest_timestamp_in_server(crate::types::DEFAULT_SERVER_ID),
+        }
+    }
+
+    fn snapshot(&self) -> (u64, Bytes) {
+        let version = self.repo.current_version();
+        let repo = self.repo.clone();
+        let channels =
+            block_in_place_or_current(|handle| handle.block_on(repo.get_all())).unwrap_or_default();
+        let freshness = self
+            .repo
+            .latest_timestamp_in_server(crate::types::DEFAULT_SERVER_ID);
+        let bytes = Bytes::from(
+            rmp_serde::to_vec(&TestChannelSnapshot {
+                channels,
+                freshness,
+            })
+            .unwrap_or_default(),
+        );
+        (version, bytes)
+    }
+
+    fn log_since(&self, since: u64) -> LogSlice<Self::Op> {
+        let repo = self.repo.clone();
+        let entries =
+            block_in_place_or_current(|handle| handle.block_on(repo.get_log_since(since)));
+        LogSlice::Available(
+            entries
+                .unwrap_or_default()
+                .into_iter()
+                .map(|op| (op.version, (*op).clone()))
+                .collect(),
+        )
+    }
+
+    async fn apply_committed(&self, version: u64, mut op: Self::Op) {
+        op.version = version;
+        self.repo.apply_committed_operation(op).await.unwrap();
+    }
+
+    async fn install_snapshot(&self, version: u64, snapshot: Bytes) {
+        let snapshot: TestChannelSnapshot = rmp_serde::from_slice(&snapshot).unwrap();
+        self.repo
+            .install_s2s_snapshot(version, snapshot.channels)
+            .await
+            .unwrap();
+    }
+}
+
+fn channel_tuning() -> ChannelRepoTuning {
+    ChannelRepoTuning {
+        log_max_entries: 128,
+        snapshot_every_ops: 100,
+        snapshot_every_secs: 60,
+        wal_compaction_expire_count: 100,
+    }
+}
+
+fn block_in_place_or_current<T>(f: impl FnOnce(&tokio::runtime::Handle) -> T) -> Option<T> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    Some(tokio::task::block_in_place(|| f(&handle)))
+}
+
+fn channel_create_op(node_id: u16, channel: Channel) -> ChannelOperation {
+    ChannelOperation {
+        server_id: crate::types::DEFAULT_SERVER_ID.to_owned(),
+        version: 0,
+        node_id,
+        timestamp: chrono::Utc::now().timestamp(),
+        emits_client_message: true,
+        op: ChannelOp::CreateChannel { channel },
+    }
+}
 
 /// Checks strict replication convergence with sequential proposers.
 /// Expected: three replicas converge to the same total-ordered 15-operation
@@ -315,6 +425,159 @@ async fn strict_quorum_lost_on_partition() {
         "expected QuorumLost, got {:?}",
         res
     );
+
+    cluster.shutdown().await;
+}
+
+/// Checks channel repository history election across a real split-heal.
+/// Expected: after {1,2}|{3,4} diverge, healing elects the longest/freshest
+/// channel history and installs that snapshot on the losing side, removing
+/// channels that only existed in the shorter partition history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_channel_repository_split_heal_elects_one_complete_history() {
+    let cfg = ReplicationConfig::default()
+        .with_delivery_tick_interval(Duration::from_millis(25))
+        .with_strict_bootstrap_retry_interval(Duration::from_millis(100));
+    let cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3, 4], cfg).await;
+    let repos: Vec<Arc<ChannelRepository>> = [1u16, 2, 3, 4]
+        .into_iter()
+        .map(|node_id| ChannelRepository::new_in_memory(node_id, channel_tuning()))
+        .collect();
+    let mut handles = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        handles.push(
+            cluster
+                .register_strict(
+                    i,
+                    "channels",
+                    Arc::new(TestChannelReplicationAdapter::new(repo.clone())),
+                )
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for channel_id in [10, 11] {
+        handles[0]
+            .propose(channel_create_op(
+                1,
+                Channel::new(
+                    channel_id,
+                    format!("common-{channel_id}"),
+                    channel_id as i32,
+                    0,
+                    Some(0),
+                ),
+            ))
+            .await
+            .unwrap();
+    }
+    let converged = wait_until(Duration::from_secs(10), || {
+        repos.iter().all(|repo| repo.current_version() == 2)
+    })
+    .await;
+    assert!(converged, "pre-split common history did not converge");
+
+    cluster.cluster.partition(&[1, 2], &[3, 4]);
+    let partitioned = wait_until(Duration::from_secs(10), || {
+        let left_ok = [1u16, 2].iter().all(|&node_id| {
+            let alive = cluster.cluster.node(node_id).overlay.alive_members();
+            !alive.contains(&3) && !alive.contains(&4)
+        });
+        let right_ok = [3u16, 4].iter().all(|&node_id| {
+            let alive = cluster.cluster.node(node_id).overlay.alive_members();
+            !alive.contains(&1) && !alive.contains(&2)
+        });
+        left_ok && right_ok
+    })
+    .await;
+    assert!(partitioned, "partition did not age out of alive views");
+
+    for channel_id in [20, 21, 22] {
+        handles[0]
+            .propose(channel_create_op(
+                1,
+                Channel::new(
+                    channel_id,
+                    format!("left-{channel_id}"),
+                    channel_id as i32,
+                    0,
+                    Some(0),
+                ),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for channel_id in [30] {
+        handles[2]
+            .propose(channel_create_op(
+                3,
+                Channel::new(
+                    channel_id,
+                    format!("right-{channel_id}"),
+                    channel_id as i32,
+                    0,
+                    Some(0),
+                ),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let divergent = wait_until(Duration::from_secs(10), || {
+        repos[0].current_version() == 5
+            && repos[1].current_version() == 5
+            && repos[2].current_version() == 3
+            && repos[3].current_version() == 3
+    })
+    .await;
+    assert!(
+        divergent,
+        "partition sides did not form divergent histories"
+    );
+
+    cluster.cluster.heal_partition(&[1, 2], &[3, 4]);
+    assert!(
+        wait_for_full_routing(&cluster.cluster, Duration::from_secs(15)).await,
+        "routing did not reconverge after partition heal"
+    );
+
+    let healed = wait_until(Duration::from_secs(20), || {
+        repos.iter().all(|repo| {
+            repo.current_version() == 5
+                && tokio::task::block_in_place(|| {
+                    let handle = tokio::runtime::Handle::current();
+                    handle.block_on(repo.get_channel(20)).is_some()
+                        && handle.block_on(repo.get_channel(21)).is_some()
+                        && handle.block_on(repo.get_channel(22)).is_some()
+                        && handle.block_on(repo.get_channel(30)).is_none()
+                })
+        })
+    })
+    .await;
+    assert!(
+        healed,
+        "healed cluster did not converge on the elected channel history"
+    );
+
+    let names: Vec<Vec<String>> = repos
+        .iter()
+        .map(|repo| {
+            let mut names = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(repo.get_all())
+                    .into_iter()
+                    .map(|channel| channel.name)
+                    .collect::<Vec<_>>()
+            });
+            names.sort();
+            names
+        })
+        .collect();
+    for names_for_repo in &names[1..] {
+        assert_eq!(names_for_repo, &names[0]);
+    }
 
     cluster.shutdown().await;
 }

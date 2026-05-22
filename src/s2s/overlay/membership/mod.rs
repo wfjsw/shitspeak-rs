@@ -161,12 +161,7 @@ impl MembershipTable {
 
     /// Sum max_users advertised by every current non-tombstone LSA.
     pub fn alive_max_users(&self) -> u64 {
-        self.lsdb
-            .snapshot()
-            .into_iter()
-            .filter(|entry| !entry.tombstone)
-            .map(|entry| entry.max_users)
-            .sum()
+        self.lsdb.alive_max_users()
     }
 
     /// Event broadcast subscriber. Each subscriber receives every event.
@@ -177,19 +172,20 @@ impl MembershipTable {
     /// Diff the current LSDB origin set against `last` and emit events
     /// for transitions. Called by the diff watcher task.
     pub fn diff_and_emit(&self, swept_failed: &HashSet<NodeIdentifier>) {
-        let lsas = self.lsdb.snapshot();
-        let now: HashMap<NodeIdentifier, LastSeen> = lsas
-            .iter()
-            .map(|e| {
-                (
-                    e.origin,
-                    LastSeen {
-                        boot_epoch: e.boot_epoch,
-                        tombstone: e.tombstone,
-                    },
-                )
-            })
-            .collect();
+        let now: HashMap<NodeIdentifier, LastSeen> = self.lsdb.with_entries(|entries| {
+            entries
+                .values()
+                .map(|e| {
+                    (
+                        e.origin,
+                        LastSeen {
+                            boot_epoch: e.boot_epoch,
+                            tombstone: e.tombstone,
+                        },
+                    )
+                })
+                .collect()
+        });
         let mut last = self.last.write();
         // Departed origins (not in `now`): if previously Alive AND
         // we know it failed (sweeper told us), emit Failed; otherwise

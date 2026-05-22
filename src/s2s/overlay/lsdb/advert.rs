@@ -32,6 +32,7 @@ use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::super::config::OverlayConfig;
+use super::super::discovery::learn_from_lsa;
 use super::super::neighbor::monitor::{NeighborMonitor, NeighborSnapshot};
 use super::super::proto::{encode_message, node_to_wire, wrap, OverlayBody};
 use super::store::{AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry};
@@ -45,9 +46,10 @@ pub struct LsaEmitter {
     next_seq: AtomicU64,
     /// Whether this node asks peers not to use it as a transit router.
     transit_disabled: AtomicBool,
-    /// Last `(rtt_us, throughput_bps)` per neighbor we last published. Used
-    /// to apply the cost-change-threshold filter.
-    last_published: parking_lot::Mutex<std::collections::HashMap<NodeIdentifier, (u64, u64)>>,
+    /// Last `(rtt_us, jitter_us, throughput_bps, loss_ppm)` per neighbor we
+    /// last published. Used to apply the cost-change-threshold filter.
+    last_published:
+        parking_lot::Mutex<std::collections::HashMap<NodeIdentifier, (u64, u64, u64, u32)>>,
     /// Local listen addresses. Captured at construction.
     self_addresses: Vec<crate::s2s::transport::PeerAddress>,
     /// Notify to wake the emitter task on neighbor change.
@@ -116,6 +118,7 @@ pub fn build_local_lsa(
                 jitter_us: n.jitter_us,
                 throughput_bps: n.throughput_bps,
                 transports_mask: n.transports_mask,
+                loss_ppm: n.loss_ppm,
             })
             .collect()
     };
@@ -160,7 +163,8 @@ pub fn cost_changed_significantly(
         return true;
     }
     for n in snap {
-        let Some((prev_rtt, prev_tput)) = last.get(&n.node_id).copied() else {
+        let Some((prev_rtt, prev_jitter, prev_tput, prev_loss)) = last.get(&n.node_id).copied()
+        else {
             return true;
         };
         if prev_rtt > 0 {
@@ -171,12 +175,28 @@ pub fn cost_changed_significantly(
         } else if n.rtt_us > 0 {
             return true;
         }
+        if prev_jitter > 0 {
+            let delta = (n.jitter_us as i64 - prev_jitter as i64).unsigned_abs();
+            if (delta as f64) / (prev_jitter as f64) >= rtt_pct {
+                return true;
+            }
+        } else if n.jitter_us > 0 {
+            return true;
+        }
         if prev_tput > 0 {
             let delta = (n.throughput_bps as i64 - prev_tput as i64).unsigned_abs();
             if (delta as f64) / (prev_tput as f64) >= tput_pct {
                 return true;
             }
         } else if n.throughput_bps > 0 {
+            return true;
+        }
+        if prev_loss > 0 {
+            let delta = (n.loss_ppm as i64 - prev_loss as i64).unsigned_abs();
+            if (delta as f64) / (prev_loss as f64) >= rtt_pct {
+                return true;
+            }
+        } else if n.loss_ppm >= 10_000 {
             return true;
         }
     }
@@ -189,7 +209,10 @@ pub fn record_published(emitter: &LsaEmitter, snap: &[NeighborSnapshot]) {
     let mut last = emitter.last_published.lock();
     last.clear();
     for n in snap {
-        last.insert(n.node_id, (n.rtt_us, n.throughput_bps));
+        last.insert(
+            n.node_id,
+            (n.rtt_us, n.jitter_us, n.throughput_bps, n.loss_ppm),
+        );
     }
 }
 
@@ -311,8 +334,11 @@ pub async fn handle_flood(
         let Some(lsa) = LsaEntry::from_pb(&pb_lsa) else {
             continue;
         };
-        match lsdb.admit(lsa) {
-            AdmissionResult::Accepted => accepted.push(pb_lsa),
+        match lsdb.admit(lsa.clone()) {
+            AdmissionResult::Accepted => {
+                learn_from_lsa(transport, &lsa);
+                accepted.push(pb_lsa);
+            }
             AdmissionResult::Stale | AdmissionResult::BelowFloor => {}
         }
     }

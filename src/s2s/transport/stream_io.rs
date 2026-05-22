@@ -17,6 +17,7 @@
 //!   * exits on EOF, write error, or `closed` cancellation.
 
 use std::collections::VecDeque;
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -89,6 +90,7 @@ pub(crate) fn spawn_stream_pump<S>(
     cfg: StreamPumpConfig,
     peer: Arc<PeerState>,
     inbound: InboundDispatch,
+    is_dialer: bool,
 ) -> ActiveStream
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -96,7 +98,7 @@ where
     let (tx, rx) = mpsc::channel::<OutboundFrame>(cfg.outbound_capacity);
     let closed = CancellationToken::new();
 
-    let active = ActiveStream::new(cfg.transport, tx, closed.clone());
+    let active = ActiveStream::new(cfg.transport, tx, closed.clone(), is_dialer);
 
     tokio::spawn(run_pump(stream, cfg, peer, inbound, rx, closed));
 
@@ -158,6 +160,13 @@ impl MaybeInterval {
     }
 }
 
+fn is_tls_close_notify_eof(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::UnexpectedEof
+        && error
+            .to_string()
+            .contains("without sending TLS close_notify")
+}
+
 async fn run_pump<S>(
     stream: S,
     cfg: StreamPumpConfig,
@@ -208,7 +217,14 @@ async fn run_pump<S>(
             maybe_in = framed.next() => {
                 let buf = match maybe_in {
                     Some(Ok(b)) => b,
-                    Some(Err(e)) => { warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream read error"); break; }
+                    Some(Err(e)) => {
+                        if is_tls_close_notify_eof(&e) {
+                            debug!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream closed without TLS close_notify");
+                        } else {
+                            warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream read error");
+                        }
+                        break;
+                    }
                     None => { debug!(peer=%peer.node_id(), transport=?cfg.transport, "stream EOF"); break; }
                 };
                 let recv_size = buf.len();
@@ -419,4 +435,26 @@ fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_close_notify_eof_is_not_a_read_warning() {
+        let error = io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        );
+
+        assert!(is_tls_close_notify_eof(&error));
+    }
+
+    #[test]
+    fn unrelated_unexpected_eof_still_warns() {
+        let error = io::Error::new(io::ErrorKind::UnexpectedEof, "short frame");
+
+        assert!(!is_tls_close_notify_eof(&error));
+    }
 }

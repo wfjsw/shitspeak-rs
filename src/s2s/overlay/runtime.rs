@@ -13,10 +13,9 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::s2s::transport::{ConnectionManager, Inbound};
+use crate::s2s::transport::{ConnectionManager, Inbound, PeerAddress};
 use crate::types::NodeIdentifier;
 
 use super::config::OverlayConfig;
@@ -51,6 +50,7 @@ impl OverlayInner {
         transport: ConnectionManager,
         cfg: OverlayConfig,
         max_users: Arc<AtomicU64>,
+        self_addresses: Vec<PeerAddress>,
     ) -> Self {
         let self_id = transport.local_node_id();
         let boot_epoch = capture_boot_epoch();
@@ -71,7 +71,6 @@ impl OverlayInner {
         let routing = new_routing_handle();
         let services = Arc::new(ServiceRegistry::new());
 
-        let self_addresses = transport.listen_addresses();
         let emitter = Arc::new(LsaEmitter::new(
             self_id,
             boot_epoch,
@@ -111,7 +110,7 @@ impl OverlayInner {
     /// Spawn every long-running task: Hello ticker, link-up watcher,
     /// LSA emitter, floor persister, anti-entropy, routing recomputer,
     /// diff watcher, and the inbound dispatcher.
-    pub fn spawn_tasks(self: &Arc<Self>, inbound: Inbound, persist_trigger: Arc<Notify>) {
+    pub fn spawn_tasks(self: &Arc<Self>, inbound: Inbound) {
         // Plumb the LSDB change_signal into the LSA emitter so a sync
         // pull that admits new LSAs triggers re-evaluation of routing
         // (the recomputer also subscribes to change_signal directly).
@@ -162,6 +161,7 @@ impl OverlayInner {
             self.lsdb.clone(),
             self.self_id,
             self.routing.clone(),
+            self.transport.clone(),
             self.cfg.clone(),
             self.shutdown.clone(),
         );
@@ -192,8 +192,8 @@ impl OverlayInner {
             super::discovery::spawn_persister(
                 dir,
                 self.cfg.peer_persistence_interval(),
-                self.table.clone(),
-                persist_trigger,
+                self.transport.clone(),
+                self.lsdb.clone(),
                 self.shutdown.clone(),
             );
         }
@@ -222,12 +222,12 @@ pub(crate) async fn start_inner(
     cfg: OverlayConfig,
     max_users: Arc<AtomicU64>,
 ) -> Result<Arc<OverlayInner>, OverlayError> {
-    let inner = Arc::new(OverlayInner::new(transport, cfg, max_users));
+    let self_addresses = transport.listen_addresses_with_public_ip_probe().await;
+    let inner = Arc::new(OverlayInner::new(transport, cfg, max_users, self_addresses));
 
     super::discovery::bootstrap(&inner.cfg, &inner.transport);
 
-    let persist_trigger = Arc::new(Notify::new());
-    inner.spawn_tasks(inbound, persist_trigger);
+    inner.spawn_tasks(inbound);
 
     Ok(inner)
 }

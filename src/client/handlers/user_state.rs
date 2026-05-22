@@ -39,10 +39,13 @@ pub async fn handle_user_state(
     // against a known local or replicated target.
     let target = match msg.session {
         Some(session_id) if session_id != sender_id => {
-            match repo.get_client_in_server(&server_id, session_id).await {
-                Some(c) => c,
-                None => return Ok(()), // target gone, ignore
+            let Some(c) = repo.get_client_in_server(&server_id, session_id).await else {
+                return Ok(());
+            };
+            if !crate::client::visibility::can_view_user(server, sender, &c).await {
+                return Ok(());
             }
+            c
         }
         _ => sender.clone(),
     };
@@ -184,7 +187,7 @@ pub async fn handle_user_state(
         }
     }
 
-    if msg.suppress.is_some() {
+    if msg.suppress.is_some() && (!is_self || msg.suppress == Some(true)) {
         return Err(MessageHandlerError::PermissionDenied(
             PermissionDenied::for_permission(
                 u32::from(sender_id),
@@ -194,9 +197,11 @@ pub async fn handle_user_state(
         ));
     }
 
-    // ── ACL: Mute/deaf/priority_speaker (moderator actions) ──────
-    if (msg.mute.is_some() || msg.deaf.is_some() || msg.priority_speaker.is_some())
-        && (!is_self || msg.priority_speaker.is_some())
+    // ── ACL: Server mute/deaf/suppress/priority_speaker ──────
+    if msg.mute.is_some()
+        || msg.deaf.is_some()
+        || msg.suppress.is_some()
+        || msg.priority_speaker.is_some()
     {
         let perms = match actor_source_perms {
             Some(perms) => perms,
@@ -236,6 +241,15 @@ pub async fn handle_user_state(
         }
         let perms =
             crate::client::acl::compute_permissions_for_client(server, sender, *ch_id).await;
+        if !perms.contains(ACLPermissions::Traverse) {
+            return Err(MessageHandlerError::PermissionDenied(
+                PermissionDenied::for_permission(
+                    u32::from(sender_id),
+                    Some(*ch_id),
+                    ACLPermissions::Traverse,
+                ),
+            ));
+        }
         if !perms.contains(ACLPermissions::Listen) {
             return Err(MessageHandlerError::PermissionDenied(
                 PermissionDenied::for_permission(
@@ -499,8 +513,8 @@ pub async fn handle_user_state(
         }
     }
 
-    // ── Moderator: server mute/deaf/suppress ─────────────────────────────
-    if !is_self {
+    // ── Server mute/deaf/suppress ────────────────────────────────────────
+    if !is_self || msg.mute.is_some() || msg.deaf.is_some() || msg.suppress.is_some() {
         if let Some(mute) = msg.mute {
             if gs.is_muted() != mute {
                 gs.set_mute(mute);
@@ -521,6 +535,11 @@ pub async fn handle_user_state(
                 if deaf && !gs.is_muted() {
                     gs.set_mute(true);
                 }
+            }
+        }
+        if let Some(suppress) = msg.suppress {
+            if gs.is_suppressed() != suppress {
+                gs.set_suppress(suppress);
             }
         }
     }

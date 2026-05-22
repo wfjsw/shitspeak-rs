@@ -13,6 +13,7 @@ config = "0.15.19"
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 enumflags2 = { version = "0.7.12", features = ["serde"] }
 hex = "0.4.3"
+libc = "0.2"
 maxminddb = { version = "0.28.1", features = ["mmap", "simdutf8"] }
 num_enum = "0.7.5"
 paste = "1.0.15"
@@ -64,6 +65,7 @@ moq = ["dep:moq-lite", "dep:moq-native", "dep:hang"]
 [build-dependencies]
 chrono = "0.4.41"
 prost-build = "0.14.3"
+protoc-bin-vendored = "3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 

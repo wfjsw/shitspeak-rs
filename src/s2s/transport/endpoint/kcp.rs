@@ -148,7 +148,7 @@ async fn handle_inbound(
     inner: Arc<ManagerInner>,
     acceptor: TlsAcceptor,
     sock: KcpStream,
-    _peer_addr: SocketAddr,
+    peer_addr: SocketAddr,
 ) -> io::Result<()> {
     let tls = acceptor.accept(sock).await?;
     let (_, server) = tls.get_ref();
@@ -163,6 +163,9 @@ async fn handle_inbound(
             "self-loop rejected",
         ));
     }
+    inner
+        .get_or_create_peer(peer_node)
+        .note_observed_remote_addr(peer_addr);
     install_stream_session(&inner, peer_node, TransportKind::Kcp, false, tls);
     Ok(())
 }

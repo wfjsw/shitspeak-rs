@@ -29,6 +29,7 @@ pub struct TestServerOpts {
     pub udp_ping_enabled: bool,
     pub default_channel: u32,
     pub send_permission_info: bool,
+    pub hide_users_without_traverse: bool,
     pub server_protocol_version: ProtocolVersion,
 }
 
@@ -42,6 +43,7 @@ impl Default for TestServerOpts {
             udp_ping_enabled: true,
             default_channel: 0,
             send_permission_info: false,
+            hide_users_without_traverse: false,
             server_protocol_version: APP_PROTO_VER,
         }
     }
@@ -166,6 +168,7 @@ async fn spawn_test_server_with_pki(
         pending_delete_timeout_ms: 5_000,
         required_groups: Vec::new(),
         send_permission_info: opts.send_permission_info,
+        hide_users_without_traverse: opts.hide_users_without_traverse,
         s2s,
         web: WebConfig::default(),
     };

@@ -14,7 +14,7 @@ use crate::s2s::transport::{ConnectionManager, MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
 use super::error::OverlayError;
-use super::routing::RoutingHandle;
+use super::routing::{RoutingHandle, RoutingMetric};
 
 /// Inbound message handed to a registered service handler.
 #[derive(Debug, Clone)]
@@ -97,6 +97,33 @@ pub async fn send_unicast_with_transit_processing(
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
+    send_unicast_with_routing_metric_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        dst,
+        tag,
+        level,
+        RoutingMetric::PerServiceCost,
+        class,
+        body,
+        process_on_transit,
+    )
+    .await
+}
+
+pub async fn send_unicast_with_routing_metric_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    dst: NodeIdentifier,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
     forward::originate(
         transport,
         routing,
@@ -104,6 +131,7 @@ pub async fn send_unicast_with_transit_processing(
         vec![dst],
         tag,
         level,
+        routing_metric,
         class,
         body,
         process_on_transit,
@@ -141,6 +169,34 @@ pub async fn send_multicast_with_transit_processing(
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
     let dsts: Vec<NodeIdentifier> = dsts.iter().copied().filter(|n| *n != self_id).collect();
+    send_multicast_with_routing_metric_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        &dsts,
+        tag,
+        level,
+        RoutingMetric::PerServiceCost,
+        class,
+        body,
+        process_on_transit,
+    )
+    .await
+}
+
+pub async fn send_multicast_with_routing_metric_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    dsts: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    let dsts: Vec<NodeIdentifier> = dsts.iter().copied().filter(|n| *n != self_id).collect();
     forward::originate(
         transport,
         routing,
@@ -148,6 +204,7 @@ pub async fn send_multicast_with_transit_processing(
         dsts,
         tag,
         level,
+        routing_metric,
         class,
         body,
         process_on_transit,
@@ -188,6 +245,37 @@ pub async fn send_broadcast_with_transit_processing(
     if dsts.is_empty() {
         return Ok(());
     }
+    send_multicast_with_routing_metric_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        &dsts,
+        tag,
+        level,
+        RoutingMetric::PerServiceCost,
+        class,
+        body,
+        process_on_transit,
+    )
+    .await
+}
+
+pub async fn send_broadcast_with_routing_metric_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    alive: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    let dsts: Vec<NodeIdentifier> = alive.iter().copied().filter(|n| *n != self_id).collect();
+    if dsts.is_empty() {
+        return Ok(());
+    }
     forward::originate(
         transport,
         routing,
@@ -195,6 +283,7 @@ pub async fn send_broadcast_with_transit_processing(
         dsts,
         tag,
         level,
+        routing_metric,
         class,
         body,
         process_on_transit,

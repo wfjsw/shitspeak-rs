@@ -42,6 +42,9 @@ pub async fn handle_text_message(
         else {
             continue;
         };
+        if !crate::client::visibility::can_view_user(server, sender, &target).await {
+            continue;
+        }
         let target_channel = target.get_current_channel_id();
         let perms =
             crate::client::acl::compute_permissions_for_client(server, sender, target_channel)
@@ -115,6 +118,16 @@ pub async fn handle_text_message(
     for target_session in direct_sessions {
         let session_id =
             crate::client::client_session_identifier::ClientSessionIdentifier::from(target_session);
+        let Some(target) = server
+            .get_clients()
+            .get_client_in_server(&server_id, session_id)
+            .await
+        else {
+            continue;
+        };
+        if !crate::client::visibility::can_view_user(server, &target, sender).await {
+            continue;
+        }
         server
             .get_clients()
             .send_to_in_server(&server_id, session_id, &relay)
@@ -132,6 +145,9 @@ pub async fn handle_text_message(
                 continue;
             }
             if client.get_current_channel_id() == target_channel && client.is_authenticated() {
+                if !crate::client::visibility::can_view_user(server, client, sender).await {
+                    continue;
+                }
                 let _ = client.write_proto_message(&relay).await;
             }
         }
@@ -145,6 +161,9 @@ pub async fn handle_text_message(
             if tree_deliverable_channels.contains(&client.get_current_channel_id())
                 && client.is_authenticated()
             {
+                if !crate::client::visibility::can_view_user(server, client, sender).await {
+                    continue;
+                }
                 let _ = client.write_proto_message(&relay).await;
             }
         }

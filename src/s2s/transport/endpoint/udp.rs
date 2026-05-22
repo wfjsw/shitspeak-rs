@@ -214,7 +214,13 @@ fn install_session(
 ) {
     let peer = inner.get_or_create_peer(peer_node);
     peer.note_udp_seen(peer_addr);
-    let active = spawn_dtls_pump(conn, peer.clone(), inner.clone(), inner.inbound().clone());
+    let active = spawn_dtls_pump(
+        conn,
+        peer.clone(),
+        inner.clone(),
+        inner.inbound().clone(),
+        is_dialer,
+    );
     if let Err(rejected) = peer.try_install_stream(inner.self_id(), is_dialer, active) {
         rejected.cancel();
     }
@@ -225,6 +231,7 @@ fn spawn_dtls_pump(
     peer: Arc<PeerState>,
     inner: Arc<ManagerInner>,
     inbound: InboundDispatch,
+    is_dialer: bool,
 ) -> ActiveStream {
     let (tx, rx) = mpsc::channel::<OutboundFrame>(inner.cfg().outbound_capacity());
     let closed = CancellationToken::new();
@@ -256,7 +263,7 @@ fn spawn_dtls_pump(
         });
     }
 
-    ActiveStream::new(TransportKind::Udp, tx, closed)
+    ActiveStream::new(TransportKind::Udp, tx, closed, is_dialer)
 }
 
 async fn run_read(

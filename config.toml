@@ -28,6 +28,8 @@ max_text_message_length = 5000
 max_image_message_length = 131072
 default_channel = 0
 cert_required = false
+# When enabled, clients only see users in channels they can Traverse.
+hide_users_without_traverse = false
 
 # UDP
 udp_voice_enabled = true
@@ -60,6 +62,17 @@ jitter_ewma_alpha = 0.0625
 throughput_ewma_alpha = 0.3
 # Cap on in-flight pings remembered per stream/UDP session.
 max_pending_pings = 64
+# Exponential probing retry cap for peers seen recently.
+recent_probe_retry_cap_secs = 30
+# Exponential probing retry cap for peers not seen for stale_probe_age_secs.
+stale_probe_retry_cap_secs = 600
+# Age where a peer is considered old enough to use the stale retry cap.
+stale_probe_age_secs = 3600
+# How often to sample one otherwise unselected peer/transport while the
+# outgoing cap is full. Set to 0 to disable.
+unselected_link_probe_interval_secs = 30
+# Soft cap on live outbound S2S transport sessions. Inbound is still accepted.
+max_outgoing_connections = 1024
 
 # ── L2 overlay tunables ───────────────────────────────────────────────
 [s2s.overlay]

@@ -176,22 +176,38 @@ pub async fn deliver_to_local_recipients(server: &Arc<Box<Server>>, envelope: Pl
         return;
     }
 
-    let message: Message = PluginDataTransmission {
-        sender_session: Some(envelope.sender_session),
-        receiver_sessions: envelope.receiver_sessions.clone(),
-        data: Some(envelope.data),
-        data_id: envelope.data_id,
-    }
-    .into();
-
     let server_id = if envelope.server_id.is_empty() {
         crate::types::default_server_id()
     } else {
         envelope.server_id
     };
+    let sender_id = ClientSessionIdentifier::from(envelope.sender_session);
+    let sender = server
+        .get_clients()
+        .get_client_in_server(&server_id, sender_id)
+        .await;
     for receiver in envelope.receiver_sessions {
         let id = ClientSessionIdentifier::from(receiver);
         if id.get_node_id() == server.get_clients().local_node_id() {
+            let Some(target) = server
+                .get_clients()
+                .get_client_in_server(&server_id, id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(sender) = sender.as_ref() {
+                if !crate::client::visibility::can_view_user(server, &target, sender).await {
+                    continue;
+                }
+            }
+            let message: Message = PluginDataTransmission {
+                sender_session: Some(envelope.sender_session),
+                receiver_sessions: vec![receiver],
+                data: Some(envelope.data.clone()),
+                data_id: envelope.data_id.clone(),
+            }
+            .into();
             server
                 .get_clients()
                 .send_to_in_server(&server_id, id, &message)

@@ -58,6 +58,7 @@ pub struct LinkAdvertised {
     pub jitter_us: u64,
     pub throughput_bps: u64,
     pub transports_mask: u32,
+    pub loss_ppm: u32,
 }
 
 impl LsaEntry {
@@ -78,6 +79,7 @@ impl LsaEntry {
                     jitter_us: l.jitter_us,
                     throughput_bps: l.throughput_bps,
                     transports_mask: l.transports_mask,
+                    loss_ppm: l.loss_ppm,
                 })
             })
             .collect();
@@ -112,6 +114,7 @@ impl LsaEntry {
                     jitter_us: l.jitter_us,
                     throughput_bps: l.throughput_bps,
                     transports_mask: l.transports_mask,
+                    loss_ppm: l.loss_ppm,
                 })
                 .collect(),
             max_users: self.max_users,
@@ -362,6 +365,39 @@ impl LinkStateDb {
         out
     }
 
+    pub(crate) fn with_entries<R>(
+        &self,
+        f: impl FnOnce(&HashMap<NodeIdentifier, LsaEntry>) -> R,
+    ) -> R {
+        let entries = self.inner.read();
+        f(&entries)
+    }
+
+    pub(crate) fn alive_max_users(&self) -> u64 {
+        self.inner
+            .read()
+            .values()
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| entry.max_users)
+            .sum()
+    }
+
+    pub(crate) fn edge_rtt_snapshot(&self) -> Vec<Duration> {
+        self.inner
+            .read()
+            .values()
+            .filter(|entry| !entry.tombstone)
+            .flat_map(|entry| entry.links.iter())
+            .filter_map(|link| {
+                if link.rtt_us == 0 {
+                    None
+                } else {
+                    Some(Duration::from_micros(link.rtt_us))
+                }
+            })
+            .collect()
+    }
+
     /// Compact `(origin, boot_epoch, seq)` digest.
     pub fn digest(&self) -> Vec<(NodeIdentifier, u64, u64)> {
         self.inner
@@ -512,13 +548,45 @@ mod tests {
         db.admit(first);
         db.admit(second);
         db.admit(left);
-        let total: u64 = db
-            .snapshot()
-            .into_iter()
-            .filter(|entry| !entry.tombstone)
-            .map(|entry| entry.max_users)
-            .sum();
-        assert_eq!(total, 300);
+        assert_eq!(db.alive_max_users(), 300);
+    }
+
+    #[test]
+    fn edge_rtt_snapshot_skips_zero_and_tombstoned_links() {
+        let floor = Arc::new(LsaFloor::new(None));
+        let db = LinkStateDb::new(floor);
+        let mut alive = entry(1, 100, 1, false);
+        alive.links = vec![
+            LinkAdvertised {
+                neighbor: 2,
+                rtt_us: 1_500,
+                jitter_us: 0,
+                throughput_bps: 0,
+                transports_mask: 0,
+                loss_ppm: 0,
+            },
+            LinkAdvertised {
+                neighbor: 3,
+                rtt_us: 0,
+                jitter_us: 0,
+                throughput_bps: 0,
+                transports_mask: 0,
+                loss_ppm: 0,
+            },
+        ];
+        let mut left = entry(4, 100, 1, true);
+        left.links = vec![LinkAdvertised {
+            neighbor: 5,
+            rtt_us: 9_000,
+            jitter_us: 0,
+            throughput_bps: 0,
+            transports_mask: 0,
+            loss_ppm: 0,
+        }];
+        db.admit(alive);
+        db.admit(left);
+
+        assert_eq!(db.edge_rtt_snapshot(), vec![Duration::from_micros(1_500)]);
     }
 
     #[test]

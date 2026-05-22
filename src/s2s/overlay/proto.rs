@@ -9,6 +9,8 @@ use bytes::{Bytes, BytesMut};
 use prost::Message as _;
 
 use crate::s2s::transport::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
+
+use super::routing::RoutingMetric;
 use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
@@ -123,6 +125,23 @@ pub fn level_from_wire(v: u32) -> Option<ServiceLevel> {
 }
 
 #[inline]
+pub fn route_metric_to_wire(metric: RoutingMetric) -> u32 {
+    match metric {
+        RoutingMetric::PerServiceCost => 0,
+        RoutingMetric::ConversationalQuality => 1,
+    }
+}
+
+#[inline]
+pub fn route_metric_from_wire(v: u32) -> Option<RoutingMetric> {
+    match v {
+        0 => Some(RoutingMetric::PerServiceCost),
+        1 => Some(RoutingMetric::ConversationalQuality),
+        _ => None,
+    }
+}
+
+#[inline]
 pub fn class_to_wire(c: MessageClass) -> u32 {
     match c {
         MessageClass::HighPriority => 0,
@@ -179,6 +198,15 @@ mod tests {
             ServiceLevel::BestEffort,
         ] {
             assert_eq!(level_from_wire(level_to_wire(l)).unwrap(), l);
+        }
+        for metric in [
+            RoutingMetric::PerServiceCost,
+            RoutingMetric::ConversationalQuality,
+        ] {
+            assert_eq!(
+                route_metric_from_wire(route_metric_to_wire(metric)).unwrap(),
+                metric
+            );
         }
         for c in [MessageClass::HighPriority, MessageClass::Regular] {
             assert_eq!(class_from_wire(class_to_wire(c)).unwrap(), c);

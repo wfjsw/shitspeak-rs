@@ -30,14 +30,34 @@ pub fn app_version() -> &'static str {
     APP_VERSION_FROM_ENV.unwrap_or("0.1.0")
 }
 
+fn non_empty_prefix<'a>(value: &'a str, max_len: usize, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        return fallback;
+    }
+
+    value.get(..max_len).unwrap_or(value)
+}
+
 pub fn release() -> String {
     let app_name = app_name();
     let app_version = app_version();
-    let short_sha = &COMMIT_HASH[..7];
-    let build_date = &BUILD_DATE[..19];
+    let short_sha = non_empty_prefix(COMMIT_HASH.trim(), 7, "unknown");
+    let build_date = non_empty_prefix(BUILD_DATE.trim(), 19, "unknown");
 
     format!(
         "{} {} ({}) [{}]",
         app_name, app_version, short_sha, build_date
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_metadata_prefix_handles_empty_values() {
+        assert_eq!(non_empty_prefix("", 7, "unknown"), "unknown");
+        assert_eq!(non_empty_prefix("abcd", 7, "unknown"), "abcd");
+        assert_eq!(non_empty_prefix("abcdefghi", 7, "unknown"), "abcdefg");
+    }
 }

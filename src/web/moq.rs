@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::api::Authenticator;
 use crate::channel_handler::SessionChannelShadow;
 use crate::client::state_log::ClientStateOperation;
+use crate::client::visibility::UserVisibilityState;
 use crate::client::{client_session_identifier::ClientSessionIdentifier, Client};
 use crate::config::{WebConfig, WebMoqConfig};
 use crate::messages::Message;
@@ -558,6 +559,7 @@ pub struct MoqSessionRuntime {
         Option<tokio::sync::broadcast::Receiver<Arc<crate::channel_repository::ChannelOperation>>>,
     voice_rx: Option<mpsc::Receiver<Bytes>>,
     channel_shadow: SessionChannelShadow,
+    user_visibility: UserVisibilityState,
     inbound_voice: InboundVoiceMetadata,
     frame_numbers: crate::web::voice::RtpFrameNumberMapper,
 }
@@ -572,6 +574,7 @@ impl MoqSessionRuntime {
             channel_log_rx: None,
             voice_rx: None,
             channel_shadow: HashMap::new(),
+            user_visibility: UserVisibilityState::default(),
             inbound_voice: InboundVoiceMetadata::new(),
             frame_numbers: crate::web::voice::RtpFrameNumberMapper::new(),
         }
@@ -610,7 +613,13 @@ impl MoqSessionRuntime {
                     display_name,
                 }];
                 events.extend(
-                    initial_server_events(&server, &client, &mut self.channel_shadow).await,
+                    initial_server_events(
+                        &server,
+                        &client,
+                        &mut self.channel_shadow,
+                        &mut self.user_visibility,
+                    )
+                    .await,
                 );
                 client
                     .set_last_channel_version(
@@ -864,11 +873,40 @@ impl MoqSessionRuntime {
             Some(&mut self.channel_shadow),
         )
         .await;
+        let mut events = Vec::new();
+        for message in messages {
+            events.extend(
+                message_with_synthetic_events(
+                    &server,
+                    &client,
+                    &mut self.channel_shadow,
+                    &mut self.user_visibility,
+                    &server_id,
+                    &message,
+                )
+                .await,
+            );
+        }
+        let reconcile =
+            crate::client::visibility::reconcile_all(&server, &client, &mut self.user_visibility)
+                .await;
+        for message in reconcile {
+            events.extend(
+                crate::client::visibility::sync_projected_message_with_shadow(
+                    &server,
+                    &client,
+                    &mut self.user_visibility,
+                    &mut self.channel_shadow,
+                    &server_id,
+                    message,
+                )
+                .await
+                .into_iter()
+                .filter_map(server_event_from_message),
+            );
+        }
         client.set_last_channel_version(op.version).await;
-        Ok(messages
-            .into_iter()
-            .filter_map(server_event_from_message)
-            .collect())
+        Ok(events)
     }
 
     #[cfg(feature = "moq")]
@@ -899,7 +937,40 @@ impl MoqSessionRuntime {
                     Some(&mut self.channel_shadow),
                 )
                 .await;
-            events.extend(messages.into_iter().filter_map(server_event_from_message));
+            for message in messages {
+                events.extend(
+                    message_with_synthetic_events(
+                        &server,
+                        &client,
+                        &mut self.channel_shadow,
+                        &mut self.user_visibility,
+                        &server_id,
+                        &message,
+                    )
+                    .await,
+                );
+            }
+            let reconcile = crate::client::visibility::reconcile_all(
+                &server,
+                &client,
+                &mut self.user_visibility,
+            )
+            .await;
+            for message in reconcile {
+                events.extend(
+                    crate::client::visibility::sync_projected_message_with_shadow(
+                        &server,
+                        &client,
+                        &mut self.user_visibility,
+                        &mut self.channel_shadow,
+                        &server_id,
+                        message,
+                    )
+                    .await
+                    .into_iter()
+                    .filter_map(server_event_from_message),
+                );
+            }
             client.set_last_channel_version(op.version).await;
         }
         Ok(events)
@@ -938,11 +1009,31 @@ impl MoqSessionRuntime {
             events.extend(
                 message_with_synthetic_events(
                     &server,
+                    &client,
                     &mut self.channel_shadow,
+                    &mut self.user_visibility,
                     &server_id,
                     &message,
                 )
                 .await,
+            );
+        }
+        let reconcile =
+            crate::client::visibility::reconcile_all(&server, &client, &mut self.user_visibility)
+                .await;
+        for message in reconcile {
+            events.extend(
+                crate::client::visibility::sync_projected_message_with_shadow(
+                    &server,
+                    &client,
+                    &mut self.user_visibility,
+                    &mut self.channel_shadow,
+                    &server_id,
+                    message,
+                )
+                .await
+                .into_iter()
+                .filter_map(server_event_from_message),
             );
         }
         client.update_last_client_versions(&payload.versions).await;
@@ -969,11 +1060,31 @@ impl MoqSessionRuntime {
             events.extend(
                 message_with_synthetic_events(
                     &server,
+                    &client,
                     &mut self.channel_shadow,
+                    &mut self.user_visibility,
                     &server_id,
                     &message,
                 )
                 .await,
+            );
+        }
+        let reconcile =
+            crate::client::visibility::reconcile_all(&server, &client, &mut self.user_visibility)
+                .await;
+        for message in reconcile {
+            events.extend(
+                crate::client::visibility::sync_projected_message_with_shadow(
+                    &server,
+                    &client,
+                    &mut self.user_visibility,
+                    &mut self.channel_shadow,
+                    &server_id,
+                    message,
+                )
+                .await
+                .into_iter()
+                .filter_map(server_event_from_message),
             );
         }
         client.update_last_client_versions(&versions).await;
@@ -1172,24 +1283,24 @@ async fn recv_broadcast_now<T: Clone>(
 #[cfg(feature = "moq")]
 async fn message_with_synthetic_events(
     server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
     channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
     server_id: &str,
     message: &Message,
 ) -> Vec<ServerEvent> {
-    let mut events = Vec::new();
-    if let Some(event) = server_event_from_message(message.clone()) {
-        events.push(event);
-    }
-    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+    crate::client::visibility::project_message_with_shadow(
         server,
-        server.get_channels(),
+        client,
+        user_visibility,
         channel_shadow,
         server_id,
         message,
     )
-    .await;
-    events.extend(synthetic.into_iter().filter_map(server_event_from_message));
-    events
+    .await
+    .into_iter()
+    .filter_map(server_event_from_message)
+    .collect()
 }
 
 #[cfg(feature = "moq")]
@@ -1790,6 +1901,7 @@ mod tests {
             pending_delete_timeout_ms: 5_000,
             required_groups: Vec::new(),
             send_permission_info: false,
+            hide_users_without_traverse: false,
             s2s: crate::config::S2sConfig::default(),
             web: WebConfig::default(),
         }

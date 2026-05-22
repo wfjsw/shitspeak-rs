@@ -50,7 +50,7 @@ pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use error::OverlayError;
 pub use membership::{MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{OverlayInboundMessage, ServiceInbound};
-pub use routing::RouteEntry;
+pub use routing::{RouteEntry, RoutingMetric};
 
 /// Public handle for the overlay network. Cheap to clone — internally a
 /// shared `Arc`.
@@ -104,18 +104,17 @@ impl OverlayNetwork {
     /// Used by L3 (replications) to scale the strict-mode clock-tick
     /// cadence to the cluster's measured network latency.
     pub fn edge_rtt_snapshot(&self) -> Vec<std::time::Duration> {
-        let mut out = Vec::new();
-        for entry in self.inner.lsdb.snapshot() {
-            if entry.tombstone {
-                continue;
-            }
-            for link in entry.links {
-                if link.rtt_us > 0 {
-                    out.push(std::time::Duration::from_micros(link.rtt_us));
-                }
-            }
-        }
-        out
+        self.inner.lsdb.edge_rtt_snapshot()
+    }
+
+    /// Raw LSDB snapshot for diagnostics and topology rendering.
+    pub fn link_state_snapshot(&self) -> Vec<lsdb::LsaEntry> {
+        self.inner.lsdb.snapshot()
+    }
+
+    /// Current routing-table snapshot for diagnostics and topology rendering.
+    pub fn routing_snapshot(&self) -> routing::RoutingTables {
+        self.inner.routing.load().as_ref().clone()
     }
 
     /// Snapshot of the current membership view, sorted by node id.
@@ -215,6 +214,57 @@ impl OverlayNetwork {
         .await
     }
 
+    /// Send to a single peer with an explicit routing metric and also deliver
+    /// to matching services on transit nodes.
+    pub async fn send_unicast_with_routing_metric_and_transit_processing(
+        &self,
+        dst: NodeIdentifier,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        messaging::send_unicast_with_routing_metric_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            dst,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            true,
+        )
+        .await
+    }
+
+    /// Send to a single peer with an explicit routing metric.
+    pub async fn send_unicast_with_routing_metric(
+        &self,
+        dst: NodeIdentifier,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        messaging::send_unicast_with_routing_metric_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            dst,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+        )
+        .await
+    }
+
     /// Send to a list of peers — fanned out per next-hop.
     pub async fn send_multicast(
         &self,
@@ -256,6 +306,57 @@ impl OverlayNetwork {
             class,
             body,
             true,
+        )
+        .await
+    }
+
+    /// Send to a list of peers with an explicit routing metric and also
+    /// deliver to matching services on transit nodes.
+    pub async fn send_multicast_with_routing_metric_and_transit_processing(
+        &self,
+        dsts: &[NodeIdentifier],
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        messaging::send_multicast_with_routing_metric_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            dsts,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            true,
+        )
+        .await
+    }
+
+    /// Send to a list of peers with an explicit routing metric.
+    pub async fn send_multicast_with_routing_metric(
+        &self,
+        dsts: &[NodeIdentifier],
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        messaging::send_multicast_with_routing_metric_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            dsts,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
         )
         .await
     }
@@ -305,14 +406,95 @@ impl OverlayNetwork {
         .await
     }
 
+    /// Send to every alive peer with an explicit routing metric and also
+    /// deliver to matching services on transit nodes.
+    pub async fn send_broadcast_with_routing_metric_and_transit_processing(
+        &self,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        let alive = self.alive_members();
+        messaging::send_broadcast_with_routing_metric_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            &alive,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            true,
+        )
+        .await
+    }
+
+    /// Send to every alive peer with an explicit routing metric.
+    pub async fn send_broadcast_with_routing_metric(
+        &self,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        let alive = self.alive_members();
+        messaging::send_broadcast_with_routing_metric_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            &alive,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+        )
+        .await
+    }
+
     /// Look up the next-hop for `dst` at `level`. Returns `None` if no
     /// route is known.
     pub fn route_to(&self, dst: NodeIdentifier, level: ServiceLevel) -> Option<NodeIdentifier> {
+        self.route_to_with_metric(dst, level, RoutingMetric::PerServiceCost)
+    }
+
+    /// Look up the next-hop for `dst` at `level` with an explicit routing
+    /// metric. Returns `None` if no route is known.
+    pub fn route_to_with_metric(
+        &self,
+        dst: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+    ) -> Option<NodeIdentifier> {
         self.inner
             .routing
             .load()
-            .lookup(dst, level)
+            .lookup_with_metric(dst, level, routing_metric)
             .map(|e| e.next_hop)
+    }
+
+    /// Returns true if any route can satisfy `level` for `dst`.
+    pub fn has_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
+        self.inner.routing.load().has_route(dst, level)
+    }
+
+    /// Returns true if any route can satisfy `level` for `dst` using an
+    /// explicit routing metric.
+    pub fn has_route_with_metric(
+        &self,
+        dst: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+    ) -> bool {
+        self.inner
+            .routing
+            .load()
+            .has_route_with_metric(dst, level, routing_metric)
     }
 
     /// Announce graceful leave (tombstone LSA flood) to every direct

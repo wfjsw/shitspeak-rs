@@ -11,7 +11,7 @@
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -117,6 +117,7 @@ pub struct BanRepository {
     /// SQLite connection wrapped in a Mutex (rusqlite Connection is not Sync).
     conn: Mutex<Connection>,
     version: AtomicU64,
+    history_freshness: AtomicI64,
     /// Optional storage directory (for logging / future use).
     #[allow(dead_code)]
     storage_dir: Option<PathBuf>,
@@ -195,6 +196,7 @@ impl BanRepository {
             node_id,
             conn: Mutex::new(conn),
             version: AtomicU64::new(max_version),
+            history_freshness: AtomicI64::new(0),
             storage_dir,
             tx,
         }
@@ -204,6 +206,17 @@ impl BanRepository {
 
     pub fn current_version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
+    }
+
+    pub fn latest_timestamp(&self) -> i64 {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COALESCE(MAX(timestamp), 0) FROM ban_operations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+        .max(self.history_freshness.load(Ordering::Acquire))
     }
 
     pub fn local_node_id(&self) -> u16 {
@@ -424,15 +437,20 @@ impl BanRepository {
         )
         .ok();
         self.version.fetch_max(op.version, Ordering::AcqRel);
+        self.history_freshness
+            .fetch_max(op.timestamp, Ordering::AcqRel);
     }
 
-    pub async fn install_s2s_snapshot(&self, version: u64, entries: Vec<BanEntry>) {
+    pub async fn install_s2s_snapshot(&self, version: u64, entries: Vec<BanEntry>, freshness: i64) {
         let conn = self.conn.lock();
         if let Err(e) = apply_op_to_db(&conn, &BanOp::SetBans { entries }) {
             tracing::warn!("ban snapshot install failed: {e}");
             return;
         }
         self.version.store(version, Ordering::Release);
+        if freshness > 0 {
+            self.history_freshness.store(freshness, Ordering::Release);
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -488,6 +506,8 @@ impl BanRepository {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let op = Arc::new(op);
+        self.history_freshness
+            .fetch_max(op.timestamp, Ordering::AcqRel);
         Ok(op)
     }
 }

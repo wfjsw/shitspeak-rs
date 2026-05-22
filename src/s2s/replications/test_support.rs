@@ -19,6 +19,7 @@ use super::error::ReplicationError;
 use super::owner::runtime::OwnerNet;
 use super::proto::{OwnerBody, StrictBody};
 use super::strict::runtime::StrictNet;
+use crate::s2s::transport::ServiceLevel;
 use crate::types::NodeIdentifier;
 
 #[derive(Debug, Clone)]
@@ -55,6 +56,7 @@ pub(crate) struct MockNet {
     pub self_id: NodeIdentifier,
     pub alive: Mutex<Vec<NodeIdentifier>>,
     pub epochs: Mutex<std::collections::HashMap<NodeIdentifier, u64>>,
+    routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
     pub captured: Mutex<Vec<CapturedFrame>>,
     pub edge_rtts: Mutex<Vec<Duration>>,
 }
@@ -65,6 +67,7 @@ impl MockNet {
             self_id,
             alive: Mutex::new(alive),
             epochs: Mutex::new(Default::default()),
+            routes: Mutex::new(None),
             captured: Mutex::new(Vec::new()),
             edge_rtts: Mutex::new(Vec::new()),
         })
@@ -76,6 +79,18 @@ impl MockNet {
 
     pub fn set_alive(&self, alive: Vec<NodeIdentifier>) {
         *self.alive.lock() = alive;
+    }
+
+    pub fn set_routes(
+        &self,
+        level: ServiceLevel,
+        routes: impl IntoIterator<Item = NodeIdentifier>,
+    ) {
+        *self.routes.lock() = Some(routes.into_iter().map(|dst| (level, dst)).collect());
+    }
+
+    pub fn set_reliable_routes(&self, routes: impl IntoIterator<Item = NodeIdentifier>) {
+        self.set_routes(ServiceLevel::Reliable, routes);
     }
 
     pub fn set_epoch(&self, node: NodeIdentifier, epoch: u64) {
@@ -155,6 +170,13 @@ impl StrictNet for MockNet {
 
     fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.alive.lock().clone()
+    }
+
+    fn has_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
+        match self.routes.lock().as_ref() {
+            Some(routes) => routes.contains(&(level, dst)),
+            None => true,
+        }
     }
 
     fn local_node_id(&self) -> NodeIdentifier {

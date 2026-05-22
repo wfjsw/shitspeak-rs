@@ -4,10 +4,15 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use crate::acl::{ACLPermissions, ACL};
 use crate::channels::{Channel, ChannelPatch};
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
-use crate::messages::encoder::{Authenticate, ChanAcl, ClientType};
+use crate::messages::encoder::{
+    Authenticate, ChanAcl, ClientType, PluginDataTransmission, TextMessage, UserState, UserStats,
+    VoiceTarget,
+};
 use crate::messages::Message;
 
 /// Checks that ACL denial prevents a non-admin from entering a channel.
@@ -137,6 +142,347 @@ async fn acl_query_returns_chain() {
     );
 }
 
+#[tokio::test]
+async fn traverse_visibility_gate_off_keeps_existing_user_visibility() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["secret".into()]);
+
+    create_secret_channel(&server, 70).await;
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    bob.move_to_channel(70).await;
+    bob.recv_until(
+        |m| matches!(m, Message::UserState(us) if us.session == Some(bob.session_id) && us.channel_id == Some(70)),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("bob moves to secret channel");
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    assert!(
+        alice
+            .initial_user_states
+            .iter()
+            .any(|state| state.session == Some(bob.session_id) && state.channel_id == Some(70)),
+        "gate-off clients should keep the existing unfiltered user list"
+    );
+}
+
+#[tokio::test]
+async fn traverse_visibility_hides_and_reveals_users_on_move() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["secret".into()]);
+
+    create_secret_channel(&server, 71).await;
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice
+        .recv_until(
+            |m| matches!(m, Message::UserState(us) if us.session == Some(bob.session_id)),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob in root");
+    alice.drain_now().await;
+
+    bob.move_to_channel(71).await;
+    alice
+        .recv_until(
+            |m| matches!(m, Message::UserRemove(ur) if ur.session == bob.session_id),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("bob entering hidden channel is delivered as UserRemove");
+
+    bob.move_to_channel(0).await;
+    let rejoin = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id)
+                        && us.channel_id == Some(0)
+                        && us.name.as_deref() == Some("bob")
+                        && us.user_id == Some(2))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        rejoin.is_some(),
+        "bob leaving the hidden channel should be delivered as a full UserState"
+    );
+}
+
+#[tokio::test]
+async fn traverse_visibility_filters_listener_add_and_remove() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["secret".into()]);
+
+    create_secret_channel(&server, 72).await;
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    bob.send(
+        UserState {
+            session: Some(bob.server_session),
+            listening_channel_add: vec![72],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .await;
+    bob.recv_until(
+        |m| {
+            matches!(m, Message::UserState(us)
+                if us.session == Some(bob.session_id)
+                    && us.listening_channel_add.contains(&72))
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("bob sees his own listener add");
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob_state = alice
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob.session_id))
+        .expect("bob is visible in root");
+    assert!(
+        !bob_state.listening_channel_add.contains(&72),
+        "hidden listener channels must be omitted from full UserState"
+    );
+
+    alice.drain_now().await;
+    bob.send(
+        UserState {
+            session: Some(bob.server_session),
+            listening_channel_remove: vec![72],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .await;
+
+    let invalid_remove = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id)
+                        && us.listening_channel_remove.contains(&72))
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        invalid_remove.is_none(),
+        "clients must not receive listener removes for channels they never knew"
+    );
+}
+
+#[tokio::test]
+async fn traverse_visibility_hidden_users_are_missing_from_targeted_surfaces() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["secret".into()]);
+
+    create_secret_channel(&server, 73).await;
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice
+        .recv_until(
+            |m| matches!(m, Message::UserState(us) if us.session == Some(bob.session_id)),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob before he enters the hidden channel");
+
+    bob.move_to_channel(73).await;
+    alice
+        .recv_until(
+            |m| matches!(m, Message::UserRemove(ur) if ur.session == bob.session_id),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("bob becomes hidden from alice");
+    alice.drain_now().await;
+
+    alice
+        .send(
+            UserStats {
+                session: Some(bob.session_id),
+                ..UserStats::default()
+            }
+            .into(),
+        )
+        .await;
+    let hidden_stats = alice
+        .recv_until(
+            |m| matches!(m, Message::UserStats(us) if us.session == Some(bob.session_id)),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        hidden_stats.is_none(),
+        "UserStats should treat a hidden user as missing"
+    );
+
+    bob.send(
+        TextMessage {
+            session: vec![alice.session_id],
+            message: "hidden text".to_owned(),
+            ..TextMessage::default()
+        }
+        .into(),
+    )
+    .await;
+    let hidden_text = alice
+        .recv_until(
+            |m| matches!(m, Message::TextMessage(tm) if tm.actor == Some(bob.session_id)),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        hidden_text.is_none(),
+        "direct text from a hidden sender should be dropped"
+    );
+
+    bob.send(
+        PluginDataTransmission {
+            receiver_sessions: vec![alice.session_id],
+            data: Some(Bytes::from_static(b"hidden plugin")),
+            data_id: Some("visibility-test".to_owned()),
+            ..PluginDataTransmission::default()
+        }
+        .into(),
+    )
+    .await;
+    let hidden_plugin = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PluginDataTransmission(p)
+                    if p.sender_session == Some(bob.session_id))
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        hidden_plugin.is_none(),
+        "plugin data from a hidden sender should be dropped"
+    );
+
+    bob.set_voice_target(VoiceTarget {
+        id: Some(1),
+        targets: vec![crate::mumble_proto::voice_target::Target {
+            session: vec![alice.session_id],
+            channel_id: None,
+            group: None,
+            links: Some(false),
+            children: Some(false),
+        }],
+    })
+    .await;
+    bob.send_voice_tcp(1, 101, Bytes::from_static(b"hidden voice"))
+        .await;
+    let hidden_voice = alice.recv_voice_tcp(Duration::from_millis(300)).await;
+    assert!(
+        hidden_voice.is_none(),
+        "voice target audio from a hidden sender should be dropped"
+    );
+}
+
+#[tokio::test]
+async fn listen_add_requires_traverse_before_listen() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    create_secret_channel(&server, 73).await;
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    alice
+        .send(
+            UserState {
+                session: Some(alice.server_session),
+                listening_channel_add: vec![73],
+                ..Default::default()
+            }
+            .into(),
+        )
+        .await;
+
+    let denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionDenied(pd)
+                    if pd.channel_id == Some(73)
+                        && pd.permission == Some(ACLPermissions::Traverse as u32))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        denied.is_some(),
+        "listen add should report missing Traverse before checking Listen"
+    );
+}
+
 fn acl_for_group(
     group: &str,
     allow: enumflags2::BitFlags<ACLPermissions>,
@@ -151,6 +497,36 @@ fn acl_for_group(
         allow,
         deny,
     }
+}
+
+async fn create_secret_channel(
+    server: &crate::integration_tests::harness::TestServer,
+    channel_id: u32,
+) {
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(
+            channel_id,
+            format!("Secret {channel_id}"),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            channel_id,
+            true,
+            vec![acl_for_group(
+                "!secret",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Traverse.into(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
 }
 
 fn empty_channel_patch() -> ChannelPatch {
@@ -447,6 +823,44 @@ async fn permission_query_reports_evaluated_bits() {
     };
     let permissions = reply.permissions.expect("permissions");
     assert_eq!(permissions & ACLPermissions::TextMessage as u32, 0);
+}
+
+#[tokio::test]
+async fn superuser_speak_and_whisper_follow_acl_evaluation() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    let initial = cached_permissions(&server, &alice, 0).await;
+    assert!(initial.contains(ACLPermissions::Speak));
+    assert!(initial.contains(ACLPermissions::Whisper));
+    assert!(initial.contains(ACLPermissions::Ban));
+
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Speak | ACLPermissions::Whisper,
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let after_deny = cached_permissions(&server, &alice, 0).await;
+    assert!(!after_deny.contains(ACLPermissions::Speak));
+    assert!(!after_deny.contains(ACLPermissions::Whisper));
+    assert!(after_deny.contains(ACLPermissions::Ban));
 }
 
 #[tokio::test]

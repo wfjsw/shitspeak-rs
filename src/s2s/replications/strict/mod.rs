@@ -27,6 +27,12 @@ pub enum LogSlice<Op> {
     TooOld,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryMetadata {
+    pub version: u64,
+    pub freshness: i64,
+}
+
 /// Repository-side contract for the strict (Tempo) replication mode.
 ///
 /// # Apply ordering
@@ -51,6 +57,16 @@ pub trait StrictReplicable: Send + Sync + 'static {
 
     /// Latest applied version.
     fn current_version(&self) -> u64;
+
+    /// Metadata used during startup history election. Higher `version`
+    /// wins, then higher `freshness`; runtime age and node id are supplied
+    /// by the replication runtime.
+    fn history_metadata(&self) -> HistoryMetadata {
+        HistoryMetadata {
+            version: self.current_version(),
+            freshness: 0,
+        }
+    }
 
     /// Atomic snapshot. Returns `(version, msgpack_bytes)` where `version`
     /// matches the applied state captured by `msgpack_bytes`.

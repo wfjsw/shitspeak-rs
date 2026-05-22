@@ -12,7 +12,9 @@ use rand::seq::SliceRandom;
 use tracing::warn;
 
 use super::super::proto::{CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp};
-use super::runtime::StrictRuntime;
+use super::runtime::{
+    HistoryElectionCandidate, HistoryRank, StrictRuntime, HISTORY_ELECTION_SNAPSHOT_TOKEN,
+};
 use super::{LogSlice, StrictReplicable};
 use crate::types::NodeIdentifier;
 
@@ -26,16 +28,25 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     let mut snapshot_msgpack: Bytes = Bytes::new();
     let mut too_old_use_snapshot = false;
 
-    let (effective_ops, _effective_since) = match rt.repo.log_since(req.since_version) {
-        LogSlice::Available(ops) => (ops, req.since_version),
-        LogSlice::TooOld => {
-            too_old_use_snapshot = true;
-            let (sv, snap) = rt.repo.snapshot();
-            snapshot_version = sv;
-            snapshot_msgpack = snap;
-            match rt.repo.log_since(sv) {
-                LogSlice::Available(ops) => (ops, sv),
-                LogSlice::TooOld => (Vec::new(), sv),
+    let force_snapshot = req.force_snapshot || req.chunk_token == HISTORY_ELECTION_SNAPSHOT_TOKEN;
+    let (effective_ops, _effective_since) = if force_snapshot {
+        too_old_use_snapshot = true;
+        let (sv, snap) = rt.repo.snapshot();
+        snapshot_version = sv;
+        snapshot_msgpack = snap;
+        (Vec::new(), sv)
+    } else {
+        match rt.repo.log_since(req.since_version) {
+            LogSlice::Available(ops) => (ops, req.since_version),
+            LogSlice::TooOld => {
+                too_old_use_snapshot = true;
+                let (sv, snap) = rt.repo.snapshot();
+                snapshot_version = sv;
+                snapshot_msgpack = snap;
+                match rt.repo.log_since(sv) {
+                    LogSlice::Available(ops) => (ops, sv),
+                    LogSlice::TooOld => (Vec::new(), sv),
+                }
             }
         }
     };
@@ -60,6 +71,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         .map(|c| c.version)
         .unwrap_or(req.since_version);
 
+    let rank = HistoryRank::local(rt);
     let resp = StrictCatchupResp {
         snapshot_version,
         snapshot_msgpack,
@@ -67,6 +79,10 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         has_more,
         next_chunk_token,
         too_old_use_snapshot,
+        history_version: rank.version,
+        history_freshness: rank.freshness,
+        runtime_started_at: rank.runtime_started_at,
+        history_node: u32::from(rank.node_id),
     };
     let _ = rt
         .net
@@ -79,16 +95,57 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
 /// `has_more`, fires off another request to a random alive peer.
 pub(crate) async fn apply_response<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
+    from: NodeIdentifier,
     resp: StrictCatchupResp,
 ) {
     if !rt.state.lock().can_bootstrap_catchup() {
         return;
     }
-    if resp.too_old_use_snapshot && !resp.snapshot_msgpack.is_empty() {
-        rt.repo
-            .install_snapshot(resp.snapshot_version, resp.snapshot_msgpack)
-            .await;
+    let Some(remote_node) = super::runtime::node_from_u32(resp.history_node) else {
+        warn!(
+            node = resp.history_node,
+            "strict catchup response has invalid history_node"
+        );
+        return;
+    };
+    let remote_rank = HistoryRank {
+        version: resp.history_version,
+        freshness: resp.history_freshness,
+        runtime_started_at: resp.runtime_started_at,
+        node_id: remote_node,
+    };
+    let local_rank = HistoryRank::local(rt);
+
+    if resp.too_old_use_snapshot {
+        let candidate = if remote_rank.beats(local_rank) && !resp.snapshot_msgpack.is_empty() {
+            Some(HistoryElectionCandidate {
+                rank: remote_rank,
+                snapshot_version: resp.snapshot_version,
+                snapshot_msgpack: resp.snapshot_msgpack,
+            })
+        } else {
+            None
+        };
+        let winner = rt
+            .state
+            .lock()
+            .record_history_election_response(remote_node, candidate);
+        if let Some(winner) = winner {
+            rt.repo
+                .install_snapshot(winner.snapshot_version, winner.snapshot_msgpack)
+                .await;
+            rt.state.lock().finish_history_election();
+        }
+        return;
     }
+
+    if !remote_rank.beats(local_rank) {
+        rt.state
+            .lock()
+            .record_history_election_response(remote_node, None);
+        return;
+    }
+
     for cop in resp.ops {
         // Dedup: skip ops we've already applied. This protects against
         // overlapping responses when two bootstrap requests are in
@@ -123,10 +180,16 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             src_node: rt.self_id as u32,
             since_version: rt.repo.current_version(),
             chunk_token: resp.next_chunk_token,
+            force_snapshot: false,
         };
         let _ = rt
             .net
             .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))
             .await;
+    }
+    if !resp.has_more {
+        rt.state
+            .lock()
+            .record_history_election_response(remote_node, None);
     }
 }

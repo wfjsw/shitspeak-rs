@@ -29,6 +29,7 @@ use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::super::config::OverlayConfig;
+use super::super::discovery::learn_from_lsa;
 use super::super::neighbor::monitor::NeighborMonitor;
 use super::super::proto::{encode_message, node_from_wire, node_to_wire, wrap, OverlayBody};
 use super::store::{AdmissionResult, LinkStateDb, LsaEntry, OriginVersion};
@@ -121,13 +122,14 @@ pub async fn handle_request(
 /// Handle an inbound `LsdbSyncResp`. Each LSA goes through the normal
 /// admission rule (including the floor check). Accepted LSAs are NOT
 /// re-flooded — sync is point-to-point.
-pub fn handle_response(lsdb: &LinkStateDb, resp: pb::LsdbSyncResp) {
+pub fn handle_response(lsdb: &LinkStateDb, transport: &ConnectionManager, resp: pb::LsdbSyncResp) {
     let mut accepted = 0usize;
     for pb_lsa in resp.delta {
         let Some(lsa) = LsaEntry::from_pb(&pb_lsa) else {
             continue;
         };
-        if matches!(lsdb.admit(lsa), AdmissionResult::Accepted) {
+        if matches!(lsdb.admit(lsa.clone()), AdmissionResult::Accepted) {
+            learn_from_lsa(transport, &lsa);
             accepted += 1;
         }
     }

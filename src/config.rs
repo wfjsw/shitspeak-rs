@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
 use crate::constants::APP_PROTO_VER;
 use crate::protocol_version::ProtocolVersion;
 
 use config::{Config as ConfigCrate, Environment, File};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::s2s::application::ApplicationConfig;
 use crate::s2s::overlay::OverlayTuning;
@@ -33,6 +33,18 @@ pub struct S2sConfig {
     pub quic_listen: Option<SocketAddr>,
     #[serde(default)]
     pub udp_listen: Option<SocketAddr>,
+    #[serde(default, deserialize_with = "deserialize_advertise_overrides")]
+    pub tcp_advertise: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_advertise_overrides")]
+    pub kcp_advertise: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_advertise_overrides")]
+    pub quic_advertise: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_advertise_overrides")]
+    pub udp_advertise: Vec<String>,
+
+    /// Optional plain HTTP listener for the S2S topology/status page.
+    #[serde(default)]
+    pub status_http_listen: Option<SocketAddr>,
 
     #[serde(default)]
     pub persistence_dir: Option<PathBuf>,
@@ -66,6 +78,13 @@ impl S2sConfig {
     }
 
     pub fn transport_config(&self) -> Result<Option<TransportConfig>, String> {
+        self.transport_config_with_auto_advertise_host(None)
+    }
+
+    pub fn transport_config_with_auto_advertise_host(
+        &self,
+        auto_advertise_host: Option<&str>,
+    ) -> Result<Option<TransportConfig>, String> {
         if !self.enabled {
             return Ok(None);
         }
@@ -96,12 +115,64 @@ impl S2sConfig {
         if let Some(addr) = self.udp_listen {
             cfg = cfg.with_udp_listen(addr);
         }
+        let tcp_advertise = resolve_s2s_advertise_overrides(
+            "s2s.tcp_advertise",
+            &self.tcp_advertise,
+            auto_advertise_host,
+            self.tcp_listen,
+        )?;
+        for addr in tcp_advertise.addrs {
+            cfg = if tcp_advertise.is_override {
+                cfg.with_tcp_advertise_override(addr)
+            } else {
+                cfg.with_tcp_advertise(addr)
+            };
+        }
+        let kcp_advertise = resolve_s2s_advertise_overrides(
+            "s2s.kcp_advertise",
+            &self.kcp_advertise,
+            auto_advertise_host,
+            self.kcp_listen,
+        )?;
+        for addr in kcp_advertise.addrs {
+            cfg = if kcp_advertise.is_override {
+                cfg.with_kcp_advertise_override(addr)
+            } else {
+                cfg.with_kcp_advertise(addr)
+            };
+        }
+        let quic_advertise = resolve_s2s_advertise_overrides(
+            "s2s.quic_advertise",
+            &self.quic_advertise,
+            auto_advertise_host,
+            self.quic_listen,
+        )?;
+        for addr in quic_advertise.addrs {
+            cfg = if quic_advertise.is_override {
+                cfg.with_quic_advertise_override(addr)
+            } else {
+                cfg.with_quic_advertise(addr)
+            };
+        }
+        let udp_advertise = resolve_s2s_advertise_overrides(
+            "s2s.udp_advertise",
+            &self.udp_advertise,
+            auto_advertise_host,
+            self.udp_listen,
+        )?;
+        for addr in udp_advertise.addrs {
+            cfg = if udp_advertise.is_override {
+                cfg.with_udp_advertise_override(addr)
+            } else {
+                cfg.with_udp_advertise(addr)
+            };
+        }
 
         cfg = cfg.with_seed_addresses(
             self.seed_addresses
                 .iter()
                 .map(S2sSeedAddressConfig::peer_address)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
         );
         Ok(Some(self.transport.apply(cfg)))
     }
@@ -115,27 +186,183 @@ impl S2sConfig {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct S2sSeedAddressConfig {
     transport: S2sTransportKindConfig,
-    addr: SocketAddr,
+    addr: String,
 }
 
 impl S2sSeedAddressConfig {
     pub fn new(transport: S2sTransportKindConfig, addr: SocketAddr) -> Self {
-        Self { transport, addr }
+        Self {
+            transport,
+            addr: addr.to_string(),
+        }
     }
 
     pub fn transport(&self) -> S2sTransportKindConfig {
         self.transport
     }
 
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+    pub fn addr(&self) -> &str {
+        &self.addr
     }
 
-    pub fn peer_address(&self) -> PeerAddress {
-        PeerAddress::new(self.addr, self.transport.into())
+    pub fn peer_address(&self) -> Result<PeerAddress, String> {
+        let addr = resolve_s2s_addr("s2s seed address", &self.addr)?;
+        Ok(PeerAddress::new(addr, self.transport.into()))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AdvertiseOverrides {
+    One(String),
+    Many(Vec<String>),
+}
+
+struct ResolvedAdvertiseAddrs {
+    addrs: Vec<SocketAddr>,
+    is_override: bool,
+}
+
+fn deserialize_advertise_overrides<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = AdvertiseOverrides::deserialize(deserializer)?;
+    let values = match raw {
+        AdvertiseOverrides::One(value) => vec![value],
+        AdvertiseOverrides::Many(values) => values,
+    };
+    Ok(values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
+fn resolve_s2s_advertise_overrides(
+    label: &str,
+    values: &[String],
+    auto_advertise_host: Option<&str>,
+    listen: Option<SocketAddr>,
+) -> Result<ResolvedAdvertiseAddrs, String> {
+    let mut resolved = Vec::new();
+    if !values.is_empty() {
+        for value in values {
+            push_unique_socket_addrs(&mut resolved, resolve_s2s_advertise_addrs(label, value)?);
+        }
+        return Ok(ResolvedAdvertiseAddrs {
+            addrs: resolved,
+            is_override: true,
+        });
+    }
+
+    let Some(host) = auto_advertise_host
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    else {
+        return Ok(ResolvedAdvertiseAddrs {
+            addrs: Vec::new(),
+            is_override: false,
+        });
+    };
+    let Some(listen) = listen else {
+        return Ok(ResolvedAdvertiseAddrs {
+            addrs: Vec::new(),
+            is_override: false,
+        });
+    };
+    let value = format_host_port(host, listen.port());
+    push_unique_socket_addrs(&mut resolved, resolve_s2s_advertise_addrs(label, &value)?);
+    Ok(ResolvedAdvertiseAddrs {
+        addrs: resolved,
+        is_override: false,
+    })
+}
+
+fn push_unique_socket_addrs(out: &mut Vec<SocketAddr>, addrs: Vec<SocketAddr>) {
+    for addr in addrs {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
+fn resolve_s2s_advertise_addrs(label: &str, value: &str) -> Result<Vec<SocketAddr>, String> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        if addr.ip().is_unspecified() {
+            return Err(format!(
+                "{label} {value:?} must not resolve to an unspecified address"
+            ));
+        }
+        return Ok(vec![addr]);
+    }
+
+    let mut resolved = Vec::new();
+    for addr in value
+        .to_socket_addrs()
+        .map_err(|e| format!("invalid {label} {value:?}: {e}"))?
+    {
+        if !is_routable_advertise_ip(addr.ip()) {
+            continue;
+        }
+        if !resolved.contains(&addr) {
+            resolved.push(addr);
+        }
+    }
+    if resolved.is_empty() {
+        return Err(format!(
+            "{label} {value:?} did not resolve to any routable advertise addresses"
+        ));
+    }
+    Ok(resolved)
+}
+
+fn resolve_s2s_addr(label: &str, value: &str) -> Result<SocketAddr, String> {
+    let addr = value
+        .to_socket_addrs()
+        .map_err(|e| format!("invalid {label} {value:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{label} {value:?} resolved to no addresses"))?;
+    if addr.ip().is_unspecified() {
+        return Err(format!(
+            "{label} {value:?} must not resolve to an unspecified address"
+        ));
+    }
+    Ok(addr)
+}
+
+fn is_routable_advertise_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && !ip.is_documentation()
+                && octets[0] != 0
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !((segments[0] & 0xffc0) == 0xfe80)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
     }
 }
 
@@ -441,6 +668,11 @@ pub struct Config {
     #[serde(default)]
     pub send_permission_info: bool,
 
+    /// When `true`, clients only receive user/session information for users
+    /// whose current channel they can Traverse. Default: `false`.
+    #[serde(default)]
+    pub hide_users_without_traverse: bool,
+
     // ── S2S cluster bootstrap ───────────────────────────────────────────
     #[serde(default)]
     pub s2s: S2sConfig,
@@ -543,6 +775,7 @@ impl Config {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::time::Duration;
 
     fn parse_s2s(raw: &str) -> Result<S2sConfig, ::config::ConfigError> {
         ::config::Config::builder()
@@ -743,13 +976,25 @@ mod tests {
             kcp_listen = "0.0.0.0:64740"
             quic_listen = "0.0.0.0:64741"
             udp_listen = "0.0.0.0:64742"
+            tcp_advertise = ["127.0.0.1:64739", "127.0.0.2:64739"]
+            kcp_advertise = ["127.0.0.1:64740"]
+            quic_advertise = ["127.0.0.1:64741"]
+            udp_advertise = ["127.0.0.1:64742"]
+            status_http_listen = "0.0.0.0:64750"
             persistence_dir = "s2s-state"
 
             seed_addresses = [
                 { transport = "tcp", addr = "10.0.0.2:64739" },
-                { transport = "quic", addr = "10.0.0.3:64741" },
+                { transport = "quic", addr = "localhost:64741" },
                 { transport = "udp", addr = "10.0.0.4:64742" },
             ]
+
+            [transport]
+            recent_probe_retry_cap_secs = 31
+            stale_probe_retry_cap_secs = 601
+            stale_probe_age_secs = 3601
+            unselected_link_probe_interval_secs = 41
+            max_outgoing_connections = 777
         "#;
         let cfg: S2sConfig = parse_s2s(raw).expect("s2s config parses");
         assert!(cfg.is_enabled());
@@ -766,12 +1011,44 @@ mod tests {
             cfg.seed_addresses[2].transport(),
             S2sTransportKindConfig::Udp
         );
+        assert_eq!(cfg.seed_addresses[1].addr(), "localhost:64741");
+        assert_eq!(
+            cfg.status_http_listen,
+            Some("0.0.0.0:64750".parse().unwrap())
+        );
 
         let transport = cfg
             .transport_config()
             .expect("valid transport config")
             .expect("s2s enabled");
         assert_eq!(transport.seed_addresses().len(), 3);
+        assert_eq!(
+            transport.tcp_advertise(),
+            &[
+                "127.0.0.1:64739".parse::<SocketAddr>().unwrap(),
+                "127.0.0.2:64739".parse::<SocketAddr>().unwrap()
+            ]
+        );
+        assert_eq!(
+            transport.kcp_advertise(),
+            &["127.0.0.1:64740".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            transport.quic_advertise(),
+            &["127.0.0.1:64741".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            transport.udp_advertise(),
+            &["127.0.0.1:64742".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(transport.backoff_cap(), Duration::from_secs(31));
+        assert_eq!(transport.stale_backoff_cap(), Duration::from_secs(601));
+        assert_eq!(transport.stale_backoff_after(), Duration::from_secs(3601));
+        assert_eq!(
+            transport.unselected_link_probe_interval(),
+            Duration::from_secs(41)
+        );
+        assert_eq!(transport.max_outgoing_connections(), 777);
         assert!(cfg.overlay_config().persistence_dir().is_some());
     }
 
@@ -823,6 +1100,103 @@ mod tests {
                 { transport = "tcp", addr = "not an address" },
             ]
         "#;
-        assert!(parse_s2s(raw).is_err());
+        let cfg = parse_s2s(raw).expect("seed address text deserializes");
+        assert!(cfg.transport_config().is_err());
+    }
+
+    #[test]
+    fn s2s_rejects_unspecified_seed_address() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            seed_addresses = [
+                { transport = "tcp", addr = "0.0.0.0:64739" },
+            ]
+        "#;
+        let cfg = parse_s2s(raw).expect("seed address text deserializes");
+        let err = cfg
+            .transport_config()
+            .expect_err("unspecified seed address is not dialable");
+        assert!(err.contains("must not resolve to an unspecified address"));
+    }
+
+    #[test]
+    fn s2s_rejects_unspecified_advertise_address() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_advertise = ["0.0.0.0:64739"]
+        "#;
+        let cfg = parse_s2s(raw).expect("advertise address text deserializes");
+        let err = cfg
+            .transport_config()
+            .expect_err("unspecified advertise address is not dialable");
+        assert!(err.contains("must not resolve to an unspecified address"));
+    }
+
+    #[test]
+    fn s2s_rejects_hostname_advertise_without_routable_addresses() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_advertise = ["localhost:64739"]
+        "#;
+        let cfg = parse_s2s(raw).expect("advertise hostname text deserializes");
+        let err = cfg
+            .transport_config()
+            .expect_err("hostname advertise must resolve to routable addresses");
+        assert!(err.contains("did not resolve to any routable advertise addresses"));
+    }
+
+    #[test]
+    fn s2s_dns_advertise_filter_allows_private_network_addresses() {
+        assert!(is_routable_advertise_ip("10.182.157.4".parse().unwrap()));
+        assert!(is_routable_advertise_ip("fd00::1".parse().unwrap()));
+        assert!(!is_routable_advertise_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_routable_advertise_ip("169.254.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn s2s_blank_scalar_advertise_is_treated_as_no_override() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+            tcp_advertise = ""
+        "#;
+        let cfg = parse_s2s(raw).expect("blank legacy advertise string deserializes");
+        let transport = cfg
+            .transport_config()
+            .expect("blank advertise is ignored")
+            .expect("s2s enabled");
+        assert!(transport.tcp_advertise().is_empty());
+    }
+
+    #[test]
+    fn s2s_auto_advertise_host_is_used_when_no_override_is_set() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+        "#;
+        let cfg = parse_s2s(raw).expect("s2s config parses");
+        let transport = cfg
+            .transport_config_with_auto_advertise_host(Some("127.0.0.1"))
+            .expect("auto advertise host resolves")
+            .expect("s2s enabled");
+        assert_eq!(
+            transport.tcp_advertise(),
+            &["127.0.0.1:64739".parse::<SocketAddr>().unwrap()]
+        );
     }
 }

@@ -387,14 +387,23 @@ pub async fn handle_authenticate(
             if !client.is_authenticated() {
                 continue;
             }
-            let us: Message = client.build_user_state_for_broadcast().into();
+            if !crate::client::visibility::can_view_user(server, sender, client).await {
+                continue;
+            }
+            let us: Message =
+                crate::client::visibility::build_visible_user_state(server, sender, client)
+                    .await
+                    .into();
             push_burst(us);
         }
     }
 
     // 4. UserState for self
     {
-        let self_us: Message = sender.build_user_state_for_broadcast().into();
+        let self_us: Message =
+            crate::client::visibility::build_visible_user_state(server, sender, sender)
+                .await
+                .into();
         push_burst(self_us);
     }
 

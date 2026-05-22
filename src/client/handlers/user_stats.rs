@@ -49,6 +49,9 @@ pub async fn handle_user_stats(
             .get_client_in_server(&server_id, target_session)
             .await
         {
+            if !crate::client::visibility::can_view_user(server, sender, &target_state).await {
+                return Ok(());
+            }
             let target_channel = target_state.get_current_channel_id();
             let root_perms =
                 crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
@@ -270,6 +273,12 @@ impl UserStatsResponder for ServerUserStatsResponder {
                     payload: Bytes::new(),
                 };
             };
+            if !crate::client::visibility::can_view_user(&server, &actor, &target).await {
+                return UserStatsApplyOutcome {
+                    found: false,
+                    payload: Bytes::new(),
+                };
+            }
             let target_channel = target.get_current_channel_id();
             let root_perms =
                 crate::client::acl::compute_permissions_for_client(&server, &actor, 0).await;

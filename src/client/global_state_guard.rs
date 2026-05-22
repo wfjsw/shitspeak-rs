@@ -15,7 +15,7 @@ use parking_lot::RwLockWriteGuard;
 
 use crate::client::{
     client_global_state::ClientGlobalState, client_session_identifier::ClientSessionIdentifier,
-    state_log::ClientStateOperation,
+    state_log::ClientStateOperation, ClientInstanceId,
 };
 use crate::client_repository::ClientRepository;
 
@@ -26,12 +26,14 @@ pub struct GlobalStateWriteGuard<'a> {
     repo: &'a ClientRepository,
     /// The session that owns this state.
     session_id: ClientSessionIdentifier,
+    /// Unique identifier for this concrete client connection.
+    client_instance_id: ClientInstanceId,
     /// The server-id scope that owns this state.
     server_id: String,
     /// The session that initiated this mutation.
     sender_session_id: Option<ClientSessionIdentifier>,
     /// The channel version at the time this guard was acquired.
-    /// `Some(v)` means this mutation depends on channel state ≥ v.
+    /// `Some(v)` means this mutation depends on channel state >= v.
     channel_version_dep: Option<u64>,
     /// Whether the guard has already been committed (or rolled back).
     committed: bool,
@@ -43,6 +45,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
         repo: &'a ClientRepository,
         server_id: String,
         session_id: ClientSessionIdentifier,
+        client_instance_id: ClientInstanceId,
         sender_session_id: Option<ClientSessionIdentifier>,
         channel_version_dep: Option<u64>,
     ) -> Self {
@@ -52,6 +55,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
             repo,
             server_id,
             session_id,
+            client_instance_id,
             sender_session_id,
             channel_version_dep,
             committed: false,
@@ -73,6 +77,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
             ClientStateOperation::UpdateGlobalState {
                 server_id: self.server_id.clone(),
                 session_id: self.session_id,
+                client_instance_id: self.client_instance_id,
                 sender_session_id: self.sender_session_id,
                 delta,
             },
@@ -119,6 +124,7 @@ impl<'a> Drop for GlobalStateWriteGuard<'a> {
                 ClientStateOperation::UpdateGlobalState {
                     server_id: self.server_id.clone(),
                     session_id: self.session_id,
+                    client_instance_id: self.client_instance_id,
                     sender_session_id: self.sender_session_id,
                     delta,
                 },

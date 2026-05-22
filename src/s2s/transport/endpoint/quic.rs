@@ -200,6 +200,7 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
     let conn = incoming
         .await
         .map_err(|e| io::Error::other(format!("quic connect: {e}")))?;
+    let remote_addr = conn.remote_address();
     let chain = conn
         .peer_identity()
         .and_then(|d| {
@@ -215,6 +216,9 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
             "self-loop rejected",
         ));
     }
+    inner
+        .get_or_create_peer(peer_node)
+        .note_observed_remote_addr(remote_addr);
     let (send, recv) = conn
         .accept_bi()
         .await

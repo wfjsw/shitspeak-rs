@@ -1,12 +1,14 @@
 pub mod application;
 pub mod overlay;
 pub mod replications;
+pub mod status;
 pub mod transport;
 
 #[cfg(test)]
 pub(crate) mod testing;
 
 use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
@@ -46,6 +48,7 @@ pub struct S2SManager {
     transport_tuning: transport::TransportTuning,
     overlay_tuning: overlay::OverlayTuning,
     replication_config: replications::ReplicationConfig,
+    status_http_listen: Option<SocketAddr>,
     max_users: Arc<AtomicU64>,
     state: RwLock<S2SRuntimeState>,
 }
@@ -68,7 +71,15 @@ struct S2SRuntimeState {
 
 impl S2SManager {
     pub fn initialize(config: &crate::config::Config) -> Self {
-        let (transport_config, config_error) = match config.s2s.transport_config() {
+        let auto_advertise_host = config
+            .register_hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty());
+        let (transport_config, config_error) = match config
+            .s2s
+            .transport_config_with_auto_advertise_host(auto_advertise_host)
+        {
             Ok(cfg) => (cfg, None),
             Err(e) => (None, Some(e)),
         };
@@ -82,6 +93,7 @@ impl S2SManager {
             transport_tuning: config.s2s.transport.clone(),
             overlay_tuning: config.s2s.overlay.clone(),
             replication_config: config.s2s.replications.clone().into(),
+            status_http_listen: config.s2s.status_http_listen,
             max_users: Arc::new(AtomicU64::new(config.max_users)),
             state: RwLock::new(S2SRuntimeState::default()),
         }
@@ -437,6 +449,21 @@ impl S2SManager {
             state.bridge_tasks = bridge_tasks;
         }
 
+        let status_task = self.status_http_listen.and_then(|listen| {
+            match status::spawn_status_server(
+                listen,
+                overlay.clone(),
+                transport.clone(),
+                shutdown.clone(),
+            ) {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    warn!(%listen, %error, "s2s topology HTTP server startup failed");
+                    None
+                }
+            }
+        });
+
         info!(node = overlay.local_node_id(), "s2s runtime started");
 
         let _ = shutdown.changed().await;
@@ -457,6 +484,9 @@ impl S2SManager {
             bridge_tasks
         };
         for task in bridge_tasks {
+            task.abort();
+        }
+        if let Some(task) = status_task {
             task.abort();
         }
 
@@ -757,6 +787,17 @@ async fn apply_user_state_patch(
     else {
         return;
     };
+    let actor = ClientSessionIdentifier::from(actor_session);
+    let Some(actor_client) = server
+        .get_clients()
+        .get_client_in_server(server_id, actor)
+        .await
+    else {
+        return;
+    };
+    if !crate::client::visibility::can_view_user(server, &actor_client, &target).await {
+        return;
+    }
 
     if let Some(expected) = patch.expected_from_channel {
         if target.get_current_channel_id() != expected {
@@ -770,7 +811,6 @@ async fn apply_user_state_patch(
         }
     }
 
-    let actor = ClientSessionIdentifier::from(actor_session);
     let has_channel_dependency = patch.channel_id.is_some()
         || patch.mute.is_some()
         || patch.deaf.is_some()
@@ -838,6 +878,17 @@ async fn apply_user_remove_patch(
     else {
         return;
     };
+    let actor = ClientSessionIdentifier::from(actor_session);
+    let Some(actor_client) = server
+        .get_clients()
+        .get_client_in_server(server_id, actor)
+        .await
+    else {
+        return;
+    };
+    if !crate::client::visibility::can_view_user(server, &actor_client, &target).await {
+        return;
+    }
 
     if patch.ban {
         let reason = patch.reason.clone().unwrap_or_default();
@@ -955,6 +1006,8 @@ impl ChannelReplicationAdapter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChannelSnapshot {
     channels: Vec<crate::channels::Channel>,
+    #[serde(default)]
+    freshness: i64,
 }
 
 #[async_trait]
@@ -965,6 +1018,13 @@ impl StrictReplicable for ChannelReplicationAdapter {
         self.repo.current_version_in_server(&self.server_id)
     }
 
+    fn history_metadata(&self) -> replications::strict::HistoryMetadata {
+        replications::strict::HistoryMetadata {
+            version: self.repo.current_version_in_server(&self.server_id),
+            freshness: self.repo.latest_timestamp_in_server(&self.server_id),
+        }
+    }
+
     fn snapshot(&self) -> (u64, Bytes) {
         let version = self.repo.current_version_in_server(&self.server_id);
         let repo = self.repo.clone();
@@ -972,8 +1032,14 @@ impl StrictReplicable for ChannelReplicationAdapter {
         let channels =
             block_in_place_or_current(|handle| handle.block_on(repo.get_all_in_server(&server_id)))
                 .unwrap_or_default();
-        let bytes =
-            Bytes::from(rmp_serde::to_vec(&ChannelSnapshot { channels }).unwrap_or_default());
+        let freshness = self.repo.latest_timestamp_in_server(&self.server_id);
+        let bytes = Bytes::from(
+            rmp_serde::to_vec(&ChannelSnapshot {
+                channels,
+                freshness,
+            })
+            .unwrap_or_default(),
+        );
         (version, bytes)
     }
 
@@ -1014,7 +1080,12 @@ impl StrictReplicable for ChannelReplicationAdapter {
         };
         if let Err(e) = self
             .repo
-            .install_s2s_snapshot_in_server(&self.server_id, version, decoded.channels)
+            .install_s2s_snapshot_in_server(
+                &self.server_id,
+                version,
+                decoded.channels,
+                decoded.freshness,
+            )
             .await
         {
             warn!(error = ?e, "s2s channel snapshot install failed");
@@ -1098,6 +1169,8 @@ impl BanReplicationAdapter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BanSnapshot {
     entries: Vec<BanEntry>,
+    #[serde(default)]
+    freshness: i64,
 }
 
 #[async_trait]
@@ -1108,12 +1181,21 @@ impl StrictReplicable for BanReplicationAdapter {
         self.repo.current_version()
     }
 
+    fn history_metadata(&self) -> replications::strict::HistoryMetadata {
+        replications::strict::HistoryMetadata {
+            version: self.repo.current_version(),
+            freshness: self.repo.latest_timestamp(),
+        }
+    }
+
     fn snapshot(&self) -> (u64, Bytes) {
         let version = self.repo.current_version();
         let repo = self.repo.clone();
         let entries = block_in_place_or_current(|handle| handle.block_on(repo.get_active_bans()))
             .unwrap_or_default();
-        let bytes = Bytes::from(rmp_serde::to_vec(&BanSnapshot { entries }).unwrap_or_default());
+        let freshness = self.repo.latest_timestamp();
+        let bytes =
+            Bytes::from(rmp_serde::to_vec(&BanSnapshot { entries, freshness }).unwrap_or_default());
         (version, bytes)
     }
 
@@ -1146,7 +1228,7 @@ impl StrictReplicable for BanReplicationAdapter {
             }
         };
         self.repo
-            .install_s2s_snapshot(version, decoded.entries)
+            .install_s2s_snapshot(version, decoded.entries, decoded.freshness)
             .await;
     }
 }

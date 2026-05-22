@@ -46,16 +46,35 @@ pub async fn handle_plugin_data_transmission(
         data: msg.data,
         data_id: msg.data_id,
     };
-    let relay_message: Message = relay.clone().into();
     let local_node_id = server.get_clients().local_node_id();
     let mut remote_by_node: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
 
     for receiver in &relay.receiver_sessions {
         let id = ClientSessionIdentifier::from(*receiver);
+        let Some(target) = server
+            .get_clients()
+            .get_client_in_server(&server_id, id)
+            .await
+        else {
+            continue;
+        };
+        if !crate::client::visibility::can_view_user(server, sender, &target).await {
+            continue;
+        }
         if id.get_node_id() == local_node_id {
+            if !crate::client::visibility::can_view_user(server, &target, sender).await {
+                continue;
+            }
+            let direct_message: Message = PluginDataTransmission {
+                sender_session: Some(sender_session),
+                receiver_sessions: vec![*receiver],
+                data: relay.data.clone(),
+                data_id: relay.data_id.clone(),
+            }
+            .into();
             server
                 .get_clients()
-                .send_to_in_server(&server_id, id, &relay_message)
+                .send_to_in_server(&server_id, id, &direct_message)
                 .await;
         } else {
             remote_by_node

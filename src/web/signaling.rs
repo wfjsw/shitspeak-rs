@@ -15,6 +15,7 @@ use crate::api::{
 use crate::channel_handler::SessionChannelShadow;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::ClientStateOperation;
+use crate::client::visibility::UserVisibilityState;
 use crate::client::{AsyncMessageHandlerExt, Client};
 use crate::config::{WebAuthMode, WebConfig};
 use crate::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
@@ -463,6 +464,7 @@ struct SignalingSession {
     channel_log_rx:
         Option<tokio::sync::broadcast::Receiver<Arc<crate::channel_repository::ChannelOperation>>>,
     channel_shadow: SessionChannelShadow,
+    user_visibility: UserVisibilityState,
     peer: Option<WebRtcPeer>,
     peer_signal_rx: Option<tokio::sync::mpsc::Receiver<PeerSignal>>,
 }
@@ -478,6 +480,7 @@ impl Default for SignalingSession {
             client_log_rx: None,
             channel_log_rx: None,
             channel_shadow: HashMap::new(),
+            user_visibility: UserVisibilityState::default(),
             peer: None,
             peer_signal_rx: None,
         }
@@ -1275,7 +1278,14 @@ async fn handle_successful_password_auth(
     send_authentication_success(stream, session.session_id, display_name).await?;
     session.authenticated = true;
     if let Some((server, client)) = initial_state_client {
-        send_initial_server_state(stream, &server, &client, &mut session.channel_shadow).await?;
+        send_initial_server_state(
+            stream,
+            &server,
+            &client,
+            &mut session.channel_shadow,
+            &mut session.user_visibility,
+        )
+        .await?;
         client
             .set_last_channel_version(
                 server
@@ -1299,6 +1309,7 @@ async fn send_initial_server_state(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
 ) -> io::Result<()> {
     let server_id = client.server_id();
     let channels = server.get_channels().get_all_in_server(&server_id).await;
@@ -1346,27 +1357,33 @@ async fn send_initial_server_state(
             continue;
         }
         let user_state: Message = visible.build_user_state_for_broadcast().into();
-        send_web_outbound_message_with_synthetic(
-            stream,
+        for message in crate::client::visibility::project_message_with_shadow(
             server,
-            None,
+            client,
+            user_visibility,
             channel_shadow,
             &server_id,
             &user_state,
         )
-        .await?;
+        .await
+        {
+            send_web_outbound_message(stream, None, message).await?;
+        }
     }
 
     let self_state: Message = client.build_user_state_for_broadcast().into();
-    send_web_outbound_message_with_synthetic(
-        stream,
+    for message in crate::client::visibility::project_message_with_shadow(
         server,
-        None,
+        client,
+        user_visibility,
         channel_shadow,
         &server_id,
         &self_state,
     )
-    .await?;
+    .await
+    {
+        send_web_outbound_message(stream, None, message).await?;
+    }
 
     let root_permissions =
         crate::client::acl::compute_permissions_for_client(server, client, 0).await;
@@ -1450,7 +1467,34 @@ async fn send_web_channel_log_update(
     )
     .await;
     for message in messages {
-        send_web_outbound_message(stream, session.peer.as_ref(), message).await?;
+        send_web_outbound_message_with_synthetic(
+            stream,
+            &server,
+            &client,
+            session.peer.as_ref(),
+            &mut session.channel_shadow,
+            &mut session.user_visibility,
+            &server_id,
+            &message,
+        )
+        .await?;
+    }
+    let reconcile =
+        crate::client::visibility::reconcile_all(&server, &client, &mut session.user_visibility)
+            .await;
+    for message in reconcile {
+        for projected in crate::client::visibility::sync_projected_message_with_shadow(
+            &server,
+            &client,
+            &mut session.user_visibility,
+            &mut session.channel_shadow,
+            &server_id,
+            message,
+        )
+        .await
+        {
+            send_web_outbound_message(stream, session.peer.as_ref(), projected).await?;
+        }
     }
     client.set_last_channel_version(op.version).await;
     Ok(())
@@ -1489,7 +1533,37 @@ async fn send_web_channel_log_gap(
         )
         .await;
         for message in messages {
-            send_web_outbound_message(stream, session.peer.as_ref(), message).await?;
+            send_web_outbound_message_with_synthetic(
+                stream,
+                &server,
+                &client,
+                session.peer.as_ref(),
+                &mut session.channel_shadow,
+                &mut session.user_visibility,
+                &server_id,
+                &message,
+            )
+            .await?;
+        }
+        let reconcile = crate::client::visibility::reconcile_all(
+            &server,
+            &client,
+            &mut session.user_visibility,
+        )
+        .await;
+        for message in reconcile {
+            for projected in crate::client::visibility::sync_projected_message_with_shadow(
+                &server,
+                &client,
+                &mut session.user_visibility,
+                &mut session.channel_shadow,
+                &server_id,
+                message,
+            )
+            .await
+            {
+                send_web_outbound_message(stream, session.peer.as_ref(), projected).await?;
+            }
         }
         client.set_last_channel_version(op.version).await;
     }
@@ -1536,12 +1610,31 @@ async fn send_web_client_log_update(
         send_web_outbound_message_with_synthetic(
             stream,
             &server,
+            &client,
             session.peer.as_ref(),
             &mut session.channel_shadow,
+            &mut session.user_visibility,
             &server_id,
             &message,
         )
         .await?;
+    }
+    let reconcile =
+        crate::client::visibility::reconcile_all(&server, &client, &mut session.user_visibility)
+            .await;
+    for message in reconcile {
+        for projected in crate::client::visibility::sync_projected_message_with_shadow(
+            &server,
+            &client,
+            &mut session.user_visibility,
+            &mut session.channel_shadow,
+            &server_id,
+            message,
+        )
+        .await
+        {
+            send_web_outbound_message(stream, session.peer.as_ref(), projected).await?;
+        }
     }
     client.update_last_client_versions(&payload.versions).await;
     Ok(())
@@ -1580,12 +1673,31 @@ async fn send_web_client_log_gap(
         send_web_outbound_message_with_synthetic(
             stream,
             &server,
+            &client,
             session.peer.as_ref(),
             &mut session.channel_shadow,
+            &mut session.user_visibility,
             &server_id,
             &message,
         )
         .await?;
+    }
+    let reconcile =
+        crate::client::visibility::reconcile_all(&server, &client, &mut session.user_visibility)
+            .await;
+    for message in reconcile {
+        for projected in crate::client::visibility::sync_projected_message_with_shadow(
+            &server,
+            &client,
+            &mut session.user_visibility,
+            &mut session.channel_shadow,
+            &server_id,
+            message,
+        )
+        .await
+        {
+            send_web_outbound_message(stream, session.peer.as_ref(), projected).await?;
+        }
     }
     client.update_last_client_versions(&versions).await;
     Ok(())
@@ -1594,21 +1706,23 @@ async fn send_web_client_log_gap(
 async fn send_web_outbound_message_with_synthetic(
     stream: &mut (impl AsyncWrite + Unpin),
     server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
     peer: Option<&WebRtcPeer>,
     channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
     server_id: &str,
     message: &Message,
 ) -> io::Result<()> {
-    send_web_outbound_message(stream, peer, message.clone()).await?;
-    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+    for message in crate::client::visibility::project_message_with_shadow(
         server,
-        server.get_channels(),
+        client,
+        user_visibility,
         channel_shadow,
         server_id,
         message,
     )
-    .await;
-    for message in synthetic {
+    .await
+    {
         send_web_outbound_message(stream, peer, message).await?;
     }
     Ok(())
@@ -2520,6 +2634,7 @@ mod tests {
             pending_delete_timeout_ms: 5_000,
             required_groups: Vec::new(),
             send_permission_info: false,
+            hide_users_without_traverse: false,
             s2s: crate::config::S2sConfig::default(),
             web: WebConfig::default(),
         };

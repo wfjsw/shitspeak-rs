@@ -189,18 +189,15 @@ async fn sendmmsg_linux(
         }
 
         for i in 0..chunk.len() {
-            msgs.push(libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: &sockaddrs[i] as *const _ as *mut libc::c_void,
-                    msg_namelen: std::mem::size_of::<libc::sockaddr_in6>() as u32,
-                    msg_iov: &iovecs[i] as *const _ as *mut libc::iovec,
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                msg_len: 0,
-            });
+            let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            msg.msg_hdr.msg_name = &sockaddrs[i] as *const _ as *mut libc::c_void;
+            msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+            msg.msg_hdr.msg_iov = &iovecs[i] as *const _ as *mut libc::iovec;
+            msg.msg_hdr.msg_iovlen = 1;
+            msg.msg_hdr.msg_control = std::ptr::null_mut();
+            msg.msg_hdr.msg_controllen = 0;
+            msg.msg_hdr.msg_flags = 0;
+            msgs.push(msg);
         }
 
         // Safety: sendmmsg operates on UDP datagram sockets and is non-blocking.

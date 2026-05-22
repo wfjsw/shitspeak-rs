@@ -1,6 +1,6 @@
 //! Per-link telemetry: EWMA latency + RFC-3550-style jitter, plus a sliding
-//! bandwidth meter. Aggregated per `(node, ServiceLevel)` so callers can pick
-//! the fastest path among co-existing transports.
+//! bandwidth meter. Aggregated per `(node, ServiceLevel)` so callers can score
+//! path quality among co-existing transports.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +11,75 @@ use parking_lot::Mutex;
 use crate::types::NodeIdentifier;
 
 use super::service_level::{ServiceLevel, TransportKind};
+
+const E_MODEL_R0: f64 = 93.2;
+const E_MODEL_DELAY_KNEE_MS: f64 = 177.3;
+const E_MODEL_JITTER_BUFFER_FLOOR_MS: f64 = 20.0;
+const E_MODEL_JITTER_BUFFER_MULTIPLIER: f64 = 4.0;
+const E_MODEL_JITTER_IMPAIRMENT_FREE_MS: f64 = 5.0;
+const E_MODEL_JITTER_IMPAIRMENT_PER_MS: f64 = 0.12;
+const E_MODEL_PACKET_LOSS_ROBUSTNESS: f64 = 20.0;
+const E_MODEL_BURST_RATIO: f64 = 1.0;
+const E_MODEL_REFERENCE_THROUGHPUT_BYTES_PER_SEC: f64 = 24_000.0;
+const E_MODEL_THROUGHPUT_IMPAIRMENT_PER_LOG2: f64 = 4.0;
+const E_MODEL_MAX_THROUGHPUT_IMPAIRMENT: f64 = 20.0;
+
+pub(crate) fn conversational_effective_delay_us(rtt_us: f64, jitter_us: f64) -> u64 {
+    let one_way_ms = rtt_us.max(1.0) / 2_000.0;
+    let jitter_ms = jitter_us.max(0.0) / 1_000.0;
+    let jitter_buffer_ms =
+        E_MODEL_JITTER_BUFFER_FLOOR_MS.max(jitter_ms * E_MODEL_JITTER_BUFFER_MULTIPLIER);
+    ((one_way_ms + jitter_buffer_ms) * 1_000.0).ceil() as u64
+}
+
+pub(crate) fn conversational_impairment(
+    rtt_us: f64,
+    jitter_us: f64,
+    throughput_bytes_per_sec: f64,
+    packet_loss_ppm: u32,
+) -> f64 {
+    let delay_ms = conversational_effective_delay_us(rtt_us, jitter_us) as f64 / 1_000.0;
+    let delay_impairment = 0.024 * delay_ms
+        + if delay_ms > E_MODEL_DELAY_KNEE_MS {
+            0.11 * (delay_ms - E_MODEL_DELAY_KNEE_MS)
+        } else {
+            0.0
+        };
+
+    let jitter_ms = jitter_us.max(0.0) / 1_000.0;
+    let jitter_impairment = ((jitter_ms - E_MODEL_JITTER_IMPAIRMENT_FREE_MS).max(0.0)
+        * E_MODEL_JITTER_IMPAIRMENT_PER_MS)
+        .min(15.0);
+
+    let loss_pct = (packet_loss_ppm as f64 / 10_000.0).clamp(0.0, 100.0);
+    let loss_impairment = if loss_pct <= 0.0 {
+        0.0
+    } else {
+        (95.0 * loss_pct * E_MODEL_BURST_RATIO) / (loss_pct + E_MODEL_PACKET_LOSS_ROBUSTNESS)
+    };
+
+    let throughput = throughput_bytes_per_sec.max(1.0);
+    let throughput_impairment = if throughput >= E_MODEL_REFERENCE_THROUGHPUT_BYTES_PER_SEC {
+        0.0
+    } else {
+        (E_MODEL_REFERENCE_THROUGHPUT_BYTES_PER_SEC / throughput).log2()
+            * E_MODEL_THROUGHPUT_IMPAIRMENT_PER_LOG2
+    }
+    .clamp(0.0, E_MODEL_MAX_THROUGHPUT_IMPAIRMENT);
+
+    delay_impairment + jitter_impairment + loss_impairment + throughput_impairment
+}
+
+pub(crate) fn conversational_quality_score(
+    rtt_us: f64,
+    jitter_us: f64,
+    throughput_bytes_per_sec: f64,
+    packet_loss_ppm: u32,
+) -> f64 {
+    (E_MODEL_R0
+        - conversational_impairment(rtt_us, jitter_us, throughput_bytes_per_sec, packet_loss_ppm))
+    .clamp(0.0, 100.0)
+}
 
 /// EWMA smoothing coefficients for [`PeerMetrics`]. Values are configured
 /// in [`super::config::TransportConfig`]; the [`Default`] impl mirrors
@@ -117,6 +186,23 @@ impl LinkMetrics {
     pub fn estimated_throughput_bps(&self) -> f64 {
         let utilized = self.recv_bps().max(self.sent_bps());
         utilized.max(self.probe_throughput_bps)
+    }
+
+    /// E-model-inspired conversational link-quality score. Higher is better.
+    ///
+    /// Links without RTT samples are left unranked so the dial scheduler can
+    /// prefer peers with observed quality.
+    pub fn quality_score(&self) -> Option<f64> {
+        if self.samples == 0 {
+            return None;
+        }
+
+        Some(conversational_quality_score(
+            self.rtt_us,
+            self.jitter_us,
+            self.estimated_throughput_bps(),
+            0,
+        ))
     }
 }
 
@@ -383,6 +469,33 @@ mod tests {
         let tcp = snap.get(&TransportKind::Tcp).unwrap();
         // Probe estimate dominates because actual flow is tiny.
         assert!(tcp.estimated_throughput_bps() > 1_000_000.0);
+    }
+
+    #[test]
+    fn quality_score_prefers_stronger_composite_link() {
+        assert_eq!(LinkMetrics::default().quality_score(), None);
+
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+
+        m.record_rtt(TransportKind::Tcp, Duration::from_millis(5));
+        m.record_rtt(TransportKind::Tcp, Duration::from_millis(80));
+        m.record_probe(TransportKind::Tcp, 1024, Duration::from_millis(100));
+
+        m.record_rtt(TransportKind::Quic, Duration::from_millis(25));
+        m.record_rtt(TransportKind::Quic, Duration::from_millis(26));
+        m.record_probe(TransportKind::Quic, 1024 * 1024, Duration::from_millis(50));
+
+        let snap = m.snapshot_per_transport();
+        let tcp = snap
+            .get(&TransportKind::Tcp)
+            .and_then(LinkMetrics::quality_score)
+            .unwrap();
+        let quic = snap
+            .get(&TransportKind::Quic)
+            .and_then(LinkMetrics::quality_score)
+            .unwrap();
+
+        assert!(quic > tcp, "quic={quic} tcp={tcp}");
     }
 
     #[test]

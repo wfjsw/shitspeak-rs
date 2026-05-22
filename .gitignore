@@ -8,3 +8,4 @@ cert.pfx
 log/
 data/
 .claude/settings.local.json
+deploy/

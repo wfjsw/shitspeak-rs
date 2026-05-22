@@ -18,11 +18,24 @@ pub struct TransportConfig {
     kcp_listen: Option<SocketAddr>,
     quic_listen: Option<SocketAddr>,
     udp_listen: Option<SocketAddr>,
+    tcp_advertise: Vec<SocketAddr>,
+    kcp_advertise: Vec<SocketAddr>,
+    quic_advertise: Vec<SocketAddr>,
+    udp_advertise: Vec<SocketAddr>,
+    tcp_advertise_override: bool,
+    kcp_advertise_override: bool,
+    quic_advertise_override: bool,
+    udp_advertise_override: bool,
     seed_addresses: Vec<PeerAddress>,
 
     backoff_initial: Duration,
     backoff_cap: Duration,
+    stale_backoff_cap: Duration,
+    stale_backoff_after: Duration,
     reconnect_check_interval: Duration,
+    /// How often to give an otherwise unselected peer/transport one
+    /// exploratory dial while the outgoing cap is full. Set to zero to disable.
+    unselected_link_probe_interval: Duration,
     ping_interval: Duration,
     bandwidth_window: Duration,
 
@@ -55,6 +68,10 @@ pub struct TransportConfig {
     /// entries are dropped when the buffer fills, preventing unbounded
     /// memory if pongs are lost.
     max_pending_pings: usize,
+
+    /// Soft cap on live outbound transport sessions. Inbound sessions remain
+    /// accepted so a too-low cap cannot isolate this node by itself.
+    max_outgoing_connections: usize,
 }
 
 impl TransportConfig {
@@ -67,10 +84,21 @@ impl TransportConfig {
             kcp_listen: None,
             quic_listen: None,
             udp_listen: None,
+            tcp_advertise: Vec::new(),
+            kcp_advertise: Vec::new(),
+            quic_advertise: Vec::new(),
+            udp_advertise: Vec::new(),
+            tcp_advertise_override: false,
+            kcp_advertise_override: false,
+            quic_advertise_override: false,
+            udp_advertise_override: false,
             seed_addresses: Vec::new(),
             backoff_initial: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
+            stale_backoff_cap: Duration::from_secs(10 * 60),
+            stale_backoff_after: Duration::from_secs(60 * 60),
             reconnect_check_interval: Duration::from_secs(1),
+            unselected_link_probe_interval: Duration::from_secs(30),
             ping_interval: Duration::from_secs(2),
             bandwidth_window: Duration::from_secs(5),
             bandwidth_probe_interval: Duration::from_secs(15),
@@ -84,6 +112,7 @@ impl TransportConfig {
             jitter_ewma_alpha: 1.0 / 16.0,
             throughput_ewma_alpha: 0.3,
             max_pending_pings: 64,
+            max_outgoing_connections: 1024,
         }
     }
 
@@ -117,6 +146,38 @@ impl TransportConfig {
         self.udp_listen
     }
 
+    pub fn tcp_advertise(&self) -> &[SocketAddr] {
+        &self.tcp_advertise
+    }
+
+    pub fn kcp_advertise(&self) -> &[SocketAddr] {
+        &self.kcp_advertise
+    }
+
+    pub fn quic_advertise(&self) -> &[SocketAddr] {
+        &self.quic_advertise
+    }
+
+    pub fn udp_advertise(&self) -> &[SocketAddr] {
+        &self.udp_advertise
+    }
+
+    pub fn tcp_advertise_override(&self) -> bool {
+        self.tcp_advertise_override
+    }
+
+    pub fn kcp_advertise_override(&self) -> bool {
+        self.kcp_advertise_override
+    }
+
+    pub fn quic_advertise_override(&self) -> bool {
+        self.quic_advertise_override
+    }
+
+    pub fn udp_advertise_override(&self) -> bool {
+        self.udp_advertise_override
+    }
+
     pub fn seed_addresses(&self) -> &[PeerAddress] {
         &self.seed_addresses
     }
@@ -129,8 +190,20 @@ impl TransportConfig {
         self.backoff_cap
     }
 
+    pub fn stale_backoff_cap(&self) -> Duration {
+        self.stale_backoff_cap
+    }
+
+    pub fn stale_backoff_after(&self) -> Duration {
+        self.stale_backoff_after
+    }
+
     pub fn reconnect_check_interval(&self) -> Duration {
         self.reconnect_check_interval
+    }
+
+    pub fn unselected_link_probe_interval(&self) -> Duration {
+        self.unselected_link_probe_interval
     }
 
     pub fn ping_interval(&self) -> Duration {
@@ -185,6 +258,10 @@ impl TransportConfig {
         self.max_pending_pings
     }
 
+    pub fn max_outgoing_connections(&self) -> usize {
+        self.max_outgoing_connections
+    }
+
     // --- Chainable setters ---
 
     pub fn with_tcp_listen(mut self, addr: SocketAddr) -> Self {
@@ -204,6 +281,50 @@ impl TransportConfig {
 
     pub fn with_udp_listen(mut self, addr: SocketAddr) -> Self {
         self.udp_listen = Some(addr);
+        self
+    }
+
+    pub fn with_tcp_advertise(mut self, addr: SocketAddr) -> Self {
+        self.tcp_advertise.push(addr);
+        self
+    }
+
+    pub fn with_kcp_advertise(mut self, addr: SocketAddr) -> Self {
+        self.kcp_advertise.push(addr);
+        self
+    }
+
+    pub fn with_quic_advertise(mut self, addr: SocketAddr) -> Self {
+        self.quic_advertise.push(addr);
+        self
+    }
+
+    pub fn with_udp_advertise(mut self, addr: SocketAddr) -> Self {
+        self.udp_advertise.push(addr);
+        self
+    }
+
+    pub fn with_tcp_advertise_override(mut self, addr: SocketAddr) -> Self {
+        self.tcp_advertise_override = true;
+        self.tcp_advertise.push(addr);
+        self
+    }
+
+    pub fn with_kcp_advertise_override(mut self, addr: SocketAddr) -> Self {
+        self.kcp_advertise_override = true;
+        self.kcp_advertise.push(addr);
+        self
+    }
+
+    pub fn with_quic_advertise_override(mut self, addr: SocketAddr) -> Self {
+        self.quic_advertise_override = true;
+        self.quic_advertise.push(addr);
+        self
+    }
+
+    pub fn with_udp_advertise_override(mut self, addr: SocketAddr) -> Self {
+        self.udp_advertise_override = true;
+        self.udp_advertise.push(addr);
         self
     }
 
@@ -227,8 +348,23 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_stale_backoff_cap(mut self, d: Duration) -> Self {
+        self.stale_backoff_cap = d;
+        self
+    }
+
+    pub fn with_stale_backoff_after(mut self, d: Duration) -> Self {
+        self.stale_backoff_after = d;
+        self
+    }
+
     pub fn with_reconnect_check_interval(mut self, d: Duration) -> Self {
         self.reconnect_check_interval = d;
+        self
+    }
+
+    pub fn with_unselected_link_probe_interval(mut self, d: Duration) -> Self {
+        self.unselected_link_probe_interval = d;
         self
     }
 
@@ -296,10 +432,15 @@ impl TransportConfig {
         self.max_pending_pings = n;
         self
     }
+
+    pub fn with_max_outgoing_connections(mut self, n: usize) -> Self {
+        self.max_outgoing_connections = n;
+        self
+    }
 }
 
-/// TOML-deserializable shadow of the per-link metrics smoothing & ping-cap
-/// knobs. Only the new tunables are surfaced here; other [`TransportConfig`]
+/// TOML-deserializable shadow of the per-link metrics smoothing, ping-cap,
+/// and connection-selection knobs. Only these tunables are surfaced here; other [`TransportConfig`]
 /// fields (listen addrs, PKI paths, queue sizes, etc.) stay Rust-builder-
 /// only for now.
 #[derive(Deserialize, Debug, Clone)]
@@ -312,6 +453,16 @@ pub struct TransportTuning {
     pub throughput_ewma_alpha: f64,
     #[serde(default = "default_max_pending_pings")]
     pub max_pending_pings: usize,
+    #[serde(default = "default_recent_probe_retry_cap_secs")]
+    pub recent_probe_retry_cap_secs: u64,
+    #[serde(default = "default_stale_probe_retry_cap_secs")]
+    pub stale_probe_retry_cap_secs: u64,
+    #[serde(default = "default_stale_probe_age_secs")]
+    pub stale_probe_age_secs: u64,
+    #[serde(default = "default_unselected_link_probe_interval_secs")]
+    pub unselected_link_probe_interval_secs: u64,
+    #[serde(default = "default_max_outgoing_connections")]
+    pub max_outgoing_connections: usize,
 }
 
 impl Default for TransportTuning {
@@ -321,6 +472,11 @@ impl Default for TransportTuning {
             jitter_ewma_alpha: default_jitter_ewma_alpha(),
             throughput_ewma_alpha: default_throughput_ewma_alpha(),
             max_pending_pings: default_max_pending_pings(),
+            recent_probe_retry_cap_secs: default_recent_probe_retry_cap_secs(),
+            stale_probe_retry_cap_secs: default_stale_probe_retry_cap_secs(),
+            stale_probe_age_secs: default_stale_probe_age_secs(),
+            unselected_link_probe_interval_secs: default_unselected_link_probe_interval_secs(),
+            max_outgoing_connections: default_max_outgoing_connections(),
         }
     }
 }
@@ -332,6 +488,13 @@ impl TransportTuning {
             .with_jitter_ewma_alpha(self.jitter_ewma_alpha)
             .with_throughput_ewma_alpha(self.throughput_ewma_alpha)
             .with_max_pending_pings(self.max_pending_pings)
+            .with_backoff_cap(Duration::from_secs(self.recent_probe_retry_cap_secs))
+            .with_stale_backoff_cap(Duration::from_secs(self.stale_probe_retry_cap_secs))
+            .with_stale_backoff_after(Duration::from_secs(self.stale_probe_age_secs))
+            .with_unselected_link_probe_interval(Duration::from_secs(
+                self.unselected_link_probe_interval_secs,
+            ))
+            .with_max_outgoing_connections(self.max_outgoing_connections)
     }
 }
 
@@ -346,4 +509,19 @@ fn default_throughput_ewma_alpha() -> f64 {
 }
 fn default_max_pending_pings() -> usize {
     64
+}
+fn default_recent_probe_retry_cap_secs() -> u64 {
+    30
+}
+fn default_stale_probe_retry_cap_secs() -> u64 {
+    10 * 60
+}
+fn default_stale_probe_age_secs() -> u64 {
+    60 * 60
+}
+fn default_unselected_link_probe_interval_secs() -> u64 {
+    30
+}
+fn default_max_outgoing_connections() -> usize {
+    1024
 }

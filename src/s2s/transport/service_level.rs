@@ -81,6 +81,10 @@ impl PeerAddress {
     pub fn transport(&self) -> TransportKind {
         self.transport
     }
+
+    pub fn is_dialable(&self) -> bool {
+        !self.addr.ip().is_unspecified()
+    }
 }
 
 /// Lookup convenience: who is asking? Used by the supervisor when iterating

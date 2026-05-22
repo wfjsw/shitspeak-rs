@@ -313,6 +313,7 @@ pub async fn replay_channel_log_gap(
     client: &Arc<Box<Client>>,
     channels: &Arc<ChannelRepository>,
     session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut crate::client::visibility::UserVisibilityState,
     session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
     last: u64,
     current: u64,
@@ -352,8 +353,37 @@ pub async fn replay_channel_log_gap(
         )
         .await;
         for msg in messages {
-            if client.write_proto_message(&msg).await.is_err() {
-                return Err(());
+            let projected = crate::client::visibility::project_message_with_shadow(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                &server_id,
+                &msg,
+            )
+            .await;
+            for msg in projected {
+                if client.write_proto_message(&msg).await.is_err() {
+                    return Err(());
+                }
+            }
+        }
+        let reconcile =
+            crate::client::visibility::reconcile_all(server, client, user_visibility).await;
+        for msg in reconcile {
+            let projected = crate::client::visibility::sync_projected_message_with_shadow(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                &server_id,
+                msg,
+            )
+            .await;
+            for msg in projected {
+                if client.write_proto_message(&msg).await.is_err() {
+                    return Err(());
+                }
             }
         }
         client.set_last_channel_version(entry.version).await;

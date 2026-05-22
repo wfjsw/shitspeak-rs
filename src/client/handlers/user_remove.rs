@@ -35,6 +35,14 @@ pub async fn handle_user_remove(
         crate::client::client_session_identifier::ClientSessionIdentifier::from(target_raw);
     let server_id = sender.server_id();
     let is_ban = msg.ban.unwrap_or(false);
+    let target = match server
+        .get_clients()
+        .get_client_in_server(&server_id, target_session)
+        .await
+    {
+        Some(c) if crate::client::visibility::can_view_user(server, sender, &c).await => c,
+        Some(_) | None => return Ok(()),
+    };
     let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
     if is_ban {
         if !root_perms.contains(ACLPermissions::Ban) {
@@ -96,15 +104,6 @@ pub async fn handle_user_remove(
         }
         return Ok(());
     }
-
-    let target = match server
-        .get_clients()
-        .get_client_in_server(&server_id, target_session)
-        .await
-    {
-        Some(c) => c,
-        None => return Ok(()),
-    };
 
     let reason = msg.reason.clone().unwrap_or_default();
 

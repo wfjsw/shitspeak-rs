@@ -34,13 +34,14 @@ pub async fn handle_voice_target(
         for session in &t.session {
             let session_id =
                 crate::client::client_session_identifier::ClientSessionIdentifier::from(*session);
-            if server
+            if let Some(target) = server
                 .get_clients()
                 .get_client_in_server(&server_id, session_id)
                 .await
-                .is_some()
             {
-                valid_sessions.push(*session);
+                if crate::client::visibility::can_view_user(server, sender, &target).await {
+                    valid_sessions.push(*session);
+                }
             }
         }
         if let Some(channel_id) = t.channel_id {

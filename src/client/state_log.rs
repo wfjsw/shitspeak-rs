@@ -13,7 +13,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::client::client_session_identifier::ClientSessionIdentifier;
+use crate::client::{client_session_identifier::ClientSessionIdentifier, ClientInstanceId};
 use crate::client_repository::ClientRepository;
 use crate::types::default_server_id;
 
@@ -220,6 +220,8 @@ pub enum ClientStateOperation {
         #[serde(default = "default_server_id")]
         server_id: String,
         session_id: ClientSessionIdentifier,
+        #[serde(default)]
+        client_instance_id: ClientInstanceId,
         #[serde(with = "ip_addr_string")]
         real_ip: IpAddr,
         #[serde(with = "socket_addr_string")]
@@ -236,11 +238,15 @@ pub enum ClientStateOperation {
         #[serde(default = "default_server_id")]
         server_id: String,
         session_id: ClientSessionIdentifier,
+        #[serde(default)]
+        client_instance_id: ClientInstanceId,
     },
     UpdateGlobalState {
         #[serde(default = "default_server_id")]
         server_id: String,
         session_id: ClientSessionIdentifier,
+        #[serde(default)]
+        client_instance_id: ClientInstanceId,
         sender_session_id: Option<ClientSessionIdentifier>,
         delta: ClientGlobalStateDelta,
     },
@@ -253,6 +259,20 @@ impl ClientStateOperation {
             ClientStateOperation::AddClient { session_id, .. } => Some(*session_id),
             ClientStateOperation::RemoveClient { session_id, .. } => Some(*session_id),
             ClientStateOperation::UpdateGlobalState { session_id, .. } => Some(*session_id),
+        }
+    }
+
+    pub fn client_instance_id(&self) -> ClientInstanceId {
+        match self {
+            ClientStateOperation::AddClient {
+                client_instance_id, ..
+            }
+            | ClientStateOperation::RemoveClient {
+                client_instance_id, ..
+            }
+            | ClientStateOperation::UpdateGlobalState {
+                client_instance_id, ..
+            } => *client_instance_id,
         }
     }
 
@@ -294,37 +314,59 @@ impl ClientStateLogEntry {
     /// Convert this log entry into the protobuf `Message` that should be
     /// sent to a subscriber.
     ///
-    /// * `AddClient` → `UserState` snapshot of the new client
-    /// * `RemoveClient` → `UserRemove` message
-    /// * `UpdateGlobalState` → `UserState` delta (only changed fields)
+    /// * `AddClient` -> `UserState` snapshot of the new client
+    /// * `RemoveClient` -> `UserRemove` message
+    /// * `UpdateGlobalState` -> `UserState` delta (only changed fields)
     pub async fn to_message(&self, repo: &ClientRepository) -> Option<crate::messages::Message> {
         match &self.op {
             ClientStateOperation::AddClient {
                 server_id,
                 session_id,
+                client_instance_id,
                 ..
             } => {
                 let client = repo.get_client_in_server(server_id, *session_id).await?;
+                if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
+                    return None;
+                }
                 let us: crate::messages::encoder::UserState =
                     client.build_user_state_for_broadcast();
                 Some(crate::messages::Message::UserState(us.into()))
             }
-            ClientStateOperation::RemoveClient { session_id, .. } => Some(
-                crate::messages::encoder::UserRemove {
-                    session: u32::from(*session_id),
-                    actor: None,
-                    reason: None,
-                    ban: Some(false),
-                }
-                .into(),
-            ),
-            ClientStateOperation::UpdateGlobalState {
-                server_id: _,
+            ClientStateOperation::RemoveClient {
+                server_id,
                 session_id,
+                ..
+            } => {
+                if repo
+                    .get_client_in_server(server_id, *session_id)
+                    .await
+                    .is_some()
+                {
+                    return None;
+                }
+                Some(
+                    crate::messages::encoder::UserRemove {
+                        session: u32::from(*session_id),
+                        actor: None,
+                        reason: None,
+                        ban: Some(false),
+                    }
+                    .into(),
+                )
+            }
+            ClientStateOperation::UpdateGlobalState {
+                server_id,
+                session_id,
+                client_instance_id,
                 sender_session_id,
                 delta,
             } => {
                 if delta.is_empty() {
+                    return None;
+                }
+                let client = repo.get_client_in_server(server_id, *session_id).await?;
+                if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
                     return None;
                 }
                 let mut us = crate::messages::encoder::UserState {
@@ -436,6 +478,7 @@ mod tests {
             op: ClientStateOperation::AddClient {
                 server_id: default_server_id(),
                 session_id: ClientSessionIdentifier::new(1, 42).unwrap(),
+                client_instance_id: 99,
                 real_ip: "203.0.113.17".parse().unwrap(),
                 tcp_addr: "203.0.113.17:64738".parse().unwrap(),
                 udp_addr: Some("203.0.113.17:64739".parse().unwrap()),
@@ -461,6 +504,7 @@ mod tests {
             ClientStateOperation::AddClient {
                 server_id,
                 session_id,
+                client_instance_id,
                 real_ip,
                 tcp_addr,
                 udp_addr,
@@ -474,6 +518,7 @@ mod tests {
                     u32::from(session_id),
                     u32::from(ClientSessionIdentifier::new(1, 42).unwrap())
                 );
+                assert_eq!(client_instance_id, 99);
                 assert_eq!(real_ip, "203.0.113.17".parse::<IpAddr>().unwrap());
                 assert_eq!(
                     tcp_addr,

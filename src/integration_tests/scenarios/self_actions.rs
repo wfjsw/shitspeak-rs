@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::acl::ACLPermissions;
+use crate::acl::{ACLPermissions, ACL};
 use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
 use crate::messages::encoder::UserState;
 use crate::messages::Message;
@@ -142,6 +142,78 @@ async fn client_suppress_update_is_denied() {
         )
         .await;
     assert!(denied.is_some(), "Client suppress updates should be denied");
+}
+
+#[tokio::test]
+async fn mute_deafen_user_can_clear_own_server_mute_deaf_and_suppress() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![ACL {
+                user_id: None,
+                group: Some("all".to_owned()),
+                apply_here: true,
+                apply_subs: true,
+                allow: ACLPermissions::MuteDeafen.into(),
+                deny: enumflags2::BitFlags::empty(),
+            }],
+        )
+        .await
+        .unwrap();
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let live_alice = server
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("live alice");
+    {
+        let mut gs = live_alice.write_global_state_direct();
+        gs.set_mute(true);
+        gs.set_deaf(true);
+        gs.set_suppress(true);
+    }
+
+    let mut state = UserState::default();
+    state.session = Some(alice.server_session);
+    state.mute = Some(false);
+    state.deaf = Some(false);
+    state.suppress = Some(false);
+    alice.send(state.into()).await;
+
+    let cleared = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice.session_id)
+                        && us.mute == Some(false)
+                        && us.deaf == Some(false)
+                        && us.suppress == Some(false))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        cleared.is_some(),
+        "MuteDeafen should allow clearing own server mute/deaf/suppress"
+    );
 }
 
 /// Checks that comment updates are advertised by blob hash and retrievable.

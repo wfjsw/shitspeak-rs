@@ -12,11 +12,12 @@ use tokio_rustls::server::TlsStream;
 use crate::{
     client::{
         client_session_identifier::ClientSessionIdentifier,
+        random_client_instance_id,
         state_log::{
             ClientGlobalStateDelta, ClientStateBroadcastPayload, ClientStateLogEntry,
             ClientStateOperation,
         },
-        Client,
+        Client, ClientInstanceId,
     },
     constants::MAX_LOCAL_SESSION_ID,
     types::{default_server_id, ScopedChannelId, ScopedSessionId, DEFAULT_SERVER_ID},
@@ -272,6 +273,43 @@ impl ClientRepository {
             .insert(local_session_id);
     }
 
+    fn allocate_client_instance_id(register: &ClientRegister) -> ClientInstanceId {
+        for _ in 0..1024 {
+            let candidate = random_client_instance_id();
+            if !Self::client_instance_id_collides(register, candidate) {
+                return candidate;
+            }
+        }
+
+        panic!("failed to allocate unique client instance id after repeated collisions");
+    }
+
+    fn client_instance_id_collides(register: &ClientRegister, candidate: ClientInstanceId) -> bool {
+        candidate == 0
+            || register
+                .local_clients
+                .values()
+                .any(|client| client.client_instance_id() == candidate)
+            || register
+                .remote_clients
+                .values()
+                .flat_map(|clients| clients.values())
+                .any(|client| client.client_instance_id() == candidate)
+            || register
+                .local_log
+                .iter()
+                .any(|entry| entry.op.client_instance_id() == candidate)
+            || register
+                .remote_logs
+                .values()
+                .flat_map(|log| log.iter())
+                .any(|entry| entry.op.client_instance_id() == candidate)
+            || register
+                .pending_remote_ops
+                .iter()
+                .any(|(entry, _)| entry.op.client_instance_id() == candidate)
+    }
+
     pub async fn move_local_client_to_server(
         &self,
         old_server_id: &str,
@@ -367,8 +405,9 @@ impl ClientRepository {
 
         let id = self.allocate_local_session_id(&server_id);
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
+        let client_instance_id = Self::allocate_client_instance_id(&register);
         let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
-        let client = Client::new_local_in_server(
+        let client = Client::new_local_in_server_with_instance_id(
             server_id,
             client_identifier,
             real_ip_address,
@@ -376,6 +415,7 @@ impl ClientRepository {
             udp_address,
             local_address,
             connection,
+            client_instance_id,
         );
 
         let client = Arc::new(client);
@@ -437,14 +477,16 @@ impl ClientRepository {
 
         let id = self.allocate_local_session_id(&server_id);
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
+        let client_instance_id = Self::allocate_client_instance_id(&register);
         let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
-        let client = Client::new_web_gateway_in_server(
+        let client = Client::new_web_gateway_in_server_with_instance_id(
             server_id,
             client_identifier,
             real_ip_address,
             tcp_address,
             local_address,
             outbound_tx,
+            client_instance_id,
         );
 
         let client = Arc::new(client);
@@ -476,14 +518,16 @@ impl ClientRepository {
 
         let id = self.allocate_local_session_id(&server_id);
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
+        let client_instance_id = Self::allocate_client_instance_id(&register);
         let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
-        let client = Client::new_moq_gateway_in_server(
+        let client = Client::new_moq_gateway_in_server_with_instance_id(
             server_id,
             client_identifier,
             real_ip_address,
             tcp_address,
             local_address,
             outbound_tx,
+            client_instance_id,
         );
 
         let client = Arc::new(client);
@@ -529,6 +573,7 @@ impl ClientRepository {
             ClientStateOperation::AddClient {
                 server_id: server_id.to_owned(),
                 session_id: id,
+                client_instance_id: client.client_instance_id(),
                 real_ip: client.get_real_ip_address(),
                 tcp_addr: client.get_tcp_address(),
                 udp_addr: client.get_udp_address(),
@@ -553,6 +598,7 @@ impl ClientRepository {
         let scoped_id = ScopedSessionId::new(server_id.clone(), id);
 
         // Snapshot fields before moving into the map
+        let client_instance_id = client.client_instance_id();
         let real_ip = client.get_real_ip_address();
         let tcp_addr = client.get_tcp_address();
         let udp_addr = client.get_udp_address();
@@ -582,6 +628,7 @@ impl ClientRepository {
             ClientStateOperation::AddClient {
                 server_id,
                 session_id: id,
+                client_instance_id,
                 real_ip,
                 tcp_addr,
                 udp_addr,
@@ -666,6 +713,7 @@ impl ClientRepository {
                 ClientStateOperation::RemoveClient {
                     server_id: server_id.to_owned(),
                     session_id: id,
+                    client_instance_id: client.client_instance_id(),
                 },
                 None,
             )
@@ -680,20 +728,21 @@ impl ClientRepository {
             panic!("Not supposed to clear clients from the local node");
         }
 
-        let (ids_to_remove, published): (Vec<ScopedSessionId>, Vec<bool>) = {
+        let removals: Vec<(ScopedSessionId, bool, u64)> = {
             let mut register = self.register.write().await;
 
             // Collect published status before removing from map
             let result = match register.remote_clients.get(&node_id) {
-                Some(remote_map) => {
-                    let ids: Vec<ScopedSessionId> = remote_map.keys().cloned().collect();
-                    let pub_flags: Vec<bool> = ids
-                        .iter()
-                        .filter_map(|id| remote_map.get(id))
-                        .map(|c| c.is_published())
-                        .collect();
-                    (ids, pub_flags)
-                }
+                Some(remote_map) => remote_map
+                    .iter()
+                    .map(|(id, client)| {
+                        (
+                            id.clone(),
+                            client.is_published(),
+                            client.client_instance_id(),
+                        )
+                    })
+                    .collect(),
                 None => return,
             };
 
@@ -706,12 +755,13 @@ impl ClientRepository {
         };
 
         // ── Log each removal (only if client was published) ─────────────
-        for (id, was_published) in ids_to_remove.iter().zip(published.iter()) {
-            if *was_published {
+        for (id, was_published, client_instance_id) in removals {
+            if was_published {
                 self.commit_operation(
                     ClientStateOperation::RemoveClient {
                         server_id: id.server_id().to_owned(),
                         session_id: id.session_id(),
+                        client_instance_id,
                     },
                     None,
                 )
@@ -1195,6 +1245,16 @@ impl ClientRepository {
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
     ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
+        self.replay_since_in_server_filtered(server_id, last_seen, None)
+            .await
+    }
+
+    async fn replay_since_in_server_filtered(
+        &self,
+        server_id: &str,
+        last_seen: &HashMap<u16, u64>,
+        _skip_lifecycle_for: Option<ClientSessionIdentifier>,
+    ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
         let register = self.register.read().await;
 
         // Check that no log has been pruned past the requested version
@@ -1477,6 +1537,7 @@ impl ClientRepository {
             ClientStateOperation::AddClient {
                 server_id,
                 session_id,
+                client_instance_id,
                 real_ip,
                 tcp_addr,
                 udp_addr,
@@ -1503,6 +1564,7 @@ impl ClientRepository {
                         *local_addr,
                         cert_hash.clone(),
                         *login_time,
+                        *client_instance_id,
                     ));
                     {
                         let mut gs = client.write_global_state_direct();
@@ -1518,20 +1580,38 @@ impl ClientRepository {
             ClientStateOperation::RemoveClient {
                 server_id,
                 session_id,
+                client_instance_id,
             } => {
                 // Remote clients are not in the channel/listener index, so
                 // no index cleanup is necessary here.
                 let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
                 if let Some(remote_map) = register.remote_clients.get_mut(&remote_node) {
-                    remote_map.remove(&scoped_id);
-                    if remote_map.is_empty() {
-                        register.remote_clients.remove(&remote_node);
+                    let should_remove = remote_map
+                        .get(&scoped_id)
+                        .map(|client| {
+                            *client_instance_id == 0
+                                || client.client_instance_id() == *client_instance_id
+                        })
+                        .unwrap_or(false);
+                    if should_remove {
+                        remote_map.remove(&scoped_id);
+                        if remote_map.is_empty() {
+                            register.remote_clients.remove(&remote_node);
+                        }
+                    } else {
+                        tracing::trace!(
+                            remote_node,
+                            session = u32::from(*session_id),
+                            client_instance_id,
+                            "remote RemoveClient ignored: client instance mismatch"
+                        );
                     }
                 }
             }
             ClientStateOperation::UpdateGlobalState {
                 server_id,
                 session_id,
+                client_instance_id,
                 sender_session_id: _,
                 delta,
             } => {
@@ -1541,8 +1621,19 @@ impl ClientRepository {
                 let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
                 let client = register.get(&scoped_id, remote_node).cloned();
                 if let Some(client) = client {
-                    let mut gs = client.write_global_state_direct();
-                    apply_delta_to_global_state(&mut gs, delta);
+                    if *client_instance_id == 0
+                        || client.client_instance_id() == *client_instance_id
+                    {
+                        let mut gs = client.write_global_state_direct();
+                        apply_delta_to_global_state(&mut gs, delta);
+                    } else {
+                        tracing::trace!(
+                            remote_node,
+                            session = u32::from(*session_id),
+                            client_instance_id,
+                            "remote UpdateGlobalState ignored: client instance mismatch"
+                        );
+                    }
                 }
             }
         }
@@ -1793,6 +1884,7 @@ mod tests {
             op: ClientStateOperation::AddClient {
                 server_id: "alpha".to_string(),
                 session_id: remote_session,
+                client_instance_id: 7,
                 real_ip,
                 tcp_addr,
                 udp_addr: None,
@@ -1810,6 +1902,7 @@ mod tests {
             op: ClientStateOperation::UpdateGlobalState {
                 server_id: "beta".to_string(),
                 session_id: remote_session,
+                client_instance_id: 7,
                 sender_session_id: None,
                 delta: ClientGlobalStateDelta {
                     display_name: Some(Some("beta user".to_string())),
@@ -1837,6 +1930,86 @@ mod tests {
             .get_client_in_server("alpha", remote_session)
             .await
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_remove_client_does_not_remove_reused_session_instance() {
+        let repo = ClientRepository::new(1, 128);
+        let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+        let live_instance_id = 22;
+
+        let client = Arc::new(Client::new_remote_in_server(
+            crate::types::default_server_id(),
+            remote_session,
+            real_ip,
+            tcp_addr,
+            None,
+            local_addr,
+            None,
+            Utc::now(),
+            live_instance_id,
+        ));
+        repo.add_remote_client(remote_session, client).await;
+
+        let stale_remove = Arc::new(ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::RemoveClient {
+                server_id: crate::types::default_server_id(),
+                session_id: remote_session,
+                client_instance_id: 11,
+            },
+        });
+
+        repo.apply_remote_operation(Arc::clone(&stale_remove), 0)
+            .await
+            .unwrap();
+        assert!(repo
+            .get_client_in_server(&crate::types::default_server_id(), remote_session)
+            .await
+            .is_some());
+        assert!(stale_remove.to_message(&repo).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn client_instance_id_collision_check_covers_live_clients_and_retained_logs() {
+        let repo = ClientRepository::new(1, 128);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30003);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        let client = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, tx)
+            .await;
+        let instance_id = client.client_instance_id();
+
+        {
+            let register = repo.register.read().await;
+            assert!(ClientRepository::client_instance_id_collides(
+                &register,
+                instance_id
+            ));
+        }
+
+        repo.publish_client_in_server("alpha", client.get_session_id())
+            .await;
+        repo.remove_client_in_server("alpha", client.get_session_id())
+            .await;
+
+        let register = repo.register.read().await;
+        assert!(ClientRepository::client_instance_id_collides(
+            &register,
+            instance_id
+        ));
+        let non_colliding = (1..)
+            .find(|candidate| !ClientRepository::client_instance_id_collides(&register, *candidate))
+            .expect("available non-colliding client instance id");
+        assert_ne!(non_colliding, 0);
     }
 }
 

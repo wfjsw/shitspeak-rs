@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use crate::s2s::application::error::ApplicationError;
 use crate::s2s::application::proto::{self, VoiceIntent, VOICE_SERVICE_TAG};
-use crate::s2s::overlay::OverlayNetwork;
+use crate::s2s::overlay::{OverlayNetwork, RoutingMetric};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
@@ -20,6 +20,7 @@ use crate::types::NodeIdentifier;
 /// critical) and run on the high-priority receiver queue.
 pub const VOICE_LEVEL: ServiceLevel = ServiceLevel::BestEffort;
 pub const VOICE_CLASS: MessageClass = MessageClass::HighPriority;
+pub const VOICE_ROUTING_METRIC: RoutingMetric = RoutingMetric::ConversationalQuality;
 
 /// Narrow send-only interface used by the voice service. Production
 /// impl: [`OverlayVoiceTransport`]. Test impl: see the unit tests below.
@@ -49,10 +50,11 @@ pub struct OverlayVoiceTransport {
 impl VoiceTransport for OverlayVoiceTransport {
     async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
-            .send_unicast_with_transit_processing(
+            .send_unicast_with_routing_metric_and_transit_processing(
                 dst,
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
+                VOICE_ROUTING_METRIC,
                 VOICE_CLASS,
                 body,
             )
@@ -69,10 +71,11 @@ impl VoiceTransport for OverlayVoiceTransport {
             return Ok(());
         }
         self.overlay
-            .send_multicast_with_transit_processing(
+            .send_multicast_with_routing_metric_and_transit_processing(
                 dsts,
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
+                VOICE_ROUTING_METRIC,
                 VOICE_CLASS,
                 body,
             )
@@ -82,9 +85,10 @@ impl VoiceTransport for OverlayVoiceTransport {
 
     async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
-            .send_broadcast_with_transit_processing(
+            .send_broadcast_with_routing_metric_and_transit_processing(
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
+                VOICE_ROUTING_METRIC,
                 VOICE_CLASS,
                 body,
             )

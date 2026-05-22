@@ -37,6 +37,9 @@ pub async fn handle_request_blob(
         else {
             continue;
         };
+        if !crate::client::visibility::can_view_user(server, sender, &client).await {
+            continue;
+        }
 
         let (texture_hash, texture_url) = {
             let gs = client.read_global_state();
@@ -104,6 +107,9 @@ pub async fn handle_request_blob(
         else {
             continue;
         };
+        if !crate::client::visibility::can_view_user(server, sender, &client).await {
+            continue;
+        }
 
         let (comment_hash, comment_url) = {
             let gs = client.read_global_state();

@@ -28,7 +28,7 @@
 //! user changes channels.  The actual ACL evaluation logic lives in `acl.rs`;
 //! the repository only drives invalidation and cache storage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -238,6 +238,8 @@ struct Snapshot {
     version: u64,
     #[serde(default)]
     versions: HashMap<String, u64>,
+    #[serde(default)]
+    history_freshness: HashMap<String, i64>,
     saved_at: i64,
     node_id: u16,
     channels: Vec<SnapshotChannel>,
@@ -280,6 +282,7 @@ pub struct ChannelRepository {
     client_repo: ParkingMutex<Option<Arc<crate::client_repository::ClientRepository>>>,
     /// Unix timestamp when the last snapshot compaction succeeded.
     last_snapshot_at: AtomicI64,
+    history_freshness: ParkingRwLock<HashMap<String, i64>>,
 }
 
 // ─── public API ───────────────────────────────────────────────────────────────
@@ -316,6 +319,7 @@ impl ChannelRepository {
             tx,
             client_repo: ParkingMutex::new(None),
             last_snapshot_at: AtomicI64::new(chrono::Utc::now().timestamp()),
+            history_freshness: ParkingRwLock::new(HashMap::new()),
         })
     }
 
@@ -337,28 +341,32 @@ impl ChannelRepository {
         let wal_path = storage_dir.join("channels.wal.jsonl");
 
         // ── 1. Load snapshot ─────────────────────────────────────────────
-        let (mut channels, mut versions) = match tokio::fs::read(&snapshot_path).await {
-            Ok(data) => {
-                let snap: Snapshot =
-                    serde_json::from_slice(&data).map_err(|e| ChannelRepoError::WalCorrupt {
-                        line: 0,
-                        reason: format!("snapshot corrupt: {e}"),
+        let (mut channels, mut versions, mut history_freshness) =
+            match tokio::fs::read(&snapshot_path).await {
+                Ok(data) => {
+                    let snap: Snapshot = serde_json::from_slice(&data).map_err(|e| {
+                        ChannelRepoError::WalCorrupt {
+                            line: 0,
+                            reason: format!("snapshot corrupt: {e}"),
+                        }
                     })?;
-                let mut map: HashMap<String, HashMap<u32, Channel>> = HashMap::new();
-                for scoped in snap.channels {
-                    map.entry(scoped.server_id)
-                        .or_default()
-                        .insert(scoped.channel.id, scoped.channel);
+                    let mut map: HashMap<String, HashMap<u32, Channel>> = HashMap::new();
+                    for scoped in snap.channels {
+                        map.entry(scoped.server_id)
+                            .or_default()
+                            .insert(scoped.channel.id, scoped.channel);
+                    }
+                    let mut versions = snap.versions;
+                    if versions.is_empty() {
+                        versions.insert(DEFAULT_SERVER_ID.to_owned(), snap.version);
+                    }
+                    (map, versions, snap.history_freshness)
                 }
-                let mut versions = snap.versions;
-                if versions.is_empty() {
-                    versions.insert(DEFAULT_SERVER_ID.to_owned(), snap.version);
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    (HashMap::new(), HashMap::new(), HashMap::new())
                 }
-                (map, versions)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), HashMap::new()),
-            Err(e) => return Err(ChannelRepoError::WalIo(e)),
-        };
+                Err(e) => return Err(ChannelRepoError::WalIo(e)),
+            };
 
         // ── 2. Replay WAL ────────────────────────────────────────────────
         let wal_contents = match tokio::fs::read_to_string(&wal_path).await {
@@ -386,6 +394,10 @@ impl ChannelRepository {
                 }
             };
             wal_entry_count += 1;
+            history_freshness
+                .entry(op.server_id.clone())
+                .and_modify(|freshness| *freshness = (*freshness).max(op.timestamp))
+                .or_insert(op.timestamp);
 
             // Keep an in-memory bounded replay window for S2S catch-up.
             log_entries.push_back(Arc::new(op.clone()));
@@ -441,6 +453,7 @@ impl ChannelRepository {
             tx,
             client_repo: ParkingMutex::new(None),
             last_snapshot_at: AtomicI64::new(chrono::Utc::now().timestamp()),
+            history_freshness: ParkingRwLock::new(history_freshness),
         }))
     }
 
@@ -452,6 +465,24 @@ impl ChannelRepository {
 
     pub fn current_version_in_server(&self, server_id: &str) -> u64 {
         self.versions.read().get(server_id).copied().unwrap_or(0)
+    }
+
+    pub fn latest_timestamp_in_server(&self, server_id: &str) -> i64 {
+        let logged = self
+            .log
+            .read()
+            .iter()
+            .filter(|op| op.server_id == server_id)
+            .map(|op| op.timestamp)
+            .max()
+            .unwrap_or(0);
+        let snapshot = self
+            .history_freshness
+            .read()
+            .get(server_id)
+            .copied()
+            .unwrap_or(0);
+        logged.max(snapshot)
     }
 
     pub(crate) fn channel_acl_generation(&self) -> u64 {
@@ -665,6 +696,46 @@ impl ChannelRepository {
             moved += 1;
         }
         moved
+    }
+
+    pub async fn move_local_clients_out_of_missing_channels_in_server(
+        &self,
+        server_id: &str,
+        valid_channel_ids: &HashSet<u32>,
+        channel_version: u64,
+    ) -> usize {
+        let Some(client_repo) = self.client_repo.lock().clone() else {
+            return 0;
+        };
+
+        let mut repaired = 0;
+        for client in client_repo.get_local_clients_in_server(server_id).await {
+            let missing_listeners: Vec<u32> = client
+                .get_listening_channel_ids()
+                .into_iter()
+                .filter(|channel_id| !valid_channel_ids.contains(channel_id))
+                .collect();
+            let missing_current = !valid_channel_ids.contains(&client.get_current_channel_id());
+            if !missing_current && missing_listeners.is_empty() {
+                continue;
+            }
+
+            {
+                let mut state = client.write_global_state_as(
+                    &client_repo,
+                    Some(client.get_session_id()),
+                    Some(channel_version),
+                );
+                if missing_current {
+                    state.set_current_channel_id(0);
+                }
+                for channel_id in missing_listeners {
+                    state.unlisten_channel(channel_id);
+                }
+            }
+            repaired += 1;
+        }
+        repaired
     }
 
     pub async fn get_all(&self) -> Vec<Channel> {
@@ -1430,6 +1501,7 @@ impl ChannelRepository {
         let wal_tmp = dir.join("channels.wal.jsonl.tmp");
 
         let versions = self.versions.read().clone();
+        let history_freshness = self.history_freshness.read().clone();
         let version = versions.get(DEFAULT_SERVER_ID).copied().unwrap_or_default();
         let channels: Vec<SnapshotChannel> = self
             .channels
@@ -1450,6 +1522,7 @@ impl ChannelRepository {
         let snap = Snapshot {
             version,
             versions,
+            history_freshness,
             saved_at: chrono::Utc::now().timestamp(),
             node_id: self.node_id,
             channels,
@@ -1688,8 +1761,13 @@ impl ChannelRepository {
         version: u64,
         channels_snapshot: Vec<Channel>,
     ) -> Result<(), ChannelRepoError> {
-        self.install_s2s_snapshot_in_server(DEFAULT_SERVER_ID, version, channels_snapshot)
-            .await
+        self.install_s2s_snapshot_in_server(
+            DEFAULT_SERVER_ID,
+            version,
+            channels_snapshot,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
     }
 
     pub async fn install_s2s_snapshot_in_server(
@@ -1697,24 +1775,47 @@ impl ChannelRepository {
         server_id: &str,
         version: u64,
         channels_snapshot: Vec<Channel>,
+        freshness: i64,
     ) -> Result<(), ChannelRepoError> {
-        {
-            let mut all_channels = self.channels.write();
-            let channels = all_channels.entry(server_id.to_owned()).or_default();
-            channels.clear();
-            for channel in channels_snapshot {
-                channels.insert(channel.id, channel);
+        let valid_channel_ids = {
+            let mut ids = HashSet::new();
+            {
+                let mut all_channels = self.channels.write();
+                let channels = all_channels.entry(server_id.to_owned()).or_default();
+                channels.clear();
+                for channel in channels_snapshot {
+                    channels.insert(channel.id, channel);
+                }
+                ensure_root_channel(channels);
+                ids.extend(channels.keys().copied());
+                self.versions.write().insert(server_id.to_owned(), version);
+                self.log.write().retain(|op| op.server_id != server_id);
             }
-            ensure_root_channel(channels);
-            self.versions.write().insert(server_id.to_owned(), version);
-            self.log.write().retain(|op| op.server_id != server_id);
-        }
+            ids
+        };
+        self.history_freshness
+            .write()
+            .insert(server_id.to_owned(), freshness);
         self.channel_acl_generation.fetch_add(1, Ordering::AcqRel);
         self.acl_cache.clear_sync();
 
         let client_repo = self.client_repo.lock().clone();
         if let Some(client_repo) = client_repo {
             client_repo.drain_pending_ops(server_id, version).await;
+        }
+        let repaired = self
+            .move_local_clients_out_of_missing_channels_in_server(
+                server_id,
+                &valid_channel_ids,
+                version,
+            )
+            .await;
+        if repaired > 0 {
+            tracing::trace!(
+                server_id,
+                repaired,
+                "repaired local clients after s2s channel snapshot install"
+            );
         }
 
         if self.storage_dir.is_some() {
@@ -1868,6 +1969,11 @@ impl ChannelRepository {
             }
             op
         };
+        self.history_freshness
+            .write()
+            .entry(op.server_id.clone())
+            .and_modify(|freshness| *freshness = (*freshness).max(op.timestamp))
+            .or_insert(op.timestamp);
 
         if let Some(ref wal_mutex) = self.wal_file {
             let mut line =
@@ -2110,6 +2216,8 @@ fn is_descendant(channels: &HashMap<u32, Channel>, candidate: u32, ancestor_id: 
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
     use super::*;
 
     fn tuning() -> ChannelRepoTuning {
@@ -2183,5 +2291,66 @@ mod tests {
         );
         assert_eq!(repo.len_in_server("alpha").await, 2);
         assert_eq!(repo.len_in_server("beta").await, 2);
+    }
+
+    #[tokio::test]
+    async fn s2s_snapshot_install_repairs_clients_in_removed_channels() {
+        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let client_repo = Arc::new(crate::client_repository::ClientRepository::new(1, 128));
+        repo.set_client_repo(client_repo.clone()).await;
+
+        repo.create_channel(Channel::new(7, "kept", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(8, "removed", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client = client_repo
+            .allocate_web_client(peer.ip(), peer, local, tx)
+            .await;
+        {
+            let mut state = client.write_global_state_as(
+                &client_repo,
+                Some(client.get_session_id()),
+                Some(repo.current_version()),
+            );
+            state.set_current_channel_id(8);
+            state.listen_channel(8);
+            state.listen_channel(7);
+        }
+
+        assert_eq!(
+            client_repo.get_local_clients_in_channel(8).await.len(),
+            1,
+            "precondition: local channel index should point at removed channel"
+        );
+        assert_eq!(
+            client_repo.get_local_listeners_for_channel(8).await.len(),
+            1,
+            "precondition: local listener index should point at removed channel"
+        );
+
+        repo.install_s2s_snapshot(3, vec![Channel::new(7, "kept", 0, 0, Some(0))])
+            .await
+            .unwrap();
+
+        assert!(repo.get_channel(8).await.is_none());
+        assert_eq!(client.get_current_channel_id(), 0);
+        assert!(!client.get_listening_channel_ids().contains(&8));
+        assert!(client.get_listening_channel_ids().contains(&7));
+        assert_eq!(client_repo.get_local_clients_in_channel(8).await.len(), 0);
+        assert_eq!(client_repo.get_local_clients_in_channel(0).await.len(), 1);
+        assert_eq!(
+            client_repo.get_local_listeners_for_channel(8).await.len(),
+            0
+        );
+        assert_eq!(
+            client_repo.get_local_listeners_for_channel(7).await.len(),
+            1
+        );
     }
 }

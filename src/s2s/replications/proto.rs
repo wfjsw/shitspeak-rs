@@ -165,6 +165,7 @@ mod tests {
                 src_node: 2,
                 since_version: 5,
                 chunk_token: 0,
+                force_snapshot: false,
             }),
         );
         let bytes = encode(&req).unwrap();
@@ -188,6 +189,10 @@ mod tests {
                 has_more: true,
                 next_chunk_token: 1,
                 too_old_use_snapshot: false,
+                history_version: 7,
+                history_freshness: 123,
+                runtime_started_at: 456,
+                history_node: 2,
             }),
         );
         let bytes = encode(&resp).unwrap();

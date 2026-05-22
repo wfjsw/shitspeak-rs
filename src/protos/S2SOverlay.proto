@@ -56,6 +56,7 @@ message LinkAdvert {
   uint64 jitter_us       = 3;
   uint64 throughput_bps  = 4;
   uint32 transports_mask = 5;  // bitmap of TransportKind values; 1<<Tcp etc.
+  uint32 loss_ppm        = 6;  // EWMA packet loss estimate, parts per million.
 }
 
 // Address entry (kept compatible with Phase 1's existing AddressEntry).
@@ -92,9 +93,10 @@ message LsdbSyncResp {
 }
 
 // Application-data envelope. Routed across the overlay using per-service-
-// level routing tables. Forwarders consume `dsts` (subtract self, add to
-// `path_trace`), pick next hops, and re-fanout. `service_tag` lets the
-// receiver dispatch to the right handler (replications, etc.).
+// level routing tables unless `route_metric` requests an upper-layer
+// override. Forwarders consume `dsts` (subtract self, add to `path_trace`),
+// pick next hops, and re-fanout. `service_tag` lets the receiver dispatch to
+// the right handler (replications, etc.).
 message OverlayData {
   uint32 src              = 1;
   repeated uint32 dsts    = 2;   // remaining destinations after this hop
@@ -104,4 +106,5 @@ message OverlayData {
   uint32 message_class    = 6;   // matches s2s::transport::MessageClass
   bytes  payload          = 7;
   bool   process_on_transit = 8; // deliver to local service on transit hops too
+  uint32 route_metric     = 9;   // 0=per-service default, 1=conversational
 }

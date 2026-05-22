@@ -37,6 +37,7 @@ pub struct NeighborSnapshot {
     pub jitter_us: u64,
     pub throughput_bps: u64,
     pub transports_mask: u32,
+    pub loss_ppm: u32,
 }
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ struct NeighborState {
     last_ack_at: Option<Instant>,
     miss_count: u32,
     is_up: bool,
+    loss_ppm: f64,
     /// Pending pings by nonce -> when sent (for RTT calculation on ack).
     pending: HashMap<u64, Instant>,
 }
@@ -56,9 +58,15 @@ impl NeighborState {
             last_ack_at: None,
             miss_count: 0,
             is_up: false,
+            loss_ppm: 0.0,
             pending: HashMap::new(),
         }
     }
+}
+
+fn record_loss_sample(st: &mut NeighborState, loss_ppm: f64) {
+    const ALPHA: f64 = 0.2;
+    st.loss_ppm += ALPHA * (loss_ppm - st.loss_ppm);
 }
 
 /// Direct-neighbor table.
@@ -150,6 +158,7 @@ impl NeighborMonitor {
                 jitter_us,
                 throughput_bps,
                 transports_mask,
+                loss_ppm: st.loss_ppm.clamp(0.0, 1_000_000.0).round() as u32,
             });
         }
         out.sort_by_key(|n| n.node_id);
@@ -167,9 +176,24 @@ impl NeighborMonitor {
 
     /// Record an outbound Hello so we can match its ack later.
     pub fn record_outbound_ping(&self, dst: NodeIdentifier, nonce: u64) {
+        let now = Instant::now();
+        let cutoff = now
+            .checked_sub(self.cfg.hello_dead_interval())
+            .unwrap_or(now);
         let mut g = self.state.lock();
         let st = g.entry(dst).or_insert_with(NeighborState::new);
-        st.pending.insert(nonce, Instant::now());
+        let expired = st
+            .pending
+            .iter()
+            .filter(|(_, sent)| **sent <= cutoff)
+            .count();
+        if expired > 0 {
+            st.pending.retain(|_, sent| *sent > cutoff);
+            for _ in 0..expired {
+                record_loss_sample(st, 1_000_000.0);
+            }
+        }
+        st.pending.insert(nonce, now);
     }
 
     /// Caller: inbound dispatcher when a `Hello` arrives. Updates
@@ -235,6 +259,9 @@ impl NeighborMonitor {
             // RTT calc — prefer the recorded ts_send (echoed) over our own
             // pending table since either is a valid round-trip measurement.
             let sent_at_instant: Option<Instant> = st.pending.remove(&nonce);
+            if sent_at_instant.is_some() {
+                record_loss_sample(st, 0.0);
+            }
             // Cap pending table size — drop stale entries occasionally.
             if st.pending.len() > 32 {
                 let cutoff = now - Duration::from_secs(60);

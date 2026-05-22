@@ -92,7 +92,7 @@ pub fn spawn_config_watcher(
             };
 
             // Check shutdown before reloading.
-            if matches!(shutdown.has_changed(), Ok(true)) {
+            if !matches!(shutdown.has_changed(), Ok(false)) {
                 tracing::info!("config watcher: shutdown received, stopping");
                 return;
             }
@@ -104,7 +104,7 @@ pub fn spawn_config_watcher(
             }
 
             // Check shutdown again after debounce.
-            if matches!(shutdown.has_changed(), Ok(true)) {
+            if !matches!(shutdown.has_changed(), Ok(false)) {
                 tracing::info!("config watcher: shutdown received, stopping");
                 return;
             }

@@ -45,6 +45,17 @@ const VOICE_TCP_QUEUE_CAPACITY: usize = 256;
 /// shifts left by 16), so bit 0 is free to use as a "set" marker.
 const PROTOCOL_VERSION_SET_BIT: u64 = 1;
 
+pub type ClientInstanceId = u64;
+
+pub(crate) fn random_client_instance_id() -> ClientInstanceId {
+    loop {
+        let id = rand::random::<ClientInstanceId>();
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +68,7 @@ pub enum ClientTransportKind {
 
 pub struct Client {
     session_id: ParkingRwLock<ClientSessionIdentifier>,
+    client_instance_id: ClientInstanceId,
     server_id: ParkingRwLock<String>,
 
     real_ip_address: IpAddr,
@@ -179,6 +191,28 @@ impl Client {
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
     ) -> Box<Self> {
+        Self::new_local_in_server_with_instance_id(
+            server_id,
+            session_id,
+            real_ip_address,
+            tcp_address,
+            udp_address,
+            local_address,
+            connection,
+            random_client_instance_id(),
+        )
+    }
+
+    pub(crate) fn new_local_in_server_with_instance_id(
+        server_id: String,
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        udp_address: Option<SocketAddr>,
+        local_address: SocketAddr,
+        connection: TlsStream<TcpStream>,
+        client_instance_id: ClientInstanceId,
+    ) -> Box<Self> {
         let (certificate_hash, certificate_chain, is_verified) = {
             let (_, tls_connection) = connection.get_ref();
             let certificate_chain = tls_connection
@@ -209,6 +243,7 @@ impl Client {
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
+            client_instance_id,
             server_id: ParkingRwLock::new(server_id),
             real_ip_address,
             tcp_address,
@@ -260,6 +295,7 @@ impl Client {
             local_address,
             outbound_tx,
             ClientTransportKind::WebRtc,
+            random_client_instance_id(),
         )
     }
 
@@ -271,6 +307,26 @@ impl Client {
         local_address: SocketAddr,
         outbound_tx: mpsc::Sender<Message>,
     ) -> Box<Self> {
+        Self::new_web_gateway_in_server_with_instance_id(
+            server_id,
+            session_id,
+            real_ip_address,
+            tcp_address,
+            local_address,
+            outbound_tx,
+            random_client_instance_id(),
+        )
+    }
+
+    pub(crate) fn new_web_gateway_in_server_with_instance_id(
+        server_id: String,
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: mpsc::Sender<Message>,
+        client_instance_id: ClientInstanceId,
+    ) -> Box<Self> {
         Self::new_web_gateway_with_kind_in_server(
             server_id,
             session_id,
@@ -279,6 +335,7 @@ impl Client {
             local_address,
             outbound_tx,
             ClientTransportKind::WebRtc,
+            client_instance_id,
         )
     }
 
@@ -290,6 +347,26 @@ impl Client {
         local_address: SocketAddr,
         outbound_tx: mpsc::Sender<Message>,
     ) -> Box<Self> {
+        Self::new_moq_gateway_in_server_with_instance_id(
+            server_id,
+            session_id,
+            real_ip_address,
+            tcp_address,
+            local_address,
+            outbound_tx,
+            random_client_instance_id(),
+        )
+    }
+
+    pub(crate) fn new_moq_gateway_in_server_with_instance_id(
+        server_id: String,
+        session_id: ClientSessionIdentifier,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        local_address: SocketAddr,
+        outbound_tx: mpsc::Sender<Message>,
+        client_instance_id: ClientInstanceId,
+    ) -> Box<Self> {
         Self::new_web_gateway_with_kind_in_server(
             server_id,
             session_id,
@@ -298,6 +375,7 @@ impl Client {
             local_address,
             outbound_tx,
             ClientTransportKind::Moq,
+            client_instance_id,
         )
     }
 
@@ -309,6 +387,7 @@ impl Client {
         local_address: SocketAddr,
         outbound_tx: mpsc::Sender<Message>,
         kind: ClientTransportKind,
+        client_instance_id: ClientInstanceId,
     ) -> Box<Self> {
         let now = Utc::now();
         let (voice_routing_tx, voice_routing_rx) =
@@ -318,6 +397,7 @@ impl Client {
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
+            client_instance_id,
             server_id: ParkingRwLock::new(server_id),
             real_ip_address,
             tcp_address,
@@ -369,6 +449,7 @@ impl Client {
             local_address,
             cert_hash,
             login_time,
+            random_client_instance_id(),
         )
     }
 
@@ -381,6 +462,7 @@ impl Client {
         local_address: SocketAddr,
         cert_hash: Option<Bytes>,
         login_time: DateTime<Utc>,
+        client_instance_id: ClientInstanceId,
     ) -> Box<Self> {
         let is_verified = cert_hash.is_some();
         let (voice_routing_tx, voice_routing_rx) =
@@ -390,6 +472,7 @@ impl Client {
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
+            client_instance_id,
             server_id: ParkingRwLock::new(server_id),
             real_ip_address,
             tcp_address,
@@ -490,6 +573,10 @@ impl Client {
 
     pub fn get_session_id(&self) -> ClientSessionIdentifier {
         *self.session_id.read()
+    }
+
+    pub fn client_instance_id(&self) -> ClientInstanceId {
+        self.client_instance_id
     }
 
     pub fn scoped_session_id(&self) -> ScopedSessionId {
@@ -944,6 +1031,7 @@ impl Client {
             repo,
             self.server_id(),
             self.get_session_id(),
+            self.client_instance_id(),
             sender_session_id,
             channel_version_dep,
         )

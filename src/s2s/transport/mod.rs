@@ -15,6 +15,7 @@ mod frame;
 mod identity;
 mod manager;
 mod metrics;
+mod public_ip;
 mod service_level;
 mod stream_io;
 mod tls;
@@ -24,6 +25,10 @@ mod integration_tests;
 
 pub use config::{TransportConfig, TransportTuning};
 pub use error::{ConfigError, SendError, TransportError};
+pub(crate) use manager::PeerAddressSnapshot;
 pub use manager::{ConnectionManager, Inbound, InboundMessage};
+pub(crate) use metrics::{
+    conversational_effective_delay_us, conversational_impairment, conversational_quality_score,
+};
 pub use metrics::{LinkMetrics, MetricsSnapshot};
 pub use service_level::{MessageClass, PeerAddress, ServiceLevel, TransportKind};

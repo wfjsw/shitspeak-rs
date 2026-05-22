@@ -23,11 +23,26 @@ use crate::types::NodeIdentifier;
 use super::super::error::OverlayError;
 use super::super::proto::{
     class_from_wire, class_to_wire, encode_message, level_from_wire, level_to_wire, node_from_wire,
-    node_to_wire, wrap, OverlayBody,
+    node_to_wire, route_metric_from_wire, route_metric_to_wire, wrap, OverlayBody,
 };
-use super::super::routing::{RoutingHandle, RoutingTables};
+use super::super::routing::{RoutingHandle, RoutingMetric, RoutingTables};
 use super::delivery;
 use super::ServiceRegistry;
+
+const FORWARD_PAYLOAD_LOG_BYTES: usize = 256;
+
+fn payload_hex_preview(payload: &[u8]) -> String {
+    let shown = payload.len().min(FORWARD_PAYLOAD_LOG_BYTES);
+    let mut out = String::with_capacity(shown * 2 + 24);
+    use std::fmt::Write as _;
+    for byte in &payload[..shown] {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    if shown < payload.len() {
+        let _ = write!(&mut out, "...(+{} bytes)", payload.len() - shown);
+    }
+    out
+}
 
 /// Build, encode, and dispatch an outbound `OverlayData` originated by
 /// the local node.
@@ -38,6 +53,7 @@ pub async fn originate(
     dsts: Vec<NodeIdentifier>,
     tag: u32,
     level: ServiceLevel,
+    routing_metric: RoutingMetric,
     class: MessageClass,
     body: Bytes,
     process_on_transit: bool,
@@ -51,6 +67,7 @@ pub async fn originate(
         message_class: class_to_wire(class),
         payload: body,
         process_on_transit,
+        route_metric: route_metric_to_wire(routing_metric),
     };
     forward_pb(
         transport, routing, self_id, data, class, /*is_originator=*/ true,
@@ -122,6 +139,7 @@ async fn forward_pb(
     is_originator: bool,
 ) -> Result<(), OverlayError> {
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
+    let routing_metric = route_metric_from_wire(data.route_metric).unwrap_or_default();
     let tables = routing.load();
 
     // Bucket dsts by next_hop.
@@ -134,7 +152,7 @@ async fn forward_pb(
         if dst == self_id {
             continue;
         }
-        let entry = match tables.lookup(dst, level) {
+        let entry = match tables.lookup_with_metric(dst, level, routing_metric) {
             Some(e) => e,
             None => {
                 if is_originator {
@@ -175,7 +193,36 @@ async fn forward_pb(
             message_class: data.message_class,
             payload: data.payload.clone(),
             process_on_transit: data.process_on_transit,
+            route_metric: data.route_metric,
         };
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let dsts: Vec<NodeIdentifier> = pb_msg
+                .dsts
+                .iter()
+                .filter_map(|dst| node_from_wire(*dst))
+                .collect();
+            let path_trace: Vec<NodeIdentifier> = pb_msg
+                .path_trace
+                .iter()
+                .filter_map(|node| node_from_wire(*node))
+                .collect();
+            let payload_hex = payload_hex_preview(&pb_msg.payload);
+            trace!(
+                %next_hop,
+                src = %node_from_wire(pb_msg.src).unwrap_or(0),
+                dsts = ?dsts,
+                path_trace = ?path_trace,
+                service_tag = pb_msg.service_tag,
+                ?level,
+                ?routing_metric,
+                ?class,
+                process_on_transit = pb_msg.process_on_transit,
+                payload_len = pb_msg.payload.len(),
+                payload_hex = %payload_hex,
+                "forwarding overlay data"
+            );
+        }
+
         let payload = match encode_message(&wrap(OverlayBody::Data(pb_msg))) {
             Ok(b) => b,
             Err(e) => {
@@ -201,4 +248,20 @@ async fn forward_pb(
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_hex_preview_is_bounded() {
+        assert_eq!(payload_hex_preview(&[]), "");
+        assert_eq!(payload_hex_preview(&[0, 1, 0xab, 0xff]), "0001abff");
+
+        let payload = vec![0xff; FORWARD_PAYLOAD_LOG_BYTES + 2];
+        let preview = payload_hex_preview(&payload);
+        assert!(preview.starts_with(&"ff".repeat(FORWARD_PAYLOAD_LOG_BYTES)));
+        assert!(preview.ends_with("...(+2 bytes)"));
+    }
 }

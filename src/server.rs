@@ -21,7 +21,7 @@ use crate::channel_handler::SessionChannelShadow;
 use crate::channel_repository::{ChannelOperation, ChannelRepoTuning, ChannelRepository};
 use crate::client::{
     client_session_identifier::ClientSessionIdentifier, state_log::ClientStateBroadcastPayload,
-    AsyncMessageHandlerExt, Client,
+    visibility::UserVisibilityState, AsyncMessageHandlerExt, Client,
 };
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError};
@@ -40,6 +40,18 @@ use crate::{
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
 type UdpPacket = (Bytes, std::net::SocketAddr, std::net::SocketAddr);
+
+fn startup_file_error(
+    config_key: &str,
+    path: &str,
+    action: &str,
+    source: impl std::fmt::Display,
+) -> Box<dyn std::error::Error> {
+    std::io::Error::other(format!(
+        "{action} failed for {config_key}={path:?}: {source}"
+    ))
+    .into()
+}
 
 fn first_socket_addr(address: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
     address.to_socket_addrs()?.next().ok_or_else(|| {
@@ -260,6 +272,7 @@ mod tests {
             pending_delete_timeout_ms: 5_000,
             required_groups: Vec::new(),
             send_permission_info: false,
+            hide_users_without_traverse: false,
             s2s: crate::config::S2sConfig::default(),
             web: crate::config::WebConfig::default(),
         }
@@ -429,6 +442,7 @@ async fn activate_client_subscriptions(
     client_log_rx: &mut Option<ClientLogReceiver>,
     channel_log_rx: &mut Option<ChannelLogReceiver>,
     session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
 ) -> Result<(), HandleIncomingConnectionError> {
     if !client.is_authenticated() || client_log_rx.is_some() {
         return Ok(());
@@ -449,13 +463,8 @@ async fn activate_client_subscriptions(
     *client_log_rx = Some(server.clients.subscribe());
     *channel_log_rx = Some(server.channels.subscribe());
 
-    session_channel_shadow.clear();
-    for visible in server.clients.get_all_clients_in_server(&server_id).await {
-        if visible.is_authenticated() {
-            session_channel_shadow
-                .insert(visible.get_session_id(), visible.get_current_channel_id());
-        }
-    }
+    crate::client::visibility::initialize(server, client, user_visibility, session_channel_shadow)
+        .await;
 
     let last_seen = client.get_last_client_versions().await;
     let (missed, new_versions) = server
@@ -464,19 +473,16 @@ async fn activate_client_subscriptions(
         .await
         .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
     for msg in &missed {
-        client
-            .write_proto_message(msg)
-            .await
-            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-        let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+        let messages = crate::client::visibility::project_message_with_shadow(
             server,
-            &server.channels,
+            client,
+            user_visibility,
             session_channel_shadow,
             &server_id,
             msg,
         )
         .await;
-        for msg in synthetic {
+        for msg in messages {
             client
                 .write_proto_message(&msg)
                 .await
@@ -494,6 +500,7 @@ async fn finish_handler_result(
     client_log_rx: &mut Option<ClientLogReceiver>,
     channel_log_rx: &mut Option<ChannelLogReceiver>,
     session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
     result: Result<(), MessageHandlerError>,
 ) -> Result<(), HandleIncomingConnectionError> {
     map_handler_result(client_session_id, result)?;
@@ -504,6 +511,7 @@ async fn finish_handler_result(
         client_log_rx,
         channel_log_rx,
         session_channel_shadow,
+        user_visibility,
     )
     .await
 }
@@ -513,15 +521,25 @@ impl Server {
         config: Config,
         authenticator: A,
     ) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
+        Version::cache_server_os_info();
+
         let allowed_proxies = config
             .allowed_proxies
             .iter()
             .map(|proxy| AnyIpCidr::from_str(proxy))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let certificate =
-            CertificateDer::pem_file_iter(&config.cert_path)?.collect::<Result<Vec<_>, _>>()?;
-        let private_key = PrivateKeyDer::from_pem_file(&config.key_path)?;
+        let certificate = CertificateDer::pem_file_iter(&config.cert_path)
+            .map_err(|e| {
+                startup_file_error("cert_path", &config.cert_path, "read TLS certificate", e)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                startup_file_error("cert_path", &config.cert_path, "parse TLS certificate", e)
+            })?;
+        let private_key = PrivateKeyDer::from_pem_file(&config.key_path).map_err(|e| {
+            startup_file_error("key_path", &config.key_path, "read TLS private key", e)
+        })?;
 
         let entrypoints = bind_entrypoints(&config).await?;
 
@@ -1477,6 +1495,7 @@ impl Server {
         let mut client_log_rx: Option<ClientLogReceiver> = None;
         let mut channel_log_rx: Option<ChannelLogReceiver> = None;
         let mut session_channel_shadow: SessionChannelShadow = HashMap::new();
+        let mut user_visibility = UserVisibilityState::default();
 
         // Run the connection loop.  On any unrecoverable error, clean up
         // the client and return the error to the caller.
@@ -1506,6 +1525,7 @@ impl Server {
                             &mut client_log_rx,
                             &mut channel_log_rx,
                             &mut session_channel_shadow,
+                            &mut user_visibility,
                             result,
                         )
                         .await?;
@@ -1525,6 +1545,7 @@ impl Server {
                                         &mut client_log_rx,
                                         &mut channel_log_rx,
                                         &mut session_channel_shadow,
+                                        &mut user_visibility,
                                         result,
                                     )
                                     .await?;
@@ -1560,7 +1581,7 @@ impl Server {
                 }
                 let last = client.get_last_channel_version().await;
                                 replay_channel_log_gap(
-                                    self, &client, &self.channels, &mut session_channel_shadow, client_session_id, last, op.version,
+                                    self, &client, &self.channels, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, op.version,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
 
                                 // Use unified message conversion function
@@ -1572,16 +1593,34 @@ impl Server {
                                     Some(&mut session_channel_shadow),
                                 ).await;
                                 for msg in messages {
-                                    client.write_proto_message(&msg).await
-                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+                                    let projected = crate::client::visibility::project_message_with_shadow(
                                         self,
-                                        &self.channels,
+                                        &client,
+                                        &mut user_visibility,
                                         &mut session_channel_shadow,
                                         &client.server_id(),
                                         &msg,
                                     ).await;
-                                    for msg in synthetic {
+                                    for msg in projected {
+                                        client.write_proto_message(&msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
+                                }
+                                let reconcile = crate::client::visibility::reconcile_all(
+                                    self,
+                                    &client,
+                                    &mut user_visibility,
+                                ).await;
+                                for msg in reconcile {
+                                    let projected = crate::client::visibility::sync_projected_message_with_shadow(
+                                        self,
+                                        &client,
+                                        &mut user_visibility,
+                                        &mut session_channel_shadow,
+                                        &client.server_id(),
+                                        msg,
+                                    ).await;
+                                    for msg in projected {
                                         client.write_proto_message(&msg).await
                                             .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                     }
@@ -1591,7 +1630,7 @@ impl Server {
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                                 let last = client.get_last_channel_version().await;
                                 replay_channel_log_gap(
-                                    self, &client, &self.channels, &mut session_channel_shadow, client_session_id, last, u64::MAX,
+                                    self, &client, &self.channels, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, u64::MAX,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -1618,16 +1657,34 @@ impl Server {
                                     let (missed, new_versions) = self.clients.replay_since_in_server(&server_id, &last_seen).await
                                         .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
                                     for msg in &missed {
-                                        client.write_proto_message(msg).await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                        let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+                                        let projected = crate::client::visibility::project_message_with_shadow(
                                             self,
-                                            &self.channels,
+                                            &client,
+                                            &mut user_visibility,
                                             &mut session_channel_shadow,
                                             &server_id,
                                             msg,
                                         ).await;
-                                        for msg in synthetic {
+                                        for msg in projected {
+                                            client.write_proto_message(&msg).await
+                                                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                        }
+                                    }
+                                    let reconcile = crate::client::visibility::reconcile_all(
+                                        self,
+                                        &client,
+                                        &mut user_visibility,
+                                    ).await;
+                                    for msg in reconcile {
+                                        let projected = crate::client::visibility::sync_projected_message_with_shadow(
+                                            self,
+                                            &client,
+                                            &mut user_visibility,
+                                            &mut session_channel_shadow,
+                                            &server_id,
+                                            msg,
+                                        ).await;
+                                        for msg in projected {
                                             client.write_proto_message(&msg).await
                                                 .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                         }
@@ -1641,22 +1698,40 @@ impl Server {
                                     let last_ch = client.get_last_channel_version().await;
                                     if last_ch < dep {
                                         replay_channel_log_gap(
-                                            self, &client, &self.channels, &mut session_channel_shadow, client_session_id, last_ch, dep + 1,
+                                            self, &client, &self.channels, &mut session_channel_shadow, &mut user_visibility, client_session_id, last_ch, dep + 1,
                                         ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
                                     }
                                 }
 
                                 if let Some(msg) = entry.to_message(&self.clients).await {
-                                    client.write_proto_message(&msg).await
-                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+                                    let projected = crate::client::visibility::project_message_with_shadow(
                                         self,
-                                        &self.channels,
+                                        &client,
+                                        &mut user_visibility,
                                         &mut session_channel_shadow,
                                         &client.server_id(),
                                         &msg,
                                     ).await;
-                                    for msg in synthetic {
+                                    for msg in projected {
+                                        client.write_proto_message(&msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
+                                }
+                                let reconcile = crate::client::visibility::reconcile_all(
+                                    self,
+                                    &client,
+                                    &mut user_visibility,
+                                ).await;
+                                for msg in reconcile {
+                                    let projected = crate::client::visibility::sync_projected_message_with_shadow(
+                                        self,
+                                        &client,
+                                        &mut user_visibility,
+                                        &mut session_channel_shadow,
+                                        &client.server_id(),
+                                        msg,
+                                    ).await;
+                                    for msg in projected {
                                         client.write_proto_message(&msg).await
                                             .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                     }
@@ -1669,16 +1744,34 @@ impl Server {
                                 let (missed, new_versions) = self.clients.replay_since_in_server(&server_id, &last_seen).await
                                     .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
                                 for msg in &missed {
-                                    client.write_proto_message(msg).await
-                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+                                    let projected = crate::client::visibility::project_message_with_shadow(
                                         self,
-                                        &self.channels,
+                                        &client,
+                                        &mut user_visibility,
                                         &mut session_channel_shadow,
                                         &server_id,
                                         msg,
                                     ).await;
-                                    for msg in synthetic {
+                                    for msg in projected {
+                                        client.write_proto_message(&msg).await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
+                                }
+                                let reconcile = crate::client::visibility::reconcile_all(
+                                    self,
+                                    &client,
+                                    &mut user_visibility,
+                                ).await;
+                                for msg in reconcile {
+                                    let projected = crate::client::visibility::sync_projected_message_with_shadow(
+                                        self,
+                                        &client,
+                                        &mut user_visibility,
+                                        &mut session_channel_shadow,
+                                        &server_id,
+                                        msg,
+                                    ).await;
+                                    for msg in projected {
                                         client.write_proto_message(&msg).await
                                             .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                     }
@@ -1783,6 +1876,13 @@ impl Server {
                         new_config.send_permission_info
                     );
                 }
+                if current.hide_users_without_traverse != new_config.hide_users_without_traverse {
+                    tracing::info!(
+                        "config reload: hide_users_without_traverse {} -> {}",
+                        current.hide_users_without_traverse,
+                        new_config.hide_users_without_traverse
+                    );
+                }
                 if current.server_entrypoints != new_config.server_entrypoints {
                     tracing::info!("config reload: server_entrypoints changed");
                 }
@@ -1855,6 +1955,10 @@ impl Server {
 
     pub fn get_send_permission_info(&self) -> bool {
         self.read_config().send_permission_info
+    }
+
+    pub fn get_hide_users_without_traverse(&self) -> bool {
+        self.read_config().hide_users_without_traverse
     }
 
     pub fn get_max_bandwidth(&self) -> u32 {

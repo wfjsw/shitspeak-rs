@@ -1,8 +1,8 @@
 //! Per-service-level shortest-path computation over the LSDB graph.
 //!
 //! For each `ServiceLevel`, we run a single-source Dijkstra from the
-//! local node. The cost function and the per-edge admission filter
-//! depend on the level:
+//! local node. The default cost function and the per-edge admission
+//! filter depend on the level:
 //!
 //! * `Reliable`: `rtt_us + cfg.reliable_throughput_penalty_us_kbps /
 //!   max(throughput_kbps, 1)`. Edges whose `transports_mask` does not
@@ -12,23 +12,112 @@
 //! * `BestEffort`: `rtt_us`. Filtered against
 //!   `cfg.best_effort_transports_mask`.
 //!
-//! Edges only count if BOTH endpoints have non-tombstone LSAs. This
-//! matches LSDB-derived membership: a peer is in the graph iff its LSA
-//! is current.
+//! Upper layers may request a different `RoutingMetric`; voice uses the
+//! E-model-inspired conversational metric. Edges only count if BOTH
+//! endpoints have non-tombstone LSAs. This matches LSDB-derived
+//! membership: a peer is in the graph iff its LSA is current.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::s2s::transport::ServiceLevel;
+use crate::s2s::transport::{
+    conversational_effective_delay_us, conversational_impairment, ServiceLevel,
+};
 use crate::types::NodeIdentifier;
 
 use super::super::config::OverlayConfig;
-use super::super::lsdb::{LinkAdvertised, LinkStateDb};
+use super::super::lsdb::{LinkAdvertised, LinkStateDb, LsaEntry};
+use super::RoutingMetric;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RouteEntry {
     pub next_hop: NodeIdentifier,
     pub cost: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RoutingGraph {
+    active: HashSet<NodeIdentifier>,
+    transit_disabled: HashSet<NodeIdentifier>,
+    links: HashMap<NodeIdentifier, Vec<LinkAdvertised>>,
+}
+
+impl RoutingGraph {
+    pub(crate) fn from_lsdb(lsdb: &LinkStateDb) -> Self {
+        lsdb.with_entries(|entries| Self::from_entries(entries.values()))
+    }
+
+    fn from_entries<'a>(entries: impl IntoIterator<Item = &'a LsaEntry>) -> Self {
+        let mut active = HashSet::new();
+        let mut transit_disabled = HashSet::new();
+        let mut links = HashMap::new();
+
+        for entry in entries {
+            if entry.tombstone {
+                continue;
+            }
+            active.insert(entry.origin);
+            if entry.transit_disabled {
+                transit_disabled.insert(entry.origin);
+            }
+            links.insert(entry.origin, entry.links.clone());
+        }
+
+        Self {
+            active,
+            transit_disabled,
+            links,
+        }
+    }
+
+    pub(crate) fn active_len(&self) -> usize {
+        self.active.len()
+    }
+
+    pub(crate) fn is_active(&self, node: NodeIdentifier) -> bool {
+        self.active.contains(&node)
+    }
+
+    pub(crate) fn active_nodes(&self) -> impl Iterator<Item = NodeIdentifier> + '_ {
+        self.active.iter().copied()
+    }
+
+    pub(crate) fn links_by_origin(
+        &self,
+    ) -> impl Iterator<Item = (NodeIdentifier, &[LinkAdvertised])> + '_ {
+        self.links
+            .iter()
+            .map(|(origin, links)| (*origin, links.as_slice()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PathCost {
+    primary: u64,
+    latency_us: u64,
+    hops: u32,
+}
+
+impl PathCost {
+    const ZERO: Self = Self {
+        primary: 0,
+        latency_us: 0,
+        hops: 0,
+    };
+
+    fn add(self, edge: EdgeCost) -> Self {
+        Self {
+            primary: self.primary.saturating_add(edge.primary),
+            latency_us: self.latency_us.saturating_add(edge.latency_us),
+            hops: self.hops.saturating_add(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EdgeCost {
+    primary: u64,
+    latency_us: u64,
 }
 
 /// Compute the shortest-path table from `self_id` for `level`.
@@ -40,67 +129,67 @@ pub fn compute(
     level: ServiceLevel,
     cfg: &OverlayConfig,
 ) -> HashMap<NodeIdentifier, RouteEntry> {
-    let lsas = lsdb.snapshot();
-    // Active origin set (non-tombstone).
-    let active: HashSet<NodeIdentifier> = lsas
-        .iter()
-        .filter(|e| !e.tombstone)
-        .map(|e| e.origin)
-        .collect();
-    let transit_disabled: HashSet<NodeIdentifier> = lsas
-        .iter()
-        .filter(|e| !e.tombstone && e.transit_disabled)
-        .map(|e| e.origin)
-        .collect();
-    if !active.contains(&self_id) {
-        // Local LSA hasn't been admitted yet — early return; routing is
-        // empty until we publish ourselves.
-    }
-    // Adjacency: origin -> [(neighbor, cost)] for *admitted* edges.
-    let mut adj: HashMap<NodeIdentifier, Vec<(NodeIdentifier, u64)>> = HashMap::new();
-    for e in &lsas {
-        if e.tombstone {
-            continue;
-        }
+    compute_with_metric(lsdb, self_id, level, RoutingMetric::PerServiceCost, cfg)
+}
+
+/// Compute the shortest-path table with an explicit route-selection metric.
+pub fn compute_with_metric(
+    lsdb: &LinkStateDb,
+    self_id: NodeIdentifier,
+    level: ServiceLevel,
+    metric: RoutingMetric,
+    cfg: &OverlayConfig,
+) -> HashMap<NodeIdentifier, RouteEntry> {
+    let graph = RoutingGraph::from_lsdb(lsdb);
+    compute_on_graph(&graph, self_id, level, metric, cfg)
+}
+
+pub(crate) fn compute_on_graph(
+    graph: &RoutingGraph,
+    self_id: NodeIdentifier,
+    level: ServiceLevel,
+    metric: RoutingMetric,
+    cfg: &OverlayConfig,
+) -> HashMap<NodeIdentifier, RouteEntry> {
+    let mask = match level {
+        ServiceLevel::Reliable => cfg.reliable_transports_mask(),
+        ServiceLevel::ReliableLowLatency => cfg.rll_transports_mask(),
+        ServiceLevel::BestEffort => cfg.best_effort_transports_mask(),
+    };
+
+    let mut adj: HashMap<NodeIdentifier, Vec<(NodeIdentifier, EdgeCost)>> = HashMap::new();
+    for (origin, links) in graph.links_by_origin() {
         let mut edges = Vec::new();
-        for link in &e.links {
-            if !active.contains(&link.neighbor) {
+        for link in links {
+            if !graph.is_active(link.neighbor) || link.transports_mask & mask == 0 {
                 continue;
             }
-            let mask = match level {
-                ServiceLevel::Reliable => cfg.reliable_transports_mask(),
-                ServiceLevel::ReliableLowLatency => cfg.rll_transports_mask(),
-                ServiceLevel::BestEffort => cfg.best_effort_transports_mask(),
-            };
-            if link.transports_mask & mask == 0 {
-                continue;
-            }
-            let cost = compute_cost(link, level, cfg);
+            let cost = compute_cost(link, level, metric, cfg);
             edges.push((link.neighbor, cost));
         }
-        adj.insert(e.origin, edges);
+        adj.insert(origin, edges);
     }
 
     // Dijkstra from self_id.
-    let mut dist: HashMap<NodeIdentifier, u64> = HashMap::new();
+    let mut dist: HashMap<NodeIdentifier, PathCost> = HashMap::new();
     let mut prev: HashMap<NodeIdentifier, NodeIdentifier> = HashMap::new();
-    let mut heap: BinaryHeap<Reverse<(u64, NodeIdentifier)>> = BinaryHeap::new();
-    dist.insert(self_id, 0);
-    heap.push(Reverse((0, self_id)));
+    let mut heap: BinaryHeap<Reverse<(PathCost, NodeIdentifier)>> = BinaryHeap::new();
+    dist.insert(self_id, PathCost::ZERO);
+    heap.push(Reverse((PathCost::ZERO, self_id)));
 
     while let Some(Reverse((d, u))) = heap.pop() {
-        if d > *dist.get(&u).unwrap_or(&u64::MAX) {
+        if dist.get(&u).is_some_and(|known| d > *known) {
             continue;
         }
-        if u != self_id && transit_disabled.contains(&u) {
+        if u != self_id && graph.transit_disabled.contains(&u) {
             continue;
         }
         let Some(neighbors) = adj.get(&u) else {
             continue;
         };
         for (v, w) in neighbors {
-            let nd = d.saturating_add(*w);
-            if nd < *dist.get(v).unwrap_or(&u64::MAX) {
+            let nd = d.add(*w);
+            if dist.get(v).map_or(true, |known| nd < *known) {
                 dist.insert(*v, nd);
                 prev.insert(*v, u);
                 heap.push(Reverse((nd, *v)));
@@ -123,7 +212,7 @@ pub fn compute(
                         dst,
                         RouteEntry {
                             next_hop: cur,
-                            cost,
+                            cost: cost.primary,
                         },
                     );
                     break;
@@ -136,7 +225,40 @@ pub fn compute(
     out
 }
 
-fn compute_cost(link: &LinkAdvertised, level: ServiceLevel, cfg: &OverlayConfig) -> u64 {
+fn compute_cost(
+    link: &LinkAdvertised,
+    level: ServiceLevel,
+    metric: RoutingMetric,
+    cfg: &OverlayConfig,
+) -> EdgeCost {
+    let primary = match metric {
+        RoutingMetric::PerServiceCost => compute_per_service_cost(link, level, cfg),
+        RoutingMetric::ConversationalQuality => (conversational_impairment(
+            link.rtt_us as f64,
+            link.jitter_us as f64,
+            link.throughput_bps as f64,
+            link.loss_ppm,
+        ) * 1_000.0)
+            .ceil()
+            .max(1.0) as u64,
+    };
+    let latency_us = match metric {
+        RoutingMetric::PerServiceCost => link.rtt_us.max(1),
+        RoutingMetric::ConversationalQuality => {
+            conversational_effective_delay_us(link.rtt_us as f64, link.jitter_us as f64).max(1)
+        }
+    };
+    EdgeCost {
+        primary: primary.max(1),
+        latency_us,
+    }
+}
+
+fn compute_per_service_cost(
+    link: &LinkAdvertised,
+    level: ServiceLevel,
+    cfg: &OverlayConfig,
+) -> u64 {
     match level {
         ServiceLevel::BestEffort => link.rtt_us.max(1),
         ServiceLevel::ReliableLowLatency => {
@@ -168,6 +290,23 @@ mod tests {
         seq: u64,
         links: Vec<(NodeIdentifier, u64, u64, u64)>,
     ) -> LsaEntry {
+        entry_with_loss(
+            origin,
+            boot,
+            seq,
+            links
+                .into_iter()
+                .map(|(n, rtt, jitter, tput)| (n, rtt, jitter, tput, 0))
+                .collect(),
+        )
+    }
+
+    fn entry_with_loss(
+        origin: NodeIdentifier,
+        boot: u64,
+        seq: u64,
+        links: Vec<(NodeIdentifier, u64, u64, u64, u32)>,
+    ) -> LsaEntry {
         LsaEntry {
             origin,
             boot_epoch: boot,
@@ -177,7 +316,7 @@ mod tests {
             addresses: vec![],
             links: links
                 .into_iter()
-                .map(|(n, rtt, jitter, tput)| LinkAdvertised {
+                .map(|(n, rtt, jitter, tput, loss_ppm)| LinkAdvertised {
                     neighbor: n,
                     rtt_us: rtt,
                     jitter_us: jitter,
@@ -185,6 +324,7 @@ mod tests {
                     transports_mask: super::super::super::config::transport_bit(
                         crate::s2s::transport::TransportKind::Tcp,
                     ),
+                    loss_ppm,
                 })
                 .collect(),
             max_users: 0,
@@ -247,6 +387,54 @@ mod tests {
         let table = compute(&db, 1, ServiceLevel::ReliableLowLatency, &cfg());
         assert_eq!(table[&2].next_hop, 3);
         assert_eq!(table[&3].next_hop, 3);
+    }
+
+    #[test]
+    fn conversational_metric_avoids_lossy_low_latency_path() {
+        // Default best-effort still picks the lower per-service RTT path
+        // through node 3. Conversational routing prefers the direct path
+        // because the low-RTT transit edges advertise heavy loss.
+        let db = build_db(vec![
+            entry_with_loss(
+                1,
+                100,
+                1,
+                vec![
+                    (2, 10_000, 0, 1_000_000, 0),
+                    (3, 2_000, 0, 1_000_000, 250_000),
+                ],
+            ),
+            entry_with_loss(
+                2,
+                100,
+                1,
+                vec![
+                    (1, 10_000, 0, 1_000_000, 0),
+                    (3, 2_000, 0, 1_000_000, 250_000),
+                ],
+            ),
+            entry_with_loss(
+                3,
+                100,
+                1,
+                vec![
+                    (1, 2_000, 0, 1_000_000, 250_000),
+                    (2, 2_000, 0, 1_000_000, 250_000),
+                ],
+            ),
+        ]);
+
+        let default = compute(&db, 1, ServiceLevel::BestEffort, &cfg());
+        assert_eq!(default[&2].next_hop, 3);
+
+        let conversational = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            &cfg(),
+        );
+        assert_eq!(conversational[&2].next_hop, 2);
     }
 
     #[test]

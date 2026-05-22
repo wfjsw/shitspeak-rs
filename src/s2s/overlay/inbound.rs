@@ -115,7 +115,7 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
             )
             .await
         }
-        OverlayBody::LsdbSyncResp(resp) => handle_sync_response(&ctx.lsdb, resp),
+        OverlayBody::LsdbSyncResp(resp) => handle_sync_response(&ctx.lsdb, &ctx.transport, resp),
         OverlayBody::Data(data) => {
             messaging_forward::handle_inbound(
                 &ctx.transport,

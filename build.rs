@@ -5,6 +5,7 @@ use serde::Deserialize;
 fn main() -> Result<(), Box<dyn Error>> {
     generate_localization_catalog()?;
     let mut config = prost_build::Config::new();
+    config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
     // Generate `bytes::Bytes` instead of `Vec<u8>` for opaque-blob fields on
     // hot paths so cloning becomes an Arc-bump and decode→forward chains do
     // not need Vec↔Bytes wrappers:
@@ -41,18 +42,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     config.compile_protos(&proto_files, &["src/"])?;
 
-    if let Ok(output) = Command::new("git").args(&["rev-parse", "HEAD"]).output() {
-        let git_hash = String::from_utf8(output.stdout).unwrap();
-        println!("cargo:rustc-env=COMMIT_HASH={}", git_hash);
-    }
-
-    if let Ok(output) = Command::new("git")
-        .args(&["log", "-1", "--format=%cd", "--date=iso"])
+    let commit_hash = Command::new("git")
+        .args(["rev-parse", "HEAD"])
         .output()
-    {
-        let commit_date = String::from_utf8(output.stdout).unwrap();
-        println!("cargo:rustc-env=COMMIT_DATE={}", commit_date.trim());
-    }
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=COMMIT_HASH={commit_hash}");
+
+    let commit_date = Command::new("git")
+        .args(["log", "-1", "--format=%cd", "--date=iso"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=COMMIT_DATE={commit_date}");
 
     let current_date = chrono::Utc::now().to_rfc3339();
     println!("cargo:rustc-env=BUILD_DATE={}", current_date);
