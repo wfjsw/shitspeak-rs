@@ -121,7 +121,7 @@ When a configured WASM file changes, the reload path compiles the new module fir
 
 ## Persistence
 
-The default `blob_storage_dir` is `data`. This directory stores channel snapshots, write ahead logs, channel blobs, and session blob cache data. For any durable deployment, back up this directory and place it on storage that survives process and host restarts.
+The default `blob_storage_dir` is `data`. This directory stores channel snapshots, write ahead logs, channel blobs, session blob cache data, and `user_channel_cache.json` for TTL-bound last/listening channel restoration. For any durable deployment, back up this directory and place it on storage that survives process and host restarts.
 
 The main tunables are:
 

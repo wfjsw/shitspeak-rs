@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::future::join_all;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
 use tracing::debug;
 
@@ -38,6 +39,35 @@ pub(crate) mod kcp;
 pub(crate) mod quic;
 pub(crate) mod tcp;
 pub(crate) mod udp;
+
+pub(crate) async fn bind_reusable_udp_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    UdpSocket::from_std(socket.into())
+}
+
+pub(crate) async fn bind_transport_udp_socket(
+    listen_addr: Option<SocketAddr>,
+    remote_addr: SocketAddr,
+) -> io::Result<UdpSocket> {
+    let port = listen_addr
+        .filter(|addr| addr.is_ipv4() == remote_addr.is_ipv4())
+        .map_or(0, |addr| addr.port());
+    let bind_addr = if remote_addr.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], port))
+    } else {
+        SocketAddr::from(([0u16; 8], port))
+    };
+    bind_reusable_udp_socket(bind_addr).await
+}
 
 /// Common shape for every wire transport. Implementations own their own
 /// per-transport state and are wrapped in an `Arc` before being placed in

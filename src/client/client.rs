@@ -46,6 +46,11 @@ const VOICE_TCP_QUEUE_CAPACITY: usize = 256;
 const PROTOCOL_VERSION_SET_BIT: u64 = 1;
 
 pub type ClientInstanceId = u64;
+pub(crate) type ClientStateSubscription = tokio::sync::broadcast::Receiver<
+    std::sync::Arc<crate::client::state_log::ClientStateBroadcastPayload>,
+>;
+pub(crate) type StagedChannelStateSubscription =
+    (u64, crate::channel_repository::ChannelStateSubscription);
 
 pub(crate) fn random_client_instance_id() -> ClientInstanceId {
     loop {
@@ -117,6 +122,8 @@ pub struct Client {
     /// has been emitted).  Only published clients generate `RemoveClient`
     /// log entries on disconnect.
     published: AtomicBool,
+    pending_client_state_subscription: ParkingMutex<Option<ClientStateSubscription>>,
+    pending_channel_state_subscription: ParkingMutex<Option<StagedChannelStateSubscription>>,
 
     /// If true, send voice through TCP `UDPTunnel` instead of UDP.
     /// This is toggled when tunneled voice is received and reset once
@@ -273,6 +280,8 @@ impl Client {
             voice_tcp_tx,
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
             published: AtomicBool::new(false),
+            pending_client_state_subscription: ParkingMutex::new(None),
+            pending_channel_state_subscription: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             protocol_version: AtomicU64::new(0),
             last_client_version: ParkingMutex::new(HashMap::new()),
@@ -424,6 +433,8 @@ impl Client {
             voice_tcp_tx,
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
             published: AtomicBool::new(false),
+            pending_client_state_subscription: ParkingMutex::new(None),
+            pending_channel_state_subscription: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             protocol_version: AtomicU64::new(0),
             last_client_version: ParkingMutex::new(HashMap::new()),
@@ -499,6 +510,8 @@ impl Client {
             voice_tcp_tx,
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
             published: AtomicBool::new(true),
+            pending_client_state_subscription: ParkingMutex::new(None),
+            pending_channel_state_subscription: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             protocol_version: AtomicU64::new(0),
             last_client_version: ParkingMutex::new(HashMap::new()),
@@ -520,6 +533,26 @@ impl Client {
 
     pub fn set_published(&self, value: bool) {
         self.published.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn stage_client_state_subscription(&self, rx: ClientStateSubscription) {
+        *self.pending_client_state_subscription.lock() = Some(rx);
+    }
+
+    pub(crate) fn take_client_state_subscription(&self) -> Option<ClientStateSubscription> {
+        self.pending_client_state_subscription.lock().take()
+    }
+
+    pub(crate) fn stage_channel_state_subscription(
+        &self,
+        version: u64,
+        rx: crate::channel_repository::ChannelStateSubscription,
+    ) {
+        *self.pending_channel_state_subscription.lock() = Some((version, rx));
+    }
+
+    pub(crate) fn take_channel_state_subscription(&self) -> Option<StagedChannelStateSubscription> {
+        self.pending_channel_state_subscription.lock().take()
     }
 
     pub fn set_prefer_tcp_tunnel(&self, value: bool) {

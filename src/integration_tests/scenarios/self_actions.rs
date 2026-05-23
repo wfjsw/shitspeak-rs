@@ -89,6 +89,41 @@ async fn self_deaf_broadcasts() {
 }
 
 #[tokio::test]
+async fn pre_auth_user_state_only_updates_self_mute_deaf() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let mut pre_auth_state = UserState::default();
+    pre_auth_state.self_deaf = Some(true);
+    pre_auth_state.channel_id = Some(99);
+    pre_auth_state.mute = Some(true);
+    pre_auth_state.comment = Some("ignored before auth".into());
+
+    let alice = TestClient::connect_with_preauth_messages(
+        &server,
+        "alice",
+        None,
+        vec![pre_auth_state.into()],
+    )
+    .await
+    .expect("alice auth");
+
+    let self_state = alice
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(alice.session_id))
+        .expect("self UserState during auth sync");
+
+    assert_eq!(self_state.self_deaf, Some(true));
+    assert_eq!(self_state.self_mute, Some(true));
+    assert_ne!(self_state.channel_id, Some(99));
+    assert_eq!(self_state.mute, None);
+    assert_eq!(self_state.comment, None);
+}
+
+#[tokio::test]
 async fn self_priority_speaker_is_denied() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

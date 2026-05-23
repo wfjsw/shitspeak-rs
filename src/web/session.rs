@@ -9,6 +9,7 @@ use crate::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
 };
 use crate::channel_handler::SessionChannelShadow;
+use crate::client::user_info::Credential;
 use crate::client::visibility::UserVisibilityState;
 use crate::client::{AsyncMessageHandlerExt, Client};
 use crate::config::{WebAuthMode, WebConfig};
@@ -121,6 +122,7 @@ impl WebSessionContext {
         result: AuthenticateResult,
         outbound_tx: mpsc::Sender<Message>,
         transport: WebSessionTransport,
+        cache_username: Option<&str>,
     ) -> Option<(Arc<Box<Server>>, Arc<Box<Client>>, u32, Option<String>)> {
         let server = Arc::clone(self.server.as_ref()?);
         let client = match transport {
@@ -157,7 +159,7 @@ impl WebSessionContext {
         };
 
         let display_name = result.display_name.clone();
-        configure_authenticated_client(&server, &client, result).await;
+        configure_authenticated_client(&server, &client, result, cache_username).await;
         Some((
             server,
             Arc::clone(&client),
@@ -177,7 +179,10 @@ pub async fn configure_authenticated_client(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     result: AuthenticateResult,
+    cache_username: Option<&str>,
 ) {
+    let channel_cache_key =
+        crate::user_channel_cache::user_channel_cache_key(result.user_id, cache_username);
     client.set_language(result.language);
     client.set_protocol_version(Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)));
     {
@@ -186,28 +191,59 @@ pub async fn configure_authenticated_client(
         gs.set_display_name(result.display_name);
         gs.set_groups(result.groups.into_iter().collect());
     }
+    if let Some(username) = cache_username {
+        let mut ext = client.user_info_extended().await;
+        ext.set_credential(Credential::new(username.to_owned(), None));
+    }
 
-    let default_ch = server.get_default_channel();
     let server_id = client.server_id();
-    let target_ch = if server
-        .get_channels()
-        .get_channel_in_server(&server_id, default_ch)
-        .await
-        .is_some()
-    {
-        default_ch
-    } else {
-        0
-    };
-    let target_ch = server
-        .get_channels()
-        .redirect_pending_delete_target_in_server(&server_id, target_ch)
-        .await;
+    let restored_channels = crate::user_channel_cache::resolve_login_channels(
+        server,
+        client,
+        channel_cache_key.as_deref(),
+    )
+    .await;
+    let target_ch = restored_channels.current_channel_id;
     client.set_current_channel_id(
         target_ch,
         server.get_clients(),
         server.get_channels().current_version_in_server(&server_id),
     );
+    if !restored_channels.listening_channel_ids.is_empty() {
+        let mut gs = client.write_global_state(server.get_clients());
+        for channel_id in &restored_channels.listening_channel_ids {
+            gs.listen_channel(*channel_id);
+        }
+    }
+    if let Some(cache_key) = channel_cache_key.as_deref() {
+        if let Err(error) = server
+            .get_user_channel_cache()
+            .remember_last_channel(cache_key, target_ch)
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                cache_key,
+                "failed to stage user last channel cache"
+            );
+        }
+        if !restored_channels.listening_channel_ids.is_empty() {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_listening_channels(
+                    cache_key,
+                    restored_channels.listening_channel_ids.iter().copied(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key,
+                    "failed to stage user listening channel cache"
+                );
+            }
+        }
+    }
     client.set_authenticated(true);
     server
         .get_clients()

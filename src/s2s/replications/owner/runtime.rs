@@ -279,6 +279,19 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         tokio::spawn(async move {
             runtime.catchup_alive_members().await;
         });
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(runtime.cfg.fallback_clock_tick());
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = runtime.shutdown.cancelled() => return,
+                    _ = ticker.tick() => {
+                        runtime.catchup_alive_members().await;
+                    }
+                }
+            }
+        });
     }
 
     async fn catchup_alive_members(&self) {

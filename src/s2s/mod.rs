@@ -812,47 +812,94 @@ async fn apply_user_state_patch(
         || !patch.listening_channel_remove.is_empty();
     let channel_version_dep =
         has_channel_dependency.then(|| server.get_channels().current_version_in_server(server_id));
+    let should_stage_channel_cache = patch.channel_id.is_some()
+        || !patch.listening_channel_add.is_empty()
+        || !patch.listening_channel_remove.is_empty();
+    let channel_cache_key = if should_stage_channel_cache {
+        crate::user_channel_cache::cache_key_for_client(target.as_ref()).await
+    } else {
+        None
+    };
+    let mut cache_listening_channel_ids = None;
+    {
+        let mut gs =
+            target.write_global_state_as(server.get_clients(), Some(actor), channel_version_dep);
 
-    let mut gs =
-        target.write_global_state_as(server.get_clients(), Some(actor), channel_version_dep);
-
-    if let Some(mute) = patch.mute {
-        if gs.is_muted() != mute {
-            gs.set_mute(mute);
-            if !mute {
-                gs.set_deaf(false);
+        if let Some(mute) = patch.mute {
+            if gs.is_muted() != mute {
+                gs.set_mute(mute);
+                if !mute {
+                    gs.set_deaf(false);
+                }
+            }
+            if gs.is_suppressed() && !mute {
+                gs.set_suppress(false);
             }
         }
-        if gs.is_suppressed() && !mute {
-            gs.set_suppress(false);
-        }
-    }
-    if let Some(deaf) = patch.deaf {
-        if gs.is_deafened() != deaf {
-            gs.set_deaf(deaf);
-            if deaf && !gs.is_muted() {
-                gs.set_mute(true);
+        if let Some(deaf) = patch.deaf {
+            if gs.is_deafened() != deaf {
+                gs.set_deaf(deaf);
+                if deaf && !gs.is_muted() {
+                    gs.set_mute(true);
+                }
             }
         }
-    }
-    if let Some(priority_speaker) = patch.priority_speaker {
-        if gs.is_priority_speaker() != priority_speaker {
-            gs.set_priority_speaker(priority_speaker);
+        if let Some(priority_speaker) = patch.priority_speaker {
+            if gs.is_priority_speaker() != priority_speaker {
+                gs.set_priority_speaker(priority_speaker);
+            }
+        }
+        if let Some(channel_id) = patch.channel_id {
+            gs.set_current_channel_id(channel_id);
+        }
+        if let Some(suppress) = patch.suppress {
+            if gs.is_suppressed() != suppress {
+                gs.set_suppress(suppress);
+            }
+        }
+        for channel_id in &patch.listening_channel_add {
+            gs.listen_channel(*channel_id);
+        }
+        for channel_id in &patch.listening_channel_remove {
+            gs.unlisten_channel(*channel_id);
+        }
+        if !patch.listening_channel_add.is_empty() || !patch.listening_channel_remove.is_empty() {
+            cache_listening_channel_ids = Some(
+                gs.get_listening_channel_id()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            );
         }
     }
-    if let Some(channel_id) = patch.channel_id {
-        gs.set_current_channel_id(channel_id);
-    }
-    if let Some(suppress) = patch.suppress {
-        if gs.is_suppressed() != suppress {
-            gs.set_suppress(suppress);
+
+    if let Some(cache_key) = channel_cache_key.as_deref() {
+        if let Some(channel_id) = patch.channel_id {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_last_channel(cache_key, channel_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key,
+                    "failed to stage user last channel cache"
+                );
+            }
         }
-    }
-    for channel_id in patch.listening_channel_add {
-        gs.listen_channel(channel_id);
-    }
-    for channel_id in patch.listening_channel_remove {
-        gs.unlisten_channel(channel_id);
+        if let Some(channel_ids) = cache_listening_channel_ids {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_listening_channels(cache_key, channel_ids)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key,
+                    "failed to stage user listening channel cache"
+                );
+            }
+        }
     }
 }
 

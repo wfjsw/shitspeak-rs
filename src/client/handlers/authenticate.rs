@@ -116,6 +116,8 @@ pub async fn handle_authenticate(
             .into())
         }
     };
+    let channel_cache_key =
+        crate::user_channel_cache::user_channel_cache_key(result.user_id, Some(username.as_str()));
 
     if let Some(auth_server_id) = result.virtual_server_id.clone() {
         if auth_server_id != provisional_server_id {
@@ -135,16 +137,15 @@ pub async fn handle_authenticate(
     }
     let server_id = sender.server_id();
 
-    // ── Snapshot clients + versions for the selected server scope. These are
-    // used for max-users, the initial UserState burst, and last-seen tracking.
-    let (all_clients, all_versions) = server
+    // ── Snapshot clients for the selected server scope for max-users.
+    let (limit_clients, _) = server
         .get_clients()
         .snapshot_with_versions_in_server(&server_id)
         .await;
 
     // ── Max-users check ───────────────────────────────────────────────────
     {
-        let authenticated_clients = all_clients
+        let authenticated_clients = limit_clients
             .iter()
             .filter(|client| client.is_authenticated())
             .count() as u64;
@@ -296,23 +297,15 @@ pub async fn handle_authenticate(
         .into()
     };
 
-    // ── Place user in the default channel ────────────────────────────────
+    // ── Place user in cached/default channel ─────────────────────────────
     {
-        let default_ch = server.get_default_channel();
-        let target_ch = if server
-            .get_channels()
-            .get_channel_in_server(&server_id, default_ch)
-            .await
-            .is_some()
-        {
-            default_ch
-        } else {
-            0 // fall back to root
-        };
-        let target_ch = server
-            .get_channels()
-            .redirect_pending_delete_target_in_server(&server_id, target_ch)
-            .await;
+        let restored_channels = crate::user_channel_cache::resolve_login_channels(
+            server,
+            sender,
+            channel_cache_key.as_deref(),
+        )
+        .await;
+        let target_ch = restored_channels.current_channel_id;
         sender.set_current_channel_id(
             target_ch,
             repo,
@@ -322,7 +315,39 @@ pub async fn handle_authenticate(
             crate::client::acl::compute_permissions_for_client(server, sender, target_ch).await;
         {
             let mut gs = sender.write_global_state(repo);
+            for channel_id in &restored_channels.listening_channel_ids {
+                gs.listen_channel(*channel_id);
+            }
             gs.set_suppress(!initial_perms.contains(crate::acl::ACLPermissions::Speak));
+        }
+        if let Some(cache_key) = channel_cache_key.as_deref() {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_last_channel(cache_key, target_ch)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key,
+                    "failed to stage user last channel cache"
+                );
+            }
+            if !restored_channels.listening_channel_ids.is_empty() {
+                if let Err(error) = server
+                    .get_user_channel_cache()
+                    .remember_listening_channels(
+                        cache_key,
+                        restored_channels.listening_channel_ids.iter().copied(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        cache_key,
+                        "failed to stage user listening channel cache"
+                    );
+                }
+            }
         }
     }
 
@@ -341,6 +366,16 @@ pub async fn handle_authenticate(
     //
     // This matches the Mumble server's auth-complete sequence.
 
+    let (all_clients, all_versions, client_state_rx) = server
+        .get_clients()
+        .snapshot_with_versions_and_subscription_in_server(&server_id)
+        .await;
+    sender.stage_client_state_subscription(client_state_rx);
+    let (all_channels, channel_version, channel_state_rx) = server
+        .get_channels()
+        .snapshot_with_version_and_subscription_in_server(&server_id);
+    sender.stage_channel_state_subscription(channel_version, channel_state_rx);
+
     let mut burst: Vec<Message> = Vec::new();
     let mut push_burst = |message: Message| {
         tracing::trace!(session = u32::from(session_id), message = %message, "Authenticate built outbound message");
@@ -352,7 +387,6 @@ pub async fn handle_authenticate(
 
     // 2. Channel tree — BFS from root
     {
-        let all_channels = server.get_channels().get_all_in_server(&server_id).await;
         // BFS ordering: root first, then children in order
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(0u32); // root channel id

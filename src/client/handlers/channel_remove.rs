@@ -103,11 +103,26 @@ pub async fn handle_channel_remove(
     let local_clients = repo.get_local_clients_in_server(&server_id).await;
     for client in &local_clients {
         if deleting_subtree.contains(&client.get_current_channel_id()) {
+            let channel_cache_key =
+                crate::user_channel_cache::cache_key_for_client(client.as_ref()).await;
             client.set_current_channel_id(
                 parent_id,
                 repo,
                 server.get_channels().current_version_in_server(&server_id),
             );
+            if let Some(cache_key) = channel_cache_key.as_deref() {
+                if let Err(error) = server
+                    .get_user_channel_cache()
+                    .remember_last_channel(cache_key, parent_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        cache_key,
+                        "failed to stage user last channel cache"
+                    );
+                }
+            }
         }
     }
 

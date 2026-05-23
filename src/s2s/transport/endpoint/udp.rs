@@ -4,25 +4,28 @@
 //! same CA + node certificate as the stream transports — peer identity is
 //! the X.509 Subject CN, parsed as `NodeIdentifier`. dtls's
 //! `Listener` does the per-source demultiplex on a single bound socket and
-//! drives the handshake; for outbound dials we open a fresh ephemeral UDP
-//! socket per peer and run the DTLS client side over it.
+//! drives the handshake; for outbound dials we bind from the configured UDP
+//! transport port when one is available and run the DTLS client side over it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use dtls::conn::DTLSConn;
 use prost::Message as _;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, Interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 use webrtc_util::conn::Listener as UtilListener;
+use webrtc_util::Buffer;
 use webrtc_util::Conn as UtilConn;
 
 use crate::s2s_transport_proto as pb;
@@ -36,7 +39,7 @@ use super::super::frame::{build_frame, FrameType};
 use super::super::identity::NodeIdentity;
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
 use super::super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
-use super::Endpoint;
+use super::{bind_reusable_udp_socket, bind_transport_udp_socket, Endpoint};
 
 /// UDP+DTLS endpoint. Owns the loaded `NodeIdentity` (used to build server
 /// and client DTLS configs) and the listen address.
@@ -67,8 +70,8 @@ impl Endpoint for UdpEndpoint {
             };
             let server_cfg = build_server_dtls_config(&self.identity, inner.cfg().udp_mtu())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
-            let listener = dtls::listener::listen(addr, server_cfg)
-                .await
+            let parent = Arc::new(ReusableUdpListener::bind(addr).await?);
+            let listener = dtls::listener::DTLSListener::new(parent, server_cfg)
                 .map_err(|e| io::Error::other(format!("udp dtls listen: {e}")))?;
             debug!(%addr, "udp dtls listener up");
             tokio::spawn(accept_loop(listener, inner));
@@ -83,11 +86,7 @@ impl Endpoint for UdpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let local_bind: SocketAddr = match addr {
-                SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-                SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
-            };
-            let socket = UdpSocket::bind(local_bind).await?;
+            let socket = bind_transport_udp_socket(self.listen_addr, addr).await?;
             socket.connect(addr).await?;
             let conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(socket);
 
@@ -120,11 +119,7 @@ impl Endpoint for UdpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<NodeIdentifier>> + Send {
         async move {
-            let local_bind: SocketAddr = match addr {
-                SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-                SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
-            };
-            let socket = UdpSocket::bind(local_bind).await?;
+            let socket = bind_transport_udp_socket(self.listen_addr, addr).await?;
             socket.connect(addr).await?;
             let conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(socket);
 
@@ -152,6 +147,166 @@ impl Endpoint for UdpEndpoint {
             Ok(peer_node)
         }
     }
+}
+
+struct ReusableUdpListener {
+    pconn: Arc<dyn UtilConn + Send + Sync>,
+    accept_rx: Mutex<mpsc::Receiver<Arc<BufferedUdpConn>>>,
+    shutdown: CancellationToken,
+    accepting: Arc<AtomicBool>,
+}
+
+impl ReusableUdpListener {
+    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        let socket = bind_reusable_udp_socket(addr).await?;
+        let pconn: Arc<dyn UtilConn + Send + Sync> = Arc::new(socket);
+        let (accept_tx, accept_rx) = mpsc::channel(128);
+        let shutdown = CancellationToken::new();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let conns = Arc::new(Mutex::new(HashMap::new()));
+
+        tokio::spawn(reusable_udp_read_loop(
+            pconn.clone(),
+            accept_tx,
+            conns,
+            shutdown.clone(),
+            accepting.clone(),
+        ));
+
+        Ok(Self {
+            pconn,
+            accept_rx: Mutex::new(accept_rx),
+            shutdown,
+            accepting,
+        })
+    }
+}
+
+#[async_trait]
+impl UtilListener for ReusableUdpListener {
+    async fn accept(&self) -> webrtc_util::Result<(Arc<dyn UtilConn + Send + Sync>, SocketAddr)> {
+        let mut accept_rx = self.accept_rx.lock().await;
+        tokio::select! {
+            conn = accept_rx.recv() => {
+                let conn = conn.ok_or_else(|| io::Error::other("udp dtls listener closed"))?;
+                let raddr = conn.raddr;
+                let conn: Arc<dyn UtilConn + Send + Sync> = conn;
+                Ok((conn, raddr))
+            }
+            _ = self.shutdown.cancelled() => {
+                Err(io::Error::other("udp dtls listener closed").into())
+            }
+        }
+    }
+
+    async fn close(&self) -> webrtc_util::Result<()> {
+        self.accepting.store(false, Ordering::SeqCst);
+        self.shutdown.cancel();
+        self.pconn.close().await
+    }
+
+    async fn addr(&self) -> webrtc_util::Result<SocketAddr> {
+        self.pconn.local_addr()
+    }
+}
+
+struct BufferedUdpConn {
+    pconn: Arc<dyn UtilConn + Send + Sync>,
+    raddr: SocketAddr,
+    buffer: Buffer,
+}
+
+impl BufferedUdpConn {
+    fn new(pconn: Arc<dyn UtilConn + Send + Sync>, raddr: SocketAddr) -> Self {
+        Self {
+            pconn,
+            raddr,
+            buffer: Buffer::new(0, 0),
+        }
+    }
+}
+
+#[async_trait]
+impl UtilConn for BufferedUdpConn {
+    async fn connect(&self, addr: SocketAddr) -> webrtc_util::Result<()> {
+        self.pconn.connect(addr).await
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> webrtc_util::Result<usize> {
+        self.buffer.read(buf, None).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+        let n = self.buffer.read(buf, None).await?;
+        Ok((n, self.raddr))
+    }
+
+    async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
+        self.pconn.send_to(buf, self.raddr).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> webrtc_util::Result<usize> {
+        self.pconn.send_to(buf, target).await
+    }
+
+    fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+        self.pconn.local_addr()
+    }
+
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        Some(self.raddr)
+    }
+
+    async fn close(&self) -> webrtc_util::Result<()> {
+        Ok(())
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+async fn reusable_udp_read_loop(
+    pconn: Arc<dyn UtilConn + Send + Sync>,
+    accept_tx: mpsc::Sender<Arc<BufferedUdpConn>>,
+    conns: Arc<Mutex<HashMap<SocketAddr, Arc<BufferedUdpConn>>>>,
+    shutdown: CancellationToken,
+    accepting: Arc<AtomicBool>,
+) {
+    let mut buf = vec![0u8; 8192];
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            result = pconn.recv_from(&mut buf) => {
+                let (n, raddr) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error=%e, "udp dtls reusable listener read failed");
+                        break;
+                    }
+                };
+                let packet = &buf[..n];
+                let existing = { conns.lock().await.get(&raddr).cloned() };
+                if let Some(conn) = existing {
+                    let _ = conn.buffer.write(packet).await;
+                    continue;
+                }
+                if !accepting.load(Ordering::SeqCst) || !looks_like_dtls_handshake(packet) {
+                    continue;
+                }
+
+                let conn = Arc::new(BufferedUdpConn::new(pconn.clone(), raddr));
+                let _ = conn.buffer.write(packet).await;
+                if accept_tx.try_send(conn.clone()).is_ok() {
+                    conns.lock().await.insert(raddr, conn);
+                }
+            }
+        }
+    }
+}
+
+fn looks_like_dtls_handshake(packet: &[u8]) -> bool {
+    packet.len() >= 13 && packet[0] == 22 && packet[1] == 0xfe
 }
 
 async fn accept_loop(

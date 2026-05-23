@@ -33,6 +33,7 @@ pub mod register;
 pub mod s2s;
 pub mod server;
 pub mod types;
+pub mod user_channel_cache;
 pub mod utils;
 pub mod voice;
 pub mod voice_crypto;

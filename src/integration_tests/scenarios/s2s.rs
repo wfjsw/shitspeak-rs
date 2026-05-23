@@ -380,6 +380,38 @@ async fn s2s_client_replication_propagates_add_update_remove() {
             .is_some();
     assert!(saw_add, "Bob should see Alice's replicated add");
 
+    let bob_session = bob.server_session;
+    let bob_session_wire = u32::from(bob_session);
+    let bob_indexed_on_a = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(a.server.get_clients().get_client(bob_session))
+                .is_some()
+        })
+    })
+    .await;
+    assert!(
+        bob_indexed_on_a,
+        "Server A should materialize Bob in its remote index"
+    );
+
+    let saw_reverse_add = alice
+        .initial_user_states
+        .iter()
+        .any(|us| us.session == Some(bob_session_wire) && us.name.as_deref() == Some("bob"))
+        || alice
+            .recv_until(
+                |m| {
+                    matches!(m, Message::UserState(us)
+                    if us.session == Some(bob_session_wire)
+                        && us.name.as_deref() == Some("bob"))
+                },
+                S2S_DEADLINE,
+            )
+            .await
+            .is_some();
+    assert!(saw_reverse_add, "Alice should see Bob's replicated add");
+
     alice.set_self_mute(true).await;
     let saw_update = bob
         .recv_until(

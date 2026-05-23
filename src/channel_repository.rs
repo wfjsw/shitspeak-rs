@@ -48,6 +48,8 @@ use crate::config::Config;
 use crate::errors::ChannelRepoError;
 use crate::types::{default_server_id, DEFAULT_SERVER_ID};
 
+pub(crate) type ChannelStateSubscription = broadcast::Receiver<Arc<ChannelOperation>>;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ChannelRepoTuning {
     pub log_max_entries: usize,
@@ -754,6 +756,26 @@ impl ChannelRepository {
             }
             None => vec![root_channel()],
         }
+    }
+
+    pub(crate) fn snapshot_with_version_and_subscription_in_server(
+        &self,
+        server_id: &str,
+    ) -> (Vec<Channel>, u64, ChannelStateSubscription) {
+        let channels = self.channels.read();
+        let version = self.versions.read().get(server_id).copied().unwrap_or(0);
+        let rx = self.tx.subscribe();
+        let channels = match channels.get(server_id) {
+            Some(channels) => {
+                let mut channels: Vec<Channel> = channels.values().cloned().collect();
+                if !channels.iter().any(|channel| channel.id == 0) {
+                    channels.push(root_channel());
+                }
+                channels
+            }
+            None => vec![root_channel()],
+        };
+        (channels, version, rx)
     }
 
     /// Return the total number of channels.
@@ -2291,6 +2313,26 @@ mod tests {
         );
         assert_eq!(repo.len_in_server("alpha").await, 2);
         assert_eq!(repo.len_in_server("beta").await, 2);
+    }
+
+    #[tokio::test]
+    async fn subscribed_snapshot_receives_followup_channel_operations() {
+        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let (channels, version, mut rx) =
+            repo.snapshot_with_version_and_subscription_in_server("alpha");
+
+        assert_eq!(version, 0);
+        assert!(channels.iter().any(|channel| channel.id == 0));
+
+        repo.create_channel_in_server("alpha", Channel::new(7, "alpha", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        let op = rx
+            .try_recv()
+            .expect("snapshot subscription receives channel operation");
+        assert_eq!(op.server_id, "alpha");
+        assert_eq!(op.version, 1);
     }
 
     #[tokio::test]

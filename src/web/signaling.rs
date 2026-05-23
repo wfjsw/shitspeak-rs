@@ -15,6 +15,7 @@ use crate::api::{
 use crate::channel_handler::SessionChannelShadow;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::ClientStateOperation;
+use crate::client::user_info::Credential;
 use crate::client::visibility::UserVisibilityState;
 use crate::client::{AsyncMessageHandlerExt, Client};
 use crate::config::{WebAuthMode, WebConfig};
@@ -1103,7 +1104,14 @@ async fn handle_signaling_authenticate(
                 .await
             {
                 Ok(result) => {
-                    handle_successful_password_auth(stream, context, session, result).await
+                    handle_successful_password_auth(
+                        stream,
+                        context,
+                        session,
+                        result,
+                        Some(username.as_str()),
+                    )
+                    .await
                 }
                 Err(rejection) => send_authentication_rejection(stream, rejection).await,
             }
@@ -1214,8 +1222,11 @@ async fn handle_successful_password_auth(
     context: &SignalingContext,
     session: &mut SignalingSession,
     result: AuthenticateResult,
+    cache_username: Option<&str>,
 ) -> io::Result<()> {
     let display_name = result.display_name.clone();
+    let channel_cache_key =
+        crate::user_channel_cache::user_channel_cache_key(result.user_id, cache_username);
     let mut initial_state_client = None;
     if let Some(server) = context.server.as_ref() {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<Message>(256);
@@ -1243,28 +1254,59 @@ async fn handle_successful_password_auth(
             gs.set_display_name(result.display_name);
             gs.set_groups(result.groups.into_iter().collect());
         }
+        if let Some(username) = cache_username {
+            let mut ext = client.user_info_extended().await;
+            ext.set_credential(Credential::new(username.to_owned(), None));
+        }
 
-        let default_ch = server.get_default_channel();
         let server_id = client.server_id();
-        let target_ch = if server
-            .get_channels()
-            .get_channel_in_server(&server_id, default_ch)
-            .await
-            .is_some()
-        {
-            default_ch
-        } else {
-            0
-        };
-        let target_ch = server
-            .get_channels()
-            .redirect_pending_delete_target_in_server(&server_id, target_ch)
-            .await;
+        let restored_channels = crate::user_channel_cache::resolve_login_channels(
+            server,
+            &client,
+            channel_cache_key.as_deref(),
+        )
+        .await;
+        let target_ch = restored_channels.current_channel_id;
         client.set_current_channel_id(
             target_ch,
             server.get_clients(),
             server.get_channels().current_version_in_server(&server_id),
         );
+        if !restored_channels.listening_channel_ids.is_empty() {
+            let mut gs = client.write_global_state(server.get_clients());
+            for channel_id in &restored_channels.listening_channel_ids {
+                gs.listen_channel(*channel_id);
+            }
+        }
+        if let Some(cache_key) = channel_cache_key.as_deref() {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_last_channel(cache_key, target_ch)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key,
+                    "failed to stage user last channel cache"
+                );
+            }
+            if !restored_channels.listening_channel_ids.is_empty() {
+                if let Err(error) = server
+                    .get_user_channel_cache()
+                    .remember_listening_channels(
+                        cache_key,
+                        restored_channels.listening_channel_ids.iter().copied(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        cache_key,
+                        "failed to stage user listening channel cache"
+                    );
+                }
+            }
+        }
         client.set_authenticated(true);
         server
             .get_clients()

@@ -41,6 +41,54 @@ async fn auth_two_clients_succeeds() {
     assert_eq!(bob.welcome_text.as_deref(), Some("test-welcome"));
 }
 
+/// Checks that two users authenticating at the same time converge on each
+/// other's presence even if one user's auth burst races the other's publish.
+#[tokio::test]
+async fn auth_concurrent_clients_see_each_other() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let (alice, bob) = tokio::join!(
+        TestClient::connect_and_authenticate(&server, "alice", None),
+        TestClient::connect_and_authenticate(&server, "bob", None),
+    );
+    let alice = alice.expect("alice auth");
+    let bob = bob.expect("bob auth");
+
+    let alice_saw_bob_initial = alice
+        .initial_user_states
+        .iter()
+        .any(|state| state.session == Some(bob.session_id));
+    if !alice_saw_bob_initial {
+        let saw_bob = alice
+            .recv_until(
+                |message| matches!(message, Message::UserState(state) if state.session == Some(bob.session_id)),
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+        assert!(saw_bob.is_some(), "Alice should receive Bob's UserState");
+    }
+
+    let bob_saw_alice_initial = bob
+        .initial_user_states
+        .iter()
+        .any(|state| state.session == Some(alice.session_id));
+    if !bob_saw_alice_initial {
+        let saw_alice = bob
+            .recv_until(
+                |message| matches!(message, Message::UserState(state) if state.session == Some(alice.session_id)),
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+        assert!(saw_alice.is_some(), "Bob should receive Alice's UserState");
+    }
+}
+
 #[tokio::test]
 async fn auth_selected_server_id_absent_from_config_scopes_client() {
     let server = spawn_test_server(TestServerOpts::default()).await;

@@ -29,6 +29,7 @@ use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, ReadProt
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::get_proxy_protocol_real_ip;
+use crate::user_channel_cache::UserChannelCache;
 use crate::{
     client_repository::ClientRepository,
     codec_info::CodecInfo,
@@ -510,6 +511,7 @@ pub struct Server {
     channels: Arc<ChannelRepository>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
+    user_channel_cache: Arc<UserChannelCache>,
     bans: Arc<crate::ban_repository::BanRepository>,
 
     codec_info: Mutex<CodecInfo>,
@@ -583,7 +585,11 @@ async fn activate_client_subscriptions(
     let server_id = client.server_id();
     let client_session_id = client.get_session_id();
 
-    let channel_snapshot_version = server.channels.current_version_in_server(&server_id);
+    let staged_channel_subscription = client.take_channel_state_subscription();
+    let channel_snapshot_version = staged_channel_subscription
+        .as_ref()
+        .map(|(version, _)| *version)
+        .unwrap_or_else(|| server.channels.current_version_in_server(&server_id));
     client
         .set_last_channel_version(channel_snapshot_version)
         .await;
@@ -593,12 +599,18 @@ async fn activate_client_subscriptions(
         .publish_client_in_server(&server_id, client_session_id)
         .await;
 
-    *client_log_rx = Some(server.clients.subscribe());
-    *channel_log_rx = Some(server.channels.subscribe());
+    *client_log_rx = Some(
+        client
+            .take_client_state_subscription()
+            .unwrap_or_else(|| server.clients.subscribe()),
+    );
+    *channel_log_rx = Some(
+        staged_channel_subscription
+            .map(|(_, rx)| rx)
+            .unwrap_or_else(|| server.channels.subscribe()),
+    );
 
-    crate::client::visibility::initialize(server, client, user_visibility, session_channel_shadow)
-        .await;
-
+    // --- PATCH: Replay missed entries before initializing visibility ---
     let last_seen = client.get_last_client_versions().await;
     let (missed, new_versions) = server
         .clients
@@ -623,6 +635,10 @@ async fn activate_client_subscriptions(
         }
     }
     client.update_last_client_versions(&new_versions).await;
+
+    // Now rebuild visibility from the up-to-date state
+    crate::client::visibility::initialize(server, client, user_visibility, session_channel_shadow)
+        .await;
     Ok(())
 }
 
@@ -704,13 +720,16 @@ impl Server {
         let node_id = config.node_id;
         let client_log_max_entries = config.client_log_max_entries;
         let channel_repo_tuning = ChannelRepoTuning::from(&config);
-        let (channels, channel_blobs, session_blobs, bans) = match &config.blob_storage_dir {
+        let (channels, channel_blobs, session_blobs, user_channel_cache, bans) = match &config
+            .blob_storage_dir
+        {
             Some(dir) => {
                 let ch_repo = ChannelRepository::open(node_id, dir, channel_repo_tuning).await?;
                 let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
+                let user_channel_cache = UserChannelCache::open(dir).await?;
                 let ban_repo = crate::ban_repository::BanRepository::open(node_id, dir).await?;
-                (ch_repo, ch_blobs, s_blobs, ban_repo)
+                (ch_repo, ch_blobs, s_blobs, user_channel_cache, ban_repo)
             }
             None => {
                 // In-memory mode: use a temp dir for blob stores so the
@@ -719,8 +738,9 @@ impl Server {
                 let ch_repo = ChannelRepository::new_in_memory(node_id, channel_repo_tuning);
                 let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
+                let user_channel_cache = UserChannelCache::new_in_memory();
                 let ban_repo = crate::ban_repository::BanRepository::new_in_memory(node_id);
-                (ch_repo, ch_blobs, s_blobs, ban_repo)
+                (ch_repo, ch_blobs, s_blobs, user_channel_cache, ban_repo)
             }
         };
 
@@ -741,6 +761,7 @@ impl Server {
             channels,
             channel_blobs,
             session_blobs,
+            user_channel_cache,
             bans,
             codec_info: Mutex::new(CodecInfo::default()),
             authenticator: Arc::new(authenticator),
@@ -1816,6 +1837,9 @@ impl Server {
                     continue;
                 }
                 let last = client.get_last_channel_version().await;
+                if op.version <= last {
+                    continue;
+                }
                                 replay_channel_log_gap(
                                     self, &client, &self.channels, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, op.version,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
@@ -1888,6 +1912,9 @@ impl Server {
                                 }
                                 let last_seen = client.get_last_client_versions().await;
                                 let last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
+                                if entry.version <= last_for_node {
+                                    continue;
+                                }
                                 if entry.version > last_for_node + 1 {
                                     let server_id = client.server_id();
                                     let (missed, new_versions) = self.clients.replay_since_in_server(&server_id, &last_seen).await
@@ -2177,6 +2204,10 @@ impl Server {
 
     pub fn get_session_blobs(&self) -> &Arc<SessionBlobStore> {
         &self.session_blobs
+    }
+
+    pub fn get_user_channel_cache(&self) -> &Arc<UserChannelCache> {
+        &self.user_channel_cache
     }
 
     pub fn get_udp_socket(&self) -> Option<Arc<tokio::net::UdpSocket>> {

@@ -3,22 +3,56 @@ use std::sync::Arc;
 
 use crate::{
     acl::ACLPermissions,
-    client::Client,
+    client::{client_global_state::ClientGlobalState, Client},
     errors::MessageHandlerError,
     localization::channel_does_not_exist,
-    messages::encoder::{DenyType, PermissionDenied},
+    messages::encoder::{DenyType, PermissionDenied, UserState},
     server::Server,
 };
+
+fn apply_self_mute_deaf(
+    state: &mut ClientGlobalState,
+    self_mute: Option<bool>,
+    self_deaf: Option<bool>,
+) {
+    if let Some(self_mute) = self_mute {
+        if state.is_self_muted() != self_mute {
+            state.set_self_mute(self_mute);
+            // Implicitly clear self-deaf when unmuting.
+            if !self_mute {
+                state.set_self_deaf(false);
+            }
+        }
+    }
+    if let Some(self_deaf) = self_deaf {
+        if state.is_self_deafened() != self_deaf {
+            state.set_self_deaf(self_deaf);
+            // Implicitly self-mute when self-deafening.
+            if self_deaf && !state.is_self_muted() {
+                state.set_self_mute(true);
+            }
+        }
+    }
+}
+
+fn handle_pre_auth_user_state(
+    server: &Arc<Box<Server>>,
+    sender: &Arc<Box<Client>>,
+    msg: &UserState,
+) {
+    let repo = server.get_clients();
+    let mut gs = sender.write_global_state_as(repo, Some(sender.get_session_id()), None);
+    apply_self_mute_deaf(&mut gs, msg.self_mute, msg.self_deaf);
+}
 
 pub async fn handle_user_state(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
-    msg: crate::messages::encoder::UserState,
+    msg: UserState,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated() {
-        return Err(MessageHandlerError::protocol_violation(
-            "UserState message received before authentication",
-        ));
+        handle_pre_auth_user_state(server, sender, &msg);
+        return Ok(());
     }
 
     let sender_id = sender.get_session_id();
@@ -489,123 +523,153 @@ pub async fn handle_user_state(
     } else {
         None
     };
-    let mut gs = target.write_global_state_as(repo, Some(sender_id), channel_version_dep);
+    let should_stage_channel_cache = requested_channel_change.is_some()
+        || !msg.listening_channel_add.is_empty()
+        || !msg.listening_channel_remove.is_empty();
+    let channel_cache_key = if should_stage_channel_cache {
+        crate::user_channel_cache::cache_key_for_client(target.as_ref()).await
+    } else {
+        None
+    };
+    let mut cache_last_channel_id = None;
+    let mut cache_listening_channel_ids = None;
+    {
+        let mut gs = target.write_global_state_as(repo, Some(sender_id), channel_version_dep);
 
-    // ── Self-mute / self-deaf (only target can set their own) ─────────────
-    if is_self {
-        if let Some(self_mute) = msg.self_mute {
-            if gs.is_self_muted() != self_mute {
-                gs.set_self_mute(self_mute);
-                // Implicitly clear self-deaf when unmuting
-                if !self_mute {
-                    gs.set_self_deaf(false);
+        // ── Self-mute / self-deaf (only target can set their own) ─────────────
+        if is_self {
+            apply_self_mute_deaf(&mut gs, msg.self_mute, msg.self_deaf);
+        }
+
+        // ── Server mute/deaf/suppress ────────────────────────────────────────
+        if !is_self || msg.mute.is_some() || msg.deaf.is_some() || msg.suppress.is_some() {
+            if let Some(mute) = msg.mute {
+                if gs.is_muted() != mute {
+                    gs.set_mute(mute);
+                    // Implicitly clear deaf when unmuting
+                    if !mute {
+                        gs.set_deaf(false);
+                    }
+                }
+
+                if gs.is_suppressed() && !mute {
+                    gs.set_suppress(false);
+                }
+            }
+            if let Some(deaf) = msg.deaf {
+                if gs.is_deafened() != deaf {
+                    gs.set_deaf(deaf);
+                    // Implicitly mute when deafening
+                    if deaf && !gs.is_muted() {
+                        gs.set_mute(true);
+                    }
+                }
+            }
+            if let Some(suppress) = msg.suppress {
+                if gs.is_suppressed() != suppress {
+                    gs.set_suppress(suppress);
                 }
             }
         }
-        if let Some(self_deaf) = msg.self_deaf {
-            if gs.is_self_deafened() != self_deaf {
-                gs.set_self_deaf(self_deaf);
-                // Implicitly self-mute when self-deafening
-                if self_deaf && !gs.is_self_muted() {
-                    gs.set_self_mute(true);
+
+        if !is_self {
+            if let Some(priority_speaker) = msg.priority_speaker {
+                if gs.is_priority_speaker() != priority_speaker {
+                    gs.set_priority_speaker(priority_speaker);
                 }
             }
         }
-    }
 
-    // ── Server mute/deaf/suppress ────────────────────────────────────────
-    if !is_self || msg.mute.is_some() || msg.deaf.is_some() || msg.suppress.is_some() {
-        if let Some(mute) = msg.mute {
-            if gs.is_muted() != mute {
-                gs.set_mute(mute);
-                // Implicitly clear deaf when unmuting
-                if !mute {
-                    gs.set_deaf(false);
-                }
-            }
-
-            if gs.is_suppressed() && !mute {
-                gs.set_suppress(false);
-            }
-        }
-        if let Some(deaf) = msg.deaf {
-            if gs.is_deafened() != deaf {
-                gs.set_deaf(deaf);
-                // Implicitly mute when deafening
-                if deaf && !gs.is_muted() {
-                    gs.set_mute(true);
+        // ── Recording (self only) ─────────────────────────────────────────────
+        if is_self {
+            if let Some(recording) = msg.recording {
+                if gs.is_recording() != recording {
+                    gs.set_recording(recording);
                 }
             }
         }
-        if let Some(suppress) = msg.suppress {
-            if gs.is_suppressed() != suppress {
-                gs.set_suppress(suppress);
+
+        // ── Channel move ──────────────────────────────────────────────────────
+        if let Some(new_channel_id) = requested_channel_change {
+            gs.set_current_channel_id(new_channel_id);
+            cache_last_channel_id = Some(new_channel_id);
+
+            if let Some(dst_perms) = target_destination_perms {
+                gs.set_suppress(!dst_perms.contains(ACLPermissions::Speak));
+            }
+        }
+
+        // ── Listening channel add/remove ──────────────────────────────────────
+        if !msg.listening_channel_add.is_empty() || !msg.listening_channel_remove.is_empty() {
+            for ch in &msg.listening_channel_add {
+                gs.listen_channel(*ch);
+            }
+            for ch in &msg.listening_channel_remove {
+                gs.unlisten_channel(*ch);
+            }
+            cache_listening_channel_ids = Some(
+                gs.get_listening_channel_id()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        // ── Comment update ────────────────────────────────────────────────────
+        if let Some(comment_blob_hash) = comment_blob_hash {
+            match comment_blob_hash {
+                Some(hash) => gs.set_comment_blob(None, Some(hash)),
+                None => gs.clear_comment_blob(),
+            }
+        }
+
+        // ── Texture update ────────────────────────────────────────────────────
+        if let Some(texture_blob_hash) = texture_blob_hash {
+            match texture_blob_hash {
+                Some(hash) => gs.set_texture_blob(None, Some(hash)),
+                None => gs.clear_texture_blob(),
+            }
+        }
+
+        // ── Plugin context/identity (self only) ───────────────────────────────
+        if is_self {
+            if let Some(ctx) = msg.plugin_context {
+                gs.set_plugin_context(ctx);
+            }
+            if let Some(identity) = msg.plugin_identity {
+                gs.set_plugin_identity(identity);
             }
         }
     }
 
-    if !is_self {
-        if let Some(priority_speaker) = msg.priority_speaker {
-            if gs.is_priority_speaker() != priority_speaker {
-                gs.set_priority_speaker(priority_speaker);
+    if let Some(cache_key) = channel_cache_key.as_deref() {
+        if let Some(channel_id) = cache_last_channel_id {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_last_channel(cache_key, channel_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key,
+                    "failed to stage user last channel cache"
+                );
+            }
+        }
+        if let Some(channel_ids) = cache_listening_channel_ids {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_listening_channels(cache_key, channel_ids)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key,
+                    "failed to stage user listening channel cache"
+                );
             }
         }
     }
 
-    // ── Recording (self only) ─────────────────────────────────────────────
-    if is_self {
-        if let Some(recording) = msg.recording {
-            if gs.is_recording() != recording {
-                gs.set_recording(recording);
-            }
-        }
-    }
-
-    // ── Channel move ──────────────────────────────────────────────────────
-    if let Some(new_channel_id) = requested_channel_change {
-        gs.set_current_channel_id(new_channel_id);
-
-        if let Some(dst_perms) = target_destination_perms {
-            gs.set_suppress(!dst_perms.contains(ACLPermissions::Speak));
-        }
-    }
-
-    // ── Listening channel add/remove ──────────────────────────────────────
-    if !msg.listening_channel_add.is_empty() || !msg.listening_channel_remove.is_empty() {
-        for ch in &msg.listening_channel_add {
-            gs.listen_channel(*ch);
-        }
-        for ch in &msg.listening_channel_remove {
-            gs.unlisten_channel(*ch);
-        }
-    }
-
-    // ── Comment update ────────────────────────────────────────────────────
-    if let Some(comment_blob_hash) = comment_blob_hash {
-        match comment_blob_hash {
-            Some(hash) => gs.set_comment_blob(None, Some(hash)),
-            None => gs.clear_comment_blob(),
-        }
-    }
-
-    // ── Texture update ────────────────────────────────────────────────────
-    if let Some(texture_blob_hash) = texture_blob_hash {
-        match texture_blob_hash {
-            Some(hash) => gs.set_texture_blob(None, Some(hash)),
-            None => gs.clear_texture_blob(),
-        }
-    }
-
-    // ── Plugin context/identity (self only) ───────────────────────────────
-    if is_self {
-        if let Some(ctx) = msg.plugin_context {
-            gs.set_plugin_context(ctx);
-        }
-        if let Some(identity) = msg.plugin_identity {
-            gs.set_plugin_identity(identity);
-        }
-    }
-
-    // Guard drops here → auto-commits delta, bumps version, broadcasts via log.
     Ok(())
 }

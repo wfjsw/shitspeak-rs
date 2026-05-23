@@ -16,7 +16,9 @@ use super::super::connection::PeerState;
 use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
 use super::super::service_level::TransportKind;
-use super::{install_stream_session, Endpoint};
+use super::{
+    bind_reusable_udp_socket, bind_transport_udp_socket, install_stream_session, Endpoint,
+};
 
 pub(crate) struct KcpEndpoint {
     server_tls: Arc<rustls::ServerConfig>,
@@ -50,7 +52,8 @@ impl Endpoint for KcpEndpoint {
                 return Ok(());
             };
             let cfg = KcpConfig::default();
-            let listener = KcpListener::bind(cfg, addr)
+            let socket = bind_reusable_udp_socket(addr).await?;
+            let listener = KcpListener::from_socket(cfg, socket)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp bind: {e}")))?;
             let acceptor = TlsAcceptor::from(self.server_tls.clone());
@@ -68,7 +71,8 @@ impl Endpoint for KcpEndpoint {
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
             let cfg = KcpConfig::default();
-            let sock = KcpStream::connect(&cfg, addr)
+            let socket = bind_transport_udp_socket(self.listen_addr, addr).await?;
+            let sock = KcpStream::connect_with_socket(&cfg, socket, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
             let connector = TlsConnector::from(self.client_tls.clone());
@@ -99,7 +103,8 @@ impl Endpoint for KcpEndpoint {
     ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
         async move {
             let cfg = KcpConfig::default();
-            let sock = KcpStream::connect(&cfg, addr)
+            let socket = bind_transport_udp_socket(self.listen_addr, addr).await?;
+            let sock = KcpStream::connect_with_socket(&cfg, socket, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
             let connector = TlsConnector::from(self.client_tls.clone());

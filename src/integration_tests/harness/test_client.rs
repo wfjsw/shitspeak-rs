@@ -300,6 +300,7 @@ impl TestClient {
             password,
             true,
             ProtocolVersion::new(1, 5, 0),
+            Vec::new(),
         )
         .await
     }
@@ -314,7 +315,7 @@ impl TestClient {
         password: Option<&str>,
         version: ProtocolVersion,
     ) -> Result<TestClient, ConnectError> {
-        Self::connect_with(server, username, password, true, version).await
+        Self::connect_with(server, username, password, true, version, Vec::new()).await
     }
 
     /// Same as `connect_and_authenticate` but does not present a client cert.
@@ -330,6 +331,24 @@ impl TestClient {
             password,
             false,
             ProtocolVersion::new(1, 5, 0),
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn connect_with_preauth_messages(
+        server: &TestServer,
+        username: &str,
+        password: Option<&str>,
+        pre_auth_messages: Vec<Message>,
+    ) -> Result<TestClient, ConnectError> {
+        Self::connect_with(
+            server,
+            username,
+            password,
+            true,
+            ProtocolVersion::new(1, 5, 0),
+            pre_auth_messages,
         )
         .await
     }
@@ -340,6 +359,7 @@ impl TestClient {
         password: Option<&str>,
         present_client_cert: bool,
         declared_version: ProtocolVersion,
+        pre_auth_messages: Vec<Message>,
     ) -> Result<TestClient, ConnectError> {
         // ── Build CA-trusting RootCertStore ───────────────────────────────
         let ca_pem = std::fs::read_to_string(&server.pki.ca_path).expect("read ca pem");
@@ -425,6 +445,10 @@ impl TestClient {
         }
         .into();
         client.send(version).await;
+
+        for message in pre_auth_messages {
+            client.send(message).await;
+        }
 
         // ── Send Authenticate ─────────────────────────────────────────────
         let authenticate: Message = Authenticate {

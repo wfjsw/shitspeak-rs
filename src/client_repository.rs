@@ -17,7 +17,7 @@ use crate::{
             ClientGlobalStateDelta, ClientStateBroadcastPayload, ClientStateLogEntry,
             ClientStateOperation,
         },
-        Client, ClientInstanceId,
+        Client, ClientInstanceId, ClientStateSubscription,
     },
     constants::MAX_LOCAL_SESSION_ID,
     types::{default_server_id, ScopedChannelId, ScopedSessionId, DEFAULT_SERVER_ID},
@@ -1229,7 +1229,65 @@ impl ClientRepository {
             .filter(|client| client.server_id() == server_id)
             .cloned()
             .collect();
-        (clients, register.versions.clone())
+        let mut versions = HashMap::new();
+        if let Some(version) = register
+            .local_log
+            .iter()
+            .filter(|entry| entry.op.server_id() == server_id)
+            .map(|entry| entry.version)
+            .max()
+        {
+            versions.insert(self.local_node_id, version);
+        }
+        for (node_id, log) in &register.remote_logs {
+            if let Some(version) = log
+                .iter()
+                .filter(|entry| entry.op.server_id() == server_id)
+                .map(|entry| entry.version)
+                .max()
+            {
+                versions.insert(*node_id, version);
+            }
+        }
+        (clients, versions)
+    }
+
+    pub(crate) async fn snapshot_with_versions_and_subscription_in_server(
+        &self,
+        server_id: &str,
+    ) -> (
+        Vec<Arc<Box<Client>>>,
+        HashMap<u16, u64>,
+        ClientStateSubscription,
+    ) {
+        let register = self.register.read().await;
+        let rx = self.tx.subscribe();
+        let clients: Vec<_> = register
+            .all_clients()
+            .filter(|client| client.server_id() == server_id)
+            .cloned()
+            .collect();
+        let mut versions = HashMap::new();
+        if let Some(version) = register
+            .local_log
+            .iter()
+            .filter(|entry| entry.op.server_id() == server_id)
+            .map(|entry| entry.version)
+            .max()
+        {
+            versions.insert(self.local_node_id, version);
+        }
+        for (node_id, log) in &register.remote_logs {
+            if let Some(version) = log
+                .iter()
+                .filter(|entry| entry.op.server_id() == server_id)
+                .map(|entry| entry.version)
+                .max()
+            {
+                versions.insert(*node_id, version);
+            }
+        }
+        (clients, versions, rx)
     }
 
     /// Replay all log entries newer than the given per-node versions.
@@ -1837,6 +1895,92 @@ mod tests {
             .get_client_in_server("beta", alpha.get_session_id())
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_versions_in_server_is_scoped_to_matching_log_entries() {
+        let repo = ClientRepository::new(1, 128);
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+        let alpha_session = ClientSessionIdentifier::new(1, 7).unwrap();
+        let beta_session = ClientSessionIdentifier::new(1, 8).unwrap();
+
+        repo.commit_operation(
+            ClientStateOperation::AddClient {
+                server_id: "alpha".to_string(),
+                session_id: alpha_session,
+                client_instance_id: 7,
+                real_ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+            None,
+        )
+        .await;
+        repo.commit_operation(
+            ClientStateOperation::AddClient {
+                server_id: "beta".to_string(),
+                session_id: beta_session,
+                client_instance_id: 8,
+                real_ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+            None,
+        )
+        .await;
+
+        let (_, alpha_versions) = repo.snapshot_with_versions_in_server("alpha").await;
+        let (_, beta_versions) = repo.snapshot_with_versions_in_server("beta").await;
+
+        assert_eq!(alpha_versions.get(&1), Some(&1));
+        assert_eq!(beta_versions.get(&1), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn subscribed_snapshot_receives_followup_client_state_entries() {
+        let repo = ClientRepository::new(1, 128);
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+        let session = ClientSessionIdentifier::new(1, 9).unwrap();
+
+        let (_clients, versions, mut rx) = repo
+            .snapshot_with_versions_and_subscription_in_server("alpha")
+            .await;
+        assert!(versions.is_empty());
+
+        repo.commit_operation(
+            ClientStateOperation::AddClient {
+                server_id: "alpha".to_string(),
+                session_id: session,
+                client_instance_id: 9,
+                real_ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+            None,
+        )
+        .await;
+
+        let broadcast = rx
+            .try_recv()
+            .expect("snapshot subscription receives commit");
+        assert_eq!(broadcast.entry.version, 1);
+        assert_eq!(broadcast.entry.op.server_id(), "alpha");
     }
 
     #[tokio::test]

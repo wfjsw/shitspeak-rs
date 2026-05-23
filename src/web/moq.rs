@@ -591,6 +591,12 @@ impl MoqSessionRuntime {
                         reason: "already authenticated".to_string(),
                     }]);
                 }
+                let cache_username = match &auth {
+                    crate::web::protocol::AuthRequest::Password { username, .. } => {
+                        Some(username.clone())
+                    }
+                    crate::web::protocol::AuthRequest::Sso { .. } => None,
+                };
                 let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(256);
                 let result = self
                     .context
@@ -599,7 +605,12 @@ impl MoqSessionRuntime {
                     .map_err(authentication_rejection_reason)?;
                 let Some((server, client, session, display_name)) = self
                     .context
-                    .allocate_authenticated_client(result, outbound_tx, WebSessionTransport::Moq)
+                    .allocate_authenticated_client(
+                        result,
+                        outbound_tx,
+                        WebSessionTransport::Moq,
+                        cache_username.as_deref(),
+                    )
                     .await
                 else {
                     return Err("MoQ authentication is not wired to this server".to_string());

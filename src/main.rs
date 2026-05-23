@@ -34,6 +34,7 @@ mod register;
 mod s2s;
 mod server;
 mod types;
+mod user_channel_cache;
 mod utils;
 mod voice;
 mod voice_crypto;
