@@ -461,7 +461,7 @@ pub async fn handle_user_state(
                 };
                 if let Err(e) = app
                     .moderation()
-                    .dispatch_user_state_in_server(&server_id, sender_id, target_session_id, patch)
+                    .dispatch_user_state(Some(&server_id), sender_id, target_session_id, patch)
                     .await
                 {
                     tracing::warn!(

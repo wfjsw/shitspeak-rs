@@ -421,6 +421,119 @@ async fn s2s_client_replication_propagates_add_update_remove() {
     );
 }
 
+/// Checks that a reconnecting client receives other replicated users in their
+/// actual channels, even though the reconnecting client itself starts in root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
+    let _guard = S2S_TEST_LOCK.lock().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    a.server
+        .get_channels()
+        .create_channel(crate::channels::Channel::new(
+            42,
+            "S2S Lobby".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create replicated channel");
+
+    let channel_replicated = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(b.server.get_channels().get_channel(42))
+                .is_some()
+        })
+    })
+    .await;
+    assert!(channel_replicated, "Server B should know channel 42");
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    alice.move_to_channel(42).await;
+    bob.move_to_channel(42).await;
+
+    let alice_materialized_on_b = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let client = tokio::runtime::Handle::current()
+                .block_on(b.server.get_clients().get_client(alice.server_session));
+            client.is_some_and(|client| client.get_current_channel_id() == 42)
+        })
+    })
+    .await;
+    assert!(
+        alice_materialized_on_b,
+        "Server B should track Alice in channel 42 before Bob reconnects; channel_version={}, client_versions={:?}, alice_channel={:?}",
+        b.server.get_channels().current_version(),
+        b.server.get_clients().snapshot_with_versions().await.1,
+        b.server
+            .get_clients()
+            .get_client(alice.server_session)
+            .await
+            .map(|client| client.get_current_channel_id())
+    );
+
+    let bob_materialized_on_a = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let client = tokio::runtime::Handle::current()
+                .block_on(a.server.get_clients().get_client(bob.server_session));
+            client.is_some_and(|client| client.get_current_channel_id() == 42)
+        })
+    })
+    .await;
+    assert!(
+        bob_materialized_on_a,
+        "Server A should track Bob in channel 42 before Bob disconnects"
+    );
+
+    let old_bob_session = bob.server_session;
+    drop(bob);
+
+    let old_bob_removed = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(a.server.get_clients().get_client(old_bob_session))
+                .is_none()
+        })
+    })
+    .await;
+    assert!(old_bob_removed, "Server A should remove old Bob");
+
+    let bob_reconnected = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob reconnect");
+
+    let alice_wire_session = u32::from(alice.server_session);
+    let alice_state = bob_reconnected
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(alice_wire_session));
+    assert_eq!(
+        alice_state.and_then(|state| state.channel_id),
+        Some(42),
+        "Bob's reconnect burst should keep Alice in channel 42"
+    );
+
+    let bob_state = bob_reconnected
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob_reconnected.session_id));
+    assert_eq!(
+        bob_state.and_then(|state| state.channel_id),
+        Some(0),
+        "Bob reconnects into root until last-channel persistence exists"
+    );
+}
+
 /// Checks that a ban operation proposed on one S2S node appears on another.
 /// Expected: server B's active ban list contains the proposed ban reason after
 /// server A accepts the S2S proposal. Ban semantics come from Mumble's

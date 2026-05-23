@@ -77,7 +77,7 @@ pub async fn handle_channel_remove(
 
     let s2s_marked = server
         .s2s_manager()
-        .propose_channel_op_in_server(&server_id, mark)
+        .propose_channel_op(Some(&server_id), mark)
         .await;
     let deleting_subtree: std::collections::HashSet<u32> = if !s2s_marked {
         match server
@@ -127,7 +127,7 @@ pub async fn handle_channel_remove(
         };
         if !server
             .s2s_manager()
-            .propose_channel_op_in_server(&server_id, cancel)
+            .propose_channel_op(Some(&server_id), cancel)
             .await
         {
             let _ = server
@@ -139,7 +139,7 @@ pub async fn handle_channel_remove(
     }
     if !server
         .s2s_manager()
-        .propose_channel_op_in_server(&server_id, delete)
+        .propose_channel_op(Some(&server_id), delete)
         .await
     {
         match server

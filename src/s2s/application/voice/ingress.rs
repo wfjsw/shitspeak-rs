@@ -339,48 +339,6 @@ impl VoiceService {
         self.transport.send_unicast(dst, bytes).await
     }
 
-    pub async fn send_intent_broadcast(
-        &self,
-        sender_session: u32,
-        server_id: String,
-        target_kind: u32,
-        is_terminator: bool,
-        payload: Bytes,
-        intent: VoiceIntent,
-    ) -> Result<(), ApplicationError> {
-        self.send_broadcast(
-            sender_session,
-            server_id,
-            target_kind,
-            is_terminator,
-            payload,
-            intent,
-        )
-        .await
-    }
-
-    pub async fn send_intent_multicast(
-        &self,
-        sender_session: u32,
-        server_id: String,
-        target_kind: u32,
-        is_terminator: bool,
-        payload: Bytes,
-        intent: VoiceIntent,
-        dsts: &[NodeIdentifier],
-    ) -> Result<(), ApplicationError> {
-        self.send_multicast(
-            sender_session,
-            server_id,
-            target_kind,
-            is_terminator,
-            payload,
-            intent,
-            dsts,
-        )
-        .await
-    }
-
     fn encode(
         &self,
         sender_session: u32,

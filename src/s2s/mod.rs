@@ -183,12 +183,8 @@ impl S2SManager {
         info!(seed_count, "s2s enabled");
     }
 
-    pub async fn propose_channel_op(&self, op: ChannelOp) -> bool {
-        self.propose_channel_op_in_server(DEFAULT_SERVER_ID, op)
-            .await
-    }
-
-    pub async fn propose_channel_op_in_server(&self, server_id: &str, op: ChannelOp) -> bool {
+    pub async fn propose_channel_op(&self, server_id: Option<&str>, op: ChannelOp) -> bool {
+        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID);
         let handle = match self.channel_replication_handle(server_id) {
             Some(handle) => handle,
             None => return false,
@@ -229,12 +225,8 @@ impl S2SManager {
         }
     }
 
-    pub async fn get_channel_blob(&self, key: &str) -> Option<Bytes> {
-        self.get_channel_blob_in_server(DEFAULT_SERVER_ID, key)
-            .await
-    }
-
-    pub async fn get_channel_blob_in_server(&self, server_id: &str, key: &str) -> Option<Bytes> {
+    pub async fn get_channel_blob(&self, server_id: Option<&str>, key: &str) -> Option<Bytes> {
+        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID);
         let handle = self.channel_blob_replication_handle(server_id)?;
         handle.get(key).await
     }
@@ -1358,6 +1350,12 @@ impl OwnerReplicable for ClientReplicationAdapter {
     }
 
     async fn reset_origin(&self, origin: NodeIdentifier, _new_epoch: u64) {
+        if origin != self.clients.local_node_id() {
+            self.clients.clear_clients_from_node(origin).await;
+        }
+    }
+
+    async fn remove_origin(&self, origin: NodeIdentifier) {
         if origin != self.clients.local_node_id() {
             self.clients.clear_clients_from_node(origin).await;
         }

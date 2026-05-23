@@ -3,14 +3,13 @@
 //! Builds an in-memory configuration (no persistent blob storage, no S2S
 //! cluster activity), generates a single-cert PKI via [`mint_pki`], hands
 //! a [`AuthenticatorAdapter`] to `Server::new`, and spawns `Server::run` on a
-//! tokio task. Dropping the [`TestServer`] drops the shutdown channel, which
+//! tokio task. Dropping the [`TestServer`] triggers server shutdown, which
 //! causes `Server::run` to exit cleanly.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, S2sConfig, S2sSeedAddressConfig, UdpPingUserCountScope, WebConfig};
@@ -55,18 +54,16 @@ pub struct TestServer {
     pub udp_addr: SocketAddr,
     pub pki: Arc<Pki>,
     pub authenticator: Arc<TestAuthenticator>,
-    shutdown_tx: watch::Sender<()>,
     run_handle: Option<JoinHandle<()>>,
     _s2s_persistence_dir: Option<TempDir>,
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        // Sending on the watch channel triggers Server::run's shutdown branch,
-        // which stops the accept loops and lets the run task exit.
+        // Trigger shutdown so Server::run stops accept loops and can exit.
         // We can't await the JoinHandle from Drop, so we abort it as a fallback;
         // the run task will already have noticed the shutdown signal.
-        let _ = self.shutdown_tx.send(());
+        self.server.shutdown();
         if let Some(h) = self.run_handle.take() {
             h.abort();
         }
@@ -147,6 +144,7 @@ async fn spawn_test_server_with_pki(
         allowed_proxies: Vec::new(),
         min_client_version: 0,
         max_users: opts.max_users,
+        authenticator_wasm_path: None,
         welcome_text: opts.welcome_text.clone(),
         max_bandwidth: 72_000,
         allow_html: true,
@@ -183,12 +181,10 @@ async fn spawn_test_server_with_pki(
     let addr = server.local_addr().expect("local_addr");
     let udp_addr = server.local_udp_addr().expect("local_udp_addr");
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-
     let run_handle = tokio::spawn({
         let server = Arc::clone(&server);
         async move {
-            let _ = server.run(shutdown_rx).await;
+            let _ = server.run().await;
         }
     });
 
@@ -198,7 +194,6 @@ async fn spawn_test_server_with_pki(
         udp_addr,
         pki,
         authenticator,
-        shutdown_tx,
         run_handle: Some(run_handle),
         _s2s_persistence_dir: s2s_persistence_dir,
     }

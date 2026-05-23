@@ -75,10 +75,15 @@ pub trait OwnerReplicable: Send + Sync + 'static {
     );
 
     /// Called whenever the runtime detects a strictly-greater epoch for
-    /// `origin` — either via a fresh `OwnerOp` carrying the new epoch or
-    /// via the overlay's `MembershipEvent::Restarted`. Implementations
-    /// should drop any state under the old epoch.
+    /// `origin` -- either via a fresh `OwnerOp` carrying the new epoch or
+    /// via the overlay's `MembershipEvent::Restarted`. This is restart
+    /// handling: implementations should drop any state under the old epoch.
     async fn reset_origin(&self, origin: NodeIdentifier, new_epoch: u64);
+
+    /// Called when membership reports that `origin` is offline without a
+    /// replacement epoch. Transient implementations can remove visible state;
+    /// durable implementations may keep their data and leave this as a no-op.
+    async fn remove_origin(&self, _origin: NodeIdentifier) {}
 }
 
 /// Caller-facing handle for an owner-scoped topic.

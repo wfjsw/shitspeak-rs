@@ -346,8 +346,8 @@ async fn owner_three_node_replication() {
 }
 
 /// Checks owner-mode catchup for a late remote replica.
-/// Expected: after A registers late and B proposes one more operation, A
-/// detects the gap, pulls the missing owner log, and records `(epoch_b, 6)`.
+/// Expected: after A registers late, A proactively pulls B's existing owner
+/// log without requiring another post-join operation and records `(epoch_b, 5)`.
 /// This is this crate's S2S catchup behavior for owner-scoped Mumble/shitspeak
 /// state.
 #[tokio::test]
@@ -365,21 +365,20 @@ async fn owner_late_join_catches_up_via_log() {
     let ok = wait_until(Duration::from_secs(5), || repo_b.applied_for(6).len() == 5).await;
     assert!(ok, "owner B must apply its own 5 ops");
 
-    // Register on A late: we get nothing automatically because owner
-    // catchup is reactive — only `OwnerOp` arrivals or membership-driven
-    // catchup hooks fire it. So have B propose one more op after A
-    // registers; A should detect a gap and pull the missing 5 + 1.
+    // Register on A late. Owner runtime startup should proactively request
+    // catchup for already-alive origins, without waiting for another op.
     let repo_a = CountingOwnerRepo::new();
     let _h_a = cluster
         .register_owner(0, "clients", repo_a.clone())
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    h_b.propose(999u64).await.unwrap();
 
-    let ok = wait_until(Duration::from_secs(10), || repo_a.applied_for(6).len() == 6).await;
-    assert!(ok, "late-joined replica must converge to all 6 ops");
+    let ok = wait_until(Duration::from_secs(10), || repo_a.applied_for(6).len() == 5).await;
+    assert!(
+        ok,
+        "late-joined replica must converge to all 5 existing ops"
+    );
     let known_a = repo_a.known_versions();
-    assert_eq!(known_a.get(&6), Some(&(epoch_b, 6)));
+    assert_eq!(known_a.get(&6), Some(&(epoch_b, 5)));
     cluster.shutdown().await;
 }
 

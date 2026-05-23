@@ -9,8 +9,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::s2s::overlay::{MemberStatus, OverlayNetwork, RoutingMetric};
-use crate::s2s::transport::ServiceLevel;
 use crate::s2s::transport::{ConnectionManager, TransportKind};
+use crate::s2s::transport::{MessageClass, ServiceLevel, ServiceShape};
 use crate::types::NodeIdentifier;
 
 const MAX_REQUEST_BYTES: usize = 8192;
@@ -72,10 +72,25 @@ struct TransportMetric {
     jitter_us: f64,
     recv_bps: f64,
     sent_bps: f64,
+    wire_recv_bps: f64,
+    wire_sent_bps: f64,
+    probe_goodput_bps: f64,
     estimated_throughput_bps: f64,
     samples: u64,
     probe_samples: u64,
+    service_metrics: Vec<TransportServiceMetric>,
     last_update_age_ms: Option<u128>,
+}
+
+#[derive(Debug, Serialize)]
+struct TransportServiceMetric {
+    service: &'static str,
+    level: &'static str,
+    class: &'static str,
+    payload_bytes: usize,
+    supported: bool,
+    probe_goodput_bps: f64,
+    probe_samples: u64,
 }
 
 pub fn spawn_status_server(
@@ -340,8 +355,24 @@ fn build_topology_snapshot(
     routes.sort_by_key(|route| (route.metric, route.level, route.dst));
 
     let mut local_metrics = Vec::new();
+    let transport_cfg = transport.inner.cfg();
     for (peer, per_transport) in metrics.per_node() {
         for (kind, metric) in per_transport {
+            let service_metrics = ServiceShape::ALL
+                .into_iter()
+                .map(|shape| {
+                    let probe = metric.service_probe(shape);
+                    TransportServiceMetric {
+                        service: shape.name(),
+                        level: service_level_name(shape.service_level()),
+                        class: message_class_name(shape.message_class()),
+                        payload_bytes: transport_cfg.service_probe_payload_size(shape),
+                        supported: transport_cfg.service_probe_supported(*kind, shape),
+                        probe_goodput_bps: probe.goodput_bps(),
+                        probe_samples: probe.samples(),
+                    }
+                })
+                .collect();
             local_metrics.push(TransportMetric {
                 peer: *peer,
                 transport: transport_kind_name(*kind),
@@ -349,9 +380,13 @@ fn build_topology_snapshot(
                 jitter_us: metric.jitter_us(),
                 recv_bps: metric.recv_bps(),
                 sent_bps: metric.sent_bps(),
+                wire_recv_bps: metric.wire_recv_bps(),
+                wire_sent_bps: metric.wire_sent_bps(),
+                probe_goodput_bps: metric.max_probe_goodput_bps(),
                 estimated_throughput_bps: metric.estimated_throughput_bps(),
                 samples: metric.samples(),
                 probe_samples: metric.probe_samples(),
+                service_metrics,
                 last_update_age_ms: metric
                     .last_update()
                     .map(|ts| now.duration_since(ts).as_millis()),
@@ -399,6 +434,21 @@ fn transport_kind_name(kind: TransportKind) -> &'static str {
         TransportKind::Kcp => "kcp",
         TransportKind::Quic => "quic",
         TransportKind::Udp => "udp",
+    }
+}
+
+fn service_level_name(level: ServiceLevel) -> &'static str {
+    match level {
+        ServiceLevel::ReliableLowLatency => "reliable_low_latency",
+        ServiceLevel::Reliable => "reliable",
+        ServiceLevel::BestEffort => "best_effort",
+    }
+}
+
+fn message_class_name(class: MessageClass) -> &'static str {
+    match class {
+        MessageClass::HighPriority => "high_priority",
+        MessageClass::Regular => "regular",
     }
 }
 
@@ -464,7 +514,7 @@ th { color: var(--muted); font-weight: 600; background: #fafbfc; }
   </section>
   <section class="tables">
     <div class="panel"><h2>Nodes</h2><table><thead><tr><th>Node</th><th>Status</th><th>LSA</th><th>Addresses</th></tr></thead><tbody id="nodes"></tbody></table></div>
-    <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Throughput</th></tr></thead><tbody id="metrics"></tbody></table></div>
+    <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Voice</th><th>Control</th><th>Bulk</th></tr></thead><tbody id="metrics"></tbody></table></div>
     <div class="panel"><h2>Routes</h2><table><thead><tr><th>Metric</th><th>Level</th><th>Dst</th><th>Next hop</th><th>Cost</th></tr></thead><tbody id="routes"></tbody></table></div>
   </section>
 </main>
@@ -484,6 +534,13 @@ function fmtUs(v) { return v ? (v / 1000).toFixed(1) + ' ms' : '-'; }
 function fmtBps(v) { if (!v) return '-'; const u = ['B/s','KB/s','MB/s','GB/s']; let i = 0; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return v.toFixed(i ? 1 : 0) + ' ' + u[i]; }
 function fmtLoss(v) { return v ? (v / 10000).toFixed(2) + '%' : '0%'; }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtPair(a, b) { const v = Math.max(a || 0, b || 0); return fmtBps(v); }
+function serviceProbeCell(metric, service) {
+    const item = (metric.service_metrics || []).find(s => s.service === service);
+    if (!item || !item.supported) return 'n/a';
+    const value = fmtBps(item.probe_goodput_bps);
+    return `${value}<br><span class="transport">${item.payload_bytes} B</span>`;
+}
 function tooltipHtml(lines) {
   const el = document.createElement('div');
   el.innerHTML = lines.join('<br>');
@@ -618,7 +675,7 @@ function renderGraph(data) {
 }
 function renderTables(data) {
   nodesTbody.innerHTML = data.nodes.map(n => `<tr><td>${n.node_id}</td><td><span class="pill ${n.status}">${n.status}</span></td><td>seq ${n.lsa_seq ?? '-'}<br>${n.lsa_age_ms ?? '-'} ms</td><td>${n.addresses.map(a => `<span class="transport">${esc(a.transport)}</span> ${esc(a.addr)}`).join('<br>')}</td></tr>`).join('');
-  metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${fmtBps(m.estimated_throughput_bps)}</td></tr>`).join('');
+    metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
   routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${r.cost}</td></tr>`).join('');
 }
 async function refresh() {

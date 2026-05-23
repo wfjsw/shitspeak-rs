@@ -1,16 +1,18 @@
 //! Per-peer state held by the supervisor.
 //!
 //! The supervisor owns one `PeerState` per known peer; that struct contains
-//! the dial address book, the set of currently-active streams (one per
-//! transport flavor), reconnect backoff, and aggregated metrics.
+//! the dial address book, the set of currently-active streams, reconnect
+//! backoff, and aggregated metrics.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use rand::RngExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +22,7 @@ use super::metrics::{MetricsTuning, PeerMetrics};
 use super::service_level::{MessageClass, PeerAddress, TransportKind};
 
 const MAX_OBSERVED_REMOTE_IPS: usize = 8;
+const BACKOFF_JITTER_DIVISOR: u64 = 5;
 
 /// One outbound frame, addressed to a specific stream.
 #[derive(Debug, Clone)]
@@ -43,8 +46,30 @@ impl OutboundFrame {
 }
 
 /// Sender-side handle to a single live stream connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct StreamKey {
+    transport: TransportKind,
+    remote_addr: Option<SocketAddr>,
+    is_dialer: bool,
+}
+
+impl StreamKey {
+    pub fn new(transport: TransportKind, remote_addr: Option<SocketAddr>, is_dialer: bool) -> Self {
+        Self {
+            transport,
+            remote_addr,
+            is_dialer,
+        }
+    }
+
+    pub fn transport(&self) -> TransportKind {
+        self.transport
+    }
+}
+
 pub(crate) struct ActiveStream {
     transport: TransportKind,
+    remote_addr: Option<SocketAddr>,
     sender: mpsc::Sender<OutboundFrame>,
     closed: CancellationToken,
     is_dialer: bool,
@@ -53,12 +78,14 @@ pub(crate) struct ActiveStream {
 impl ActiveStream {
     pub fn new(
         transport: TransportKind,
+        remote_addr: Option<SocketAddr>,
         sender: mpsc::Sender<OutboundFrame>,
         closed: CancellationToken,
         is_dialer: bool,
     ) -> Self {
         Self {
             transport,
+            remote_addr,
             sender,
             closed,
             is_dialer,
@@ -77,6 +104,10 @@ impl ActiveStream {
         self.is_dialer
     }
 
+    pub fn key(&self) -> StreamKey {
+        StreamKey::new(self.transport, self.remote_addr, self.is_dialer)
+    }
+
     pub fn cancel(&self) {
         self.closed.cancel();
     }
@@ -86,6 +117,7 @@ impl ActiveStream {
 pub(crate) struct BackoffState {
     initial: Duration,
     next_delay: Duration,
+    retry_delay: Duration,
     last_attempt: Option<Instant>,
     consecutive_failures: u32,
 }
@@ -95,13 +127,14 @@ impl BackoffState {
         Self {
             initial,
             next_delay: initial,
+            retry_delay: initial,
             last_attempt: None,
             consecutive_failures: 0,
         }
     }
 
     pub fn ready(&self, now: Instant, retry_cap: Duration) -> bool {
-        let effective_delay = self.next_delay.min(retry_cap);
+        let effective_delay = self.retry_delay.min(retry_cap);
         match self.last_attempt {
             None => true,
             Some(at) => now.duration_since(at) >= effective_delay,
@@ -120,12 +153,29 @@ impl BackoffState {
         } else {
             doubled
         };
+        self.retry_delay = jittered_delay(self.next_delay.min(retry_cap), retry_cap);
+        self.last_attempt = Some(Instant::now());
     }
 
     pub fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.next_delay = self.initial;
+        self.retry_delay = self.initial;
     }
+}
+
+fn jittered_delay(base: Duration, cap: Duration) -> Duration {
+    let base_nanos = base.as_nanos().min(u64::MAX as u128) as u64;
+    let cap_nanos = cap.as_nanos().min(u64::MAX as u128) as u64;
+    let jitter_window = base_nanos / BACKOFF_JITTER_DIVISOR;
+    if jitter_window == 0 {
+        return base;
+    }
+    let low = base_nanos.saturating_sub(jitter_window);
+    let high = base_nanos
+        .saturating_add(jitter_window)
+        .min(cap_nanos.max(low));
+    Duration::from_nanos(rand::rng().random_range(low..=high))
 }
 
 /// Aggregate state for one peer. The supervisor mutates this through `Mutex`
@@ -133,7 +183,7 @@ impl BackoffState {
 pub(crate) struct PeerState {
     node_id: NodeIdentifier,
     addresses: Mutex<Vec<PeerAddress>>,
-    streams: Mutex<HashMap<TransportKind, ActiveStream>>,
+    streams: Mutex<HashMap<StreamKey, ActiveStream>>,
     udp_seen_at: Mutex<Option<Instant>>,
     udp_addr: Mutex<Option<std::net::SocketAddr>>,
     /// Authenticated inbound remote IPs. Source ports are often ephemeral; the
@@ -141,7 +191,8 @@ pub(crate) struct PeerState {
     observed_remote_ips: Mutex<Vec<std::net::IpAddr>>,
     last_seen_wall: Mutex<Option<SystemTime>>,
     metrics: Arc<PeerMetrics>,
-    backoff: Mutex<BackoffState>,
+    backoff_initial: Duration,
+    address_backoffs: Mutex<HashMap<PeerAddress, BackoffState>>,
     outbound_seq: AtomicU32,
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
@@ -164,7 +215,8 @@ impl PeerState {
             observed_remote_ips: Mutex::new(Vec::new()),
             last_seen_wall: Mutex::new(None),
             metrics: Arc::new(PeerMetrics::new(bandwidth_window, metrics_tuning)),
-            backoff: Mutex::new(BackoffState::new(backoff_initial)),
+            backoff_initial,
+            address_backoffs: Mutex::new(HashMap::new()),
             outbound_seq: AtomicU32::new(0),
             connecting: AtomicBool::new(false),
         })
@@ -176,10 +228,6 @@ impl PeerState {
 
     pub fn metrics(&self) -> &Arc<PeerMetrics> {
         &self.metrics
-    }
-
-    pub fn backoff(&self) -> &Mutex<BackoffState> {
-        &self.backoff
     }
 
     /// Atomically claim the connect slot. Returns `true` if this caller now
@@ -207,6 +255,7 @@ impl PeerState {
             return false;
         }
         g.push(addr);
+        self.ensure_address_backoff(addr);
         true
     }
 
@@ -219,7 +268,51 @@ impl PeerState {
             return false;
         }
         g.push(addr);
+        self.ensure_address_backoff(addr);
         true
+    }
+
+    fn ensure_address_backoff(&self, addr: PeerAddress) {
+        self.address_backoffs
+            .lock()
+            .entry(addr)
+            .or_insert_with(|| BackoffState::new(self.backoff_initial));
+    }
+
+    pub fn address_retry_ready(
+        &self,
+        addr: PeerAddress,
+        now: Instant,
+        retry_cap: Duration,
+    ) -> bool {
+        self.address_backoffs
+            .lock()
+            .get(&addr)
+            .is_none_or(|backoff| backoff.ready(now, retry_cap))
+    }
+
+    pub fn record_address_attempt(&self, addr: PeerAddress) {
+        self.address_backoffs
+            .lock()
+            .entry(addr)
+            .or_insert_with(|| BackoffState::new(self.backoff_initial))
+            .record_attempt();
+    }
+
+    pub fn record_address_failure(&self, addr: PeerAddress, retry_cap: Duration) {
+        self.address_backoffs
+            .lock()
+            .entry(addr)
+            .or_insert_with(|| BackoffState::new(self.backoff_initial))
+            .record_failure(retry_cap);
+    }
+
+    pub fn record_address_success(&self, addr: PeerAddress) {
+        self.address_backoffs
+            .lock()
+            .entry(addr)
+            .or_insert_with(|| BackoffState::new(self.backoff_initial))
+            .record_success();
     }
 
     pub fn note_observed_remote_addr(&self, addr: std::net::SocketAddr) {
@@ -270,6 +363,7 @@ impl PeerState {
         } else {
             g.insert(0, addr);
         }
+        self.ensure_address_backoff(addr);
     }
 
     pub fn note_seen_now(&self) {
@@ -298,7 +392,12 @@ impl PeerState {
         let mut g = self.addresses.lock();
         let before = g.len();
         g.retain(|a| *a != addr);
-        g.len() != before
+        let removed = g.len() != before;
+        drop(g);
+        if removed {
+            self.address_backoffs.lock().remove(&addr);
+        }
+        removed
     }
 
     pub fn snapshot_addresses(&self) -> Vec<PeerAddress> {
@@ -306,39 +405,24 @@ impl PeerState {
     }
 
     pub fn install_stream(&self, stream: ActiveStream) {
-        let kind = stream.transport;
+        let key = stream.key();
         let mut g = self.streams.lock();
-        if let Some(prev) = g.insert(kind, stream) {
+        prune_dead_streams(&mut g);
+        if let Some(prev) = g.insert(key, stream) {
             prev.closed.cancel();
         }
         self.note_seen_now();
     }
 
-    /// Install with simultaneous-dial tiebreaker. Returns `Err(stream)` if the
-    /// caller should discard the new stream (the existing one wins).
-    ///
-    /// Convention: when both sides race a connection of the same `kind`, the
-    /// lower-numbered node keeps its dial-side stream, the higher-numbered
-    /// node keeps its accept-side stream. Both sides converge on the same
-    /// physical connection.
-    pub fn try_install_stream(
-        &self,
-        self_id: NodeIdentifier,
-        is_dialer: bool,
-        new_stream: ActiveStream,
-    ) -> Result<(), ActiveStream> {
-        let kind = new_stream.transport;
+    /// Install a stream unless the exact same connection key is already live.
+    pub fn try_install_stream(&self, new_stream: ActiveStream) -> Result<(), ActiveStream> {
+        let key = new_stream.key();
         let mut g = self.streams.lock();
-        if let Some(existing) = g.get(&kind) {
-            if existing.is_alive() {
-                let prefer_dialer = self_id < self.node_id;
-                let new_is_preferred = is_dialer == prefer_dialer;
-                if !new_is_preferred {
-                    return Err(new_stream);
-                }
-            }
+        prune_dead_streams(&mut g);
+        if g.get(&key).is_some_and(ActiveStream::is_alive) {
+            return Err(new_stream);
         }
-        if let Some(prev) = g.insert(kind, new_stream) {
+        if let Some(prev) = g.insert(key, new_stream) {
             prev.closed.cancel();
         }
         self.note_seen_now();
@@ -347,66 +431,77 @@ impl PeerState {
 
     pub fn drop_stream(&self, kind: TransportKind) {
         let mut g = self.streams.lock();
-        if let Some(prev) = g.remove(&kind) {
-            prev.closed.cancel();
-        }
+        g.retain(|key, stream| {
+            if key.transport() == kind {
+                stream.cancel();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub fn has_live_outgoing_to(&self, addr: PeerAddress) -> bool {
+        let key = StreamKey::new(addr.transport(), Some(addr.addr()), true);
+        let mut g = self.streams.lock();
+        prune_dead_streams(&mut g);
+        g.get(&key).is_some_and(ActiveStream::is_alive)
     }
 
     pub fn live_kinds(&self) -> Vec<TransportKind> {
-        self.streams
-            .lock()
-            .iter()
-            .filter(|(_, s)| s.is_alive())
-            .map(|(k, _)| *k)
-            .collect()
+        let mut g = self.streams.lock();
+        prune_dead_streams(&mut g);
+        let mut kinds = Vec::new();
+        for stream in g.values() {
+            if stream.is_alive() && !kinds.contains(&stream.transport()) {
+                kinds.push(stream.transport());
+            }
+        }
+        kinds
     }
 
     /// Attempt to obtain a sender for any stream of the requested transport.
     /// Drops the stream if it has died.
     pub fn try_get_stream(&self, kind: TransportKind) -> Option<mpsc::Sender<OutboundFrame>> {
         let mut g = self.streams.lock();
-        if let Some(s) = g.get(&kind) {
-            if s.is_alive() {
+        prune_dead_streams(&mut g);
+        for s in g.values() {
+            if s.transport() == kind && s.is_alive() {
                 return Some(s.sender.clone());
-            }
-            let dead = g.remove(&kind);
-            if let Some(d) = dead {
-                d.closed.cancel();
             }
         }
         None
     }
 
     pub fn has_any_live_stream(&self) -> bool {
-        self.streams.lock().values().any(|s| s.is_alive())
+        let mut g = self.streams.lock();
+        prune_dead_streams(&mut g);
+        g.values().any(ActiveStream::is_alive)
     }
 
     pub fn outgoing_live_count(&self) -> usize {
-        self.streams
-            .lock()
-            .values()
-            .filter(|s| s.is_alive() && s.is_dialer())
-            .count()
+        let mut g = self.streams.lock();
+        prune_dead_streams(&mut g);
+        g.values().filter(|s| s.is_alive() && s.is_dialer()).count()
     }
 
-    pub fn outgoing_live_kinds(&self) -> Vec<TransportKind> {
-        self.streams
-            .lock()
-            .values()
-            .filter(|s| s.is_alive() && s.is_dialer())
-            .map(|s| s.transport())
+    pub fn outgoing_live_keys(&self) -> Vec<StreamKey> {
+        let mut g = self.streams.lock();
+        prune_dead_streams(&mut g);
+        g.iter()
+            .filter_map(|(key, stream)| {
+                if stream.is_alive() && stream.is_dialer() {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
-    pub fn drop_outgoing_stream(&self, kind: TransportKind) -> bool {
+    pub fn drop_outgoing_stream(&self, key: StreamKey) -> bool {
         let mut g = self.streams.lock();
-        let should_drop = g
-            .get(&kind)
-            .is_some_and(|stream| stream.is_alive() && stream.is_dialer());
-        if !should_drop {
-            return false;
-        }
-        if let Some(prev) = g.remove(&kind) {
+        if let Some(prev) = g.remove(&key) {
             prev.closed.cancel();
             true
         } else {
@@ -423,6 +518,17 @@ impl PeerState {
     pub fn udp_addr(&self) -> Option<std::net::SocketAddr> {
         *self.udp_addr.lock()
     }
+}
+
+fn prune_dead_streams(streams: &mut HashMap<StreamKey, ActiveStream>) {
+    streams.retain(|_, stream| {
+        if stream.is_alive() {
+            true
+        } else {
+            stream.cancel();
+            false
+        }
+    });
 }
 
 fn push_unique_candidate(candidates: &mut Vec<PeerAddress>, addr: PeerAddress) {
@@ -516,6 +622,43 @@ mod tests {
     }
 
     #[test]
+    fn backoff_jitters_retry_delay_within_bounds() {
+        let mut b = BackoffState::new(Duration::from_millis(250));
+
+        b.record_failure(Duration::from_secs(2));
+
+        assert!(b.retry_delay >= Duration::from_millis(400));
+        assert!(b.retry_delay <= Duration::from_millis(600));
+    }
+
+    #[test]
+    fn backoff_jitters_capped_retry_delay_within_cap() {
+        let mut b = BackoffState::new(Duration::from_millis(250));
+
+        b.record_failure(Duration::from_millis(500));
+
+        assert!(b.retry_delay >= Duration::from_millis(400));
+        assert!(b.retry_delay <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn backoff_waits_from_failure_completion() {
+        let mut b = BackoffState::new(Duration::from_millis(250));
+        b.record_attempt();
+        b.last_attempt = Some(Instant::now() - Duration::from_secs(60));
+
+        b.record_failure(Duration::from_secs(30));
+        let last_attempt = b.last_attempt.unwrap();
+        let retry_delay = b.retry_delay;
+
+        assert!(!b.ready(
+            last_attempt + retry_delay.saturating_sub(Duration::from_nanos(1)),
+            Duration::from_secs(30)
+        ));
+        assert!(b.ready(last_attempt + retry_delay, Duration::from_secs(30)));
+    }
+
+    #[test]
     fn retry_cap_grows_with_last_seen_age() {
         let recent = Duration::from_secs(30);
         let stale = Duration::from_secs(600);
@@ -546,6 +689,95 @@ mod tests {
             Duration::from_secs(5),
             MetricsTuning::default(),
         )
+    }
+
+    #[test]
+    fn peer_backoff_is_tracked_per_address() {
+        let peer = peer_for_address_tests();
+        let first = PeerAddress::new("10.1.2.3:64739".parse().unwrap(), TransportKind::Tcp);
+        let second = PeerAddress::new("10.1.2.4:64739".parse().unwrap(), TransportKind::Tcp);
+        let retry_cap = Duration::from_secs(30);
+
+        peer.add_address(first);
+        peer.add_address(second);
+        peer.record_address_failure(first, retry_cap);
+        let now = Instant::now();
+
+        assert!(!peer.address_retry_ready(first, now, retry_cap));
+        assert!(peer.address_retry_ready(second, now, retry_cap));
+
+        peer.record_address_failure(second, retry_cap);
+        peer.record_address_success(first);
+        let backoffs = peer.address_backoffs.lock();
+        assert_eq!(
+            backoffs.get(&first).unwrap().next_delay,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            backoffs.get(&second).unwrap().next_delay,
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn removing_address_prunes_address_backoff() {
+        let peer = peer_for_address_tests();
+        let addr = PeerAddress::new("10.1.2.3:64739".parse().unwrap(), TransportKind::Tcp);
+
+        peer.add_address(addr);
+        peer.record_address_failure(addr, Duration::from_secs(30));
+        assert!(peer.address_backoffs.lock().contains_key(&addr));
+
+        assert!(peer.remove_address(addr));
+        assert!(!peer.address_backoffs.lock().contains_key(&addr));
+    }
+
+    fn active_stream_for_test(
+        transport: TransportKind,
+        remote_addr: SocketAddr,
+        is_dialer: bool,
+    ) -> (ActiveStream, mpsc::Receiver<OutboundFrame>) {
+        let (tx, rx) = mpsc::channel(1);
+        (
+            ActiveStream::new(
+                transport,
+                Some(remote_addr),
+                tx,
+                CancellationToken::new(),
+                is_dialer,
+            ),
+            rx,
+        )
+    }
+
+    #[test]
+    fn same_transport_streams_with_different_remote_addresses_coexist() {
+        let peer = peer_for_address_tests();
+        let first_addr = "10.1.2.3:64739".parse().unwrap();
+        let second_addr = "10.1.2.4:64739".parse().unwrap();
+        let (first, _first_rx) = active_stream_for_test(TransportKind::Tcp, first_addr, true);
+        let (second, _second_rx) = active_stream_for_test(TransportKind::Tcp, second_addr, true);
+
+        assert!(peer.try_install_stream(first).is_ok());
+        assert!(peer.try_install_stream(second).is_ok());
+
+        assert_eq!(peer.outgoing_live_count(), 2);
+        assert!(peer.has_live_outgoing_to(PeerAddress::new(first_addr, TransportKind::Tcp)));
+        assert!(peer.has_live_outgoing_to(PeerAddress::new(second_addr, TransportKind::Tcp)));
+    }
+
+    #[test]
+    fn exact_duplicate_stream_key_is_rejected() {
+        let peer = peer_for_address_tests();
+        let addr = "10.1.2.3:64739".parse().unwrap();
+        let (first, _first_rx) = active_stream_for_test(TransportKind::Tcp, addr, true);
+        let (duplicate, _duplicate_rx) = active_stream_for_test(TransportKind::Tcp, addr, true);
+
+        assert!(peer.try_install_stream(first).is_ok());
+        assert!(peer.try_install_stream(duplicate).is_err());
+
+        assert_eq!(peer.outgoing_live_count(), 1);
+        assert!(peer.has_live_outgoing_to(PeerAddress::new(addr, TransportKind::Tcp)));
     }
 
     #[test]

@@ -31,7 +31,7 @@ use shitspeak_rs::voice::codec::{
 use tempfile::TempDir;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::{client::TlsStream, TlsConnector};
@@ -155,7 +155,6 @@ struct BenchServer {
     addr: SocketAddr,
     udp_addr: SocketAddr,
     authenticator: Arc<BenchAuthenticator>,
-    shutdown_tx: watch::Sender<()>,
     _run_handle: JoinHandle<()>,
     _pki: BenchPki,
 }
@@ -280,6 +279,7 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         allowed_proxies: Vec::new(),
         min_client_version: 0,
         max_users: 128,
+        authenticator_wasm_path: None,
         welcome_text: None,
         max_bandwidth: 72_000,
         allow_html: true,
@@ -317,11 +317,10 @@ async fn spawn_bench_server(server_protocol_version: ProtocolVersion) -> BenchSe
         .expect("Server::new");
     let addr = server.local_addr().expect("tcp addr");
     let udp_addr = server.local_udp_addr().expect("udp addr");
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
     let run_handle = tokio::spawn({
         let server = Arc::clone(&server);
         async move {
-            let _ = server.run(shutdown_rx).await;
+            let _ = server.run().await;
         }
     });
 
@@ -330,7 +329,6 @@ async fn spawn_bench_server(server_protocol_version: ProtocolVersion) -> BenchSe
         addr,
         udp_addr,
         authenticator,
-        shutdown_tx,
         _run_handle: run_handle,
         _pki: pki,
     }
@@ -338,7 +336,7 @@ async fn spawn_bench_server(server_protocol_version: ProtocolVersion) -> BenchSe
 
 impl Drop for BenchServer {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(());
+        self._server.shutdown();
     }
 }
 

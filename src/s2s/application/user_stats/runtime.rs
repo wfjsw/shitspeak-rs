@@ -155,9 +155,9 @@ impl UserStatsService {
     }
 
     /// Ship a UserStats request to the owner of `target` and await the
-    /// reply with [`DEFAULT_REQUEST_TIMEOUT`]. The owner unicasts a
-    /// matching `Reply` back; the inbound dispatcher correlates it with
-    /// the parked oneshot via `request_id`.
+    /// reply. Uses [`DEFAULT_REQUEST_TIMEOUT`] when `timeout` is `None`.
+    /// The owner unicasts a matching `Reply` back; the inbound dispatcher
+    /// correlates it with the parked oneshot via `request_id`.
     pub async fn dispatch_request(
         &self,
         owner: NodeIdentifier,
@@ -165,27 +165,9 @@ impl UserStatsService {
         target_session: u32,
         stats_only: bool,
         server_id: String,
+        timeout: Option<Duration>,
     ) -> Result<UserStatsReply, ApplicationError> {
-        self.dispatch_request_with_timeout(
-            owner,
-            actor_session,
-            target_session,
-            stats_only,
-            server_id,
-            DEFAULT_REQUEST_TIMEOUT,
-        )
-        .await
-    }
-
-    pub async fn dispatch_request_with_timeout(
-        &self,
-        owner: NodeIdentifier,
-        actor_session: u32,
-        target_session: u32,
-        stats_only: bool,
-        server_id: String,
-        timeout: Duration,
-    ) -> Result<UserStatsReply, ApplicationError> {
+        let timeout = timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let req = UserStatsRequest {
             request_id,
@@ -460,13 +442,13 @@ mod tests {
         // No responder installed — we just want to inspect the outbound shape.
         // Use a short timeout because nothing will reply.
         let res = svc
-            .dispatch_request_with_timeout(
+            .dispatch_request(
                 42,
                 0xABC_12345,
                 0xDEF_67890,
                 false,
                 crate::types::default_server_id(),
-                Duration::from_millis(50),
+                Some(Duration::from_millis(50)),
             )
             .await;
         assert!(matches!(res, Err(ApplicationError::Timeout)));
@@ -538,13 +520,13 @@ mod tests {
         *loopback.originator_inbound.lock() = Some(originator.inbound_handler());
 
         let reply = originator
-            .dispatch_request_with_timeout(
+            .dispatch_request(
                 99,
                 1,
                 2,
                 true,
                 crate::types::default_server_id(),
-                Duration::from_millis(500),
+                Some(Duration::from_millis(500)),
             )
             .await
             .expect("reply should arrive");

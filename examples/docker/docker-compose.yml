@@ -1,0 +1,42 @@
+name: shitspeak-node-example
+
+services:
+  shitspeak-node:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        CARGO_FEATURES: ${CARGO_FEATURES:-}
+    image: shitspeak-rs:node-example
+    container_name: shitspeak-node
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGINT
+    working_dir: /app
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      # Mumble client listener
+      - "${SHITSPEAK_TCP_PORT:-64738}:64738/tcp"
+      - "${SHITSPEAK_UDP_PORT:-64738}:64738/udp"
+      # S2S (server-to-server) transports
+      - "${SHITSPEAK_S2S_TCP_PORT:-64739}:64739/tcp"
+      - "${SHITSPEAK_S2S_KCP_PORT:-64740}:64740/udp"
+      - "${SHITSPEAK_S2S_QUIC_PORT:-64741}:64741/tcp"
+      - "${SHITSPEAK_S2S_UDP_PORT:-64742}:64742/udp"
+      # S2S topology / status HTTP
+      - "${SHITSPEAK_S2S_STATUS_PORT:-64750}:64750/tcp"
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - ./cert.pem:/app/cert.pem:ro
+      - ./key.pem:/app/key.pem:ro
+      - ./data:/app/data
+      - ./s2s-state:/app/s2s-state
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # shitspeak-data:
+  # shitspeak-s2s-state:

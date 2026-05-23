@@ -333,6 +333,7 @@ impl ReplicationManager {
         );
         let erased: Arc<dyn ErasedOwnerRuntime> = runtime.clone();
         let _ = self.inner.owner_topics.insert_sync(topic, erased);
+        runtime.start();
         Ok(OwnerHandle { runtime })
     }
 

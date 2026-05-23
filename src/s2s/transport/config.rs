@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::service_level::PeerAddress;
+use super::service_level::{PeerAddress, ServiceShape, TransportKind};
+
+const PROBE_FRAME_OVERHEAD_BUDGET: usize = 128;
 
 /// Knobs for [`super::ConnectionManager::start`]. All listeners are optional —
 /// at least one must be set or [`super::ConfigError::NoListener`] is returned.
@@ -33,6 +35,8 @@ pub struct TransportConfig {
     stale_backoff_cap: Duration,
     stale_backoff_after: Duration,
     reconnect_check_interval: Duration,
+    /// Per-address outbound dial deadline. Zero disables the deadline.
+    dial_attempt_timeout: Duration,
     /// How often to give an otherwise unselected peer/transport one
     /// exploratory dial while the outgoing cap is full. Set to zero to disable.
     unselected_link_probe_interval: Duration,
@@ -44,9 +48,10 @@ pub struct TransportConfig {
     /// a Pong so the round trip carries enough bytes to be meaningful.
     /// Set to zero to disable.
     bandwidth_probe_interval: Duration,
-    /// Payload size of each bandwidth probe, in bytes. The link's *utilized*
-    /// bandwidth meter measures only bytes that actually flowed; the probe
-    /// gives a non-zero floor estimate of throughput when the link is idle.
+    /// Payload size of the bulk service-shaped probe, in bytes. Voice and
+    /// control probes derive smaller payloads from this cap. The link's
+    /// payload traffic meter measures only real Data bytes; probes provide an
+    /// idle-link goodput estimate by service shape.
     bandwidth_probe_size: usize,
 
     inbound_high_capacity: usize,
@@ -98,11 +103,12 @@ impl TransportConfig {
             stale_backoff_cap: Duration::from_secs(10 * 60),
             stale_backoff_after: Duration::from_secs(60 * 60),
             reconnect_check_interval: Duration::from_secs(1),
+            dial_attempt_timeout: Duration::from_secs(10),
             unselected_link_probe_interval: Duration::from_secs(30),
             ping_interval: Duration::from_secs(2),
             bandwidth_window: Duration::from_secs(5),
             bandwidth_probe_interval: Duration::from_secs(15),
-            bandwidth_probe_size: 4096,
+            bandwidth_probe_size: 64 * 1024,
             inbound_high_capacity: 1024,
             inbound_regular_capacity: 1024,
             outbound_capacity: 256,
@@ -202,6 +208,10 @@ impl TransportConfig {
         self.reconnect_check_interval
     }
 
+    pub fn dial_attempt_timeout(&self) -> Duration {
+        self.dial_attempt_timeout
+    }
+
     pub fn unselected_link_probe_interval(&self) -> Duration {
         self.unselected_link_probe_interval
     }
@@ -220,6 +230,24 @@ impl TransportConfig {
 
     pub fn bandwidth_probe_size(&self) -> usize {
         self.bandwidth_probe_size
+    }
+
+    pub fn service_probe_payload_size(&self, shape: ServiceShape) -> usize {
+        shape.probe_payload_bytes(self.bandwidth_probe_size)
+    }
+
+    pub fn service_probe_supported(&self, transport: TransportKind, shape: ServiceShape) -> bool {
+        let payload = self.service_probe_payload_size(shape);
+        if payload == 0 || self.bandwidth_probe_interval.is_zero() {
+            return false;
+        }
+        let budgeted_frame = payload.saturating_add(PROBE_FRAME_OVERHEAD_BUDGET);
+        match transport {
+            TransportKind::Udp => budgeted_frame <= self.udp_mtu,
+            TransportKind::Tcp | TransportKind::Kcp | TransportKind::Quic => {
+                budgeted_frame <= self.max_frame_bytes
+            }
+        }
     }
 
     pub fn inbound_high_capacity(&self) -> usize {
@@ -363,6 +391,11 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_dial_attempt_timeout(mut self, d: Duration) -> Self {
+        self.dial_attempt_timeout = d;
+        self
+    }
+
     pub fn with_unselected_link_probe_interval(mut self, d: Duration) -> Self {
         self.unselected_link_probe_interval = d;
         self
@@ -459,6 +492,9 @@ pub struct TransportTuning {
     pub stale_probe_retry_cap_secs: u64,
     #[serde(default = "default_stale_probe_age_secs")]
     pub stale_probe_age_secs: u64,
+    /// Per-address outbound dial deadline. Set to zero to disable.
+    #[serde(default = "default_dial_attempt_timeout_secs")]
+    pub dial_attempt_timeout_secs: u64,
     #[serde(default = "default_unselected_link_probe_interval_secs")]
     pub unselected_link_probe_interval_secs: u64,
     #[serde(default = "default_max_outgoing_connections")]
@@ -475,6 +511,7 @@ impl Default for TransportTuning {
             recent_probe_retry_cap_secs: default_recent_probe_retry_cap_secs(),
             stale_probe_retry_cap_secs: default_stale_probe_retry_cap_secs(),
             stale_probe_age_secs: default_stale_probe_age_secs(),
+            dial_attempt_timeout_secs: default_dial_attempt_timeout_secs(),
             unselected_link_probe_interval_secs: default_unselected_link_probe_interval_secs(),
             max_outgoing_connections: default_max_outgoing_connections(),
         }
@@ -491,6 +528,7 @@ impl TransportTuning {
             .with_backoff_cap(Duration::from_secs(self.recent_probe_retry_cap_secs))
             .with_stale_backoff_cap(Duration::from_secs(self.stale_probe_retry_cap_secs))
             .with_stale_backoff_after(Duration::from_secs(self.stale_probe_age_secs))
+            .with_dial_attempt_timeout(Duration::from_secs(self.dial_attempt_timeout_secs))
             .with_unselected_link_probe_interval(Duration::from_secs(
                 self.unselected_link_probe_interval_secs,
             ))
@@ -518,6 +556,9 @@ fn default_stale_probe_retry_cap_secs() -> u64 {
 }
 fn default_stale_probe_age_secs() -> u64 {
     60 * 60
+}
+fn default_dial_attempt_timeout_secs() -> u64 {
+    10
 }
 fn default_unselected_link_probe_interval_secs() -> u64 {
     30

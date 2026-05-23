@@ -1,0 +1,13 @@
+{
+  "name": "shitspeak-wasm-auth-assemblyscript-example",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "asc assembly/index.ts --target release",
+    "build:debug": "asc assembly/index.ts --target debug"
+  },
+  "devDependencies": {
+    "assemblyscript": "latest",
+    "json-as": "^1.3.7"
+  }
+}

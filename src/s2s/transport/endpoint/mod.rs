@@ -21,16 +21,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use futures_util::future::join_all;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::debug;
 
 use crate::types::NodeIdentifier;
 
 use super::config::TransportConfig;
-use super::connection::{retry_cap_for_last_seen_age, PeerState};
+use super::connection::{retry_cap_for_last_seen_age, PeerState, StreamKey};
 use super::manager::ManagerInner;
-use super::service_level::{PeerAddress, TransportKind};
+use super::service_level::{PeerAddress, ServiceShape, TransportKind};
 use super::stream_io::{spawn_stream_pump, StreamPumpConfig};
 
 pub(crate) mod kcp;
@@ -153,13 +154,14 @@ pub(crate) async fn start_all(inner: Arc<ManagerInner>) -> io::Result<()> {
 
 /// Stream-pump session installer shared by every byte-stream transport
 /// (TCP, KCP, QUIC). Wraps `stream` in the framed read/write pump and
-/// registers the resulting [`ActiveStream`] on `peer`. `is_dialer` indicates
-/// whether this stream came from an outbound dial (`true`) or an inbound
-/// accept (`false`) — used to break ties when both sides race a connection.
+/// registers the resulting [`ActiveStream`] on `peer`. `remote_addr` and
+/// `is_dialer` form part of the live-session key so multiple usable paths to
+/// the same peer can coexist.
 pub(crate) fn install_stream_session<S>(
     inner: &Arc<ManagerInner>,
     peer_node: NodeIdentifier,
     transport: TransportKind,
+    remote_addr: Option<SocketAddr>,
     is_dialer: bool,
     stream: S,
 ) where
@@ -182,19 +184,20 @@ pub(crate) fn install_stream_session<S>(
         cfg,
         peer.clone(),
         inner.inbound().clone(),
+        remote_addr,
         is_dialer,
     );
-    if let Err(rejected) = peer.try_install_stream(inner.self_id(), is_dialer, active) {
-        // The existing stream wins the race; close the loser so its TCP/TLS
-        // connection drops cleanly without disturbing the survivor.
+    if let Err(rejected) = peer.try_install_stream(active) {
+        // The exact connection key is already live; close the duplicate without
+        // disturbing the survivor.
         rejected.cancel();
     }
 }
 
 /// Supervisor: every `reconnect_check_interval`, walk the peer table and
-/// spawn dial tasks for peers whose configured transports don't all have
-/// a live session yet. The `connecting` AtomicBool gates concurrent dial
-/// tasks per peer; the per-peer backoff state controls retry timing.
+/// spawn dial tasks for peers whose address candidates don't all have a live
+/// outbound session yet. The `connecting` AtomicBool gates concurrent dial
+/// batches per peer; per-address backoff state controls retry timing.
 pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
     let interval = inner.cfg().reconnect_check_interval();
     let mut last_unselected_probe: Option<Instant> = None;
@@ -202,10 +205,12 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
         if inner.shutdown().is_cancelled() {
             return;
         }
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
         let mut candidates: Vec<_> = inner
             .iter_peers()
             .into_iter()
-            .filter(|(_, peer)| needs_dial(peer))
+            .filter(|(_, peer)| needs_dial(peer, inner.cfg(), now, wall_now))
             .collect();
         let mandatory_targets = mandatory_backbone_targets(&inner);
         candidates.sort_by(|a, b| compare_dial_candidates(a, b, &mandatory_targets));
@@ -235,7 +240,6 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
             });
         }
 
-        let now = Instant::now();
         if inner.outgoing_connection_count() >= inner.cfg().max_outgoing_connections()
             && unselected_probe_due(
                 last_unselected_probe,
@@ -396,7 +400,9 @@ fn peer_retry_ready(
         cfg.stale_backoff_cap(),
         cfg.stale_backoff_after(),
     );
-    peer.backoff().lock().ready(now, retry_cap)
+    peer.snapshot_addresses().iter().any(|addr| {
+        !peer.has_live_outgoing_to(*addr) && peer.address_retry_ready(*addr, now, retry_cap)
+    })
 }
 
 fn compare_dial_candidates(
@@ -414,12 +420,9 @@ fn compare_dial_candidates(
         .then_with(|| a.0.cmp(&b.0))
 }
 
-/// True iff at least one configured transport for this peer has no live session.
-fn needs_dial(peer: &PeerState) -> bool {
-    let live: HashSet<TransportKind> = peer.live_kinds().into_iter().collect();
-    peer.snapshot_addresses()
-        .iter()
-        .any(|a| !live.contains(&a.transport()))
+/// True iff at least one known address candidate has no live outbound session.
+fn needs_dial(peer: &PeerState, cfg: &TransportConfig, now: Instant, wall_now: SystemTime) -> bool {
+    peer_retry_ready(peer, cfg, now, wall_now)
 }
 
 fn peer_priority(peer: &PeerState) -> f64 {
@@ -448,18 +451,19 @@ fn prune_outgoing_to_soft_cap(inner: &Arc<ManagerInner>) {
     }
 
     let protected = backbone_targets(inner);
-    let mut candidates: Vec<(f64, NodeIdentifier, TransportKind, Arc<PeerState>)> = Vec::new();
+    let mut candidates: Vec<(f64, NodeIdentifier, StreamKey, Arc<PeerState>)> = Vec::new();
     for (node, peer) in inner.iter_peers() {
         if protected.contains(&node) {
             continue;
         }
         let metrics = peer.metrics().snapshot_per_transport();
-        for kind in peer.outgoing_live_kinds() {
+        for key in peer.outgoing_live_keys() {
+            let kind = key.transport();
             let score = metrics
                 .get(&kind)
                 .and_then(|metric| metric.quality_score())
                 .unwrap_or(f64::NEG_INFINITY);
-            candidates.push((score, node, kind, peer.clone()));
+            candidates.push((score, node, key, peer.clone()));
         }
     }
 
@@ -467,22 +471,26 @@ fn prune_outgoing_to_soft_cap(inner: &Arc<ManagerInner>) {
         a.0.partial_cmp(&b.0)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| (a.2 as u8).cmp(&(b.2 as u8)))
+            .then_with(|| kind_sort_order(a.2).cmp(&kind_sort_order(b.2)))
     });
 
-    for (_score, node, kind, peer) in candidates {
+    for (_score, node, key, peer) in candidates {
         if inner.outgoing_connection_count() <= max {
             break;
         }
-        if peer.drop_outgoing_stream(kind) {
+        if peer.drop_outgoing_stream(key) {
             debug!(
                 peer = %node,
-                transport = ?kind,
+                transport = ?key.transport(),
                 max_outgoing_connections = max,
                 "pruned exploratory S2S outbound link after probe window"
             );
         }
     }
+}
+
+fn kind_sort_order(key: StreamKey) -> u8 {
+    key.transport() as u8
 }
 
 fn seed_address_registered(inner: &ManagerInner, addr: PeerAddress) -> bool {
@@ -497,34 +505,33 @@ async fn try_dial_peer(
     peer: &Arc<PeerState>,
     allow_cap_override: bool,
 ) -> io::Result<()> {
-    {
-        let mut bo = peer.backoff().lock();
-        let retry_cap = retry_cap_for_last_seen_age(
-            peer.last_seen_age(SystemTime::now()),
-            inner.cfg().backoff_cap(),
-            inner.cfg().stale_backoff_cap(),
-            inner.cfg().stale_backoff_after(),
-        );
-        if !bo.ready(Instant::now(), retry_cap) {
-            return Ok(());
-        }
-        bo.record_attempt();
-    }
-
     let addrs = peer.snapshot_addresses();
     if addrs.is_empty() {
         return Ok(());
     }
 
-    let live: HashSet<TransportKind> = peer.live_kinds().into_iter().collect();
-    let mut any_success = false;
-    let mut last_err: Option<io::Error> = None;
+    let retry_cap = retry_cap_for_last_seen_age(
+        peer.last_seen_age(SystemTime::now()),
+        inner.cfg().backoff_cap(),
+        inner.cfg().stale_backoff_cap(),
+        inner.cfg().stale_backoff_after(),
+    );
+    let now = Instant::now();
+
+    let mut attempts = Vec::new();
+    let mut planned_outgoing = 0usize;
     for addr in addrs {
-        if live.contains(&addr.transport()) {
+        let transport = addr.transport();
+        if peer.has_live_outgoing_to(addr) {
             continue;
         }
-        if inner.outgoing_connection_count() >= inner.cfg().max_outgoing_connections() {
-            if !allow_cap_override || any_success {
+        if !peer.address_retry_ready(addr, now, retry_cap) {
+            continue;
+        }
+        if inner.outgoing_connection_count() + planned_outgoing
+            >= inner.cfg().max_outgoing_connections()
+        {
+            if !allow_cap_override || planned_outgoing > 0 {
                 debug!(
                     peer = %peer.node_id(),
                     max_outgoing_connections = inner.cfg().max_outgoing_connections(),
@@ -534,41 +541,58 @@ async fn try_dial_peer(
             }
             debug!(
                 peer = %peer.node_id(),
-                transport = ?addr.transport(),
+                transport = ?transport,
                 max_outgoing_connections = inner.cfg().max_outgoing_connections(),
                 "outgoing S2S connection cap reached; attempting backbone dial to prevent partition"
             );
         }
-        match dispatch_dial(inner, peer, addr).await {
+        peer.record_address_attempt(addr);
+        planned_outgoing += 1;
+        attempts.push(async move {
+            let result = dispatch_dial_with_timeout(inner, peer, addr).await;
+            (addr, transport, result)
+        });
+    }
+
+    if attempts.is_empty() {
+        return Ok(());
+    }
+
+    let mut any_success = false;
+    let mut last_err: Option<io::Error> = None;
+    for (addr, transport, result) in join_all(attempts).await {
+        match result {
             Ok(()) => {
                 peer.confirm_address(addr);
-                debug!(peer=%peer.node_id(), transport=?addr.transport(), "dial succeeded");
+                peer.record_address_success(addr);
+                debug!(peer=%peer.node_id(), transport=?transport, "dial succeeded");
                 any_success = true;
             }
             Err(e) => {
-                if e.kind() == io::ErrorKind::InvalidData && peer.remove_address(addr) {
+                let removed = should_remove_failed_address(&e) && peer.remove_address(addr);
+                if removed {
                     debug!(
                         peer=%peer.node_id(),
                         ?addr,
                         error=%e,
                         "removed peer address candidate after identity/ping validation failure"
                     );
+                } else {
+                    let retry_cap = retry_cap_for_last_seen_age(
+                        peer.last_seen_age(SystemTime::now()),
+                        inner.cfg().backoff_cap(),
+                        inner.cfg().stale_backoff_cap(),
+                        inner.cfg().stale_backoff_after(),
+                    );
+                    peer.record_address_failure(addr, retry_cap);
                 }
-                debug!(peer=%peer.node_id(), transport=?addr.transport(), error=%e, "dial failed");
+                debug!(peer=%peer.node_id(), transport=?transport, error=%e, "dial failed");
                 last_err = Some(e);
             }
         }
     }
     if any_success {
-        peer.backoff().lock().record_success();
-    } else if last_err.is_some() {
-        let retry_cap = retry_cap_for_last_seen_age(
-            peer.last_seen_age(SystemTime::now()),
-            inner.cfg().backoff_cap(),
-            inner.cfg().stale_backoff_cap(),
-            inner.cfg().stale_backoff_after(),
-        );
-        peer.backoff().lock().record_failure(retry_cap);
+        return Ok(());
     }
     if let Some(e) = last_err {
         return Err(e);
@@ -601,6 +625,34 @@ async fn dispatch_dial(
             None => Err(unconfigured(TransportKind::Udp)),
         },
     }
+}
+
+async fn dispatch_dial_with_timeout(
+    inner: &Arc<ManagerInner>,
+    peer: &Arc<PeerState>,
+    addr: PeerAddress,
+) -> io::Result<()> {
+    let timeout_duration = inner.cfg().dial_attempt_timeout();
+    if timeout_duration.is_zero() {
+        return dispatch_dial(inner, peer, addr).await;
+    }
+    timeout(timeout_duration, dispatch_dial(inner, peer, addr))
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "S2S dial attempt timed out",
+            ))
+        })
+}
+
+fn should_remove_failed_address(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::InvalidData {
+        return true;
+    }
+    let message = error.to_string();
+    message.contains("invalid peer certificate")
+        || message.contains("certificate not valid for name")
 }
 
 pub(crate) async fn dial_seed_address(
@@ -670,6 +722,13 @@ mod tests {
     use super::super::connection::ActiveStream;
     use super::super::metrics::MetricsTuning;
 
+    fn tcp_peer_address(node_id: NodeIdentifier) -> PeerAddress {
+        PeerAddress::new(
+            format!("127.0.0.1:{}", 10_000 + node_id).parse().unwrap(),
+            TransportKind::Tcp,
+        )
+    }
+
     fn peer_with_tcp_address(node_id: NodeIdentifier) -> Arc<PeerState> {
         let peer = PeerState::new(
             node_id,
@@ -677,10 +736,7 @@ mod tests {
             Duration::from_secs(1),
             MetricsTuning::default(),
         );
-        peer.add_address(PeerAddress::new(
-            format!("127.0.0.1:{}", 10_000 + node_id).parse().unwrap(),
-            TransportKind::Tcp,
-        ));
+        peer.add_address(tcp_peer_address(node_id));
         peer
     }
 
@@ -689,6 +745,7 @@ mod tests {
         std::mem::forget(rx);
         peer.install_stream(ActiveStream::new(
             TransportKind::Tcp,
+            None,
             tx,
             CancellationToken::new(),
             false,
@@ -711,9 +768,12 @@ mod tests {
         connected
             .metrics()
             .record_rtt(TransportKind::Tcp, Duration::from_millis(1));
-        connected
-            .metrics()
-            .record_probe(TransportKind::Tcp, 1024 * 1024, Duration::from_millis(1));
+        connected.metrics().record_probe(
+            TransportKind::Tcp,
+            ServiceShape::Bulk,
+            1024 * 1024,
+            Duration::from_millis(1),
+        );
 
         let mut candidates = vec![
             (connected.node_id(), connected),
@@ -762,7 +822,7 @@ mod tests {
             .with_backoff_cap(Duration::from_secs(30));
         let mandatory = peer_with_tcp_address(2);
         let backed_off = peer_with_tcp_address(3);
-        backed_off.backoff().lock().record_attempt();
+        backed_off.record_address_attempt(tcp_peer_address(3));
         let ready = peer_with_tcp_address(4);
         let candidates = vec![
             (mandatory.node_id(), mandatory),
@@ -773,5 +833,22 @@ mod tests {
             .expect("ready non-mandatory peer should be selected");
 
         assert_eq!(selected.0, 4);
+    }
+
+    #[test]
+    fn failed_address_pruning_recognizes_dtls_certificate_name_errors() {
+        let err = io::Error::other(
+            "dtls handshake: invalid peer certificate: certificate not valid for name \"node-4\"",
+        );
+        assert!(should_remove_failed_address(&err));
+    }
+
+    #[test]
+    fn failed_address_pruning_keeps_transient_dial_errors() {
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "S2S dial attempt timed out");
+
+        assert!(!should_remove_failed_address(&refused));
+        assert!(!should_remove_failed_address(&timed_out));
     }
 }

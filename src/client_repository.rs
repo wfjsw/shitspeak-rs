@@ -244,15 +244,15 @@ impl ClientRepository {
     }
 
     fn allocate_local_session_id(&self, server_id: &str) -> u32 {
-        let mut free_ids_guard = self.free_ids.lock();
-        if let Some(free_ids) = free_ids_guard.get_mut(server_id) {
-            if let Some(free_id) = free_ids.iter().next().copied() {
-                free_ids.remove(&free_id);
-                return free_id;
+        {
+            let mut free_ids_guard = self.free_ids.lock();
+            if let Some(free_ids) = free_ids_guard.get_mut(server_id) {
+                if let Some(free_id) = free_ids.iter().next().copied() {
+                    free_ids.remove(&free_id);
+                    return free_id;
+                }
             }
         }
-        drop(free_ids_guard);
-
         let mut pointers = self.allocation_pointers.lock();
         let allocation_pointer = pointers.entry(server_id.to_owned()).or_insert(0);
         let id = *allocation_pointer;
@@ -728,7 +728,11 @@ impl ClientRepository {
             panic!("Not supposed to clear clients from the local node");
         }
 
-        let removals: Vec<(ScopedSessionId, bool, u64)> = {
+        let (removals, base_version, versions_after_removal): (
+            Vec<(ScopedSessionId, bool, u64)>,
+            u64,
+            HashMap<u16, u64>,
+        ) = {
             let mut register = self.register.write().await;
 
             // Collect published status before removing from map
@@ -745,27 +749,36 @@ impl ClientRepository {
                     .collect(),
                 None => return,
             };
+            let base_version = register.versions.get(&node_id).copied().unwrap_or(0);
 
             // Remove the entire remote node entry
             register.remote_clients.remove(&node_id);
             register.versions.remove(&node_id);
             register.remote_logs.remove(&node_id);
+            register
+                .pending_remote_ops
+                .retain(|(entry, _)| entry.node_id != node_id);
 
-            result
+            (result, base_version, register.versions.clone())
         };
 
-        // ── Log each removal (only if client was published) ─────────────
-        for (id, was_published, client_instance_id) in removals {
+        for (index, (id, was_published, client_instance_id)) in removals.into_iter().enumerate() {
             if was_published {
-                self.commit_operation(
-                    ClientStateOperation::RemoveClient {
+                let entry = Arc::new(ClientStateLogEntry {
+                    version: base_version + index as u64 + 1,
+                    node_id,
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    channel_version_dep: None,
+                    op: ClientStateOperation::RemoveClient {
                         server_id: id.server_id().to_owned(),
                         session_id: id.session_id(),
                         client_instance_id,
                     },
-                    None,
-                )
-                .await;
+                });
+                let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
+                    entry,
+                    versions: versions_after_removal.clone(),
+                }));
             }
         }
     }
@@ -1456,7 +1469,7 @@ impl ClientRepository {
                 return Ok(());
             }
 
-            Self::apply_op_inner(&mut register, &op, remote_node);
+            Self::apply_op_inner(&mut register, &op, self.local_node_id, remote_node);
             Some(Arc::new(ClientStateBroadcastPayload {
                 entry: Arc::clone(&op),
                 versions: register.versions.clone(),
@@ -1504,7 +1517,7 @@ impl ClientRepository {
                     remote_node,
                     available_channel_version,
                 );
-                Self::apply_op_inner(&mut register, &op, remote_node);
+                Self::apply_op_inner(&mut register, &op, self.local_node_id, remote_node);
                 broadcasts.push(Arc::new(ClientStateBroadcastPayload {
                     entry: Arc::clone(&op),
                     versions: register.versions.clone(),
@@ -1532,7 +1545,12 @@ impl ClientRepository {
     }
 
     /// Apply a single remote op to the register (no version/buffer checks).
-    fn apply_op_inner(register: &mut ClientRegister, op: &ClientStateLogEntry, remote_node: u16) {
+    fn apply_op_inner(
+        register: &mut ClientRegister,
+        op: &ClientStateLogEntry,
+        local_node_id: u16,
+        remote_node: u16,
+    ) {
         match &op.op {
             ClientStateOperation::AddClient {
                 server_id,
@@ -1619,7 +1637,7 @@ impl ClientRepository {
                 // index — those exist solely for routing voice to local
                 // recipients on this node.
                 let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
-                let client = register.get(&scoped_id, remote_node).cloned();
+                let client = register.get(&scoped_id, local_node_id).cloned();
                 if let Some(client) = client {
                     if *client_instance_id == 0
                         || client.client_instance_id() == *client_instance_id
@@ -1933,6 +1951,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_update_global_state_mutates_remote_client() {
+        let repo = ClientRepository::new(1, 128);
+        let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+
+        let add = Arc::new(ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id: crate::types::default_server_id(),
+                session_id: remote_session,
+                client_instance_id: 7,
+                real_ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+        });
+        let update = Arc::new(ClientStateLogEntry {
+            version: 2,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: Some(1),
+            op: ClientStateOperation::UpdateGlobalState {
+                server_id: crate::types::default_server_id(),
+                session_id: remote_session,
+                client_instance_id: 7,
+                sender_session_id: None,
+                delta: ClientGlobalStateDelta {
+                    current_channel_id: Some(42),
+                    ..Default::default()
+                },
+            },
+        });
+
+        repo.apply_remote_operation(add, 1).await.unwrap();
+        repo.apply_remote_operation(update, 1).await.unwrap();
+
+        let client = repo
+            .get_client_in_server(&crate::types::default_server_id(), remote_session)
+            .await
+            .expect("remote client should be materialized");
+        assert_eq!(client.get_current_channel_id(), 42);
+        assert_eq!(repo.snapshot_with_versions().await.1.get(&2), Some(&2));
+    }
+
+    #[tokio::test]
     async fn stale_remove_client_does_not_remove_reused_session_instance() {
         let repo = ClientRepository::new(1, 128);
         let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
@@ -1974,6 +2046,65 @@ mod tests {
             .await
             .is_some());
         assert!(stale_remove.to_message(&repo).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_clients_from_node_broadcasts_remote_user_remove_without_local_log() {
+        let repo = ClientRepository::new(1, 128);
+        let mut rx = repo.subscribe();
+        let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+
+        let add = Arc::new(ClientStateLogEntry {
+            version: 3,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id: crate::types::default_server_id(),
+                session_id: remote_session,
+                client_instance_id: 22,
+                real_ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+        });
+
+        repo.apply_remote_operation(add, 0).await.unwrap();
+        let _ = rx.recv().await.expect("add broadcast");
+        assert!(repo.get_client(remote_session).await.is_some());
+        assert_eq!(repo.current_version(), 0);
+
+        repo.clear_clients_from_node(2).await;
+
+        assert!(repo.get_client(remote_session).await.is_none());
+        assert_eq!(repo.current_version(), 0);
+
+        let payload = rx.recv().await.expect("remove broadcast");
+        assert_eq!(payload.entry.node_id, 2);
+        assert_eq!(payload.entry.version, 4);
+        assert!(!payload.versions.contains_key(&2));
+        match &payload.entry.op {
+            ClientStateOperation::RemoveClient {
+                session_id,
+                client_instance_id,
+                ..
+            } => {
+                assert_eq!(*session_id, remote_session);
+                assert_eq!(*client_instance_id, 22);
+            }
+            other => panic!("expected RemoveClient, got {other:?}"),
+        }
+        assert!(matches!(
+            payload.entry.to_message(&repo).await,
+            Some(Message::UserRemove(remove)) if remove.session == u32::from(remote_session)
+        ));
     }
 
     #[tokio::test]

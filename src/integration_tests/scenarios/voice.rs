@@ -229,6 +229,28 @@ async fn open_udp_pair(alice: &mut TestClient, bob: &mut TestClient) {
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
+#[tokio::test]
+async fn voice_udp_ping_echoes_encrypted_timestamp() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+
+    let mut alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    alice.open_udp().await.expect("alice udp bind");
+    alice.udp_handshake().await.expect("alice udp ping");
+
+    let ping = alice
+        .recv_udp_ping(VOICE_DEADLINE)
+        .await
+        .expect("encrypted udp ping response");
+    assert_eq!(ping.timestamp, 1);
+    assert_eq!(ping.format, PacketFormat::Legacy);
+}
+
 /// Checks real UDP voice routing, encryption, and decryption for one channel.
 /// Expected: Bob decrypts Alice's byte-identical Opus payload and sender
 /// session. This follows Mumble's UDP decrypt/route/encrypt path in

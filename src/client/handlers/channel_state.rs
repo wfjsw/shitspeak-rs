@@ -129,7 +129,7 @@ pub async fn handle_channel_state(
             }
             if !server
                 .s2s_manager()
-                .propose_channel_op_in_server(&server_id, op.clone())
+                .propose_channel_op(Some(&server_id), op.clone())
                 .await
             {
                 if let Err(e) = channels.create_channel_in_server(&server_id, new_ch).await {
@@ -301,7 +301,7 @@ pub async fn handle_channel_state(
             }
             if !server
                 .s2s_manager()
-                .propose_channel_op_in_server(&server_id, op)
+                .propose_channel_op(Some(&server_id), op)
                 .await
             {
                 if let Err(e) = channels

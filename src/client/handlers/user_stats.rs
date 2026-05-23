@@ -86,6 +86,7 @@ pub async fn handle_user_stats(
                     target_session_raw,
                     effective_stats_only,
                     server_id.clone(),
+                    None,
                 )
                 .await;
             match reply {

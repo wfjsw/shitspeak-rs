@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 
 use crate::types::NodeIdentifier;
 
-use super::service_level::{ServiceLevel, TransportKind};
+use super::service_level::{RoutingMetric, ServiceLevel, ServiceShape, TransportKind};
 
 const E_MODEL_R0: f64 = 93.2;
 const E_MODEL_DELAY_KNEE_MS: f64 = 177.3;
@@ -23,6 +23,8 @@ const E_MODEL_BURST_RATIO: f64 = 1.0;
 const E_MODEL_REFERENCE_THROUGHPUT_BYTES_PER_SEC: f64 = 24_000.0;
 const E_MODEL_THROUGHPUT_IMPAIRMENT_PER_LOG2: f64 = 4.0;
 const E_MODEL_MAX_THROUGHPUT_IMPAIRMENT: f64 = 20.0;
+const DEFAULT_RELIABLE_THROUGHPUT_PENALTY_US_KBPS: f64 = 1_000_000.0;
+const DEFAULT_RLL_JITTER_WEIGHT: f64 = 4.0;
 
 pub(crate) fn conversational_effective_delay_us(rtt_us: f64, jitter_us: f64) -> u64 {
     let one_way_ms = rtt_us.max(1.0) / 2_000.0;
@@ -110,20 +112,36 @@ pub struct LinkMetrics {
     rtt_us: f64,
     /// Smoothed |Δrtt| in microseconds (jitter).
     jitter_us: f64,
-    /// Bytes received since the window started.
+    /// Data payload bytes received since the window started.
     recv_bytes: u64,
-    /// Bytes sent since the window started.
+    /// Data payload bytes sent since the window started.
     sent_bytes: u64,
+    /// Encoded transport-frame bytes received since the window started.
+    wire_recv_bytes: u64,
+    /// Encoded transport-frame bytes sent since the window started.
+    wire_sent_bytes: u64,
     /// The wall-clock window over which `recv_bytes` / `sent_bytes` apply.
     window: Duration,
     samples: u64,
     last_update: Option<Instant>,
-    /// EWMA of throughput observed during active bandwidth probes, in
-    /// bytes/sec. Lower bound — the probe is small and finishes during a
-    /// single RTT, so a high-bandwidth idle link still shows a finite value.
-    probe_throughput_bps: f64,
-    /// Number of probe round trips completed.
-    probe_samples: u64,
+    /// EWMA of service-shaped active probe goodput, in useful payload bytes/sec.
+    service_probes: HashMap<ServiceShape, ServiceProbeMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServiceProbeMetrics {
+    goodput_bps: f64,
+    samples: u64,
+}
+
+impl ServiceProbeMetrics {
+    pub fn goodput_bps(&self) -> f64 {
+        self.goodput_bps
+    }
+
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
 }
 
 impl LinkMetrics {
@@ -143,6 +161,14 @@ impl LinkMetrics {
         self.sent_bytes
     }
 
+    pub fn wire_recv_bytes(&self) -> u64 {
+        self.wire_recv_bytes
+    }
+
+    pub fn wire_sent_bytes(&self) -> u64 {
+        self.wire_sent_bytes
+    }
+
     pub fn window(&self) -> Duration {
         self.window
     }
@@ -155,12 +181,22 @@ impl LinkMetrics {
         self.last_update
     }
 
-    pub fn probe_throughput_bps(&self) -> f64 {
-        self.probe_throughput_bps
+    pub fn probe_samples(&self) -> u64 {
+        self.service_probes
+            .values()
+            .map(ServiceProbeMetrics::samples)
+            .sum()
     }
 
-    pub fn probe_samples(&self) -> u64 {
-        self.probe_samples
+    pub fn service_probe(&self, shape: ServiceShape) -> ServiceProbeMetrics {
+        self.service_probes.get(&shape).copied().unwrap_or_default()
+    }
+
+    pub fn max_probe_goodput_bps(&self) -> f64 {
+        self.service_probes
+            .values()
+            .map(ServiceProbeMetrics::goodput_bps)
+            .fold(0.0, f64::max)
     }
 
     /// Approximate average inbound bandwidth in bytes/sec over the current window.
@@ -179,13 +215,27 @@ impl LinkMetrics {
         (self.sent_bytes as f64) / self.window.as_secs_f64()
     }
 
+    pub fn wire_recv_bps(&self) -> f64 {
+        if self.window.is_zero() {
+            return 0.0;
+        }
+        (self.wire_recv_bytes as f64) / self.window.as_secs_f64()
+    }
+
+    pub fn wire_sent_bps(&self) -> f64 {
+        if self.window.is_zero() {
+            return 0.0;
+        }
+        (self.wire_sent_bytes as f64) / self.window.as_secs_f64()
+    }
+
     /// Best estimate of the link's available throughput. Returns whichever is
     /// larger of (a) actual bytes flowing in/out across the rolling window
     /// and (b) the active probe's measured throughput. This ensures an idle
     /// link still reports a non-zero throughput estimate.
     pub fn estimated_throughput_bps(&self) -> f64 {
         let utilized = self.recv_bps().max(self.sent_bps());
-        utilized.max(self.probe_throughput_bps)
+        utilized.max(self.max_probe_goodput_bps())
     }
 
     /// E-model-inspired conversational link-quality score. Higher is better.
@@ -203,6 +253,38 @@ impl LinkMetrics {
             self.estimated_throughput_bps(),
             0,
         ))
+    }
+
+    /// Cost of this link under the sender-selected route metric. Lower is
+    /// better. Links without RTT samples are left unranked.
+    pub fn routing_cost(&self, level: ServiceLevel, metric: RoutingMetric) -> Option<f64> {
+        if self.samples == 0 {
+            return None;
+        }
+
+        Some(match metric {
+            RoutingMetric::PerServiceCost => self.per_service_cost(level),
+            RoutingMetric::ConversationalQuality => conversational_impairment(
+                self.rtt_us,
+                self.jitter_us,
+                self.estimated_throughput_bps(),
+                0,
+            ),
+        })
+    }
+
+    fn per_service_cost(&self, level: ServiceLevel) -> f64 {
+        match level {
+            ServiceLevel::BestEffort => self.rtt_us.max(1.0),
+            ServiceLevel::ReliableLowLatency => {
+                (self.rtt_us + DEFAULT_RLL_JITTER_WEIGHT * self.jitter_us).max(1.0)
+            }
+            ServiceLevel::Reliable => {
+                let throughput_kbps = (self.estimated_throughput_bps() / 1024.0).max(1.0);
+                let penalty = DEFAULT_RELIABLE_THROUGHPUT_PENALTY_US_KBPS / throughput_kbps;
+                (self.rtt_us + penalty).max(1.0)
+            }
+        }
     }
 }
 
@@ -245,8 +327,15 @@ struct LinkInner {
     last_update: Option<Instant>,
     sent: SlidingCounters,
     recv: SlidingCounters,
-    probe_throughput_bps: Option<f64>,
-    probe_samples: u64,
+    wire_sent: SlidingCounters,
+    wire_recv: SlidingCounters,
+    service_probes: HashMap<ServiceShape, ServiceProbeInner>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServiceProbeInner {
+    goodput_bps: f64,
+    samples: u64,
 }
 
 impl LinkInner {
@@ -259,8 +348,9 @@ impl LinkInner {
             last_update: None,
             sent: SlidingCounters::new(window),
             recv: SlidingCounters::new(window),
-            probe_throughput_bps: None,
-            probe_samples: 0,
+            wire_sent: SlidingCounters::new(window),
+            wire_recv: SlidingCounters::new(window),
+            service_probes: HashMap::new(),
         }
     }
 }
@@ -305,7 +395,7 @@ impl PeerMetrics {
         let mut g = self.inner.lock();
         g.entry(transport)
             .or_insert_with(|| LinkInner::new(self.window))
-            .sent
+            .wire_sent
             .record(bytes as u64);
     }
 
@@ -313,60 +403,159 @@ impl PeerMetrics {
         let mut g = self.inner.lock();
         g.entry(transport)
             .or_insert_with(|| LinkInner::new(self.window))
+            .wire_recv
+            .record(bytes as u64);
+    }
+
+    pub fn record_payload_sent(&self, transport: TransportKind, bytes: usize) {
+        let mut g = self.inner.lock();
+        g.entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window))
+            .sent
+            .record(bytes as u64);
+    }
+
+    pub fn record_payload_recv(&self, transport: TransportKind, bytes: usize) {
+        let mut g = self.inner.lock();
+        g.entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window))
             .recv
             .record(bytes as u64);
     }
 
-    /// Record one bandwidth-probe round trip: `bytes_round_trip` bytes were
-    /// exchanged in `rtt`. Computes `bytes / rtt` and feeds it into the
-    /// probe-throughput EWMA. Tiny RTTs are clamped to avoid divide-by-zero.
-    pub fn record_probe(&self, transport: TransportKind, bytes_round_trip: usize, rtt: Duration) {
-        let secs = rtt.as_secs_f64().max(1e-6);
-        let bps = (bytes_round_trip as f64) / secs;
+    /// Record one service-shaped active probe: `payload_bytes` useful bytes
+    /// were delivered by this transport shape in `elapsed`.
+    pub fn record_probe(
+        &self,
+        transport: TransportKind,
+        shape: ServiceShape,
+        payload_bytes: usize,
+        elapsed: Duration,
+    ) {
+        if payload_bytes == 0 {
+            return;
+        }
+        let secs = elapsed.as_secs_f64().max(1e-6);
+        let bps = (payload_bytes as f64) / secs;
         let mut g = self.inner.lock();
         let entry = g
             .entry(transport)
             .or_insert_with(|| LinkInner::new(self.window));
-        entry.probe_throughput_bps = Some(match entry.probe_throughput_bps {
-            None => bps,
-            Some(prev) => prev + self.tuning.throughput_alpha * (bps - prev),
-        });
-        entry.probe_samples += 1;
+        let probe = entry
+            .service_probes
+            .entry(shape)
+            .or_insert(ServiceProbeInner {
+                goodput_bps: bps,
+                samples: 0,
+            });
+        if probe.samples > 0 {
+            probe.goodput_bps += self.tuning.throughput_alpha * (bps - probe.goodput_bps);
+        }
+        probe.samples += 1;
     }
 
     pub fn snapshot_per_transport(&self) -> HashMap<TransportKind, LinkMetrics> {
         let g = self.inner.lock();
         g.iter()
             .map(|(t, inner)| {
-                let (sent_bytes, _) = inner.sent.snapshot();
+                let (sent_bytes, sent_age) = inner.sent.snapshot();
                 let (recv_bytes, recv_age) = inner.recv.snapshot();
-                let window = self.window.min(recv_age.max(Duration::from_micros(1)));
+                let (wire_sent_bytes, wire_sent_age) = inner.wire_sent.snapshot();
+                let (wire_recv_bytes, wire_recv_age) = inner.wire_recv.snapshot();
+                let window = self.window.min(
+                    recv_age
+                        .max(sent_age)
+                        .max(wire_recv_age)
+                        .max(wire_sent_age)
+                        .max(Duration::from_micros(1)),
+                );
                 let m = LinkMetrics {
                     rtt_us: inner.rtt_us.unwrap_or(0.0),
                     jitter_us: inner.jitter_us,
                     sent_bytes,
                     recv_bytes,
+                    wire_sent_bytes,
+                    wire_recv_bytes,
                     window,
                     samples: inner.samples,
                     last_update: inner.last_update,
-                    probe_throughput_bps: inner.probe_throughput_bps.unwrap_or(0.0),
-                    probe_samples: inner.probe_samples,
+                    service_probes: inner
+                        .service_probes
+                        .iter()
+                        .map(|(shape, probe)| {
+                            (
+                                *shape,
+                                ServiceProbeMetrics {
+                                    goodput_bps: probe.goodput_bps,
+                                    samples: probe.samples,
+                                },
+                            )
+                        })
+                        .collect(),
                 };
                 (*t, m)
             })
             .collect()
     }
 
-    /// For a requested service level, pick the live link that satisfies the
-    /// level with the smallest smoothed RTT. Returns `None` if no link
-    /// qualifies (caller falls back to fixed-priority selection).
-    pub fn best_transport_for(&self, requested: ServiceLevel) -> Option<TransportKind> {
-        let g = self.inner.lock();
-        g.iter()
-            .filter(|(t, _)| t.service_level().satisfies(requested))
-            .filter_map(|(t, inner)| inner.rtt_us.map(|r| (*t, r)))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(t, _)| t)
+    /// Rank measured candidate transports for a requested service level using
+    /// the sender-selected route metric. Returns only candidates with enough
+    /// samples to compute a metric; callers can append their fixed fallback
+    /// order for unmeasured transports.
+    pub fn ranked_transports_for(
+        &self,
+        requested: ServiceLevel,
+        metric: RoutingMetric,
+        candidates: &[TransportKind],
+    ) -> Vec<TransportKind> {
+        let snapshot = self.snapshot_per_transport();
+        let mut ranked: Vec<(TransportKind, f64)> = candidates
+            .iter()
+            .copied()
+            .filter(|transport| transport.is_acceptable_for(requested))
+            .filter_map(|transport| {
+                snapshot
+                    .get(&transport)
+                    .and_then(|link| link.routing_cost(requested, metric))
+                    .map(|cost| (transport, cost))
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    transport_tie_rank(a.0, requested).cmp(&transport_tie_rank(b.0, requested))
+                })
+        });
+        ranked.into_iter().map(|(transport, _)| transport).collect()
+    }
+
+    /// For a requested service level, pick the best measured candidate using
+    /// the sender-selected route metric.
+    pub fn best_transport_for(
+        &self,
+        requested: ServiceLevel,
+        metric: RoutingMetric,
+        candidates: &[TransportKind],
+    ) -> Option<TransportKind> {
+        self.ranked_transports_for(requested, metric, candidates)
+            .into_iter()
+            .next()
+    }
+}
+
+fn transport_tie_rank(transport: TransportKind, requested: ServiceLevel) -> (u8, u8, u8) {
+    let provided = transport.service_level();
+    let exact_first = if provided == requested { 0 } else { 1 };
+    (exact_first, provided as u8, transport_kind_order(transport))
+}
+
+fn transport_kind_order(transport: TransportKind) -> u8 {
+    match transport {
+        TransportKind::Tcp => 3,
+        TransportKind::Quic => 1,
+        TransportKind::Kcp => 2,
+        TransportKind::Udp => 0,
     }
 }
 
@@ -423,25 +612,96 @@ mod tests {
     #[test]
     fn best_transport_picks_lowest_rtt() {
         let m = PeerMetrics::new(Duration::from_secs(5), MetricsTuning::default());
+        let candidates = [TransportKind::Tcp, TransportKind::Quic, TransportKind::Udp];
         m.record_rtt(TransportKind::Tcp, Duration::from_millis(50));
         m.record_rtt(TransportKind::Quic, Duration::from_millis(20));
         m.record_rtt(TransportKind::Udp, Duration::from_millis(15));
 
         // For best-effort, all three qualify; lowest RTT wins.
         assert_eq!(
-            m.best_transport_for(ServiceLevel::BestEffort),
+            m.best_transport_for(
+                ServiceLevel::BestEffort,
+                RoutingMetric::PerServiceCost,
+                &candidates
+            ),
             Some(TransportKind::Udp)
         );
-        // For RLL (the strongest tier), only QUIC qualifies in this setup
-        // (TCP is plain Reliable, UDP is BestEffort).
+        // For RLL, QUIC wins on latency; TCP remains an acceptable fallback.
         assert_eq!(
-            m.best_transport_for(ServiceLevel::ReliableLowLatency),
+            m.best_transport_for(
+                ServiceLevel::ReliableLowLatency,
+                RoutingMetric::PerServiceCost,
+                &candidates
+            ),
             Some(TransportKind::Quic)
         );
         // For Reliable, both TCP and QUIC qualify (QUIC is strictly stronger);
         // QUIC wins on lowest RTT.
         assert_eq!(
-            m.best_transport_for(ServiceLevel::Reliable),
+            m.best_transport_for(
+                ServiceLevel::Reliable,
+                RoutingMetric::PerServiceCost,
+                &candidates
+            ),
+            Some(TransportKind::Quic)
+        );
+    }
+
+    #[test]
+    fn reliable_policy_prefers_higher_throughput_over_lower_rtt() {
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        let candidates = [TransportKind::Tcp, TransportKind::Quic];
+
+        m.record_rtt(TransportKind::Tcp, Duration::from_millis(5));
+        m.record_probe(
+            TransportKind::Tcp,
+            ServiceShape::Bulk,
+            100,
+            Duration::from_secs(1),
+        );
+
+        m.record_rtt(TransportKind::Quic, Duration::from_millis(25));
+        m.record_probe(
+            TransportKind::Quic,
+            ServiceShape::Bulk,
+            1024 * 1024,
+            Duration::from_millis(50),
+        );
+
+        assert_eq!(
+            m.best_transport_for(
+                ServiceLevel::Reliable,
+                RoutingMetric::PerServiceCost,
+                &candidates
+            ),
+            Some(TransportKind::Quic)
+        );
+    }
+
+    #[test]
+    fn conversational_policy_can_upgrade_best_effort_from_jittery_udp() {
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        let candidates = [TransportKind::Udp, TransportKind::Quic];
+
+        m.record_rtt(TransportKind::Udp, Duration::from_millis(10));
+        m.record_rtt(TransportKind::Udp, Duration::from_millis(250));
+        m.record_rtt(TransportKind::Quic, Duration::from_millis(70));
+        m.record_rtt(TransportKind::Quic, Duration::from_millis(71));
+
+        assert_eq!(
+            m.best_transport_for(
+                ServiceLevel::BestEffort,
+                RoutingMetric::PerServiceCost,
+                &candidates
+            ),
+            Some(TransportKind::Udp)
+        );
+        assert_eq!(
+            m.best_transport_for(
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+                &candidates
+            ),
             Some(TransportKind::Quic)
         );
     }
@@ -449,22 +709,43 @@ mod tests {
     #[test]
     fn probe_throughput_smooths() {
         let m = PeerMetrics::new(Duration::from_secs(5), MetricsTuning::default());
-        // 8 KB round trip in 1 ms = 8 MB/s.
-        m.record_probe(TransportKind::Tcp, 8192, Duration::from_millis(1));
-        m.record_probe(TransportKind::Tcp, 8192, Duration::from_millis(1));
-        m.record_probe(TransportKind::Tcp, 8192, Duration::from_millis(1));
+        // 8 KB useful payload in 1 ms = 8 MB/s.
+        m.record_probe(
+            TransportKind::Tcp,
+            ServiceShape::Bulk,
+            8192,
+            Duration::from_millis(1),
+        );
+        m.record_probe(
+            TransportKind::Tcp,
+            ServiceShape::Bulk,
+            8192,
+            Duration::from_millis(1),
+        );
+        m.record_probe(
+            TransportKind::Tcp,
+            ServiceShape::Bulk,
+            8192,
+            Duration::from_millis(1),
+        );
         let snap = m.snapshot_per_transport();
         let tcp = snap.get(&TransportKind::Tcp).unwrap();
         let expected = 8192.0 / 1e-3;
-        assert!((tcp.probe_throughput_bps - expected).abs() < 1.0);
-        assert_eq!(tcp.probe_samples, 3);
+        assert!((tcp.max_probe_goodput_bps() - expected).abs() < 1.0);
+        assert_eq!(tcp.probe_samples(), 3);
+        assert_eq!(tcp.service_probe(ServiceShape::Bulk).samples(), 3);
     }
 
     #[test]
     fn estimated_throughput_takes_max() {
         let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
-        m.record_sent(TransportKind::Tcp, 100); // tiny actual flow
-        m.record_probe(TransportKind::Tcp, 8192, Duration::from_millis(1)); // probe says 8 MB/s
+        m.record_payload_sent(TransportKind::Tcp, 100); // tiny actual flow
+        m.record_probe(
+            TransportKind::Tcp,
+            ServiceShape::Bulk,
+            8192,
+            Duration::from_millis(1),
+        ); // probe says 8 MB/s
         let snap = m.snapshot_per_transport();
         let tcp = snap.get(&TransportKind::Tcp).unwrap();
         // Probe estimate dominates because actual flow is tiny.
@@ -479,11 +760,21 @@ mod tests {
 
         m.record_rtt(TransportKind::Tcp, Duration::from_millis(5));
         m.record_rtt(TransportKind::Tcp, Duration::from_millis(80));
-        m.record_probe(TransportKind::Tcp, 1024, Duration::from_millis(100));
+        m.record_probe(
+            TransportKind::Tcp,
+            ServiceShape::Bulk,
+            1024,
+            Duration::from_millis(100),
+        );
 
         m.record_rtt(TransportKind::Quic, Duration::from_millis(25));
         m.record_rtt(TransportKind::Quic, Duration::from_millis(26));
-        m.record_probe(TransportKind::Quic, 1024 * 1024, Duration::from_millis(50));
+        m.record_probe(
+            TransportKind::Quic,
+            ServiceShape::Bulk,
+            1024 * 1024,
+            Duration::from_millis(50),
+        );
 
         let snap = m.snapshot_per_transport();
         let tcp = snap
@@ -501,11 +792,15 @@ mod tests {
     #[test]
     fn bandwidth_counters_accumulate() {
         let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
-        m.record_sent(TransportKind::Tcp, 1024);
-        m.record_recv(TransportKind::Tcp, 512);
+        m.record_payload_sent(TransportKind::Tcp, 1024);
+        m.record_payload_recv(TransportKind::Tcp, 512);
+        m.record_sent(TransportKind::Tcp, 2048);
+        m.record_recv(TransportKind::Tcp, 1536);
         let snap = m.snapshot_per_transport();
         let tcp = snap.get(&TransportKind::Tcp).unwrap();
         assert_eq!(tcp.sent_bytes, 1024);
         assert_eq!(tcp.recv_bytes, 512);
+        assert_eq!(tcp.wire_sent_bytes(), 2048);
+        assert_eq!(tcp.wire_recv_bytes(), 1536);
     }
 }

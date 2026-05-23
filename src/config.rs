@@ -395,6 +395,8 @@ pub struct ServerEntrypointConfig {
     #[serde(default)]
     pub listen: Option<String>,
     #[serde(default)]
+    pub udp_ping_status_server_id: Option<String>,
+    #[serde(default)]
     pub sni: Vec<String>,
 }
 
@@ -587,6 +589,12 @@ pub struct Config {
     pub allowed_proxies: Vec<String>,
     pub min_client_version: u64,
     pub max_users: u64,
+
+    // ── Authentication backend ───────────────────────────────────────────
+    /// Optional WASM authenticator module loaded by the binary at startup and
+    /// on hot reload. `None` falls back to the built-in demo authenticator.
+    #[serde(default)]
+    pub authenticator_wasm_path: Option<PathBuf>,
 
     // ── Mumble standard server config ──────────────────────────────────────
     #[serde(default)]
@@ -856,6 +864,7 @@ mod tests {
             [[server_entrypoints]]
             server_id = "tenant-a"
             listen = "127.0.0.1:64748"
+            udp_ping_status_server_id = "tenant-a-status"
             sni = ["tenant-a.example.test", "TENANT-A-ALT.example.test"]
 
             [[server_entrypoints]]
@@ -875,9 +884,18 @@ mod tests {
             cfg.server_entrypoints[0].listen.as_deref(),
             Some("127.0.0.1:64748")
         );
+        assert_eq!(
+            cfg.server_entrypoints[0]
+                .udp_ping_status_server_id
+                .as_deref(),
+            Some("tenant-a-status")
+        );
         assert_eq!(cfg.server_entrypoints[0].sni.len(), 2);
         assert_eq!(cfg.server_entrypoints[1].server_id, "tenant-b");
         assert!(cfg.server_entrypoints[1].listen.is_none());
+        assert!(cfg.server_entrypoints[1]
+            .udp_ping_status_server_id
+            .is_none());
     }
 
     #[test]

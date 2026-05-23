@@ -243,6 +243,7 @@ pub async fn flood_to_neighbors(
             .send(
                 n.node_id,
                 ServiceLevel::Reliable,
+                None,
                 MessageClass::Regular,
                 payload.clone(),
             )

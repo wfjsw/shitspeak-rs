@@ -86,6 +86,7 @@ async fn two_node_tcp_data_roundtrip() {
         .send(
             2,
             ServiceLevel::Reliable,
+            None,
             MessageClass::Regular,
             Bytes::from_static(b"hi-from-a"),
         )
@@ -105,6 +106,7 @@ async fn two_node_tcp_data_roundtrip() {
         .send(
             1,
             ServiceLevel::Reliable,
+            None,
             MessageClass::HighPriority,
             Bytes::from_static(b"hi-from-b"),
         )
@@ -124,9 +126,9 @@ async fn two_node_tcp_data_roundtrip() {
     let _ = inbound_b;
 }
 
-/// Checks that idle transport probes produce a usable throughput metric.
-/// Expected: after probe round trips, TCP probe throughput is positive and the
-/// estimated throughput is at least that probe-only value. The expected
+/// Checks that idle transport probes produce a usable goodput metric.
+/// Expected: after service-shaped probe round trips, TCP probe goodput is
+/// positive and the estimated throughput is at least that probe-only value. The expected
 /// behavior is local to this crate's S2S transport health model; the reference
 /// projects provide the surrounding server model (`D:\mumble\src\murmur`) and
 /// shitspeak's side-channel precedent (`D:\shitspeak\slavehub.go`).
@@ -149,7 +151,7 @@ async fn probe_throughput_reports_idle_link_bandwidth() {
     wait_for_link(&mgr_a, 200, TransportKind::Tcp).await;
 
     // Idle the link: send no Data frames; let the periodic probe drive
-    // the throughput metric. The probe interval is 200ms; we wait long
+    // the goodput metric. The probe interval is 200ms; we wait long
     // enough to register multiple round trips.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
@@ -163,11 +165,11 @@ async fn probe_throughput_reports_idle_link_bandwidth() {
                     // should be nonzero. On loopback this will be a very
                     // large number — we just verify it is positive.
                     assert!(
-                        tcp.probe_throughput_bps() > 0.0,
-                        "probe_throughput_bps should be positive after probes"
+                        tcp.max_probe_goodput_bps() > 0.0,
+                        "max_probe_goodput_bps should be positive after probes"
                     );
                     assert!(
-                        tcp.estimated_throughput_bps() >= tcp.probe_throughput_bps(),
+                        tcp.estimated_throughput_bps() >= tcp.max_probe_goodput_bps(),
                         "estimate should not be less than probe alone"
                     );
                     return;
@@ -208,6 +210,7 @@ async fn upward_fallback_uses_tcp_for_best_effort() {
         .send(
             20,
             ServiceLevel::BestEffort,
+            None,
             MessageClass::Regular,
             Bytes::from_static(b"fb"),
         )
@@ -258,6 +261,7 @@ async fn two_node_udp_dtls_roundtrip() {
         .send(
             222,
             ServiceLevel::BestEffort,
+            None,
             MessageClass::HighPriority,
             Bytes::from_static(b"voice-frame-from-a"),
         )
@@ -277,6 +281,7 @@ async fn two_node_udp_dtls_roundtrip() {
         .send(
             111,
             ServiceLevel::BestEffort,
+            None,
             MessageClass::Regular,
             Bytes::from_static(b"control-frame-from-b"),
         )

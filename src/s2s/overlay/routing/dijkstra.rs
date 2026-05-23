@@ -39,6 +39,10 @@ pub struct RouteEntry {
 pub(crate) struct RoutingGraph {
     active: HashSet<NodeIdentifier>,
     transit_disabled: HashSet<NodeIdentifier>,
+    /// `links[origin]` = what `origin` observes about each of its neighbors.
+    /// Each entry represents one directed edge: origin → link.neighbor, scored
+    /// by origin's own measurements (RTT probes it sent, jitter/loss it
+    /// received). The reverse edge B→A is stored separately under B's entry.
     links: HashMap<NodeIdentifier, Vec<LinkAdvertised>>,
 }
 
@@ -232,7 +236,9 @@ fn compute_cost(
     cfg: &OverlayConfig,
 ) -> EdgeCost {
     let primary = match metric {
-        RoutingMetric::PerServiceCost => compute_per_service_cost(link, level, cfg),
+        RoutingMetric::PerServiceCost => {
+            compute_per_service_cost(link.rtt_us, link.jitter_us, link.throughput_bps, level, cfg)
+        }
         RoutingMetric::ConversationalQuality => (conversational_impairment(
             link.rtt_us as f64,
             link.jitter_us as f64,
@@ -255,20 +261,22 @@ fn compute_cost(
 }
 
 fn compute_per_service_cost(
-    link: &LinkAdvertised,
+    rtt_us: u64,
+    jitter_us: u64,
+    throughput_bps: u64,
     level: ServiceLevel,
     cfg: &OverlayConfig,
 ) -> u64 {
     match level {
-        ServiceLevel::BestEffort => link.rtt_us.max(1),
+        ServiceLevel::BestEffort => rtt_us.max(1),
         ServiceLevel::ReliableLowLatency => {
-            let weighted_jitter = (cfg.rll_jitter_weight() * link.jitter_us as f64) as u64;
-            (link.rtt_us + weighted_jitter).max(1)
+            let weighted_jitter = (cfg.rll_jitter_weight() * jitter_us as f64) as u64;
+            (rtt_us + weighted_jitter).max(1)
         }
         ServiceLevel::Reliable => {
-            let throughput_kbps = (link.throughput_bps as f64 / 1024.0).max(1.0);
+            let throughput_kbps = (throughput_bps as f64 / 1024.0).max(1.0);
             let penalty = (cfg.reliable_throughput_penalty_us_kbps() / throughput_kbps) as u64;
-            (link.rtt_us + penalty).max(1)
+            (rtt_us + penalty).max(1)
         }
     }
 }
@@ -466,6 +474,66 @@ mod tests {
         ]);
         let table = compute(&db, 1, ServiceLevel::ReliableLowLatency, &cfg());
         assert!(!table.contains_key(&2));
+    }
+
+    #[test]
+    fn directed_edge_uses_originator_metrics_only() {
+        // Node 1→2: forward (node 1's view) has 10ms RTT and 100 Kbps.
+        // Node 2→1: reverse (node 2's view) has 10ms RTT and 1 Mbps.
+        // Edge 1→2 cost must reflect 100 Kbps (node 1's measurement), not 1 Mbps.
+        let db = build_db(vec![
+            entry(1, 100, 1, vec![(2, 10_000, 0, 100_000)]), // 1's view of 1→2
+            entry(2, 100, 1, vec![(1, 10_000, 0, 1_000_000)]), // 2's view of 2→1
+        ]);
+        let table_low = compute(&db, 1, ServiceLevel::Reliable, &cfg());
+
+        // Compare: both sides say 100 Kbps — symmetric baseline.
+        let db_sym = build_db(vec![
+            entry(1, 100, 1, vec![(2, 10_000, 0, 100_000)]),
+            entry(2, 100, 1, vec![(1, 10_000, 0, 100_000)]),
+        ]);
+        let table_sym = compute(&db_sym, 1, ServiceLevel::Reliable, &cfg());
+
+        // The directed edge 1→2 uses node 1's metrics only: 100 Kbps in both
+        // cases, so costs must match.
+        assert_eq!(table_low[&2].cost, table_sym[&2].cost);
+    }
+
+    #[test]
+    fn directed_graph_independent_path_costs() {
+        // Asymmetric topology: 1→3 (node 1's view of 3) is expensive (2ms RTT
+        // + 8ms jitter), but 3→1 (node 3's view of 1) is cheap. Routing from
+        // node 1 to node 2 must use the 1-side directed costs.
+        //
+        //   1 —(1→2: 10ms, jitter=0)—> 2
+        //   1 —(1→3: 2ms, jitter=8ms)—> 3
+        //   3 —(3→2: 2ms, jitter=0)—>  2
+        //
+        // RLL cost of path 1→3→2: (2ms + 4*8ms=34ms) + (2ms) = 36ms > direct 10ms.
+        // So routing from 1 to 2 should prefer direct 1→2.
+        let db = build_db(vec![
+            entry(
+                1,
+                100,
+                1,
+                vec![(2, 10_000, 0, 1_000_000), (3, 2_000, 8_000, 1_000_000)],
+            ),
+            entry(
+                2,
+                100,
+                1,
+                vec![(1, 10_000, 0, 1_000_000), (3, 2_000, 0, 1_000_000)],
+            ),
+            entry(
+                3,
+                100,
+                1,
+                vec![(1, 2_000, 0, 1_000_000), (2, 2_000, 0, 1_000_000)],
+            ),
+        ]);
+        let table = compute(&db, 1, ServiceLevel::ReliableLowLatency, &cfg());
+        // Direct path is cheaper (10ms) than via 3 (2ms + 32ms jitter penalty + 2ms).
+        assert_eq!(table[&2].next_hop, 2);
     }
 
     #[test]

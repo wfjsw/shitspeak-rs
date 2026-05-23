@@ -287,6 +287,8 @@ pub(crate) struct CountingOwnerRepo {
     pub state: Mutex<std::collections::HashMap<NodeIdentifier, (u64, u64, Vec<(u64, u64)>)>>,
     /// Counts each call to `reset_origin(node, _)`.
     pub reset_calls: Mutex<Vec<(NodeIdentifier, u64)>>,
+    /// Counts each call to `remove_origin(node)`.
+    pub remove_calls: Mutex<Vec<NodeIdentifier>>,
 }
 
 impl CountingOwnerRepo {
@@ -294,6 +296,7 @@ impl CountingOwnerRepo {
         Arc::new(Self {
             state: Mutex::new(Default::default()),
             reset_calls: Mutex::new(Vec::new()),
+            remove_calls: Mutex::new(Vec::new()),
         })
     }
 
@@ -312,6 +315,14 @@ impl CountingOwnerRepo {
             .filter(|(o, _)| *o == origin)
             .map(|(_, e)| *e)
             .collect()
+    }
+
+    pub fn remove_calls_for(&self, origin: NodeIdentifier) -> usize {
+        self.remove_calls
+            .lock()
+            .iter()
+            .filter(|node| **node == origin)
+            .count()
     }
 }
 
@@ -377,6 +388,12 @@ impl OwnerReplicable for CountingOwnerRepo {
         let mut s = self.state.lock();
         s.remove(&origin);
     }
+
+    async fn remove_origin(&self, origin: NodeIdentifier) {
+        self.remove_calls.lock().push(origin);
+        let mut s = self.state.lock();
+        s.remove(&origin);
+    }
 }
 
 // ---------- End-to-end tests using MockNet + counting repos ----------
@@ -386,8 +403,8 @@ mod e2e_tests {
     use super::super::config::ReplicationConfig;
     use super::super::owner::runtime::OwnerRuntime;
     use super::super::proto::{
-        OwnerBody, OwnerCatchupReq, OwnerOp, StrictBody, StrictCommit, StrictPropose,
-        StrictProposeAck,
+        CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp, StrictBody, StrictCommit,
+        StrictPropose, StrictProposeAck,
     };
     use super::super::strict::runtime::StrictRuntime;
     use super::*;
@@ -578,12 +595,13 @@ mod e2e_tests {
         assert_eq!(repo.applied_for(2), vec![(1, 999)]);
     }
 
-    /// `MembershipEvent::Restarted` clears pending buffer for origin but
-    /// does NOT call `reset_origin` until the next OwnerOp.
+    /// `MembershipEvent::Restarted` is restart handling: clear old state,
+    /// call `reset_origin`, then request catchup from version 0.
     #[tokio::test]
-    async fn owner_restarted_event_clears_pending_no_immediate_reset() {
+    async fn owner_restarted_event_resets_and_catches_up_from_zero() {
         use crate::s2s::overlay::MembershipEvent;
         let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(2, 11);
         let repo = CountingOwnerRepo::new();
         let rt = OwnerRuntime::new(
             repo.clone(),
@@ -594,6 +612,11 @@ mod e2e_tests {
             CancellationToken::new(),
             default_cfg(),
         );
+
+        repo.state
+            .lock()
+            .insert(2, (10, 2, vec![(1, 100), (2, 200)]));
+        rt.state.lock().known.insert(2, (10, 2));
 
         // Pre-buffer ops at the old epoch.
         rt.state.lock().pending_buffers.insert(2, {
@@ -617,7 +640,113 @@ mod e2e_tests {
         // Pending buffer + catchup state cleared.
         assert!(rt.state.lock().pending_buffers.get(&2).is_none());
         assert!(rt.state.lock().catchup_in_flight.get(&2).is_none());
-        // BUT no immediate reset_origin call.
+        assert!(rt.state.lock().known.get(&2).is_none());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if repo.reset_calls_for(2) == vec![11] && net.count_owner_unicasts() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restart handling should finish");
+
+        assert!(repo.applied_for(2).is_empty());
+        let caps = net.captures();
+        let CapturedFrame::OwnerUnicast { body, .. } = &caps[0] else {
+            panic!()
+        };
+        match body {
+            OwnerBody::CatchupReq(req) => {
+                assert_eq!(req.origin_node, 2);
+                assert_eq!(req.known_epoch, 11);
+                assert_eq!(req.since_version, 0);
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// `MembershipEvent::Failed` removes transient origin state without
+    /// treating the event as an owner epoch reset.
+    #[tokio::test]
+    async fn owner_failed_event_removes_origin_without_epoch_reset() {
+        use crate::s2s::overlay::MembershipEvent;
+        let net = MockNet::new(1, vec![1]);
+        let repo = CountingOwnerRepo::new();
+        let rt = OwnerRuntime::new(
+            repo.clone(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            default_cfg(),
+        );
+
+        repo.state
+            .lock()
+            .insert(2, (10, 2, vec![(1, 100), (2, 200)]));
+        rt.state.lock().known.insert(2, (10, 2));
+
+        rt.on_membership_event(&MembershipEvent::Failed(2));
+
+        assert!(rt.state.lock().known.get(&2).is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if repo.remove_calls_for(2) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("offline handling should finish");
+
         assert!(repo.reset_calls_for(2).is_empty());
+        assert!(repo.applied_for(2).is_empty());
+        assert_eq!(net.count_owner_unicasts(), 0);
+    }
+
+    #[tokio::test]
+    async fn owner_duplicate_catchup_response_is_idempotent() {
+        let net = MockNet::new(1, vec![1, 2]);
+        let repo = CountingOwnerRepo::new();
+        let rt = OwnerRuntime::new(
+            repo.clone(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            default_cfg(),
+        );
+
+        let ops: Vec<CatchupOp> = (1..=5u64)
+            .map(|version| CatchupOp {
+                version,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&(700 + version - 1)).unwrap()),
+            })
+            .collect();
+        let resp = OwnerCatchupResp {
+            origin_node: 2,
+            origin_epoch: 200,
+            snapshot_version: 0,
+            snapshot_msgpack: Bytes::new(),
+            ops,
+            has_more: false,
+            next_chunk_token: 0,
+            too_old_use_snapshot: false,
+        };
+
+        rt.recv_catchup_resp(2, resp.clone()).await;
+        rt.recv_catchup_resp(2, resp).await;
+
+        assert_eq!(
+            repo.applied_for(2),
+            vec![(1, 700), (2, 701), (3, 702), (4, 703), (5, 704)]
+        );
+        assert_eq!(repo.known_versions().get(&2), Some(&(200, 5)));
     }
 }

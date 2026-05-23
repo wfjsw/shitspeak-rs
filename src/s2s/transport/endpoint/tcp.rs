@@ -83,7 +83,7 @@ impl Endpoint for TcpEndpoint {
                     format!("peer cn {peer_node} != expected {}", peer.node_id()),
                 ));
             }
-            install_stream_session(&inner, peer_node, TransportKind::Tcp, true, tls);
+            install_stream_session(&inner, peer_node, TransportKind::Tcp, Some(addr), true, tls);
             Ok(())
         }
     }
@@ -111,7 +111,7 @@ impl Endpoint for TcpEndpoint {
                     "self-loop rejected",
                 ));
             }
-            install_stream_session(&inner, peer_node, TransportKind::Tcp, true, tls);
+            install_stream_session(&inner, peer_node, TransportKind::Tcp, Some(addr), true, tls);
             Ok(peer_node)
         }
     }
@@ -161,6 +161,13 @@ async fn handle_inbound(
     inner
         .get_or_create_peer(peer_node)
         .note_observed_remote_addr(peer_addr);
-    install_stream_session(&inner, peer_node, TransportKind::Tcp, false, tls);
+    install_stream_session(
+        &inner,
+        peer_node,
+        TransportKind::Tcp,
+        Some(peer_addr),
+        false,
+        tls,
+    );
     Ok(())
 }

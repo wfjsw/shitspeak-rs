@@ -27,7 +27,7 @@ use super::endpoint::{
 use super::error::{ConfigError, SendError, TransportError};
 use super::identity::NodeIdentity;
 use super::metrics::{assemble_snapshot, MetricsSnapshot, MetricsTuning};
-use super::service_level::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
+use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
 use super::tls::build_tls_configs;
 
 #[derive(Debug, Clone)]
@@ -382,16 +382,16 @@ impl ConnectionManager {
             return;
         }
         for candidate in candidates {
-            if candidate != addr {
-                debug!(
-                    peer=%node,
-                    advertised=?addr,
-                    candidate=?candidate,
-                    "derived peer address candidate using observed remote IP"
-                );
-            }
             let added = peer.add_address(candidate);
             if added {
+                if candidate != addr {
+                    debug!(
+                        peer=%node,
+                        advertised=?addr,
+                        candidate=?candidate,
+                        "derived peer address candidate using observed remote IP"
+                    );
+                }
                 debug!(peer=%node, ?candidate, "address added");
             }
         }
@@ -413,16 +413,16 @@ impl ConnectionManager {
             return;
         }
         for candidate in candidates {
-            if candidate != addr {
-                debug!(
-                    peer=%node,
-                    advertised=?addr,
-                    candidate=?candidate,
-                    "derived peer address candidate using observed remote IP"
-                );
-            }
             let added = peer.add_address_seen_at(candidate, seen_at);
             if added {
+                if candidate != addr {
+                    debug!(
+                        peer=%node,
+                        advertised=?addr,
+                        candidate=?candidate,
+                        "derived peer address candidate using observed remote IP"
+                    );
+                }
                 debug!(peer=%node, ?candidate, "address added");
             }
         }
@@ -443,25 +443,45 @@ impl ConnectionManager {
         }
     }
 
-    /// Send a `Data` frame to `node` using the best transport satisfying
-    /// `level`. Falls back to a stronger transport when the requested level's
-    /// flavor isn't currently up; returns `NoSuitableTransport` if nothing
-    /// qualifies.
+    /// Send a `Data` frame using the best live transport under the sender's
+    /// selected routing metric. Uses [`RoutingMetric::PerServiceCost`] when
+    /// `routing_metric` is `None`. If the first acceptable transport closes or
+    /// is full before enqueue, retry the next acceptable transport.
     pub async fn send(
         &self,
         node: NodeIdentifier,
         level: ServiceLevel,
+        routing_metric: Option<RoutingMetric>,
         class: MessageClass,
         payload: Bytes,
     ) -> Result<(), SendError> {
+        let routing_metric = routing_metric.unwrap_or(RoutingMetric::PerServiceCost);
         let peer = self
             .inner
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
 
-        let chosen = pick_transport(&peer, level).ok_or(SendError::NoSuitableTransport { node })?;
+        let choices = pick_transports(&peer, level, routing_metric);
+        if choices.is_empty() {
+            return Err(SendError::NoSuitableTransport { node });
+        }
 
-        self.send_stream(&peer, chosen, class, payload).await
+        let mut first_err = None;
+        for chosen in choices {
+            match self
+                .send_stream(&peer, chosen, class, payload.clone())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        Err(first_err.unwrap_or(SendError::NoSuitableTransport { node }))
     }
 
     /// Send via a specific transport, ignoring the fallback ordering. Useful
@@ -563,35 +583,55 @@ impl ConnectionManager {
 ///   guarantee is lost in that case but reliability is preserved —
 ///   acceptable for non-realtime traffic like moderation.
 ///
-/// Among accepted transports, exact-level matches win; the rest are
-/// ordered by stronger-first then a stable kind tiebreaker.
-fn pick_transport(peer: &PeerState, level: ServiceLevel) -> Option<TransportKind> {
+/// Among measured accepted transports, the sender-selected routing metric
+/// wins. Unmeasured transports are appended in the fixed fallback order:
+/// exact-level first, then stronger-first with a stable kind tiebreaker.
+#[cfg(test)]
+fn pick_transport(
+    peer: &PeerState,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+) -> Option<TransportKind> {
+    pick_transports(peer, level, routing_metric)
+        .first()
+        .copied()
+}
+
+fn pick_transports(
+    peer: &PeerState,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+) -> Vec<TransportKind> {
     let mut candidates: Vec<TransportKind> = peer
         .live_kinds()
         .into_iter()
         .filter(|k| accepts(*k, level))
         .collect();
     if candidates.is_empty() {
-        return None;
+        return Vec::new();
     }
+
+    let mut ranked = peer
+        .metrics()
+        .ranked_transports_for(level, routing_metric, &candidates);
 
     candidates.sort_by_key(|k| {
         let provided = k.service_level();
         let exact_first = if provided == level { 0 } else { 1 };
         (exact_first, provided as u8, kind_order(*k))
     });
-    candidates.first().copied()
+
+    for candidate in candidates {
+        if !ranked.contains(&candidate) {
+            ranked.push(candidate);
+        }
+    }
+
+    ranked
 }
 
 fn accepts(kind: TransportKind, requested: ServiceLevel) -> bool {
-    let provided = kind.service_level();
-    match requested {
-        ServiceLevel::BestEffort => true,
-        ServiceLevel::Reliable | ServiceLevel::ReliableLowLatency => {
-            // Both reliable tiers accept any reliable transport.
-            provided != ServiceLevel::BestEffort
-        }
-    }
+    kind.is_acceptable_for(requested)
 }
 
 fn kind_order(k: TransportKind) -> u8 {
@@ -752,11 +792,111 @@ fn build_endpoints(
 
 #[cfg(test)]
 mod tests {
+    use super::super::connection::ActiveStream;
+    use super::super::service_level::ServiceShape;
     use super::*;
     use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     fn socket(raw: &str) -> SocketAddr {
         raw.parse().unwrap()
+    }
+
+    fn peer_with_live_transports(
+        kinds: &[TransportKind],
+    ) -> (Arc<PeerState>, Vec<mpsc::Receiver<OutboundFrame>>) {
+        let peer = PeerState::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+            MetricsTuning::default(),
+        );
+        let mut receivers = Vec::new();
+        for kind in kinds {
+            let (tx, rx) = mpsc::channel(1);
+            peer.install_stream(ActiveStream::new(
+                *kind,
+                None,
+                tx,
+                CancellationToken::new(),
+                false,
+            ));
+            receivers.push(rx);
+        }
+        (peer, receivers)
+    }
+
+    #[test]
+    fn fixed_transport_order_prefers_exact_level_when_unmeasured() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Quic]);
+
+        assert_eq!(
+            pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::PerServiceCost),
+            Some(TransportKind::Tcp)
+        );
+    }
+
+    #[test]
+    fn metric_transport_order_can_upgrade_reliable_from_bad_tcp() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Quic]);
+
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(5));
+        peer.metrics().record_probe(
+            TransportKind::Tcp,
+            ServiceShape::Bulk,
+            100,
+            Duration::from_secs(1),
+        );
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(25));
+        peer.metrics().record_probe(
+            TransportKind::Quic,
+            ServiceShape::Bulk,
+            1024 * 1024,
+            Duration::from_millis(50),
+        );
+
+        assert_eq!(
+            pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::PerServiceCost),
+            Some(TransportKind::Quic)
+        );
+    }
+
+    #[test]
+    fn conversational_transport_order_can_upgrade_best_effort_from_udp() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Udp, TransportKind::Quic]);
+
+        peer.metrics()
+            .record_rtt(TransportKind::Udp, Duration::from_millis(10));
+        peer.metrics()
+            .record_rtt(TransportKind::Udp, Duration::from_millis(250));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(70));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(71));
+
+        assert_eq!(
+            pick_transport(
+                &peer,
+                ServiceLevel::BestEffort,
+                RoutingMetric::PerServiceCost
+            ),
+            Some(TransportKind::Udp)
+        );
+        assert_eq!(
+            pick_transport(
+                &peer,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality
+            ),
+            Some(TransportKind::Quic)
+        );
     }
 
     #[test]

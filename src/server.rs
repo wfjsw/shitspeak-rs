@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock as StdRwLock};
 
@@ -15,7 +16,7 @@ use tokio::task::JoinSet;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
-use crate::api::Authenticator;
+use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::channel_handler::SessionChannelShadow;
 use crate::channel_repository::{ChannelOperation, ChannelRepoTuning, ChannelRepository};
@@ -72,6 +73,13 @@ async fn bind_entrypoint_socket_pair(
     Ok((tcp_listener, udp_socket))
 }
 
+#[derive(Debug, Clone)]
+struct EntrypointListenSpec {
+    address: SocketAddr,
+    server_id: String,
+    udp_ping_status_server_id: String,
+}
+
 fn normalize_sni_name(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -83,6 +91,7 @@ async fn bind_entrypoints(
     let mut udp_sockets = Vec::new();
     let mut udp_socket_by_port = HashMap::new();
     let mut server_id_by_port = HashMap::new();
+    let mut udp_ping_status_server_id_by_port = HashMap::new();
 
     let (server_id_by_sni, listen_specs) = entrypoint_config_routes(config)?;
 
@@ -95,7 +104,12 @@ async fn bind_entrypoints(
         listener: Arc::new(listener),
     });
 
-    for (address, server_id) in listen_specs {
+    for spec in listen_specs {
+        let EntrypointListenSpec {
+            address,
+            server_id,
+            udp_ping_status_server_id,
+        } = spec;
         let (listener, udp_socket) = bind_entrypoint_socket_pair(address).await?;
         let port = listener.local_addr()?.port();
         if port == default_port {
@@ -114,6 +128,7 @@ async fn bind_entrypoints(
             )
             .into());
         }
+        udp_ping_status_server_id_by_port.insert(port, udp_ping_status_server_id);
         udp_socket_by_port.insert(port, Arc::clone(&udp_socket));
         udp_sockets.push(udp_socket);
         tcp_listeners.push(ServerTcpListener {
@@ -127,6 +142,7 @@ async fn bind_entrypoints(
         udp_sockets,
         udp_socket_by_port,
         server_id_by_port,
+        udp_ping_status_server_id_by_port,
         server_id_by_sni,
     })
 }
@@ -154,7 +170,7 @@ fn register_sni_entrypoints(
 
 fn entrypoint_config_routes(
     config: &Config,
-) -> Result<(HashMap<String, String>, Vec<(SocketAddr, String)>), Box<dyn std::error::Error>> {
+) -> Result<(HashMap<String, String>, Vec<EntrypointListenSpec>), Box<dyn std::error::Error>> {
     let mut server_id_by_sni = HashMap::new();
     let mut listen_specs = Vec::new();
     let mut fixed_port_owners: HashMap<u16, String> = HashMap::new();
@@ -174,6 +190,18 @@ fn entrypoint_config_routes(
         let Some(listen) = entrypoint.listen.as_deref() else {
             continue;
         };
+        let udp_ping_status_server_id = entrypoint
+            .udp_ping_status_server_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(server_id);
+        if udp_ping_status_server_id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("server entrypoint for {server_id} has empty udp_ping_status_server_id"),
+            )
+            .into());
+        }
         let address = first_socket_addr(listen)?;
         if address.port() != 0 {
             if let Some(existing) = fixed_port_owners.insert(address.port(), server_id.to_owned()) {
@@ -189,7 +217,11 @@ fn entrypoint_config_routes(
                 .into());
             }
         }
-        listen_specs.push((address, server_id.to_owned()));
+        listen_specs.push(EntrypointListenSpec {
+            address,
+            server_id: server_id.to_owned(),
+            udp_ping_status_server_id: udp_ping_status_server_id.to_owned(),
+        });
     }
 
     Ok((server_id_by_sni, listen_specs))
@@ -251,6 +283,7 @@ mod tests {
             allowed_proxies: Vec::new(),
             min_client_version: 0,
             max_users: 100,
+            authenticator_wasm_path: None,
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,
@@ -283,6 +316,7 @@ mod tests {
         let config = test_config(vec![ServerEntrypointConfig {
             server_id: "tenant-a".to_owned(),
             listen: Some("127.0.0.1:0".to_owned()),
+            udp_ping_status_server_id: None,
             sni: Vec::new(),
         }]);
 
@@ -310,6 +344,48 @@ mod tests {
                 .map(String::as_str),
             Some("tenant-a")
         );
+        assert_eq!(
+            bindings
+                .udp_ping_status_server_id_by_port
+                .get(
+                    &bindings.tcp_listeners[1]
+                        .listener
+                        .local_addr()
+                        .unwrap()
+                        .port()
+                )
+                .map(String::as_str),
+            Some("tenant-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_entrypoints_maps_udp_ping_status_override() {
+        let config = test_config(vec![ServerEntrypointConfig {
+            server_id: "tenant-a".to_owned(),
+            listen: Some("127.0.0.1:0".to_owned()),
+            udp_ping_status_server_id: Some("tenant-a-status".to_owned()),
+            sni: Vec::new(),
+        }]);
+
+        let bindings = bind_entrypoints(&config).await.expect("entrypoints bind");
+        let port = bindings.tcp_listeners[1]
+            .listener
+            .local_addr()
+            .unwrap()
+            .port();
+
+        assert_eq!(
+            bindings.server_id_by_port.get(&port).map(String::as_str),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            bindings
+                .udp_ping_status_server_id_by_port
+                .get(&port)
+                .map(String::as_str),
+            Some("tenant-a-status")
+        );
     }
 
     #[test]
@@ -317,6 +393,7 @@ mod tests {
         let entrypoint = ServerEntrypointConfig {
             server_id: "tenant-a".to_owned(),
             listen: None,
+            udp_ping_status_server_id: None,
             sni: vec!["Tenant-A.Example.Test.".to_owned()],
         };
         let mut map = HashMap::new();
@@ -339,6 +416,7 @@ mod tests {
         let new_config = test_config(vec![ServerEntrypointConfig {
             server_id: "tenant-from-existing-state".to_owned(),
             listen: Some("127.0.0.1:0".to_owned()),
+            udp_ping_status_server_id: None,
             sni: vec!["Tenant.Example.Test".to_owned()],
         }]);
 
@@ -436,12 +514,13 @@ pub struct Server {
 
     codec_info: Mutex<CodecInfo>,
 
-    authenticator: Arc<dyn Authenticator>,
+    authenticator: Arc<ReloadableAuthenticator>,
 
     /// Registry of server-defined context menu actions.
     context_actions: Arc<crate::context_action::ContextActionRegistry>,
 
     s2s_manager: Arc<S2SManager>,
+    shutdown_tx: tokio::sync::watch::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -455,6 +534,7 @@ struct EntrypointBindings {
     udp_sockets: Vec<Arc<tokio::net::UdpSocket>>,
     udp_socket_by_port: HashMap<u16, Arc<tokio::net::UdpSocket>>,
     server_id_by_port: HashMap<u16, String>,
+    udp_ping_status_server_id_by_port: HashMap<u16, String>,
     server_id_by_sni: HashMap<String, String>,
 }
 
@@ -574,6 +654,17 @@ impl Server {
         config: Config,
         authenticator: A,
     ) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
+        Self::new_with_reloadable_authenticator(
+            config,
+            ReloadableAuthenticator::fixed(authenticator),
+        )
+        .await
+    }
+
+    pub async fn new_with_reloadable_authenticator(
+        config: Config,
+        authenticator: ReloadableAuthenticator,
+    ) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
         Version::cache_server_os_info();
 
         let allowed_proxies = config
@@ -637,6 +728,7 @@ impl Server {
         let s2s_manager = Arc::new(S2SManager::initialize(
             &config.read().expect("Config RwLock poisoned"),
         ));
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(());
 
         let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
@@ -655,6 +747,7 @@ impl Server {
             config,
             context_actions: Arc::new(crate::context_action::ContextActionRegistry::new()),
             s2s_manager,
+            shutdown_tx,
         }));
 
         // Wire cross-repo causal notification: ChannelRepository notifies
@@ -693,10 +786,25 @@ impl Server {
             .local_addr()
     }
 
-    pub async fn run(
-        self: &Arc<Box<Self>>,
-        mut shutdown_rx: tokio::sync::watch::Receiver<()>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn shutdown_receiver(&self) -> tokio::sync::watch::Receiver<()> {
+        self.shutdown_tx.subscribe()
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
+    }
+
+    pub fn authenticator_wasm_path(&self) -> Option<PathBuf> {
+        self.read_config().authenticator_wasm_path.clone()
+    }
+
+    fn authenticator_arc(&self) -> Arc<dyn Authenticator> {
+        let authenticator: Arc<dyn Authenticator> = self.authenticator.clone();
+        authenticator
+    }
+
+    pub async fn run(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut shutdown_rx = self.shutdown_receiver();
         let listen_addrs: Vec<String> = {
             let entrypoints = self.entrypoints.read();
             entrypoints
@@ -718,37 +826,42 @@ impl Server {
 
         // Bounded channel shared between UDP drain and processing tasks.
         let (udp_in, udp_out) = tokio::sync::mpsc::channel::<UdpPacket>(udp_channel_size);
+
+        // Internal shutdown channel: used to signal all spawned tasks regardless
+        // of whether shutdown originated from the external signal or a task dying.
+        let (internal_tx, internal_rx) = tokio::sync::watch::channel(());
+
         {
             let mut runtime = self.entrypoint_runtime.lock();
             *runtime = Some(EntrypointRuntime {
                 udp_in: udp_in.clone(),
                 udp_voice_enabled,
                 udp_ping_enabled,
-                shutdown: shutdown_rx.clone(),
+                shutdown: internal_rx.clone(),
             });
         }
-        let udp_process = Self::spawn_udp_process(
+        let mut udp_process = Self::spawn_udp_process(
             Arc::clone(self),
             udp_out,
             udp_ping_enabled,
-            shutdown_rx.clone(),
+            internal_rx.clone(),
         );
-        self.spawn_entrypoint_tasks_for_existing_bindings(&udp_in, &shutdown_rx);
-        let idle_reaper =
-            Self::spawn_idle_reaper(Arc::clone(self), idle_timeout_secs, shutdown_rx.clone());
-        let pending_delete_watchdog = Self::spawn_pending_delete_watchdog(
+        self.spawn_entrypoint_tasks_for_existing_bindings(&udp_in, &internal_rx);
+        let mut idle_reaper =
+            Self::spawn_idle_reaper(Arc::clone(self), idle_timeout_secs, internal_rx.clone());
+        let mut pending_delete_watchdog = Self::spawn_pending_delete_watchdog(
             Arc::clone(self),
             pending_delete_timeout_ms,
-            shutdown_rx.clone(),
+            internal_rx.clone(),
         );
         let startup_config = self.read_config().clone();
         let web_config = startup_config.web.clone();
         let web_signaling = match web_config.clone() {
             web if web.enabled && web.listen.is_some() => Some(
                 crate::web::signaling::SignalingServer::new(web)
-                    .with_authenticator(Arc::clone(&self.authenticator))
+                    .with_authenticator(self.authenticator_arc())
                     .with_server(Arc::clone(self))
-                    .spawn(shutdown_rx.clone())?,
+                    .spawn(internal_rx.clone())?,
             ),
             _ => None,
         };
@@ -759,27 +872,27 @@ impl Server {
                         startup_config.cert_path.clone(),
                         startup_config.key_path.clone(),
                     )
-                    .with_authenticator(Arc::clone(&self.authenticator))
+                    .with_authenticator(self.authenticator_arc())
                     .with_server(Arc::clone(self))
-                    .spawn(shutdown_rx.clone())?,
+                    .spawn(internal_rx.clone())?,
             ),
             _ => None,
         };
-        let _s2s_task = Arc::clone(&self.s2s_manager)
-            .spawn_runtime_task(Arc::downgrade(self), shutdown_rx.clone());
+        let s2s_task = Arc::clone(&self.s2s_manager)
+            .spawn_runtime_task(Arc::downgrade(self), internal_rx.clone());
 
         // Public server registration (periodic HTTP POST to registry).
         // This task is optional and may exit early when registration is disabled;
         // it must never terminate the main server loop.
-        let _register_task =
-            crate::register::spawn_register_task(Arc::clone(self), shutdown_rx.clone());
+        let register_task =
+            crate::register::spawn_register_task(Arc::clone(self), internal_rx.clone());
 
         // Wait for any task to finish (error) or for the caller to request
         // shutdown by sending on the shared watch channel.
         tokio::select! {
-            result = udp_process => { let _ = result; }
-            result = idle_reaper => { let _ = result; }
-            result = pending_delete_watchdog => { let _ = result; }
+            result = &mut udp_process => { let _ = result; }
+            result = &mut idle_reaper => { let _ = result; }
+            result = &mut pending_delete_watchdog => { let _ = result; }
             result = async {
                 match web_signaling {
                     Some(handle) => handle.await.ok(),
@@ -796,6 +909,15 @@ impl Server {
                 tracing::info!("Shutdown signal received.");
             }
         }
+
+        // Ensure every spawned runtime task observes shutdown before joining.
+        let _ = internal_tx.send(());
+
+        let _ = udp_process.await;
+        let _ = idle_reaper.await;
+        let _ = pending_delete_watchdog.await;
+        let _ = s2s_task.await;
+        let _ = register_task.await;
 
         Ok(())
     }
@@ -847,16 +969,21 @@ impl Server {
                                 ping.timestamp,
                                 ping.format
                             );
-                            let reply = match Self::build_ping_response(&server, &ping).await {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to build UDP ping response for {}: {e}",
-                                        src_addr
-                                    );
-                                    continue;
-                                }
-                            };
+                            let status_server_id =
+                                server.udp_ping_status_server_id_for_port(local_addr.port());
+                            let reply =
+                                match Self::build_ping_response(&server, &ping, &status_server_id)
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to build UDP ping response for {}: {e}",
+                                            src_addr
+                                        );
+                                        continue;
+                                    }
+                                };
                             match socket.send_to(&reply, src_addr).await {
                                 Ok(sent) => tracing::trace!(
                                     "UDP ping reply sent to {}: {} bytes",
@@ -1069,15 +1196,35 @@ impl Server {
                             ping.format
                         );
                         tracing::debug!("UDP ping from {}: timestamp={}", src_addr, ping.timestamp);
-                        let reply = match Self::build_ping_response(&server, &ping).await {
-                            Ok(r) => r,
+                        let cleartext = match ping.encode_authenticated_echo() {
+                            Ok(reply) => reply,
                             Err(e) => {
                                 tracing::warn!(
-                                    "Failed to build UDP ping response for {}: {e}",
+                                    "Failed to encode authenticated UDP ping response for {}: {e}",
                                     src_addr
                                 );
                                 continue;
                             }
+                        };
+                        let encrypted = {
+                            let mut crypt = client.crypt_state();
+                            let Some(state) = crypt.as_mut() else {
+                                tracing::warn!(
+                                    "no crypt state available for authenticated UDP ping reply to {}",
+                                    src_addr
+                                );
+                                continue;
+                            };
+                            let mut encrypted = vec![0u8; cleartext.len() + state.overhead()];
+                            if let Err(e) = state.encrypt(&mut encrypted, &cleartext) {
+                                tracing::warn!(
+                                    "Failed to encrypt authenticated UDP ping response for {}: {:?}",
+                                    src_addr,
+                                    e
+                                );
+                                continue;
+                            }
+                            encrypted
                         };
                         let socket = server
                             .udp_socket_for_local_addr(local_addr)
@@ -1086,9 +1233,9 @@ impl Server {
                             tracing::warn!("no UDP socket available for ping reply");
                             continue;
                         };
-                        match socket.send_to(&reply, src_addr).await {
+                        match socket.send_to(&encrypted, src_addr).await {
                             Ok(sent) => tracing::trace!(
-                                "UDP ping reply sent to {}: {} bytes",
+                                "authenticated UDP ping reply sent to {}: {} bytes",
                                 src_addr,
                                 sent
                             ),
@@ -1189,6 +1336,15 @@ impl Server {
             .unwrap_or_else(default_server_id)
     }
 
+    fn udp_ping_status_server_id_for_port(&self, port: u16) -> String {
+        self.entrypoints
+            .read()
+            .udp_ping_status_server_id_by_port
+            .get(&port)
+            .cloned()
+            .unwrap_or_else(default_server_id)
+    }
+
     fn spawn_entrypoint_tasks_for_existing_bindings(
         self: &Arc<Box<Self>>,
         udp_in: &tokio::sync::mpsc::Sender<UdpPacket>,
@@ -1246,7 +1402,13 @@ impl Server {
         let default_port = self.entrypoints.read().default_port;
 
         let mut new_bindings = Vec::new();
-        for (address, server_id) in listen_specs {
+        let mut udp_ping_status_updates = Vec::new();
+        for spec in listen_specs {
+            let EntrypointListenSpec {
+                address,
+                server_id,
+                udp_ping_status_server_id,
+            } = spec;
             if address.port() == default_port {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1277,6 +1439,7 @@ impl Server {
                         )
                         .into());
                     }
+                    udp_ping_status_updates.push((address.port(), udp_ping_status_server_id));
                     continue;
                 }
             }
@@ -1306,16 +1469,31 @@ impl Server {
                 }
             }
 
-            new_bindings.push((server_id, Arc::new(listener), udp_socket, port));
+            new_bindings.push((
+                server_id,
+                udp_ping_status_server_id,
+                Arc::new(listener),
+                udp_socket,
+                port,
+            ));
         }
 
         {
             let mut entrypoints = self.entrypoints.write();
             entrypoints.server_id_by_sni = server_id_by_sni;
-            for (server_id, listener, udp_socket, port) in &new_bindings {
+            for (port, udp_ping_status_server_id) in udp_ping_status_updates {
+                entrypoints
+                    .udp_ping_status_server_id_by_port
+                    .insert(port, udp_ping_status_server_id);
+            }
+            for (server_id, udp_ping_status_server_id, listener, udp_socket, port) in &new_bindings
+            {
                 entrypoints
                     .server_id_by_port
                     .insert(*port, server_id.clone());
+                entrypoints
+                    .udp_ping_status_server_id_by_port
+                    .insert(*port, udp_ping_status_server_id.clone());
                 entrypoints
                     .udp_socket_by_port
                     .insert(*port, Arc::clone(udp_socket));
@@ -1326,7 +1504,7 @@ impl Server {
             }
         }
 
-        for (server_id, listener, udp_socket, port) in new_bindings {
+        for (server_id, _udp_ping_status_server_id, listener, udp_socket, port) in new_bindings {
             tracing::info!(
                 "config reload: added client entrypoint {} for server_id {}",
                 port,
@@ -1412,7 +1590,7 @@ impl Server {
                         };
                         if !server
                             .s2s_manager()
-                            .propose_channel_op_in_server(&server_id, op)
+                            .propose_channel_op(Some(&server_id), op)
                             .await
                         {
                             if let Err(e) = server
@@ -1462,7 +1640,7 @@ impl Server {
             Some(crate::web::signaling::ALPN_HTTP_1_1) => {
                 let web = self.read_config().web.clone();
                 crate::web::signaling::SignalingServer::new(web)
-                    .with_authenticator(Arc::clone(&self.authenticator))
+                    .with_authenticator(self.authenticator_arc())
                     .with_server(Arc::clone(self))
                     .with_provisional_server_id(server_id)
                     .handle_stream_with_peer(tls_stream, real_ip, remote_addr, local_addr)
@@ -1862,6 +2040,11 @@ impl Server {
     pub async fn reload_config(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
         match Config::reload() {
             Ok(Some(new_config)) => {
+                let prepared_authenticator = self
+                    .authenticator
+                    .prepare_wasm_reload(new_config.authenticator_wasm_path.as_deref())?;
+                let authenticator_reloaded = prepared_authenticator.is_some();
+
                 self.apply_entrypoint_config(&new_config).await?;
 
                 let mut current = self.config.write().expect("Config RwLock poisoned");
@@ -1883,6 +2066,13 @@ impl Server {
                         new_config.max_users
                     );
                     self.s2s_manager.update_max_users(new_config.max_users);
+                }
+                if current.authenticator_wasm_path != new_config.authenticator_wasm_path {
+                    tracing::info!(
+                        "config reload: authenticator_wasm_path {:?} -> {:?}",
+                        current.authenticator_wasm_path,
+                        new_config.authenticator_wasm_path
+                    );
                 }
                 if current.s2s.overlay.route_transit_messages
                     != new_config.s2s.overlay.route_transit_messages
@@ -1945,6 +2135,12 @@ impl Server {
                     tracing::info!("config reload: server_entrypoints changed");
                 }
                 *current = new_config;
+                drop(current);
+                self.authenticator
+                    .apply_prepared_reload(prepared_authenticator);
+                if authenticator_reloaded {
+                    tracing::info!("config reload: authenticator backend reloaded");
+                }
                 tracing::info!("config reload: successfully applied new configuration");
                 Ok(())
             }
@@ -2056,6 +2252,7 @@ impl Server {
     async fn build_ping_response(
         server: &Arc<Box<Self>>,
         ping: &crate::voice::ping::PingRequest,
+        status_server_id: &str,
     ) -> Result<Bytes, EncodeError> {
         // Snapshot config values before any .await (RwLockReadGuard is !Send)
         let (local_max_users, max_bandwidth, user_count_scope, server_version) = {
@@ -2070,7 +2267,7 @@ impl Server {
 
         let (user_count, max_user_count) = match user_count_scope {
             UdpPingUserCountScope::Cluster => {
-                let users = server.clients.len_in_server(DEFAULT_SERVER_ID).await;
+                let users = server.clients.len_in_server(status_server_id).await;
                 let max_users = server
                     .s2s_manager
                     .cluster_max_users()
@@ -2079,7 +2276,7 @@ impl Server {
                 (users as u64, max_users)
             }
             UdpPingUserCountScope::Local => {
-                let users = server.clients.local_len_in_server(DEFAULT_SERVER_ID).await;
+                let users = server.clients.local_len_in_server(status_server_id).await;
                 (users as u64, local_max_users)
             }
         };

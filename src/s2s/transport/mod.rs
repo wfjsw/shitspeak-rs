@@ -31,4 +31,6 @@ pub(crate) use metrics::{
     conversational_effective_delay_us, conversational_impairment, conversational_quality_score,
 };
 pub use metrics::{LinkMetrics, MetricsSnapshot};
-pub use service_level::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
+pub use service_level::{
+    MessageClass, PeerAddress, RoutingMetric, ServiceLevel, ServiceShape, TransportKind,
+};

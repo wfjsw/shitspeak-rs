@@ -1,0 +1,17 @@
+{
+  "options": {
+    "transform": ["json-as"]
+  },
+  "targets": {
+    "debug": {
+      "outFile": "build/auth.debug.wasm",
+      "debug": true
+    },
+    "release": {
+      "outFile": "build/auth.wasm",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "noAssert": true
+    }
+  }
+}

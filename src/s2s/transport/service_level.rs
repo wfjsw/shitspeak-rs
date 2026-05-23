@@ -25,6 +25,18 @@ impl ServiceLevel {
     }
 }
 
+/// Route-selection metric used in addition to [`ServiceLevel`].
+///
+/// The default preserves the per-service cost formulas. Upper layers can
+/// request a different metric when the payload has different quality needs,
+/// for example conversational voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RoutingMetric {
+    #[default]
+    PerServiceCost,
+    ConversationalQuality,
+}
+
 /// Wire transport flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TransportKind {
@@ -52,6 +64,21 @@ impl TransportKind {
             TransportKind::Tcp | TransportKind::Kcp | TransportKind::Quic
         )
     }
+
+    /// True when this transport is acceptable for a send at `requested`.
+    ///
+    /// This mirrors overlay routing fallback: best-effort traffic may ride
+    /// any live transport, reliable traffic never rides UDP, and
+    /// reliable-low-latency traffic can fall back to TCP when needed.
+    #[inline]
+    pub fn is_acceptable_for(self, requested: ServiceLevel) -> bool {
+        match requested {
+            ServiceLevel::BestEffort => true,
+            ServiceLevel::Reliable | ServiceLevel::ReliableLowLatency => {
+                self.service_level() != ServiceLevel::BestEffort
+            }
+        }
+    }
 }
 
 /// Receiver-side routing class. Picked by the sender; carried in the frame
@@ -60,6 +87,53 @@ impl TransportKind {
 pub enum MessageClass {
     HighPriority,
     Regular,
+}
+
+/// Application traffic shape used by active transport probes and topology
+/// reporting. These are workload shapes, not new reliability tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ServiceShape {
+    Voice,
+    Control,
+    Bulk,
+}
+
+impl ServiceShape {
+    pub const ALL: [Self; 3] = [Self::Voice, Self::Control, Self::Bulk];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Voice => "voice",
+            Self::Control => "control",
+            Self::Bulk => "bulk",
+        }
+    }
+
+    pub fn service_level(self) -> ServiceLevel {
+        match self {
+            Self::Voice => ServiceLevel::BestEffort,
+            Self::Control => ServiceLevel::ReliableLowLatency,
+            Self::Bulk => ServiceLevel::Reliable,
+        }
+    }
+
+    pub fn message_class(self) -> MessageClass {
+        match self {
+            Self::Voice | Self::Control => MessageClass::HighPriority,
+            Self::Bulk => MessageClass::Regular,
+        }
+    }
+
+    pub fn probe_payload_bytes(self, bulk_payload_bytes: usize) -> usize {
+        if bulk_payload_bytes == 0 {
+            return 0;
+        }
+        match self {
+            Self::Voice => 160.min(bulk_payload_bytes),
+            Self::Control => 1024.min(bulk_payload_bytes),
+            Self::Bulk => bulk_payload_bytes,
+        }
+    }
 }
 
 /// A peer address bound to a specific transport flavor.

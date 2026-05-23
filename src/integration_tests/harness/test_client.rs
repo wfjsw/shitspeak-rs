@@ -33,6 +33,7 @@ use crate::messages::encoder::{
 use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat};
+use crate::voice::ping::PingRequest;
 
 /// Build a Mumble-legacy client→server Opus voice packet.
 ///
@@ -848,6 +849,33 @@ impl TestClient {
         }
         socket.send_to(&encrypted, self.udp_server_addr).await?;
         Ok(())
+    }
+
+    /// Receive and decrypt the next UDP ping reply for this client.
+    pub async fn recv_udp_ping(&self, deadline: Duration) -> Option<PingRequest> {
+        let socket = self.udp.as_ref().expect("open_udp first").clone();
+        let crypt = self.crypt.as_ref().expect("crypt state").clone();
+
+        let res = timeout(deadline, async {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let (n, _src) = socket.recv_from(&mut buf).await.ok()?;
+                let mut decrypted = BytesMut::new();
+                {
+                    let mut state = crypt.lock();
+                    if state.decrypt(&mut decrypted, &buf[..n]).is_err() {
+                        continue;
+                    }
+                }
+                if let Ok(IncomingUdpPacket::Ping(ping)) =
+                    IncomingUdpPacket::decode(&decrypted, None)
+                {
+                    return Some(ping);
+                }
+            }
+        })
+        .await;
+        res.ok().flatten()
     }
 
     /// Encode an audio frame, OCB2-encrypt it, and send over UDP.

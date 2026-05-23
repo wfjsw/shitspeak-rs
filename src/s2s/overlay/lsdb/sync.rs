@@ -56,7 +56,13 @@ pub async fn send_request(
     match encode_message(&wrap(body)) {
         Ok(payload) => {
             if let Err(e) = transport
-                .send(dst, ServiceLevel::Reliable, MessageClass::Regular, payload)
+                .send(
+                    dst,
+                    ServiceLevel::Reliable,
+                    None,
+                    MessageClass::Regular,
+                    payload,
+                )
                 .await
             {
                 trace!(peer=%dst, error=%e, "lsdb sync send failed");
@@ -107,6 +113,7 @@ pub async fn handle_request(
             .send(
                 sender,
                 ServiceLevel::Reliable,
+                None,
                 MessageClass::Regular,
                 payload,
             )

@@ -12,20 +12,9 @@ use std::sync::Arc;
 use crate::s2s::transport::ServiceLevel;
 use crate::types::NodeIdentifier;
 
+pub use crate::s2s::transport::RoutingMetric;
 pub use dijkstra::RouteEntry;
 pub use recompute::spawn_recomputer;
-
-/// Route-selection metric used in addition to [`ServiceLevel`].
-///
-/// The default preserves the historical per-service cost formulas. Upper
-/// layers can request a different metric when the payload has different
-/// quality needs, for example conversational voice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum RoutingMetric {
-    #[default]
-    PerServiceCost,
-    ConversationalQuality,
-}
 
 /// One snapshot of all three service-level tables.
 #[derive(Default, Clone)]

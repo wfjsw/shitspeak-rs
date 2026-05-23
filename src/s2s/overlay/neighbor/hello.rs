@@ -77,7 +77,13 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
     };
     if let Err(e) = ctx
         .transport
-        .send(dst, ServiceLevel::Reliable, MessageClass::Regular, payload)
+        .send(
+            dst,
+            ServiceLevel::Reliable,
+            None,
+            MessageClass::Regular,
+            payload,
+        )
         .await
     {
         trace!(peer=%dst, error=%e, "hello send failed");
@@ -139,7 +145,13 @@ pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: p
     };
     if let Err(e) = ctx
         .transport
-        .send(from, ServiceLevel::Reliable, MessageClass::Regular, payload)
+        .send(
+            from,
+            ServiceLevel::Reliable,
+            None,
+            MessageClass::Regular,
+            payload,
+        )
         .await
     {
         trace!(peer=%from, error=%e, "hello_ack send failed");

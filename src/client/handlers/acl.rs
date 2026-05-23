@@ -210,7 +210,7 @@ pub async fn handle_acl(
         }
         if !server
             .s2s_manager()
-            .propose_channel_op_in_server(&server_id, op)
+            .propose_channel_op(Some(&server_id), op)
             .await
         {
             if let Err(e) = server

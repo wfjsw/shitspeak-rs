@@ -558,7 +558,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
                 }
                 _ => {
                     app.voice()
-                        .send_intent_broadcast(
+                        .send_broadcast(
                             u32::from(sender_id),
                             server_id.clone(),
                             target_kind,

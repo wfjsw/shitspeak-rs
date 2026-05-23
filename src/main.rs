@@ -7,7 +7,7 @@
     unused_assignments
 )]
 
-use crate::{config::Config, server::Server};
+use crate::{api::ReloadableAuthenticator, config::Config, server::Server};
 
 mod acl;
 mod api;
@@ -63,36 +63,6 @@ mod s2s_application_proto {
     include!(concat!(env!("OUT_DIR"), "/s2s_application.rs"));
 }
 
-/// Minimal no-op authenticator used when no external auth backend is wired up.
-struct NoopAuthenticator;
-
-#[async_trait::async_trait]
-impl api::Authenticator for NoopAuthenticator {
-    async fn authenticate(
-        &self,
-        username: &str,
-        _password: Option<&str>,
-        _auxiliary_data: &api::AuthenticateAuxiliaryData,
-    ) -> Result<api::AuthenticateResult, api::AuthenticationRejection> {
-        // Accept everyone with no user ID (guests only).
-        // Users with username "admin" get the "admin" group for superuser privileges.
-        let groups = if username == "admin" {
-            vec!["admin".to_owned()]
-        } else {
-            Vec::new()
-        };
-        Ok(api::AuthenticateResult {
-            user_id: None,
-            display_name: Some(username.to_owned()),
-            groups,
-            virtual_server_id: None,
-            language: localization::Language::default(),
-            texture_url: None,
-            comment_url: None,
-        })
-    }
-}
-
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -121,17 +91,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     crate::client::crypt::probe_gf128_backend();
 
     let config = Config::load();
-    let server = Server::new(config, NoopAuthenticator).await?;
-
-    // Shutdown signal: sending a value notifies all spawned tasks.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let authenticator =
+        ReloadableAuthenticator::from_wasm_path(config.authenticator_wasm_path.as_deref())?;
+    let server = Server::new_with_reloadable_authenticator(config, authenticator).await?;
 
     // Spawn the hot config reload watcher.
-    let _watcher = config_watcher::spawn_config_watcher(server.clone(), shutdown_rx.clone());
+    let _watcher = config_watcher::spawn_config_watcher(server.clone(), server.shutdown_receiver());
 
     // Graceful shutdown: wait for Ctrl-C while the server runs.  On Ctrl-C,
     // signal shutdown and then wait for Server::run to reach its cleanup path.
-    let server_run = server.run(shutdown_rx);
+    let server_run = server.run();
     tokio::pin!(server_run);
 
     tokio::select! {
@@ -146,7 +115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => tracing::info!("Received Ctrl-C, shutting down."),
                 Err(e) => tracing::error!("Failed to listen for Ctrl-C: {e}"),
             }
-            let _ = shutdown_tx.send(());
+            server.shutdown();
         }
     }
 

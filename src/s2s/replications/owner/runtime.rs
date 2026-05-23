@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -240,6 +240,7 @@ pub(crate) struct OwnerRuntime<R: OwnerReplicable> {
     pub net: Arc<dyn OwnerNet>,
     pub state: Mutex<OwnerState>,
     pub local_counter: AtomicU64,
+    pub weak_self: Mutex<Option<Weak<Self>>>,
     pub shutdown: CancellationToken,
     pub cfg: Arc<ReplicationConfig>,
 }
@@ -257,7 +258,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         // Seed local_counter from the repo's existing local_version (so a
         // restart with state already loaded continues monotonically).
         let initial = repo.local_version();
-        Arc::new(Self {
+        let arc = Arc::new(Self {
             repo,
             self_id,
             self_epoch,
@@ -265,9 +266,84 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             net,
             state: Mutex::new(OwnerState::new()),
             local_counter: AtomicU64::new(initial),
+            weak_self: Mutex::new(None),
             shutdown,
             cfg,
-        })
+        });
+        *arc.weak_self.lock() = Some(Arc::downgrade(&arc));
+        arc
+    }
+
+    pub fn start(self: &Arc<Self>) {
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            runtime.catchup_alive_members().await;
+        });
+    }
+
+    async fn catchup_alive_members(&self) {
+        let members = self.net.alive_members();
+        for origin in members {
+            if origin == self.self_id {
+                continue;
+            }
+            let known_epoch = self.known_epoch_for_origin(origin);
+            self.request_catchup(origin, known_epoch, None).await;
+        }
+    }
+
+    fn known_epoch_for_origin(&self, origin: NodeIdentifier) -> u64 {
+        self.net
+            .member_boot_epoch(origin)
+            .or_else(|| {
+                self.state
+                    .lock()
+                    .known
+                    .get(&origin)
+                    .map(|(epoch, _)| *epoch)
+            })
+            .unwrap_or(0)
+    }
+
+    async fn request_catchup(
+        &self,
+        origin: NodeIdentifier,
+        known_epoch: u64,
+        since_version: Option<u64>,
+    ) {
+        if origin == self.self_id {
+            return;
+        }
+        let should_send = {
+            let mut state = self.state.lock();
+            state.arm_catchup(origin, Instant::now(), self.cfg.owner_catchup_timeout())
+        };
+        if should_send {
+            self.send_catchup_req_since(origin, known_epoch, since_version)
+                .await;
+        }
+    }
+
+    fn clear_origin_tracking(&self, origin: NodeIdentifier) {
+        let mut state = self.state.lock();
+        state.known.remove(&origin);
+        state.pending_buffers.remove(&origin);
+        state.catchup_in_flight.remove(&origin);
+    }
+
+    async fn handle_origin_offline(&self, origin: NodeIdentifier) {
+        self.repo.remove_origin(origin).await;
+    }
+
+    async fn handle_origin_restarted(&self, origin: NodeIdentifier) {
+        let new_epoch = self.known_epoch_for_origin(origin);
+        self.repo.reset_origin(origin, new_epoch).await;
+        self.request_catchup(origin, new_epoch, Some(0)).await;
+    }
+
+    async fn handle_origin_joined(&self, origin: NodeIdentifier) {
+        let known_epoch = self.known_epoch_for_origin(origin);
+        self.request_catchup(origin, known_epoch, None).await;
     }
 
     /// Local-side propose. Broadcasts first, then applies locally — see
@@ -319,7 +395,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         self.process_remote_op(origin, op).await;
     }
 
-    async fn process_remote_op(&self, origin: NodeIdentifier, op: OwnerOp) {
+    pub(super) async fn process_remote_op(&self, origin: NodeIdentifier, op: OwnerOp) {
         // Classify and act.
         let classification = {
             let s = self.state.lock();
@@ -427,6 +503,15 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
     }
 
     async fn send_catchup_req(&self, origin: NodeIdentifier, known_epoch: u64) {
+        self.send_catchup_req_since(origin, known_epoch, None).await;
+    }
+
+    async fn send_catchup_req_since(
+        &self,
+        origin: NodeIdentifier,
+        known_epoch: u64,
+        since_version: Option<u64>,
+    ) {
         let alive = self.net.alive_members();
         // Prefer a non-origin alive peer; fall back to origin.
         let mut candidates: Vec<NodeIdentifier> = alive
@@ -445,10 +530,10 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             // No one to ask.
             return;
         };
-        let since = {
+        let since = since_version.unwrap_or_else(|| {
             let s = self.state.lock();
             s.known.get(&origin).map(|(_, v)| *v).unwrap_or(0)
-        };
+        });
         let req = OwnerCatchupReq {
             origin_node: origin as u32,
             src_node: self.self_id as u32,
@@ -474,26 +559,46 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         super::catchup::apply_response(self, resp).await
     }
 
-    /// Handle a membership event. The runtime cares about Restarted (clear
-    /// pending buffers, defer reset_origin to the next OwnerOp) and
-    /// Failed/Left (clear in-flight catchup state).
+    /// Handle a membership event. Offline removes transient owner state;
+    /// restart is treated as offline-online and catches up from version 0;
+    /// join proactively catches up pre-existing state.
     pub fn on_membership_event(&self, ev: &MembershipEvent) {
         match ev {
             MembershipEvent::Restarted(node) => {
-                let mut s = self.state.lock();
-                s.pending_buffers.remove(node);
-                s.catchup_in_flight.remove(node);
-                // We do NOT call reset_origin here — that's deferred until
-                // the first OwnerOp with the new epoch arrives. Keeps the
-                // network-driven and event-driven paths symmetric.
+                self.clear_origin_tracking(*node);
+                let weak = self.weak_self.lock().clone();
+                let node = *node;
+                if let Some(weak) = weak {
+                    tokio::spawn(async move {
+                        if let Some(runtime) = weak.upgrade() {
+                            runtime.handle_origin_restarted(node).await;
+                        }
+                    });
+                }
             }
             MembershipEvent::Failed(node) | MembershipEvent::Left(node) => {
-                let mut s = self.state.lock();
-                s.catchup_in_flight.remove(node);
-                // We retain `known[node]` so a re-join at the same epoch
-                // continues from the correct version.
+                self.clear_origin_tracking(*node);
+                let weak = self.weak_self.lock().clone();
+                let node = *node;
+                if let Some(weak) = weak {
+                    tokio::spawn(async move {
+                        if let Some(runtime) = weak.upgrade() {
+                            runtime.handle_origin_offline(node).await;
+                        }
+                    });
+                }
             }
-            MembershipEvent::Joined(_) => {}
+            MembershipEvent::Joined(node) => {
+                let weak = self.weak_self.lock().clone();
+                let node = *node;
+                if let Some(weak) = weak {
+                    tokio::spawn(async move {
+                        if let Some(runtime) = weak.upgrade() {
+                            runtime.handle_origin_joined(node).await;
+                        }
+                    });
+                }
+            }
         }
     }
 }

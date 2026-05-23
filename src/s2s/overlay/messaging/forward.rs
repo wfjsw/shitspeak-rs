@@ -233,7 +233,10 @@ async fn forward_pb(
                 continue;
             }
         };
-        match transport.send(next_hop, level, class, payload).await {
+        match transport
+            .send(next_hop, level, Some(routing_metric), class, payload)
+            .await
+        {
             Ok(()) => trace!(%next_hop, ?level, "forwarded"),
             Err(e) => {
                 if is_originator && first_err.is_none() {

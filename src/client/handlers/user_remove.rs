@@ -82,8 +82,8 @@ pub async fn handle_user_remove(
             };
             if let Err(e) = app
                 .moderation()
-                .dispatch_user_remove_in_server(
-                    &server_id,
+                .dispatch_user_remove(
+                    Some(&server_id),
                     sender.get_session_id(),
                     target_session,
                     patch,

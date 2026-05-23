@@ -3,11 +3,12 @@
 //! Spawns a background task that watches `config.toml` for changes and
 //! calls `Server::reload_config()` through the Tokio runtime when a write is detected.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::{EventKind, Watcher};
+use notify::{EventKind, RecommendedWatcher, Watcher};
 use tokio::sync::watch;
 
 use crate::server::Server;
@@ -46,20 +47,15 @@ pub fn spawn_config_watcher(
             }
         };
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let config_path = canonical.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
 
         let mut watcher =
             match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = res {
-                    // Only care about data changes (write, create)
                     match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(_) => {
-                            for p in &event.paths {
-                                if p.file_name().map_or(false, |n| n == "config.toml") {
-                                    let _ = tx.send(());
-                                    break;
-                                }
-                            }
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                            let _ = tx.send(event.paths);
                         }
                         _ => {}
                     }
@@ -72,10 +68,14 @@ pub fn spawn_config_watcher(
                 }
             };
 
-        if let Err(e) = watcher.watch(&parent, notify::RecursiveMode::NonRecursive) {
-            tracing::error!("config watcher: failed to watch directory: {e}");
-            return;
-        }
+        let mut watched_dirs = HashSet::new();
+        watch_directory(
+            &mut watcher,
+            &mut watched_dirs,
+            parent.clone(),
+            "config.toml",
+        );
+        watch_authenticator_directory(&mut watcher, &mut watched_dirs, &server);
 
         tracing::info!("config watcher: watching {} for changes", parent.display());
 
@@ -83,9 +83,13 @@ pub fn spawn_config_watcher(
         // filesystem to settle before reloading.
         loop {
             // Wait for the first event or shutdown.
+            let mut changed_paths = Vec::new();
             let received = loop {
                 match rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(()) => break true,
+                    Ok(paths) => {
+                        changed_paths.extend(paths);
+                        break true;
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break false,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
@@ -100,7 +104,9 @@ pub fn spawn_config_watcher(
             if received {
                 // Drain any additional events that arrive within 500ms
                 // (debounce window).
-                while rx.recv_timeout(Duration::from_millis(500)).is_ok() {}
+                while let Ok(paths) = rx.recv_timeout(Duration::from_millis(500)) {
+                    changed_paths.extend(paths);
+                }
             }
 
             // Check shutdown again after debounce.
@@ -109,12 +115,74 @@ pub fn spawn_config_watcher(
                 return;
             }
 
-            if received {
-                tracing::info!("config watcher: config.toml changed, reloading...");
+            let should_reload = changed_paths.iter().any(|changed| {
+                same_fileish(changed, &config_path)
+                    || server
+                        .authenticator_wasm_path()
+                        .as_deref()
+                        .is_some_and(|auth_path| same_fileish(changed, auth_path))
+            });
+
+            if received && should_reload {
+                tracing::info!("config watcher: auth/config change detected, reloading...");
                 if let Err(e) = runtime.block_on(server.reload_config()) {
                     tracing::error!("config watcher: reload failed: {e}");
                 }
+                watch_authenticator_directory(&mut watcher, &mut watched_dirs, &server);
             }
         }
     })
+}
+
+fn watch_authenticator_directory(
+    watcher: &mut RecommendedWatcher,
+    watched_dirs: &mut HashSet<PathBuf>,
+    server: &Arc<Box<Server>>,
+) {
+    if let Some(path) = server.authenticator_wasm_path() {
+        let normalized = normalize_path(&path);
+        let dir = normalized
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        watch_directory(
+            watcher,
+            watched_dirs,
+            normalize_path(&dir),
+            "WASM authenticator",
+        );
+    }
+}
+
+fn watch_directory(
+    watcher: &mut RecommendedWatcher,
+    watched_dirs: &mut HashSet<PathBuf>,
+    dir: PathBuf,
+    label: &str,
+) {
+    if !watched_dirs.insert(dir.clone()) {
+        return;
+    }
+    match watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+        Ok(()) => tracing::info!("config watcher: watching {} for {label}", dir.display()),
+        Err(e) => tracing::warn!(
+            "config watcher: failed to watch {} for {label}: {e}",
+            dir.display()
+        ),
+    }
+}
+
+fn same_fileish(a: &Path, b: &Path) -> bool {
+    normalize_path(a) == normalize_path(b)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    absolute.canonicalize().unwrap_or(absolute)
 }

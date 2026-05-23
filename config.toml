@@ -20,6 +20,11 @@ allowed_proxies = []
 min_client_version = 0
 max_users = 100
 
+# Authentication backend. Omit this to use the built-in demo authenticator.
+# The configured WASM file is loaded at startup and hot-reloaded when the file
+# or config.toml changes.
+# authenticator_wasm_path = "auth.wasm"
+
 # Mumble standard
 welcome_text = "Welcome to ShitSpeak test server!"
 max_bandwidth = 72000
@@ -35,6 +40,8 @@ hide_users_without_traverse = false
 udp_voice_enabled = true
 udp_ping_enabled = true
 # cluster = clusterwide user count and summed cluster max_users; local = this node only
+# Per-port virtual-server UDP ping status can be overridden with
+# [[server_entrypoints]].udp_ping_status_server_id; otherwise a listen entrypoint reports its server_id.
 udp_ping_user_count_scope = "cluster"
 udp_channel_size = 2048
 

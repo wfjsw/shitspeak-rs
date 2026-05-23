@@ -126,6 +126,7 @@ impl Endpoint for QuicEndpoint {
                 &inner,
                 peer_node,
                 TransportKind::Quic,
+                Some(addr),
                 true,
                 BiStream { send, recv },
             );
@@ -171,6 +172,7 @@ impl Endpoint for QuicEndpoint {
                 &inner,
                 peer_node,
                 TransportKind::Quic,
+                Some(addr),
                 true,
                 BiStream { send, recv },
             );
@@ -188,12 +190,26 @@ async fn accept_loop(ep: Arc<QuicEndpoint>, inner: Arc<ManagerInner>) {
                 let inner_c = inner.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_incoming(inner_c, incoming).await {
-                        warn!(error=%e, "quic inbound failed");
+                        if is_peer_closed_quic_inbound(&e) {
+                            debug!(error=%e, "quic inbound closed by peer during setup");
+                        } else {
+                            warn!(error=%e, "quic inbound failed");
+                        }
                     }
                 });
             }
         }
     }
+}
+
+fn is_peer_closed_quic_inbound(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+    ) || error.to_string().contains("closed by peer")
 }
 
 async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) -> io::Result<()> {
@@ -227,6 +243,7 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
         &inner,
         peer_node,
         TransportKind::Quic,
+        Some(remote_addr),
         false,
         BiStream { send, recv },
     );

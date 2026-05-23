@@ -7,12 +7,12 @@
 //! drives the handshake; for outbound dials we open a fresh ephemeral UDP
 //! socket per peer and run the DTLS client side over it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use dtls::conn::DTLSConn;
@@ -35,7 +35,7 @@ use super::super::dtls_config::{
 use super::super::frame::{build_frame, FrameType};
 use super::super::identity::NodeIdentity;
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
-use super::super::service_level::{MessageClass, ServiceLevel, TransportKind};
+use super::super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
 use super::Endpoint;
 
 /// UDP+DTLS endpoint. Owns the loaded `NodeIdentity` (used to build server
@@ -175,12 +175,20 @@ async fn accept_loop(
                         });
                     }
                     Err(e) => {
-                        warn!(error=?e, "udp dtls accept failed");
+                        if is_peer_closed_dtls_accept(&e) {
+                            debug!(error=?e, "udp dtls accept closed by peer during handshake");
+                        } else {
+                            warn!(error=?e, "udp dtls accept failed");
+                        }
                     }
                 }
             }
         }
     }
+}
+
+fn is_peer_closed_dtls_accept(error: &impl std::fmt::Debug) -> bool {
+    format!("{error:?}").contains("ErrAlertFatalOrClose")
 }
 
 async fn handle_inbound(
@@ -219,9 +227,10 @@ fn install_session(
         peer.clone(),
         inner.clone(),
         inner.inbound().clone(),
+        peer_addr,
         is_dialer,
     );
-    if let Err(rejected) = peer.try_install_stream(inner.self_id(), is_dialer, active) {
+    if let Err(rejected) = peer.try_install_stream(active) {
         rejected.cancel();
     }
 }
@@ -231,6 +240,7 @@ fn spawn_dtls_pump(
     peer: Arc<PeerState>,
     inner: Arc<ManagerInner>,
     inbound: InboundDispatch,
+    peer_addr: SocketAddr,
     is_dialer: bool,
 ) -> ActiveStream {
     let (tx, rx) = mpsc::channel::<OutboundFrame>(inner.cfg().outbound_capacity());
@@ -263,7 +273,7 @@ fn spawn_dtls_pump(
         });
     }
 
-    ActiveStream::new(TransportKind::Udp, tx, closed, is_dialer)
+    ActiveStream::new(TransportKind::Udp, Some(peer_addr), tx, closed, is_dialer)
 }
 
 async fn run_read(
@@ -365,9 +375,14 @@ async fn run_write(
                     now_us(),
                     out.payload().clone(),
                 );
-                if let Err(e) = send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
-                    warn!(peer=%peer.node_id(), error=%e, "udp dtls write failed");
-                    break;
+                match send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
+                    Ok(_) => peer
+                        .metrics()
+                        .record_payload_sent(TransportKind::Udp, out.payload().len()),
+                    Err(e) => {
+                        warn!(peer=%peer.node_id(), error=%e, "udp dtls write failed");
+                        break;
+                    }
                 }
             }
 
@@ -379,23 +394,35 @@ async fn run_write(
                     peer.next_seq(), ts, Bytes::new(),
                 );
                 match send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
-                    Ok(sent) => pending.lock().insert(ts, sent),
+                    Ok(_) => pending.lock().insert(ts, None, 0),
                     Err(e) => { warn!(peer=%peer.node_id(), error=%e, "udp dtls keepalive failed"); break; }
                 }
             }
 
             _ = probe_tick.tick() => {
-                if let Err(e) = send_probe_burst(
-                    &conn,
-                    &peer,
-                    inner.self_id(),
-                    level,
-                    inner.cfg().bandwidth_probe_size(),
-                    inner.cfg().udp_mtu(),
-                    &pending,
-                ).await {
-                    warn!(peer=%peer.node_id(), error=%e, "udp dtls probe failed");
-                    break;
+                let mut ts = now_us();
+                for shape in ServiceShape::ALL {
+                    match send_service_probe(
+                        &conn,
+                        &peer,
+                        inner.self_id(),
+                        shape,
+                        inner.cfg().service_probe_payload_size(shape),
+                        inner.cfg().udp_mtu(),
+                        ts,
+                    ).await {
+                        Ok(true) => pending.lock().insert(
+                            ts,
+                            Some(shape),
+                            inner.cfg().service_probe_payload_size(shape),
+                        ),
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(peer=%peer.node_id(), service=%shape.name(), error=%e, "udp dtls probe failed");
+                            break;
+                        }
+                    }
+                    ts = ts.saturating_add(1);
                 }
             }
         }
@@ -442,65 +469,41 @@ async fn send_datagram(
     Ok(n)
 }
 
-async fn send_probe_burst(
+async fn send_service_probe(
     conn: &Arc<dyn UtilConn + Send + Sync>,
     peer: &PeerState,
     local_id: NodeIdentifier,
-    level: ServiceLevel,
-    target_payload_bytes: usize,
+    shape: ServiceShape,
+    payload_bytes: usize,
     udp_mtu: usize,
-    pending: &Arc<parking_lot::Mutex<PendingPings>>,
-) -> io::Result<()> {
-    let max_payload = udp_mtu.saturating_sub(128);
-    if target_payload_bytes == 0 || max_payload == 0 {
-        return Ok(());
+    ts: u64,
+) -> io::Result<bool> {
+    if payload_bytes == 0 {
+        return Ok(false);
     }
-
-    let burst_id = now_us();
-    let mut remaining = target_payload_bytes;
-    let mut sent_total = 0usize;
-    let mut packets = Vec::new();
-    let mut next_ts = burst_id;
-
-    while remaining > 0 {
-        let payload_len = remaining.min(max_payload);
-        let ts = next_ts;
-        next_ts = next_ts.saturating_add(1);
-        let payload = bytes::BytesMut::zeroed(payload_len).freeze();
-        let frame = build_frame(
-            local_id,
-            peer.node_id(),
-            level,
-            FrameType::Ping,
-            MessageClass::Regular,
-            peer.next_seq(),
-            ts,
-            payload,
-        );
-        let buf = encode_frame_datagram(&frame, udp_mtu)?;
-        sent_total += buf.len();
-        packets.push((ts, buf));
-        remaining -= payload_len;
-    }
-
-    let started_at = Instant::now();
-    {
-        let mut g = pending.lock();
-        g.insert_burst(burst_id, started_at, sent_total, packets.len());
-        for (ts, _) in &packets {
-            g.insert_burst_packet(*ts, burst_id);
-        }
-    }
-
-    for (_, buf) in packets {
-        send_datagram(conn, &buf, peer).await?;
-    }
-    Ok(())
+    let payload = bytes::BytesMut::zeroed(payload_bytes).freeze();
+    let frame = build_frame(
+        local_id,
+        peer.node_id(),
+        shape.service_level(),
+        FrameType::Ping,
+        shape.message_class(),
+        peer.next_seq(),
+        ts,
+        payload,
+    );
+    let buf = match encode_frame_datagram(&frame, udp_mtu) {
+        Ok(buf) => buf,
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    send_datagram(conn, &buf, peer).await?;
+    Ok(true)
 }
 
 async fn handle_frame(
     frame: pb::Frame,
-    incoming_wire_size: usize,
+    _incoming_wire_size: usize,
     conn: &Arc<dyn UtilConn + Send + Sync>,
     local_id: NodeIdentifier,
     peer: &PeerState,
@@ -517,6 +520,8 @@ async fn handle_frame(
             let class = pb::MessageClass::try_from(frame.message_class)
                 .map(MessageClass::from)
                 .unwrap_or(MessageClass::Regular);
+            peer.metrics()
+                .record_payload_recv(TransportKind::Udp, frame.payload.len());
             inbound.dispatch(InboundMessage::new(
                 peer.node_id(),
                 level,
@@ -551,19 +556,15 @@ async fn handle_frame(
             if now > frame.ts_us {
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(TransportKind::Udp, rtt);
-                match pending.lock().take(frame.ts_us, incoming_wire_size) {
-                    Some(ProbeObservation::Single { bytes }) => {
-                        if bytes >= 256 {
-                            peer.metrics().record_probe(TransportKind::Udp, bytes, rtt);
-                        }
+                if let Some(pending) = pending.lock().take(frame.ts_us) {
+                    if let Some(shape) = pending.shape {
+                        peer.metrics().record_probe(
+                            TransportKind::Udp,
+                            shape,
+                            pending.payload_bytes,
+                            rtt,
+                        );
                     }
-                    Some(ProbeObservation::BurstComplete { bytes, elapsed }) => {
-                        if bytes >= 256 {
-                            peer.metrics()
-                                .record_probe(TransportKind::Udp, bytes, elapsed);
-                        }
-                    }
-                    None => {}
                 }
             }
         }
@@ -582,115 +583,59 @@ async fn handle_frame(
 
 struct PendingPings {
     inner: VecDeque<(u64, PendingPing)>,
-    bursts: HashMap<u64, PendingProbeBurst>,
     cap: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingPing {
-    Single { sent: usize },
-    Burst { burst_id: u64 },
-}
-
-struct PendingProbeBurst {
-    started_at: Instant,
-    sent_bytes: usize,
-    recv_bytes: usize,
-    remaining: usize,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ProbeObservation {
-    Single { bytes: usize },
-    BurstComplete { bytes: usize, elapsed: Duration },
+    Probe {
+        shape: Option<ServiceShape>,
+        payload_bytes: usize,
+    },
 }
 
 impl PendingPings {
     fn new(cap: usize) -> Self {
         Self {
             inner: VecDeque::with_capacity(cap),
-            bursts: HashMap::new(),
             cap,
         }
     }
 
-    fn insert(&mut self, ts: u64, sent: usize) {
-        self.insert_entry(ts, PendingPing::Single { sent });
-    }
-
-    fn insert_burst(
-        &mut self,
-        burst_id: u64,
-        started_at: Instant,
-        sent_bytes: usize,
-        expected_replies: usize,
-    ) {
-        if expected_replies == 0 {
-            return;
-        }
-        self.bursts.insert(
-            burst_id,
-            PendingProbeBurst {
-                started_at,
-                sent_bytes,
-                recv_bytes: 0,
-                remaining: expected_replies,
-            },
-        );
-    }
-
-    fn insert_burst_packet(&mut self, ts: u64, burst_id: u64) {
-        self.insert_entry(ts, PendingPing::Burst { burst_id });
-    }
-
-    fn insert_entry(&mut self, ts: u64, ping: PendingPing) {
+    fn insert(&mut self, ts: u64, shape: Option<ServiceShape>, payload_bytes: usize) {
         if self.cap == 0 {
             return;
         }
         if self.inner.len() >= self.cap {
-            if let Some((_, evicted)) = self.inner.pop_front() {
-                self.drop_entry(evicted);
-            }
+            self.inner.pop_front();
         }
-        self.inner.push_back((ts, ping));
+        self.inner.push_back((
+            ts,
+            PendingPing::Probe {
+                shape,
+                payload_bytes,
+            },
+        ));
     }
 
-    fn take(&mut self, ts: u64, incoming_wire_size: usize) -> Option<ProbeObservation> {
+    fn take(&mut self, ts: u64) -> Option<PendingProbe> {
         let pos = self.inner.iter().position(|(t, _)| *t == ts)?;
         match self.inner.remove(pos).map(|(_, ping)| ping)? {
-            PendingPing::Single { sent } => Some(ProbeObservation::Single {
-                bytes: sent + incoming_wire_size,
+            PendingPing::Probe {
+                shape,
+                payload_bytes,
+            } => Some(PendingProbe {
+                shape,
+                payload_bytes,
             }),
-            PendingPing::Burst { burst_id } => {
-                let burst = self.bursts.get_mut(&burst_id)?;
-                burst.recv_bytes += incoming_wire_size;
-                burst.remaining = burst.remaining.saturating_sub(1);
-                if burst.remaining == 0 {
-                    let burst = self.bursts.remove(&burst_id)?;
-                    Some(ProbeObservation::BurstComplete {
-                        bytes: burst.sent_bytes + burst.recv_bytes,
-                        elapsed: burst.started_at.elapsed().max(Duration::from_micros(1)),
-                    })
-                } else {
-                    None
-                }
-            }
         }
     }
+}
 
-    fn drop_entry(&mut self, ping: PendingPing) {
-        if let PendingPing::Burst { burst_id } = ping {
-            let remove_burst = match self.bursts.get_mut(&burst_id) {
-                Some(burst) => {
-                    burst.remaining = burst.remaining.saturating_sub(1);
-                    burst.remaining == 0
-                }
-                None => false,
-            };
-            if remove_burst {
-                self.bursts.remove(&burst_id);
-            }
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingProbe {
+    shape: Option<ServiceShape>,
+    payload_bytes: usize,
 }
 
 enum MaybeInterval {
@@ -730,32 +675,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_single_reports_round_trip_bytes() {
+    fn pending_probe_reports_service_shape_and_payload_bytes() {
         let mut pending = PendingPings::new(8);
-        pending.insert(7, 100);
+        pending.insert(7, Some(ServiceShape::Voice), 160);
 
         assert_eq!(
-            pending.take(7, 50),
-            Some(ProbeObservation::Single { bytes: 150 })
+            pending.take(7),
+            Some(PendingProbe {
+                shape: Some(ServiceShape::Voice),
+                payload_bytes: 160
+            })
         );
-        assert_eq!(pending.take(7, 50), None);
+        assert_eq!(pending.take(7), None);
     }
 
     #[test]
-    fn pending_burst_reports_one_aggregate_sample() {
+    fn pending_latency_ping_has_no_service_shape() {
         let mut pending = PendingPings::new(8);
-        pending.insert_burst(42, Instant::now(), 300, 2);
-        pending.insert_burst_packet(10, 42);
-        pending.insert_burst_packet(11, 42);
+        pending.insert(7, None, 0);
 
-        assert_eq!(pending.take(10, 100), None);
-
-        match pending.take(11, 100) {
-            Some(ProbeObservation::BurstComplete { bytes, elapsed }) => {
-                assert_eq!(bytes, 500);
-                assert!(elapsed >= Duration::from_micros(1));
-            }
-            other => panic!("unexpected observation: {other:?}"),
-        }
+        assert_eq!(
+            pending.take(7),
+            Some(PendingProbe {
+                shape: None,
+                payload_bytes: 0
+            })
+        );
     }
 }

@@ -1,4 +1,12 @@
 /target
+examples/wasm-auth-rust/target/
+examples/wasm-auth-assemblyscript/build/
+examples/wasm-auth-assemblyscript/node_modules/
+examples/docker-compose-16node/nodes
+examples/docker-compose-16node/image
+examples/docker-compose-16node/shared
+examples/docker-compose-16node/manifest.json
+examples/docker-compose-16node/compose.yaml
 # Generated test certificates
 cert.pem
 key.pem
@@ -9,3 +17,4 @@ log/
 data/
 .claude/settings.local.json
 deploy/
+

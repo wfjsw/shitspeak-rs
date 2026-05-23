@@ -9,15 +9,16 @@
 //!   * decodes incoming length-prefixed frames, dispatches `Data` to the
 //!     appropriate inbound mpsc, generates `Pong` for `Ping` (echoing the
 //!     ping's payload back so bandwidth probes round-trip enough bytes),
-//!     and updates RTT + jitter + probe-throughput metrics for `Pong`;
+//!     and updates RTT + jitter + probe-goodput metrics for `Pong`;
 //!   * periodically issues two kinds of self-driven Pings:
 //!       - a small Ping every `ping_interval` for latency / jitter;
-//!       - a probe Ping with `bandwidth_probe_size` bytes every
+//!       - service-shaped probe Pings derived from `bandwidth_probe_size` every
 //!         `bandwidth_probe_interval` for throughput estimation;
 //!   * exits on EOF, write error, or `closed` cancellation.
 
 use std::collections::VecDeque;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,7 +38,7 @@ use crate::types::NodeIdentifier;
 use super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::frame::{build_frame, stream_codec, FrameType};
 use super::manager::InboundDispatch;
-use super::service_level::{MessageClass, ServiceLevel, TransportKind};
+use super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
 
 /// Tunables for a single stream pump. Cloned per stream.
 #[derive(Clone)]
@@ -90,6 +91,7 @@ pub(crate) fn spawn_stream_pump<S>(
     cfg: StreamPumpConfig,
     peer: Arc<PeerState>,
     inbound: InboundDispatch,
+    remote_addr: Option<SocketAddr>,
     is_dialer: bool,
 ) -> ActiveStream
 where
@@ -98,7 +100,7 @@ where
     let (tx, rx) = mpsc::channel::<OutboundFrame>(cfg.outbound_capacity);
     let closed = CancellationToken::new();
 
-    let active = ActiveStream::new(cfg.transport, tx, closed.clone(), is_dialer);
+    let active = ActiveStream::new(cfg.transport, remote_addr, tx, closed.clone(), is_dialer);
 
     tokio::spawn(run_pump(stream, cfg, peer, inbound, rx, closed));
 
@@ -107,8 +109,14 @@ where
 
 /// In-flight ping bookkeeping.
 struct PendingPings {
-    inner: VecDeque<(u64, usize)>, // (ts_us, encoded sent bytes)
+    inner: VecDeque<(u64, PendingPing)>,
     cap: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingPing {
+    shape: Option<ServiceShape>,
+    payload_bytes: usize,
 }
 
 impl PendingPings {
@@ -118,15 +126,21 @@ impl PendingPings {
             cap,
         }
     }
-    fn insert(&mut self, ts_us: u64, sent: usize) {
+    fn insert(&mut self, ts_us: u64, shape: Option<ServiceShape>, payload_bytes: usize) {
         if self.inner.len() >= self.cap {
             self.inner.pop_front();
         }
-        self.inner.push_back((ts_us, sent));
+        self.inner.push_back((
+            ts_us,
+            PendingPing {
+                shape,
+                payload_bytes,
+            },
+        ));
     }
-    fn take(&mut self, ts_us: u64) -> Option<usize> {
+    fn take(&mut self, ts_us: u64) -> Option<PendingPing> {
         let pos = self.inner.iter().position(|(t, _)| *t == ts_us)?;
-        self.inner.remove(pos).map(|(_, b)| b)
+        self.inner.remove(pos).map(|(_, pending)| pending)
     }
 }
 
@@ -167,6 +181,16 @@ fn is_tls_close_notify_eof(error: &io::Error) -> bool {
             .contains("without sending TLS close_notify")
 }
 
+fn is_peer_closed_initial_write(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 async fn run_pump<S>(
     stream: S,
     cfg: StreamPumpConfig,
@@ -200,7 +224,11 @@ async fn run_pump<S>(
         Bytes::new(),
     );
     if let Err(e) = encode_and_send(&mut framed, &hello, cfg.transport, &peer).await {
-        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "hello write failed");
+        if is_peer_closed_initial_write(&e) {
+            debug!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "hello write closed by peer");
+        } else {
+            warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "hello write failed");
+        }
         closed.cancel();
         return;
     }
@@ -264,9 +292,14 @@ async fn run_pump<S>(
                     now_us(),
                     out.payload().clone(),
                 );
-                if let Err(e) = encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
-                    warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream write failed");
-                    break;
+                match encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
+                    Ok(()) => peer
+                        .metrics()
+                        .record_payload_sent(cfg.transport, out.payload().len()),
+                    Err(e) => {
+                        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream write failed");
+                        break;
+                    }
                 }
             }
 
@@ -283,7 +316,7 @@ async fn run_pump<S>(
                     Bytes::new(),
                 );
                 match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
-                    Ok(sent) => pending.insert(ts, sent),
+                    Ok(_) => pending.insert(ts, None, 0),
                     Err(e) => {
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "keepalive write failed");
                         break;
@@ -292,24 +325,34 @@ async fn run_pump<S>(
             }
 
             _ = probe_tick.tick() => {
-                let ts = now_us();
-                let payload = BytesMut::zeroed(cfg.bandwidth_probe_size).freeze();
-                let frame = build_frame(
-                    cfg.local_node,
-                    cfg.peer_node,
-                    level_for_metrics,
-                    FrameType::Ping,
-                    MessageClass::Regular,
-                    peer.next_seq(),
-                    ts,
-                    payload,
-                );
-                match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
-                    Ok(sent) => pending.insert(ts, sent),
-                    Err(e) => {
-                        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "probe write failed");
-                        break;
+                let mut ts = now_us();
+                for shape in ServiceShape::ALL {
+                    let payload_bytes = shape.probe_payload_bytes(cfg.bandwidth_probe_size);
+                    if payload_bytes == 0 {
+                        continue;
                     }
+                    let payload = BytesMut::zeroed(payload_bytes).freeze();
+                    let frame = build_frame(
+                        cfg.local_node,
+                        cfg.peer_node,
+                        shape.service_level(),
+                        FrameType::Ping,
+                        shape.message_class(),
+                        peer.next_seq(),
+                        ts,
+                        payload,
+                    );
+                    if frame.encoded_len() > cfg.max_frame_bytes {
+                        continue;
+                    }
+                    match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
+                        Ok(_) => pending.insert(ts, Some(shape), payload_bytes),
+                        Err(e) => {
+                            warn!(peer=%peer.node_id(), transport=?cfg.transport, service=%shape.name(), error=%e, "probe write failed");
+                            break;
+                        }
+                    }
+                    ts = ts.saturating_add(1);
                 }
             }
         }
@@ -353,7 +396,7 @@ where
 
 async fn handle_inbound<S>(
     frame: pb::Frame,
-    incoming_wire_size: usize,
+    _incoming_wire_size: usize,
     cfg: &StreamPumpConfig,
     peer: &PeerState,
     inbound: &InboundDispatch,
@@ -373,6 +416,8 @@ where
             let class = pb::MessageClass::try_from(frame.message_class)
                 .map(MessageClass::from)
                 .unwrap_or(MessageClass::Regular);
+            peer.metrics()
+                .record_payload_recv(cfg.transport, frame.payload.len());
             inbound.dispatch(super::manager::InboundMessage::new(
                 cfg.peer_node,
                 level,
@@ -404,14 +449,14 @@ where
             if now > frame.ts_us {
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(cfg.transport, rtt);
-                if let Some(sent_size) = pending.take(frame.ts_us) {
-                    let total_bytes = sent_size + incoming_wire_size;
-                    // Only feed the probe-throughput EWMA when the round
-                    // trip is large enough to be informative — small pings
-                    // would dominate the EWMA toward an overly-low estimate.
-                    let min_meaningful = cfg.bandwidth_probe_size.max(256);
-                    if total_bytes >= min_meaningful {
-                        peer.metrics().record_probe(cfg.transport, total_bytes, rtt);
+                if let Some(pending) = pending.take(frame.ts_us) {
+                    if let Some(shape) = pending.shape {
+                        peer.metrics().record_probe(
+                            cfg.transport,
+                            shape,
+                            pending.payload_bytes,
+                            rtt,
+                        );
                     }
                 }
             }

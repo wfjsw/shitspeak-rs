@@ -7,7 +7,7 @@ use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
-use super::super::proto::{CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp};
+use super::super::proto::{CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp};
 use super::runtime::OwnerRuntime;
 use super::{LogSlice, OwnerReplicable};
 use crate::types::NodeIdentifier;
@@ -115,58 +115,72 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
     };
     let resp_epoch = resp.origin_epoch;
 
-    // If the response carries a snapshot, install it (and consider this a
-    // fresh epoch root if it advances ours).
-    if resp.too_old_use_snapshot && !resp.snapshot_msgpack.is_empty() {
-        rt.repo
-            .install_snapshot_for_origin(
-                origin,
-                resp_epoch,
-                resp.snapshot_version,
-                resp.snapshot_msgpack,
-            )
-            .await;
-        let mut s = rt.state.lock();
-        s.known.insert(origin, (resp_epoch, resp.snapshot_version));
-        // Wipe pending under the new epoch root.
-        s.pending_buffers.remove(&origin);
+    let previous_epoch = {
+        let s = rt.state.lock();
+        s.known.get(&origin).map(|(epoch, _)| *epoch)
+    };
+    if previous_epoch
+        .map(|known_epoch| resp_epoch < known_epoch)
+        .unwrap_or(false)
+    {
+        return;
     }
 
-    // If the responder reports a higher epoch than we have, treat that as
-    // a network-driven epoch reset (same path as Classification::Reset).
-    let needs_reset = {
-        let s = rt.state.lock();
-        match s.known.get(&origin) {
-            Some((e, _)) => resp_epoch > *e,
-            None => true,
-        }
-    };
-    if needs_reset && !resp.too_old_use_snapshot {
+    let needs_restart_reset = previous_epoch
+        .map(|known_epoch| resp_epoch > known_epoch)
+        .unwrap_or(false);
+    if needs_restart_reset {
         rt.repo.reset_origin(origin, resp_epoch).await;
         let mut s = rt.state.lock();
         s.known.insert(origin, (resp_epoch, 0));
         s.pending_buffers.remove(&origin);
     }
 
-    for cop in resp.ops {
-        let typed: R::Op = match rmp_serde::from_slice(&cop.op_msgpack) {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error=%e, "owner catchup op decode failed; aborting chunk");
-                return;
+    // If the response carries a snapshot, install it (and consider this a
+    // fresh epoch root if it advances ours).
+    if resp.too_old_use_snapshot && !resp.snapshot_msgpack.is_empty() {
+        let should_install = {
+            let s = rt.state.lock();
+            match s.known.get(&origin).copied() {
+                Some((known_epoch, _)) if known_epoch > resp_epoch => false,
+                Some((known_epoch, known_version)) if known_epoch == resp_epoch => {
+                    known_version < resp.snapshot_version
+                }
+                _ => true,
             }
         };
-        rt.repo
-            .apply_remote(origin, resp_epoch, cop.version, typed)
-            .await;
-        let mut s = rt.state.lock();
-        s.known.insert(origin, (resp_epoch, cop.version));
+        if should_install {
+            rt.repo
+                .install_snapshot_for_origin(
+                    origin,
+                    resp_epoch,
+                    resp.snapshot_version,
+                    resp.snapshot_msgpack,
+                )
+                .await;
+            let mut s = rt.state.lock();
+            s.known.insert(origin, (resp_epoch, resp.snapshot_version));
+            // Wipe pending under the new epoch root.
+            s.pending_buffers.remove(&origin);
+        }
     }
 
-    // Clear catchup-in-flight unless we're going to immediately re-fire.
     {
         let mut s = rt.state.lock();
         s.catchup_in_flight.remove(&origin);
+    }
+
+    for cop in resp.ops {
+        rt.process_remote_op(
+            origin,
+            OwnerOp {
+                origin_node: origin as u32,
+                origin_epoch: resp_epoch,
+                origin_version: cop.version,
+                op_msgpack: cop.op_msgpack,
+            },
+        )
+        .await;
     }
 
     if resp.has_more {

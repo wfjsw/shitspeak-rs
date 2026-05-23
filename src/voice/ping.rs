@@ -1,7 +1,7 @@
 //! UDP ping packet encoding/decoding — supports both legacy (pre-1.5.0)
 //! and protobuf (1.5.0+) formats.
 
-use bytes::{BufMut as _, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use prost::EncodeError;
 
 use crate::messages::encoder::UdpPing;
@@ -100,6 +100,59 @@ impl PingRequest {
             format: PacketFormat::Legacy,
         })
     }
+
+    /// Encode the authenticated UDP ping echo used on the encrypted voice socket.
+    pub fn encode_authenticated_echo(&self) -> Result<Bytes, EncodeError> {
+        Ok(match self.format {
+            PacketFormat::Protobuf => {
+                let ping = UdpPing {
+                    timestamp: self.timestamp,
+                    ..UdpPing::default()
+                };
+                let mut buf = BytesMut::with_capacity(1 + ping.encoded_len());
+                buf.put_u8(0x01);
+                ping.encode(&mut buf)?;
+                buf.freeze()
+            }
+            PacketFormat::Legacy => {
+                let mut buf = BytesMut::with_capacity(1 + legacy_varint_len(self.timestamp));
+                buf.put_u8(0x20);
+                write_legacy_varint(&mut buf, self.timestamp);
+                buf.freeze()
+            }
+        })
+    }
+}
+
+fn legacy_varint_len(value: u64) -> usize {
+    if value <= 0x7F {
+        1
+    } else if value <= 0x3FFF {
+        2
+    } else if value <= 0x1F_FFFF {
+        3
+    } else {
+        4
+    }
+}
+
+fn write_legacy_varint(buf: &mut impl BufMut, value: u64) {
+    if value <= 0x7F {
+        buf.put_u8(value as u8);
+    } else if value <= 0x3FFF {
+        buf.put_u8(0x80 | (value >> 8) as u8);
+        buf.put_u8((value & 0xFF) as u8);
+    } else if value <= 0x1F_FFFF {
+        buf.put_u8(0xC0 | (value >> 16) as u8);
+        buf.put_u8(((value >> 8) & 0xFF) as u8);
+        buf.put_u8((value & 0xFF) as u8);
+    } else {
+        let value = value.min(0x0FFF_FFFF);
+        buf.put_u8(0xE0 | (value >> 24) as u8);
+        buf.put_u8(((value >> 16) & 0xFF) as u8);
+        buf.put_u8(((value >> 8) & 0xFF) as u8);
+        buf.put_u8((value & 0xFF) as u8);
+    }
 }
 
 impl PingResponse {
@@ -144,5 +197,49 @@ impl PingResponse {
         buf.put_u32(self.max_user_count.unwrap_or(u32::MAX));
         buf.put_u32(self.max_bandwidth_per_user);
         buf.freeze()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::voice::codec::IncomingUdpPacket;
+
+    #[test]
+    fn authenticated_legacy_echo_decodes_as_ping() {
+        let request = PingRequest {
+            timestamp: 300,
+            request_extended_information: false,
+            format: PacketFormat::Legacy,
+        };
+
+        let encoded = request.encode_authenticated_echo().expect("encode echo");
+        assert_eq!(encoded[0], 0x20);
+
+        let packet = IncomingUdpPacket::decode(&encoded, None).expect("decode ping");
+        let IncomingUdpPacket::Ping(decoded) = packet else {
+            panic!("expected ping");
+        };
+        assert_eq!(decoded.timestamp, request.timestamp);
+        assert_eq!(decoded.format, PacketFormat::Legacy);
+    }
+
+    #[test]
+    fn authenticated_protobuf_echo_decodes_as_ping() {
+        let request = PingRequest {
+            timestamp: 123_456,
+            request_extended_information: false,
+            format: PacketFormat::Protobuf,
+        };
+
+        let encoded = request.encode_authenticated_echo().expect("encode echo");
+        assert_eq!(encoded[0], 0x01);
+
+        let packet = IncomingUdpPacket::decode(&encoded, None).expect("decode ping");
+        let IncomingUdpPacket::Ping(decoded) = packet else {
+            panic!("expected ping");
+        };
+        assert_eq!(decoded.timestamp, request.timestamp);
+        assert_eq!(decoded.format, PacketFormat::Protobuf);
     }
 }
