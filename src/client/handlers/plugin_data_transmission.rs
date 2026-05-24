@@ -51,17 +51,17 @@ pub async fn handle_plugin_data_transmission(
 
     for receiver in &relay.receiver_sessions {
         let id = ClientSessionIdentifier::from(*receiver);
-        let Some(target) = server
-            .get_clients()
-            .get_client_in_server(&server_id, id)
-            .await
-        else {
-            continue;
-        };
-        if !crate::client::visibility::can_view_user(server, sender, &target).await {
-            continue;
-        }
         if id.get_node_id() == local_node_id {
+            let Some(target) = server
+                .get_clients()
+                .get_client_in_server(&server_id, id)
+                .await
+            else {
+                continue;
+            };
+            if !crate::client::visibility::can_view_user(server, sender, &target).await {
+                continue;
+            }
             if !crate::client::visibility::can_view_user(server, &target, sender).await {
                 continue;
             }
@@ -77,6 +77,15 @@ pub async fn handle_plugin_data_transmission(
                 .send_to_in_server(&server_id, id, &direct_message)
                 .await;
         } else {
+            if let Some(target) = server
+                .get_clients()
+                .get_client_in_server(&server_id, id)
+                .await
+            {
+                if !crate::client::visibility::can_view_user(server, sender, &target).await {
+                    continue;
+                }
+            }
             remote_by_node
                 .entry(id.get_node_id())
                 .or_default()
@@ -88,25 +97,20 @@ pub async fn handle_plugin_data_transmission(
         return Ok(());
     }
 
-    if let Some(app) = server.s2s_manager().application() {
-        for (node_id, receiver_sessions) in remote_by_node {
-            let envelope = PluginDataEnvelope {
-                sender_session,
-                receiver_sessions,
-                data: relay.data.clone().unwrap_or_default(),
-                data_id: relay.data_id.clone(),
-                server_id: server_id.clone(),
-            };
-            if let Err(e) = app.plugin_data().dispatch(node_id, envelope).await {
-                tracing::warn!(
-                    error = %e,
-                    node_id,
-                    "plugin data dispatch failed",
-                );
-            }
+    for (node_id, receiver_sessions) in remote_by_node {
+        let envelope = PluginDataEnvelope {
+            sender_session,
+            receiver_sessions,
+            data: relay.data.clone().unwrap_or_default(),
+            data_id: relay.data_id.clone(),
+            server_id: server_id.clone(),
+        };
+        if !server.s2s_manager().dispatch_plugin_data(node_id, envelope) {
+            tracing::trace!(
+                node_id,
+                "cross-node PluginDataTransmission dropped: S2S gateway unavailable"
+            );
         }
-    } else {
-        tracing::trace!("cross-node PluginDataTransmission dropped: ApplicationLayer not attached");
     }
 
     Ok(())

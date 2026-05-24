@@ -25,7 +25,7 @@ use super::lsdb::{
     LinkStateDb, LsaEmitter, LsaFloor,
 };
 use super::membership::{spawn_diff_watcher, MembershipTable};
-use super::messaging::ServiceRegistry;
+use super::messaging::{ordering::OverlayOrdering, ServiceRegistry};
 use super::neighbor::hello::{spawn_hello_task, spawn_link_up_watcher, HelloContext};
 use super::neighbor::monitor::NeighborMonitor;
 use super::routing::{new_handle as new_routing_handle, spawn_recomputer, RoutingHandle};
@@ -39,6 +39,7 @@ pub(crate) struct OverlayInner {
     pub neighbor: Arc<NeighborMonitor>,
     pub routing: RoutingHandle,
     pub services: Arc<ServiceRegistry>,
+    ordering: Arc<OverlayOrdering>,
     pub emitter: Arc<LsaEmitter>,
     pub hello: Arc<HelloContext>,
     pub shutdown: CancellationToken,
@@ -70,6 +71,7 @@ impl OverlayInner {
 
         let routing = new_routing_handle();
         let services = Arc::new(ServiceRegistry::new());
+        let ordering = Arc::new(OverlayOrdering::new());
 
         let emitter = Arc::new(LsaEmitter::new(
             self_id,
@@ -100,6 +102,7 @@ impl OverlayInner {
             neighbor,
             routing,
             services,
+            ordering,
             emitter,
             hello,
             shutdown,
@@ -172,6 +175,30 @@ impl OverlayInner {
             self.cfg.tombstone_in_memory_age(),
             self.shutdown.clone(),
         );
+        {
+            let mut events = self.table.subscribe();
+            let ordering = self.ordering.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        ev = events.recv() => {
+                            match ev {
+                                Ok(super::MembershipEvent::Restarted(node))
+                                | Ok(super::MembershipEvent::Failed(node))
+                                | Ok(super::MembershipEvent::Left(node)) => {
+                                    ordering.reset_peer(node).await;
+                                }
+                                Ok(super::MembershipEvent::Joined(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Inbound dispatcher.
         let dctx = Arc::new(super::inbound::DispatcherCtx {
@@ -180,6 +207,7 @@ impl OverlayInner {
             lsdb: self.lsdb.clone(),
             routing: self.routing.clone(),
             services: self.services.clone(),
+            ordering: self.ordering.clone(),
             transport: self.transport.clone(),
             self_id: self.self_id,
             shutdown: self.shutdown.clone(),
@@ -212,6 +240,10 @@ impl OverlayInner {
         )
         .await;
         self.shutdown.cancel();
+    }
+
+    pub(crate) fn ordering(&self) -> &Arc<OverlayOrdering> {
+        &self.ordering
     }
 }
 

@@ -58,60 +58,17 @@ fn recompute_now(
     let graph = dijkstra::RoutingGraph::from_lsdb(lsdb);
     transport.set_required_outgoing_nodes(component_bridge_targets(&graph, self_id));
 
-    let reliable = dijkstra::compute_on_graph(
-        &graph,
-        self_id,
-        ServiceLevel::Reliable,
-        RoutingMetric::PerServiceCost,
-        cfg,
-    );
-    let rll = dijkstra::compute_on_graph(
-        &graph,
-        self_id,
-        ServiceLevel::ReliableLowLatency,
-        RoutingMetric::PerServiceCost,
-        cfg,
-    );
-    let best = dijkstra::compute_on_graph(
-        &graph,
-        self_id,
-        ServiceLevel::BestEffort,
-        RoutingMetric::PerServiceCost,
-        cfg,
-    );
-    let conversational_reliable = dijkstra::compute_on_graph(
-        &graph,
-        self_id,
-        ServiceLevel::Reliable,
-        RoutingMetric::ConversationalQuality,
-        cfg,
-    );
-    let conversational_rll = dijkstra::compute_on_graph(
-        &graph,
-        self_id,
-        ServiceLevel::ReliableLowLatency,
-        RoutingMetric::ConversationalQuality,
-        cfg,
-    );
-    let conversational_best = dijkstra::compute_on_graph(
-        &graph,
-        self_id,
-        ServiceLevel::BestEffort,
-        RoutingMetric::ConversationalQuality,
-        cfg,
-    );
-    let new = RoutingTables {
-        reliable,
-        reliable_low_latency: rll,
-        best_effort: best,
-        conversational_reliable,
-        conversational_reliable_low_latency: conversational_rll,
-        conversational_best_effort: conversational_best,
-    };
+    let mut new = RoutingTables::empty();
+    for metric in RoutingMetric::ALL {
+        for level in ServiceLevel::ALL {
+            let table = dijkstra::compute_on_graph(&graph, self_id, level, metric, cfg);
+            new.insert_table(metric, level, table);
+        }
+    }
     trace!(
-        reliable = new.reliable.len(),
-        rll = new.reliable_low_latency.len(),
-        best_effort = new.best_effort.len(),
+        reliable = new.for_level(ServiceLevel::Reliable).len(),
+        rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
+        best_effort = new.for_level(ServiceLevel::BestEffort).len(),
         "routing recomputed"
     );
     tables.store(Arc::new(new));

@@ -27,6 +27,7 @@ use super::super::proto::{
 };
 use super::super::routing::{RoutingHandle, RoutingMetric, RoutingTables};
 use super::delivery;
+use super::ordering::{requires_ordering, OrderedDelivery, OverlayOrdering};
 use super::ServiceRegistry;
 
 const FORWARD_PAYLOAD_LOG_BYTES: usize = 256;
@@ -50,14 +51,52 @@ pub async fn originate(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     dsts: Vec<NodeIdentifier>,
     tag: u32,
     level: ServiceLevel,
     routing_metric: RoutingMetric,
     class: MessageClass,
     body: Bytes,
+    ordered_delivery: bool,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
+    if ordered_delivery && requires_ordering(level) {
+        let _send_guard = ordering.outbound_send_guard().await;
+        let mut first_err = None;
+        for dst in dsts {
+            let seq = ordering.next_outbound_seq(dst).await;
+            let data = pb::OverlayData {
+                src: node_to_wire(self_id),
+                dsts: vec![node_to_wire(dst)],
+                path_trace: vec![node_to_wire(self_id)],
+                service_tag: tag,
+                service_level: level_to_wire(level),
+                message_class: class_to_wire(class),
+                payload: body.clone(),
+                process_on_transit,
+                route_metric: route_metric_to_wire(routing_metric),
+                ordered_delivery: true,
+                ordering_seq: seq,
+                ordering_dst: node_to_wire(dst),
+            };
+            if let Err(err) = forward_pb(
+                transport, routing, self_id, data, class, /*is_originator=*/ true,
+            )
+            .await
+            {
+                ordering.release_failed_outbound_seq(dst, seq).await;
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        return Ok(());
+    }
+
     let data = pb::OverlayData {
         src: node_to_wire(self_id),
         dsts: dsts.iter().map(|d| node_to_wire(*d)).collect(),
@@ -68,6 +107,9 @@ pub async fn originate(
         payload: body,
         process_on_transit,
         route_metric: route_metric_to_wire(routing_metric),
+        ordered_delivery: false,
+        ordering_seq: 0,
+        ordering_dst: 0,
     };
     forward_pb(
         transport, routing, self_id, data, class, /*is_originator=*/ true,
@@ -81,6 +123,7 @@ pub async fn handle_inbound(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     services: &ServiceRegistry,
+    ordering: &OverlayOrdering,
     self_id: NodeIdentifier,
     from: NodeIdentifier,
     data: pb::OverlayData,
@@ -94,14 +137,38 @@ pub async fn handle_inbound(
     if is_for_self || data.process_on_transit {
         let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
         let src = node_from_wire(data.src).unwrap_or(0);
-        delivery::deliver(
-            services,
-            data.service_tag,
-            src,
-            level,
-            class,
-            data.payload.clone(),
-        );
+        if is_for_self
+            && data.ordered_delivery
+            && requires_ordering(level)
+            && node_from_wire(data.ordering_dst) == Some(self_id)
+        {
+            let ready = ordering
+                .accept_inbound(
+                    self_id,
+                    data.ordering_seq,
+                    OrderedDelivery::new(src, data.service_tag, level, class, data.payload.clone()),
+                )
+                .await;
+            for msg in ready {
+                delivery::deliver(
+                    services,
+                    msg.tag(),
+                    msg.src(),
+                    msg.level(),
+                    msg.class(),
+                    msg.body(),
+                );
+            }
+        } else {
+            delivery::deliver(
+                services,
+                data.service_tag,
+                src,
+                level,
+                class,
+                data.payload.clone(),
+            );
+        }
     }
     // Forward the remainder if any.
     let remaining: Vec<u32> = data
@@ -139,7 +206,8 @@ async fn forward_pb(
     is_originator: bool,
 ) -> Result<(), OverlayError> {
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
-    let routing_metric = route_metric_from_wire(data.route_metric).unwrap_or_default();
+    let routing_metric = route_metric_from_wire(data.route_metric, level)
+        .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let tables = routing.load();
 
     // Bucket dsts by next_hop.
@@ -194,6 +262,9 @@ async fn forward_pb(
             payload: data.payload.clone(),
             process_on_transit: data.process_on_transit,
             route_metric: data.route_metric,
+            ordered_delivery: data.ordered_delivery,
+            ordering_seq: data.ordering_seq,
+            ordering_dst: data.ordering_dst,
         };
         if tracing::enabled!(tracing::Level::TRACE) {
             let dsts: Vec<NodeIdentifier> = pb_msg

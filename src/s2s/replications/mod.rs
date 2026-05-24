@@ -251,6 +251,11 @@ impl ReplicationManager {
         self.inner.self_id
     }
 
+    /// Local node boot epoch captured by the overlay at S2S runtime start.
+    pub fn local_boot_epoch(&self) -> u64 {
+        self.inner.self_epoch
+    }
+
     /// Register a strict (Tempo) topic. Returns the caller-facing handle
     /// used to propose ops.
     pub fn register_strict<R: StrictReplicable>(

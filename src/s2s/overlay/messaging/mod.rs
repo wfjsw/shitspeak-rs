@@ -4,6 +4,7 @@
 
 pub mod delivery;
 pub mod forward;
+pub(crate) mod ordering;
 
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use scc::HashMap as SccMap;
 use crate::s2s::transport::{ConnectionManager, MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
+use self::ordering::OverlayOrdering;
 use super::error::OverlayError;
 use super::routing::{RoutingHandle, RoutingMetric};
 
@@ -73,6 +75,7 @@ pub async fn send_unicast(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     dst: NodeIdentifier,
     tag: u32,
     level: ServiceLevel,
@@ -80,7 +83,7 @@ pub async fn send_unicast(
     body: Bytes,
 ) -> Result<(), OverlayError> {
     send_unicast_with_transit_processing(
-        transport, routing, self_id, dst, tag, level, class, body, false,
+        transport, routing, self_id, ordering, dst, tag, level, class, body, false,
     )
     .await
 }
@@ -90,6 +93,7 @@ pub async fn send_unicast_with_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     dst: NodeIdentifier,
     tag: u32,
     level: ServiceLevel,
@@ -101,10 +105,11 @@ pub async fn send_unicast_with_transit_processing(
         transport,
         routing,
         self_id,
+        ordering,
         dst,
         tag,
         level,
-        RoutingMetric::PerServiceCost,
+        RoutingMetric::default_for_level(level),
         class,
         body,
         process_on_transit,
@@ -116,6 +121,7 @@ pub async fn send_unicast_with_routing_metric_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     dst: NodeIdentifier,
     tag: u32,
     level: ServiceLevel,
@@ -124,16 +130,79 @@ pub async fn send_unicast_with_routing_metric_and_transit_processing(
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
+    send_unicast_with_routing_metric_ordering_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        ordering,
+        dst,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        true,
+        process_on_transit,
+    )
+    .await
+}
+
+pub async fn send_unicast_with_routing_metric_unordered_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
+    dst: NodeIdentifier,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_unicast_with_routing_metric_ordering_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        ordering,
+        dst,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        false,
+        process_on_transit,
+    )
+    .await
+}
+
+async fn send_unicast_with_routing_metric_ordering_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
+    dst: NodeIdentifier,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    ordered_delivery: bool,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
     forward::originate(
         transport,
         routing,
         self_id,
+        ordering,
         vec![dst],
         tag,
         level,
         routing_metric,
         class,
         body,
+        ordered_delivery,
         process_on_transit,
     )
     .await
@@ -144,6 +213,7 @@ pub async fn send_multicast(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     dsts: &[NodeIdentifier],
     tag: u32,
     level: ServiceLevel,
@@ -151,7 +221,7 @@ pub async fn send_multicast(
     body: Bytes,
 ) -> Result<(), OverlayError> {
     send_multicast_with_transit_processing(
-        transport, routing, self_id, dsts, tag, level, class, body, false,
+        transport, routing, self_id, ordering, dsts, tag, level, class, body, false,
     )
     .await
 }
@@ -161,6 +231,7 @@ pub async fn send_multicast_with_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     dsts: &[NodeIdentifier],
     tag: u32,
     level: ServiceLevel,
@@ -173,10 +244,11 @@ pub async fn send_multicast_with_transit_processing(
         transport,
         routing,
         self_id,
+        ordering,
         &dsts,
         tag,
         level,
-        RoutingMetric::PerServiceCost,
+        RoutingMetric::default_for_level(level),
         class,
         body,
         process_on_transit,
@@ -188,6 +260,7 @@ pub async fn send_multicast_with_routing_metric_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     dsts: &[NodeIdentifier],
     tag: u32,
     level: ServiceLevel,
@@ -196,17 +269,80 @@ pub async fn send_multicast_with_routing_metric_and_transit_processing(
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
-    let dsts: Vec<NodeIdentifier> = dsts.iter().copied().filter(|n| *n != self_id).collect();
-    forward::originate(
+    send_multicast_with_routing_metric_ordering_and_transit_processing(
         transport,
         routing,
         self_id,
+        ordering,
         dsts,
         tag,
         level,
         routing_metric,
         class,
         body,
+        true,
+        process_on_transit,
+    )
+    .await
+}
+
+pub async fn send_multicast_with_routing_metric_unordered_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
+    dsts: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_multicast_with_routing_metric_ordering_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        ordering,
+        dsts,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        false,
+        process_on_transit,
+    )
+    .await
+}
+
+async fn send_multicast_with_routing_metric_ordering_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
+    dsts: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    ordered_delivery: bool,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    let dsts: Vec<NodeIdentifier> = dsts.iter().copied().filter(|n| *n != self_id).collect();
+    forward::originate(
+        transport,
+        routing,
+        self_id,
+        ordering,
+        dsts,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        ordered_delivery,
         process_on_transit,
     )
     .await
@@ -217,6 +353,7 @@ pub async fn send_broadcast(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     alive: &[NodeIdentifier],
     tag: u32,
     level: ServiceLevel,
@@ -224,7 +361,7 @@ pub async fn send_broadcast(
     body: Bytes,
 ) -> Result<(), OverlayError> {
     send_broadcast_with_transit_processing(
-        transport, routing, self_id, alive, tag, level, class, body, false,
+        transport, routing, self_id, ordering, alive, tag, level, class, body, false,
     )
     .await
 }
@@ -234,6 +371,7 @@ pub async fn send_broadcast_with_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     alive: &[NodeIdentifier],
     tag: u32,
     level: ServiceLevel,
@@ -249,10 +387,11 @@ pub async fn send_broadcast_with_transit_processing(
         transport,
         routing,
         self_id,
+        ordering,
         &dsts,
         tag,
         level,
-        RoutingMetric::PerServiceCost,
+        RoutingMetric::default_for_level(level),
         class,
         body,
         process_on_transit,
@@ -264,12 +403,74 @@ pub async fn send_broadcast_with_routing_metric_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
     alive: &[NodeIdentifier],
     tag: u32,
     level: ServiceLevel,
     routing_metric: RoutingMetric,
     class: MessageClass,
     body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_broadcast_with_routing_metric_ordering_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        ordering,
+        alive,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        true,
+        process_on_transit,
+    )
+    .await
+}
+
+pub async fn send_broadcast_with_routing_metric_unordered_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
+    alive: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_broadcast_with_routing_metric_ordering_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        ordering,
+        alive,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        false,
+        process_on_transit,
+    )
+    .await
+}
+
+async fn send_broadcast_with_routing_metric_ordering_and_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    ordering: &OverlayOrdering,
+    alive: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    ordered_delivery: bool,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
     let dsts: Vec<NodeIdentifier> = alive.iter().copied().filter(|n| *n != self_id).collect();
@@ -280,12 +481,14 @@ pub async fn send_broadcast_with_routing_metric_and_transit_processing(
         transport,
         routing,
         self_id,
+        ordering,
         dsts,
         tag,
         level,
         routing_metric,
         class,
         body,
+        ordered_delivery,
         process_on_transit,
     )
     .await

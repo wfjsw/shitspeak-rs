@@ -4548,7 +4548,6 @@ dependencies = [
  "cidr",
  "config",
  "criterion",
- "dtls",
  "enumflags2",
  "futures-util",
  "hang",
@@ -4595,7 +4594,6 @@ dependencies = [
  "tracing-test",
  "wasmtime",
  "webrtc",
- "webrtc-util",
  "x509-parser 0.18.1",
 ]
 

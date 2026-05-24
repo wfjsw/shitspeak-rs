@@ -7,16 +7,18 @@ pub mod transport;
 #[cfg(test)]
 pub(crate) mod testing;
 
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
+use std::thread;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, trace, warn};
 
@@ -29,15 +31,20 @@ use crate::client_repository::ClientRepository;
 use crate::server::Server;
 use crate::types::{NodeIdentifier, DEFAULT_SERVER_ID};
 
+use self::application::error::ApplicationError;
 use self::application::moderation::ModerationApplier;
-use self::application::plugin_data::ServerPluginDataSink;
 use self::application::proto::{
-    ModerationCommand, ModerationEnvelope, UserRemovePatch, UserStatePatch, VoiceFrame,
+    ModerationCommand, ModerationEnvelope, PluginDataEnvelope, UserRemovePatch, UserStatePatch,
+    UserStatsReply, VoiceFrame, VoiceIntent,
 };
 use self::application::voice::{AudioSink, RecipientIndex};
 use self::overlay::OverlayNetwork;
 use self::replications::{BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable};
 use self::transport::{ConnectionManager, TransportConfig};
+
+const NATIVE_GATEWAY_CAPACITY: usize = 4096;
+const S2S_GATEWAY_CAPACITY: usize = 4096;
+const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct S2SManager {
     enabled: bool,
@@ -67,6 +74,100 @@ struct S2SRuntimeState {
     channel_blob_replications:
         HashMap<String, replications::BlobHandle<ChannelBlobReplicationAdapter>>,
     bridge_tasks: Vec<JoinHandle<()>>,
+    gateway_tx: Option<mpsc::Sender<NativeToS2SCommand>>,
+}
+
+enum S2SNativeCommand {
+    ApplyModeration {
+        from: NodeIdentifier,
+        envelope: ModerationEnvelope,
+    },
+    DeliverPluginData {
+        from: NodeIdentifier,
+        envelope: PluginDataEnvelope,
+    },
+    DeliverVoice {
+        from_immediate: NodeIdentifier,
+        frame: VoiceFrame,
+    },
+}
+
+enum NativeToS2SCommand {
+    ProposeChannel {
+        server_id: String,
+        op: ChannelOp,
+        respond: oneshot::Sender<bool>,
+    },
+    ProposeBan {
+        op: BanOp,
+        respond: oneshot::Sender<bool>,
+    },
+    ProposeClientReplication(ClientStateLogEntry),
+    RefreshVoiceRecipientIndex(HashMap<u32, BTreeSet<NodeIdentifier>>),
+    DispatchPluginData {
+        owner: NodeIdentifier,
+        envelope: PluginDataEnvelope,
+    },
+    DispatchModeration {
+        owner: NodeIdentifier,
+        envelope: ModerationEnvelope,
+    },
+    DispatchUserStats {
+        owner: NodeIdentifier,
+        actor_session: u32,
+        target_session: u32,
+        stats_only: bool,
+        server_id: String,
+        respond: oneshot::Sender<Result<UserStatsReply, ApplicationError>>,
+    },
+    SendVoiceForChannel {
+        sender_session: u32,
+        server_id: String,
+        source_channel: u32,
+        is_terminator: bool,
+        payload: Bytes,
+    },
+    SendVoiceBroadcast {
+        sender_session: u32,
+        server_id: String,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+    },
+}
+
+struct S2SGateways {
+    native_tx: mpsc::Sender<S2SNativeCommand>,
+    s2s_tx: mpsc::Sender<NativeToS2SCommand>,
+    s2s_rx: mpsc::Receiver<NativeToS2SCommand>,
+    native_runtime: tokio::runtime::Handle,
+}
+
+pub(crate) struct S2SRuntimeTask {
+    thread: Option<thread::JoinHandle<()>>,
+    native_tasks: Vec<JoinHandle<()>>,
+}
+
+impl S2SRuntimeTask {
+    pub(crate) async fn join(mut self) {
+        if let Some(thread) = self.thread.take() {
+            match tokio::task::spawn_blocking(move || thread.join()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    warn!("s2s runtime thread panicked");
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to join s2s runtime thread");
+                }
+            }
+        }
+
+        for task in self.native_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 impl S2SManager {
@@ -183,8 +284,35 @@ impl S2SManager {
         info!(seed_count, "s2s enabled");
     }
 
+    fn clear_gateway_tx(&self) {
+        self.state.write().gateway_tx = None;
+    }
+
     pub async fn propose_channel_op(&self, server_id: Option<&str>, op: ChannelOp) -> bool {
-        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID);
+        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID).to_owned();
+        let Some(tx) = self.state.read().gateway_tx.clone() else {
+            return false;
+        };
+        let (respond, rx) = oneshot::channel();
+        match tx.try_send(NativeToS2SCommand::ProposeChannel {
+            server_id,
+            op,
+            respond,
+        }) {
+            Ok(()) => tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("s2s gateway full; dropping channel proposal");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    async fn propose_channel_op_direct(&self, server_id: &str, op: ChannelOp) -> bool {
         let handle = match self.channel_replication_handle(server_id) {
             Some(handle) => handle,
             None => return false,
@@ -207,6 +335,25 @@ impl S2SManager {
     }
 
     pub async fn propose_ban_op(&self, op: BanOp) -> bool {
+        let Some(tx) = self.state.read().gateway_tx.clone() else {
+            return false;
+        };
+        let (respond, rx) = oneshot::channel();
+        match tx.try_send(NativeToS2SCommand::ProposeBan { op, respond }) {
+            Ok(()) => tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("s2s gateway full; dropping ban proposal");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    async fn propose_ban_op_direct(&self, op: BanOp) -> bool {
         let Some(handle) = self.state.read().ban_replication.clone() else {
             return false;
         };
@@ -223,6 +370,158 @@ impl S2SManager {
                 false
             }
         }
+    }
+
+    fn try_send_s2s_command(&self, command: NativeToS2SCommand, label: &'static str) -> bool {
+        let Some(tx) = self.state.read().gateway_tx.clone() else {
+            trace!(label, "s2s gateway unavailable; dropping command");
+            return false;
+        };
+        match tx.try_send(command) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(label, "s2s gateway full; dropping command");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                trace!(label, "s2s gateway closed; dropping command");
+                false
+            }
+        }
+    }
+
+    pub fn dispatch_plugin_data(
+        &self,
+        owner: NodeIdentifier,
+        envelope: PluginDataEnvelope,
+    ) -> bool {
+        self.try_send_s2s_command(
+            NativeToS2SCommand::DispatchPluginData { owner, envelope },
+            "plugin_data",
+        )
+    }
+
+    pub fn dispatch_moderation_user_state(
+        &self,
+        server_id: Option<&str>,
+        actor: ClientSessionIdentifier,
+        target: ClientSessionIdentifier,
+        patch: UserStatePatch,
+    ) -> bool {
+        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID);
+        let envelope = ModerationEnvelope {
+            actor_session: actor.to_u32(),
+            target_session: target.to_u32(),
+            issued_at_ms: now_ms(),
+            server_id: server_id.to_owned(),
+            command: Some(ModerationCommand::UserState(patch)),
+        };
+        self.try_send_s2s_command(
+            NativeToS2SCommand::DispatchModeration {
+                owner: target.get_node_id(),
+                envelope,
+            },
+            "moderation",
+        )
+    }
+
+    pub fn dispatch_moderation_user_remove(
+        &self,
+        server_id: Option<&str>,
+        actor: ClientSessionIdentifier,
+        target: ClientSessionIdentifier,
+        patch: UserRemovePatch,
+    ) -> bool {
+        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID);
+        let envelope = ModerationEnvelope {
+            actor_session: actor.to_u32(),
+            target_session: target.to_u32(),
+            issued_at_ms: now_ms(),
+            server_id: server_id.to_owned(),
+            command: Some(ModerationCommand::UserRemove(patch)),
+        };
+        self.try_send_s2s_command(
+            NativeToS2SCommand::DispatchModeration {
+                owner: target.get_node_id(),
+                envelope,
+            },
+            "moderation",
+        )
+    }
+
+    pub async fn dispatch_user_stats_request(
+        &self,
+        owner: NodeIdentifier,
+        actor_session: u32,
+        target_session: u32,
+        stats_only: bool,
+        server_id: String,
+    ) -> Result<UserStatsReply, ApplicationError> {
+        let Some(tx) = self.state.read().gateway_tx.clone() else {
+            return Err(ApplicationError::Unavailable);
+        };
+        let (respond, rx) = oneshot::channel();
+        match tx.try_send(NativeToS2SCommand::DispatchUserStats {
+            owner,
+            actor_session,
+            target_session,
+            stats_only,
+            server_id,
+            respond,
+        }) {
+            Ok(()) => tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(Err(ApplicationError::Unavailable)),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("s2s gateway full; dropping user_stats request");
+                Err(ApplicationError::Unavailable)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ApplicationError::Unavailable),
+        }
+    }
+
+    pub fn send_voice_for_channel(
+        &self,
+        sender_session: u32,
+        server_id: String,
+        source_channel: u32,
+        is_terminator: bool,
+        payload: Bytes,
+    ) -> bool {
+        self.try_send_s2s_command(
+            NativeToS2SCommand::SendVoiceForChannel {
+                sender_session,
+                server_id,
+                source_channel,
+                is_terminator,
+                payload,
+            },
+            "voice",
+        )
+    }
+
+    pub fn send_voice_broadcast(
+        &self,
+        sender_session: u32,
+        server_id: String,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+    ) -> bool {
+        self.try_send_s2s_command(
+            NativeToS2SCommand::SendVoiceBroadcast {
+                sender_session,
+                server_id,
+                target_kind,
+                is_terminator,
+                payload,
+                intent,
+            },
+            "voice",
+        )
     }
 
     pub async fn get_channel_blob(&self, server_id: Option<&str>, key: &str) -> Option<Bytes> {
@@ -285,34 +584,92 @@ impl S2SManager {
         }
     }
 
-    pub fn spawn_runtime_task(
+    pub(crate) fn spawn_runtime_task(
         self: Arc<Self>,
         server: Weak<Box<Server>>,
         shutdown: watch::Receiver<()>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            self.run_runtime(server, shutdown).await;
-        })
+    ) -> S2SRuntimeTask {
+        let native_runtime = tokio::runtime::Handle::current();
+        let (native_tx, native_rx) = mpsc::channel(NATIVE_GATEWAY_CAPACITY);
+        let (s2s_tx, s2s_rx) = mpsc::channel(S2S_GATEWAY_CAPACITY);
+        if self.enabled && self.config_error.is_none() && self.transport_config.is_some() {
+            self.state.write().gateway_tx = Some(s2s_tx.clone());
+        } else {
+            self.clear_gateway_tx();
+        }
+        let native_gateway_task = native_runtime.spawn(run_native_gateway(
+            server.clone(),
+            native_rx,
+            shutdown.clone(),
+        ));
+        let gateways = S2SGateways {
+            native_tx,
+            s2s_tx,
+            s2s_rx,
+            native_runtime,
+        };
+
+        let thread = thread::Builder::new()
+            .name("s2s-runtime".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("s2s-runtime-worker")
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        warn!(error = %e, "failed to build s2s tokio runtime");
+                        return;
+                    }
+                };
+
+                runtime.block_on(async move {
+                    self.run_runtime(server, shutdown, gateways).await;
+                });
+            });
+
+        match thread {
+            Ok(thread) => S2SRuntimeTask {
+                thread: Some(thread),
+                native_tasks: vec![native_gateway_task],
+            },
+            Err(e) => {
+                warn!(error = %e, "failed to spawn s2s runtime thread");
+                S2SRuntimeTask {
+                    thread: None,
+                    native_tasks: vec![native_gateway_task],
+                }
+            }
+        }
     }
 
     async fn run_runtime(
         self: Arc<Self>,
         server: Weak<Box<Server>>,
         mut shutdown: watch::Receiver<()>,
+        gateways: S2SGateways,
     ) {
         if !self.enabled {
+            self.clear_gateway_tx();
+            drop(gateways);
             let _ = shutdown.changed().await;
             return;
         }
 
         if let Some(error) = &self.config_error {
             warn!(error = %error, "s2s startup skipped");
+            self.clear_gateway_tx();
+            drop(gateways);
             let _ = shutdown.changed().await;
             return;
         }
 
         let Some(transport_config) = self.transport_config.clone() else {
             warn!("s2s startup skipped: no transport config");
+            self.clear_gateway_tx();
+            drop(gateways);
             let _ = shutdown.changed().await;
             return;
         };
@@ -321,6 +678,8 @@ impl S2SManager {
             Ok(parts) => parts,
             Err(e) => {
                 warn!(error = %e, "s2s transport startup failed");
+                self.clear_gateway_tx();
+                drop(gateways);
                 let _ = shutdown.changed().await;
                 return;
             }
@@ -338,6 +697,8 @@ impl S2SManager {
             Err(e) => {
                 warn!(error = %e, "s2s overlay startup failed");
                 transport.shutdown().await;
+                self.clear_gateway_tx();
+                drop(gateways);
                 let _ = shutdown.changed().await;
                 return;
             }
@@ -396,18 +757,19 @@ impl S2SManager {
         application.user_stats().set_responder(
             crate::client::handlers::ServerUserStatsResponder::new(server.clone()),
         );
-        application
-            .moderation()
-            .set_applier(Arc::new(ServerModerationApplier::new(server.clone())));
-        application
-            .voice()
-            .set_audio_sink(Arc::new(ServerVoiceSink::new(server.clone())));
+        let S2SGateways {
+            native_tx,
+            s2s_tx,
+            s2s_rx,
+            native_runtime,
+        } = gateways;
+        let native_sink = Arc::new(S2SNativeGatewaySink::new(native_tx));
+        application.moderation().set_applier(native_sink.clone());
+        application.voice().set_audio_sink(native_sink.clone());
         application
             .voice()
             .set_recipient_index(recipient_index.clone());
-        application
-            .plugin_data()
-            .set_sink(ServerPluginDataSink::new(server.clone()));
+        application.plugin_data().set_sink(native_sink);
 
         let (
             channel_replications,
@@ -417,8 +779,18 @@ impl S2SManager {
             bridge_tasks,
         ) = match server_handle.as_ref() {
             Some(server) => {
-                self.register_repositories(&replications, server, recipient_index.clone())
-                    .await
+                self.register_repositories(
+                    Arc::clone(&self),
+                    &replications,
+                    application.clone(),
+                    server,
+                    recipient_index.clone(),
+                    &native_runtime,
+                    s2s_tx.clone(),
+                    s2s_rx,
+                    shutdown.clone(),
+                )
+                .await
             }
             None => {
                 warn!("s2s repository replication skipped: server handle dropped");
@@ -473,6 +845,7 @@ impl S2SManager {
             state.replications = None;
             state.overlay = None;
             state.transport = None;
+            state.gateway_tx = None;
             bridge_tasks
         };
         for task in bridge_tasks {
@@ -494,9 +867,15 @@ impl S2SManager {
 
     async fn register_repositories(
         &self,
+        manager: Arc<S2SManager>,
         replications: &Arc<ReplicationManager>,
+        application: Arc<application::ApplicationLayer>,
         server: &Arc<Box<Server>>,
         recipient_index: Arc<RecipientIndex>,
+        native_runtime: &tokio::runtime::Handle,
+        s2s_tx: mpsc::Sender<NativeToS2SCommand>,
+        s2s_rx: mpsc::Receiver<NativeToS2SCommand>,
+        shutdown: watch::Receiver<()>,
     ) -> (
         HashMap<String, replications::StrictHandle<ChannelReplicationAdapter>>,
         Option<replications::StrictHandle<BanReplicationAdapter>>,
@@ -508,6 +887,7 @@ impl S2SManager {
         let clients = Arc::new(ClientReplicationAdapter::new(
             server.get_clients().clone(),
             server.get_channels().clone(),
+            replications.local_boot_epoch(),
         ));
 
         let mut channel_handles = HashMap::new();
@@ -545,14 +925,33 @@ impl S2SManager {
 
         let mut bridge_tasks = Vec::new();
         if let Some(handle) = client_handle.clone() {
-            bridge_tasks.push(spawn_client_replication_bridge(
+            bridge_tasks.push(spawn_native_client_replication_bridge(
+                native_runtime,
                 server.get_clients().clone(),
-                handle,
+                s2s_tx.clone(),
+                shutdown.clone(),
+            ));
+            bridge_tasks.push(spawn_s2s_gateway_receiver(
+                s2s_rx,
+                manager,
+                application,
+                Some(handle),
+                recipient_index.clone(),
+            ));
+        } else {
+            bridge_tasks.push(spawn_s2s_gateway_receiver(
+                s2s_rx,
+                manager,
+                application,
+                None,
+                recipient_index.clone(),
             ));
         }
-        bridge_tasks.push(spawn_voice_recipient_index_bridge(
+        bridge_tasks.push(spawn_native_voice_recipient_index_bridge(
+            native_runtime,
             server.get_clients().clone(),
-            recipient_index,
+            s2s_tx.clone(),
+            shutdown,
         ));
 
         (
@@ -658,21 +1057,36 @@ impl S2SManager {
     }
 }
 
-fn spawn_client_replication_bridge(
+fn spawn_native_client_replication_bridge(
+    runtime: &tokio::runtime::Handle,
     repo: Arc<ClientRepository>,
-    handle: replications::OwnerHandle<ClientReplicationAdapter>,
+    tx: mpsc::Sender<NativeToS2SCommand>,
+    mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     let mut rx = repo.subscribe();
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         loop {
-            match rx.recv().await {
+            let payload = tokio::select! {
+                _ = shutdown.changed() => return,
+                next = rx.recv() => next,
+            };
+            match payload {
                 Ok(payload) => {
                     let entry = payload.entry.clone();
                     if entry.node_id != repo.local_node_id() {
                         continue;
                     }
-                    if let Err(e) = handle.propose((*entry).clone()).await {
-                        warn!(error = %e, version = entry.version, "s2s client replication propose failed");
+                    match tx.try_send(NativeToS2SCommand::ProposeClientReplication(
+                        (*entry).clone(),
+                    )) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                version = entry.version,
+                                "s2s client replication gateway full; dropping proposal"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => return,
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -684,21 +1098,27 @@ fn spawn_client_replication_bridge(
     })
 }
 
-fn spawn_voice_recipient_index_bridge(
+fn spawn_native_voice_recipient_index_bridge(
+    runtime: &tokio::runtime::Handle,
     repo: Arc<ClientRepository>,
-    index: Arc<RecipientIndex>,
+    tx: mpsc::Sender<NativeToS2SCommand>,
+    mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     let mut rx = repo.subscribe();
-    tokio::spawn(async move {
-        index.replace_all(repo.voice_recipient_index_snapshot().await);
+    runtime.spawn(async move {
+        enqueue_voice_recipient_index_snapshot(&repo, &tx).await;
         loop {
-            match rx.recv().await {
+            let payload = tokio::select! {
+                _ = shutdown.changed() => return,
+                next = rx.recv() => next,
+            };
+            match payload {
                 Ok(_) => {
-                    index.replace_all(repo.voice_recipient_index_snapshot().await);
+                    enqueue_voice_recipient_index_snapshot(&repo, &tx).await;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "s2s voice recipient index bridge lagged");
-                    index.replace_all(repo.voice_recipient_index_snapshot().await);
+                    enqueue_voice_recipient_index_snapshot(&repo, &tx).await;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             }
@@ -706,61 +1126,260 @@ fn spawn_voice_recipient_index_bridge(
     })
 }
 
-struct ServerModerationApplier {
-    server: Weak<Box<Server>>,
+async fn enqueue_voice_recipient_index_snapshot(
+    repo: &Arc<ClientRepository>,
+    tx: &mpsc::Sender<NativeToS2SCommand>,
+) {
+    let snapshot = repo.voice_recipient_index_snapshot().await;
+    match tx.try_send(NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("s2s voice recipient index gateway full; dropping snapshot");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
 }
 
-impl ServerModerationApplier {
-    fn new(server: Weak<Box<Server>>) -> Self {
-        Self { server }
+fn spawn_s2s_gateway_receiver(
+    mut rx: mpsc::Receiver<NativeToS2SCommand>,
+    manager: Arc<S2SManager>,
+    application: Arc<application::ApplicationLayer>,
+    client_handle: Option<replications::OwnerHandle<ClientReplicationAdapter>>,
+    recipient_index: Arc<RecipientIndex>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            match command {
+                NativeToS2SCommand::ProposeChannel {
+                    server_id,
+                    op,
+                    respond,
+                } => {
+                    let _ = respond.send(manager.propose_channel_op_direct(&server_id, op).await);
+                }
+                NativeToS2SCommand::ProposeBan { op, respond } => {
+                    let _ = respond.send(manager.propose_ban_op_direct(op).await);
+                }
+                NativeToS2SCommand::ProposeClientReplication(entry) => {
+                    let Some(handle) = client_handle.as_ref() else {
+                        warn!(
+                            version = entry.version,
+                            "s2s client replication gateway has no owner handle; dropping proposal"
+                        );
+                        continue;
+                    };
+                    if let Err(e) = handle.propose(entry).await {
+                        warn!(error = %e, "s2s client replication propose failed");
+                    }
+                }
+                NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot) => {
+                    recipient_index.replace_all(snapshot);
+                }
+                NativeToS2SCommand::DispatchPluginData { owner, envelope } => {
+                    if let Err(e) = application.plugin_data().dispatch(owner, envelope).await {
+                        warn!(error = %e, owner, "plugin data dispatch failed");
+                    }
+                }
+                NativeToS2SCommand::DispatchModeration { owner, envelope } => {
+                    if let Err(e) = application
+                        .moderation()
+                        .dispatch_envelope_for_gateway(owner, envelope)
+                        .await
+                    {
+                        warn!(error = %e, owner, "moderation dispatch failed");
+                    }
+                }
+                NativeToS2SCommand::DispatchUserStats {
+                    owner,
+                    actor_session,
+                    target_session,
+                    stats_only,
+                    server_id,
+                    respond,
+                } => {
+                    let result = application
+                        .user_stats()
+                        .dispatch_request(
+                            owner,
+                            actor_session,
+                            target_session,
+                            stats_only,
+                            server_id,
+                            None,
+                        )
+                        .await;
+                    let _ = respond.send(result);
+                }
+                NativeToS2SCommand::SendVoiceForChannel {
+                    sender_session,
+                    server_id,
+                    source_channel,
+                    is_terminator,
+                    payload,
+                } => {
+                    if let Err(e) = application
+                        .voice()
+                        .send_for_channel(
+                            sender_session,
+                            server_id,
+                            source_channel,
+                            is_terminator,
+                            payload,
+                        )
+                        .await
+                    {
+                        trace!(error = %e, "voice s2s send_for_channel failed");
+                    }
+                }
+                NativeToS2SCommand::SendVoiceBroadcast {
+                    sender_session,
+                    server_id,
+                    target_kind,
+                    is_terminator,
+                    payload,
+                    intent,
+                } => {
+                    if let Err(e) = application
+                        .voice()
+                        .send_broadcast(
+                            sender_session,
+                            server_id,
+                            target_kind,
+                            is_terminator,
+                            payload,
+                            intent,
+                        )
+                        .await
+                    {
+                        trace!(error = %e, "voice s2s send_broadcast failed");
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn run_native_gateway(
+    server: Weak<Box<Server>>,
+    mut rx: mpsc::Receiver<S2SNativeCommand>,
+    mut shutdown: watch::Receiver<()>,
+) {
+    loop {
+        let command = tokio::select! {
+            _ = shutdown.changed() => return,
+            next = rx.recv() => match next {
+                Some(command) => command,
+                None => return,
+            },
+        };
+        let Some(server) = server.upgrade() else {
+            return;
+        };
+        match command {
+            S2SNativeCommand::ApplyModeration { from, envelope } => {
+                apply_s2s_moderation(&server, from, envelope).await;
+            }
+            S2SNativeCommand::DeliverPluginData { from, envelope } => {
+                trace!(from, "s2s plugin data handed to native gateway");
+                application::plugin_data::runtime::deliver_to_local_recipients(&server, envelope)
+                    .await;
+            }
+            S2SNativeCommand::DeliverVoice {
+                from_immediate,
+                frame,
+            } => {
+                crate::voice::route_s2s_voice_frame(&server, from_immediate, frame).await;
+            }
+        }
+    }
+}
+
+struct S2SNativeGatewaySink {
+    tx: mpsc::Sender<S2SNativeCommand>,
+}
+
+impl S2SNativeGatewaySink {
+    fn new(tx: mpsc::Sender<S2SNativeCommand>) -> Self {
+        Self { tx }
+    }
+
+    fn try_send(&self, command: S2SNativeCommand, label: &'static str) {
+        match self.tx.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(label, "s2s native gateway full; dropping command");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                trace!(label, "s2s native gateway closed; dropping command");
+            }
+        }
     }
 }
 
 #[async_trait]
-impl ModerationApplier for ServerModerationApplier {
+impl ModerationApplier for S2SNativeGatewaySink {
     async fn apply(&self, from: NodeIdentifier, envelope: ModerationEnvelope) {
-        let Some(server) = self.server.upgrade() else {
-            return;
-        };
-        let target_id = ClientSessionIdentifier::from(envelope.target_session);
-        if target_id.get_node_id() != server.get_clients().local_node_id() {
-            trace!(
-                from,
-                target = envelope.target_session,
-                "s2s moderation ignored: target is not local"
-            );
-            return;
-        }
+        self.try_send(
+            S2SNativeCommand::ApplyModeration { from, envelope },
+            "moderation",
+        );
+    }
+}
 
-        let server_id = if envelope.server_id.is_empty() {
-            crate::types::default_server_id()
-        } else {
-            envelope.server_id.clone()
-        };
-        match envelope.command {
-            Some(ModerationCommand::UserState(patch)) => {
-                apply_user_state_patch(
-                    &server,
-                    &server_id,
-                    envelope.actor_session,
-                    target_id,
-                    patch,
-                )
+#[async_trait]
+impl AudioSink for S2SNativeGatewaySink {
+    async fn deliver(&self, from_immediate: NodeIdentifier, frame: VoiceFrame) {
+        self.try_send(
+            S2SNativeCommand::DeliverVoice {
+                from_immediate,
+                frame,
+            },
+            "voice",
+        );
+    }
+}
+
+#[async_trait]
+impl application::plugin_data::PluginDataSink for S2SNativeGatewaySink {
+    async fn deliver(&self, from: NodeIdentifier, envelope: PluginDataEnvelope) {
+        self.try_send(
+            S2SNativeCommand::DeliverPluginData { from, envelope },
+            "plugin_data",
+        );
+    }
+}
+
+async fn apply_s2s_moderation(
+    server: &Arc<Box<Server>>,
+    from: NodeIdentifier,
+    envelope: ModerationEnvelope,
+) {
+    let target_id = ClientSessionIdentifier::from(envelope.target_session);
+    if target_id.get_node_id() != server.get_clients().local_node_id() {
+        trace!(
+            from,
+            target = envelope.target_session,
+            "s2s moderation ignored: target is not local"
+        );
+        return;
+    }
+
+    let server_id = if envelope.server_id.is_empty() {
+        crate::types::default_server_id()
+    } else {
+        envelope.server_id.clone()
+    };
+    match envelope.command {
+        Some(ModerationCommand::UserState(patch)) => {
+            apply_user_state_patch(server, &server_id, envelope.actor_session, target_id, patch)
                 .await;
-            }
-            Some(ModerationCommand::UserRemove(patch)) => {
-                apply_user_remove_patch(
-                    &server,
-                    &server_id,
-                    envelope.actor_session,
-                    target_id,
-                    patch,
-                )
+        }
+        Some(ModerationCommand::UserRemove(patch)) => {
+            apply_user_remove_patch(server, &server_id, envelope.actor_session, target_id, patch)
                 .await;
-            }
-            None => {
-                trace!(from, "s2s moderation ignored: empty command");
-            }
+        }
+        None => {
+            trace!(from, "s2s moderation ignored: empty command");
         }
     }
 }
@@ -972,26 +1591,6 @@ async fn apply_user_remove_patch(
     }
 }
 
-struct ServerVoiceSink {
-    server: Weak<Box<Server>>,
-}
-
-impl ServerVoiceSink {
-    fn new(server: Weak<Box<Server>>) -> Self {
-        Self { server }
-    }
-}
-
-#[async_trait]
-impl AudioSink for ServerVoiceSink {
-    async fn deliver(&self, from_immediate: NodeIdentifier, frame: VoiceFrame) {
-        let Some(server) = self.server.upgrade() else {
-            return;
-        };
-        crate::voice::route_s2s_voice_frame(&server, from_immediate, frame).await;
-    }
-}
-
 fn server_id_from_channel_topic(topic: &str) -> Option<String> {
     if topic == "channels" {
         Some(DEFAULT_SERVER_ID.to_owned())
@@ -1028,6 +1627,10 @@ fn channel_blob_topic(server_id: &str) -> String {
     } else {
         format!("channel_blobs:{server_id}")
     }
+}
+
+fn now_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
 #[derive(Clone)]
@@ -1276,11 +1879,20 @@ impl StrictReplicable for BanReplicationAdapter {
 struct ClientReplicationAdapter {
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
+    local_epoch: u64,
 }
 
 impl ClientReplicationAdapter {
-    fn new(clients: Arc<ClientRepository>, channels: Arc<ChannelRepository>) -> Self {
-        Self { clients, channels }
+    fn new(
+        clients: Arc<ClientRepository>,
+        channels: Arc<ChannelRepository>,
+        local_epoch: u64,
+    ) -> Self {
+        Self {
+            clients,
+            channels,
+            local_epoch,
+        }
     }
 }
 
@@ -1300,12 +1912,15 @@ impl OwnerReplicable for ClientReplicationAdapter {
 
     fn known_versions(&self) -> HashMap<NodeIdentifier, (u64, u64)> {
         let clients = self.clients.clone();
+        let local_node = self.clients.local_node_id();
+        let local_epoch = self.local_epoch;
         block_in_place_or_current(|handle| {
             let (_, versions) = handle.block_on(clients.snapshot_with_versions());
             versions
-                .into_iter()
-                .map(|(node, version)| (node, (0, version)))
-                .collect()
+                .get(&local_node)
+                .copied()
+                .map(|version| HashMap::from([(local_node, (local_epoch, version))]))
+                .unwrap_or_default()
         })
         .unwrap_or_default()
     }
@@ -1319,7 +1934,7 @@ impl OwnerReplicable for ClientReplicationAdapter {
                 entries.into_iter().map(|entry| (*entry).clone()).collect();
             let bytes =
                 Bytes::from(rmp_serde::to_vec(&ClientOriginSnapshot { version, entries }).ok()?);
-            Some((0, version, bytes))
+            Some((self.local_epoch, version, bytes))
         })
         .flatten()
         .filter(|_| origin == self.clients.local_node_id())

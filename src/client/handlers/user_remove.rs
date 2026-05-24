@@ -75,31 +75,19 @@ pub async fn handle_user_remove(
     // RemoveClient log entry, in turn, broadcasts UserRemove to all
     // subscribers via owner-scoped replication.
     if target_session.get_node_id() != local_node_id {
-        if let Some(app) = server.s2s_manager().application() {
-            let patch = crate::s2s::application::proto::UserRemovePatch {
-                reason: msg.reason.clone().map(Into::into),
-                ban: is_ban,
-            };
-            if let Err(e) = app
-                .moderation()
-                .dispatch_user_remove(
-                    Some(&server_id),
-                    sender.get_session_id(),
-                    target_session,
-                    patch,
-                )
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    target = target_raw,
-                    "moderation dispatch_user_remove failed",
-                );
-            }
-        } else {
+        let patch = crate::s2s::application::proto::UserRemovePatch {
+            reason: msg.reason.clone().map(Into::into),
+            ban: is_ban,
+        };
+        if !server.s2s_manager().dispatch_moderation_user_remove(
+            Some(&server_id),
+            sender.get_session_id(),
+            target_session,
+            patch,
+        ) {
             tracing::trace!(
                 target = target_raw,
-                "cross-owner UserRemove dropped: ApplicationLayer not attached",
+                "cross-owner UserRemove dropped: S2S gateway unavailable",
             );
         }
         return Ok(());

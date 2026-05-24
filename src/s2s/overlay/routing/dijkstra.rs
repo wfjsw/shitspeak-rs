@@ -1,7 +1,7 @@
 //! Per-service-level shortest-path computation over the LSDB graph.
 //!
 //! For each `ServiceLevel`, we run a single-source Dijkstra from the
-//! local node. The default cost function and the per-edge admission
+//! local node. The default cost functions and the per-edge admission
 //! filter depend on the level:
 //!
 //! * `Reliable`: `rtt_us + cfg.reliable_throughput_penalty_us_kbps /
@@ -21,7 +21,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::s2s::transport::{
-    conversational_effective_delay_us, conversational_impairment, ServiceLevel,
+    apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,
+    ServiceLevel,
 };
 use crate::types::NodeIdentifier;
 
@@ -133,7 +134,13 @@ pub fn compute(
     level: ServiceLevel,
     cfg: &OverlayConfig,
 ) -> HashMap<NodeIdentifier, RouteEntry> {
-    compute_with_metric(lsdb, self_id, level, RoutingMetric::PerServiceCost, cfg)
+    compute_with_metric(
+        lsdb,
+        self_id,
+        level,
+        RoutingMetric::default_for_level(level),
+        cfg,
+    )
 }
 
 /// Compute the shortest-path table with an explicit route-selection metric.
@@ -165,10 +172,13 @@ pub(crate) fn compute_on_graph(
     for (origin, links) in graph.links_by_origin() {
         let mut edges = Vec::new();
         for link in links {
-            if !graph.is_active(link.neighbor) || link.transports_mask & mask == 0 {
+            if !graph.is_active(link.neighbor)
+                || link.transports_mask & mask == 0
+                || link.loss_ppm >= cfg.max_route_packet_loss_ppm()
+            {
                 continue;
             }
-            let cost = compute_cost(link, level, metric, cfg);
+            let cost = compute_cost(link, metric, cfg);
             edges.push((link.neighbor, cost));
         }
         adj.insert(origin, edges);
@@ -229,15 +239,16 @@ pub(crate) fn compute_on_graph(
     out
 }
 
-fn compute_cost(
-    link: &LinkAdvertised,
-    level: ServiceLevel,
-    metric: RoutingMetric,
-    cfg: &OverlayConfig,
-) -> EdgeCost {
+fn compute_cost(link: &LinkAdvertised, metric: RoutingMetric, cfg: &OverlayConfig) -> EdgeCost {
     let primary = match metric {
-        RoutingMetric::PerServiceCost => {
-            compute_per_service_cost(link.rtt_us, link.jitter_us, link.throughput_bps, level, cfg)
+        RoutingMetric::ReliableCost => {
+            compute_reliable_cost(link.rtt_us, link.throughput_bps, link.loss_ppm, cfg)
+        }
+        RoutingMetric::ReliableLowLatencyCost => {
+            compute_reliable_low_latency_cost(link.rtt_us, link.jitter_us, link.loss_ppm, cfg)
+        }
+        RoutingMetric::BestEffortCost => {
+            apply_packet_loss_penalty(link.rtt_us.max(1) as f64, link.loss_ppm).ceil() as u64
         }
         RoutingMetric::ConversationalQuality => (conversational_impairment(
             link.rtt_us as f64,
@@ -249,7 +260,9 @@ fn compute_cost(
             .max(1.0) as u64,
     };
     let latency_us = match metric {
-        RoutingMetric::PerServiceCost => link.rtt_us.max(1),
+        RoutingMetric::ReliableCost
+        | RoutingMetric::ReliableLowLatencyCost
+        | RoutingMetric::BestEffortCost => link.rtt_us.max(1),
         RoutingMetric::ConversationalQuality => {
             conversational_effective_delay_us(link.rtt_us as f64, link.jitter_us as f64).max(1)
         }
@@ -260,25 +273,25 @@ fn compute_cost(
     }
 }
 
-fn compute_per_service_cost(
+fn compute_reliable_low_latency_cost(
     rtt_us: u64,
     jitter_us: u64,
-    throughput_bps: u64,
-    level: ServiceLevel,
+    loss_ppm: u32,
     cfg: &OverlayConfig,
 ) -> u64 {
-    match level {
-        ServiceLevel::BestEffort => rtt_us.max(1),
-        ServiceLevel::ReliableLowLatency => {
-            let weighted_jitter = (cfg.rll_jitter_weight() * jitter_us as f64) as u64;
-            (rtt_us + weighted_jitter).max(1)
-        }
-        ServiceLevel::Reliable => {
-            let throughput_kbps = (throughput_bps as f64 / 1024.0).max(1.0);
-            let penalty = (cfg.reliable_throughput_penalty_us_kbps() / throughput_kbps) as u64;
-            (rtt_us + penalty).max(1)
-        }
-    }
+    let weighted_jitter = (cfg.rll_jitter_weight() * jitter_us as f64) as u64;
+    apply_packet_loss_penalty((rtt_us + weighted_jitter).max(1) as f64, loss_ppm).ceil() as u64
+}
+
+fn compute_reliable_cost(
+    rtt_us: u64,
+    throughput_bps: u64,
+    loss_ppm: u32,
+    cfg: &OverlayConfig,
+) -> u64 {
+    let throughput_kbps = (throughput_bps as f64 / 1024.0).max(1.0);
+    let penalty = (cfg.reliable_throughput_penalty_us_kbps() / throughput_kbps) as u64;
+    apply_packet_loss_penalty((rtt_us + penalty).max(1) as f64, loss_ppm).ceil() as u64
 }
 
 #[cfg(test)]
@@ -443,6 +456,52 @@ mod tests {
             &cfg(),
         );
         assert_eq!(conversational[&2].next_hop, 2);
+    }
+
+    #[test]
+    fn default_metrics_penalize_packet_loss() {
+        // Direct 1->2 is lower RTT but 40% loss. The two-hop path via 3 has
+        // higher raw RTT and no loss, so the packet-loss penalty should win.
+        let db = build_db(vec![
+            entry_with_loss(
+                1,
+                100,
+                1,
+                vec![
+                    (2, 10_000, 0, 1_000_000, 400_000),
+                    (3, 12_000, 0, 1_000_000, 0),
+                ],
+            ),
+            entry_with_loss(
+                2,
+                100,
+                1,
+                vec![
+                    (1, 10_000, 0, 1_000_000, 400_000),
+                    (3, 1_000, 0, 1_000_000, 0),
+                ],
+            ),
+            entry_with_loss(
+                3,
+                100,
+                1,
+                vec![(1, 12_000, 0, 1_000_000, 0), (2, 1_000, 0, 1_000_000, 0)],
+            ),
+        ]);
+
+        let table = compute(&db, 1, ServiceLevel::BestEffort, &cfg());
+        assert_eq!(table[&2].next_hop, 3);
+    }
+
+    #[test]
+    fn excessive_packet_loss_makes_link_unavailable() {
+        let db = build_db(vec![
+            entry_with_loss(1, 100, 1, vec![(2, 1_000, 0, 1_000_000, 600_000)]),
+            entry_with_loss(2, 100, 1, vec![(1, 1_000, 0, 1_000_000, 600_000)]),
+        ]);
+
+        let table = compute(&db, 1, ServiceLevel::BestEffort, &cfg());
+        assert!(!table.contains_key(&2));
     }
 
     #[test]

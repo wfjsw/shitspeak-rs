@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
@@ -115,6 +115,7 @@ struct PendingPings {
 
 #[derive(Debug, Clone, Copy)]
 struct PendingPing {
+    sent_at: Instant,
     shape: Option<ServiceShape>,
     payload_bytes: usize,
 }
@@ -126,21 +127,47 @@ impl PendingPings {
             cap,
         }
     }
-    fn insert(&mut self, ts_us: u64, shape: Option<ServiceShape>, payload_bytes: usize) {
-        if self.inner.len() >= self.cap {
-            self.inner.pop_front();
+    fn insert(
+        &mut self,
+        ts_us: u64,
+        shape: Option<ServiceShape>,
+        payload_bytes: usize,
+    ) -> Option<PendingPing> {
+        if self.cap == 0 {
+            return None;
         }
+        let evicted = if self.inner.len() >= self.cap {
+            self.inner.pop_front().map(|(_, pending)| pending)
+        } else {
+            None
+        };
         self.inner.push_back((
             ts_us,
             PendingPing {
+                sent_at: Instant::now(),
                 shape,
                 payload_bytes,
             },
         ));
+        evicted
     }
     fn take(&mut self, ts_us: u64) -> Option<PendingPing> {
         let pos = self.inner.iter().position(|(t, _)| *t == ts_us)?;
         self.inner.remove(pos).map(|(_, pending)| pending)
+    }
+
+    fn expire_older_than(&mut self, timeout: Duration) -> usize {
+        let now = Instant::now();
+        let mut expired = 0;
+        while self
+            .inner
+            .front()
+            .is_some_and(|(_, pending)| now.saturating_duration_since(pending.sent_at) >= timeout)
+        {
+            self.inner.pop_front();
+            expired += 1;
+        }
+        expired
     }
 }
 
@@ -211,6 +238,10 @@ async fn run_pump<S>(
         MaybeInterval::Disabled
     };
     let mut pending = PendingPings::new(cfg.max_pending_pings);
+    let pending_timeout = cfg
+        .ping_interval
+        .saturating_mul(2)
+        .max(Duration::from_secs(1));
     let level_for_metrics = cfg.transport.service_level();
 
     let hello = build_frame(
@@ -304,6 +335,7 @@ async fn run_pump<S>(
             }
 
             _ = ping_tick.tick() => {
+                record_expired_pending(&mut pending, pending_timeout, cfg.transport, &peer);
                 let ts = now_us();
                 let frame = build_frame(
                     cfg.local_node,
@@ -316,7 +348,11 @@ async fn run_pump<S>(
                     Bytes::new(),
                 );
                 match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
-                    Ok(_) => pending.insert(ts, None, 0),
+                    Ok(_) => {
+                        if pending.insert(ts, None, 0).is_some() {
+                            peer.metrics().record_probe_lost(cfg.transport);
+                        }
+                    }
                     Err(e) => {
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "keepalive write failed");
                         break;
@@ -325,6 +361,7 @@ async fn run_pump<S>(
             }
 
             _ = probe_tick.tick() => {
+                record_expired_pending(&mut pending, pending_timeout, cfg.transport, &peer);
                 let mut ts = now_us();
                 for shape in ServiceShape::ALL {
                     let payload_bytes = shape.probe_payload_bytes(cfg.bandwidth_probe_size);
@@ -346,7 +383,11 @@ async fn run_pump<S>(
                         continue;
                     }
                     match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
-                        Ok(_) => pending.insert(ts, Some(shape), payload_bytes),
+                        Ok(_) => {
+                            if pending.insert(ts, Some(shape), payload_bytes).is_some() {
+                                peer.metrics().record_probe_lost(cfg.transport);
+                            }
+                        }
                         Err(e) => {
                             warn!(peer=%peer.node_id(), transport=?cfg.transport, service=%shape.name(), error=%e, "probe write failed");
                             break;
@@ -360,6 +401,17 @@ async fn run_pump<S>(
 
     closed.cancel();
     trace!(peer=%peer.node_id(), transport=?cfg.transport, "stream pump exiting");
+}
+
+fn record_expired_pending(
+    pending: &mut PendingPings,
+    timeout: Duration,
+    transport: TransportKind,
+    peer: &PeerState,
+) {
+    for _ in 0..pending.expire_older_than(timeout) {
+        peer.metrics().record_probe_lost(transport);
+    }
 }
 
 async fn encode_and_send<S>(
@@ -450,6 +502,7 @@ where
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(cfg.transport, rtt);
                 if let Some(pending) = pending.take(frame.ts_us) {
+                    peer.metrics().record_probe_delivered(cfg.transport);
                     if let Some(shape) = pending.shape {
                         peer.metrics().record_probe(
                             cfg.transport,

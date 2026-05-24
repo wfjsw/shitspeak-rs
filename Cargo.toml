@@ -48,8 +48,6 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-dtls = "0.17.1"
-webrtc-util = "0.17.1"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
 rand = "0.10.1"
 arc-swap = "1"
@@ -88,3 +86,17 @@ harness = false
 [[bench]]
 name = "voice_e2e"
 harness = false
+
+[profile.dev]
+incremental = false
+
+[profile.release]
+incremental = false
+
+[profile.test]
+incremental = false
+
+[profile.bench]
+incremental = false
+
+

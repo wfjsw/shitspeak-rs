@@ -937,7 +937,7 @@ impl Server {
         let _ = udp_process.await;
         let _ = idle_reaper.await;
         let _ = pending_delete_watchdog.await;
-        let _ = s2s_task.await;
+        s2s_task.join().await;
         let _ = register_task.await;
 
         Ok(())
@@ -1910,8 +1910,19 @@ impl Server {
                                 if entry.op.server_id() != client.server_id() {
                                     continue;
                                 }
-                                let last_seen = client.get_last_client_versions().await;
-                                let last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
+                                let mut last_seen = client.get_last_client_versions().await;
+                                let mut last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
+                                // Owner-scoped S2S logs restart from version 1 after a node
+                                // reboot, so connected clients must forget the old incarnation.
+                                if broadcast
+                                    .versions
+                                    .get(&entry.node_id)
+                                    .is_some_and(|current| *current < last_for_node)
+                                {
+                                    client.remove_last_client_version(entry.node_id).await;
+                                    last_seen.remove(&entry.node_id);
+                                    last_for_node = 0;
+                                }
                                 if entry.version <= last_for_node {
                                     continue;
                                 }

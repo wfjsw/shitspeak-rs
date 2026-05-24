@@ -18,6 +18,8 @@ pub enum ServiceLevel {
 }
 
 impl ServiceLevel {
+    pub const ALL: [Self; 3] = [Self::Reliable, Self::ReliableLowLatency, Self::BestEffort];
+
     /// True when a transport providing `self` can satisfy a `requested` level.
     #[inline]
     pub fn satisfies(self, requested: ServiceLevel) -> bool {
@@ -27,14 +29,47 @@ impl ServiceLevel {
 
 /// Route-selection metric used in addition to [`ServiceLevel`].
 ///
-/// The default preserves the per-service cost formulas. Upper layers can
-/// request a different metric when the payload has different quality needs,
+/// Each default service-level policy has its own metric identity. Upper layers
+/// can request a different metric when the payload has different quality needs,
 /// for example conversational voice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoutingMetric {
-    #[default]
-    PerServiceCost,
+    ReliableCost,
+    ReliableLowLatencyCost,
+    BestEffortCost,
     ConversationalQuality,
+}
+
+impl RoutingMetric {
+    pub const ALL: [Self; 4] = [
+        Self::ReliableCost,
+        Self::ReliableLowLatencyCost,
+        Self::BestEffortCost,
+        Self::ConversationalQuality,
+    ];
+
+    pub fn default_for_level(level: ServiceLevel) -> Self {
+        match level {
+            ServiceLevel::Reliable => Self::ReliableCost,
+            ServiceLevel::ReliableLowLatency => Self::ReliableLowLatencyCost,
+            ServiceLevel::BestEffort => Self::BestEffortCost,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ReliableCost => "reliable",
+            Self::ReliableLowLatencyCost => "reliable_low_latency",
+            Self::BestEffortCost => "best_effort",
+            Self::ConversationalQuality => "conversational",
+        }
+    }
+}
+
+impl Default for RoutingMetric {
+    fn default() -> Self {
+        Self::ReliableCost
+    }
 }
 
 /// Wire transport flavor.

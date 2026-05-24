@@ -444,8 +444,9 @@ impl ConnectionManager {
     }
 
     /// Send a `Data` frame using the best live transport under the sender's
-    /// selected routing metric. Uses [`RoutingMetric::PerServiceCost`] when
-    /// `routing_metric` is `None`. If the first acceptable transport closes or
+    /// selected routing metric. Uses the service level's default
+    /// [`RoutingMetric`] when `routing_metric` is `None`. If the first
+    /// acceptable transport closes or
     /// is full before enqueue, retry the next acceptable transport.
     pub async fn send(
         &self,
@@ -455,7 +456,8 @@ impl ConnectionManager {
         class: MessageClass,
         payload: Bytes,
     ) -> Result<(), SendError> {
-        let routing_metric = routing_metric.unwrap_or(RoutingMetric::PerServiceCost);
+        let routing_metric =
+            routing_metric.unwrap_or_else(|| RoutingMetric::default_for_level(level));
         let peer = self
             .inner
             .get_peer(node)
@@ -834,7 +836,7 @@ mod tests {
             peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Quic]);
 
         assert_eq!(
-            pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::PerServiceCost),
+            pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::ReliableCost),
             Some(TransportKind::Tcp)
         );
     }
@@ -862,7 +864,7 @@ mod tests {
         );
 
         assert_eq!(
-            pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::PerServiceCost),
+            pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::ReliableCost),
             Some(TransportKind::Quic)
         );
     }
@@ -885,7 +887,7 @@ mod tests {
             pick_transport(
                 &peer,
                 ServiceLevel::BestEffort,
-                RoutingMetric::PerServiceCost
+                RoutingMetric::BestEffortCost
             ),
             Some(TransportKind::Udp)
         );

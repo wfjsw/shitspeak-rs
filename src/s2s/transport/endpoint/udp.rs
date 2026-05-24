@@ -1,51 +1,68 @@
-//! UDP + DTLS endpoint.
+//! UDP packet-encryption endpoint.
 //!
-//! Every UDP datagram is encrypted under a DTLS 1.2 session that uses the
-//! same CA + node certificate as the stream transports — peer identity is
-//! the X.509 Subject CN, parsed as `NodeIdentifier`. dtls's
-//! `Listener` does the per-source demultiplex on a single bound socket and
-//! drives the handshake; for outbound dials we bind from the configured UDP
-//! transport port when one is available and run the DTLS client side over it.
+//! UDP remains connectionless at the wire level: every datagram carries a
+//! small authenticated header and one encrypted protobuf transport frame.
+//! AEAD keys come from a signed ephemeral X25519 exchange using the same
+//! certificate identity as the stream transports. The per-peer route object
+//! exists only to hold send queues, AEAD keys, replay windows, and probe
+//! bookkeeping; it does not represent a DTLS-style connection.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use aws_lc_rs::agreement;
+use aws_lc_rs::digest;
+use aws_lc_rs::hkdf;
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature;
 use bytes::Bytes;
-use dtls::conn::DTLSConn;
 use prost::Message as _;
+use rustls::SignatureScheme;
+use rustls_pki_types::CertificateDer;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{interval, Interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
-use webrtc_util::conn::Listener as UtilListener;
-use webrtc_util::Buffer;
-use webrtc_util::Conn as UtilConn;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
-use super::super::dtls_config::{
-    build_client_dtls_config, build_server_dtls_config, peer_node_id_from_dtls,
-};
 use super::super::frame::{build_frame, FrameType};
-use super::super::identity::NodeIdentity;
+use super::super::identity::{parse_peer_cn, NodeIdentity};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
 use super::super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
-use super::{bind_reusable_udp_socket, bind_transport_udp_socket, Endpoint};
+use super::super::tls;
+use super::{bind_reusable_udp_socket, Endpoint};
 
-/// UDP+DTLS endpoint. Owns the loaded `NodeIdentity` (used to build server
-/// and client DTLS configs) and the listen address.
+const MAGIC: [u8; 4] = *b"SSU1";
+const HEADER_LEN: usize = 20;
+const TAG_LEN: usize = 16;
+const X25519_PUBLIC_KEY_LEN: usize = 32;
+const MAX_HANDSHAKE_DATAGRAM: usize = 16 * 1024;
+const KEX_TRANSCRIPT_DOMAIN: &[u8] = b"shitspeak-s2s-udp-kex-v1";
+const KEX_KEY_INFO: &[u8] = b"shitspeak-s2s-udp-packet-keys-v1";
+const SUPPORTED_SIGNATURE_SCHEMES: &[SignatureScheme] = &[
+    SignatureScheme::ECDSA_NISTP256_SHA256,
+    SignatureScheme::ECDSA_NISTP384_SHA384,
+    SignatureScheme::ECDSA_NISTP521_SHA512,
+    SignatureScheme::ED25519,
+    SignatureScheme::RSA_PSS_SHA256,
+    SignatureScheme::RSA_PKCS1_SHA256,
+];
+
 pub(crate) struct UdpEndpoint {
     identity: Arc<NodeIdentity>,
     listen_addr: Option<SocketAddr>,
+    sockets: Mutex<UdpSocketSet>,
 }
 
 impl UdpEndpoint {
@@ -53,7 +70,29 @@ impl UdpEndpoint {
         Self {
             identity,
             listen_addr,
+            sockets: Mutex::new(UdpSocketSet::default()),
         }
+    }
+
+    async fn ensure_socket(
+        &self,
+        remote_addr: SocketAddr,
+        inner: Arc<ManagerInner>,
+    ) -> io::Result<Arc<UdpSocketState>> {
+        let mut sockets = self.sockets.lock().await;
+        if let Some(existing) = sockets.for_addr(remote_addr) {
+            return Ok(existing.clone());
+        }
+
+        let bind_addr = bind_addr_for_udp_socket(self.listen_addr, remote_addr);
+        let state = Arc::new(UdpSocketState::bind(bind_addr).await?);
+        sockets.set_for_addr(remote_addr, state.clone());
+        tokio::spawn(run_socket_read_loop(
+            state.clone(),
+            inner,
+            self.identity.clone(),
+        ));
+        Ok(state)
     }
 }
 
@@ -68,13 +107,8 @@ impl Endpoint for UdpEndpoint {
             let Some(addr) = self.listen_addr else {
                 return Ok(());
             };
-            let server_cfg = build_server_dtls_config(&self.identity, inner.cfg().udp_mtu())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
-            let parent = Arc::new(ReusableUdpListener::bind(addr).await?);
-            let listener = dtls::listener::DTLSListener::new(parent, server_cfg)
-                .map_err(|e| io::Error::other(format!("udp dtls listen: {e}")))?;
-            debug!(%addr, "udp dtls listener up");
-            tokio::spawn(accept_loop(listener, inner));
+            self.ensure_socket(addr, inner).await?;
+            debug!(%addr, "udp packet-encryption listener up");
             Ok(())
         }
     }
@@ -86,409 +120,1552 @@ impl Endpoint for UdpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let socket = bind_transport_udp_socket(self.listen_addr, addr).await?;
-            socket.connect(addr).await?;
-            let conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(socket);
-
-            let server_name = format!("node-{}", peer.node_id());
-            let client_cfg =
-                build_client_dtls_config(&self.identity, server_name, inner.cfg().udp_mtu())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
-
-            let dtls_conn = DTLSConn::new(conn, client_cfg, true, None)
-                .await
-                .map_err(|e| io::Error::other(format!("dtls handshake: {e}")))?;
-            let peer_node = peer_node_id_from_dtls(&dtls_conn)
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
-            if peer_node != peer.node_id() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("peer cn {peer_node} != expected {}", peer.node_id()),
-                ));
-            }
-            let dyn_conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(dtls_conn);
-            install_session(&inner, peer_node, addr, true, dyn_conn);
-            Ok(())
+            let socket = self.ensure_socket(addr, inner.clone()).await?;
+            let completion =
+                start_key_exchange(&inner, &self.identity, socket, peer.node_id(), addr).await?;
+            completion.await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "udp signed key exchange was cancelled",
+                )
+            })?
         }
     }
 
     fn dial_unidentified(
         self: Arc<Self>,
-        inner: Arc<ManagerInner>,
-        addr: SocketAddr,
+        _inner: Arc<ManagerInner>,
+        _addr: SocketAddr,
     ) -> impl Future<Output = io::Result<NodeIdentifier>> + Send {
         async move {
-            let socket = bind_transport_udp_socket(self.listen_addr, addr).await?;
-            socket.connect(addr).await?;
-            let conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(socket);
-
-            let client_cfg = build_client_dtls_config(
-                &self.identity,
-                "s2s-seed.local".to_string(),
-                inner.cfg().udp_mtu(),
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
-
-            let dtls_conn = DTLSConn::new(conn, client_cfg, true, None)
-                .await
-                .map_err(|e| io::Error::other(format!("dtls handshake: {e}")))?;
-            let peer_node = peer_node_id_from_dtls(&dtls_conn)
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
-            if peer_node == inner.self_id() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "self-loop rejected",
-                ));
-            }
-            let dyn_conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(dtls_conn);
-            install_session(&inner, peer_node, addr, true, dyn_conn);
-            Ok(peer_node)
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "udp packet encryption requires a known peer node id",
+            ))
         }
     }
 }
 
-struct ReusableUdpListener {
-    pconn: Arc<dyn UtilConn + Send + Sync>,
-    accept_rx: Mutex<mpsc::Receiver<Arc<BufferedUdpConn>>>,
-    shutdown: CancellationToken,
-    accepting: Arc<AtomicBool>,
+#[derive(Default)]
+struct UdpSocketSet {
+    ipv4: Option<Arc<UdpSocketState>>,
+    ipv6: Option<Arc<UdpSocketState>>,
 }
 
-impl ReusableUdpListener {
+impl UdpSocketSet {
+    fn for_addr(&self, addr: SocketAddr) -> Option<&Arc<UdpSocketState>> {
+        if addr.is_ipv4() {
+            self.ipv4.as_ref()
+        } else {
+            self.ipv6.as_ref()
+        }
+    }
+
+    fn set_for_addr(&mut self, addr: SocketAddr, state: Arc<UdpSocketState>) {
+        if addr.is_ipv4() {
+            self.ipv4 = Some(state);
+        } else {
+            self.ipv6 = Some(state);
+        }
+    }
+}
+
+fn bind_addr_for_udp_socket(
+    listen_addr: Option<SocketAddr>,
+    remote_addr: SocketAddr,
+) -> SocketAddr {
+    listen_addr
+        .filter(|addr| addr.is_ipv4() == remote_addr.is_ipv4())
+        .unwrap_or_else(|| {
+            if remote_addr.is_ipv4() {
+                SocketAddr::from(([0, 0, 0, 0], 0))
+            } else {
+                SocketAddr::from(([0u16; 8], 0))
+            }
+        })
+}
+
+struct UdpSocketState {
+    socket: Arc<UdpSocket>,
+    sessions: Mutex<HashMap<NodeIdentifier, Arc<UdpCryptoSession>>>,
+    exchanges: Mutex<HashMap<NodeIdentifier, PeerKeyExchange>>,
+    shutdown: CancellationToken,
+}
+
+impl UdpSocketState {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let socket = bind_reusable_udp_socket(addr).await?;
-        let pconn: Arc<dyn UtilConn + Send + Sync> = Arc::new(socket);
-        let (accept_tx, accept_rx) = mpsc::channel(128);
-        let shutdown = CancellationToken::new();
-        let accepting = Arc::new(AtomicBool::new(true));
-        let conns = Arc::new(Mutex::new(HashMap::new()));
-
-        tokio::spawn(reusable_udp_read_loop(
-            pconn.clone(),
-            accept_tx,
-            conns,
-            shutdown.clone(),
-            accepting.clone(),
-        ));
-
         Ok(Self {
-            pconn,
-            accept_rx: Mutex::new(accept_rx),
-            shutdown,
-            accepting,
+            socket: Arc::new(bind_reusable_udp_socket(addr).await?),
+            sessions: Mutex::new(HashMap::new()),
+            exchanges: Mutex::new(HashMap::new()),
+            shutdown: CancellationToken::new(),
+        })
+    }
+
+    async fn session(&self, node: NodeIdentifier) -> Option<Arc<UdpCryptoSession>> {
+        self.sessions.lock().await.get(&node).cloned()
+    }
+
+    async fn insert_session(&self, session: Arc<UdpCryptoSession>) {
+        self.sessions
+            .lock()
+            .await
+            .insert(session.peer_node, session);
+    }
+}
+
+#[derive(Default)]
+struct PeerKeyExchange {
+    local: Option<LocalKeyOffer>,
+    peer: Option<PeerKeyOffer>,
+    candidate: Option<KeyCandidate>,
+    early_ready: Vec<Vec<u8>>,
+    waiters: Vec<oneshot::Sender<io::Result<()>>>,
+    local_initiated: bool,
+}
+
+struct LocalKeyOffer {
+    offer_id: u64,
+    private_key: Option<agreement::EphemeralPrivateKey>,
+    public_key: Vec<u8>,
+    packet: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct PeerKeyOffer {
+    offer_id: u64,
+    public_key: Vec<u8>,
+}
+
+impl PeerKeyOffer {
+    fn matches(&self, other: &Self) -> bool {
+        self.offer_id == other.offer_id && self.public_key == other.public_key
+    }
+}
+
+struct KeyCandidate {
+    exchange_id: u64,
+    peer_addr: SocketAddr,
+    seal_key: [u8; 32],
+    open_key: [u8; 32],
+    ready_packet: Vec<u8>,
+    ready_received: bool,
+    promoted: bool,
+}
+
+struct PromoteSession {
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+    is_dialer: bool,
+    seal_key: [u8; 32],
+    open_key: [u8; 32],
+    accepted_seq: Option<u64>,
+    waiters: Vec<oneshot::Sender<io::Result<()>>>,
+}
+
+struct UdpCryptoSession {
+    peer_node: NodeIdentifier,
+    peer_addr: parking_lot::Mutex<SocketAddr>,
+    socket: Arc<UdpSocket>,
+    seal_key: LessSafeKey,
+    open_key: LessSafeKey,
+    send_seq: AtomicU64,
+    replay: parking_lot::Mutex<ReplayWindow>,
+    pending: Arc<parking_lot::Mutex<PendingPings>>,
+}
+
+impl UdpCryptoSession {
+    fn new(
+        peer_node: NodeIdentifier,
+        peer_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
+        seal_key: [u8; 32],
+        open_key: [u8; 32],
+        max_pending_pings: usize,
+    ) -> io::Result<Self> {
+        let seal_key = aead_key(&seal_key)?;
+        let open_key = aead_key(&open_key)?;
+        Ok(Self {
+            peer_node,
+            peer_addr: parking_lot::Mutex::new(peer_addr),
+            socket,
+            seal_key,
+            open_key,
+            send_seq: AtomicU64::new(1),
+            replay: parking_lot::Mutex::new(ReplayWindow::default()),
+            pending: Arc::new(parking_lot::Mutex::new(PendingPings::new(
+                max_pending_pings,
+            ))),
+        })
+    }
+
+    fn update_addr(&self, addr: SocketAddr) {
+        *self.peer_addr.lock() = addr;
+    }
+
+    async fn send_frame(
+        &self,
+        frame: &pb::Frame,
+        peer: &PeerState,
+        udp_mtu: usize,
+    ) -> io::Result<usize> {
+        let datagram = self.encrypt_frame(frame, udp_mtu)?;
+        let addr = *self.peer_addr.lock();
+        let n = self
+            .socket
+            .send_to(&datagram, addr)
+            .await
+            .map_err(|e| io::Error::other(format!("udp send: {e}")))?;
+        peer.metrics().record_sent(TransportKind::Udp, n);
+        Ok(n)
+    }
+
+    fn encrypt_frame(&self, frame: &pb::Frame, udp_mtu: usize) -> io::Result<Vec<u8>> {
+        let mut plaintext = Vec::with_capacity(frame.encoded_len());
+        frame
+            .encode(&mut plaintext)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
+        let header = UdpPacketHeader {
+            kind: UdpPacketKind::Data,
+            src: frame.src_node as NodeIdentifier,
+            dst: frame.dst_node as NodeIdentifier,
+            seq,
+        };
+        let header_bytes = header.encode();
+        if HEADER_LEN + plaintext.len() + TAG_LEN > udp_mtu {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "encrypted frame {} > udp_mtu {}",
+                    HEADER_LEN + plaintext.len() + TAG_LEN,
+                    udp_mtu
+                ),
+            ));
+        }
+        let mut ciphertext = plaintext;
+        let nonce = packet_nonce(header.kind, header.src, header.dst, header.seq)?;
+        self.seal_key
+            .seal_in_place_append_tag(nonce, Aad::from(header_bytes), &mut ciphertext)
+            .map_err(|_| io::Error::other("udp packet encryption failed"))?;
+        let mut datagram = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+        datagram.extend_from_slice(&header_bytes);
+        datagram.extend_from_slice(&ciphertext);
+        Ok(datagram)
+    }
+
+    fn decrypt_packet(&self, packet: &[u8], header: UdpPacketHeader) -> io::Result<Vec<u8>> {
+        if header.kind != UdpPacketKind::Data {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "udp non-data packet on encrypted path",
+            ));
+        }
+        if packet.len() < HEADER_LEN + TAG_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short udp encrypted packet",
+            ));
+        }
+        let mut ciphertext = packet[HEADER_LEN..].to_vec();
+        let nonce = packet_nonce(header.kind, header.src, header.dst, header.seq)?;
+        let plaintext = self
+            .open_key
+            .open_in_place(nonce, Aad::from(&packet[..HEADER_LEN]), &mut ciphertext)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "udp decrypt failed"))?;
+        if !self.replay.lock().accept(header.seq) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "replayed udp packet",
+            ));
+        }
+        Ok(plaintext.to_vec())
+    }
+}
+
+fn aead_key(key: &[u8; 32]) -> io::Result<LessSafeKey> {
+    let unbound = UnboundKey::new(&AES_256_GCM, key)
+        .map_err(|_| io::Error::other("udp AEAD key init failed"))?;
+    Ok(LessSafeKey::new(unbound))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpPacketKind {
+    KeyOffer = 1,
+    KeyReady = 2,
+    Data = 3,
+}
+
+impl UdpPacketKind {
+    fn decode(value: u8) -> io::Result<Self> {
+        match value {
+            1 => Ok(Self::KeyOffer),
+            2 => Ok(Self::KeyReady),
+            3 => Ok(Self::Data),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown udp packet kind",
+            )),
+        }
+    }
+
+    fn encode(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpPacketHeader {
+    kind: UdpPacketKind,
+    src: NodeIdentifier,
+    dst: NodeIdentifier,
+    seq: u64,
+}
+
+impl UdpPacketHeader {
+    fn decode(packet: &[u8]) -> io::Result<Self> {
+        if packet.len() < HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short udp packet",
+            ));
+        }
+        if packet[..4] != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad udp packet magic",
+            ));
+        }
+        let src = u16::from_be_bytes([packet[4], packet[5]]);
+        let dst = u16::from_be_bytes([packet[6], packet[7]]);
+        let seq = u64::from_be_bytes([
+            packet[8], packet[9], packet[10], packet[11], packet[12], packet[13], packet[14],
+            packet[15],
+        ]);
+        let kind = UdpPacketKind::decode(packet[16])?;
+        Ok(Self {
+            kind,
+            src,
+            dst,
+            seq,
+        })
+    }
+
+    fn encode(self) -> [u8; HEADER_LEN] {
+        let mut out = [0u8; HEADER_LEN];
+        out[..4].copy_from_slice(&MAGIC);
+        out[4..6].copy_from_slice(&self.src.to_be_bytes());
+        out[6..8].copy_from_slice(&self.dst.to_be_bytes());
+        out[8..16].copy_from_slice(&self.seq.to_be_bytes());
+        out[16] = self.kind.encode();
+        out
+    }
+}
+
+fn packet_nonce(
+    kind: UdpPacketKind,
+    src: NodeIdentifier,
+    dst: NodeIdentifier,
+    seq: u64,
+) -> io::Result<Nonce> {
+    let mut nonce = [0u8; 12];
+    nonce[..2].copy_from_slice(&src.to_be_bytes());
+    nonce[2..4].copy_from_slice(&dst.to_be_bytes());
+    let kind_domain = match kind {
+        UdpPacketKind::Data => 0u64,
+        UdpPacketKind::KeyReady => 1u64 << 62,
+        UdpPacketKind::KeyOffer => 2u64 << 62,
+    };
+    let seq = kind_domain | (seq & 0x3fff_ffff_ffff_ffff);
+    nonce[4..].copy_from_slice(&seq.to_be_bytes());
+    Nonce::try_assume_unique_for_key(&nonce)
+        .map_err(|_| io::Error::other("udp nonce construction failed"))
+}
+
+#[derive(Default)]
+struct ReplayWindow {
+    max_seen: u64,
+    seen: u128,
+}
+
+impl ReplayWindow {
+    fn accept(&mut self, seq: u64) -> bool {
+        if seq == 0 {
+            return false;
+        }
+        if self.max_seen == 0 {
+            self.max_seen = seq;
+            self.seen = 1;
+            return true;
+        }
+        if seq > self.max_seen {
+            let shift = (seq - self.max_seen).min(128);
+            self.seen = if shift == 128 {
+                1
+            } else {
+                (self.seen << shift) | 1
+            };
+            self.max_seen = seq;
+            return true;
+        }
+        let offset = self.max_seen - seq;
+        if offset >= 128 {
+            return false;
+        }
+        let bit = 1u128 << offset;
+        if self.seen & bit != 0 {
+            return false;
+        }
+        self.seen |= bit;
+        true
+    }
+}
+
+async fn run_socket_read_loop(
+    state: Arc<UdpSocketState>,
+    inner: Arc<ManagerInner>,
+    identity: Arc<NodeIdentity>,
+) {
+    let mut buf =
+        vec![0u8; inner.cfg().udp_mtu().max(MAX_HANDSHAKE_DATAGRAM) + HEADER_LEN + TAG_LEN];
+    loop {
+        tokio::select! {
+            _ = inner.shutdown().cancelled() => {
+                state.shutdown.cancel();
+                return;
+            }
+            result = state.socket.recv_from(&mut buf) => {
+                let (n, peer_addr) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error=%e, "udp encrypted socket read failed");
+                        return;
+                    }
+                };
+                if let Err(e) = handle_udp_datagram(
+                    &state,
+                    &inner,
+                    &identity,
+                    &buf[..n],
+                    peer_addr,
+                ).await {
+                    if e.kind() != io::ErrorKind::AlreadyExists {
+                        trace!(error=%e, %peer_addr, "ignored udp encrypted packet");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_udp_datagram(
+    state: &Arc<UdpSocketState>,
+    inner: &Arc<ManagerInner>,
+    identity: &Arc<NodeIdentity>,
+    packet: &[u8],
+    peer_addr: SocketAddr,
+) -> io::Result<()> {
+    let header = UdpPacketHeader::decode(packet)?;
+    match header.kind {
+        UdpPacketKind::KeyOffer => {
+            return handle_key_offer(state, inner, identity, packet, header, peer_addr).await;
+        }
+        UdpPacketKind::KeyReady => {
+            return handle_key_ready(state, inner, packet, header, peer_addr).await;
+        }
+        UdpPacketKind::Data => {}
+    }
+
+    if header.dst != inner.self_id() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp packet addressed to another node",
+        ));
+    }
+    if header.src == inner.self_id() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp self-loop rejected",
+        ));
+    }
+
+    let (session, plaintext) = match state.session(header.src).await {
+        Some(session) => {
+            session.update_addr(peer_addr);
+            match session.decrypt_packet(packet, header) {
+                Ok(plaintext) => (session, plaintext),
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                    match decrypt_with_candidate_data(state, inner, packet, header, peer_addr)
+                        .await?
+                    {
+                        Some(v) => v,
+                        None => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        None => match decrypt_with_candidate_data(state, inner, packet, header, peer_addr).await? {
+            Some(v) => v,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "udp data arrived before signed key exchange",
+                ));
+            }
+        },
+    };
+
+    let frame = pb::Frame::decode(&plaintext[..])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if frame.src_node != u32::from(header.src) || frame.dst_node != u32::from(inner.self_id()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp encrypted frame/header mismatch",
+        ));
+    }
+    let peer = inner.get_or_create_peer(header.src);
+    peer.metrics().record_recv(TransportKind::Udp, packet.len());
+    handle_frame(
+        frame,
+        &session,
+        inner.self_id(),
+        &peer,
+        inner.inbound(),
+        TransportKind::Udp.service_level(),
+        inner.cfg().udp_mtu(),
+    )
+    .await
+}
+
+async fn handle_key_offer(
+    state: &Arc<UdpSocketState>,
+    inner: &Arc<ManagerInner>,
+    identity: &Arc<NodeIdentity>,
+    packet: &[u8],
+    header: UdpPacketHeader,
+    peer_addr: SocketAddr,
+) -> io::Result<()> {
+    validate_exchange_header(header, inner.self_id())?;
+    let offer = UdpHandshakeBody::decode(packet)?;
+    verify_peer_identity(identity, &offer.cert_chain, header.src)?;
+
+    let transcript = offer_transcript(header.src, header.dst, header.seq, &offer.ephemeral_public);
+    verify_transcript_signature(
+        &offer.cert_chain,
+        offer.signature_scheme,
+        &transcript,
+        &offer.signature,
+    )?;
+
+    let peer_offer = PeerKeyOffer {
+        offer_id: header.seq,
+        public_key: offer.ephemeral_public,
+    };
+    let (packets, promote) = accept_peer_offer(
+        state,
+        identity,
+        inner.self_id(),
+        header.src,
+        peer_addr,
+        peer_offer,
+    )
+    .await?;
+
+    send_exchange_packets(state, header.src, peer_addr, packets).await?;
+    if let Some(promote) = promote {
+        promote_exchange(inner, state, promote).await?;
+    }
+    Ok(())
+}
+
+async fn handle_key_ready(
+    state: &Arc<UdpSocketState>,
+    inner: &Arc<ManagerInner>,
+    packet: &[u8],
+    header: UdpPacketHeader,
+    peer_addr: SocketAddr,
+) -> io::Result<()> {
+    validate_exchange_header(header, inner.self_id())?;
+    let (packets, promote) = accept_key_ready(
+        state,
+        inner.self_id(),
+        header.src,
+        peer_addr,
+        packet,
+        header,
+    )
+    .await?;
+    send_exchange_packets(state, header.src, peer_addr, packets).await?;
+    if let Some(promote) = promote {
+        promote_exchange(inner, state, promote).await?;
+    }
+    Ok(())
+}
+
+fn validate_exchange_header(header: UdpPacketHeader, local_id: NodeIdentifier) -> io::Result<()> {
+    if header.dst != local_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp key exchange addressed to another node",
+        ));
+    }
+    if header.src == local_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp key exchange self-loop rejected",
+        ));
+    }
+    if header.seq == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp key exchange id must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
+async fn start_key_exchange(
+    inner: &Arc<ManagerInner>,
+    identity: &NodeIdentity,
+    state: Arc<UdpSocketState>,
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+) -> io::Result<oneshot::Receiver<io::Result<()>>> {
+    let peer = inner.get_or_create_peer(peer_node);
+    peer.note_udp_seen(peer_addr);
+
+    if let Some(existing) = state.session(peer_node).await {
+        existing.update_addr(peer_addr);
+        install_active_stream(inner, peer, existing, peer_addr, true);
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(()));
+        return Ok(rx);
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let packets = begin_symmetric_exchange(identity, &state, peer_node, peer_addr, tx).await?;
+    send_exchange_packets(&state, peer_node, peer_addr, packets).await?;
+    Ok(rx)
+}
+
+async fn install_session(
+    inner: &Arc<ManagerInner>,
+    state: &Arc<UdpSocketState>,
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+    is_dialer: bool,
+    seal_key: [u8; 32],
+    open_key: [u8; 32],
+    accepted_seq: Option<u64>,
+) -> io::Result<Arc<UdpCryptoSession>> {
+    let peer = inner.get_or_create_peer(peer_node);
+    peer.note_udp_seen(peer_addr);
+    let session = Arc::new(UdpCryptoSession::new(
+        peer_node,
+        peer_addr,
+        state.socket.clone(),
+        seal_key,
+        open_key,
+        inner.cfg().max_pending_pings(),
+    )?);
+    if let Some(seq) = accepted_seq {
+        session.replay.lock().accept(seq);
+    }
+    state.insert_session(session.clone()).await;
+    install_active_stream(inner, peer, session.clone(), peer_addr, is_dialer);
+    Ok(session)
+}
+
+async fn begin_symmetric_exchange(
+    identity: &NodeIdentity,
+    state: &Arc<UdpSocketState>,
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+    waiter: oneshot::Sender<io::Result<()>>,
+) -> io::Result<Vec<Vec<u8>>> {
+    let mut exchanges = state.exchanges.lock().await;
+    let exchange = exchanges.entry(peer_node).or_default();
+    exchange.local_initiated = true;
+    exchange.waiters.push(waiter);
+    ensure_local_offer(exchange, identity, peer_node)?;
+    Ok(exchange_packets(exchange))
+}
+
+async fn accept_peer_offer(
+    state: &Arc<UdpSocketState>,
+    identity: &NodeIdentity,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+    peer_offer: PeerKeyOffer,
+) -> io::Result<(Vec<Vec<u8>>, Option<PromoteSession>)> {
+    let mut exchanges = state.exchanges.lock().await;
+    let exchange = exchanges.entry(peer_node).or_default();
+    ensure_local_offer(exchange, identity, peer_node)?;
+
+    let offer_changed = exchange
+        .peer
+        .as_ref()
+        .is_none_or(|existing| !existing.matches(&peer_offer));
+    if offer_changed {
+        if exchange
+            .local
+            .as_ref()
+            .is_none_or(|local| local.private_key.is_none())
+        {
+            exchange.local = Some(new_local_offer(identity, peer_node)?);
+        }
+        exchange.peer = Some(peer_offer);
+        match derive_candidate(exchange, local_node, peer_node, peer_addr) {
+            Ok(candidate) => exchange.candidate = Some(candidate),
+            Err(e) => {
+                exchange.local = None;
+                exchange.peer = None;
+                exchange.candidate = None;
+                return Err(e);
+            }
+        }
+        accept_buffered_ready(exchange, local_node, peer_node);
+    } else if let Some(candidate) = exchange.candidate.as_mut() {
+        candidate.peer_addr = peer_addr;
+    }
+
+    let packets = exchange_packets(exchange);
+    let promote = promote_if_ready(exchange, local_node, peer_node);
+    Ok((packets, promote))
+}
+
+async fn accept_key_ready(
+    state: &Arc<UdpSocketState>,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+    packet: &[u8],
+    header: UdpPacketHeader,
+) -> io::Result<(Vec<Vec<u8>>, Option<PromoteSession>)> {
+    let mut exchanges = state.exchanges.lock().await;
+    let exchange = exchanges.entry(peer_node).or_default();
+    let Some(exchange_id) = exchange
+        .candidate
+        .as_ref()
+        .map(|candidate| candidate.exchange_id)
+    else {
+        if exchange.early_ready.len() < 4 {
+            exchange.early_ready.push(packet.to_vec());
+        }
+        return Ok((exchange_packets(exchange), None));
+    };
+
+    if exchange_id != header.seq {
+        if exchange.early_ready.len() < 4 {
+            exchange.early_ready.push(packet.to_vec());
+        }
+        return Ok((exchange_packets(exchange), None));
+    }
+
+    accept_ready_packet(exchange, local_node, peer_node, packet, header)?;
+    if let Some(candidate) = exchange.candidate.as_mut() {
+        candidate.peer_addr = peer_addr;
+    }
+    let packets = exchange_packets(exchange);
+    let promote = promote_if_ready(exchange, local_node, peer_node);
+    Ok((packets, promote))
+}
+
+async fn decrypt_with_candidate_data(
+    state: &Arc<UdpSocketState>,
+    inner: &Arc<ManagerInner>,
+    packet: &[u8],
+    header: UdpPacketHeader,
+    peer_addr: SocketAddr,
+) -> io::Result<Option<(Arc<UdpCryptoSession>, Vec<u8>)>> {
+    let (plaintext, packets, promote) = {
+        let mut exchanges = state.exchanges.lock().await;
+        let Some(exchange) = exchanges.get_mut(&header.src) else {
+            return Ok(None);
+        };
+        let Some(candidate) = exchange.candidate.as_mut() else {
+            return Ok(None);
+        };
+        let plaintext = match decrypt_packet_with_key(&candidate.open_key, packet, header) {
+            Ok(plaintext) => plaintext,
+            Err(_) => return Ok(None),
+        };
+        candidate.ready_received = true;
+        candidate.peer_addr = peer_addr;
+        let packets = exchange_packets(exchange);
+        let promote = promote_if_ready(exchange, inner.self_id(), header.src);
+        (plaintext, packets, promote)
+    };
+
+    send_exchange_packets(state, header.src, peer_addr, packets).await?;
+    let Some(mut promote) = promote else {
+        return Ok(None);
+    };
+    promote.accepted_seq = Some(header.seq);
+    let session = promote_exchange(inner, state, promote).await?;
+    Ok(Some((session, plaintext)))
+}
+
+fn ensure_local_offer(
+    exchange: &mut PeerKeyExchange,
+    identity: &NodeIdentity,
+    peer_node: NodeIdentifier,
+) -> io::Result<()> {
+    let needs_offer = exchange.local.is_none()
+        || (exchange.candidate.is_none()
+            && exchange
+                .local
+                .as_ref()
+                .is_some_and(|local| local.private_key.is_none()));
+    if needs_offer {
+        exchange.local = Some(new_local_offer(identity, peer_node)?);
+    }
+    Ok(())
+}
+
+fn new_local_offer(
+    identity: &NodeIdentity,
+    peer_node: NodeIdentifier,
+) -> io::Result<LocalKeyOffer> {
+    let (private_key, public_key) = generate_ephemeral_keypair()?;
+    let offer_id = rand::random::<u64>().max(1);
+    let packet = build_key_offer(identity, peer_node, offer_id, &public_key)?;
+    Ok(LocalKeyOffer {
+        offer_id,
+        private_key: Some(private_key),
+        public_key,
+        packet,
+    })
+}
+
+fn derive_candidate(
+    exchange: &mut PeerKeyExchange,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+) -> io::Result<KeyCandidate> {
+    let local = exchange
+        .local
+        .as_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing local udp key offer"))?;
+    let peer = exchange
+        .peer
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing peer udp key offer"))?;
+    let private_key = local.private_key.take().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp local key offer was already consumed",
+        )
+    })?;
+    let ordered = ordered_offer_material(local_node, peer_node, local, peer);
+    let exchange_id = exchange_id(&ordered);
+    let keys = derive_key_material(private_key, &peer.public_key, &ordered)?;
+    let (seal_key, open_key) = if local_node < peer_node {
+        (keys.low_to_high, keys.high_to_low)
+    } else {
+        (keys.high_to_low, keys.low_to_high)
+    };
+    let ready_packet = build_key_ready(
+        local_node,
+        peer_node,
+        exchange_id,
+        local.offer_id,
+        peer.offer_id,
+        &seal_key,
+    )?;
+    Ok(KeyCandidate {
+        exchange_id,
+        peer_addr,
+        seal_key,
+        open_key,
+        ready_packet,
+        ready_received: false,
+        promoted: false,
+    })
+}
+
+fn accept_buffered_ready(
+    exchange: &mut PeerKeyExchange,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+) {
+    let early = std::mem::take(&mut exchange.early_ready);
+    for packet in early {
+        let Ok(header) = UdpPacketHeader::decode(&packet) else {
+            continue;
+        };
+        if header.kind != UdpPacketKind::KeyReady
+            || header.src != peer_node
+            || header.dst != local_node
+        {
+            continue;
+        }
+        let _ = accept_ready_packet(exchange, local_node, peer_node, &packet, header);
+    }
+}
+
+fn accept_ready_packet(
+    exchange: &mut PeerKeyExchange,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+    packet: &[u8],
+    header: UdpPacketHeader,
+) -> io::Result<()> {
+    let local = exchange
+        .local
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing local udp key offer"))?;
+    let peer = exchange
+        .peer
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing peer udp key offer"))?;
+    let candidate = exchange
+        .candidate
+        .as_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing udp key candidate"))?;
+    open_key_ready(
+        &candidate.open_key,
+        packet,
+        header,
+        peer_node,
+        local_node,
+        candidate.exchange_id,
+        peer.offer_id,
+        local.offer_id,
+    )?;
+    candidate.ready_received = true;
+    Ok(())
+}
+
+fn exchange_packets(exchange: &PeerKeyExchange) -> Vec<Vec<u8>> {
+    let mut packets = Vec::new();
+    if let Some(local) = &exchange.local {
+        packets.push(local.packet.clone());
+    }
+    if let Some(candidate) = &exchange.candidate {
+        packets.push(candidate.ready_packet.clone());
+    }
+    packets
+}
+
+fn promote_if_ready(
+    exchange: &mut PeerKeyExchange,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+) -> Option<PromoteSession> {
+    let candidate = exchange.candidate.as_mut()?;
+    if !candidate.ready_received || candidate.promoted {
+        return None;
+    }
+    candidate.promoted = true;
+    let promote = PromoteSession {
+        peer_node,
+        peer_addr: candidate.peer_addr,
+        is_dialer: exchange.local_initiated,
+        seal_key: candidate.seal_key,
+        open_key: candidate.open_key,
+        accepted_seq: None,
+        waiters: std::mem::take(&mut exchange.waiters),
+    };
+    trace!(
+        peer = %peer_node,
+        local = %local_node,
+        exchange_id = candidate.exchange_id,
+        "udp symmetric key exchange ready"
+    );
+    Some(promote)
+}
+
+async fn send_exchange_packets(
+    state: &Arc<UdpSocketState>,
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+    packets: Vec<Vec<u8>>,
+) -> io::Result<()> {
+    for packet in packets {
+        state
+            .socket
+            .send_to(&packet, peer_addr)
+            .await
+            .map_err(|e| io::Error::other(format!("udp key exchange send to {peer_node}: {e}")))?;
+    }
+    Ok(())
+}
+
+async fn promote_exchange(
+    inner: &Arc<ManagerInner>,
+    state: &Arc<UdpSocketState>,
+    promote: PromoteSession,
+) -> io::Result<Arc<UdpCryptoSession>> {
+    let PromoteSession {
+        peer_node,
+        peer_addr,
+        is_dialer,
+        seal_key,
+        open_key,
+        accepted_seq,
+        waiters,
+    } = promote;
+    let result = install_session(
+        inner,
+        state,
+        peer_node,
+        peer_addr,
+        is_dialer,
+        seal_key,
+        open_key,
+        accepted_seq,
+    )
+    .await;
+    let completion_result = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| io::Error::new(e.kind(), e.to_string()));
+    for tx in waiters {
+        let _ = tx.send(
+            completion_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| io::Error::new(e.kind(), format!("udp key exchange failed: {e}"))),
+        );
+    }
+    result
+}
+
+#[derive(Debug)]
+struct UdpHandshakeBody {
+    ephemeral_public: Vec<u8>,
+    cert_chain: Vec<CertificateDer<'static>>,
+    signature_scheme: u16,
+    signature: Vec<u8>,
+}
+
+impl UdpHandshakeBody {
+    fn encode(&self, header: UdpPacketHeader) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(HEADER_LEN + 256 + self.signature.len());
+        out.extend_from_slice(&header.encode());
+        put_vec_u16(&mut out, &self.ephemeral_public)?;
+        put_u16(&mut out, self.cert_chain.len())?;
+        for cert in &self.cert_chain {
+            put_vec_u16(&mut out, cert.as_ref())?;
+        }
+        out.extend_from_slice(&self.signature_scheme.to_be_bytes());
+        put_vec_u16(&mut out, &self.signature)?;
+        Ok(out)
+    }
+
+    fn decode(packet: &[u8]) -> io::Result<Self> {
+        let mut reader = PacketReader::new(
+            packet
+                .get(HEADER_LEN..)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short udp packet"))?,
+        );
+        let ephemeral_public = reader.read_vec_u16()?;
+        if ephemeral_public.len() != X25519_PUBLIC_KEY_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad udp ephemeral public key length",
+            ));
+        }
+        let cert_count = reader.read_u16()? as usize;
+        if cert_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "udp handshake missing certificate chain",
+            ));
+        }
+        let mut cert_chain = Vec::with_capacity(cert_count);
+        for _ in 0..cert_count {
+            cert_chain.push(CertificateDer::from(reader.read_vec_u16()?));
+        }
+        let signature_scheme = reader.read_u16()?;
+        let signature = reader.read_vec_u16()?;
+        if signature.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "udp handshake missing signature",
+            ));
+        }
+        reader.finish()?;
+        Ok(Self {
+            ephemeral_public,
+            cert_chain,
+            signature_scheme,
+            signature,
         })
     }
 }
 
-#[async_trait]
-impl UtilListener for ReusableUdpListener {
-    async fn accept(&self) -> webrtc_util::Result<(Arc<dyn UtilConn + Send + Sync>, SocketAddr)> {
-        let mut accept_rx = self.accept_rx.lock().await;
-        tokio::select! {
-            conn = accept_rx.recv() => {
-                let conn = conn.ok_or_else(|| io::Error::other("udp dtls listener closed"))?;
-                let raddr = conn.raddr;
-                let conn: Arc<dyn UtilConn + Send + Sync> = conn;
-                Ok((conn, raddr))
-            }
-            _ = self.shutdown.cancelled() => {
-                Err(io::Error::other("udp dtls listener closed").into())
-            }
+struct PacketReader<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> PacketReader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn read_u16(&mut self) -> io::Result<u16> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_vec_u16(&mut self) -> io::Result<Vec<u8>> {
+        let len = self.read_u16()? as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn finish(&self) -> io::Result<()> {
+        if self.offset == self.input.len() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trailing bytes in udp handshake",
+            ))
         }
     }
 
-    async fn close(&self) -> webrtc_util::Result<()> {
-        self.accepting.store(false, Ordering::SeqCst);
-        self.shutdown.cancel();
-        self.pconn.close().await
-    }
-
-    async fn addr(&self) -> webrtc_util::Result<SocketAddr> {
-        self.pconn.local_addr()
-    }
-}
-
-struct BufferedUdpConn {
-    pconn: Arc<dyn UtilConn + Send + Sync>,
-    raddr: SocketAddr,
-    buffer: Buffer,
-}
-
-impl BufferedUdpConn {
-    fn new(pconn: Arc<dyn UtilConn + Send + Sync>, raddr: SocketAddr) -> Self {
-        Self {
-            pconn,
-            raddr,
-            buffer: Buffer::new(0, 0),
-        }
+    fn take(&mut self, len: usize) -> io::Result<&'a [u8]> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "udp handshake length overflow")
+        })?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short udp handshake"))?;
+        self.offset = end;
+        Ok(bytes)
     }
 }
 
-#[async_trait]
-impl UtilConn for BufferedUdpConn {
-    async fn connect(&self, addr: SocketAddr) -> webrtc_util::Result<()> {
-        self.pconn.connect(addr).await
-    }
-
-    async fn recv(&self, buf: &mut [u8]) -> webrtc_util::Result<usize> {
-        self.buffer.read(buf, None).await
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
-        let n = self.buffer.read(buf, None).await?;
-        Ok((n, self.raddr))
-    }
-
-    async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
-        self.pconn.send_to(buf, self.raddr).await
-    }
-
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> webrtc_util::Result<usize> {
-        self.pconn.send_to(buf, target).await
-    }
-
-    fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
-        self.pconn.local_addr()
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        Some(self.raddr)
-    }
-
-    async fn close(&self) -> webrtc_util::Result<()> {
-        Ok(())
-    }
-
-    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
-        self
-    }
-}
-
-async fn reusable_udp_read_loop(
-    pconn: Arc<dyn UtilConn + Send + Sync>,
-    accept_tx: mpsc::Sender<Arc<BufferedUdpConn>>,
-    conns: Arc<Mutex<HashMap<SocketAddr, Arc<BufferedUdpConn>>>>,
-    shutdown: CancellationToken,
-    accepting: Arc<AtomicBool>,
-) {
-    let mut buf = vec![0u8; 8192];
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => break,
-            result = pconn.recv_from(&mut buf) => {
-                let (n, raddr) = match result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(error=%e, "udp dtls reusable listener read failed");
-                        break;
-                    }
-                };
-                let packet = &buf[..n];
-                let existing = { conns.lock().await.get(&raddr).cloned() };
-                if let Some(conn) = existing {
-                    let _ = conn.buffer.write(packet).await;
-                    continue;
-                }
-                if !accepting.load(Ordering::SeqCst) || !looks_like_dtls_handshake(packet) {
-                    continue;
-                }
-
-                let conn = Arc::new(BufferedUdpConn::new(pconn.clone(), raddr));
-                let _ = conn.buffer.write(packet).await;
-                if accept_tx.try_send(conn.clone()).is_ok() {
-                    conns.lock().await.insert(raddr, conn);
-                }
-            }
-        }
-    }
-}
-
-fn looks_like_dtls_handshake(packet: &[u8]) -> bool {
-    packet.len() >= 13 && packet[0] == 22 && packet[1] == 0xfe
-}
-
-async fn accept_loop(
-    listener: impl UtilListener + Send + Sync + 'static,
-    inner: Arc<ManagerInner>,
-) {
-    loop {
-        tokio::select! {
-            _ = inner.shutdown().cancelled() => {
-                let _ = listener.close().await;
-                return;
-            }
-            accept = listener.accept() => {
-                match accept {
-                    Ok((conn, peer_addr)) => {
-                        let inner_c = inner.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_inbound(inner_c, conn, peer_addr).await {
-                                warn!(error=%e, %peer_addr, "udp dtls inbound failed");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        if is_peer_closed_dtls_accept(&e) {
-                            debug!(error=?e, "udp dtls accept closed by peer during handshake");
-                        } else {
-                            warn!(error=?e, "udp dtls accept failed");
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn is_peer_closed_dtls_accept(error: &impl std::fmt::Debug) -> bool {
-    format!("{error:?}").contains("ErrAlertFatalOrClose")
-}
-
-async fn handle_inbound(
-    inner: Arc<ManagerInner>,
-    conn: Arc<dyn UtilConn + Send + Sync>,
-    peer_addr: SocketAddr,
-) -> io::Result<()> {
-    let dtls = conn
-        .as_any()
-        .downcast_ref::<DTLSConn>()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-DTLS conn from listener"))?;
-    let peer_node = peer_node_id_from_dtls(dtls)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
-    if peer_node == inner.self_id() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "self-loop rejected",
-        ));
-    }
-    install_session(&inner, peer_node, peer_addr, false, conn);
+fn put_u16(out: &mut Vec<u8>, value: usize) -> io::Result<()> {
+    let value = u16::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "udp handshake field exceeds u16 length",
+        )
+    })?;
+    out.extend_from_slice(&value.to_be_bytes());
     Ok(())
 }
 
-fn install_session(
-    inner: &Arc<ManagerInner>,
+fn put_vec_u16(out: &mut Vec<u8>, value: &[u8]) -> io::Result<()> {
+    put_u16(out, value.len())?;
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+fn build_key_offer(
+    identity: &NodeIdentity,
     peer_node: NodeIdentifier,
-    peer_addr: SocketAddr,
-    is_dialer: bool,
-    conn: Arc<dyn UtilConn + Send + Sync>,
-) {
-    let peer = inner.get_or_create_peer(peer_node);
-    peer.note_udp_seen(peer_addr);
-    let active = spawn_dtls_pump(
-        conn,
-        peer.clone(),
-        inner.clone(),
-        inner.inbound().clone(),
-        peer_addr,
-        is_dialer,
+    offer_id: u64,
+    public_key: &[u8],
+) -> io::Result<Vec<u8>> {
+    let transcript = offer_transcript(identity.node_id(), peer_node, offer_id, public_key);
+    let signed = sign_transcript(identity, &transcript)?;
+    let body = UdpHandshakeBody {
+        ephemeral_public: public_key.to_vec(),
+        cert_chain: identity.chain().to_vec(),
+        signature_scheme: signed.scheme,
+        signature: signed.signature,
+    };
+    body.encode(UdpPacketHeader {
+        kind: UdpPacketKind::KeyOffer,
+        src: identity.node_id(),
+        dst: peer_node,
+        seq: offer_id,
+    })
+}
+
+fn build_key_ready(
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+    exchange_id: u64,
+    local_offer_id: u64,
+    peer_offer_id: u64,
+    seal_key: &[u8; 32],
+) -> io::Result<Vec<u8>> {
+    let header = UdpPacketHeader {
+        kind: UdpPacketKind::KeyReady,
+        src: local_node,
+        dst: peer_node,
+        seq: exchange_id,
+    };
+    let header_bytes = header.encode();
+    let mut plaintext = ready_plaintext(
+        local_node,
+        peer_node,
+        exchange_id,
+        local_offer_id,
+        peer_offer_id,
     );
-    if let Err(rejected) = peer.try_install_stream(active) {
-        rejected.cancel();
+    let key = aead_key(seal_key)?;
+    let nonce = packet_nonce(header.kind, header.src, header.dst, header.seq)?;
+    key.seal_in_place_append_tag(nonce, Aad::from(header_bytes), &mut plaintext)
+        .map_err(|_| io::Error::other("udp key ready encryption failed"))?;
+    let mut packet = Vec::with_capacity(HEADER_LEN + plaintext.len());
+    packet.extend_from_slice(&header_bytes);
+    packet.extend_from_slice(&plaintext);
+    Ok(packet)
+}
+
+fn open_key_ready(
+    open_key: &[u8; 32],
+    packet: &[u8],
+    header: UdpPacketHeader,
+    expected_src: NodeIdentifier,
+    expected_dst: NodeIdentifier,
+    expected_exchange_id: u64,
+    expected_sender_offer_id: u64,
+    expected_receiver_offer_id: u64,
+) -> io::Result<()> {
+    if header.kind != UdpPacketKind::KeyReady
+        || header.src != expected_src
+        || header.dst != expected_dst
+        || header.seq != expected_exchange_id
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp key ready header mismatch",
+        ));
+    }
+    let plaintext = decrypt_packet_with_key(open_key, packet, header)?;
+    let expected = ready_plaintext(
+        expected_src,
+        expected_dst,
+        expected_exchange_id,
+        expected_sender_offer_id,
+        expected_receiver_offer_id,
+    );
+    if plaintext != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp key ready transcript mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn ready_plaintext(
+    src: NodeIdentifier,
+    dst: NodeIdentifier,
+    exchange_id: u64,
+    sender_offer_id: u64,
+    receiver_offer_id: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(KEX_TRANSCRIPT_DOMAIN);
+    out.extend_from_slice(b":ready:");
+    out.extend_from_slice(&src.to_be_bytes());
+    out.extend_from_slice(&dst.to_be_bytes());
+    out.extend_from_slice(&exchange_id.to_be_bytes());
+    out.extend_from_slice(&sender_offer_id.to_be_bytes());
+    out.extend_from_slice(&receiver_offer_id.to_be_bytes());
+    out
+}
+
+fn decrypt_packet_with_key(
+    open_key: &[u8; 32],
+    packet: &[u8],
+    header: UdpPacketHeader,
+) -> io::Result<Vec<u8>> {
+    if packet.len() < HEADER_LEN + TAG_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short udp encrypted packet",
+        ));
+    }
+    let key = aead_key(open_key)?;
+    let mut ciphertext = packet[HEADER_LEN..].to_vec();
+    let nonce = packet_nonce(header.kind, header.src, header.dst, header.seq)?;
+    let plaintext = key
+        .open_in_place(nonce, Aad::from(&packet[..HEADER_LEN]), &mut ciphertext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "udp decrypt failed"))?;
+    Ok(plaintext.to_vec())
+}
+
+struct SignedTranscript {
+    scheme: u16,
+    signature: Vec<u8>,
+}
+
+fn sign_transcript(identity: &NodeIdentity, transcript: &[u8]) -> io::Result<SignedTranscript> {
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(identity.key())
+        .map_err(|e| io::Error::other(format!("udp signing key: {e}")))?;
+    let signer = signing_key
+        .choose_scheme(SUPPORTED_SIGNATURE_SCHEMES)
+        .ok_or_else(|| io::Error::other("udp signing key has no supported signature scheme"))?;
+    let scheme = signature_scheme_code(signer.scheme())?;
+    let signature = signer
+        .sign(transcript)
+        .map_err(|e| io::Error::other(format!("udp transcript sign: {e}")))?;
+    Ok(SignedTranscript { scheme, signature })
+}
+
+fn verify_peer_identity(
+    identity: &NodeIdentity,
+    chain: &[CertificateDer<'static>],
+    expected_node: NodeIdentifier,
+) -> io::Result<()> {
+    tls::verify_peer_cert_chain(identity.roots().clone(), chain).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("udp peer certificate chain: {e}"),
+        )
+    })?;
+    let node = parse_peer_cn(chain).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("udp peer certificate identity: {e}"),
+        )
+    })?;
+    if node != expected_node {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("udp certificate CN {node} did not match packet source {expected_node}"),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_transcript_signature(
+    chain: &[CertificateDer<'static>],
+    scheme: u16,
+    transcript: &[u8],
+    sig: &[u8],
+) -> io::Result<()> {
+    let leaf = chain.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "udp handshake missing certificate leaf",
+        )
+    })?;
+    let (_, parsed) = X509Certificate::from_der(leaf.as_ref()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("udp peer certificate parse: {e}"),
+        )
+    })?;
+    let alg = signature_verification_algorithm(scheme)?;
+    let public_key = &parsed.tbs_certificate.subject_pki.subject_public_key.data;
+    signature::UnparsedPublicKey::new(alg, public_key)
+        .verify(transcript, sig)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad udp handshake signature"))
+}
+
+fn signature_scheme_code(scheme: SignatureScheme) -> io::Result<u16> {
+    match scheme {
+        SignatureScheme::RSA_PKCS1_SHA256 => Ok(0x0401),
+        SignatureScheme::ECDSA_NISTP256_SHA256 => Ok(0x0403),
+        SignatureScheme::ECDSA_NISTP384_SHA384 => Ok(0x0503),
+        SignatureScheme::ECDSA_NISTP521_SHA512 => Ok(0x0603),
+        SignatureScheme::RSA_PSS_SHA256 => Ok(0x0804),
+        SignatureScheme::ED25519 => Ok(0x0807),
+        _ => Err(io::Error::other("unsupported udp signature scheme")),
     }
 }
 
-fn spawn_dtls_pump(
-    conn: Arc<dyn UtilConn + Send + Sync>,
+fn signature_verification_algorithm(
+    scheme: u16,
+) -> io::Result<&'static dyn signature::VerificationAlgorithm> {
+    match scheme {
+        0x0401 => Ok(&signature::RSA_PKCS1_2048_8192_SHA256),
+        0x0403 => Ok(&signature::ECDSA_P256_SHA256_ASN1),
+        0x0503 => Ok(&signature::ECDSA_P384_SHA384_ASN1),
+        0x0603 => Ok(&signature::ECDSA_P521_SHA512_ASN1),
+        0x0804 => Ok(&signature::RSA_PSS_2048_8192_SHA256),
+        0x0807 => Ok(&signature::ED25519),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported udp signature scheme",
+        )),
+    }
+}
+
+fn offer_transcript(
+    src_node: NodeIdentifier,
+    dst_node: NodeIdentifier,
+    offer_id: u64,
+    public_key: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + public_key.len());
+    out.extend_from_slice(KEX_TRANSCRIPT_DOMAIN);
+    out.extend_from_slice(b":offer:");
+    out.extend_from_slice(&src_node.to_be_bytes());
+    out.extend_from_slice(&dst_node.to_be_bytes());
+    out.extend_from_slice(&offer_id.to_be_bytes());
+    out.extend_from_slice(public_key);
+    out
+}
+
+fn generate_ephemeral_keypair() -> io::Result<(agreement::EphemeralPrivateKey, Vec<u8>)> {
+    let rng = SystemRandom::new();
+    let private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+        .map_err(|_| io::Error::other("udp ephemeral key generation failed"))?;
+    let public_key = private_key
+        .compute_public_key()
+        .map_err(|_| io::Error::other("udp ephemeral public key failed"))?
+        .as_ref()
+        .to_vec();
+    Ok((private_key, public_key))
+}
+
+struct DirectionalKeys {
+    low_to_high: [u8; 32],
+    high_to_low: [u8; 32],
+}
+
+struct OrderedOfferMaterial<'a> {
+    low_node: NodeIdentifier,
+    high_node: NodeIdentifier,
+    low_offer_id: u64,
+    high_offer_id: u64,
+    low_public_key: &'a [u8],
+    high_public_key: &'a [u8],
+}
+
+fn ordered_offer_material<'a>(
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+    local: &'a LocalKeyOffer,
+    peer: &'a PeerKeyOffer,
+) -> OrderedOfferMaterial<'a> {
+    if local_node < peer_node {
+        OrderedOfferMaterial {
+            low_node: local_node,
+            high_node: peer_node,
+            low_offer_id: local.offer_id,
+            high_offer_id: peer.offer_id,
+            low_public_key: &local.public_key,
+            high_public_key: &peer.public_key,
+        }
+    } else {
+        OrderedOfferMaterial {
+            low_node: peer_node,
+            high_node: local_node,
+            low_offer_id: peer.offer_id,
+            high_offer_id: local.offer_id,
+            low_public_key: &peer.public_key,
+            high_public_key: &local.public_key,
+        }
+    }
+}
+
+fn exchange_id(ordered: &OrderedOfferMaterial<'_>) -> u64 {
+    let salt = key_schedule_salt(ordered);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&salt[..8]);
+    u64::from_be_bytes(bytes).max(1)
+}
+
+struct UdpKeyMaterialLen;
+
+impl hkdf::KeyType for UdpKeyMaterialLen {
+    fn len(&self) -> usize {
+        64
+    }
+}
+
+fn derive_key_material(
+    private_key: agreement::EphemeralPrivateKey,
+    peer_public_key: &[u8],
+    ordered: &OrderedOfferMaterial<'_>,
+) -> io::Result<DirectionalKeys> {
+    if peer_public_key.len() != X25519_PUBLIC_KEY_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad udp peer ephemeral public key length",
+        ));
+    }
+    let peer_public_key = agreement::UnparsedPublicKey::new(&agreement::X25519, peer_public_key);
+    agreement::agree_ephemeral(
+        private_key,
+        &peer_public_key,
+        io::Error::new(io::ErrorKind::InvalidData, "bad udp peer ephemeral key"),
+        |secret| {
+            let salt_bytes = key_schedule_salt(ordered);
+            let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &salt_bytes);
+            let prk = salt.extract(secret);
+            let info = [KEX_KEY_INFO];
+            let okm = prk
+                .expand(&info, UdpKeyMaterialLen)
+                .map_err(|_| io::Error::other("udp key expansion failed"))?;
+            let mut out = [0u8; 64];
+            okm.fill(&mut out)
+                .map_err(|_| io::Error::other("udp key material fill failed"))?;
+            let mut low_to_high = [0u8; 32];
+            let mut high_to_low = [0u8; 32];
+            low_to_high.copy_from_slice(&out[..32]);
+            high_to_low.copy_from_slice(&out[32..]);
+            Ok(DirectionalKeys {
+                low_to_high,
+                high_to_low,
+            })
+        },
+    )
+}
+
+fn key_schedule_salt(ordered: &OrderedOfferMaterial<'_>) -> [u8; 32] {
+    let mut input =
+        Vec::with_capacity(112 + ordered.low_public_key.len() + ordered.high_public_key.len());
+    input.extend_from_slice(KEX_TRANSCRIPT_DOMAIN);
+    input.extend_from_slice(b":keys:");
+    input.extend_from_slice(&ordered.low_node.to_be_bytes());
+    input.extend_from_slice(&ordered.high_node.to_be_bytes());
+    input.extend_from_slice(&ordered.low_offer_id.to_be_bytes());
+    input.extend_from_slice(&ordered.high_offer_id.to_be_bytes());
+    input.extend_from_slice(ordered.low_public_key);
+    input.extend_from_slice(ordered.high_public_key);
+    let digest = digest::digest(&digest::SHA256, &input);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+fn install_active_stream(
+    inner: &Arc<ManagerInner>,
+    peer: Arc<PeerState>,
+    session: Arc<UdpCryptoSession>,
+    peer_addr: SocketAddr,
+    is_dialer: bool,
+) {
+    let active = spawn_udp_write_pump(session, peer.clone(), inner.clone(), peer_addr, is_dialer);
+    peer.install_stream(active);
+}
+
+fn spawn_udp_write_pump(
+    session: Arc<UdpCryptoSession>,
     peer: Arc<PeerState>,
     inner: Arc<ManagerInner>,
-    inbound: InboundDispatch,
     peer_addr: SocketAddr,
     is_dialer: bool,
 ) -> ActiveStream {
     let (tx, rx) = mpsc::channel::<OutboundFrame>(inner.cfg().outbound_capacity());
     let closed = CancellationToken::new();
-
-    let pending: Arc<parking_lot::Mutex<PendingPings>> = Arc::new(parking_lot::Mutex::new(
-        PendingPings::new(inner.cfg().max_pending_pings()),
-    ));
-
-    {
-        let conn = conn.clone();
-        let peer = peer.clone();
-        let inbound = inbound.clone();
-        let inner = inner.clone();
-        let closed = closed.clone();
-        let pending = pending.clone();
-        tokio::spawn(async move {
-            run_read(conn, peer, inbound, inner, closed, pending).await;
-        });
-    }
-
-    {
-        let conn = conn.clone();
-        let peer = peer.clone();
-        let inner = inner.clone();
-        let closed = closed.clone();
-        let pending = pending.clone();
-        tokio::spawn(async move {
-            run_write(conn, peer, inner, rx, closed, pending).await;
-        });
-    }
-
+    tokio::spawn(run_write(session, peer, inner, rx, closed.clone()));
     ActiveStream::new(TransportKind::Udp, Some(peer_addr), tx, closed, is_dialer)
 }
 
-async fn run_read(
-    conn: Arc<dyn UtilConn + Send + Sync>,
-    peer: Arc<PeerState>,
-    inbound: InboundDispatch,
-    inner: Arc<ManagerInner>,
-    closed: CancellationToken,
-    pending: Arc<parking_lot::Mutex<PendingPings>>,
-) {
-    let mut buf = vec![0u8; inner.cfg().max_frame_bytes().max(2048)];
-    let level = TransportKind::Udp.service_level();
-    loop {
-        tokio::select! {
-            _ = closed.cancelled() => break,
-            res = conn.recv(&mut buf) => {
-                let n = match res {
-                    Ok(n) => n,
-                    Err(e) => {
-                        debug!(peer=%peer.node_id(), error=?e, "udp dtls read error");
-                        break;
-                    }
-                };
-                if n == 0 {
-                    break;
-                }
-                peer.metrics().record_recv(TransportKind::Udp, n);
-                let frame = match pb::Frame::decode(&buf[..n]) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!(peer=%peer.node_id(), error=%e, "udp dtls frame decode failed");
-                        continue;
-                    }
-                };
-                if let Err(e) = handle_frame(
-                    frame, n, &conn, inner.self_id(), &peer, &inbound, &pending, level,
-                ).await {
-                    warn!(peer=%peer.node_id(), error=%e, "udp dtls inbound handling failed");
-                    break;
-                }
-            }
-        }
-    }
-    closed.cancel();
-    // Map self-cleans via is_alive-filtering; see stream_io::run_pump for the
-    // race rationale.
-    let _ = conn.close().await;
-    trace!(peer=%peer.node_id(), "udp dtls read pump exited");
-}
-
 async fn run_write(
-    conn: Arc<dyn UtilConn + Send + Sync>,
+    session: Arc<UdpCryptoSession>,
     peer: Arc<PeerState>,
     inner: Arc<ManagerInner>,
     mut rx: mpsc::Receiver<OutboundFrame>,
     closed: CancellationToken,
-    pending: Arc<parking_lot::Mutex<PendingPings>>,
 ) {
     let level = TransportKind::Udp.service_level();
     let probe_enabled = inner.cfg().bandwidth_probe_size() > 0;
+    let pending_timeout = inner
+        .cfg()
+        .ping_interval()
+        .saturating_mul(2)
+        .max(Duration::from_secs(1));
     let mut ping_tick = MaybeInterval::maybe(inner.cfg().ping_interval());
     let mut probe_tick = if probe_enabled {
         MaybeInterval::maybe(inner.cfg().bandwidth_probe_interval())
@@ -506,10 +1683,12 @@ async fn run_write(
         now_us(),
         Bytes::new(),
     );
-    if let Err(e) = send_frame(&conn, &hello, &peer, inner.cfg().udp_mtu()).await {
-        warn!(peer=%peer.node_id(), error=%e, "udp dtls hello failed");
+    if let Err(e) = session
+        .send_frame(&hello, &peer, inner.cfg().udp_mtu())
+        .await
+    {
+        warn!(peer=%peer.node_id(), error=%e, "udp encrypted hello failed");
         closed.cancel();
-        let _ = conn.close().await;
         return;
     }
 
@@ -530,35 +1709,44 @@ async fn run_write(
                     now_us(),
                     out.payload().clone(),
                 );
-                match send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
+                match session.send_frame(&frame, &peer, inner.cfg().udp_mtu()).await {
                     Ok(_) => peer
                         .metrics()
                         .record_payload_sent(TransportKind::Udp, out.payload().len()),
                     Err(e) => {
-                        warn!(peer=%peer.node_id(), error=%e, "udp dtls write failed");
+                        warn!(peer=%peer.node_id(), error=%e, "udp encrypted write failed");
                         break;
                     }
                 }
             }
 
             _ = ping_tick.tick() => {
+                record_expired_udp_pending(&session, &peer, pending_timeout);
                 let ts = now_us();
                 let frame = build_frame(
                     inner.self_id(), peer.node_id(), level,
                     FrameType::KeepAlive, MessageClass::Regular,
                     peer.next_seq(), ts, Bytes::new(),
                 );
-                match send_frame(&conn, &frame, &peer, inner.cfg().udp_mtu()).await {
-                    Ok(_) => pending.lock().insert(ts, None, 0),
-                    Err(e) => { warn!(peer=%peer.node_id(), error=%e, "udp dtls keepalive failed"); break; }
+                match session.send_frame(&frame, &peer, inner.cfg().udp_mtu()).await {
+                    Ok(_) => {
+                        if session.pending.lock().insert(ts, None, 0).is_some() {
+                            peer.metrics().record_probe_lost(TransportKind::Udp);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(peer=%peer.node_id(), error=%e, "udp encrypted keepalive failed");
+                        break;
+                    }
                 }
             }
 
             _ = probe_tick.tick() => {
+                record_expired_udp_pending(&session, &peer, pending_timeout);
                 let mut ts = now_us();
                 for shape in ServiceShape::ALL {
                     match send_service_probe(
-                        &conn,
+                        &session,
                         &peer,
                         inner.self_id(),
                         shape,
@@ -566,14 +1754,23 @@ async fn run_write(
                         inner.cfg().udp_mtu(),
                         ts,
                     ).await {
-                        Ok(true) => pending.lock().insert(
-                            ts,
-                            Some(shape),
-                            inner.cfg().service_probe_payload_size(shape),
-                        ),
+                        Ok(true) => {
+                            if session
+                                .pending
+                                .lock()
+                                .insert(
+                                    ts,
+                                    Some(shape),
+                                    inner.cfg().service_probe_payload_size(shape),
+                                )
+                                .is_some()
+                            {
+                                peer.metrics().record_probe_lost(TransportKind::Udp);
+                            }
+                        }
                         Ok(false) => {}
                         Err(e) => {
-                            warn!(peer=%peer.node_id(), service=%shape.name(), error=%e, "udp dtls probe failed");
+                            warn!(peer=%peer.node_id(), service=%shape.name(), error=%e, "udp encrypted probe failed");
                             break;
                         }
                     }
@@ -583,49 +1780,11 @@ async fn run_write(
         }
     }
     closed.cancel();
-    let _ = conn.close().await;
-    trace!(peer=%peer.node_id(), "udp dtls write pump exited");
-}
-
-async fn send_frame(
-    conn: &Arc<dyn UtilConn + Send + Sync>,
-    frame: &pb::Frame,
-    peer: &PeerState,
-    udp_mtu: usize,
-) -> io::Result<usize> {
-    let buf = encode_frame_datagram(frame, udp_mtu)?;
-    send_datagram(conn, &buf, peer).await
-}
-
-fn encode_frame_datagram(frame: &pb::Frame, udp_mtu: usize) -> io::Result<bytes::BytesMut> {
-    let mut buf = bytes::BytesMut::with_capacity(frame.encoded_len());
-    frame
-        .encode(&mut buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if buf.len() > udp_mtu {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("frame {} > udp_mtu {}", buf.len(), udp_mtu),
-        ));
-    }
-    Ok(buf)
-}
-
-async fn send_datagram(
-    conn: &Arc<dyn UtilConn + Send + Sync>,
-    buf: &[u8],
-    peer: &PeerState,
-) -> io::Result<usize> {
-    let n = conn
-        .send(buf)
-        .await
-        .map_err(|e| io::Error::other(format!("dtls send: {e}")))?;
-    peer.metrics().record_sent(TransportKind::Udp, n);
-    Ok(n)
+    trace!(peer=%peer.node_id(), "udp encrypted write pump exited");
 }
 
 async fn send_service_probe(
-    conn: &Arc<dyn UtilConn + Send + Sync>,
+    session: &Arc<UdpCryptoSession>,
     peer: &PeerState,
     local_id: NodeIdentifier,
     shape: ServiceShape,
@@ -647,24 +1806,31 @@ async fn send_service_probe(
         ts,
         payload,
     );
-    let buf = match encode_frame_datagram(&frame, udp_mtu) {
-        Ok(buf) => buf,
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    send_datagram(conn, &buf, peer).await?;
-    Ok(true)
+    match session.send_frame(&frame, peer, udp_mtu).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn record_expired_udp_pending(
+    session: &UdpCryptoSession,
+    peer: &PeerState,
+    pending_timeout: Duration,
+) {
+    for _ in 0..session.pending.lock().expire_older_than(pending_timeout) {
+        peer.metrics().record_probe_lost(TransportKind::Udp);
+    }
 }
 
 async fn handle_frame(
     frame: pb::Frame,
-    _incoming_wire_size: usize,
-    conn: &Arc<dyn UtilConn + Send + Sync>,
+    session: &Arc<UdpCryptoSession>,
     local_id: NodeIdentifier,
     peer: &PeerState,
     inbound: &InboundDispatch,
-    pending: &Arc<parking_lot::Mutex<PendingPings>>,
     level: ServiceLevel,
+    udp_mtu: usize,
 ) -> io::Result<()> {
     let ty = match pb::FrameType::try_from(frame.frame_type) {
         Ok(v) => v,
@@ -686,7 +1852,6 @@ async fn handle_frame(
             ));
         }
         pb::FrameType::FramePing | pb::FrameType::FrameKeepalive => {
-            let echo = frame.payload.clone();
             let pong = build_frame(
                 local_id,
                 peer.node_id(),
@@ -695,23 +1860,17 @@ async fn handle_frame(
                 MessageClass::Regular,
                 peer.next_seq(),
                 frame.ts_us,
-                echo,
+                frame.payload.clone(),
             );
-            let mut buf = bytes::BytesMut::with_capacity(pong.encoded_len());
-            pong.encode(&mut buf)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let n = conn
-                .send(&buf)
-                .await
-                .map_err(|e| io::Error::other(format!("dtls pong: {e}")))?;
-            peer.metrics().record_sent(TransportKind::Udp, n);
+            session.send_frame(&pong, peer, udp_mtu).await?;
         }
         pb::FrameType::FramePong => {
             let now = now_us();
             if now > frame.ts_us {
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(TransportKind::Udp, rtt);
-                if let Some(pending) = pending.lock().take(frame.ts_us) {
+                if let Some(pending) = session.pending.lock().take(frame.ts_us) {
+                    peer.metrics().record_probe_delivered(TransportKind::Udp);
                     if let Some(shape) = pending.shape {
                         peer.metrics().record_probe(
                             TransportKind::Udp,
@@ -724,14 +1883,9 @@ async fn handle_frame(
             }
         }
         pb::FrameType::FrameHello => {
-            trace!(peer=%peer.node_id(), seq=frame.seq, "received udp dtls transport hello");
+            trace!(peer=%peer.node_id(), seq=frame.seq, "received udp encrypted transport hello");
         }
-        pb::FrameType::FrameBye => {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "peer sent BYE",
-            ));
-        }
+        pb::FrameType::FrameBye => {}
     }
     Ok(())
 }
@@ -744,9 +1898,24 @@ struct PendingPings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingPing {
     Probe {
+        sent_at: Instant,
         shape: Option<ServiceShape>,
         payload_bytes: usize,
     },
+}
+
+impl PendingPing {
+    fn shape(self) -> Option<ServiceShape> {
+        match self {
+            Self::Probe { shape, .. } => shape,
+        }
+    }
+
+    fn payload_bytes(self) -> usize {
+        match self {
+            Self::Probe { payload_bytes, .. } => payload_bytes,
+        }
+    }
 }
 
 impl PendingPings {
@@ -757,72 +1926,94 @@ impl PendingPings {
         }
     }
 
-    fn insert(&mut self, ts: u64, shape: Option<ServiceShape>, payload_bytes: usize) {
+    fn insert(
+        &mut self,
+        ts: u64,
+        shape: Option<ServiceShape>,
+        payload_bytes: usize,
+    ) -> Option<PendingPing> {
         if self.cap == 0 {
-            return;
+            return None;
         }
-        if self.inner.len() >= self.cap {
-            self.inner.pop_front();
-        }
+        let evicted = if self.inner.len() >= self.cap {
+            self.inner.pop_front().map(|(_, pending)| pending)
+        } else {
+            None
+        };
         self.inner.push_back((
             ts,
             PendingPing::Probe {
+                sent_at: Instant::now(),
                 shape,
                 payload_bytes,
             },
         ));
+        evicted
     }
 
-    fn take(&mut self, ts: u64) -> Option<PendingProbe> {
-        let pos = self.inner.iter().position(|(t, _)| *t == ts)?;
-        match self.inner.remove(pos).map(|(_, ping)| ping)? {
-            PendingPing::Probe {
-                shape,
-                payload_bytes,
-            } => Some(PendingProbe {
-                shape,
-                payload_bytes,
-            }),
+    fn take(&mut self, ts: u64) -> Option<PendingPingInfo> {
+        let idx = self
+            .inner
+            .iter()
+            .position(|(pending_ts, _)| *pending_ts == ts)?;
+        let (_, pending) = self.inner.remove(idx)?;
+        Some(PendingPingInfo {
+            shape: pending.shape(),
+            payload_bytes: pending.payload_bytes(),
+        })
+    }
+
+    fn expire_older_than(&mut self, timeout: Duration) -> usize {
+        let now = Instant::now();
+        let mut expired = 0;
+        while self.inner.front().is_some_and(|(_, pending)| {
+            let sent_at = match pending {
+                PendingPing::Probe { sent_at, .. } => *sent_at,
+            };
+            now.saturating_duration_since(sent_at) >= timeout
+        }) {
+            self.inner.pop_front();
+            expired += 1;
         }
+        expired
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingProbe {
+struct PendingPingInfo {
     shape: Option<ServiceShape>,
     payload_bytes: usize,
 }
 
 enum MaybeInterval {
-    Active(Interval),
+    Enabled(Interval),
     Disabled,
 }
+
 impl MaybeInterval {
-    fn maybe(period: Duration) -> Self {
-        if period.is_zero() {
+    fn maybe(duration: Duration) -> Self {
+        if duration.is_zero() {
             Self::Disabled
         } else {
-            let mut iv = interval(period);
-            iv.reset();
-            Self::Active(iv)
+            Self::Enabled(interval(duration))
         }
     }
+
     async fn tick(&mut self) {
         match self {
-            Self::Active(iv) => {
-                iv.tick().await;
+            Self::Enabled(interval) => {
+                interval.tick().await;
             }
             Self::Disabled => std::future::pending::<()>().await,
         }
     }
 }
 
-#[inline]
 fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -830,31 +2021,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_probe_reports_service_shape_and_payload_bytes() {
-        let mut pending = PendingPings::new(8);
-        pending.insert(7, Some(ServiceShape::Voice), 160);
+    fn replay_window_accepts_new_and_rejects_duplicates() {
+        let mut replay = ReplayWindow::default();
 
-        assert_eq!(
-            pending.take(7),
-            Some(PendingProbe {
-                shape: Some(ServiceShape::Voice),
-                payload_bytes: 160
-            })
-        );
-        assert_eq!(pending.take(7), None);
+        assert!(replay.accept(10));
+        assert!(!replay.accept(10));
+        assert!(replay.accept(9));
+        assert!(!replay.accept(9));
+        assert!(replay.accept(11));
+        assert!(replay.accept(1));
+        assert!(!replay.accept(1));
+        assert!(replay.accept(200));
+        assert!(!replay.accept(11));
     }
 
     #[test]
-    fn pending_latency_ping_has_no_service_shape() {
-        let mut pending = PendingPings::new(8);
-        pending.insert(7, None, 0);
+    fn packet_header_roundtrips() {
+        let header = UdpPacketHeader {
+            kind: UdpPacketKind::Data,
+            src: 1,
+            dst: 2,
+            seq: 42,
+        };
+        let encoded = header.encode();
 
         assert_eq!(
-            pending.take(7),
-            Some(PendingProbe {
-                shape: None,
-                payload_bytes: 0
-            })
+            UdpPacketHeader::decode(&[encoded.as_slice(), &[0; TAG_LEN]].concat())
+                .unwrap()
+                .seq,
+            42
         );
+    }
+
+    #[test]
+    fn key_exchange_derives_matching_directional_keys() {
+        let (low_private, low_public) = generate_ephemeral_keypair().unwrap();
+        let (high_private, high_public) = generate_ephemeral_keypair().unwrap();
+        let ordered = OrderedOfferMaterial {
+            low_node: 7,
+            high_node: 9,
+            low_offer_id: 11,
+            high_offer_id: 13,
+            low_public_key: &low_public,
+            high_public_key: &high_public,
+        };
+        let low_keys = derive_key_material(low_private, &high_public, &ordered).unwrap();
+        let high_keys = derive_key_material(high_private, &low_public, &ordered).unwrap();
+
+        assert_eq!(low_keys.low_to_high, high_keys.low_to_high);
+        assert_eq!(low_keys.high_to_low, high_keys.high_to_low);
+        assert_ne!(low_keys.low_to_high, low_keys.high_to_low);
     }
 }

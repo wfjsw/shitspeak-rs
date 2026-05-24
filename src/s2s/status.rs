@@ -74,6 +74,9 @@ struct TransportMetric {
     sent_bps: f64,
     wire_recv_bps: f64,
     wire_sent_bps: f64,
+    packet_loss_ppm: u32,
+    probe_packets: u64,
+    lost_probe_packets: u64,
     probe_goodput_bps: f64,
     estimated_throughput_bps: f64,
     samples: u64,
@@ -295,63 +298,16 @@ fn build_topology_snapshot(
     links.sort_by_key(|link| (link.source, link.target));
 
     let mut routes = Vec::new();
-    append_routes(
-        &mut routes,
-        "per_service",
-        "reliable",
-        routing
-            .for_metric_level(RoutingMetric::PerServiceCost, ServiceLevel::Reliable)
-            .iter(),
-    );
-    append_routes(
-        &mut routes,
-        "per_service",
-        "reliable_low_latency",
-        routing
-            .for_metric_level(
-                RoutingMetric::PerServiceCost,
-                ServiceLevel::ReliableLowLatency,
-            )
-            .iter(),
-    );
-    append_routes(
-        &mut routes,
-        "per_service",
-        "best_effort",
-        routing
-            .for_metric_level(RoutingMetric::PerServiceCost, ServiceLevel::BestEffort)
-            .iter(),
-    );
-    append_routes(
-        &mut routes,
-        "conversational",
-        "reliable",
-        routing
-            .for_metric_level(RoutingMetric::ConversationalQuality, ServiceLevel::Reliable)
-            .iter(),
-    );
-    append_routes(
-        &mut routes,
-        "conversational",
-        "reliable_low_latency",
-        routing
-            .for_metric_level(
-                RoutingMetric::ConversationalQuality,
-                ServiceLevel::ReliableLowLatency,
-            )
-            .iter(),
-    );
-    append_routes(
-        &mut routes,
-        "conversational",
-        "best_effort",
-        routing
-            .for_metric_level(
-                RoutingMetric::ConversationalQuality,
-                ServiceLevel::BestEffort,
-            )
-            .iter(),
-    );
+    for metric in RoutingMetric::ALL {
+        for level in ServiceLevel::ALL {
+            append_routes(
+                &mut routes,
+                metric.name(),
+                service_level_name(level),
+                routing.for_metric_level(metric, level).iter(),
+            );
+        }
+    }
     routes.sort_by_key(|route| (route.metric, route.level, route.dst));
 
     let mut local_metrics = Vec::new();
@@ -382,6 +338,9 @@ fn build_topology_snapshot(
                 sent_bps: metric.sent_bps(),
                 wire_recv_bps: metric.wire_recv_bps(),
                 wire_sent_bps: metric.wire_sent_bps(),
+                packet_loss_ppm: metric.packet_loss_ppm(),
+                probe_packets: metric.probe_packets(),
+                lost_probe_packets: metric.lost_probe_packets(),
                 probe_goodput_bps: metric.max_probe_goodput_bps(),
                 estimated_throughput_bps: metric.estimated_throughput_bps(),
                 samples: metric.samples(),
@@ -514,7 +473,7 @@ th { color: var(--muted); font-weight: 600; background: #fafbfc; }
   </section>
   <section class="tables">
     <div class="panel"><h2>Nodes</h2><table><thead><tr><th>Node</th><th>Status</th><th>LSA</th><th>Addresses</th></tr></thead><tbody id="nodes"></tbody></table></div>
-    <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Voice</th><th>Control</th><th>Bulk</th></tr></thead><tbody id="metrics"></tbody></table></div>
+    <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Loss</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Voice</th><th>Control</th><th>Bulk</th></tr></thead><tbody id="metrics"></tbody></table></div>
     <div class="panel"><h2>Routes</h2><table><thead><tr><th>Metric</th><th>Level</th><th>Dst</th><th>Next hop</th><th>Cost</th></tr></thead><tbody id="routes"></tbody></table></div>
   </section>
 </main>
@@ -675,7 +634,7 @@ function renderGraph(data) {
 }
 function renderTables(data) {
   nodesTbody.innerHTML = data.nodes.map(n => `<tr><td>${n.node_id}</td><td><span class="pill ${n.status}">${n.status}</span></td><td>seq ${n.lsa_seq ?? '-'}<br>${n.lsa_age_ms ?? '-'} ms</td><td>${n.addresses.map(a => `<span class="transport">${esc(a.transport)}</span> ${esc(a.addr)}`).join('<br>')}</td></tr>`).join('');
-    metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
+    metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${fmtLoss(m.packet_loss_ppm)}<br><span class="transport">${m.lost_probe_packets}/${m.probe_packets}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
   routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${r.cost}</td></tr>`).join('');
 }
 async function refresh() {

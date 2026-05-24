@@ -77,49 +77,41 @@ pub async fn handle_user_stats(
     }
 
     if target_session != sender_id && target_session.get_node_id() != local_node_id {
-        if let Some(app) = server.s2s_manager().application() {
-            let reply = app
-                .user_stats()
-                .dispatch_request(
-                    target_session.get_node_id(),
-                    sender_raw,
-                    target_session_raw,
-                    effective_stats_only,
-                    server_id.clone(),
-                    None,
-                )
-                .await;
-            match reply {
-                Ok(r) if r.found && !r.payload.is_empty() => {
-                    let proto = match crate::mumble_proto::UserStats::decode(r.payload.as_ref()) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                target = target_session_raw,
-                                "user_stats: owner returned undecodable payload",
-                            );
-                            return Ok(());
-                        }
-                    };
-                    let user_stats: UserStats = proto.into();
-                    let outbound: Message = user_stats.into();
-                    sender.write_proto_message(&outbound).await?;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        target = target_session_raw,
-                        "user_stats: dispatch_request failed",
-                    );
-                }
+        let reply = server
+            .s2s_manager()
+            .dispatch_user_stats_request(
+                target_session.get_node_id(),
+                sender_raw,
+                target_session_raw,
+                effective_stats_only,
+                server_id.clone(),
+            )
+            .await;
+        match reply {
+            Ok(r) if r.found && !r.payload.is_empty() => {
+                let proto = match crate::mumble_proto::UserStats::decode(r.payload.as_ref()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            target = target_session_raw,
+                            "user_stats: owner returned undecodable payload",
+                        );
+                        return Ok(());
+                    }
+                };
+                let user_stats: UserStats = proto.into();
+                let outbound: Message = user_stats.into();
+                sender.write_proto_message(&outbound).await?;
             }
-        } else {
-            tracing::trace!(
-                target = target_session_raw,
-                "cross-owner UserStats dropped: ApplicationLayer not attached",
-            );
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    target = target_session_raw,
+                    "user_stats: dispatch_request failed",
+                );
+            }
         }
         return Ok(());
     }

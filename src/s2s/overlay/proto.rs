@@ -127,16 +127,23 @@ pub fn level_from_wire(v: u32) -> Option<ServiceLevel> {
 #[inline]
 pub fn route_metric_to_wire(metric: RoutingMetric) -> u32 {
     match metric {
-        RoutingMetric::PerServiceCost => 0,
         RoutingMetric::ConversationalQuality => 1,
+        RoutingMetric::ReliableCost => 2,
+        RoutingMetric::ReliableLowLatencyCost => 3,
+        RoutingMetric::BestEffortCost => 4,
     }
 }
 
 #[inline]
-pub fn route_metric_from_wire(v: u32) -> Option<RoutingMetric> {
+pub fn route_metric_from_wire(v: u32, level: ServiceLevel) -> Option<RoutingMetric> {
     match v {
-        0 => Some(RoutingMetric::PerServiceCost),
+        // Legacy peers used `0` for the old per-service composite metric.
+        // Decode it to the default metric for the frame's service level.
+        0 => Some(RoutingMetric::default_for_level(level)),
         1 => Some(RoutingMetric::ConversationalQuality),
+        2 => Some(RoutingMetric::ReliableCost),
+        3 => Some(RoutingMetric::ReliableLowLatencyCost),
+        4 => Some(RoutingMetric::BestEffortCost),
         _ => None,
     }
 }
@@ -200,14 +207,21 @@ mod tests {
             assert_eq!(level_from_wire(level_to_wire(l)).unwrap(), l);
         }
         for metric in [
-            RoutingMetric::PerServiceCost,
+            RoutingMetric::ReliableCost,
+            RoutingMetric::ReliableLowLatencyCost,
+            RoutingMetric::BestEffortCost,
             RoutingMetric::ConversationalQuality,
         ] {
             assert_eq!(
-                route_metric_from_wire(route_metric_to_wire(metric)).unwrap(),
+                route_metric_from_wire(route_metric_to_wire(metric), ServiceLevel::Reliable)
+                    .unwrap(),
                 metric
             );
         }
+        assert_eq!(
+            route_metric_from_wire(0, ServiceLevel::BestEffort).unwrap(),
+            RoutingMetric::BestEffortCost
+        );
         for c in [MessageClass::HighPriority, MessageClass::Regular] {
             assert_eq!(class_from_wire(class_to_wire(c)).unwrap(), c);
         }

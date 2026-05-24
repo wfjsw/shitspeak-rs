@@ -58,6 +58,15 @@ pub struct TestServer {
     _s2s_persistence_dir: Option<TempDir>,
 }
 
+impl TestServer {
+    pub async fn shutdown_gracefully(mut self) {
+        self.server.shutdown();
+        if let Some(h) = self.run_handle.take() {
+            let _ = h.await;
+        }
+    }
+}
+
 impl Drop for TestServer {
     fn drop(&mut self) {
         // Trigger shutdown so Server::run stops accept loops and can exit.
@@ -114,6 +123,26 @@ pub async fn spawn_s2s_test_server(
         Some(persistence_dir),
     )
     .await
+}
+
+pub async fn spawn_s2s_test_server_with_config(
+    opts: TestServerOpts,
+    pki: Arc<Pki>,
+    node_id: u16,
+    cert_index: usize,
+    mut s2s: S2sConfig,
+) -> TestServer {
+    install_provider_once();
+
+    let persistence_dir = TempDir::new().expect("s2s persistence dir");
+    let (cert_path, key_path) = pki.nodes[cert_index].clone();
+    s2s.enabled = true;
+    s2s.ca_path = Some(pki.ca_path.clone());
+    s2s.cert_path = Some(cert_path);
+    s2s.key_path = Some(key_path);
+    s2s.persistence_dir = Some(persistence_dir.path().to_path_buf());
+
+    spawn_test_server_with_pki(opts, pki, node_id, cert_index, s2s, Some(persistence_dir)).await
 }
 
 async fn spawn_test_server_with_pki(

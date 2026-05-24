@@ -22,9 +22,7 @@ use crate::s2s::transport::{
     ConnectionManager, MessageClass, PeerAddress, ServiceLevel, TransportKind,
 };
 
-use super::super::config::SeedPeer;
-use super::super::membership::MembershipEvent;
-use super::super::OverlayNetwork;
+use crate::s2s::overlay::{MembershipEvent, OverlayNetwork, SeedPeer};
 
 // ---------------------------------------------------------------------------
 // Phase-2 baseline tests (5)

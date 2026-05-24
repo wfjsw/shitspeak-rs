@@ -9,5 +9,5 @@ pub mod runtime;
 
 pub use runtime::{
     OverlayPluginDataTransport, PluginDataDelivery, PluginDataService, PluginDataSink,
-    PluginDataTransport, ServerPluginDataSink, PLUGIN_DATA_CLASS, PLUGIN_DATA_LEVEL,
+    PluginDataTransport, PLUGIN_DATA_CLASS, PLUGIN_DATA_LEVEL,
 };

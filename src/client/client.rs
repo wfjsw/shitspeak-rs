@@ -578,6 +578,10 @@ impl Client {
         }
     }
 
+    pub async fn remove_last_client_version(&self, node_id: u16) {
+        self.last_client_version.lock().remove(&node_id);
+    }
+
     /// Get the last channel-state version seen.
     pub async fn get_last_channel_version(&self) -> u64 {
         *self.last_channel_version.lock()

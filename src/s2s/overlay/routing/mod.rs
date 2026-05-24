@@ -16,15 +16,34 @@ pub use crate::s2s::transport::RoutingMetric;
 pub use dijkstra::RouteEntry;
 pub use recompute::spawn_recomputer;
 
-/// One snapshot of all three service-level tables.
-#[derive(Default, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RoutingTableKey {
+    metric: RoutingMetric,
+    level: ServiceLevel,
+}
+
+impl RoutingTableKey {
+    fn new(metric: RoutingMetric, level: ServiceLevel) -> Self {
+        Self { metric, level }
+    }
+}
+
+/// One snapshot of the service-level tables for every routing metric.
+#[derive(Clone)]
 pub struct RoutingTables {
-    pub reliable: HashMap<NodeIdentifier, RouteEntry>,
-    pub reliable_low_latency: HashMap<NodeIdentifier, RouteEntry>,
-    pub best_effort: HashMap<NodeIdentifier, RouteEntry>,
-    conversational_reliable: HashMap<NodeIdentifier, RouteEntry>,
-    conversational_reliable_low_latency: HashMap<NodeIdentifier, RouteEntry>,
-    conversational_best_effort: HashMap<NodeIdentifier, RouteEntry>,
+    tables: HashMap<RoutingTableKey, HashMap<NodeIdentifier, RouteEntry>>,
+}
+
+impl Default for RoutingTables {
+    fn default() -> Self {
+        let mut tables = HashMap::new();
+        for metric in RoutingMetric::ALL {
+            for level in ServiceLevel::ALL {
+                tables.insert(RoutingTableKey::new(metric, level), HashMap::new());
+            }
+        }
+        Self { tables }
+    }
 }
 
 impl RoutingTables {
@@ -32,8 +51,18 @@ impl RoutingTables {
         Self::default()
     }
 
+    pub(crate) fn insert_table(
+        &mut self,
+        metric: RoutingMetric,
+        level: ServiceLevel,
+        table: HashMap<NodeIdentifier, RouteEntry>,
+    ) {
+        self.tables
+            .insert(RoutingTableKey::new(metric, level), table);
+    }
+
     pub fn for_level(&self, level: ServiceLevel) -> &HashMap<NodeIdentifier, RouteEntry> {
-        self.for_metric_level(RoutingMetric::PerServiceCost, level)
+        self.for_metric_level(RoutingMetric::default_for_level(level), level)
     }
 
     pub fn for_metric_level(
@@ -41,23 +70,9 @@ impl RoutingTables {
         metric: RoutingMetric,
         level: ServiceLevel,
     ) -> &HashMap<NodeIdentifier, RouteEntry> {
-        let tables = match metric {
-            RoutingMetric::PerServiceCost => (
-                &self.reliable,
-                &self.reliable_low_latency,
-                &self.best_effort,
-            ),
-            RoutingMetric::ConversationalQuality => (
-                &self.conversational_reliable,
-                &self.conversational_reliable_low_latency,
-                &self.conversational_best_effort,
-            ),
-        };
-        match level {
-            ServiceLevel::Reliable => tables.0,
-            ServiceLevel::ReliableLowLatency => tables.1,
-            ServiceLevel::BestEffort => tables.2,
-        }
+        self.tables
+            .get(&RoutingTableKey::new(metric, level))
+            .expect("routing table key initialized")
     }
 
     /// Look up the next hop. Falls back to whichever other level can
@@ -74,7 +89,47 @@ impl RoutingTables {
     ///   benefit; clusters without KCP/QUIC still get their RLL traffic
     ///   delivered.
     pub fn lookup(&self, dst: NodeIdentifier, level: ServiceLevel) -> Option<RouteEntry> {
-        self.lookup_with_metric(dst, level, RoutingMetric::PerServiceCost)
+        self.lookup_default(dst, level)
+    }
+
+    fn lookup_default(&self, dst: NodeIdentifier, level: ServiceLevel) -> Option<RouteEntry> {
+        if let Some(e) = self
+            .for_metric_level(RoutingMetric::default_for_level(level), level)
+            .get(&dst)
+        {
+            return Some(*e);
+        }
+        match level {
+            ServiceLevel::BestEffort => self
+                .for_metric_level(
+                    RoutingMetric::default_for_level(ServiceLevel::Reliable),
+                    ServiceLevel::Reliable,
+                )
+                .get(&dst)
+                .copied()
+                .or_else(|| {
+                    self.for_metric_level(
+                        RoutingMetric::default_for_level(ServiceLevel::ReliableLowLatency),
+                        ServiceLevel::ReliableLowLatency,
+                    )
+                    .get(&dst)
+                    .copied()
+                }),
+            ServiceLevel::Reliable => self
+                .for_metric_level(
+                    RoutingMetric::default_for_level(ServiceLevel::ReliableLowLatency),
+                    ServiceLevel::ReliableLowLatency,
+                )
+                .get(&dst)
+                .copied(),
+            ServiceLevel::ReliableLowLatency => self
+                .for_metric_level(
+                    RoutingMetric::default_for_level(ServiceLevel::Reliable),
+                    ServiceLevel::Reliable,
+                )
+                .get(&dst)
+                .copied(),
+        }
     }
 
     pub fn lookup_with_metric(
@@ -86,15 +141,24 @@ impl RoutingTables {
         if let Some(e) = self.for_metric_level(metric, level).get(&dst) {
             return Some(*e);
         }
-        let reliable = self.for_metric_level(metric, ServiceLevel::Reliable);
-        let reliable_low_latency = self.for_metric_level(metric, ServiceLevel::ReliableLowLatency);
         match level {
-            ServiceLevel::BestEffort => reliable
+            ServiceLevel::BestEffort => self
+                .for_metric_level(metric, ServiceLevel::Reliable)
                 .get(&dst)
                 .copied()
-                .or_else(|| reliable_low_latency.get(&dst).copied()),
-            ServiceLevel::Reliable => reliable_low_latency.get(&dst).copied(),
-            ServiceLevel::ReliableLowLatency => reliable.get(&dst).copied(),
+                .or_else(|| {
+                    self.for_metric_level(metric, ServiceLevel::ReliableLowLatency)
+                        .get(&dst)
+                        .copied()
+                }),
+            ServiceLevel::Reliable => self
+                .for_metric_level(metric, ServiceLevel::ReliableLowLatency)
+                .get(&dst)
+                .copied(),
+            ServiceLevel::ReliableLowLatency => self
+                .for_metric_level(metric, ServiceLevel::Reliable)
+                .get(&dst)
+                .copied(),
         }
     }
 
@@ -126,20 +190,34 @@ mod tests {
     #[test]
     fn has_route_uses_service_level_fallback_rules() {
         let mut tables = RoutingTables::empty();
-        tables.reliable_low_latency.insert(
-            2,
-            RouteEntry {
-                next_hop: 2,
-                cost: 10,
-            },
-        );
-        tables.best_effort.insert(
-            3,
-            RouteEntry {
-                next_hop: 3,
-                cost: 1,
-            },
-        );
+        tables
+            .tables
+            .get_mut(&RoutingTableKey::new(
+                RoutingMetric::ReliableLowLatencyCost,
+                ServiceLevel::ReliableLowLatency,
+            ))
+            .unwrap()
+            .insert(
+                2,
+                RouteEntry {
+                    next_hop: 2,
+                    cost: 10,
+                },
+            );
+        tables
+            .tables
+            .get_mut(&RoutingTableKey::new(
+                RoutingMetric::BestEffortCost,
+                ServiceLevel::BestEffort,
+            ))
+            .unwrap()
+            .insert(
+                3,
+                RouteEntry {
+                    next_hop: 3,
+                    cost: 1,
+                },
+            );
 
         assert!(tables.has_route(2, ServiceLevel::ReliableLowLatency));
         assert!(tables.has_route(2, ServiceLevel::Reliable));

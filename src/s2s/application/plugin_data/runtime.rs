@@ -1,4 +1,4 @@
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -47,26 +47,6 @@ impl PluginDataTransport for OverlayPluginDataTransport {
 #[async_trait]
 pub trait PluginDataSink: Send + Sync + 'static {
     async fn deliver(&self, from: NodeIdentifier, envelope: PluginDataEnvelope);
-}
-
-pub struct ServerPluginDataSink {
-    server: Weak<Box<Server>>,
-}
-
-impl ServerPluginDataSink {
-    pub fn new(server: Weak<Box<Server>>) -> Arc<Self> {
-        Arc::new(Self { server })
-    }
-}
-
-#[async_trait]
-impl PluginDataSink for ServerPluginDataSink {
-    async fn deliver(&self, _from: NodeIdentifier, envelope: PluginDataEnvelope) {
-        let Some(server) = self.server.upgrade() else {
-            return;
-        };
-        deliver_to_local_recipients(&server, envelope).await;
-    }
 }
 
 pub struct PluginDataDelivery {
@@ -186,6 +166,9 @@ pub async fn deliver_to_local_recipients(server: &Arc<Box<Server>>, envelope: Pl
         .get_clients()
         .get_client_in_server(&server_id, sender_id)
         .await;
+    if server.get_hide_users_without_traverse() && sender.is_none() {
+        return;
+    }
     for receiver in envelope.receiver_sessions {
         let id = ClientSessionIdentifier::from(receiver);
         if id.get_node_id() == server.get_clients().local_node_id() {
@@ -197,6 +180,9 @@ pub async fn deliver_to_local_recipients(server: &Arc<Box<Server>>, envelope: Pl
                 continue;
             };
             if let Some(sender) = sender.as_ref() {
+                if !crate::client::visibility::can_view_user(server, sender, &target).await {
+                    continue;
+                }
                 if !crate::client::visibility::can_view_user(server, &target, sender).await {
                     continue;
                 }

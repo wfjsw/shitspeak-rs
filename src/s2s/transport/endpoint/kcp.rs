@@ -17,7 +17,7 @@ use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
 use super::super::service_level::TransportKind;
 use super::{
-    bind_reusable_udp_socket, bind_transport_udp_socket, install_stream_session, Endpoint,
+    bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket, install_stream_session, Endpoint,
 };
 
 pub(crate) struct KcpEndpoint {
@@ -71,7 +71,7 @@ impl Endpoint for KcpEndpoint {
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
             let cfg = KcpConfig::default();
-            let socket = bind_transport_udp_socket(self.listen_addr, addr).await?;
+            let socket = bind_ephemeral_udp_dial_socket(addr).await?;
             let sock = KcpStream::connect_with_socket(&cfg, socket, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
@@ -103,7 +103,7 @@ impl Endpoint for KcpEndpoint {
     ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
         async move {
             let cfg = KcpConfig::default();
-            let socket = bind_transport_udp_socket(self.listen_addr, addr).await?;
+            let socket = bind_ephemeral_udp_dial_socket(addr).await?;
             let sock = KcpStream::connect_with_socket(&cfg, socket, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;

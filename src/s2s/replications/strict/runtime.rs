@@ -29,7 +29,7 @@ use super::super::proto::{
 use super::super::topic::ErasedStrictRuntime;
 use super::{HistoryMetadata, LogSlice, StrictReplicable};
 use crate::s2s::overlay::{MembershipEvent, OverlayNetwork};
-use crate::s2s::transport::{MessageClass, ServiceLevel};
+use crate::s2s::transport::{MessageClass, RoutingMetric, ServiceLevel};
 use crate::types::NodeIdentifier;
 
 // ---------- Tunables ----------
@@ -116,10 +116,11 @@ impl StrictNet for OverlayStrictNet {
         let msg = repl_proto::wrap_strict(topic, body);
         let bytes = repl_proto::encode(&msg)?;
         self.overlay
-            .send_unicast(
+            .send_unicast_unordered_with_routing_metric(
                 dst,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
                 MessageClass::Regular,
                 bytes,
             )
@@ -139,10 +140,11 @@ impl StrictNet for OverlayStrictNet {
         let msg = repl_proto::wrap_strict(topic, body);
         let bytes = repl_proto::encode(&msg)?;
         self.overlay
-            .send_multicast(
+            .send_multicast_unordered_with_routing_metric(
                 dsts,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
                 MessageClass::Regular,
                 bytes,
             )
@@ -154,9 +156,10 @@ impl StrictNet for OverlayStrictNet {
         let msg = repl_proto::wrap_strict(topic, body);
         let bytes = repl_proto::encode(&msg)?;
         self.overlay
-            .send_broadcast(
+            .send_broadcast_unordered_with_routing_metric(
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
                 MessageClass::Regular,
                 bytes,
             )

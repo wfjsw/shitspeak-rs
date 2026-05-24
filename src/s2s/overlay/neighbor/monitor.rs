@@ -13,7 +13,7 @@
 //! readings (RTT / jitter / throughput / transports). This snapshot is
 //! what `lsdb::advert::build_local_lsa` reads to construct each LSA.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,7 @@ struct NeighborState {
     last_ack_at: Option<Instant>,
     miss_count: u32,
     is_up: bool,
-    loss_ppm: f64,
+    loss_samples: VecDeque<(Instant, bool)>,
     /// Pending pings by nonce -> when sent (for RTT calculation on ack).
     pending: HashMap<u64, Instant>,
 }
@@ -58,15 +58,42 @@ impl NeighborState {
             last_ack_at: None,
             miss_count: 0,
             is_up: false,
-            loss_ppm: 0.0,
+            loss_samples: VecDeque::new(),
             pending: HashMap::new(),
         }
     }
 }
 
-fn record_loss_sample(st: &mut NeighborState, loss_ppm: f64) {
-    const ALPHA: f64 = 0.2;
-    st.loss_ppm += ALPHA * (loss_ppm - st.loss_ppm);
+fn record_loss_sample(st: &mut NeighborState, now: Instant, window: Duration, lost: bool) {
+    prune_loss_samples(st, now, window);
+    st.loss_samples.push_back((now, lost));
+}
+
+fn prune_loss_samples(st: &mut NeighborState, now: Instant, window: Duration) {
+    let cutoff = now.checked_sub(window).unwrap_or(now);
+    while st
+        .loss_samples
+        .front()
+        .is_some_and(|(sample_at, _)| *sample_at < cutoff)
+    {
+        st.loss_samples.pop_front();
+    }
+}
+
+fn packet_loss_ppm(st: &mut NeighborState, now: Instant, window: Duration) -> u32 {
+    prune_loss_samples(st, now, window);
+    let total = st.loss_samples.len();
+    if total == 0 {
+        return 0;
+    }
+    let lost = st
+        .loss_samples
+        .iter()
+        .filter(|(_, sample_lost)| *sample_lost)
+        .count();
+    ((lost as f64 / total as f64) * 1_000_000.0)
+        .round()
+        .clamp(0.0, 1_000_000.0) as u32
 }
 
 /// Direct-neighbor table.
@@ -116,9 +143,11 @@ impl NeighborMonitor {
     /// metrics drawn from `metrics_snapshot()`.
     pub fn snapshot(&self) -> Vec<NeighborSnapshot> {
         let metrics = self.transport.metrics_snapshot();
-        let g = self.state.lock();
+        let now = Instant::now();
+        let loss_window = self.cfg.hello_dead_interval();
+        let mut g = self.state.lock();
         let mut out = Vec::with_capacity(g.len());
-        for (nid, st) in g.iter() {
+        for (nid, st) in g.iter_mut() {
             if !st.is_up {
                 continue;
             }
@@ -158,7 +187,7 @@ impl NeighborMonitor {
                 jitter_us,
                 throughput_bps,
                 transports_mask,
-                loss_ppm: st.loss_ppm.clamp(0.0, 1_000_000.0).round() as u32,
+                loss_ppm: packet_loss_ppm(st, now, loss_window),
             });
         }
         out.sort_by_key(|n| n.node_id);
@@ -190,8 +219,9 @@ impl NeighborMonitor {
         if expired > 0 {
             st.pending.retain(|_, sent| *sent > cutoff);
             for _ in 0..expired {
-                record_loss_sample(st, 1_000_000.0);
+                record_loss_sample(st, now, self.cfg.hello_dead_interval(), true);
             }
+            self.on_change.notify_one();
         }
         st.pending.insert(nonce, now);
     }
@@ -260,7 +290,7 @@ impl NeighborMonitor {
             // pending table since either is a valid round-trip measurement.
             let sent_at_instant: Option<Instant> = st.pending.remove(&nonce);
             if sent_at_instant.is_some() {
-                record_loss_sample(st, 0.0);
+                record_loss_sample(st, now, self.cfg.hello_dead_interval(), false);
             }
             // Cap pending table size — drop stale entries occasionally.
             if st.pending.len() > 32 {
@@ -269,6 +299,7 @@ impl NeighborMonitor {
             }
             (was_up, sent_at_instant)
         };
+        let matched_ack = sent_at_instant.is_some();
         let rtt = if let Some(t) = sent_at_instant.take() {
             now.saturating_duration_since(t)
         } else {
@@ -287,6 +318,8 @@ impl NeighborMonitor {
             debug!(peer=%from, ?rtt, "direct link up");
             self.on_change.notify_one();
             self.on_link_up.notify_one();
+        } else if matched_ack {
+            self.on_change.notify_one();
         }
     }
 
@@ -323,6 +356,13 @@ impl NeighborMonitor {
                 }
                 if let Some(last) = st.last_ack_at {
                     if now.duration_since(last) >= dead {
+                        let expired = st.pending.len();
+                        if expired > 0 {
+                            st.pending.clear();
+                            for _ in 0..expired {
+                                record_loss_sample(st, now, dead, true);
+                            }
+                        }
                         if st.is_up {
                             st.is_up = false;
                             transitions.push((*nid, false));

@@ -18,6 +18,13 @@ pub const PROTOBUF_INTRODUCED_VERSION: ProtocolVersion = ProtocolVersion {
     patch: 0,
 };
 
+#[cfg(test)]
+const FIXED_TEST_BUILD_DATE: &str = "1970-01-01T00:00:00+00:00";
+
+#[cfg(test)]
+pub const BUILD_DATE: &str = FIXED_TEST_BUILD_DATE;
+
+#[cfg(not(test))]
 pub const BUILD_DATE: &str = env!("BUILD_DATE");
 pub const COMMIT_HASH: &str = env!("COMMIT_HASH");
 pub const COMMIT_DATE: &str = env!("COMMIT_DATE");
@@ -59,5 +66,10 @@ mod tests {
         assert_eq!(non_empty_prefix("", 7, "unknown"), "unknown");
         assert_eq!(non_empty_prefix("abcd", 7, "unknown"), "abcd");
         assert_eq!(non_empty_prefix("abcdefghi", 7, "unknown"), "abcdefg");
+    }
+
+    #[test]
+    fn build_date_is_fixed_for_tests() {
+        assert_eq!(BUILD_DATE, FIXED_TEST_BUILD_DATE);
     }
 }

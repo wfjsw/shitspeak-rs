@@ -25,6 +25,12 @@ const E_MODEL_THROUGHPUT_IMPAIRMENT_PER_LOG2: f64 = 4.0;
 const E_MODEL_MAX_THROUGHPUT_IMPAIRMENT: f64 = 20.0;
 const DEFAULT_RELIABLE_THROUGHPUT_PENALTY_US_KBPS: f64 = 1_000_000.0;
 const DEFAULT_RLL_JITTER_WEIGHT: f64 = 4.0;
+const MAX_PACKET_LOSS_PPM: u32 = 1_000_000;
+
+pub(crate) fn apply_packet_loss_penalty(cost: f64, packet_loss_ppm: u32) -> f64 {
+    let success = 1.0 - (packet_loss_ppm.min(999_999) as f64 / MAX_PACKET_LOSS_PPM as f64);
+    (cost / success.max(0.001)).max(1.0)
+}
 
 pub(crate) fn conversational_effective_delay_us(rtt_us: f64, jitter_us: f64) -> u64 {
     let one_way_ms = rtt_us.max(1.0) / 2_000.0;
@@ -122,6 +128,10 @@ pub struct LinkMetrics {
     wire_sent_bytes: u64,
     /// The wall-clock window over which `recv_bytes` / `sent_bytes` apply.
     window: Duration,
+    /// Packet loss over the rolling probe/keepalive window, parts per million.
+    packet_loss_ppm: u32,
+    probe_packets: u64,
+    lost_probe_packets: u64,
     samples: u64,
     last_update: Option<Instant>,
     /// EWMA of service-shaped active probe goodput, in useful payload bytes/sec.
@@ -171,6 +181,18 @@ impl LinkMetrics {
 
     pub fn window(&self) -> Duration {
         self.window
+    }
+
+    pub fn packet_loss_ppm(&self) -> u32 {
+        self.packet_loss_ppm
+    }
+
+    pub fn probe_packets(&self) -> u64 {
+        self.probe_packets
+    }
+
+    pub fn lost_probe_packets(&self) -> u64 {
+        self.lost_probe_packets
     }
 
     pub fn samples(&self) -> u64 {
@@ -251,40 +273,45 @@ impl LinkMetrics {
             self.rtt_us,
             self.jitter_us,
             self.estimated_throughput_bps(),
-            0,
+            self.packet_loss_ppm,
         ))
     }
 
     /// Cost of this link under the sender-selected route metric. Lower is
     /// better. Links without RTT samples are left unranked.
-    pub fn routing_cost(&self, level: ServiceLevel, metric: RoutingMetric) -> Option<f64> {
+    pub fn routing_cost(&self, _level: ServiceLevel, metric: RoutingMetric) -> Option<f64> {
         if self.samples == 0 {
             return None;
         }
 
         Some(match metric {
-            RoutingMetric::PerServiceCost => self.per_service_cost(level),
+            RoutingMetric::ReliableCost => self.reliable_cost(),
+            RoutingMetric::ReliableLowLatencyCost => self.reliable_low_latency_cost(),
+            RoutingMetric::BestEffortCost => self.best_effort_cost(),
             RoutingMetric::ConversationalQuality => conversational_impairment(
                 self.rtt_us,
                 self.jitter_us,
                 self.estimated_throughput_bps(),
-                0,
+                self.packet_loss_ppm,
             ),
         })
     }
 
-    fn per_service_cost(&self, level: ServiceLevel) -> f64 {
-        match level {
-            ServiceLevel::BestEffort => self.rtt_us.max(1.0),
-            ServiceLevel::ReliableLowLatency => {
-                (self.rtt_us + DEFAULT_RLL_JITTER_WEIGHT * self.jitter_us).max(1.0)
-            }
-            ServiceLevel::Reliable => {
-                let throughput_kbps = (self.estimated_throughput_bps() / 1024.0).max(1.0);
-                let penalty = DEFAULT_RELIABLE_THROUGHPUT_PENALTY_US_KBPS / throughput_kbps;
-                (self.rtt_us + penalty).max(1.0)
-            }
-        }
+    fn best_effort_cost(&self) -> f64 {
+        apply_packet_loss_penalty(self.rtt_us.max(1.0), self.packet_loss_ppm)
+    }
+
+    fn reliable_low_latency_cost(&self) -> f64 {
+        apply_packet_loss_penalty(
+            (self.rtt_us + DEFAULT_RLL_JITTER_WEIGHT * self.jitter_us).max(1.0),
+            self.packet_loss_ppm,
+        )
+    }
+
+    fn reliable_cost(&self) -> f64 {
+        let throughput_kbps = (self.estimated_throughput_bps() / 1024.0).max(1.0);
+        let penalty = DEFAULT_RELIABLE_THROUGHPUT_PENALTY_US_KBPS / throughput_kbps;
+        apply_packet_loss_penalty((self.rtt_us + penalty).max(1.0), self.packet_loss_ppm)
     }
 }
 
@@ -319,6 +346,51 @@ impl SlidingCounters {
 }
 
 #[derive(Debug)]
+struct PacketLossWindow {
+    delivered: u64,
+    lost: u64,
+    window_start: Instant,
+    window: Duration,
+}
+
+impl PacketLossWindow {
+    fn new(window: Duration) -> Self {
+        Self {
+            delivered: 0,
+            lost: 0,
+            window_start: Instant::now(),
+            window,
+        }
+    }
+
+    fn record_delivered(&mut self) {
+        self.maybe_roll();
+        self.delivered = self.delivered.saturating_add(1);
+    }
+
+    fn record_lost(&mut self) {
+        self.maybe_roll();
+        self.lost = self.lost.saturating_add(1);
+    }
+
+    fn maybe_roll(&mut self) {
+        if self.window_start.elapsed() >= self.window {
+            self.delivered = 0;
+            self.lost = 0;
+            self.window_start = Instant::now();
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64, Duration) {
+        let age = self.window_start.elapsed();
+        if age >= self.window {
+            return (0, 0, age);
+        }
+        (self.delivered, self.lost, age)
+    }
+}
+
+#[derive(Debug)]
 struct LinkInner {
     rtt_us: Option<f64>,
     jitter_us: f64,
@@ -329,6 +401,7 @@ struct LinkInner {
     recv: SlidingCounters,
     wire_sent: SlidingCounters,
     wire_recv: SlidingCounters,
+    packet_loss: PacketLossWindow,
     service_probes: HashMap<ServiceShape, ServiceProbeInner>,
 }
 
@@ -350,6 +423,7 @@ impl LinkInner {
             recv: SlidingCounters::new(window),
             wire_sent: SlidingCounters::new(window),
             wire_recv: SlidingCounters::new(window),
+            packet_loss: PacketLossWindow::new(window),
             service_probes: HashMap::new(),
         }
     }
@@ -423,6 +497,22 @@ impl PeerMetrics {
             .record(bytes as u64);
     }
 
+    pub fn record_probe_delivered(&self, transport: TransportKind) {
+        let mut g = self.inner.lock();
+        g.entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window))
+            .packet_loss
+            .record_delivered();
+    }
+
+    pub fn record_probe_lost(&self, transport: TransportKind) {
+        let mut g = self.inner.lock();
+        g.entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window))
+            .packet_loss
+            .record_lost();
+    }
+
     /// Record one service-shaped active probe: `payload_bytes` useful bytes
     /// were delivered by this transport shape in `elapsed`.
     pub fn record_probe(
@@ -462,11 +552,21 @@ impl PeerMetrics {
                 let (recv_bytes, recv_age) = inner.recv.snapshot();
                 let (wire_sent_bytes, wire_sent_age) = inner.wire_sent.snapshot();
                 let (wire_recv_bytes, wire_recv_age) = inner.wire_recv.snapshot();
+                let (probe_delivered, probe_lost, loss_age) = inner.packet_loss.snapshot();
+                let probe_packets = probe_delivered.saturating_add(probe_lost);
+                let packet_loss_ppm = if probe_packets == 0 {
+                    0
+                } else {
+                    ((probe_lost as f64 / probe_packets as f64) * MAX_PACKET_LOSS_PPM as f64)
+                        .round()
+                        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32
+                };
                 let window = self.window.min(
                     recv_age
                         .max(sent_age)
                         .max(wire_recv_age)
                         .max(wire_sent_age)
+                        .max(loss_age)
                         .max(Duration::from_micros(1)),
                 );
                 let m = LinkMetrics {
@@ -477,6 +577,9 @@ impl PeerMetrics {
                     wire_sent_bytes,
                     wire_recv_bytes,
                     window,
+                    packet_loss_ppm,
+                    probe_packets,
+                    lost_probe_packets: probe_lost,
                     samples: inner.samples,
                     last_update: inner.last_update,
                     service_probes: inner
@@ -621,7 +724,7 @@ mod tests {
         assert_eq!(
             m.best_transport_for(
                 ServiceLevel::BestEffort,
-                RoutingMetric::PerServiceCost,
+                RoutingMetric::BestEffortCost,
                 &candidates
             ),
             Some(TransportKind::Udp)
@@ -630,7 +733,7 @@ mod tests {
         assert_eq!(
             m.best_transport_for(
                 ServiceLevel::ReliableLowLatency,
-                RoutingMetric::PerServiceCost,
+                RoutingMetric::ReliableLowLatencyCost,
                 &candidates
             ),
             Some(TransportKind::Quic)
@@ -640,7 +743,7 @@ mod tests {
         assert_eq!(
             m.best_transport_for(
                 ServiceLevel::Reliable,
-                RoutingMetric::PerServiceCost,
+                RoutingMetric::ReliableCost,
                 &candidates
             ),
             Some(TransportKind::Quic)
@@ -671,7 +774,7 @@ mod tests {
         assert_eq!(
             m.best_transport_for(
                 ServiceLevel::Reliable,
-                RoutingMetric::PerServiceCost,
+                RoutingMetric::ReliableCost,
                 &candidates
             ),
             Some(TransportKind::Quic)
@@ -691,7 +794,7 @@ mod tests {
         assert_eq!(
             m.best_transport_for(
                 ServiceLevel::BestEffort,
-                RoutingMetric::PerServiceCost,
+                RoutingMetric::BestEffortCost,
                 &candidates
             ),
             Some(TransportKind::Udp)
@@ -704,6 +807,35 @@ mod tests {
             ),
             Some(TransportKind::Quic)
         );
+    }
+
+    #[test]
+    fn packet_loss_penalty_affects_transport_ranking() {
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        let candidates = [TransportKind::Udp, TransportKind::Quic];
+
+        m.record_rtt(TransportKind::Udp, Duration::from_millis(10));
+        m.record_probe_delivered(TransportKind::Udp);
+        m.record_probe_lost(TransportKind::Udp);
+
+        m.record_rtt(TransportKind::Quic, Duration::from_millis(15));
+        m.record_probe_delivered(TransportKind::Quic);
+
+        assert_eq!(
+            m.best_transport_for(
+                ServiceLevel::BestEffort,
+                RoutingMetric::BestEffortCost,
+                &candidates
+            ),
+            Some(TransportKind::Quic)
+        );
+
+        let udp = m
+            .snapshot_per_transport()
+            .get(&TransportKind::Udp)
+            .unwrap()
+            .packet_loss_ppm();
+        assert_eq!(udp, 500_000);
     }
 
     #[test]

@@ -28,6 +28,28 @@ pub fn build_tls_configs(
     Ok((Arc::new(server), Arc::new(client)))
 }
 
+pub(crate) fn verify_peer_cert_chain(
+    roots: Arc<RootCertStore>,
+    chain: &[CertificateDer<'static>],
+) -> Result<(), rustls::Error> {
+    let Some((end_entity, intermediates)) = chain.split_first() else {
+        return Err(rustls::Error::General(
+            "peer certificate chain was empty".into(),
+        ));
+    };
+    let verifier = CaPinnedVerifier::new(roots);
+    let server_name = ServerName::try_from("invalid.s2s.local").expect("static name parses");
+    verifier
+        .verify_server_cert(
+            end_entity,
+            intermediates,
+            &server_name,
+            &[],
+            UnixTime::now(),
+        )
+        .map(|_| ())
+}
+
 fn build_server(identity: &NodeIdentity) -> Result<ServerConfig, ConfigError> {
     let verifier = WebPkiClientVerifier::builder(identity.roots().clone())
         .build()

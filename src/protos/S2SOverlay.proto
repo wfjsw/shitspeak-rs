@@ -56,7 +56,7 @@ message LinkAdvert {
   uint64 jitter_us       = 3;
   uint64 throughput_bps  = 4;
   uint32 transports_mask = 5;  // bitmap of TransportKind values; 1<<Tcp etc.
-  uint32 loss_ppm        = 6;  // EWMA packet loss estimate, parts per million.
+  uint32 loss_ppm        = 6;  // Rolling-window packet loss estimate, parts per million.
 }
 
 // Address entry (kept compatible with Phase 1's existing AddressEntry).
@@ -106,5 +106,8 @@ message OverlayData {
   uint32 message_class    = 6;   // matches s2s::transport::MessageClass
   bytes  payload          = 7;
   bool   process_on_transit = 8; // deliver to local service on transit hops too
-  uint32 route_metric     = 9;   // 0=per-service default, 1=conversational
+  uint32 route_metric     = 9;   // 0=legacy per-service default, 1=conversational, 2..4=level defaults
+  bool   ordered_delivery = 10;  // reliable/RLL traffic is delivered by sequence
+  uint64 ordering_seq     = 11;  // sender-monotonic per final destination
+  uint32 ordering_dst     = 12;  // final destination for ordering_seq
 }

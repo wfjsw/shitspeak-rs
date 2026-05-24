@@ -480,34 +480,27 @@ pub async fn handle_user_state(
 
     if let Some(target_session_id) = msg.session {
         if target_session_id != sender_id && target_session_id.get_node_id() != local_node_id {
-            if let Some(app) = server.s2s_manager().application() {
-                let patch = crate::s2s::application::proto::UserStatePatch {
-                    channel_id: requested_channel_change,
-                    mute: msg.mute,
-                    deaf: msg.deaf,
-                    suppress: requested_channel_change.and_then(|_| {
-                        target_destination_perms.map(|perms| !perms.contains(ACLPermissions::Speak))
-                    }),
-                    priority_speaker: msg.priority_speaker,
-                    listening_channel_add: msg.listening_channel_add.clone(),
-                    listening_channel_remove: msg.listening_channel_remove.clone(),
-                    expected_from_channel: Some(target_current_channel_id),
-                };
-                if let Err(e) = app
-                    .moderation()
-                    .dispatch_user_state(Some(&server_id), sender_id, target_session_id, patch)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        target = u32::from(target_session_id),
-                        "moderation dispatch_user_state failed",
-                    );
-                }
-            } else {
+            let patch = crate::s2s::application::proto::UserStatePatch {
+                channel_id: requested_channel_change,
+                mute: msg.mute,
+                deaf: msg.deaf,
+                suppress: requested_channel_change.and_then(|_| {
+                    target_destination_perms.map(|perms| !perms.contains(ACLPermissions::Speak))
+                }),
+                priority_speaker: msg.priority_speaker,
+                listening_channel_add: msg.listening_channel_add.clone(),
+                listening_channel_remove: msg.listening_channel_remove.clone(),
+                expected_from_channel: Some(target_current_channel_id),
+            };
+            if !server.s2s_manager().dispatch_moderation_user_state(
+                Some(&server_id),
+                sender_id,
+                target_session_id,
+                patch,
+            ) {
                 tracing::trace!(
                     target = u32::from(target_session_id),
-                    "cross-owner UserState dropped: ApplicationLayer not attached",
+                    "cross-owner UserState dropped: S2S gateway unavailable",
                 );
             }
             return Ok(());

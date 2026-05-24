@@ -538,40 +538,30 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
     flush_voice_batch(server, audio, &targets).await;
 
     if send_s2s {
-        if let Some(app) = server.s2s_manager().application() {
-            let payload = encode_s2s_voice_payload(audio);
-            let is_terminator = matches!(
-                &audio.audio_payload,
-                codec::AudioPayload::Opus(payload) if payload.is_terminator
-            );
-            let result = match intent.kind.as_ref() {
-                Some(VoiceIntentKind::Normal(normal)) => {
-                    app.voice()
-                        .send_for_channel(
-                            u32::from(sender_id),
-                            server_id.clone(),
-                            normal.source_channel,
-                            is_terminator,
-                            payload,
-                        )
-                        .await
-                }
-                _ => {
-                    app.voice()
-                        .send_broadcast(
-                            u32::from(sender_id),
-                            server_id.clone(),
-                            target_kind,
-                            is_terminator,
-                            payload,
-                            intent,
-                        )
-                        .await
-                }
-            };
-            if let Err(e) = result {
-                tracing::trace!(error=%e, "voice s2s send failed");
-            }
+        let payload = encode_s2s_voice_payload(audio);
+        let is_terminator = matches!(
+            &audio.audio_payload,
+            codec::AudioPayload::Opus(payload) if payload.is_terminator
+        );
+        let sent = match intent.kind.as_ref() {
+            Some(VoiceIntentKind::Normal(normal)) => server.s2s_manager().send_voice_for_channel(
+                u32::from(sender_id),
+                server_id.clone(),
+                normal.source_channel,
+                is_terminator,
+                payload,
+            ),
+            _ => server.s2s_manager().send_voice_broadcast(
+                u32::from(sender_id),
+                server_id.clone(),
+                target_kind,
+                is_terminator,
+                payload,
+                intent,
+            ),
+        };
+        if !sent {
+            tracing::trace!("voice s2s send dropped: S2S gateway unavailable");
         }
     }
 }

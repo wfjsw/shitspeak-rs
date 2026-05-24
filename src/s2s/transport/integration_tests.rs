@@ -225,14 +225,14 @@ async fn upward_fallback_uses_tcp_for_best_effort() {
     assert_eq!(recv.transport(), TransportKind::Tcp);
 }
 
-/// Checks UDP/DTLS S2S transport establishment and bidirectional delivery.
-/// Expected: both nodes install the DTLS session and exchange BestEffort frames
+/// Checks UDP packet-encrypted S2S transport establishment and bidirectional delivery.
+/// Expected: both nodes install the UDP route and exchange BestEffort frames
 /// with the correct peer node id, class, payload, and UDP transport marker.
 /// Mumble's client UDP crypt path is in `D:\mumble\src\murmur\Server.cpp::run`;
 /// shitspeak's UDP/OCB2 precedent is in `D:\shitspeak\client.go`; this test
-/// verifies this crate's S2S DTLS transport equivalent.
+/// verifies this crate's S2S encrypted-datagram transport equivalent.
 #[tokio::test]
-async fn two_node_udp_dtls_roundtrip() {
+async fn two_node_udp_packet_encryption_roundtrip() {
     let _guard = TEST_LOCK.lock().await;
     install_provider_once();
     let pki = mint_pki(&[111, 222]);
@@ -246,9 +246,8 @@ async fn two_node_udp_dtls_roundtrip() {
     assert_eq!(mgr_a.local_node_id(), 111);
     assert_eq!(mgr_b.local_node_id(), 222);
 
-    // A learns where to dial B; the supervisor will run a DTLS client
-    // handshake. Once the handshake completes B's listener also installs
-    // the session into its peer table.
+    // A learns where to send encrypted UDP packets. B installs the reverse
+    // route when it receives a valid encrypted datagram from A.
     mgr_a
         .add_address(222, PeerAddress::new(loopback(port_b), TransportKind::Udp))
         .await;
@@ -256,7 +255,7 @@ async fn two_node_udp_dtls_roundtrip() {
     wait_for_link(&mgr_a, 222, TransportKind::Udp).await;
     wait_for_link(&mgr_b, 111, TransportKind::Udp).await;
 
-    // A → B over DTLS
+    // A → B over encrypted UDP.
     mgr_a
         .send(
             222,
@@ -269,14 +268,14 @@ async fn two_node_udp_dtls_roundtrip() {
         .unwrap();
     let recv = timeout(Duration::from_secs(3), inbound_b.high_priority().recv())
         .await
-        .expect("a→b udp dtls recv timeout")
+        .expect("a→b encrypted udp recv timeout")
         .expect("a→b channel closed");
     assert_eq!(recv.from(), 111);
     assert_eq!(recv.transport(), TransportKind::Udp);
     assert_eq!(recv.class(), MessageClass::HighPriority);
     assert_eq!(recv.payload().as_ref(), b"voice-frame-from-a");
 
-    // B → A over the same DTLS session
+    // B → A over the reverse encrypted UDP route.
     mgr_b
         .send(
             111,
@@ -289,11 +288,153 @@ async fn two_node_udp_dtls_roundtrip() {
         .unwrap();
     let recv = timeout(Duration::from_secs(3), inbound_a.regular().recv())
         .await
-        .expect("b→a udp dtls recv timeout")
+        .expect("b→a encrypted udp recv timeout")
         .expect("b→a channel closed");
     assert_eq!(recv.from(), 222);
     assert_eq!(recv.transport(), TransportKind::Udp);
     assert_eq!(recv.payload().as_ref(), b"control-frame-from-b");
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn simultaneous_udp_packet_encryption_dials_converge() {
+    let _guard = TEST_LOCK.lock().await;
+    install_provider_once();
+    let pki = mint_pki(&[121, 232]);
+    let port_a = pick_free_udp_port().await;
+    let port_b = pick_free_udp_port().await;
+    let cfg_a = config_with_udp(&pki, 0, loopback(port_a));
+    let cfg_b = config_with_udp(&pki, 1, loopback(port_b));
+
+    let (mgr_a, mut inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+
+    mgr_a
+        .add_address(232, PeerAddress::new(loopback(port_b), TransportKind::Udp))
+        .await;
+    mgr_b
+        .add_address(121, PeerAddress::new(loopback(port_a), TransportKind::Udp))
+        .await;
+
+    wait_for_link(&mgr_a, 232, TransportKind::Udp).await;
+    wait_for_link(&mgr_b, 121, TransportKind::Udp).await;
+
+    mgr_a
+        .send(
+            232,
+            ServiceLevel::BestEffort,
+            None,
+            MessageClass::Regular,
+            Bytes::from_static(b"cross-a"),
+        )
+        .await
+        .unwrap();
+    mgr_b
+        .send(
+            121,
+            ServiceLevel::BestEffort,
+            None,
+            MessageClass::Regular,
+            Bytes::from_static(b"cross-b"),
+        )
+        .await
+        .unwrap();
+
+    let recv_b = timeout(Duration::from_secs(3), inbound_b.regular().recv())
+        .await
+        .expect("a->b simultaneous udp recv timeout")
+        .expect("a->b channel closed");
+    let recv_a = timeout(Duration::from_secs(3), inbound_a.regular().recv())
+        .await
+        .expect("b->a simultaneous udp recv timeout")
+        .expect("b->a channel closed");
+
+    assert_eq!(recv_b.from(), 121);
+    assert_eq!(recv_b.transport(), TransportKind::Udp);
+    assert_eq!(recv_b.payload().as_ref(), b"cross-a");
+    assert_eq!(recv_a.from(), 232);
+    assert_eq!(recv_a.transport(), TransportKind::Udp);
+    assert_eq!(recv_a.payload().as_ref(), b"cross-b");
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn simultaneous_kcp_dials_converge_without_tls_role_collision() {
+    let _guard = TEST_LOCK.lock().await;
+    install_provider_once();
+    let pki = mint_pki(&[131, 242]);
+    let port_a = pick_free_udp_port().await;
+    let port_b = pick_free_udp_port().await;
+    let (cert_a, key_a) = &pki.nodes[0];
+    let (cert_b, key_b) = &pki.nodes[1];
+    let cfg_a = TransportConfig::new(pki.ca_path.clone(), cert_a.clone(), key_a.clone())
+        .with_kcp_listen(loopback(port_a))
+        .with_reconnect_check_interval(Duration::from_millis(50))
+        .with_backoff_initial(Duration::from_millis(20))
+        .with_backoff_cap(Duration::from_millis(500))
+        .with_ping_interval(Duration::from_millis(300))
+        .with_bandwidth_probe_size(0);
+    let cfg_b = TransportConfig::new(pki.ca_path.clone(), cert_b.clone(), key_b.clone())
+        .with_kcp_listen(loopback(port_b))
+        .with_reconnect_check_interval(Duration::from_millis(50))
+        .with_backoff_initial(Duration::from_millis(20))
+        .with_backoff_cap(Duration::from_millis(500))
+        .with_ping_interval(Duration::from_millis(300))
+        .with_bandwidth_probe_size(0);
+
+    let (mgr_a, mut inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+
+    mgr_a
+        .add_address(242, PeerAddress::new(loopback(port_b), TransportKind::Kcp))
+        .await;
+    mgr_b
+        .add_address(131, PeerAddress::new(loopback(port_a), TransportKind::Kcp))
+        .await;
+
+    wait_for_link(&mgr_a, 242, TransportKind::Kcp).await;
+    wait_for_link(&mgr_b, 131, TransportKind::Kcp).await;
+
+    mgr_a
+        .send(
+            242,
+            ServiceLevel::ReliableLowLatency,
+            None,
+            MessageClass::Regular,
+            Bytes::from_static(b"kcp-a"),
+        )
+        .await
+        .unwrap();
+    mgr_b
+        .send(
+            131,
+            ServiceLevel::ReliableLowLatency,
+            None,
+            MessageClass::Regular,
+            Bytes::from_static(b"kcp-b"),
+        )
+        .await
+        .unwrap();
+
+    let recv_b = timeout(Duration::from_secs(3), inbound_b.regular().recv())
+        .await
+        .expect("a->b simultaneous kcp recv timeout")
+        .expect("a->b channel closed");
+    let recv_a = timeout(Duration::from_secs(3), inbound_a.regular().recv())
+        .await
+        .expect("b->a simultaneous kcp recv timeout")
+        .expect("b->a channel closed");
+
+    assert_eq!(recv_b.from(), 131);
+    assert_eq!(recv_b.transport(), TransportKind::Kcp);
+    assert_eq!(recv_b.payload().as_ref(), b"kcp-a");
+    assert_eq!(recv_a.from(), 242);
+    assert_eq!(recv_a.transport(), TransportKind::Kcp);
+    assert_eq!(recv_a.payload().as_ref(), b"kcp-b");
 
     mgr_a.shutdown().await;
     mgr_b.shutdown().await;

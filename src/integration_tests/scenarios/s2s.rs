@@ -1,18 +1,24 @@
 //! S2S-enabled server scenarios.
 
+pub mod overlay;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 
 use crate::ban_repository::{BanEntry, BanOp};
-use crate::config::{S2sSeedAddressConfig, S2sTransportKindConfig};
+use crate::client::client_session_identifier::ClientSessionIdentifier;
+use crate::config::{S2sConfig, S2sSeedAddressConfig, S2sTransportKindConfig};
 use crate::integration_tests::harness::{
-    spawn_s2s_test_server, TestClient, TestS2sServerOpts, TestServer, TestServerOpts,
+    spawn_s2s_test_server, spawn_s2s_test_server_with_config, TestClient, TestS2sServerOpts,
+    TestServer, TestServerOpts,
 };
-use crate::messages::encoder::{PluginDataTransmission, UserStats};
+use crate::messages::encoder::{Ping, PluginDataTransmission, UserStats};
 use crate::messages::Message;
-use crate::s2s::testing::{loopback, mint_pki, pick_free_port, wait_until};
+use crate::s2s::testing::{
+    loopback, mint_pki, pick_free_port, pick_free_udp_port, wait_until, Pki,
+};
 use crate::s2s::transport::ServiceLevel;
 use crate::voice::codec::AudioPayload;
 
@@ -60,6 +66,86 @@ async fn spawn_s2s_pair() -> (TestServer, TestServer) {
     (a, b)
 }
 
+async fn spawn_s2s_pair_on_ports(
+    pki: Arc<Pki>,
+    a_s2s_port: u16,
+    b_s2s_port: u16,
+) -> (TestServer, TestServer) {
+    let a = spawn_s2s_test_server(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        TestS2sServerOpts {
+            node_id: 1,
+            cert_index: 0,
+            tcp_listen: loopback(a_s2s_port),
+            seed_addresses: vec![S2sSeedAddressConfig::new(
+                S2sTransportKindConfig::Tcp,
+                loopback(b_s2s_port),
+            )],
+        },
+    )
+    .await;
+
+    let b = spawn_s2s_test_server(
+        TestServerOpts::default(),
+        pki,
+        TestS2sServerOpts {
+            node_id: 2,
+            cert_index: 1,
+            tcp_listen: loopback(b_s2s_port),
+            seed_addresses: vec![S2sSeedAddressConfig::new(
+                S2sTransportKindConfig::Tcp,
+                loopback(a_s2s_port),
+            )],
+        },
+    )
+    .await;
+
+    (a, b)
+}
+
+async fn spawn_s2s_node_b(pki: Arc<Pki>, a_s2s_port: u16, b_s2s_port: u16) -> TestServer {
+    spawn_s2s_test_server(
+        TestServerOpts::default(),
+        pki,
+        TestS2sServerOpts {
+            node_id: 2,
+            cert_index: 1,
+            tcp_listen: loopback(b_s2s_port),
+            seed_addresses: vec![S2sSeedAddressConfig::new(
+                S2sTransportKindConfig::Tcp,
+                loopback(a_s2s_port),
+            )],
+        },
+    )
+    .await
+}
+
+fn all_transport_s2s_config(
+    tcp_listen: std::net::SocketAddr,
+    kcp_listen: std::net::SocketAddr,
+    quic_listen: std::net::SocketAddr,
+    udp_listen: std::net::SocketAddr,
+    seed_tcp: std::net::SocketAddr,
+) -> S2sConfig {
+    S2sConfig {
+        enabled: true,
+        tcp_listen: Some(tcp_listen),
+        kcp_listen: Some(kcp_listen),
+        quic_listen: Some(quic_listen),
+        udp_listen: Some(udp_listen),
+        tcp_advertise: vec![tcp_listen.to_string()],
+        kcp_advertise: vec![kcp_listen.to_string()],
+        quic_advertise: vec![quic_listen.to_string()],
+        udp_advertise: vec![udp_listen.to_string()],
+        seed_addresses: vec![S2sSeedAddressConfig::new(
+            S2sTransportKindConfig::Tcp,
+            seed_tcp,
+        )],
+        ..S2sConfig::default()
+    }
+}
+
 async fn wait_for_s2s_pair(a: &TestServer, b: &TestServer) {
     let ready = wait_until(S2S_DEADLINE, || {
         let a_mgr = a.server.s2s_manager();
@@ -89,6 +175,40 @@ fn register_pair_users(a: &TestServer, b: &TestServer) {
     a.authenticator
         .register_user("alice", None, Some(1), vec!["admin".into()]);
     b.authenticator.register_user("bob", None, Some(2), vec![]);
+}
+
+async fn wait_for_server_to_track_client(server: &TestServer, session: ClientSessionIdentifier) {
+    let tracked = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(server.server.get_clients().get_client(session))
+                .is_some()
+        })
+    })
+    .await;
+    assert!(tracked, "server should track client {session:?}");
+}
+
+async fn client_sees_user_state(
+    client: &TestClient,
+    session: ClientSessionIdentifier,
+    name: &str,
+) -> bool {
+    let session = u32::from(session);
+    client
+        .initial_user_states
+        .iter()
+        .any(|us| us.session == Some(session) && us.name.as_deref() == Some(name))
+        || client
+            .recv_until(
+                |m| {
+                    matches!(m, Message::UserState(us)
+                        if us.session == Some(session) && us.name.as_deref() == Some(name))
+                },
+                S2S_DEADLINE,
+            )
+            .await
+            .is_some()
 }
 
 fn opus_frame(payload: &AudioPayload) -> &[u8] {
@@ -453,6 +573,217 @@ async fn s2s_client_replication_propagates_add_update_remove() {
     );
 }
 
+/// Checks that a failed S2S transport startup does not block the native client
+/// listener/runtime. Expected: the S2S actor exits after its own startup error,
+/// while a normal client can still authenticate and receive a TCP ping reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_client_connects_when_s2s_transport_startup_fails() {
+    let _guard = S2S_TEST_LOCK.lock().await;
+    let pki = Arc::new(mint_pki(&[1]));
+    let server = spawn_s2s_test_server_with_config(
+        TestServerOpts::default(),
+        pki,
+        1,
+        0,
+        S2sConfig {
+            enabled: true,
+            ..S2sConfig::default()
+        },
+    )
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice should authenticate even when s2s startup fails");
+    let timestamp = 0x52_u64;
+    alice
+        .send(Ping::default_from_timestamp(timestamp).into())
+        .await;
+
+    let response = alice
+        .recv_until(
+            |m| matches!(m, Message::Ping(p) if p.timestamp == Some(timestamp)),
+            CLIENT_DEADLINE,
+        )
+        .await;
+    assert!(
+        response.is_some(),
+        "native client should receive a TCP ping response after s2s startup failure"
+    );
+
+    server.shutdown_gracefully().await;
+}
+
+/// Checks client replication after an S2S node restarts while another node's
+/// client stays connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_client_replication_recovers_after_node_restart() {
+    let _guard = S2S_TEST_LOCK.lock().await;
+    let pki = Arc::new(mint_pki(&[1, 2]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+    let (a, b) = spawn_s2s_pair_on_ports(Arc::clone(&pki), a_s2s_port, b_s2s_port).await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    wait_for_server_to_track_client(&a, bob.server_session).await;
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+    assert!(
+        client_sees_user_state(&alice, bob.server_session, "bob").await,
+        "Alice should initially see Bob"
+    );
+    assert!(
+        client_sees_user_state(&bob, alice.server_session, "alice").await,
+        "Bob should initially see Alice"
+    );
+
+    let old_bob_session = bob.server_session;
+    drop(bob);
+
+    let saw_old_bob_remove = alice
+        .recv_until(
+            |m| matches!(m, Message::UserRemove(ur) if ur.session == u32::from(old_bob_session)),
+            S2S_DEADLINE,
+        )
+        .await;
+    assert!(
+        saw_old_bob_remove.is_some(),
+        "Alice should see old Bob go offline"
+    );
+
+    b.shutdown_gracefully().await;
+
+    let b_restarted_s2s_port = pick_free_port().await;
+    let b = spawn_s2s_node_b(Arc::clone(&pki), a_s2s_port, b_restarted_s2s_port).await;
+    b.authenticator.register_user("bob", None, Some(2), vec![]);
+    wait_for_s2s_pair(&a, &b).await;
+
+    let bob_reconnected = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob reconnect");
+
+    wait_for_server_to_track_client(&a, bob_reconnected.server_session).await;
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+    assert!(
+        client_sees_user_state(&alice, bob_reconnected.server_session, "bob").await,
+        "Alice should see Bob after node B restarts"
+    );
+    assert!(
+        client_sees_user_state(&bob_reconnected, alice.server_session, "alice").await,
+        "Bob should see Alice after node B restarts"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_client_replication_catches_up_when_second_node_starts_later() {
+    let _guard = S2S_TEST_LOCK.lock().await;
+    let pki = Arc::new(mint_pki(&[1, 2]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+
+    let a = spawn_s2s_test_server(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        TestS2sServerOpts {
+            node_id: 1,
+            cert_index: 0,
+            tcp_listen: loopback(a_s2s_port),
+            seed_addresses: vec![S2sSeedAddressConfig::new(
+                S2sTransportKindConfig::Tcp,
+                loopback(b_s2s_port),
+            )],
+        },
+    )
+    .await;
+    a.authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+
+    let b = spawn_s2s_node_b(Arc::clone(&pki), a_s2s_port, b_s2s_port).await;
+    b.authenticator.register_user("bob", None, Some(2), vec![]);
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    wait_for_s2s_pair(&a, &b).await;
+    wait_for_server_to_track_client(&a, bob.server_session).await;
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+    assert!(
+        client_sees_user_state(&alice, bob.server_session, "bob").await,
+        "Alice should see Bob when node B starts later"
+    );
+    assert!(
+        client_sees_user_state(&bob, alice.server_session, "alice").await,
+        "Bob should catch up Alice when node B starts later"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_client_replication_catches_up_with_demo_transport_mix() {
+    let _guard = S2S_TEST_LOCK.lock().await;
+    let pki = Arc::new(mint_pki(&[1, 2]));
+
+    let a_tcp = loopback(pick_free_port().await);
+    let b_tcp = loopback(pick_free_port().await);
+    let a_kcp = loopback(pick_free_udp_port().await);
+    let b_kcp = loopback(pick_free_udp_port().await);
+    let a_quic = loopback(pick_free_udp_port().await);
+    let b_quic = loopback(pick_free_udp_port().await);
+    let a_udp = loopback(pick_free_udp_port().await);
+    let b_udp = loopback(pick_free_udp_port().await);
+
+    let a = spawn_s2s_test_server_with_config(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        1,
+        0,
+        all_transport_s2s_config(a_tcp, a_kcp, a_quic, a_udp, b_tcp),
+    )
+    .await;
+    a.authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+
+    let b = spawn_s2s_test_server_with_config(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        2,
+        1,
+        all_transport_s2s_config(b_tcp, b_kcp, b_quic, b_udp, a_tcp),
+    )
+    .await;
+    b.authenticator.register_user("bob", None, Some(2), vec![]);
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    wait_for_s2s_pair(&a, &b).await;
+    wait_for_server_to_track_client(&a, bob.server_session).await;
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+    assert!(
+        client_sees_user_state(&alice, bob.server_session, "bob").await,
+        "Alice should see Bob when the later node also advertises KCP/QUIC/UDP"
+    );
+    assert!(
+        client_sees_user_state(&bob, alice.server_session, "alice").await,
+        "Bob should catch up Alice when the later node also advertises KCP/QUIC/UDP"
+    );
+}
+
 /// Checks that a reconnecting client receives other replicated users in their
 /// actual channels, even though the reconnecting client itself starts in root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -561,8 +892,8 @@ async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
         .find(|state| state.session == Some(bob_reconnected.session_id));
     assert_eq!(
         bob_state.and_then(|state| state.channel_id),
-        Some(0),
-        "Bob reconnects into root until last-channel persistence exists"
+        Some(42),
+        "Bob reconnects into last-channel"
     );
 }
 

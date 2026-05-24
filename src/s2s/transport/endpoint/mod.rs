@@ -54,19 +54,22 @@ pub(crate) async fn bind_reusable_udp_socket(addr: SocketAddr) -> io::Result<Udp
     UdpSocket::from_std(socket.into())
 }
 
-pub(crate) async fn bind_transport_udp_socket(
-    listen_addr: Option<SocketAddr>,
+/// Bind an exclusive ephemeral UDP socket for outbound stream-style dials.
+///
+/// Raw UDP packet encryption intentionally reuses the listening socket via
+/// `bind_reusable_udp_socket`. Stream-style UDP transports such as KCP need a
+/// separate ephemeral source port so inbound listener traffic cannot be routed
+/// into a client-side TLS state machine, and so they do not share the raw
+/// UDP/QUIC port.
+pub(crate) async fn bind_ephemeral_udp_dial_socket(
     remote_addr: SocketAddr,
 ) -> io::Result<UdpSocket> {
-    let port = listen_addr
-        .filter(|addr| addr.is_ipv4() == remote_addr.is_ipv4())
-        .map_or(0, |addr| addr.port());
     let bind_addr = if remote_addr.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], port))
+        SocketAddr::from(([0, 0, 0, 0], 0))
     } else {
-        SocketAddr::from(([0u16; 8], port))
+        SocketAddr::from(([0u16; 8], 0))
     };
-    bind_reusable_udp_socket(bind_addr).await
+    UdpSocket::bind(bind_addr).await
 }
 
 /// Common shape for every wire transport. Implementations own their own
@@ -91,7 +94,7 @@ pub(crate) trait Endpoint: Send + Sync + 'static {
     /// Dial a peer at `addr`. On success the impl must have installed an
     /// `ActiveStream` of `KIND` into `peer.install_stream(...)`, typically
     /// via [`install_stream_session`] (for stream transports) or its own
-    /// session-pump installer (for UDP/DTLS).
+    /// datagram-pump installer (for UDP packet encryption).
     fn dial(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,
@@ -866,9 +869,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_address_pruning_recognizes_dtls_certificate_name_errors() {
+    fn failed_address_pruning_recognizes_certificate_name_errors() {
         let err = io::Error::other(
-            "dtls handshake: invalid peer certificate: certificate not valid for name \"node-4\"",
+            "handshake: invalid peer certificate: certificate not valid for name \"node-4\"",
         );
         assert!(should_remove_failed_address(&err));
     }

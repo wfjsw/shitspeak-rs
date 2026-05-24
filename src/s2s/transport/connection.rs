@@ -73,6 +73,7 @@ pub(crate) struct ActiveStream {
     sender: mpsc::Sender<OutboundFrame>,
     closed: CancellationToken,
     is_dialer: bool,
+    installed_at: Instant,
 }
 
 impl ActiveStream {
@@ -89,6 +90,7 @@ impl ActiveStream {
             sender,
             closed,
             is_dialer,
+            installed_at: Instant::now(),
         }
     }
 
@@ -102,6 +104,10 @@ impl ActiveStream {
 
     pub fn is_dialer(&self) -> bool {
         self.is_dialer
+    }
+
+    pub fn installed_at(&self) -> Instant {
+        self.installed_at
     }
 
     pub fn key(&self) -> StreamKey {
@@ -445,6 +451,13 @@ impl PeerState {
         let key = StreamKey::new(addr.transport(), Some(addr.addr()), true);
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
+        if addr.transport() == TransportKind::Udp {
+            return g.values().any(|stream| {
+                stream.transport == TransportKind::Udp
+                    && stream.remote_addr == Some(addr.addr())
+                    && stream.is_alive()
+            });
+        }
         g.get(&key).is_some_and(ActiveStream::is_alive)
     }
 
@@ -465,12 +478,10 @@ impl PeerState {
     pub fn try_get_stream(&self, kind: TransportKind) -> Option<mpsc::Sender<OutboundFrame>> {
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
-        for s in g.values() {
-            if s.transport() == kind && s.is_alive() {
-                return Some(s.sender.clone());
-            }
-        }
-        None
+        g.values()
+            .filter(|s| s.transport() == kind && s.is_alive())
+            .max_by_key(|s| s.installed_at())
+            .map(|s| s.sender.clone())
     }
 
     pub fn has_any_live_stream(&self) -> bool {
@@ -778,6 +789,57 @@ mod tests {
 
         assert_eq!(peer.outgoing_live_count(), 1);
         assert!(peer.has_live_outgoing_to(PeerAddress::new(addr, TransportKind::Tcp)));
+    }
+
+    #[test]
+    fn stream_lookup_prefers_newest_live_stream_for_transport() {
+        let peer = peer_for_address_tests();
+        let old_addr = "10.1.2.3:64739".parse().unwrap();
+        let new_addr = "10.1.2.4:64739".parse().unwrap();
+        let (old_stream, mut old_rx) = active_stream_for_test(TransportKind::Tcp, old_addr, true);
+        assert!(peer.try_install_stream(old_stream).is_ok());
+
+        std::thread::sleep(Duration::from_millis(1));
+
+        let (new_stream, mut new_rx) = active_stream_for_test(TransportKind::Tcp, new_addr, false);
+        assert!(peer.try_install_stream(new_stream).is_ok());
+
+        let sender = peer.try_get_stream(TransportKind::Tcp).unwrap();
+        sender
+            .try_send(OutboundFrame::new(
+                MessageClass::Regular,
+                Bytes::from_static(b"new"),
+            ))
+            .unwrap();
+
+        assert!(old_rx.try_recv().is_err());
+        assert_eq!(
+            new_rx.try_recv().unwrap().payload(),
+            &Bytes::from_static(b"new")
+        );
+    }
+
+    #[test]
+    fn udp_inbound_session_satisfies_address_dial_check() {
+        let peer = peer_for_address_tests();
+        let addr = "10.1.2.3:64739".parse().unwrap();
+        let (inbound, _rx) = active_stream_for_test(TransportKind::Udp, addr, false);
+
+        assert!(peer.try_install_stream(inbound).is_ok());
+
+        assert_eq!(peer.outgoing_live_count(), 0);
+        assert!(peer.has_live_outgoing_to(PeerAddress::new(addr, TransportKind::Udp)));
+    }
+
+    #[test]
+    fn tcp_inbound_session_does_not_satisfy_outgoing_dial_check() {
+        let peer = peer_for_address_tests();
+        let addr = "10.1.2.3:64739".parse().unwrap();
+        let (inbound, _rx) = active_stream_for_test(TransportKind::Tcp, addr, false);
+
+        assert!(peer.try_install_stream(inbound).is_ok());
+
+        assert!(!peer.has_live_outgoing_to(PeerAddress::new(addr, TransportKind::Tcp)));
     }
 
     #[test]

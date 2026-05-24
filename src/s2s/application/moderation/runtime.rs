@@ -186,6 +186,14 @@ impl ModerationService {
         let bytes = proto::encode_moderation(&env)?;
         self.transport.send_unicast(owner, bytes).await
     }
+
+    pub(crate) async fn dispatch_envelope_for_gateway(
+        &self,
+        owner: NodeIdentifier,
+        env: ModerationEnvelope,
+    ) -> Result<(), ApplicationError> {
+        self.dispatch_envelope(owner, env).await
+    }
 }
 
 pub struct ModerationInbound {

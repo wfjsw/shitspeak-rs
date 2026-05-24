@@ -4,11 +4,11 @@
 //! peer-symmetric, mTLS-authenticated `ConnectionManager`. Every stream
 //! transport carries mutual TLS rooted in a shared CA; the peer's
 //! `NodeIdentifier` is extracted from the certificate's CN. UDP is
-//! datagram-only and trusts the source-node claim in the frame header.
+//! datagram-only and encrypts each packet under keys from a signed ephemeral
+//! peer exchange rooted in the same CA.
 
 mod config;
 mod connection;
-mod dtls_config;
 mod endpoint;
 mod error;
 mod frame;
@@ -28,7 +28,8 @@ pub use error::{ConfigError, SendError, TransportError};
 pub(crate) use manager::PeerAddressSnapshot;
 pub use manager::{ConnectionManager, Inbound, InboundMessage};
 pub(crate) use metrics::{
-    conversational_effective_delay_us, conversational_impairment, conversational_quality_score,
+    apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,
+    conversational_quality_score,
 };
 pub use metrics::{LinkMetrics, MetricsSnapshot};
 pub use service_level::{

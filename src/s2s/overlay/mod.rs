@@ -34,9 +34,6 @@ pub(crate) mod proto;
 pub mod routing;
 mod runtime;
 
-#[cfg(test)]
-mod integration_tests;
-
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -182,6 +179,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             dst,
             tag,
             level,
@@ -204,6 +202,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             dst,
             tag,
             level,
@@ -229,6 +228,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             dst,
             tag,
             level,
@@ -254,6 +254,33 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
+            dst,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+        )
+        .await
+    }
+
+    /// Send to a single peer without overlay sequence ordering.
+    pub async fn send_unicast_unordered_with_routing_metric(
+        &self,
+        dst: NodeIdentifier,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        messaging::send_unicast_with_routing_metric_unordered_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            self.inner.ordering(),
             dst,
             tag,
             level,
@@ -278,6 +305,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             dsts,
             tag,
             level,
@@ -300,6 +328,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             dsts,
             tag,
             level,
@@ -325,6 +354,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             dsts,
             tag,
             level,
@@ -350,6 +380,33 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
+            dsts,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+        )
+        .await
+    }
+
+    /// Send to a list of peers without overlay sequence ordering.
+    pub async fn send_multicast_unordered_with_routing_metric(
+        &self,
+        dsts: &[NodeIdentifier],
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        messaging::send_multicast_with_routing_metric_unordered_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            self.inner.ordering(),
             dsts,
             tag,
             level,
@@ -374,11 +431,38 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             &alive,
             tag,
             level,
             class,
             body,
+        )
+        .await
+    }
+
+    /// Send to every alive peer without overlay sequence ordering.
+    pub async fn send_broadcast_unordered_with_routing_metric(
+        &self,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        let alive = self.alive_members();
+        messaging::send_broadcast_with_routing_metric_unordered_and_transit_processing(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            self.inner.ordering(),
+            &alive,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
         )
         .await
     }
@@ -396,6 +480,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             &alive,
             tag,
             level,
@@ -421,6 +506,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             &alive,
             tag,
             level,
@@ -446,6 +532,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.ordering(),
             &alive,
             tag,
             level,
@@ -460,7 +547,11 @@ impl OverlayNetwork {
     /// Look up the next-hop for `dst` at `level`. Returns `None` if no
     /// route is known.
     pub fn route_to(&self, dst: NodeIdentifier, level: ServiceLevel) -> Option<NodeIdentifier> {
-        self.route_to_with_metric(dst, level, RoutingMetric::PerServiceCost)
+        self.inner
+            .routing
+            .load()
+            .lookup(dst, level)
+            .map(|e| e.next_hop)
     }
 
     /// Look up the next-hop for `dst` at `level` with an explicit routing

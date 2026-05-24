@@ -11,12 +11,12 @@ use crate::s2s::application::proto::{
 };
 use crate::s2s::application::voice::sink::testing::RecordingSink;
 use crate::s2s::application::ApplicationLayer;
-use crate::s2s::overlay::config::SeedPeer;
+use crate::s2s::overlay::{config::SeedPeer, RoutingMetric};
 use crate::s2s::testing::{
     full_mesh_seeds, line_seeds, wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
     Cluster,
 };
-use crate::s2s::transport::{PeerAddress, TransportKind};
+use crate::s2s::transport::{PeerAddress, ServiceLevel, TransportKind};
 
 fn normal_voice_intent(channel_id: u32) -> VoiceIntent {
     VoiceIntent {
@@ -111,11 +111,11 @@ async fn two_node_voice_passthrough_in_order() {
     cluster.shutdown_all().await;
 }
 
-/// Checks targeted voice over a routed line topology.
-/// Expected: B receives A's frame while forwarding it to C, even though
-/// B is not listed as an overlay destination.
+/// Checks that a line-seeded cluster may learn a direct A-C transport path.
+/// Expected: A eventually routes voice directly to C, so only C receives the
+/// unicast frame.
 #[tokio::test]
-async fn three_node_voice_unicast_delivers_to_transit_node() {
+async fn three_node_voice_unicast_learns_direct_connection() {
     let cluster = Cluster::build(&[1, 2, 3], line_seeds).await;
     let a = cluster.node(1);
     let b = cluster.node(2);
@@ -129,11 +129,112 @@ async fn three_node_voice_unicast_delivers_to_transit_node() {
         wait_for_full_routing(&cluster, Duration::from_secs(8)).await,
         "3-node line routing failed to converge"
     );
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            a.overlay.route_to_with_metric(
+                3,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            ) == Some(3)
+        })
+        .await,
+        "A should learn a direct voice route to C; reliable={:?}, voice={:?}",
+        a.overlay.route_to(3, ServiceLevel::Reliable),
+        a.overlay.route_to_with_metric(
+            3,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+        )
+    );
+
+    let app_a = ApplicationLayer::new(a.overlay.clone(), ApplicationConfig::default());
+    let app_b = ApplicationLayer::new(b.overlay.clone(), ApplicationConfig::default());
+    let app_c = ApplicationLayer::new(c.overlay.clone(), ApplicationConfig::default());
+    let sink_b = RecordingSink::new();
+    let sink_c = RecordingSink::new();
+    app_b.voice().set_audio_sink(sink_b.clone());
+    app_c.voice().set_audio_sink(sink_c.clone());
+
+    app_a
+        .voice()
+        .send_unicast(
+            0xABC_12345,
+            crate::types::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"line-frame"),
+            normal_voice_intent(0),
+            3,
+        )
+        .await
+        .expect("send_unicast");
+
+    let ok = wait_until(Duration::from_secs(8), || sink_c.len() == 1).await;
+    assert!(
+        ok,
+        "expected C destination sink to receive one frame; got B={}, C={}",
+        sink_b.len(),
+        sink_c.len()
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
-        a.overlay
-            .route_to(3, crate::s2s::transport::ServiceLevel::Reliable),
-        Some(2),
-        "A should route to C through B in the line topology"
+        sink_b.len(),
+        0,
+        "B should not receive a frame when A routes directly to C"
+    );
+
+    let c_received = sink_c.snapshot();
+    let (from, frame) = &c_received[0];
+    assert_eq!(*from, 1, "C should see original voice sender A");
+    assert_eq!(frame.sender_session, 0xABC_12345);
+    assert_eq!(frame.target_kind, 0);
+    assert_eq!(frame.payload, b"line-frame".as_ref());
+
+    app_a.shutdown().await;
+    app_b.shutdown().await;
+    app_c.shutdown().await;
+    cluster.shutdown_all().await;
+}
+
+/// Checks targeted voice over a forced routed line topology.
+/// Expected: B receives A's frame while forwarding it to C, even though
+/// B is not listed as an overlay destination.
+#[tokio::test]
+async fn three_node_voice_unicast_delivers_to_transit_node_when_direct_blocked() {
+    let cluster = Cluster::build(&[1, 2, 3], line_seeds).await;
+    let a = cluster.node(1);
+    let b = cluster.node(2);
+    let c = cluster.node(3);
+
+    // Keep A and C from forming a usable direct overlay neighbor edge. They
+    // can still learn each other's LSAs through B and route through B.
+    a.chaos.block(3);
+    c.chaos.block(1);
+
+    assert!(
+        wait_for_full_alive_mesh(&cluster, Duration::from_secs(8)).await,
+        "3-node line mesh failed to converge"
+    );
+    assert!(
+        wait_for_full_routing(&cluster, Duration::from_secs(8)).await,
+        "3-node line routing failed to converge"
+    );
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            a.overlay.route_to_with_metric(
+                3,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            ) == Some(2)
+        })
+        .await,
+        "A should route voice to C through B when A-C is blocked; reliable={:?}, voice={:?}",
+        a.overlay.route_to(3, ServiceLevel::Reliable),
+        a.overlay.route_to_with_metric(
+            3,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+        )
     );
 
     let app_a = ApplicationLayer::new(a.overlay.clone(), ApplicationConfig::default());
