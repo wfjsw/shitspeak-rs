@@ -17,6 +17,7 @@ use crate::types::NodeIdentifier;
 use self::ordering::OverlayOrdering;
 use super::error::OverlayError;
 use super::routing::{RoutingHandle, RoutingMetric};
+use super::LaneId;
 
 /// Inbound message handed to a registered service handler.
 #[derive(Debug, Clone)]
@@ -70,11 +71,12 @@ impl Default for ServiceRegistry {
     }
 }
 
-/// Public API: send to one peer.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_unicast(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dst: NodeIdentifier,
     tag: u32,
@@ -82,29 +84,11 @@ pub async fn send_unicast(
     class: MessageClass,
     body: Bytes,
 ) -> Result<(), OverlayError> {
-    send_unicast_with_transit_processing(
-        transport, routing, self_id, ordering, dst, tag, level, class, body, false,
-    )
-    .await
-}
-
-/// Public API: send to one peer, optionally delivering to service handlers on transit nodes.
-pub async fn send_unicast_with_transit_processing(
-    transport: &ConnectionManager,
-    routing: &RoutingHandle,
-    self_id: NodeIdentifier,
-    ordering: &OverlayOrdering,
-    dst: NodeIdentifier,
-    tag: u32,
-    level: ServiceLevel,
-    class: MessageClass,
-    body: Bytes,
-    process_on_transit: bool,
-) -> Result<(), OverlayError> {
-    send_unicast_with_routing_metric_and_transit_processing(
+    send_unicast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         dst,
         tag,
@@ -112,15 +96,50 @@ pub async fn send_unicast_with_transit_processing(
         RoutingMetric::default_for_level(level),
         class,
         body,
+        None,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send_unicast_with_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    dst: NodeIdentifier,
+    tag: u32,
+    level: ServiceLevel,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_unicast_with_routing_metric_lane_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        dst,
+        tag,
+        level,
+        RoutingMetric::default_for_level(level),
+        class,
+        body,
+        None,
         process_on_transit,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_unicast_with_routing_metric_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dst: NodeIdentifier,
     tag: u32,
@@ -130,10 +149,11 @@ pub async fn send_unicast_with_routing_metric_and_transit_processing(
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
-    send_unicast_with_routing_metric_ordering_and_transit_processing(
+    send_unicast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         dst,
         tag,
@@ -141,16 +161,52 @@ pub async fn send_unicast_with_routing_metric_and_transit_processing(
         routing_metric,
         class,
         body,
-        true,
+        None,
         process_on_transit,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn send_unicast_on_lane(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    dst: NodeIdentifier,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    lane: LaneId,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_unicast_with_routing_metric_lane_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        dst,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        Some(lane),
+        process_on_transit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn send_unicast_with_routing_metric_unordered_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dst: NodeIdentifier,
     tag: u32,
@@ -160,10 +216,11 @@ pub async fn send_unicast_with_routing_metric_unordered_and_transit_processing(
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
-    send_unicast_with_routing_metric_ordering_and_transit_processing(
+    send_unicast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         dst,
         tag,
@@ -171,16 +228,18 @@ pub async fn send_unicast_with_routing_metric_unordered_and_transit_processing(
         routing_metric,
         class,
         body,
-        false,
+        None,
         process_on_transit,
     )
     .await
 }
 
-async fn send_unicast_with_routing_metric_ordering_and_transit_processing(
+#[allow(clippy::too_many_arguments)]
+async fn send_unicast_with_routing_metric_lane_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dst: NodeIdentifier,
     tag: u32,
@@ -188,13 +247,14 @@ async fn send_unicast_with_routing_metric_ordering_and_transit_processing(
     routing_metric: RoutingMetric,
     class: MessageClass,
     body: Bytes,
-    ordered_delivery: bool,
+    lane: Option<LaneId>,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
     forward::originate(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         vec![dst],
         tag,
@@ -202,17 +262,18 @@ async fn send_unicast_with_routing_metric_ordering_and_transit_processing(
         routing_metric,
         class,
         body,
-        ordered_delivery,
+        lane,
         process_on_transit,
     )
     .await
 }
 
-/// Public API: send to a specific list of peers.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_multicast(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dsts: &[NodeIdentifier],
     tag: u32,
@@ -220,17 +281,30 @@ pub async fn send_multicast(
     class: MessageClass,
     body: Bytes,
 ) -> Result<(), OverlayError> {
-    send_multicast_with_transit_processing(
-        transport, routing, self_id, ordering, dsts, tag, level, class, body, false,
+    send_multicast_with_routing_metric_lane_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        dsts,
+        tag,
+        level,
+        RoutingMetric::default_for_level(level),
+        class,
+        body,
+        None,
+        false,
     )
     .await
 }
 
-/// Public API: send to a specific list of peers, optionally delivering to service handlers on transit nodes.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_multicast_with_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dsts: &[NodeIdentifier],
     tag: u32,
@@ -239,27 +313,30 @@ pub async fn send_multicast_with_transit_processing(
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
-    let dsts: Vec<NodeIdentifier> = dsts.iter().copied().filter(|n| *n != self_id).collect();
-    send_multicast_with_routing_metric_and_transit_processing(
+    send_multicast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
-        &dsts,
+        dsts,
         tag,
         level,
         RoutingMetric::default_for_level(level),
         class,
         body,
+        None,
         process_on_transit,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_multicast_with_routing_metric_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dsts: &[NodeIdentifier],
     tag: u32,
@@ -269,10 +346,11 @@ pub async fn send_multicast_with_routing_metric_and_transit_processing(
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
-    send_multicast_with_routing_metric_ordering_and_transit_processing(
+    send_multicast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         dsts,
         tag,
@@ -280,16 +358,52 @@ pub async fn send_multicast_with_routing_metric_and_transit_processing(
         routing_metric,
         class,
         body,
-        true,
+        None,
         process_on_transit,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn send_multicast_on_lane(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    dsts: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    lane: LaneId,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_multicast_with_routing_metric_lane_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        dsts,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        Some(lane),
+        process_on_transit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn send_multicast_with_routing_metric_unordered_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dsts: &[NodeIdentifier],
     tag: u32,
@@ -299,10 +413,11 @@ pub async fn send_multicast_with_routing_metric_unordered_and_transit_processing
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
-    send_multicast_with_routing_metric_ordering_and_transit_processing(
+    send_multicast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         dsts,
         tag,
@@ -310,16 +425,18 @@ pub async fn send_multicast_with_routing_metric_unordered_and_transit_processing
         routing_metric,
         class,
         body,
-        false,
+        None,
         process_on_transit,
     )
     .await
 }
 
-async fn send_multicast_with_routing_metric_ordering_and_transit_processing(
+#[allow(clippy::too_many_arguments)]
+async fn send_multicast_with_routing_metric_lane_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     dsts: &[NodeIdentifier],
     tag: u32,
@@ -327,7 +444,7 @@ async fn send_multicast_with_routing_metric_ordering_and_transit_processing(
     routing_metric: RoutingMetric,
     class: MessageClass,
     body: Bytes,
-    ordered_delivery: bool,
+    lane: Option<LaneId>,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
     let dsts: Vec<NodeIdentifier> = dsts.iter().copied().filter(|n| *n != self_id).collect();
@@ -335,6 +452,7 @@ async fn send_multicast_with_routing_metric_ordering_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         dsts,
         tag,
@@ -342,17 +460,18 @@ async fn send_multicast_with_routing_metric_ordering_and_transit_processing(
         routing_metric,
         class,
         body,
-        ordered_delivery,
+        lane,
         process_on_transit,
     )
     .await
 }
 
-/// Public API: broadcast to every alive peer.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_broadcast(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     alive: &[NodeIdentifier],
     tag: u32,
@@ -360,49 +479,62 @@ pub async fn send_broadcast(
     class: MessageClass,
     body: Bytes,
 ) -> Result<(), OverlayError> {
-    send_broadcast_with_transit_processing(
-        transport, routing, self_id, ordering, alive, tag, level, class, body, false,
-    )
-    .await
-}
-
-/// Public API: broadcast to every alive peer, optionally delivering to service handlers on transit nodes.
-pub async fn send_broadcast_with_transit_processing(
-    transport: &ConnectionManager,
-    routing: &RoutingHandle,
-    self_id: NodeIdentifier,
-    ordering: &OverlayOrdering,
-    alive: &[NodeIdentifier],
-    tag: u32,
-    level: ServiceLevel,
-    class: MessageClass,
-    body: Bytes,
-    process_on_transit: bool,
-) -> Result<(), OverlayError> {
-    let dsts: Vec<NodeIdentifier> = alive.iter().copied().filter(|n| *n != self_id).collect();
-    if dsts.is_empty() {
-        return Ok(());
-    }
-    send_multicast_with_routing_metric_and_transit_processing(
+    send_broadcast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
-        &dsts,
+        alive,
         tag,
         level,
         RoutingMetric::default_for_level(level),
         class,
         body,
+        None,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send_broadcast_with_transit_processing(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    alive: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_broadcast_with_routing_metric_lane_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        alive,
+        tag,
+        level,
+        RoutingMetric::default_for_level(level),
+        class,
+        body,
+        None,
         process_on_transit,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_broadcast_with_routing_metric_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     alive: &[NodeIdentifier],
     tag: u32,
@@ -412,10 +544,11 @@ pub async fn send_broadcast_with_routing_metric_and_transit_processing(
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
-    send_broadcast_with_routing_metric_ordering_and_transit_processing(
+    send_broadcast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         alive,
         tag,
@@ -423,16 +556,52 @@ pub async fn send_broadcast_with_routing_metric_and_transit_processing(
         routing_metric,
         class,
         body,
-        true,
+        None,
         process_on_transit,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn send_broadcast_on_lane(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    alive: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    lane: LaneId,
+    process_on_transit: bool,
+) -> Result<(), OverlayError> {
+    send_broadcast_with_routing_metric_lane_and_transit_processing(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        alive,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        Some(lane),
+        process_on_transit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn send_broadcast_with_routing_metric_unordered_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     alive: &[NodeIdentifier],
     tag: u32,
@@ -442,10 +611,11 @@ pub async fn send_broadcast_with_routing_metric_unordered_and_transit_processing
     body: Bytes,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
-    send_broadcast_with_routing_metric_ordering_and_transit_processing(
+    send_broadcast_with_routing_metric_lane_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         alive,
         tag,
@@ -453,16 +623,18 @@ pub async fn send_broadcast_with_routing_metric_unordered_and_transit_processing
         routing_metric,
         class,
         body,
-        false,
+        None,
         process_on_transit,
     )
     .await
 }
 
-async fn send_broadcast_with_routing_metric_ordering_and_transit_processing(
+#[allow(clippy::too_many_arguments)]
+async fn send_broadcast_with_routing_metric_lane_and_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
+    boot_epoch: u64,
     ordering: &OverlayOrdering,
     alive: &[NodeIdentifier],
     tag: u32,
@@ -470,7 +642,7 @@ async fn send_broadcast_with_routing_metric_ordering_and_transit_processing(
     routing_metric: RoutingMetric,
     class: MessageClass,
     body: Bytes,
-    ordered_delivery: bool,
+    lane: Option<LaneId>,
     process_on_transit: bool,
 ) -> Result<(), OverlayError> {
     let dsts: Vec<NodeIdentifier> = alive.iter().copied().filter(|n| *n != self_id).collect();
@@ -481,6 +653,7 @@ async fn send_broadcast_with_routing_metric_ordering_and_transit_processing(
         transport,
         routing,
         self_id,
+        boot_epoch,
         ordering,
         dsts,
         tag,
@@ -488,7 +661,7 @@ async fn send_broadcast_with_routing_metric_ordering_and_transit_processing(
         routing_metric,
         class,
         body,
-        ordered_delivery,
+        lane,
         process_on_transit,
     )
     .await

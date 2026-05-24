@@ -54,6 +54,7 @@ pub struct TransportConfig {
     /// idle-link goodput estimate by service shape.
     bandwidth_probe_size: usize,
 
+    inbound_control_capacity: usize,
     inbound_high_capacity: usize,
     inbound_regular_capacity: usize,
     outbound_capacity: usize,
@@ -68,6 +69,8 @@ pub struct TransportConfig {
     jitter_ewma_alpha: f64,
     /// EWMA coefficient for the active-probe throughput estimate.
     throughput_ewma_alpha: f64,
+    /// EWMA coefficient for the long-term packet-loss estimate.
+    packet_loss_ewma_alpha: f64,
 
     /// Cap on in-flight pings remembered per stream/UDP session. Older
     /// entries are dropped when the buffer fills, preventing unbounded
@@ -109,6 +112,7 @@ impl TransportConfig {
             bandwidth_window: Duration::from_secs(5),
             bandwidth_probe_interval: Duration::from_secs(15),
             bandwidth_probe_size: 64 * 1024,
+            inbound_control_capacity: 1024,
             inbound_high_capacity: 1024,
             inbound_regular_capacity: 1024,
             outbound_capacity: 256,
@@ -117,6 +121,7 @@ impl TransportConfig {
             latency_ewma_alpha: 0.2,
             jitter_ewma_alpha: 1.0 / 16.0,
             throughput_ewma_alpha: 0.3,
+            packet_loss_ewma_alpha: 0.02,
             max_pending_pings: 64,
             max_outgoing_connections: 1024,
         }
@@ -250,6 +255,10 @@ impl TransportConfig {
         }
     }
 
+    pub fn inbound_control_capacity(&self) -> usize {
+        self.inbound_control_capacity
+    }
+
     pub fn inbound_high_capacity(&self) -> usize {
         self.inbound_high_capacity
     }
@@ -280,6 +289,10 @@ impl TransportConfig {
 
     pub fn throughput_ewma_alpha(&self) -> f64 {
         self.throughput_ewma_alpha
+    }
+
+    pub fn packet_loss_ewma_alpha(&self) -> f64 {
+        self.packet_loss_ewma_alpha
     }
 
     pub fn max_pending_pings(&self) -> usize {
@@ -421,6 +434,11 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_inbound_control_capacity(mut self, n: usize) -> Self {
+        self.inbound_control_capacity = n;
+        self
+    }
+
     pub fn with_inbound_high_capacity(mut self, n: usize) -> Self {
         self.inbound_high_capacity = n;
         self
@@ -461,6 +479,11 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_packet_loss_ewma_alpha(mut self, v: f64) -> Self {
+        self.packet_loss_ewma_alpha = v;
+        self
+    }
+
     pub fn with_max_pending_pings(mut self, n: usize) -> Self {
         self.max_pending_pings = n;
         self
@@ -484,6 +507,8 @@ pub struct TransportTuning {
     pub jitter_ewma_alpha: f64,
     #[serde(default = "default_throughput_ewma_alpha")]
     pub throughput_ewma_alpha: f64,
+    #[serde(default = "default_packet_loss_ewma_alpha")]
+    pub packet_loss_ewma_alpha: f64,
     #[serde(default = "default_max_pending_pings")]
     pub max_pending_pings: usize,
     #[serde(default = "default_recent_probe_retry_cap_secs")]
@@ -507,6 +532,7 @@ impl Default for TransportTuning {
             latency_ewma_alpha: default_latency_ewma_alpha(),
             jitter_ewma_alpha: default_jitter_ewma_alpha(),
             throughput_ewma_alpha: default_throughput_ewma_alpha(),
+            packet_loss_ewma_alpha: default_packet_loss_ewma_alpha(),
             max_pending_pings: default_max_pending_pings(),
             recent_probe_retry_cap_secs: default_recent_probe_retry_cap_secs(),
             stale_probe_retry_cap_secs: default_stale_probe_retry_cap_secs(),
@@ -524,6 +550,7 @@ impl TransportTuning {
         cfg.with_latency_ewma_alpha(self.latency_ewma_alpha)
             .with_jitter_ewma_alpha(self.jitter_ewma_alpha)
             .with_throughput_ewma_alpha(self.throughput_ewma_alpha)
+            .with_packet_loss_ewma_alpha(self.packet_loss_ewma_alpha)
             .with_max_pending_pings(self.max_pending_pings)
             .with_backoff_cap(Duration::from_secs(self.recent_probe_retry_cap_secs))
             .with_stale_backoff_cap(Duration::from_secs(self.stale_probe_retry_cap_secs))
@@ -544,6 +571,9 @@ fn default_jitter_ewma_alpha() -> f64 {
 }
 fn default_throughput_ewma_alpha() -> f64 {
     0.3
+}
+fn default_packet_loss_ewma_alpha() -> f64 {
+    0.02
 }
 fn default_max_pending_pings() -> usize {
     64

@@ -1,9 +1,9 @@
 //! Central inbound dispatcher.
 //!
-//! Reads frames from the transport's two `Inbound` mpscs (high-priority +
-//! regular) and routes the decoded `OverlayMessage` to the appropriate
-//! handler. The two queues are drained by **two independent tasks**:
-//! high-priority traffic must never wait behind regular traffic.
+//! Reads frames from the transport's `Inbound` mpscs (control,
+//! high-priority, and regular) and routes decoded `OverlayMessage`s to the
+//! appropriate handler. The queues are drained by independent tasks so
+//! overlay control traffic never waits behind application data.
 //!
 //! Why split tasks rather than `tokio::select!` with `biased;`? Decode and
 //! handler dispatch may await (e.g., `transport.send` on a forwarder), so
@@ -61,7 +61,8 @@ pub(crate) struct DispatcherCtx {
 /// so a slow handler on the regular queue cannot block high-priority
 /// frames (and vice versa).
 pub(crate) fn spawn_dispatcher(ctx: Arc<DispatcherCtx>, inbound: Inbound) {
-    let (high, regular) = inbound.into_parts();
+    let (control, high, regular) = inbound.into_parts();
+    tokio::spawn(run_queue(ctx.clone(), control, "control"));
     tokio::spawn(run_queue(ctx.clone(), high, "high"));
     tokio::spawn(run_queue(ctx, regular, "regular"));
 }
@@ -117,6 +118,18 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
             .await
         }
         OverlayBody::LsdbSyncResp(resp) => handle_sync_response(&ctx.lsdb, &ctx.transport, resp),
+        OverlayBody::Control(control) => {
+            messaging_forward::handle_control(
+                &ctx.transport,
+                &ctx.routing,
+                &ctx.services,
+                &ctx.ordering,
+                ctx.self_id,
+                from,
+                control,
+            )
+            .await
+        }
         OverlayBody::Data(data) => {
             messaging_forward::handle_inbound(
                 &ctx.transport,

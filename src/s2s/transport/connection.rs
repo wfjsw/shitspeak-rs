@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -199,7 +199,6 @@ pub(crate) struct PeerState {
     metrics: Arc<PeerMetrics>,
     backoff_initial: Duration,
     address_backoffs: Mutex<HashMap<PeerAddress, BackoffState>>,
-    outbound_seq: AtomicU32,
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
     connecting: AtomicBool,
@@ -223,7 +222,6 @@ impl PeerState {
             metrics: Arc::new(PeerMetrics::new(bandwidth_window, metrics_tuning)),
             backoff_initial,
             address_backoffs: Mutex::new(HashMap::new()),
-            outbound_seq: AtomicU32::new(0),
             connecting: AtomicBool::new(false),
         })
     }
@@ -247,10 +245,6 @@ impl PeerState {
     /// Release the connect slot previously claimed via `try_begin_connect`.
     pub fn end_connect(&self) {
         self.connecting.store(false, Ordering::SeqCst);
-    }
-
-    pub fn next_seq(&self) -> u32 {
-        self.outbound_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Add an address if it isn't already known. Returns true if newly added.

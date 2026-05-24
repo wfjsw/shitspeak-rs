@@ -67,6 +67,8 @@ latency_ewma_alpha = 0.2
 jitter_ewma_alpha = 0.0625
 # Smoothing coefficient for the active-probe throughput EWMA.
 throughput_ewma_alpha = 0.3
+# Smoothing coefficient for the long-term packet loss EWMA.
+packet_loss_ewma_alpha = 0.02
 # Cap on in-flight pings remembered per stream/UDP session.
 max_pending_pings = 64
 # Exponential probing retry cap for peers seen recently.

@@ -26,6 +26,7 @@ pub(crate) mod config;
 mod discovery;
 mod error;
 mod inbound;
+mod lane;
 pub mod lsdb;
 pub mod membership;
 pub mod messaging;
@@ -45,6 +46,7 @@ use crate::types::NodeIdentifier;
 
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use error::OverlayError;
+pub use lane::LaneId;
 pub use membership::{MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{OverlayInboundMessage, ServiceInbound};
 pub use routing::{RouteEntry, RoutingMetric};
@@ -179,6 +181,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dst,
             tag,
@@ -202,6 +205,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dst,
             tag,
@@ -228,6 +232,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dst,
             tag,
@@ -254,6 +259,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dst,
             tag,
@@ -266,7 +272,83 @@ impl OverlayNetwork {
         .await
     }
 
-    /// Send to a single peer without overlay sequence ordering.
+    /// Send to a single peer on an ordered overlay lane.
+    pub async fn send_unicast_on_lane(
+        &self,
+        dst: NodeIdentifier,
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        self.send_unicast_on_lane_with_routing_metric(
+            dst,
+            lane,
+            tag,
+            level,
+            RoutingMetric::default_for_level(level),
+            class,
+            body,
+        )
+        .await
+    }
+
+    /// Send to a single peer on an ordered overlay lane with an explicit metric.
+    pub async fn send_unicast_on_lane_with_routing_metric(
+        &self,
+        dst: NodeIdentifier,
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        self.send_unicast_on_lane_with_routing_metric_and_transit_processing(
+            dst,
+            lane,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+        )
+        .await
+    }
+
+    /// Send to a single peer on an ordered overlay lane and optionally process on transit nodes.
+    pub async fn send_unicast_on_lane_with_routing_metric_and_transit_processing(
+        &self,
+        dst: NodeIdentifier,
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+        process_on_transit: bool,
+    ) -> Result<(), OverlayError> {
+        messaging::send_unicast_on_lane(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            self.inner.boot_epoch,
+            self.inner.ordering(),
+            dst,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            lane,
+            process_on_transit,
+        )
+        .await
+    }
+
+    /// Send to a single peer without opting into an ordered overlay lane.
     pub async fn send_unicast_unordered_with_routing_metric(
         &self,
         dst: NodeIdentifier,
@@ -280,6 +362,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dst,
             tag,
@@ -305,6 +388,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dsts,
             tag,
@@ -328,6 +412,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dsts,
             tag,
@@ -354,6 +439,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dsts,
             tag,
@@ -380,6 +466,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dsts,
             tag,
@@ -392,7 +479,83 @@ impl OverlayNetwork {
         .await
     }
 
-    /// Send to a list of peers without overlay sequence ordering.
+    /// Send to a list of peers on an ordered overlay lane.
+    pub async fn send_multicast_on_lane(
+        &self,
+        dsts: &[NodeIdentifier],
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        self.send_multicast_on_lane_with_routing_metric(
+            dsts,
+            lane,
+            tag,
+            level,
+            RoutingMetric::default_for_level(level),
+            class,
+            body,
+        )
+        .await
+    }
+
+    /// Send to a list of peers on an ordered overlay lane with an explicit metric.
+    pub async fn send_multicast_on_lane_with_routing_metric(
+        &self,
+        dsts: &[NodeIdentifier],
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        self.send_multicast_on_lane_with_routing_metric_and_transit_processing(
+            dsts,
+            lane,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+        )
+        .await
+    }
+
+    /// Send to a list of peers on an ordered overlay lane and optionally process on transit nodes.
+    pub async fn send_multicast_on_lane_with_routing_metric_and_transit_processing(
+        &self,
+        dsts: &[NodeIdentifier],
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+        process_on_transit: bool,
+    ) -> Result<(), OverlayError> {
+        messaging::send_multicast_on_lane(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            self.inner.boot_epoch,
+            self.inner.ordering(),
+            dsts,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            lane,
+            process_on_transit,
+        )
+        .await
+    }
+
+    /// Send to a list of peers without opting into an ordered overlay lane.
     pub async fn send_multicast_unordered_with_routing_metric(
         &self,
         dsts: &[NodeIdentifier],
@@ -406,6 +569,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             dsts,
             tag,
@@ -431,6 +595,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             &alive,
             tag,
@@ -441,7 +606,7 @@ impl OverlayNetwork {
         .await
     }
 
-    /// Send to every alive peer without overlay sequence ordering.
+    /// Send to every alive peer without opting into an ordered overlay lane.
     pub async fn send_broadcast_unordered_with_routing_metric(
         &self,
         tag: u32,
@@ -455,6 +620,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             &alive,
             tag,
@@ -480,6 +646,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             &alive,
             tag,
@@ -506,6 +673,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             &alive,
             tag,
@@ -532,6 +700,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             self.inner.self_id,
+            self.inner.boot_epoch,
             self.inner.ordering(),
             &alive,
             tag,
@@ -540,6 +709,78 @@ impl OverlayNetwork {
             class,
             body,
             false,
+        )
+        .await
+    }
+
+    /// Send to every alive peer on an ordered overlay lane.
+    pub async fn send_broadcast_on_lane(
+        &self,
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        self.send_broadcast_on_lane_with_routing_metric(
+            lane,
+            tag,
+            level,
+            RoutingMetric::default_for_level(level),
+            class,
+            body,
+        )
+        .await
+    }
+
+    /// Send to every alive peer on an ordered overlay lane with an explicit metric.
+    pub async fn send_broadcast_on_lane_with_routing_metric(
+        &self,
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Result<(), OverlayError> {
+        self.send_broadcast_on_lane_with_routing_metric_and_transit_processing(
+            lane,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+        )
+        .await
+    }
+
+    /// Send to every alive peer on an ordered overlay lane and optionally process on transit nodes.
+    pub async fn send_broadcast_on_lane_with_routing_metric_and_transit_processing(
+        &self,
+        lane: LaneId,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+        process_on_transit: bool,
+    ) -> Result<(), OverlayError> {
+        let alive = self.alive_members();
+        messaging::send_broadcast_on_lane(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            self.inner.boot_epoch,
+            self.inner.ordering(),
+            &alive,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            lane,
+            process_on_transit,
         )
         .await
     }

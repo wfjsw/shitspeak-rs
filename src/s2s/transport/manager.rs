@@ -22,11 +22,11 @@ use crate::types::NodeIdentifier;
 use super::config::TransportConfig;
 use super::connection::{BackoffState, OutboundFrame, PeerState};
 use super::endpoint::{
-    kcp::KcpEndpoint, quic::QuicEndpoint, tcp::TcpEndpoint, udp::UdpEndpoint, EndpointRegistry,
+    EndpointRegistry, kcp::KcpEndpoint, quic::QuicEndpoint, tcp::TcpEndpoint, udp::UdpEndpoint,
 };
 use super::error::{ConfigError, SendError, TransportError};
 use super::identity::NodeIdentity;
-use super::metrics::{assemble_snapshot, MetricsSnapshot, MetricsTuning};
+use super::metrics::{MetricsSnapshot, MetricsTuning, assemble_snapshot};
 use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
 use super::tls::build_tls_configs;
 
@@ -51,7 +51,7 @@ impl PeerAddressSnapshot {
     }
 }
 
-/// Inbound message handed to the caller via one of the two mpscs in
+/// Inbound message handed to the caller via one of the mpscs in
 /// [`Inbound`]. The caller owns the receivers; the manager keeps the senders.
 #[derive(Debug)]
 pub struct InboundMessage {
@@ -102,19 +102,26 @@ impl InboundMessage {
 
 /// Receiver halves returned once at `start`.
 pub struct Inbound {
+    control: mpsc::Receiver<InboundMessage>,
     high_priority: mpsc::Receiver<InboundMessage>,
     regular: mpsc::Receiver<InboundMessage>,
 }
 
 impl Inbound {
     pub(crate) fn new(
+        control: mpsc::Receiver<InboundMessage>,
         high_priority: mpsc::Receiver<InboundMessage>,
         regular: mpsc::Receiver<InboundMessage>,
     ) -> Self {
         Self {
+            control,
             high_priority,
             regular,
         }
+    }
+
+    pub fn control(&mut self) -> &mut mpsc::Receiver<InboundMessage> {
+        &mut self.control
     }
 
     pub fn high_priority(&mut self) -> &mut mpsc::Receiver<InboundMessage> {
@@ -125,7 +132,7 @@ impl Inbound {
         &mut self.regular
     }
 
-    /// Consume the handle and return the two receivers (high-priority, regular).
+    /// Consume the handle and return the receivers (control, high-priority, regular).
     /// Used by callers (e.g. the overlay dispatcher) that want to take owned
     /// halves into separate tasks.
     pub fn into_parts(
@@ -133,25 +140,40 @@ impl Inbound {
     ) -> (
         mpsc::Receiver<InboundMessage>,
         mpsc::Receiver<InboundMessage>,
+        mpsc::Receiver<InboundMessage>,
     ) {
-        (self.high_priority, self.regular)
+        (self.control, self.high_priority, self.regular)
     }
 }
 
 /// Sender halves used by all stream/datagram pumps. Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct InboundDispatch {
+    control: mpsc::Sender<InboundMessage>,
     high: mpsc::Sender<InboundMessage>,
     regular: mpsc::Sender<InboundMessage>,
 }
 
 impl InboundDispatch {
-    pub fn new(high: mpsc::Sender<InboundMessage>, regular: mpsc::Sender<InboundMessage>) -> Self {
-        Self { high, regular }
+    pub fn new(
+        control: mpsc::Sender<InboundMessage>,
+        high: mpsc::Sender<InboundMessage>,
+        regular: mpsc::Sender<InboundMessage>,
+    ) -> Self {
+        Self {
+            control,
+            high,
+            regular,
+        }
     }
 
     pub fn dispatch(&self, msg: InboundMessage) {
         match msg.class {
+            MessageClass::Control => {
+                if let Err(e) = self.control.try_send(msg) {
+                    warn!(error=%e, "control inbound queue full; dropping frame");
+                }
+            }
             MessageClass::HighPriority => {
                 if let Err(e) = self.high.try_send(msg) {
                     warn!(error=%e, "high-priority inbound queue full; dropping frame");
@@ -213,6 +235,7 @@ impl ManagerInner {
                 latency_alpha: self.cfg.latency_ewma_alpha(),
                 jitter_alpha: self.cfg.jitter_ewma_alpha(),
                 throughput_alpha: self.cfg.throughput_ewma_alpha(),
+                packet_loss_alpha: self.cfg.packet_loss_ewma_alpha(),
             },
         );
         match self.peers.entry_sync(id) {
@@ -295,9 +318,10 @@ impl ConnectionManager {
             return Err(ConfigError::NoListener.into());
         }
 
+        let (control_tx, control_rx) = mpsc::channel(cfg.inbound_control_capacity());
         let (high_tx, high_rx) = mpsc::channel(cfg.inbound_high_capacity());
         let (regular_tx, regular_rx) = mpsc::channel(cfg.inbound_regular_capacity());
-        let inbound = InboundDispatch::new(high_tx, regular_tx);
+        let inbound = InboundDispatch::new(control_tx, high_tx, regular_tx);
 
         let inner = Arc::new(ManagerInner {
             self_id: identity.node_id(),
@@ -325,7 +349,7 @@ impl ConnectionManager {
 
         Ok((
             ConnectionManager { inner },
-            Inbound::new(high_rx, regular_rx),
+            Inbound::new(control_rx, high_rx, regular_rx),
         ))
     }
 
@@ -828,6 +852,28 @@ mod tests {
             receivers.push(rx);
         }
         (peer, receivers)
+    }
+
+    #[tokio::test]
+    async fn inbound_dispatch_routes_control_to_control_queue() {
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let (high_tx, mut high_rx) = mpsc::channel(1);
+        let (regular_tx, mut regular_rx) = mpsc::channel(1);
+        let dispatch = InboundDispatch::new(control_tx, high_tx, regular_tx);
+
+        dispatch.dispatch(InboundMessage::new(
+            7,
+            ServiceLevel::ReliableLowLatency,
+            TransportKind::Tcp,
+            MessageClass::Control,
+            Bytes::from_static(b"control"),
+        ));
+
+        let msg = control_rx.recv().await.expect("control message");
+        assert_eq!(msg.class(), MessageClass::Control);
+        assert_eq!(&msg.payload()[..], b"control");
+        assert!(high_rx.try_recv().is_err());
+        assert!(regular_rx.try_recv().is_err());
     }
 
     #[test]

@@ -406,6 +406,7 @@ fn service_level_name(level: ServiceLevel) -> &'static str {
 
 fn message_class_name(class: MessageClass) -> &'static str {
     match class {
+        MessageClass::Control => "control",
         MessageClass::HighPriority => "high_priority",
         MessageClass::Regular => "regular",
     }

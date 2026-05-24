@@ -62,6 +62,12 @@ impl NeighborState {
             pending: HashMap::new(),
         }
     }
+
+    fn reset_quality_samples(&mut self) {
+        // Probes sent before a link is usable should not seed its route cost.
+        self.loss_samples.clear();
+        self.pending.clear();
+    }
 }
 
 fn record_loss_sample(st: &mut NeighborState, now: Instant, window: Duration, lost: bool) {
@@ -218,10 +224,12 @@ impl NeighborMonitor {
             .count();
         if expired > 0 {
             st.pending.retain(|_, sent| *sent > cutoff);
-            for _ in 0..expired {
-                record_loss_sample(st, now, self.cfg.hello_dead_interval(), true);
+            if st.is_up {
+                for _ in 0..expired {
+                    record_loss_sample(st, now, self.cfg.hello_dead_interval(), true);
+                }
+                self.on_change.notify_one();
             }
-            self.on_change.notify_one();
         }
         st.pending.insert(nonce, now);
     }
@@ -249,6 +257,9 @@ impl NeighborMonitor {
             st.last_ack_at = Some(Instant::now());
             st.miss_count = 0;
             st.is_up = true;
+            if !was_up {
+                st.reset_quality_samples();
+            }
             !was_up
         };
         if became_up {
@@ -285,13 +296,16 @@ impl NeighborMonitor {
             }
             st.last_ack_at = Some(now);
             st.miss_count = 0;
-            st.is_up = true;
             // RTT calc — prefer the recorded ts_send (echoed) over our own
             // pending table since either is a valid round-trip measurement.
             let sent_at_instant: Option<Instant> = st.pending.remove(&nonce);
+            if !was_up {
+                st.reset_quality_samples();
+            }
             if sent_at_instant.is_some() {
                 record_loss_sample(st, now, self.cfg.hello_dead_interval(), false);
             }
+            st.is_up = true;
             // Cap pending table size — drop stale entries occasionally.
             if st.pending.len() > 32 {
                 let cutoff = now - Duration::from_secs(60);
@@ -359,8 +373,10 @@ impl NeighborMonitor {
                         let expired = st.pending.len();
                         if expired > 0 {
                             st.pending.clear();
-                            for _ in 0..expired {
-                                record_loss_sample(st, now, dead, true);
+                            if st.is_up {
+                                for _ in 0..expired {
+                                    record_loss_sample(st, now, dead, true);
+                                }
                             }
                         }
                         if st.is_up {

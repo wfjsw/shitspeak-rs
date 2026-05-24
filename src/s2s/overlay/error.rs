@@ -34,6 +34,8 @@ pub enum OverlayError {
         dst: NodeIdentifier,
         level: crate::s2s::transport::ServiceLevel,
     },
+    #[error("ordered lane {lane} pending window is full for destination {dst}")]
+    OrderedWindowFull { dst: NodeIdentifier, lane: u32 },
     #[error("no service handler is registered for tag {tag}")]
     ServiceNotRegistered { tag: u32 },
 }

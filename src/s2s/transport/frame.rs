@@ -94,6 +94,7 @@ impl TryFrom<i32> for ServiceLevel {
 impl From<MessageClass> for pb::MessageClass {
     fn from(v: MessageClass) -> Self {
         match v {
+            MessageClass::Control => pb::MessageClass::ClassControl,
             MessageClass::HighPriority => pb::MessageClass::ClassHighPriority,
             MessageClass::Regular => pb::MessageClass::ClassRegular,
         }
@@ -103,6 +104,7 @@ impl From<MessageClass> for pb::MessageClass {
 impl From<pb::MessageClass> for MessageClass {
     fn from(v: pb::MessageClass) -> Self {
         match v {
+            pb::MessageClass::ClassControl => MessageClass::Control,
             pb::MessageClass::ClassHighPriority => MessageClass::HighPriority,
             pb::MessageClass::ClassRegular => MessageClass::Regular,
         }
@@ -176,7 +178,6 @@ pub fn build_frame(
     level: ServiceLevel,
     ty: FrameType,
     class: MessageClass,
-    seq: u32,
     ts_us: u64,
     payload: Bytes,
 ) -> Frame {
@@ -186,7 +187,6 @@ pub fn build_frame(
         service_level: pb::ServiceLevel::from(level) as i32,
         frame_type: pb::FrameType::from(ty) as i32,
         message_class: pb::MessageClass::from(class) as i32,
-        seq,
         ts_us,
         payload,
     }
@@ -203,7 +203,6 @@ mod tests {
             ServiceLevel::ReliableLowLatency,
             FrameType::Data,
             MessageClass::HighPriority,
-            123,
             456_789,
             payload.clone(),
         );
@@ -212,7 +211,6 @@ mod tests {
         let decoded = decode_frame(&buf).expect("decode");
         assert_eq!(decoded.src_node, 42);
         assert_eq!(decoded.dst_node, 7);
-        assert_eq!(decoded.seq, 123);
         assert_eq!(decoded.ts_us, 456_789);
         assert_eq!(decoded.payload, payload);
         assert_eq!(
@@ -274,7 +272,11 @@ mod tests {
             let i = pb::FrameType::from(ty) as i32;
             assert_eq!(FrameType::try_from(i).unwrap(), ty);
         }
-        for c in [MessageClass::HighPriority, MessageClass::Regular] {
+        for c in [
+            MessageClass::Control,
+            MessageClass::HighPriority,
+            MessageClass::Regular,
+        ] {
             let i = pb::MessageClass::from(c) as i32;
             assert_eq!(MessageClass::try_from(i).unwrap(), c);
         }

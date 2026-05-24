@@ -1,6 +1,6 @@
-//! Per-link telemetry: EWMA latency + RFC-3550-style jitter, plus a sliding
-//! bandwidth meter. Aggregated per `(node, ServiceLevel)` so callers can score
-//! path quality among co-existing transports.
+//! Per-link telemetry: EWMA latency + RFC-3550-style jitter, packet loss, and
+//! a sliding bandwidth meter. Aggregated per `(node, ServiceLevel)` so callers
+//! can score path quality among co-existing transports.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +26,8 @@ const E_MODEL_MAX_THROUGHPUT_IMPAIRMENT: f64 = 20.0;
 const DEFAULT_RELIABLE_THROUGHPUT_PENALTY_US_KBPS: f64 = 1_000_000.0;
 const DEFAULT_RLL_JITTER_WEIGHT: f64 = 4.0;
 const MAX_PACKET_LOSS_PPM: u32 = 1_000_000;
+const DEFAULT_PACKET_LOSS_EWMA_ALPHA: f64 = 0.02;
+const PACKET_LOSS_EWMA_METRIC_WEIGHT: f64 = 0.25;
 
 pub(crate) fn apply_packet_loss_penalty(cost: f64, packet_loss_ppm: u32) -> f64 {
     let success = 1.0 - (packet_loss_ppm.min(999_999) as f64 / MAX_PACKET_LOSS_PPM as f64);
@@ -100,6 +102,8 @@ pub struct MetricsTuning {
     pub jitter_alpha: f64,
     /// Smoothing coefficient for the active-probe throughput EWMA.
     pub throughput_alpha: f64,
+    /// Smoothing coefficient for the long-term packet-loss EWMA.
+    pub packet_loss_alpha: f64,
 }
 
 impl Default for MetricsTuning {
@@ -108,6 +112,7 @@ impl Default for MetricsTuning {
             latency_alpha: 0.2,
             jitter_alpha: 1.0 / 16.0,
             throughput_alpha: 0.3,
+            packet_loss_alpha: DEFAULT_PACKET_LOSS_EWMA_ALPHA,
         }
     }
 }
@@ -130,6 +135,8 @@ pub struct LinkMetrics {
     window: Duration,
     /// Packet loss over the rolling probe/keepalive window, parts per million.
     packet_loss_ppm: u32,
+    /// Long-term EWMA packet loss estimate, parts per million.
+    packet_loss_ewma_ppm: u32,
     probe_packets: u64,
     lost_probe_packets: u64,
     samples: u64,
@@ -185,6 +192,14 @@ impl LinkMetrics {
 
     pub fn packet_loss_ppm(&self) -> u32 {
         self.packet_loss_ppm
+    }
+
+    pub fn packet_loss_ewma_ppm(&self) -> u32 {
+        self.packet_loss_ewma_ppm
+    }
+
+    pub fn effective_packet_loss_ppm(&self) -> u32 {
+        effective_packet_loss_ppm(self.packet_loss_ppm, self.packet_loss_ewma_ppm)
     }
 
     pub fn probe_packets(&self) -> u64 {
@@ -261,6 +276,8 @@ impl LinkMetrics {
     }
 
     /// E-model-inspired conversational link-quality score. Higher is better.
+    /// Packet loss uses the rolling estimate with a lower-weight long-term
+    /// EWMA floor so persistent reliability issues still influence ranking.
     ///
     /// Links without RTT samples are left unranked so the dial scheduler can
     /// prefer peers with observed quality.
@@ -273,7 +290,7 @@ impl LinkMetrics {
             self.rtt_us,
             self.jitter_us,
             self.estimated_throughput_bps(),
-            self.packet_loss_ppm,
+            self.effective_packet_loss_ppm(),
         ))
     }
 
@@ -292,27 +309,37 @@ impl LinkMetrics {
                 self.rtt_us,
                 self.jitter_us,
                 self.estimated_throughput_bps(),
-                self.packet_loss_ppm,
+                self.effective_packet_loss_ppm(),
             ),
         })
     }
 
     fn best_effort_cost(&self) -> f64 {
-        apply_packet_loss_penalty(self.rtt_us.max(1.0), self.packet_loss_ppm)
+        apply_packet_loss_penalty(self.rtt_us.max(1.0), self.effective_packet_loss_ppm())
     }
 
     fn reliable_low_latency_cost(&self) -> f64 {
         apply_packet_loss_penalty(
             (self.rtt_us + DEFAULT_RLL_JITTER_WEIGHT * self.jitter_us).max(1.0),
-            self.packet_loss_ppm,
+            self.effective_packet_loss_ppm(),
         )
     }
 
     fn reliable_cost(&self) -> f64 {
         let throughput_kbps = (self.estimated_throughput_bps() / 1024.0).max(1.0);
         let penalty = DEFAULT_RELIABLE_THROUGHPUT_PENALTY_US_KBPS / throughput_kbps;
-        apply_packet_loss_penalty((self.rtt_us + penalty).max(1.0), self.packet_loss_ppm)
+        apply_packet_loss_penalty(
+            (self.rtt_us + penalty).max(1.0),
+            self.effective_packet_loss_ppm(),
+        )
     }
+}
+
+fn effective_packet_loss_ppm(rolling_ppm: u32, ewma_ppm: u32) -> u32 {
+    let weighted_ewma = (ewma_ppm as f64 * PACKET_LOSS_EWMA_METRIC_WEIGHT)
+        .round()
+        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32;
+    rolling_ppm.max(weighted_ewma)
 }
 
 #[derive(Debug)]
@@ -402,6 +429,8 @@ struct LinkInner {
     wire_sent: SlidingCounters,
     wire_recv: SlidingCounters,
     packet_loss: PacketLossWindow,
+    packet_loss_ewma_ppm: f64,
+    packet_loss_ewma_samples: u64,
     service_probes: HashMap<ServiceShape, ServiceProbeInner>,
 }
 
@@ -424,8 +453,25 @@ impl LinkInner {
             wire_sent: SlidingCounters::new(window),
             wire_recv: SlidingCounters::new(window),
             packet_loss: PacketLossWindow::new(window),
+            packet_loss_ewma_ppm: 0.0,
+            packet_loss_ewma_samples: 0,
             service_probes: HashMap::new(),
         }
+    }
+
+    fn record_packet_loss_sample(&mut self, lost: bool, alpha: f64) {
+        let sample = if lost {
+            MAX_PACKET_LOSS_PPM as f64
+        } else {
+            0.0
+        };
+        if self.packet_loss_ewma_samples == 0 {
+            self.packet_loss_ewma_ppm = sample;
+        } else {
+            let alpha = alpha.clamp(0.0, 1.0);
+            self.packet_loss_ewma_ppm += alpha * (sample - self.packet_loss_ewma_ppm);
+        }
+        self.packet_loss_ewma_samples = self.packet_loss_ewma_samples.saturating_add(1);
     }
 }
 
@@ -499,18 +545,20 @@ impl PeerMetrics {
 
     pub fn record_probe_delivered(&self, transport: TransportKind) {
         let mut g = self.inner.lock();
-        g.entry(transport)
-            .or_insert_with(|| LinkInner::new(self.window))
-            .packet_loss
-            .record_delivered();
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
+        entry.packet_loss.record_delivered();
+        entry.record_packet_loss_sample(false, self.tuning.packet_loss_alpha);
     }
 
     pub fn record_probe_lost(&self, transport: TransportKind) {
         let mut g = self.inner.lock();
-        g.entry(transport)
-            .or_insert_with(|| LinkInner::new(self.window))
-            .packet_loss
-            .record_lost();
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
+        entry.packet_loss.record_lost();
+        entry.record_packet_loss_sample(true, self.tuning.packet_loss_alpha);
     }
 
     /// Record one service-shaped active probe: `payload_bytes` useful bytes
@@ -578,6 +626,11 @@ impl PeerMetrics {
                     wire_recv_bytes,
                     window,
                     packet_loss_ppm,
+                    packet_loss_ewma_ppm: inner
+                        .packet_loss_ewma_ppm
+                        .round()
+                        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64)
+                        as u32,
                     probe_packets,
                     lost_probe_packets: probe_lost,
                     samples: inner.samples,
@@ -836,6 +889,59 @@ mod tests {
             .unwrap()
             .packet_loss_ppm();
         assert_eq!(udp, 500_000);
+    }
+
+    #[test]
+    fn packet_loss_ewma_tracks_probe_outcomes() {
+        let m = PeerMetrics::new(
+            Duration::from_secs(60),
+            MetricsTuning {
+                packet_loss_alpha: 0.5,
+                ..MetricsTuning::default()
+            },
+        );
+
+        m.record_probe_lost(TransportKind::Tcp);
+        m.record_probe_delivered(TransportKind::Tcp);
+
+        let snap = m.snapshot_per_transport();
+        let tcp = snap.get(&TransportKind::Tcp).unwrap();
+        assert_eq!(tcp.packet_loss_ppm(), 500_000);
+        assert_eq!(tcp.packet_loss_ewma_ppm(), 500_000);
+    }
+
+    #[test]
+    fn packet_loss_ewma_contributes_lower_weight_to_link_cost() {
+        let clean = LinkMetrics {
+            rtt_us: 10_000.0,
+            samples: 1,
+            ..LinkMetrics::default()
+        };
+        let historical_loss = LinkMetrics {
+            packet_loss_ewma_ppm: 400_000,
+            ..clean.clone()
+        };
+        let current_loss = LinkMetrics {
+            packet_loss_ppm: 200_000,
+            packet_loss_ewma_ppm: 400_000,
+            ..clean.clone()
+        };
+
+        assert_eq!(clean.effective_packet_loss_ppm(), 0);
+        assert_eq!(historical_loss.effective_packet_loss_ppm(), 100_000);
+        assert_eq!(current_loss.effective_packet_loss_ppm(), 200_000);
+
+        let clean_cost = clean
+            .routing_cost(ServiceLevel::BestEffort, RoutingMetric::BestEffortCost)
+            .unwrap();
+        let historical_loss_cost = historical_loss
+            .routing_cost(ServiceLevel::BestEffort, RoutingMetric::BestEffortCost)
+            .unwrap();
+
+        assert!(
+            historical_loss_cost > clean_cost,
+            "historical_loss_cost={historical_loss_cost} clean_cost={clean_cost}"
+        );
     }
 
     #[test]

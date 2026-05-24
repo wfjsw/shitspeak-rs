@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -91,6 +92,15 @@ pub struct OverlayConfig {
     /// Max LSAs per `LsdbSyncResp` frame. The responder splits a delta
     /// across multiple frames when it exceeds this cap.
     lsdb_sync_max_response_lsas: usize,
+
+    // ── Ordered overlay lanes ──
+    ordered_lane_cap: NonZeroUsize,
+    ordered_pending_window_packets: usize,
+    ordered_reorder_buffer_packets: usize,
+    ordered_repair_cache_packets: usize,
+    ordered_ack_timeout: Duration,
+    ordered_retry_initial: Duration,
+    ordered_retry_max: Duration,
 }
 
 impl OverlayConfig {
@@ -123,6 +133,13 @@ impl OverlayConfig {
 
             route_transit_messages: true,
             lsdb_sync_max_response_lsas: 256,
+            ordered_lane_cap: NonZeroUsize::new(64).expect("non-zero ordered lane cap"),
+            ordered_pending_window_packets: 1024,
+            ordered_reorder_buffer_packets: 1024,
+            ordered_repair_cache_packets: 1024,
+            ordered_ack_timeout: Duration::from_millis(250),
+            ordered_retry_initial: Duration::from_millis(250),
+            ordered_retry_max: Duration::from_secs(2),
         }
     }
 
@@ -189,6 +206,34 @@ impl OverlayConfig {
 
     pub fn lsdb_sync_max_response_lsas(&self) -> usize {
         self.lsdb_sync_max_response_lsas
+    }
+
+    pub fn ordered_lane_cap(&self) -> NonZeroUsize {
+        self.ordered_lane_cap
+    }
+
+    pub fn ordered_pending_window_packets(&self) -> usize {
+        self.ordered_pending_window_packets
+    }
+
+    pub fn ordered_reorder_buffer_packets(&self) -> usize {
+        self.ordered_reorder_buffer_packets
+    }
+
+    pub fn ordered_repair_cache_packets(&self) -> usize {
+        self.ordered_repair_cache_packets
+    }
+
+    pub fn ordered_ack_timeout(&self) -> Duration {
+        self.ordered_ack_timeout
+    }
+
+    pub fn ordered_retry_initial(&self) -> Duration {
+        self.ordered_retry_initial
+    }
+
+    pub fn ordered_retry_max(&self) -> Duration {
+        self.ordered_retry_max
     }
 
     // ── Builder setters ──
@@ -263,6 +308,41 @@ impl OverlayConfig {
         self.lsdb_sync_max_response_lsas = n;
         self
     }
+
+    pub fn with_ordered_lane_cap(mut self, cap: NonZeroUsize) -> Self {
+        self.ordered_lane_cap = cap;
+        self
+    }
+
+    pub fn with_ordered_pending_window_packets(mut self, n: usize) -> Self {
+        self.ordered_pending_window_packets = n;
+        self
+    }
+
+    pub fn with_ordered_reorder_buffer_packets(mut self, n: usize) -> Self {
+        self.ordered_reorder_buffer_packets = n;
+        self
+    }
+
+    pub fn with_ordered_repair_cache_packets(mut self, n: usize) -> Self {
+        self.ordered_repair_cache_packets = n;
+        self
+    }
+
+    pub fn with_ordered_ack_timeout(mut self, d: Duration) -> Self {
+        self.ordered_ack_timeout = d;
+        self
+    }
+
+    pub fn with_ordered_retry_initial(mut self, d: Duration) -> Self {
+        self.ordered_retry_initial = d;
+        self
+    }
+
+    pub fn with_ordered_retry_max(mut self, d: Duration) -> Self {
+        self.ordered_retry_max = d;
+        self
+    }
 }
 
 /// Bootstrap peer entry from operator config. The node id is required so the
@@ -301,6 +381,21 @@ pub struct OverlayTuning {
     /// Max LSAs per `LsdbSyncResp` frame.
     #[serde(default = "default_lsdb_sync_max_response_lsas")]
     pub lsdb_sync_max_response_lsas: usize,
+
+    #[serde(default = "default_ordered_lane_cap")]
+    pub ordered_lane_cap: usize,
+    #[serde(default = "default_ordered_pending_window_packets")]
+    pub ordered_pending_window_packets: usize,
+    #[serde(default = "default_ordered_reorder_buffer_packets")]
+    pub ordered_reorder_buffer_packets: usize,
+    #[serde(default = "default_ordered_repair_cache_packets")]
+    pub ordered_repair_cache_packets: usize,
+    #[serde(default = "default_ordered_ack_timeout_ms")]
+    pub ordered_ack_timeout_ms: u64,
+    #[serde(default = "default_ordered_retry_initial_ms")]
+    pub ordered_retry_initial_ms: u64,
+    #[serde(default = "default_ordered_retry_max_ms")]
+    pub ordered_retry_max_ms: u64,
 }
 
 impl Default for OverlayTuning {
@@ -308,6 +403,13 @@ impl Default for OverlayTuning {
         Self {
             route_transit_messages: default_route_transit_messages(),
             lsdb_sync_max_response_lsas: default_lsdb_sync_max_response_lsas(),
+            ordered_lane_cap: default_ordered_lane_cap(),
+            ordered_pending_window_packets: default_ordered_pending_window_packets(),
+            ordered_reorder_buffer_packets: default_ordered_reorder_buffer_packets(),
+            ordered_repair_cache_packets: default_ordered_repair_cache_packets(),
+            ordered_ack_timeout_ms: default_ordered_ack_timeout_ms(),
+            ordered_retry_initial_ms: default_ordered_retry_initial_ms(),
+            ordered_retry_max_ms: default_ordered_retry_max_ms(),
         }
     }
 }
@@ -318,6 +420,16 @@ impl OverlayTuning {
     pub fn apply(&self, cfg: OverlayConfig) -> OverlayConfig {
         cfg.with_route_transit_messages(self.route_transit_messages)
             .with_lsdb_sync_max_response_lsas(self.lsdb_sync_max_response_lsas)
+            .with_ordered_lane_cap(
+                NonZeroUsize::new(self.ordered_lane_cap)
+                    .unwrap_or_else(|| NonZeroUsize::new(default_ordered_lane_cap()).unwrap()),
+            )
+            .with_ordered_pending_window_packets(self.ordered_pending_window_packets)
+            .with_ordered_reorder_buffer_packets(self.ordered_reorder_buffer_packets)
+            .with_ordered_repair_cache_packets(self.ordered_repair_cache_packets)
+            .with_ordered_ack_timeout(Duration::from_millis(self.ordered_ack_timeout_ms))
+            .with_ordered_retry_initial(Duration::from_millis(self.ordered_retry_initial_ms))
+            .with_ordered_retry_max(Duration::from_millis(self.ordered_retry_max_ms))
     }
 }
 
@@ -327,4 +439,26 @@ fn default_route_transit_messages() -> bool {
 
 fn default_lsdb_sync_max_response_lsas() -> usize {
     256
+}
+
+fn default_ordered_lane_cap() -> usize {
+    64
+}
+fn default_ordered_pending_window_packets() -> usize {
+    1024
+}
+fn default_ordered_reorder_buffer_packets() -> usize {
+    1024
+}
+fn default_ordered_repair_cache_packets() -> usize {
+    1024
+}
+fn default_ordered_ack_timeout_ms() -> u64 {
+    250
+}
+fn default_ordered_retry_initial_ms() -> u64 {
+    250
+}
+fn default_ordered_retry_max_ms() -> u64 {
+    2_000
 }

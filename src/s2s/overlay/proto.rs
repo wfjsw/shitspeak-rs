@@ -15,8 +15,10 @@ use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 pub use crate::s2s_overlay_proto::{
-    overlay_message::Body as OverlayBody, AddressEntry, DigestEntry, Hello, HelloAck, LinkAdvert,
-    LinkStateAdvert, LsaFlood, LsdbSync, LsdbSyncResp, OverlayData, OverlayMessage,
+    overlay_control::Body as OverlayControlBody, overlay_message::Body as OverlayBody,
+    AddressEntry, DigestEntry, Hello, HelloAck, LinkAdvert, LinkStateAdvert, LsaFlood, LsdbSync,
+    LsdbSyncResp, OverlayAck, OverlayControl, OverlayData, OverlayMessage, OverlayRepairRequest,
+    OverlayRepairResponse,
 };
 
 /// Encode an `OverlayMessage` to a fresh `Bytes` ready for `transport.send(...)`.
@@ -151,6 +153,7 @@ pub fn route_metric_from_wire(v: u32, level: ServiceLevel) -> Option<RoutingMetr
 #[inline]
 pub fn class_to_wire(c: MessageClass) -> u32 {
     match c {
+        MessageClass::Control => 2,
         MessageClass::HighPriority => 0,
         MessageClass::Regular => 1,
     }
@@ -161,6 +164,7 @@ pub fn class_from_wire(v: u32) -> Option<MessageClass> {
     match v {
         0 => Some(MessageClass::HighPriority),
         1 => Some(MessageClass::Regular),
+        2 => Some(MessageClass::Control),
         _ => None,
     }
 }
@@ -222,7 +226,11 @@ mod tests {
             route_metric_from_wire(0, ServiceLevel::BestEffort).unwrap(),
             RoutingMetric::BestEffortCost
         );
-        for c in [MessageClass::HighPriority, MessageClass::Regular] {
+        for c in [
+            MessageClass::Control,
+            MessageClass::HighPriority,
+            MessageClass::Regular,
+        ] {
             assert_eq!(class_from_wire(class_to_wire(c)).unwrap(), c);
         }
     }

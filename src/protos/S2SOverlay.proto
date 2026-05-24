@@ -13,6 +13,7 @@ message OverlayMessage {
     LsdbSync      lsdb_sync      = 4;   // request: digest of what sender has
     LsdbSyncResp  lsdb_sync_resp = 5;   // response: LSAs requester is missing/stale
     OverlayData   data           = 6;
+    OverlayControl control       = 7;
   }
 }
 
@@ -107,7 +108,38 @@ message OverlayData {
   bytes  payload          = 7;
   bool   process_on_transit = 8; // deliver to local service on transit hops too
   uint32 route_metric     = 9;   // 0=legacy per-service default, 1=conversational, 2..4=level defaults
-  bool   ordered_delivery = 10;  // reliable/RLL traffic is delivered by sequence
-  uint64 ordering_seq     = 11;  // sender-monotonic per final destination
+  bool   ordered_delivery = 10;  // legacy hint; receivers order by lane_id presence
+  uint64 ordering_seq     = 11;  // sender-monotonic per (lane, final destination)
   uint32 ordering_dst     = 12;  // final destination for ordering_seq
+  optional uint32 lane_id = 13;  // present => ordered lane; absent => unordered
+  uint64 origin_boot_epoch = 14;
+  uint64 origin_message_id = 15;
+}
+
+message OverlayControl {
+  uint32 origin = 1;
+  uint64 origin_boot_epoch = 2;
+  uint32 final_dst = 3;
+  uint32 lane_id = 4;
+  uint32 requester = 5;
+
+  oneof body {
+    OverlayAck ack = 10;
+    OverlayRepairRequest repair_request = 11;
+    OverlayRepairResponse repair_response = 12;
+  }
+}
+
+message OverlayAck {
+  uint64 next_seq = 1; // cumulative ACK: all seq < next_seq received/delivered
+}
+
+message OverlayRepairRequest {
+  uint64 first_seq = 1;
+  uint64 last_seq = 2; // inclusive
+}
+
+message OverlayRepairResponse {
+  repeated OverlayData packets = 1;
+  bool not_found = 2;
 }

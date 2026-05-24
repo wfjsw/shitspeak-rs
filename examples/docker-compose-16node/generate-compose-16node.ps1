@@ -350,6 +350,7 @@ $seedBlock
 latency_ewma_alpha = 0.2
 jitter_ewma_alpha = 0.0625
 throughput_ewma_alpha = 0.3
+packet_loss_ewma_alpha = 0.02
 max_pending_pings = 64
 recent_probe_retry_cap_secs = 30
 stale_probe_retry_cap_secs = 600

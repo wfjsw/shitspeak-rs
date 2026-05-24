@@ -42,6 +42,7 @@ use crate::{
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
 type UdpPacket = (Bytes, std::net::SocketAddr, std::net::SocketAddr);
+const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 32;
 
 fn startup_file_error(
     config_key: &str,
@@ -66,6 +67,45 @@ fn first_socket_addr(address: &str) -> Result<SocketAddr, Box<dyn std::error::Er
 }
 
 async fn bind_entrypoint_socket_pair(
+    address: SocketAddr,
+) -> Result<(tokio::net::TcpListener, Arc<tokio::net::UdpSocket>), Box<dyn std::error::Error>> {
+    if address.port() != 0 {
+        return bind_entrypoint_socket_pair_once(address).await;
+    }
+
+    let mut last_udp_bind_error = None;
+    for attempt in 1..=DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS {
+        let tcp_listener = tokio::net::TcpListener::bind(address).await?;
+        let bound_address = tcp_listener.local_addr()?;
+        match tokio::net::UdpSocket::bind(bound_address).await {
+            Ok(udp_socket) => return Ok((tcp_listener, Arc::new(udp_socket))),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                tracing::debug!(
+                    attempt,
+                    attempts = DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS,
+                    %bound_address,
+                    error = ?err,
+                    "ephemeral TCP port's UDP address is unavailable; retrying entrypoint bind"
+                );
+                last_udp_bind_error = Some(err);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let detail = last_udp_bind_error
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "no UDP bind attempt was made".to_owned());
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "failed to bind a TCP/UDP entrypoint pair for {address} after {DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS} attempts: {detail}"
+        ),
+    )
+    .into())
+}
+
+async fn bind_entrypoint_socket_pair_once(
     address: SocketAddr,
 ) -> Result<(tokio::net::TcpListener, Arc<tokio::net::UdpSocket>), Box<dyn std::error::Error>> {
     let tcp_listener = tokio::net::TcpListener::bind(address).await?;

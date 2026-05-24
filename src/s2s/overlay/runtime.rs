@@ -71,7 +71,7 @@ impl OverlayInner {
 
         let routing = new_routing_handle();
         let services = Arc::new(ServiceRegistry::new());
-        let ordering = Arc::new(OverlayOrdering::new());
+        let ordering = Arc::new(OverlayOrdering::new(&cfg));
 
         let emitter = Arc::new(LsaEmitter::new(
             self_id,
@@ -165,6 +165,14 @@ impl OverlayInner {
             self.self_id,
             self.routing.clone(),
             self.transport.clone(),
+            self.cfg.clone(),
+            self.shutdown.clone(),
+        );
+        super::messaging::forward::spawn_ordered_retransmit_task(
+            self.ordering.clone(),
+            self.transport.clone(),
+            self.routing.clone(),
+            self.self_id,
             self.cfg.clone(),
             self.shutdown.clone(),
         );

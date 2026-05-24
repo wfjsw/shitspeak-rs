@@ -27,6 +27,7 @@ enum FrameType {
 enum MessageClass {
   CLASS_HIGH_PRIORITY = 0;
   CLASS_REGULAR = 1;
+  CLASS_CONTROL = 2;
 }
 
 // Carried by every send on every transport.
@@ -38,7 +39,8 @@ message Frame {
   ServiceLevel service_level = 3;
   FrameType frame_type = 4;
   MessageClass message_class = 5;
-  uint32 seq = 6;                 // sender-monotonic per (peer, transport)
+  // Field 6 was `seq` before vNext. It is intentionally reusable because
+  // transport-level ordering moved to the overlay protocol.
   uint64 ts_us = 7;               // sender monotonic microseconds (ping RTT)
   bytes payload = 8;              // domain payload, opaque to transport
 }

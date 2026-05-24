@@ -1679,7 +1679,6 @@ async fn run_write(
         level,
         FrameType::Hello,
         MessageClass::Regular,
-        peer.next_seq(),
         now_us(),
         Bytes::new(),
     );
@@ -1705,7 +1704,6 @@ async fn run_write(
                     level,
                     FrameType::Data,
                     out.class(),
-                    peer.next_seq(),
                     now_us(),
                     out.payload().clone(),
                 );
@@ -1726,7 +1724,7 @@ async fn run_write(
                 let frame = build_frame(
                     inner.self_id(), peer.node_id(), level,
                     FrameType::KeepAlive, MessageClass::Regular,
-                    peer.next_seq(), ts, Bytes::new(),
+                    ts, Bytes::new(),
                 );
                 match session.send_frame(&frame, &peer, inner.cfg().udp_mtu()).await {
                     Ok(_) => {
@@ -1802,7 +1800,6 @@ async fn send_service_probe(
         shape.service_level(),
         FrameType::Ping,
         shape.message_class(),
-        peer.next_seq(),
         ts,
         payload,
     );
@@ -1858,7 +1855,6 @@ async fn handle_frame(
                 level,
                 FrameType::Pong,
                 MessageClass::Regular,
-                peer.next_seq(),
                 frame.ts_us,
                 frame.payload.clone(),
             );
@@ -1883,7 +1879,7 @@ async fn handle_frame(
             }
         }
         pb::FrameType::FrameHello => {
-            trace!(peer=%peer.node_id(), seq=frame.seq, "received udp encrypted transport hello");
+            trace!(peer=%peer.node_id(), "received udp encrypted transport hello");
         }
         pb::FrameType::FrameBye => {}
     }

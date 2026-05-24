@@ -348,12 +348,15 @@ async fn link_down_reroutes() {
         wait_for_full_routing(&cluster, Duration::from_secs(10)).await,
         "routing did not include all peers"
     );
-
     // Initially, A's route to C is the direct link.
-    assert_eq!(
-        a.overlay.route_to(3, ServiceLevel::Reliable),
-        Some(3),
-        "expected A→C direct"
+    assert!(
+        wait_until(Duration::from_secs(5), || a
+            .overlay
+            .route_to(3, ServiceLevel::Reliable)
+            == Some(3))
+        .await,
+        "expected A→C direct; current next-hop = {:?}",
+        a.overlay.route_to(3, ServiceLevel::Reliable)
     );
 
     // Kill A↔C bidirectionally at the chaos layer.

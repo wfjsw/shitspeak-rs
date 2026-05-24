@@ -117,9 +117,11 @@ impl TransportKind {
 }
 
 /// Receiver-side routing class. Picked by the sender; carried in the frame
-/// header so the receiver can fan inbound traffic into one of two queues.
+/// header so the receiver can fan inbound traffic into control, high-priority,
+/// or regular queues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageClass {
+    Control,
     HighPriority,
     Regular,
 }

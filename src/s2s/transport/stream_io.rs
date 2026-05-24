@@ -250,7 +250,6 @@ async fn run_pump<S>(
         level_for_metrics,
         FrameType::Hello,
         MessageClass::Regular,
-        peer.next_seq(),
         now_us(),
         Bytes::new(),
     );
@@ -319,7 +318,6 @@ async fn run_pump<S>(
                     level_for_metrics,
                     FrameType::Data,
                     out.class(),
-                    peer.next_seq(),
                     now_us(),
                     out.payload().clone(),
                 );
@@ -343,7 +341,6 @@ async fn run_pump<S>(
                     level_for_metrics,
                     FrameType::KeepAlive,
                     MessageClass::Regular,
-                    peer.next_seq(),
                     ts,
                     Bytes::new(),
                 );
@@ -375,7 +372,6 @@ async fn run_pump<S>(
                         shape.service_level(),
                         FrameType::Ping,
                         shape.message_class(),
-                        peer.next_seq(),
                         ts,
                         payload,
                     );
@@ -490,7 +486,6 @@ where
                 level,
                 FrameType::Pong,
                 MessageClass::Regular,
-                peer.next_seq(),
                 frame.ts_us,
                 echo_payload,
             );
@@ -515,7 +510,7 @@ where
             }
         }
         pb::FrameType::FrameHello => {
-            trace!(peer=%cfg.peer_node, transport=?cfg.transport, seq=frame.seq, "received transport hello");
+            trace!(peer=%cfg.peer_node, transport=?cfg.transport, "received transport hello");
         }
         pb::FrameType::FrameBye => {
             return Err(std::io::Error::new(

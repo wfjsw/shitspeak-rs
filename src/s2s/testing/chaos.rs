@@ -42,6 +42,7 @@ pub enum MessageType {
     LsdbSync,
     LsdbSyncResp,
     Data,
+    Control,
     StrictProposeAck,
 }
 
@@ -54,6 +55,7 @@ impl MessageType {
             OverlayBody::LsaFlood(_) => MessageType::LsaFlood,
             OverlayBody::LsdbSync(_) => MessageType::LsdbSync,
             OverlayBody::LsdbSyncResp(_) => MessageType::LsdbSyncResp,
+            OverlayBody::Control(_) => MessageType::Control,
             OverlayBody::Data(data) => {
                 if data.service_tag == crate::s2s::replications::proto::REPLICATION_SERVICE_TAG {
                     if let Ok(repl) = crate::s2s::replications::proto::decode(&data.payload) {
@@ -257,12 +259,19 @@ impl LinkChaos {
     /// spawned (one per priority queue) to avoid head-of-line blocking
     /// between classes.
     pub fn install(&self, real: Inbound) -> Inbound {
+        let (control_tx, control_rx) = mpsc::channel(1024);
         let (high_tx, high_rx) = mpsc::channel(1024);
         let (reg_tx, reg_rx) = mpsc::channel(1024);
-        let (real_high, real_reg) = real.into_parts();
+        let (real_control, real_high, real_reg) = real.into_parts();
+        spawn_filter(
+            self.clone(),
+            real_control,
+            control_tx,
+            MessageClass::Control,
+        );
         spawn_filter(self.clone(), real_high, high_tx, MessageClass::HighPriority);
         spawn_filter(self.clone(), real_reg, reg_tx, MessageClass::Regular);
-        Inbound::new(high_rx, reg_rx)
+        Inbound::new(control_rx, high_rx, reg_rx)
     }
 }
 
