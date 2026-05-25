@@ -1,7 +1,7 @@
-use enumflags2::{bitflags, BitFlags};
+use enumflags2::{BitFlags, bitflags};
 use serde::{Deserialize, Serialize};
 
-use crate::client::group::{is_member_in_group, ClientMembershipQuery};
+use crate::client::group::{ClientMembershipQuery, is_member_in_group};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ACL {

@@ -7,6 +7,7 @@
 //! datagram-only and encrypts each packet under keys from a signed ephemeral
 //! peer exchange rooted in the same CA.
 
+mod compression;
 mod config;
 mod connection;
 mod endpoint;
@@ -15,6 +16,8 @@ mod frame;
 mod identity;
 mod manager;
 mod metrics;
+mod native_stats;
+mod probe_schedule;
 mod public_ip;
 mod service_level;
 mod stream_io;
@@ -23,15 +26,16 @@ mod tls;
 #[cfg(test)]
 mod integration_tests;
 
+pub use compression::SendOptions;
 pub use config::{TransportConfig, TransportTuning};
 pub use error::{ConfigError, SendError, TransportError};
 pub(crate) use manager::PeerAddressSnapshot;
 pub use manager::{ConnectionManager, Inbound, InboundMessage};
+pub use metrics::{LinkMetrics, MetricsSnapshot};
 pub(crate) use metrics::{
     apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,
     conversational_quality_score,
 };
-pub use metrics::{LinkMetrics, MetricsSnapshot};
 pub use service_level::{
     MessageClass, PeerAddress, RoutingMetric, ServiceLevel, ServiceShape, TransportKind,
 };

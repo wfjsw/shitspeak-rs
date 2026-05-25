@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::{BufMut as _, Bytes, BytesMut};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use parking_lot::Mutex as PMutex;
 use prost::Message as _;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use rustls::pki_types::{pem::PemObject as _, CertificateDer, ServerName};
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject as _};
 use rustls::{ClientConfig, RootCertStore};
 use shitspeak_rs::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
@@ -31,10 +31,10 @@ use shitspeak_rs::voice::codec::{
 use tempfile::TempDir;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_rustls::{client::TlsStream, TlsConnector};
+use tokio_rustls::{TlsConnector, client::TlsStream};
 
 const SAMPLE_OPUS: &[u8] = &[
     0x4f, 0x70, 0x75, 0x73, 0x45, 0x32, 0x45, 0x2d, 0x62, 0x65, 0x6e, 0x63, 0x68, 0x2d, 0x31, 0x37,
@@ -709,11 +709,7 @@ fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
 }
 
 fn duration_abs_diff(lhs: Duration, rhs: Duration) -> Duration {
-    if lhs >= rhs {
-        lhs - rhs
-    } else {
-        rhs - lhs
-    }
+    if lhs >= rhs { lhs - rhs } else { rhs - lhs }
 }
 
 fn kbps(bytes: usize, elapsed: Duration) -> f64 {

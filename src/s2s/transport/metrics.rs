@@ -28,6 +28,11 @@ const DEFAULT_RLL_JITTER_WEIGHT: f64 = 4.0;
 const MAX_PACKET_LOSS_PPM: u32 = 1_000_000;
 const DEFAULT_PACKET_LOSS_EWMA_ALPHA: f64 = 0.02;
 const PACKET_LOSS_EWMA_METRIC_WEIGHT: f64 = 0.25;
+const NATIVE_LOSS_METRIC_WEIGHT: f64 = 0.5;
+const DATA_HEALTH_METRIC_WEIGHT: f64 = 0.25;
+const NATIVE_LOSS_EFFECTIVE_CAP_PPM: u32 = 250_000;
+const DATA_HEALTH_EFFECTIVE_CAP_PPM: u32 = 100_000;
+const LOSS_EFFECTIVE_SAMPLE_FLOOR: u64 = 32;
 
 pub(crate) fn apply_packet_loss_penalty(cost: f64, packet_loss_ppm: u32) -> f64 {
     let success = 1.0 - (packet_loss_ppm.min(999_999) as f64 / MAX_PACKET_LOSS_PPM as f64);
@@ -133,16 +138,125 @@ pub struct LinkMetrics {
     wire_sent_bytes: u64,
     /// The wall-clock window over which `recv_bytes` / `sent_bytes` apply.
     window: Duration,
-    /// Packet loss over the rolling probe/keepalive window, parts per million.
-    packet_loss_ppm: u32,
-    /// Long-term EWMA packet loss estimate, parts per million.
-    packet_loss_ewma_ppm: u32,
-    probe_packets: u64,
-    lost_probe_packets: u64,
+    /// Transport health loss breakdown. The legacy `packet_loss_ppm()` getter
+    /// intentionally returns the conservative effective value from this model.
+    loss: LossBreakdown,
     samples: u64,
     last_update: Option<Instant>,
     /// EWMA of service-shaped active probe goodput, in useful payload bytes/sec.
     service_probes: HashMap<ServiceShape, ServiceProbeMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LossBreakdown {
+    probe_loss_ppm: u32,
+    probe_loss_ewma_ppm: u32,
+    native_loss_ppm: u32,
+    native_loss_ewma_ppm: u32,
+    data_health_ppm: u32,
+    effective_loss_ppm: u32,
+    probe_sample_count: u64,
+    lost_probe_sample_count: u64,
+    native_sample_count: u64,
+    native_lost_sample_count: u64,
+    data_health_sample_count: u64,
+    data_health_failure_count: u64,
+    loss_sample_count: u64,
+}
+
+impl LossBreakdown {
+    #[allow(clippy::too_many_arguments)]
+    fn from_components(
+        probe_loss_ppm: u32,
+        probe_loss_ewma_ppm: u32,
+        probe_sample_count: u64,
+        lost_probe_sample_count: u64,
+        native_loss_ppm: u32,
+        native_loss_ewma_ppm: u32,
+        native_sample_count: u64,
+        native_lost_sample_count: u64,
+        data_health_ppm: u32,
+        data_health_sample_count: u64,
+        data_health_failure_count: u64,
+    ) -> Self {
+        let effective_loss_ppm = effective_loss_ppm(
+            probe_loss_ppm,
+            probe_loss_ewma_ppm,
+            native_loss_ppm,
+            native_sample_count,
+            data_health_ppm,
+            data_health_sample_count,
+        );
+        Self {
+            probe_loss_ppm,
+            probe_loss_ewma_ppm,
+            native_loss_ppm,
+            native_loss_ewma_ppm,
+            data_health_ppm,
+            effective_loss_ppm,
+            probe_sample_count,
+            lost_probe_sample_count,
+            native_sample_count,
+            native_lost_sample_count,
+            data_health_sample_count,
+            data_health_failure_count,
+            loss_sample_count: probe_sample_count
+                .saturating_add(native_sample_count)
+                .saturating_add(data_health_sample_count),
+        }
+    }
+
+    pub fn probe_loss_ppm(&self) -> u32 {
+        self.probe_loss_ppm
+    }
+
+    pub fn probe_loss_ewma_ppm(&self) -> u32 {
+        self.probe_loss_ewma_ppm
+    }
+
+    pub fn native_loss_ppm(&self) -> u32 {
+        self.native_loss_ppm
+    }
+
+    pub fn native_loss_ewma_ppm(&self) -> u32 {
+        self.native_loss_ewma_ppm
+    }
+
+    pub fn data_health_ppm(&self) -> u32 {
+        self.data_health_ppm
+    }
+
+    pub fn effective_loss_ppm(&self) -> u32 {
+        self.effective_loss_ppm
+    }
+
+    pub fn probe_sample_count(&self) -> u64 {
+        self.probe_sample_count
+    }
+
+    pub fn lost_probe_sample_count(&self) -> u64 {
+        self.lost_probe_sample_count
+    }
+
+    pub fn native_sample_count(&self) -> u64 {
+        self.native_sample_count
+    }
+
+    pub fn native_lost_sample_count(&self) -> u64 {
+        self.native_lost_sample_count
+    }
+
+    pub fn data_health_sample_count(&self) -> u64 {
+        self.data_health_sample_count
+    }
+
+    pub fn data_health_failure_count(&self) -> u64 {
+        self.data_health_failure_count
+    }
+
+    pub fn loss_sample_count(&self) -> u64 {
+        self.loss_sample_count
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -190,24 +304,68 @@ impl LinkMetrics {
         self.window
     }
 
+    pub fn loss_breakdown(&self) -> LossBreakdown {
+        self.loss
+    }
+
     pub fn packet_loss_ppm(&self) -> u32 {
-        self.packet_loss_ppm
+        self.effective_packet_loss_ppm()
     }
 
     pub fn packet_loss_ewma_ppm(&self) -> u32 {
-        self.packet_loss_ewma_ppm
+        self.loss.probe_loss_ewma_ppm()
     }
 
     pub fn effective_packet_loss_ppm(&self) -> u32 {
-        effective_packet_loss_ppm(self.packet_loss_ppm, self.packet_loss_ewma_ppm)
+        self.loss.effective_loss_ppm()
+    }
+
+    pub fn probe_loss_ppm(&self) -> u32 {
+        self.loss.probe_loss_ppm()
+    }
+
+    pub fn probe_loss_ewma_ppm(&self) -> u32 {
+        self.loss.probe_loss_ewma_ppm()
+    }
+
+    pub fn native_loss_ppm(&self) -> u32 {
+        self.loss.native_loss_ppm()
+    }
+
+    pub fn native_loss_ewma_ppm(&self) -> u32 {
+        self.loss.native_loss_ewma_ppm()
+    }
+
+    pub fn data_health_ppm(&self) -> u32 {
+        self.loss.data_health_ppm()
+    }
+
+    pub fn loss_sample_count(&self) -> u64 {
+        self.loss.loss_sample_count()
+    }
+
+    pub fn native_loss_samples(&self) -> u64 {
+        self.loss.native_sample_count()
+    }
+
+    pub fn native_lost_samples(&self) -> u64 {
+        self.loss.native_lost_sample_count()
+    }
+
+    pub fn data_health_samples(&self) -> u64 {
+        self.loss.data_health_sample_count()
+    }
+
+    pub fn data_health_failures(&self) -> u64 {
+        self.loss.data_health_failure_count()
     }
 
     pub fn probe_packets(&self) -> u64 {
-        self.probe_packets
+        self.loss.probe_sample_count()
     }
 
     pub fn lost_probe_packets(&self) -> u64 {
-        self.lost_probe_packets
+        self.loss.lost_probe_sample_count()
     }
 
     pub fn samples(&self) -> u64 {
@@ -335,11 +493,54 @@ impl LinkMetrics {
     }
 }
 
-fn effective_packet_loss_ppm(rolling_ppm: u32, ewma_ppm: u32) -> u32 {
+fn probe_effective_loss_ppm(rolling_ppm: u32, ewma_ppm: u32) -> u32 {
     let weighted_ewma = (ewma_ppm as f64 * PACKET_LOSS_EWMA_METRIC_WEIGHT)
         .round()
         .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32;
     rolling_ppm.max(weighted_ewma)
+}
+
+fn capped_weighted_ppm(ppm: u32, weight: f64, cap: u32) -> u32 {
+    ((ppm as f64 * weight).round().clamp(0.0, cap as f64)) as u32
+}
+
+fn effective_loss_ppm(
+    probe_loss_ppm: u32,
+    probe_loss_ewma_ppm: u32,
+    native_loss_ppm: u32,
+    native_sample_count: u64,
+    data_health_ppm: u32,
+    data_health_sample_count: u64,
+) -> u32 {
+    let probe_effective = probe_effective_loss_ppm(probe_loss_ppm, probe_loss_ewma_ppm);
+    let native_effective = if native_sample_count >= LOSS_EFFECTIVE_SAMPLE_FLOOR {
+        capped_weighted_ppm(
+            native_loss_ppm,
+            NATIVE_LOSS_METRIC_WEIGHT,
+            NATIVE_LOSS_EFFECTIVE_CAP_PPM,
+        )
+    } else {
+        0
+    };
+    let data_effective = if data_health_sample_count >= LOSS_EFFECTIVE_SAMPLE_FLOOR {
+        capped_weighted_ppm(
+            data_health_ppm,
+            DATA_HEALTH_METRIC_WEIGHT,
+            DATA_HEALTH_EFFECTIVE_CAP_PPM,
+        )
+    } else {
+        0
+    };
+    probe_effective.max(native_effective).max(data_effective)
+}
+
+fn loss_ppm(lost: u64, total: u64) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    ((lost.min(total) as f64 / total as f64) * MAX_PACKET_LOSS_PPM as f64)
+        .round()
+        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32
 }
 
 #[derive(Debug)]
@@ -373,14 +574,14 @@ impl SlidingCounters {
 }
 
 #[derive(Debug)]
-struct PacketLossWindow {
+struct LossWindow {
     delivered: u64,
     lost: u64,
     window_start: Instant,
     window: Duration,
 }
 
-impl PacketLossWindow {
+impl LossWindow {
     fn new(window: Duration) -> Self {
         Self {
             delivered: 0,
@@ -391,13 +592,21 @@ impl PacketLossWindow {
     }
 
     fn record_delivered(&mut self) {
-        self.maybe_roll();
-        self.delivered = self.delivered.saturating_add(1);
+        self.record_units(1, 0);
     }
 
     fn record_lost(&mut self) {
+        self.record_units(1, 1);
+    }
+
+    fn record_units(&mut self, total: u64, lost: u64) {
+        if total == 0 {
+            return;
+        }
         self.maybe_roll();
-        self.lost = self.lost.saturating_add(1);
+        let lost = lost.min(total);
+        self.delivered = self.delivered.saturating_add(total.saturating_sub(lost));
+        self.lost = self.lost.saturating_add(lost);
     }
 
     fn maybe_roll(&mut self) {
@@ -428,9 +637,13 @@ struct LinkInner {
     recv: SlidingCounters,
     wire_sent: SlidingCounters,
     wire_recv: SlidingCounters,
-    packet_loss: PacketLossWindow,
-    packet_loss_ewma_ppm: f64,
-    packet_loss_ewma_samples: u64,
+    probe_loss: LossWindow,
+    probe_loss_ewma_ppm: f64,
+    probe_loss_ewma_samples: u64,
+    native_loss: LossWindow,
+    native_loss_ewma_ppm: f64,
+    native_loss_ewma_samples: u64,
+    data_health: LossWindow,
     service_probes: HashMap<ServiceShape, ServiceProbeInner>,
 }
 
@@ -452,27 +665,64 @@ impl LinkInner {
             recv: SlidingCounters::new(window),
             wire_sent: SlidingCounters::new(window),
             wire_recv: SlidingCounters::new(window),
-            packet_loss: PacketLossWindow::new(window),
-            packet_loss_ewma_ppm: 0.0,
-            packet_loss_ewma_samples: 0,
+            probe_loss: LossWindow::new(window),
+            probe_loss_ewma_ppm: 0.0,
+            probe_loss_ewma_samples: 0,
+            native_loss: LossWindow::new(window),
+            native_loss_ewma_ppm: 0.0,
+            native_loss_ewma_samples: 0,
+            data_health: LossWindow::new(window),
             service_probes: HashMap::new(),
         }
     }
 
-    fn record_packet_loss_sample(&mut self, lost: bool, alpha: f64) {
-        let sample = if lost {
-            MAX_PACKET_LOSS_PPM as f64
+    fn record_probe_loss_sample(&mut self, lost: bool, alpha: f64) {
+        if lost {
+            self.probe_loss.record_lost();
         } else {
-            0.0
-        };
-        if self.packet_loss_ewma_samples == 0 {
-            self.packet_loss_ewma_ppm = sample;
-        } else {
-            let alpha = alpha.clamp(0.0, 1.0);
-            self.packet_loss_ewma_ppm += alpha * (sample - self.packet_loss_ewma_ppm);
+            self.probe_loss.record_delivered();
         }
-        self.packet_loss_ewma_samples = self.packet_loss_ewma_samples.saturating_add(1);
+        let sample = if lost { MAX_PACKET_LOSS_PPM } else { 0 };
+        update_loss_ewma(
+            &mut self.probe_loss_ewma_ppm,
+            &mut self.probe_loss_ewma_samples,
+            sample,
+            alpha,
+        );
     }
+
+    fn record_native_loss_sample(&mut self, sent_units: u64, lost_units: u64, alpha: f64) {
+        if sent_units == 0 {
+            return;
+        }
+        let lost_units = lost_units.min(sent_units);
+        self.native_loss.record_units(sent_units, lost_units);
+        update_loss_ewma(
+            &mut self.native_loss_ewma_ppm,
+            &mut self.native_loss_ewma_samples,
+            loss_ppm(lost_units, sent_units),
+            alpha,
+        );
+    }
+
+    fn record_data_health_sample(&mut self, failed: bool) {
+        if failed {
+            self.data_health.record_lost();
+        } else {
+            self.data_health.record_delivered();
+        }
+    }
+}
+
+fn update_loss_ewma(ewma_ppm: &mut f64, samples: &mut u64, sample_ppm: u32, alpha: f64) {
+    let sample = sample_ppm.min(MAX_PACKET_LOSS_PPM) as f64;
+    if *samples == 0 {
+        *ewma_ppm = sample;
+    } else {
+        let alpha = alpha.clamp(0.0, 1.0);
+        *ewma_ppm += alpha * (sample - *ewma_ppm);
+    }
+    *samples = (*samples).saturating_add(1);
 }
 
 /// Per-`(transport, service-level)` metrics for a single peer.
@@ -548,8 +798,7 @@ impl PeerMetrics {
         let entry = g
             .entry(transport)
             .or_insert_with(|| LinkInner::new(self.window));
-        entry.packet_loss.record_delivered();
-        entry.record_packet_loss_sample(false, self.tuning.packet_loss_alpha);
+        entry.record_probe_loss_sample(false, self.tuning.packet_loss_alpha);
     }
 
     pub fn record_probe_lost(&self, transport: TransportKind) {
@@ -557,8 +806,41 @@ impl PeerMetrics {
         let entry = g
             .entry(transport)
             .or_insert_with(|| LinkInner::new(self.window));
-        entry.packet_loss.record_lost();
-        entry.record_packet_loss_sample(true, self.tuning.packet_loss_alpha);
+        entry.record_probe_loss_sample(true, self.tuning.packet_loss_alpha);
+    }
+
+    pub fn record_native_loss_sample(
+        &self,
+        transport: TransportKind,
+        sent_units: u64,
+        lost_units: u64,
+    ) {
+        if sent_units == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
+        entry.record_native_loss_sample(sent_units, lost_units, self.tuning.packet_loss_alpha);
+        entry.last_update = Some(Instant::now());
+    }
+
+    pub fn record_data_health_success(&self, transport: TransportKind) {
+        self.record_data_health_sample(transport, false);
+    }
+
+    pub fn record_data_health_failure(&self, transport: TransportKind) {
+        self.record_data_health_sample(transport, true);
+    }
+
+    fn record_data_health_sample(&self, transport: TransportKind, failed: bool) {
+        let mut g = self.inner.lock();
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
+        entry.record_data_health_sample(failed);
+        entry.last_update = Some(Instant::now());
     }
 
     /// Record one service-shaped active probe: `payload_bytes` useful bytes
@@ -600,21 +882,43 @@ impl PeerMetrics {
                 let (recv_bytes, recv_age) = inner.recv.snapshot();
                 let (wire_sent_bytes, wire_sent_age) = inner.wire_sent.snapshot();
                 let (wire_recv_bytes, wire_recv_age) = inner.wire_recv.snapshot();
-                let (probe_delivered, probe_lost, loss_age) = inner.packet_loss.snapshot();
+                let (probe_delivered, probe_lost, probe_loss_age) = inner.probe_loss.snapshot();
+                let (native_delivered, native_lost, native_loss_age) = inner.native_loss.snapshot();
+                let (data_health_ok, data_health_failed, data_health_age) =
+                    inner.data_health.snapshot();
                 let probe_packets = probe_delivered.saturating_add(probe_lost);
-                let packet_loss_ppm = if probe_packets == 0 {
-                    0
-                } else {
-                    ((probe_lost as f64 / probe_packets as f64) * MAX_PACKET_LOSS_PPM as f64)
+                let native_samples = native_delivered.saturating_add(native_lost);
+                let data_health_samples = data_health_ok.saturating_add(data_health_failed);
+                let probe_loss_ppm = loss_ppm(probe_lost, probe_packets);
+                let native_loss_ppm = loss_ppm(native_lost, native_samples);
+                let data_health_ppm = loss_ppm(data_health_failed, data_health_samples);
+                let loss = LossBreakdown::from_components(
+                    probe_loss_ppm,
+                    inner
+                        .probe_loss_ewma_ppm
                         .round()
-                        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32
-                };
+                        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32,
+                    probe_packets,
+                    probe_lost,
+                    native_loss_ppm,
+                    inner
+                        .native_loss_ewma_ppm
+                        .round()
+                        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32,
+                    native_samples,
+                    native_lost,
+                    data_health_ppm,
+                    data_health_samples,
+                    data_health_failed,
+                );
                 let window = self.window.min(
                     recv_age
                         .max(sent_age)
                         .max(wire_recv_age)
                         .max(wire_sent_age)
-                        .max(loss_age)
+                        .max(probe_loss_age)
+                        .max(native_loss_age)
+                        .max(data_health_age)
                         .max(Duration::from_micros(1)),
                 );
                 let m = LinkMetrics {
@@ -625,14 +929,7 @@ impl PeerMetrics {
                     wire_sent_bytes,
                     wire_recv_bytes,
                     window,
-                    packet_loss_ppm,
-                    packet_loss_ewma_ppm: inner
-                        .packet_loss_ewma_ppm
-                        .round()
-                        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64)
-                        as u32,
-                    probe_packets,
-                    lost_probe_packets: probe_lost,
+                    loss,
                     samples: inner.samples,
                     last_update: inner.last_update,
                     service_probes: inner
@@ -918,12 +1215,11 @@ mod tests {
             ..LinkMetrics::default()
         };
         let historical_loss = LinkMetrics {
-            packet_loss_ewma_ppm: 400_000,
+            loss: LossBreakdown::from_components(0, 400_000, 0, 0, 0, 0, 0, 0, 0, 0, 0),
             ..clean.clone()
         };
         let current_loss = LinkMetrics {
-            packet_loss_ppm: 200_000,
-            packet_loss_ewma_ppm: 400_000,
+            loss: LossBreakdown::from_components(200_000, 400_000, 5, 1, 0, 0, 0, 0, 0, 0, 0),
             ..clean.clone()
         };
 
@@ -942,6 +1238,98 @@ mod tests {
             historical_loss_cost > clean_cost,
             "historical_loss_cost={historical_loss_cost} clean_cost={clean_cost}"
         );
+    }
+
+    #[test]
+    fn native_loss_waits_for_sample_floor_then_applies_cap() {
+        let below_floor = LossBreakdown::from_components(
+            0,
+            0,
+            0,
+            0,
+            800_000,
+            800_000,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR - 1,
+            24,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(below_floor.effective_loss_ppm(), 0);
+
+        let above_floor = LossBreakdown::from_components(
+            0,
+            0,
+            0,
+            0,
+            800_000,
+            800_000,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR,
+            26,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(
+            above_floor.effective_loss_ppm(),
+            NATIVE_LOSS_EFFECTIVE_CAP_PPM
+        );
+    }
+
+    #[test]
+    fn data_health_waits_for_sample_floor_and_is_capped() {
+        let below_floor = LossBreakdown::from_components(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            500_000,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR - 1,
+            15,
+        );
+        assert_eq!(below_floor.effective_loss_ppm(), 0);
+
+        let above_floor = LossBreakdown::from_components(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            800_000,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR,
+            26,
+        );
+        assert_eq!(
+            above_floor.effective_loss_ppm(),
+            DATA_HEALTH_EFFECTIVE_CAP_PPM
+        );
+    }
+
+    #[test]
+    fn peer_metrics_records_native_and_data_health_breakdown() {
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        m.record_native_loss_sample(TransportKind::Tcp, 40, 4);
+        for _ in 0..31 {
+            m.record_data_health_success(TransportKind::Tcp);
+        }
+        m.record_data_health_failure(TransportKind::Tcp);
+
+        let snap = m.snapshot_per_transport();
+        let tcp = snap.get(&TransportKind::Tcp).unwrap();
+        assert_eq!(tcp.native_loss_ppm(), 100_000);
+        assert_eq!(tcp.native_loss_samples(), 40);
+        assert_eq!(tcp.native_lost_samples(), 4);
+        assert_eq!(tcp.data_health_ppm(), 31_250);
+        assert_eq!(tcp.data_health_samples(), 32);
+        assert_eq!(tcp.data_health_failures(), 1);
+        assert_eq!(tcp.effective_packet_loss_ppm(), 50_000);
     }
 
     #[test]

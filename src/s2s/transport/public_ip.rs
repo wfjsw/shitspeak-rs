@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::join_all;
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::timeout;
 use tracing::debug;
 

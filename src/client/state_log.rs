@@ -13,7 +13,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::client::{client_session_identifier::ClientSessionIdentifier, ClientInstanceId};
+use crate::client::{ClientInstanceId, client_session_identifier::ClientSessionIdentifier};
 use crate::client_repository::ClientRepository;
 use crate::types::default_server_id;
 

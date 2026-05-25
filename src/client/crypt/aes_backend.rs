@@ -18,7 +18,7 @@
 use std::sync::OnceLock;
 
 use aws_lc_rs::cipher::{
-    DecryptingKey, DecryptionContext, EncryptingKey, UnboundCipherKey, AES_128,
+    AES_128, DecryptingKey, DecryptionContext, EncryptingKey, UnboundCipherKey,
 };
 
 use super::errors::CryptError;

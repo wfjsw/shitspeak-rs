@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::s2s::application::error::ApplicationError;
-use crate::s2s::application::proto::{self, VoiceIntent, VOICE_SERVICE_TAG};
+use crate::s2s::application::proto::{self, VOICE_SERVICE_TAG, VoiceIntent};
 use crate::s2s::overlay::{OverlayNetwork, RoutingMetric};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;

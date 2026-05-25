@@ -18,20 +18,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use rand::seq::{IndexedRandom, SliceRandom};
 use rand::SeedableRng;
+use rand::seq::{IndexedRandom, SliceRandom};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use crate::s2s::transport::{ConnectionManager, MessageClass, ServiceLevel};
+use crate::s2s::transport::{ConnectionManager, MessageClass, SendOptions, ServiceLevel};
 use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::super::config::OverlayConfig;
 use super::super::discovery::learn_from_lsa;
 use super::super::neighbor::monitor::NeighborMonitor;
-use super::super::proto::{encode_message, node_from_wire, node_to_wire, wrap, OverlayBody};
+use super::super::proto::{OverlayBody, encode_message, node_from_wire, node_to_wire, wrap};
 use super::store::{AdmissionResult, LinkStateDb, LsaEntry, OriginVersion};
 
 /// Send an `LsdbSync` request to `dst`. `have` is our digest; pass `&[]`
@@ -56,12 +56,13 @@ pub async fn send_request(
     match encode_message(&wrap(body)) {
         Ok(payload) => {
             if let Err(e) = transport
-                .send(
+                .send_with_options(
                     dst,
                     ServiceLevel::Reliable,
                     None,
                     MessageClass::Regular,
                     payload,
+                    SendOptions::default().allow_l1_compression(),
                 )
                 .await
             {
@@ -110,12 +111,13 @@ pub async fn handle_request(
             }
         };
         if let Err(e) = transport
-            .send(
+            .send_with_options(
                 sender,
                 ServiceLevel::Reliable,
                 None,
                 MessageClass::Regular,
                 payload,
+                SendOptions::default().allow_l1_compression(),
             )
             .await
         {

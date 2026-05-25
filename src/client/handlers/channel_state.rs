@@ -6,7 +6,7 @@ use crate::{
     channels::{Channel, ChannelPatch},
     client::Client,
     errors::MessageHandlerError,
-    localization::{text, TextKey},
+    localization::{TextKey, text},
     messages::encoder::{ChannelState, DenyType, PermissionDenied},
     server::Server,
 };

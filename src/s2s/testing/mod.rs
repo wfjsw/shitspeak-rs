@@ -26,8 +26,9 @@ pub mod wait;
 // attention to file layout.
 pub use chaos::{LinkChaos, MessageType};
 pub use cluster::{
-    full_mesh_seeds, line_seeds, overlay_cfg, transport_cfg, Capture, Cluster, Node,
+    Capture, Cluster, Node, full_mesh_seeds, line_seeds, overlay_cfg, s2s_network_test_guard,
+    transport_cfg,
 };
-pub use pki::{install_provider_once, mint_pki, Pki};
+pub use pki::{Pki, install_provider_once, mint_pki};
 pub use ports::{loopback, pick_free_port, pick_free_udp_port};
 pub use wait::{wait_for_full_alive_mesh, wait_for_full_routing, wait_until, wait_until_with};

@@ -4,6 +4,10 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::compression::{
+    CompressionConfig, default_compression_enabled, default_compression_level,
+    default_compression_min_bytes, default_compression_min_savings_percent,
+};
 use super::service_level::{PeerAddress, ServiceShape, TransportKind};
 
 const PROBE_FRAME_OVERHEAD_BUDGET: usize = 128;
@@ -61,6 +65,7 @@ pub struct TransportConfig {
 
     max_frame_bytes: usize,
     udp_mtu: usize,
+    compression: CompressionConfig,
 
     // ── Per-link metrics smoothing ──
     /// EWMA coefficient for the latency estimate.
@@ -71,6 +76,9 @@ pub struct TransportConfig {
     throughput_ewma_alpha: f64,
     /// EWMA coefficient for the long-term packet-loss estimate.
     packet_loss_ewma_alpha: f64,
+    /// How often stream transports sample native transport loss counters.
+    /// Set to zero to disable native sampling.
+    native_stats_interval: Duration,
 
     /// Cap on in-flight pings remembered per stream/UDP session. Older
     /// entries are dropped when the buffer fills, preventing unbounded
@@ -110,7 +118,7 @@ impl TransportConfig {
             unselected_link_probe_interval: Duration::from_secs(30),
             ping_interval: Duration::from_secs(2),
             bandwidth_window: Duration::from_secs(5),
-            bandwidth_probe_interval: Duration::from_secs(15),
+            bandwidth_probe_interval: Duration::from_secs(3 * 60 * 60),
             bandwidth_probe_size: 64 * 1024,
             inbound_control_capacity: 1024,
             inbound_high_capacity: 1024,
@@ -118,10 +126,12 @@ impl TransportConfig {
             outbound_capacity: 256,
             max_frame_bytes: 1 << 20,
             udp_mtu: 1200,
+            compression: CompressionConfig::default(),
             latency_ewma_alpha: 0.2,
             jitter_ewma_alpha: 1.0 / 16.0,
             throughput_ewma_alpha: 0.3,
             packet_loss_ewma_alpha: 0.02,
+            native_stats_interval: Duration::from_secs(1),
             max_pending_pings: 64,
             max_outgoing_connections: 1024,
         }
@@ -279,6 +289,26 @@ impl TransportConfig {
         self.udp_mtu
     }
 
+    pub fn compression_enabled(&self) -> bool {
+        self.compression.enabled()
+    }
+
+    pub fn compression_min_bytes(&self) -> usize {
+        self.compression.min_bytes()
+    }
+
+    pub fn compression_min_savings_percent(&self) -> u8 {
+        self.compression.min_savings_percent()
+    }
+
+    pub fn compression_level(&self) -> i32 {
+        self.compression.level()
+    }
+
+    pub(crate) fn compression_config(&self) -> CompressionConfig {
+        self.compression
+    }
+
     pub fn latency_ewma_alpha(&self) -> f64 {
         self.latency_ewma_alpha
     }
@@ -293,6 +323,10 @@ impl TransportConfig {
 
     pub fn packet_loss_ewma_alpha(&self) -> f64 {
         self.packet_loss_ewma_alpha
+    }
+
+    pub fn native_stats_interval(&self) -> Duration {
+        self.native_stats_interval
     }
 
     pub fn max_pending_pings(&self) -> usize {
@@ -464,6 +498,46 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_compression_enabled(mut self, enabled: bool) -> Self {
+        self.compression = CompressionConfig::new(
+            enabled,
+            self.compression.min_bytes(),
+            self.compression.min_savings_percent(),
+            self.compression.level(),
+        );
+        self
+    }
+
+    pub fn with_compression_min_bytes(mut self, n: usize) -> Self {
+        self.compression = CompressionConfig::new(
+            self.compression.enabled(),
+            n,
+            self.compression.min_savings_percent(),
+            self.compression.level(),
+        );
+        self
+    }
+
+    pub fn with_compression_min_savings_percent(mut self, percent: u8) -> Self {
+        self.compression = CompressionConfig::new(
+            self.compression.enabled(),
+            self.compression.min_bytes(),
+            percent,
+            self.compression.level(),
+        );
+        self
+    }
+
+    pub fn with_compression_level(mut self, level: i32) -> Self {
+        self.compression = CompressionConfig::new(
+            self.compression.enabled(),
+            self.compression.min_bytes(),
+            self.compression.min_savings_percent(),
+            level,
+        );
+        self
+    }
+
     pub fn with_latency_ewma_alpha(mut self, v: f64) -> Self {
         self.latency_ewma_alpha = v;
         self
@@ -481,6 +555,11 @@ impl TransportConfig {
 
     pub fn with_packet_loss_ewma_alpha(mut self, v: f64) -> Self {
         self.packet_loss_ewma_alpha = v;
+        self
+    }
+
+    pub fn with_native_stats_interval(mut self, d: Duration) -> Self {
+        self.native_stats_interval = d;
         self
     }
 
@@ -509,6 +588,8 @@ pub struct TransportTuning {
     pub throughput_ewma_alpha: f64,
     #[serde(default = "default_packet_loss_ewma_alpha")]
     pub packet_loss_ewma_alpha: f64,
+    #[serde(default = "default_native_stats_interval_secs")]
+    pub native_stats_interval_secs: u64,
     #[serde(default = "default_max_pending_pings")]
     pub max_pending_pings: usize,
     #[serde(default = "default_recent_probe_retry_cap_secs")]
@@ -524,6 +605,14 @@ pub struct TransportTuning {
     pub unselected_link_probe_interval_secs: u64,
     #[serde(default = "default_max_outgoing_connections")]
     pub max_outgoing_connections: usize,
+    #[serde(default = "default_compression_enabled")]
+    compression_enabled: bool,
+    #[serde(default = "default_compression_min_bytes")]
+    compression_min_bytes: usize,
+    #[serde(default = "default_compression_min_savings_percent")]
+    compression_min_savings_percent: u8,
+    #[serde(default = "default_compression_level")]
+    compression_level: i32,
 }
 
 impl Default for TransportTuning {
@@ -533,6 +622,7 @@ impl Default for TransportTuning {
             jitter_ewma_alpha: default_jitter_ewma_alpha(),
             throughput_ewma_alpha: default_throughput_ewma_alpha(),
             packet_loss_ewma_alpha: default_packet_loss_ewma_alpha(),
+            native_stats_interval_secs: default_native_stats_interval_secs(),
             max_pending_pings: default_max_pending_pings(),
             recent_probe_retry_cap_secs: default_recent_probe_retry_cap_secs(),
             stale_probe_retry_cap_secs: default_stale_probe_retry_cap_secs(),
@@ -540,6 +630,10 @@ impl Default for TransportTuning {
             dial_attempt_timeout_secs: default_dial_attempt_timeout_secs(),
             unselected_link_probe_interval_secs: default_unselected_link_probe_interval_secs(),
             max_outgoing_connections: default_max_outgoing_connections(),
+            compression_enabled: default_compression_enabled(),
+            compression_min_bytes: default_compression_min_bytes(),
+            compression_min_savings_percent: default_compression_min_savings_percent(),
+            compression_level: default_compression_level(),
         }
     }
 }
@@ -551,6 +645,7 @@ impl TransportTuning {
             .with_jitter_ewma_alpha(self.jitter_ewma_alpha)
             .with_throughput_ewma_alpha(self.throughput_ewma_alpha)
             .with_packet_loss_ewma_alpha(self.packet_loss_ewma_alpha)
+            .with_native_stats_interval(Duration::from_secs(self.native_stats_interval_secs))
             .with_max_pending_pings(self.max_pending_pings)
             .with_backoff_cap(Duration::from_secs(self.recent_probe_retry_cap_secs))
             .with_stale_backoff_cap(Duration::from_secs(self.stale_probe_retry_cap_secs))
@@ -560,6 +655,10 @@ impl TransportTuning {
                 self.unselected_link_probe_interval_secs,
             ))
             .with_max_outgoing_connections(self.max_outgoing_connections)
+            .with_compression_enabled(self.compression_enabled)
+            .with_compression_min_bytes(self.compression_min_bytes)
+            .with_compression_min_savings_percent(self.compression_min_savings_percent)
+            .with_compression_level(self.compression_level)
     }
 }
 
@@ -574,6 +673,9 @@ fn default_throughput_ewma_alpha() -> f64 {
 }
 fn default_packet_loss_ewma_alpha() -> f64 {
     0.02
+}
+fn default_native_stats_interval_secs() -> u64 {
+    1
 }
 fn default_max_pending_pings() -> usize {
     64

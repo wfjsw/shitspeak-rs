@@ -10,8 +10,8 @@
 //!     whenever the LSDB changes.
 //!   * `ServiceRegistry` dispatches inbound `OverlayData` by tag.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use tokio_util::sync::CancellationToken;
 
@@ -21,14 +21,14 @@ use crate::types::NodeIdentifier;
 use super::config::OverlayConfig;
 use super::error::OverlayError;
 use super::lsdb::{
-    capture_boot_epoch, emit_once, spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
-    LinkStateDb, LsaEmitter, LsaFloor,
+    LinkStateDb, LsaEmitter, LsaFloodPacer, LsaFloor, capture_boot_epoch, emit_once,
+    spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
 };
-use super::membership::{spawn_diff_watcher, MembershipTable};
-use super::messaging::{ordering::OverlayOrdering, ServiceRegistry};
-use super::neighbor::hello::{spawn_hello_task, spawn_link_up_watcher, HelloContext};
+use super::membership::{MembershipTable, spawn_diff_watcher};
+use super::messaging::{ServiceRegistry, ordering::OverlayOrdering};
+use super::neighbor::hello::{HelloContext, spawn_hello_task, spawn_link_up_watcher};
 use super::neighbor::monitor::NeighborMonitor;
-use super::routing::{new_handle as new_routing_handle, spawn_recomputer, RoutingHandle};
+use super::routing::{RoutingHandle, new_handle as new_routing_handle, spawn_recomputer};
 
 pub(crate) struct OverlayInner {
     pub self_id: NodeIdentifier,
@@ -41,6 +41,7 @@ pub(crate) struct OverlayInner {
     pub services: Arc<ServiceRegistry>,
     ordering: Arc<OverlayOrdering>,
     pub emitter: Arc<LsaEmitter>,
+    pub flood_pacer: Arc<LsaFloodPacer>,
     pub hello: Arc<HelloContext>,
     pub shutdown: CancellationToken,
     pub cfg: OverlayConfig,
@@ -80,6 +81,7 @@ impl OverlayInner {
             max_users,
             cfg.route_transit_messages(),
         ));
+        let flood_pacer = Arc::new(LsaFloodPacer::new(transport.clone()));
 
         let shutdown = CancellationToken::new();
         let hello = Arc::new(HelloContext {
@@ -104,6 +106,7 @@ impl OverlayInner {
             services,
             ordering,
             emitter,
+            flood_pacer,
             hello,
             shutdown,
             cfg,
@@ -139,11 +142,15 @@ impl OverlayInner {
 
         spawn_hello_task(self.hello.clone());
         spawn_link_up_watcher(self.hello.clone(), self.neighbor.on_link_up());
+        self.flood_pacer
+            .clone()
+            .spawn(self.cfg.clone(), self.shutdown.clone());
         spawn_emitter_task(
             self.emitter.clone(),
             self.lsdb.clone(),
             self.neighbor.clone(),
             self.transport.clone(),
+            self.flood_pacer.clone(),
             self.cfg.clone(),
             self.shutdown.clone(),
         );
@@ -221,6 +228,7 @@ impl OverlayInner {
             shutdown: self.shutdown.clone(),
             cfg: self.cfg.clone(),
             emitter: self.emitter.clone(),
+            flood_pacer: self.flood_pacer.clone(),
         });
         super::inbound::spawn_dispatcher(dctx, inbound);
 
@@ -243,6 +251,7 @@ impl OverlayInner {
             &self.lsdb,
             &self.neighbor,
             &self.transport,
+            &self.flood_pacer,
             &self.cfg,
             true,
         )

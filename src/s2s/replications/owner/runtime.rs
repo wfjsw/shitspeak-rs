@@ -23,7 +23,7 @@ use super::super::proto::{
 };
 use super::super::topic::ErasedOwnerRuntime;
 use super::OwnerReplicable;
-use crate::s2s::overlay::{MembershipEvent, OverlayNetwork};
+use crate::s2s::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
@@ -55,15 +55,21 @@ impl OwnerNet for OverlayOwnerNet {
         topic: &str,
         body: OwnerBody,
     ) -> Result<(), ReplicationError> {
+        let options = if matches!(&body, OwnerBody::CatchupResp(_)) {
+            OverlaySendOptions::default().allow_l1_compression()
+        } else {
+            OverlaySendOptions::default()
+        };
         let msg = repl_proto::wrap_owner(topic, body);
         let bytes = repl_proto::encode(&msg)?;
         self.overlay
-            .send_unicast(
+            .send_unicast_with_options(
                 dst,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 MessageClass::Regular,
                 bytes,
+                options,
             )
             .await?;
         Ok(())

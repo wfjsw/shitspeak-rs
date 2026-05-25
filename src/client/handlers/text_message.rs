@@ -4,7 +4,7 @@ use crate::{
     acl::ACLPermissions,
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::TextMessage, Message, WriteMessageExt},
+    messages::{Message, WriteMessageExt, encoder::TextMessage},
     server::Server,
 };
 

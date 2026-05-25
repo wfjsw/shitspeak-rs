@@ -11,18 +11,18 @@ use crate::api::Authenticator;
 use crate::channel_handler::SessionChannelShadow;
 use crate::client::state_log::ClientStateOperation;
 use crate::client::visibility::UserVisibilityState;
-use crate::client::{client_session_identifier::ClientSessionIdentifier, Client};
+use crate::client::{Client, client_session_identifier::ClientSessionIdentifier};
 use crate::config::{WebConfig, WebMoqConfig};
 use crate::messages::Message;
 use crate::server::Server;
 use crate::voice::codec::{Audio, AudioPayload, OpusPayload, PacketFormat};
 use crate::web::protocol::{
-    decode_client_command, encode_server_event, ClientCommand, ServerEvent, SpeakerAssigned,
-    VoiceSegment, VoiceTarget,
+    ClientCommand, ServerEvent, SpeakerAssigned, VoiceSegment, VoiceTarget, decode_client_command,
+    encode_server_event,
 };
 use crate::web::session::{
-    apply_control_command, initial_server_events, server_event_from_message, WebSessionContext,
-    WebSessionTransport,
+    WebSessionContext, WebSessionTransport, apply_control_command, initial_server_events,
+    server_event_from_message,
 };
 use crate::web::voice::{InboundVoiceMetadata, SsrcAllocator, VoiceTargetKind};
 
@@ -1437,12 +1437,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(audio.len(), 3);
         assert!(audio.iter().any(|track| track.name() == "audio/up/mic"));
-        assert!(audio
-            .iter()
-            .any(|track| track.name() == "audio/down/slot/0"));
-        assert!(audio
-            .iter()
-            .any(|track| track.name() == "audio/down/slot/1"));
+        assert!(
+            audio
+                .iter()
+                .any(|track| track.name() == "audio/down/slot/0")
+        );
+        assert!(
+            audio
+                .iter()
+                .any(|track| track.name() == "audio/down/slot/1")
+        );
         assert!(audio.iter().all(|track| track.codec() == Some("opus")));
     }
 
@@ -1502,9 +1506,11 @@ mod tests {
             .expect("allocated client");
         assert_eq!(client.transport_kind(), ClientTransportKind::Moq);
         assert!(client.is_authenticated());
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, ServerEvent::ServerSync(_))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ServerEvent::ServerSync(_)))
+        );
     }
 
     #[tokio::test]

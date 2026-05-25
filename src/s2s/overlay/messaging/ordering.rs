@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::s2s::overlay::config::OverlayConfig;
 use crate::s2s::overlay::LaneId;
+use crate::s2s::overlay::config::OverlayConfig;
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
@@ -588,6 +588,7 @@ mod tests {
             lane_id: Some(lane.get()),
             origin_boot_epoch: 99,
             origin_message_id: seq + 10,
+            allow_l1_compression: false,
         }
     }
 
@@ -725,14 +726,18 @@ mod tests {
 
         ordering.cache_ordered_packet(&packet).await;
 
-        assert!(ordering
-            .cached_range(2, 99, 1, lane(), 0, 0)
-            .await
-            .is_empty());
-        assert!(ordering
-            .accept_inbound(1, &packet, ServiceLevel::Reliable, MessageClass::Regular,)
-            .await
-            .is_none());
+        assert!(
+            ordering
+                .cached_range(2, 99, 1, lane(), 0, 0)
+                .await
+                .is_empty()
+        );
+        assert!(
+            ordering
+                .accept_inbound(1, &packet, ServiceLevel::Reliable, MessageClass::Regular,)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -742,10 +747,12 @@ mod tests {
         let packet = data(0, b"packet");
         ordering.cache_ordered_packet(&packet).await;
 
-        assert!(ordering
-            .cached_range(2, 99, 1, lane(), 0, 0)
-            .await
-            .is_empty());
+        assert!(
+            ordering
+                .cached_range(2, 99, 1, lane(), 0, 0)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -756,10 +763,12 @@ mod tests {
         ordering.cache_ordered_packet(&data(0, b"old")).await;
         ordering.cache_ordered_packet(&data(1, b"new")).await;
 
-        assert!(ordering
-            .cached_range(2, 99, 1, lane(), 0, 0)
-            .await
-            .is_empty());
+        assert!(
+            ordering
+                .cached_range(2, 99, 1, lane(), 0, 0)
+                .await
+                .is_empty()
+        );
         let repaired = ordering.cached_range(2, 99, 1, lane(), 1, 1).await;
         assert_eq!(repaired.len(), 1);
         assert_eq!(&repaired[0].payload[..], b"new");

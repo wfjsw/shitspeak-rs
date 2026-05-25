@@ -7,7 +7,7 @@ use prost::Message as _;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::UserStats, Message, WriteMessageExt},
+    messages::{Message, WriteMessageExt, encoder::UserStats},
     s2s::application::proto::UserStatsRequest,
     s2s::application::user_stats::{UserStatsApplyOutcome, UserStatsResponder},
     server::Server,

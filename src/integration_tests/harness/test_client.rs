@@ -14,14 +14,14 @@ use std::time::Duration;
 use bytes::{BufMut as _, Bytes, BytesMut};
 use parking_lot::Mutex as PMutex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_rustls::{client::TlsStream, TlsConnector};
+use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::crypt::CryptState;

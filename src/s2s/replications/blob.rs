@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
-use rand::{rng, RngExt};
+use rand::{RngExt, rng};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -18,7 +18,7 @@ use super::proto::{
 };
 use super::topic::ErasedBlobRuntime;
 use crate::blob_store::sha1_hex;
-use crate::s2s::overlay::{MembershipEvent, OverlayNetwork};
+use crate::s2s::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
@@ -47,15 +47,21 @@ impl BlobNet for OverlayBlobNet {
         topic: &str,
         body: BlobBody,
     ) -> Result<(), ReplicationError> {
+        let options = if matches!(&body, BlobBody::Chunk(_)) {
+            OverlaySendOptions::default().allow_l1_compression()
+        } else {
+            OverlaySendOptions::default()
+        };
         let msg = repl_proto::wrap_blob(topic, body);
         let bytes = repl_proto::encode(&msg)?;
         self.overlay
-            .send_unicast(
+            .send_unicast_with_options(
                 dst,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 MessageClass::Regular,
                 bytes,
+                options,
             )
             .await?;
         Ok(())
@@ -824,28 +830,32 @@ mod tests {
             chunk_size: 2,
         }));
 
-        assert!(fetch
-            .record_chunk(BlobChunk {
-                request_id: 77,
-                provider: 2,
-                key: "a".repeat(40),
-                index: 2,
-                chunk_size: 2,
-                total_size: 6,
-                data: Bytes::from_static(b"ef"),
-            })
-            .is_none());
-        assert!(fetch
-            .record_chunk(BlobChunk {
-                request_id: 77,
-                provider: 2,
-                key: "a".repeat(40),
-                index: 0,
-                chunk_size: 2,
-                total_size: 6,
-                data: Bytes::from_static(b"ab"),
-            })
-            .is_none());
+        assert!(
+            fetch
+                .record_chunk(BlobChunk {
+                    request_id: 77,
+                    provider: 2,
+                    key: "a".repeat(40),
+                    index: 2,
+                    chunk_size: 2,
+                    total_size: 6,
+                    data: Bytes::from_static(b"ef"),
+                })
+                .is_none()
+        );
+        assert!(
+            fetch
+                .record_chunk(BlobChunk {
+                    request_id: 77,
+                    provider: 2,
+                    key: "a".repeat(40),
+                    index: 0,
+                    chunk_size: 2,
+                    total_size: 6,
+                    data: Bytes::from_static(b"ab"),
+                })
+                .is_none()
+        );
         let bytes = fetch
             .record_chunk(BlobChunk {
                 request_id: 77,

@@ -7,7 +7,7 @@ pub mod transport;
 #[cfg(test)]
 pub(crate) mod testing;
 
-use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
@@ -29,7 +29,7 @@ use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::ClientStateLogEntry;
 use crate::client_repository::ClientRepository;
 use crate::server::Server;
-use crate::types::{NodeIdentifier, DEFAULT_SERVER_ID};
+use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
 
 use self::application::error::ApplicationError;
 use self::application::moderation::ModerationApplier;

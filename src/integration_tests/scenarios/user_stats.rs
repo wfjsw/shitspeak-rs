@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use crate::acl::{ACLPermissions, ACL};
+use crate::acl::{ACL, ACLPermissions};
 use crate::channels::Channel;
-use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
-use crate::messages::encoder::UserStats;
+use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
+use crate::messages::encoder::UserStats;
 
 #[tokio::test]
 async fn user_stats_includes_certificate_chain() {

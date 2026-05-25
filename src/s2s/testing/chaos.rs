@@ -29,7 +29,7 @@ use rand::RngExt;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use crate::s2s::overlay::proto::{decode_message, node_from_wire, OverlayBody};
+use crate::s2s::overlay::proto::{OverlayBody, decode_message, node_from_wire};
 use crate::s2s::transport::{Inbound, InboundMessage, MessageClass};
 use crate::types::NodeIdentifier;
 

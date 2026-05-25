@@ -2379,8 +2379,6 @@ dependencies = [
 [[package]]
 name = "kcp"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e387a924f42063d380be14857714a2f0c177e44dbeab8895244e5370d8a8e68"
 dependencies = [
  "bytes",
  "log",
@@ -4594,7 +4592,9 @@ dependencies = [
  "tracing-test",
  "wasmtime",
  "webrtc",
+ "windows-sys 0.61.2",
  "x509-parser 0.18.1",
+ "zstd",
 ]
 
 [[package]]
@@ -5009,8 +5009,6 @@ dependencies = [
 [[package]]
 name = "tokio_kcp"
 version = "0.9.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e29e2ec62565bc70b02413615745fede2eb72e0e29843f60e7206c1f633659cb"
 dependencies = [
  "byte_string",
  "bytes",

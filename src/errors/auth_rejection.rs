@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::{
-    localization::{reject_reason, Language},
+    localization::{Language, reject_reason},
     messages::encoder::RejectType,
 };
 

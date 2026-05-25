@@ -44,6 +44,6 @@
 pub mod runtime;
 
 pub use runtime::{
-    OverlayUserStatsTransport, UserStatsApplyOutcome, UserStatsDelivery, UserStatsResponder,
-    UserStatsService, UserStatsTransport, USER_STATS_CLASS, USER_STATS_LEVEL,
+    OverlayUserStatsTransport, USER_STATS_CLASS, USER_STATS_LEVEL, UserStatsApplyOutcome,
+    UserStatsDelivery, UserStatsResponder, UserStatsService, UserStatsTransport,
 };

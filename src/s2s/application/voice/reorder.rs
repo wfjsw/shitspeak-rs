@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 

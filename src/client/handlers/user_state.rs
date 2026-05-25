@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::{
     acl::ACLPermissions,
-    client::{client_global_state::ClientGlobalState, Client},
+    client::{Client, client_global_state::ClientGlobalState},
     errors::MessageHandlerError,
     localization::channel_does_not_exist,
     messages::encoder::{DenyType, PermissionDenied, UserState},

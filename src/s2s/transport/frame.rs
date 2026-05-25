@@ -189,6 +189,8 @@ pub fn build_frame(
         message_class: pb::MessageClass::from(class) as i32,
         ts_us,
         payload,
+        payload_encoding: pb::PayloadEncoding::Identity as i32,
+        uncompressed_payload_len: 0,
     }
 }
 

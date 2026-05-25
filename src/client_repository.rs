@@ -6,21 +6,21 @@ use std::{
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, RwLock as AsyncRwLock};
+use tokio::sync::{RwLock as AsyncRwLock, broadcast};
 use tokio_rustls::server::TlsStream;
 
 use crate::{
     client::{
+        Client, ClientInstanceId, ClientStateSubscription,
         client_session_identifier::ClientSessionIdentifier,
         random_client_instance_id,
         state_log::{
             ClientGlobalStateDelta, ClientStateBroadcastPayload, ClientStateLogEntry,
             ClientStateOperation,
         },
-        Client, ClientInstanceId, ClientStateSubscription,
     },
     constants::MAX_LOCAL_SESSION_ID,
-    types::{default_server_id, ScopedChannelId, ScopedSessionId, DEFAULT_SERVER_ID},
+    types::{DEFAULT_SERVER_ID, ScopedChannelId, ScopedSessionId, default_server_id},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -258,7 +258,9 @@ impl ClientRepository {
         let id = *allocation_pointer;
 
         if id > MAX_LOCAL_SESSION_ID {
-            panic!("Exceeded maximum number of local session IDs for server_id={server_id}. Consider rearranging the allocation strategy");
+            panic!(
+                "Exceeded maximum number of local session IDs for server_id={server_id}. Consider rearranging the allocation strategy"
+            );
         }
 
         *allocation_pointer += 1;
@@ -1361,7 +1363,9 @@ impl ClientRepository {
                     if oldest.version > since {
                         tracing::error!(
                             "Remote log for node {} pruned past requested version: oldest={} requested={}",
-                            node_id, oldest.version, since,
+                            node_id,
+                            oldest.version,
+                            since,
                         );
                         return Err(());
                     }
@@ -1741,7 +1745,19 @@ impl ClientRepository {
         op: ClientStateOperation,
         channel_version_dep: Option<u64>,
     ) {
-        self.commit_operation_sync(op, channel_version_dep);
+        let broadcast = {
+            let mut register = self.register.write().await;
+            Self::commit_operation_inner(
+                &mut register,
+                self.local_node_id,
+                self.log_max_entries,
+                op,
+                channel_version_dep,
+            )
+        };
+        if let Some(broadcast) = broadcast {
+            let _ = self.tx.send(broadcast);
+        }
     }
 
     /// Synchronous version of `commit_operation`.  Safe to call from
@@ -1751,97 +1767,116 @@ impl ClientRepository {
         op: ClientStateOperation,
         channel_version_dep: Option<u64>,
     ) {
-        let broadcast = {
+        let Some(broadcast) = ({
             let mut register = match self.register.try_write() {
                 Ok(r) => r,
                 Err(_) => return, // deadlock avoidance in Drop contexts
             };
-
-            // Update channel/listener indices for any state change, before the
-            // early-return for unpublished clients (the index is local state,
-            // not propagated over the log).
-            if let ClientStateOperation::UpdateGlobalState {
-                server_id,
-                session_id,
-                delta,
-                ..
-            } = &op
-            {
-                let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
-                if let Some(new_ch) = delta.current_channel_id {
-                    register.channel_index_move(scoped_id.clone(), new_ch);
-                }
-                if let Some(ref adds) = delta.listening_channel_add {
-                    for &ch in adds {
-                        register.listener_index_add(scoped_id.clone(), ch);
-                    }
-                }
-                if let Some(ref removes) = delta.listening_channel_remove {
-                    for &ch in removes {
-                        register.listener_index_remove_channel(&scoped_id, ch);
-                    }
-                }
-            }
-
-            // Suppress log entries and broadcasts for UpdateGlobalState on
-            // unpublished clients.  The in-memory write has already happened;
-            // the subsequent AddClient (from publish_client) will snapshot the
-            // full current state.  This prevents unauthenticated clients from
-            // appearing to other users before auth completes.
-            if let ClientStateOperation::UpdateGlobalState {
-                server_id,
-                session_id,
-                ..
-            } = &op
-            {
-                let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
-                let is_published = register
-                    .local_clients
-                    .get(&scoped_id)
-                    .map(|c| c.is_published())
-                    .unwrap_or(false);
-                if !is_published {
-                    return;
-                }
-            }
-
-            let cur = register.versions.entry(self.local_node_id).or_insert(0);
-            *cur += 1;
-            let version = *cur;
-            debug_assert!(
-                version < u64::MAX - 1_000_000,
-                "ClientRepository version counter approaching u64::MAX — likely a bug"
-            );
-
-            let entry = Arc::new(ClientStateLogEntry {
-                version,
-                node_id: self.local_node_id,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                channel_version_dep,
+            Self::commit_operation_inner(
+                &mut register,
+                self.local_node_id,
+                self.log_max_entries,
                 op,
-            });
-
-            register.local_log.push_back(Arc::clone(&entry));
-            while register.local_log.len() > self.log_max_entries {
-                register.local_log.pop_front();
-            }
-
-            // Build version vector
-            let versions = register.versions.clone();
-
-            Arc::new(ClientStateBroadcastPayload { entry, versions })
+                channel_version_dep,
+            )
+        }) else {
+            return;
         };
 
         // Broadcast to subscribers (ignore NoSubscribers / Full errors)
         let _ = self.tx.send(broadcast);
     }
+
+    fn commit_operation_inner(
+        register: &mut ClientRegister,
+        local_node_id: u16,
+        log_max_entries: usize,
+        op: ClientStateOperation,
+        channel_version_dep: Option<u64>,
+    ) -> Option<Arc<ClientStateBroadcastPayload>> {
+        // Update channel/listener indices for any state change, before the
+        // early-return for unpublished clients (the index is local state,
+        // not propagated over the log).
+        if let ClientStateOperation::UpdateGlobalState {
+            server_id,
+            session_id,
+            delta,
+            ..
+        } = &op
+        {
+            let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
+            if let Some(new_ch) = delta.current_channel_id {
+                register.channel_index_move(scoped_id.clone(), new_ch);
+            }
+            if let Some(ref adds) = delta.listening_channel_add {
+                for &ch in adds {
+                    register.listener_index_add(scoped_id.clone(), ch);
+                }
+            }
+            if let Some(ref removes) = delta.listening_channel_remove {
+                for &ch in removes {
+                    register.listener_index_remove_channel(&scoped_id, ch);
+                }
+            }
+        }
+
+        // Suppress log entries and broadcasts for UpdateGlobalState on
+        // unpublished clients.  The in-memory write has already happened;
+        // the subsequent AddClient (from publish_client) will snapshot the
+        // full current state.  This prevents unauthenticated clients from
+        // appearing to other users before auth completes.
+        if let ClientStateOperation::UpdateGlobalState {
+            server_id,
+            session_id,
+            ..
+        } = &op
+        {
+            let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
+            let is_published = register
+                .local_clients
+                .get(&scoped_id)
+                .map(|c| c.is_published())
+                .unwrap_or(false);
+            if !is_published {
+                return None;
+            }
+        }
+
+        let cur = register.versions.entry(local_node_id).or_insert(0);
+        *cur += 1;
+        let version = *cur;
+        debug_assert!(
+            version < u64::MAX - 1_000_000,
+            "ClientRepository version counter approaching u64::MAX — likely a bug"
+        );
+
+        let entry = Arc::new(ClientStateLogEntry {
+            version,
+            node_id: local_node_id,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            channel_version_dep,
+            op,
+        });
+
+        register.local_log.push_back(Arc::clone(&entry));
+        while register.local_log.len() > log_max_entries {
+            register.local_log.pop_front();
+        }
+
+        let versions = register.versions.clone();
+        Some(Arc::new(ClientStateBroadcastPayload { entry, versions }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
+        time::Duration,
+    };
 
-    use crate::messages::{encoder::TextMessage, Message};
+    use crate::messages::{Message, encoder::TextMessage};
     use chrono::Utc;
 
     use super::*;
@@ -1898,14 +1933,18 @@ mod tests {
         assert_eq!(beta.server_id(), "beta");
         assert_eq!(repo_a.local_len_in_server("alpha").await, 1);
         assert_eq!(repo_a.local_len_in_server("beta").await, 0);
-        assert!(repo_a
-            .get_client_in_server("alpha", alpha.get_session_id())
-            .await
-            .is_some());
-        assert!(repo_a
-            .get_client_in_server("beta", alpha.get_session_id())
-            .await
-            .is_none());
+        assert!(
+            repo_a
+                .get_client_in_server("alpha", alpha.get_session_id())
+                .await
+                .is_some()
+        );
+        assert!(
+            repo_a
+                .get_client_in_server("beta", alpha.get_session_id())
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1992,6 +2031,49 @@ mod tests {
             .expect("snapshot subscription receives commit");
         assert_eq!(broadcast.entry.version, 1);
         assert_eq!(broadcast.entry.op.server_id(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn async_commit_waits_for_transient_register_contention() {
+        let repo = Arc::new(ClientRepository::new(1, 128));
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+        let session = ClientSessionIdentifier::new(1, 9).unwrap();
+        let guard = repo.register.write().await;
+
+        let mut commit = tokio::spawn({
+            let repo = Arc::clone(&repo);
+            async move {
+                repo.commit_operation(
+                    ClientStateOperation::AddClient {
+                        server_id: "alpha".to_string(),
+                        session_id: session,
+                        client_instance_id: 9,
+                        real_ip,
+                        tcp_addr,
+                        udp_addr: None,
+                        local_addr,
+                        cert_hash: None,
+                        login_time: Utc::now(),
+                        initial_state: ClientGlobalStateDelta::default(),
+                    },
+                    None,
+                )
+                .await;
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut commit)
+                .await
+                .is_err(),
+            "async commits should wait for the register lock instead of dropping the op"
+        );
+        drop(guard);
+
+        commit.await.unwrap();
+        assert_eq!(repo.current_version(), 1);
     }
 
     #[tokio::test]
@@ -2087,22 +2169,25 @@ mod tests {
         repo.apply_remote_operation(alpha_add, 4).await.unwrap();
         repo.apply_remote_operation(beta_update, 5).await.unwrap();
 
-        assert!(repo
-            .get_client_in_server("alpha", remote_session)
-            .await
-            .is_none());
+        assert!(
+            repo.get_client_in_server("alpha", remote_session)
+                .await
+                .is_none()
+        );
 
         repo.drain_pending_ops("beta", 5).await;
-        assert!(repo
-            .get_client_in_server("alpha", remote_session)
-            .await
-            .is_none());
+        assert!(
+            repo.get_client_in_server("alpha", remote_session)
+                .await
+                .is_none()
+        );
 
         repo.drain_pending_ops("alpha", 5).await;
-        assert!(repo
-            .get_client_in_server("alpha", remote_session)
-            .await
-            .is_some());
+        assert!(
+            repo.get_client_in_server("alpha", remote_session)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2196,10 +2281,11 @@ mod tests {
         repo.apply_remote_operation(Arc::clone(&stale_remove), 0)
             .await
             .unwrap();
-        assert!(repo
-            .get_client_in_server(&crate::types::default_server_id(), remote_session)
-            .await
-            .is_some());
+        assert!(
+            repo.get_client_in_server(&crate::types::default_server_id(), remote_session)
+                .await
+                .is_some()
+        );
         assert!(stale_remove.to_message(&repo).await.is_none());
     }
 

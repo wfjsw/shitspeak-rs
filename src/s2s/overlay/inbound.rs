@@ -34,12 +34,12 @@ use tracing::warn;
 use crate::s2s::transport::Inbound;
 
 use super::lsdb::{
-    handle_flood, handle_sync_request, handle_sync_response, LinkStateDb, LsaEmitter,
+    LinkStateDb, LsaEmitter, LsaFloodPacer, handle_flood, handle_sync_request, handle_sync_response,
 };
 use super::messaging::forward as messaging_forward;
-use super::neighbor::hello::{handle_hello_ack, respond_to_hello, HelloContext};
+use super::neighbor::hello::{HelloContext, handle_hello_ack, respond_to_hello};
 use super::neighbor::monitor::NeighborMonitor;
-use super::proto::{decode_message, OverlayBody};
+use super::proto::{OverlayBody, decode_message};
 use super::routing::RoutingHandle;
 
 /// Bundle of references the dispatcher needs to route inbound frames.
@@ -55,6 +55,7 @@ pub(crate) struct DispatcherCtx {
     pub shutdown: tokio_util::sync::CancellationToken,
     pub cfg: super::config::OverlayConfig,
     pub emitter: Arc<LsaEmitter>,
+    pub flood_pacer: Arc<LsaFloodPacer>,
 }
 
 /// Spawn one dispatcher task per priority queue. They run independently
@@ -105,7 +106,15 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
         OverlayBody::Hello(h) => respond_to_hello(&ctx.hello, from, h).await,
         OverlayBody::HelloAck(a) => handle_hello_ack(&ctx.hello, from, a, kind),
         OverlayBody::LsaFlood(f) => {
-            handle_flood(&ctx.lsdb, &ctx.monitor, &ctx.transport, from, f).await
+            handle_flood(
+                &ctx.lsdb,
+                &ctx.monitor,
+                &ctx.transport,
+                &ctx.flood_pacer,
+                from,
+                f,
+            )
+            .await
         }
         OverlayBody::LsdbSync(req) => {
             handle_sync_request(

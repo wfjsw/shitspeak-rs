@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::acl::{ACLPermissions, ACL};
-use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
-use crate::messages::encoder::UserState;
+use crate::acl::{ACL, ACLPermissions};
+use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
+use crate::messages::encoder::UserState;
 
 /// Checks that self-mute changes are broadcast to peers.
 /// Expected: Bob receives Alice's `UserState` with `self_mute = true`. This is

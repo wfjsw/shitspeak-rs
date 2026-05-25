@@ -46,7 +46,7 @@ use voice_target::handle_voice_target;
 
 use crate::{
     errors::{MessageHandlerError, MessageTypeNotForIncoming},
-    messages::{errors::MessageProtocolError, Message},
+    messages::{Message, errors::MessageProtocolError},
     server::Server,
 };
 

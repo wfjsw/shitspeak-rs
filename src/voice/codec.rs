@@ -778,7 +778,7 @@ mod tests {
     fn protobuf_volume_normalization() {
         // A packet with no volume_adjustment field (proto3 default = 0.0)
         // must be normalised to 1.0 so downstream code does not mute audio.
-        use crate::mumble_udp::{audio, Audio as WireAudio};
+        use crate::mumble_udp::{Audio as WireAudio, audio};
         use prost::Message as _;
         let msg = WireAudio {
             header: Some(audio::Header::Target(0)),
@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn protobuf_positional_count_validation() {
-        use crate::mumble_udp::{audio, Audio as WireAudio};
+        use crate::mumble_udp::{Audio as WireAudio, audio};
         use prost::Message as _;
         // 2 floats is invalid — must be rejected.
         let msg = WireAudio {
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn protobuf_decode_three_positional_valid() {
-        use crate::mumble_udp::{audio, Audio as WireAudio};
+        use crate::mumble_udp::{Audio as WireAudio, audio};
         use prost::Message as _;
         let msg = WireAudio {
             header: Some(audio::Header::Target(0)),
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn protobuf_decode_one_positional_invalid() {
-        use crate::mumble_udp::{audio, Audio as WireAudio};
+        use crate::mumble_udp::{Audio as WireAudio, audio};
         use prost::Message as _;
         let msg = WireAudio {
             header: Some(audio::Header::Target(0)),
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn protobuf_decode_four_positional_invalid() {
-        use crate::mumble_udp::{audio, Audio as WireAudio};
+        use crate::mumble_udp::{Audio as WireAudio, audio};
         use prost::Message as _;
         let msg = WireAudio {
             header: Some(audio::Header::Target(0)),
@@ -1123,7 +1123,7 @@ mod tests {
     #[test]
     fn protobuf_decode_volume_nonzero_passthrough() {
         // A non-zero volume_adjustment must pass through unchanged (not clamped to 1.0).
-        use crate::mumble_udp::{audio, Audio as WireAudio};
+        use crate::mumble_udp::{Audio as WireAudio, audio};
         use prost::Message as _;
         let msg = WireAudio {
             header: Some(audio::Header::Target(0)),
@@ -1256,7 +1256,7 @@ mod tests {
     fn udp_packet_malformed_packet_propagated() {
         // Valid protobuf bytes but invalid positional count must propagate MalformedPacket,
         // not silently fall through to the legacy decoder.
-        use crate::mumble_udp::{audio, Audio as WireAudio};
+        use crate::mumble_udp::{Audio as WireAudio, audio};
         use prost::Message as _;
         let msg = WireAudio {
             header: Some(audio::Header::Target(0)),

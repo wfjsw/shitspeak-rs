@@ -52,6 +52,10 @@ struct TopologyLink {
     jitter_us: u64,
     throughput_bps: u64,
     loss_ppm: u32,
+    probe_loss_ppm: u32,
+    native_loss_ppm: u32,
+    data_health_ppm: u32,
+    loss_sample_count: u64,
     transports: Vec<&'static str>,
 }
 
@@ -75,8 +79,18 @@ struct TransportMetric {
     wire_recv_bps: f64,
     wire_sent_bps: f64,
     packet_loss_ppm: u32,
+    probe_loss_ppm: u32,
+    probe_loss_ewma_ppm: u32,
+    native_loss_ppm: u32,
+    native_loss_ewma_ppm: u32,
+    data_health_ppm: u32,
+    loss_sample_count: u64,
     probe_packets: u64,
     lost_probe_packets: u64,
+    native_loss_samples: u64,
+    native_lost_samples: u64,
+    data_health_samples: u64,
+    data_health_failures: u64,
     probe_goodput_bps: f64,
     estimated_throughput_bps: f64,
     samples: u64,
@@ -291,6 +305,10 @@ fn build_topology_snapshot(
                 jitter_us: link.jitter_us,
                 throughput_bps: link.throughput_bps,
                 loss_ppm: link.loss_ppm,
+                probe_loss_ppm: link.probe_loss_ppm,
+                native_loss_ppm: link.native_loss_ppm,
+                data_health_ppm: link.data_health_ppm,
+                loss_sample_count: link.loss_sample_count,
                 transports: transport_names_from_mask(link.transports_mask),
             });
         }
@@ -339,8 +357,18 @@ fn build_topology_snapshot(
                 wire_recv_bps: metric.wire_recv_bps(),
                 wire_sent_bps: metric.wire_sent_bps(),
                 packet_loss_ppm: metric.packet_loss_ppm(),
+                probe_loss_ppm: metric.probe_loss_ppm(),
+                probe_loss_ewma_ppm: metric.probe_loss_ewma_ppm(),
+                native_loss_ppm: metric.native_loss_ppm(),
+                native_loss_ewma_ppm: metric.native_loss_ewma_ppm(),
+                data_health_ppm: metric.data_health_ppm(),
+                loss_sample_count: metric.loss_sample_count(),
                 probe_packets: metric.probe_packets(),
                 lost_probe_packets: metric.lost_probe_packets(),
+                native_loss_samples: metric.native_loss_samples(),
+                native_lost_samples: metric.native_lost_samples(),
+                data_health_samples: metric.data_health_samples(),
+                data_health_failures: metric.data_health_failures(),
                 probe_goodput_bps: metric.max_probe_goodput_bps(),
                 estimated_throughput_bps: metric.estimated_throughput_bps(),
                 samples: metric.samples(),
@@ -495,6 +523,9 @@ function fmtBps(v) { if (!v) return '-'; const u = ['B/s','KB/s','MB/s','GB/s'];
 function fmtLoss(v) { return v ? (v / 10000).toFixed(2) + '%' : '0%'; }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtPair(a, b) { const v = Math.max(a || 0, b || 0); return fmtBps(v); }
+function lossBreakdown(item) {
+    return `eff ${fmtLoss(item.loss_ppm ?? item.packet_loss_ppm)}<br><span class="transport">probe ${fmtLoss(item.probe_loss_ppm)} &middot; native ${fmtLoss(item.native_loss_ppm)} &middot; data ${fmtLoss(item.data_health_ppm)}</span>`;
+}
 function serviceProbeCell(metric, service) {
     const item = (metric.service_metrics || []).find(s => s.service === service);
     if (!item || !item.supported) return 'n/a';
@@ -619,6 +650,8 @@ function renderGraph(data) {
         `RTT: ${fmtUs(link.rtt_us)}`,
         `Jitter: ${fmtUs(link.jitter_us)}`,
         `Loss: ${fmtLoss(link.loss_ppm)}`,
+        `Probe/native/data: ${fmtLoss(link.probe_loss_ppm)} / ${fmtLoss(link.native_loss_ppm)} / ${fmtLoss(link.data_health_ppm)}`,
+        `Loss samples: ${esc(link.loss_sample_count)}`,
         `Throughput: ${fmtBps(link.throughput_bps)}`
       ]),
       color: linkColor(link.status),
@@ -635,7 +668,7 @@ function renderGraph(data) {
 }
 function renderTables(data) {
   nodesTbody.innerHTML = data.nodes.map(n => `<tr><td>${n.node_id}</td><td><span class="pill ${n.status}">${n.status}</span></td><td>seq ${n.lsa_seq ?? '-'}<br>${n.lsa_age_ms ?? '-'} ms</td><td>${n.addresses.map(a => `<span class="transport">${esc(a.transport)}</span> ${esc(a.addr)}`).join('<br>')}</td></tr>`).join('');
-    metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${fmtLoss(m.packet_loss_ppm)}<br><span class="transport">${m.lost_probe_packets}/${m.probe_packets}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
+    metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
   routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${r.cost}</td></tr>`).join('');
 }
 async function refresh() {

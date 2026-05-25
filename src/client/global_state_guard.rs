@@ -14,8 +14,8 @@ use std::ops::{Deref, DerefMut};
 use parking_lot::RwLockWriteGuard;
 
 use crate::client::{
-    client_global_state::ClientGlobalState, client_session_identifier::ClientSessionIdentifier,
-    state_log::ClientStateOperation, ClientInstanceId,
+    ClientInstanceId, client_global_state::ClientGlobalState,
+    client_session_identifier::ClientSessionIdentifier, state_log::ClientStateOperation,
 };
 use crate::client_repository::ClientRepository;
 

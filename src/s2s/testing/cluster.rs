@@ -6,14 +6,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, OwnedMutexGuard, mpsc};
 
 use super::chaos::LinkChaos;
-use super::pki::{install_provider_once, mint_pki, Pki};
+use super::pki::{Pki, install_provider_once, mint_pki};
 use super::ports::{loopback, pick_free_port};
+use crate::s2s::overlay::OverlayNetwork;
 use crate::s2s::overlay::config::{OverlayConfig, SeedPeer};
 use crate::s2s::overlay::messaging::{OverlayInboundMessage, ServiceInbound};
-use crate::s2s::overlay::OverlayNetwork;
 use crate::s2s::transport::{
     ConnectionManager, Inbound, InboundMessage, PeerAddress, TransportConfig, TransportKind,
 };
@@ -44,12 +44,21 @@ pub fn overlay_cfg(seeds: Vec<SeedPeer>) -> OverlayConfig {
         .with_peer_persistence_interval(Duration::from_secs(1))
 }
 
-static CLUSTER_BUILD_LOCK: std::sync::OnceLock<Arc<Mutex<()>>> = std::sync::OnceLock::new();
+static S2S_NETWORK_TEST_LOCK: std::sync::OnceLock<Arc<Mutex<()>>> = std::sync::OnceLock::new();
 
-fn cluster_build_lock() -> Arc<Mutex<()>> {
-    CLUSTER_BUILD_LOCK
+fn s2s_network_test_lock() -> Arc<Mutex<()>> {
+    S2S_NETWORK_TEST_LOCK
         .get_or_init(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+/// Serialize integration tests that bring up real S2S transports.
+///
+/// The harness reserves known ports before listeners are started, so running
+/// multiple real S2S clusters in parallel can create cross-test socket races
+/// and enough scheduler pressure to trip short convergence deadlines.
+pub async fn s2s_network_test_guard() -> OwnedMutexGuard<()> {
+    s2s_network_test_lock().lock_owned().await
 }
 
 /// One node in an integration-test cluster.
@@ -74,6 +83,7 @@ impl Node {
 pub struct Cluster {
     pub pki: Pki,
     pub nodes: Vec<Node>,
+    _guard: OwnedMutexGuard<()>,
 }
 
 impl Cluster {
@@ -96,8 +106,7 @@ impl Cluster {
         F: Fn(usize, &[u16], &[u16]) -> Vec<SeedPeer>,
         G: Fn(usize, OverlayConfig) -> OverlayConfig,
     {
-        let lock = cluster_build_lock();
-        let _guard = lock.lock().await;
+        let guard = s2s_network_test_guard().await;
 
         install_provider_once();
         let pki = mint_pki(node_ids);
@@ -107,13 +116,18 @@ impl Cluster {
             ports.push(pick_free_port().await);
         }
 
-        let mut nodes = Vec::with_capacity(node_ids.len());
+        let mut transports = Vec::with_capacity(node_ids.len());
         for (idx, &id) in node_ids.iter().enumerate() {
             let port = ports[idx];
-            let seeds = seeds_for(idx, node_ids, &ports);
             let chaos = LinkChaos::new();
             let t_cfg = transport_cfg(&pki, idx, loopback(port));
             let (transport, raw_inbound) = ConnectionManager::start(t_cfg).await.unwrap();
+            transports.push((idx, id, port, chaos, transport, raw_inbound));
+        }
+
+        let mut nodes = Vec::with_capacity(node_ids.len());
+        for (idx, id, port, chaos, transport, raw_inbound) in transports {
+            let seeds = seeds_for(idx, node_ids, &ports);
             let inbound = chaos.install(raw_inbound);
             let o_cfg = cfg_for(idx, overlay_cfg(seeds));
             let overlay = OverlayNetwork::start(transport.clone(), inbound, o_cfg)
@@ -127,7 +141,11 @@ impl Cluster {
                 chaos,
             });
         }
-        Self { pki, nodes }
+        Self {
+            pki,
+            nodes,
+            _guard: guard,
+        }
     }
 
     pub fn node(&self, id: u16) -> &Node {

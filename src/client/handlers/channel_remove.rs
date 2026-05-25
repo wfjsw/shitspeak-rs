@@ -5,7 +5,7 @@ use crate::{
     channel_repository::ChannelOp,
     client::Client,
     errors::MessageHandlerError,
-    localization::{text, TextKey},
+    localization::{TextKey, text},
     messages::encoder::{ChannelRemove, DenyType, PermissionDenied},
     server::Server,
 };

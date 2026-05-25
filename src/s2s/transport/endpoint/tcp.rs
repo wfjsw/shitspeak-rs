@@ -13,8 +13,9 @@ use tracing::{debug, warn};
 use super::super::connection::PeerState;
 use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
+use super::super::native_stats;
 use super::super::service_level::TransportKind;
-use super::{install_stream_session, Endpoint};
+use super::{Endpoint, install_stream_session};
 
 /// TCP endpoint state. Holds the rustls server/client configs and the
 /// listen address. The TLS configs are shared (and built once) by the
@@ -67,6 +68,7 @@ impl Endpoint for TcpEndpoint {
         async move {
             let sock = TcpStream::connect(addr).await?;
             let _ = sock.set_nodelay(true);
+            let native_sampler = native_stats::tcp_sampler(&sock);
             let connector = TlsConnector::from(self.client_tls.clone());
             let server_name = ServerName::try_from(format!("node-{}", peer.node_id()))
                 .expect("static name parses");
@@ -83,7 +85,15 @@ impl Endpoint for TcpEndpoint {
                     format!("peer cn {peer_node} != expected {}", peer.node_id()),
                 ));
             }
-            install_stream_session(&inner, peer_node, TransportKind::Tcp, Some(addr), true, tls);
+            install_stream_session(
+                &inner,
+                peer_node,
+                TransportKind::Tcp,
+                Some(addr),
+                true,
+                tls,
+                native_sampler,
+            );
             Ok(())
         }
     }
@@ -96,6 +106,7 @@ impl Endpoint for TcpEndpoint {
         async move {
             let sock = TcpStream::connect(addr).await?;
             let _ = sock.set_nodelay(true);
+            let native_sampler = native_stats::tcp_sampler(&sock);
             let connector = TlsConnector::from(self.client_tls.clone());
             let server_name = ServerName::try_from("s2s-seed.local").expect("static name parses");
             let tls = connector.connect(server_name, sock).await?;
@@ -111,7 +122,15 @@ impl Endpoint for TcpEndpoint {
                     "self-loop rejected",
                 ));
             }
-            install_stream_session(&inner, peer_node, TransportKind::Tcp, Some(addr), true, tls);
+            install_stream_session(
+                &inner,
+                peer_node,
+                TransportKind::Tcp,
+                Some(addr),
+                true,
+                tls,
+                native_sampler,
+            );
             Ok(peer_node)
         }
     }
@@ -145,6 +164,7 @@ async fn handle_inbound(
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
     let _ = sock.set_nodelay(true);
+    let native_sampler = native_stats::tcp_sampler(&sock);
     let tls = acceptor.accept(sock).await?;
     let (_, server) = tls.get_ref();
     let chain = server
@@ -160,7 +180,7 @@ async fn handle_inbound(
     }
     inner
         .get_or_create_peer(peer_node)
-        .note_observed_remote_addr(peer_addr);
+        .note_observed_remote_addr(TransportKind::Tcp, peer_addr);
     install_stream_session(
         &inner,
         peer_node,
@@ -168,6 +188,7 @@ async fn handle_inbound(
         Some(peer_addr),
         false,
         tls,
+        native_sampler,
     );
     Ok(())
 }

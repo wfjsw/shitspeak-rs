@@ -5,8 +5,8 @@
 //! hands emitted frames to the installed audio sink. The speaker-side API
 //! wraps already-encoded audio payloads with unresolved routing intent.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use parking_lot::RwLock;

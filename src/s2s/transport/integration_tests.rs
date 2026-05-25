@@ -15,13 +15,9 @@ use super::config::TransportConfig;
 use super::manager::{ConnectionManager, Inbound};
 use super::service_level::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
 use crate::s2s::testing::{
-    install_provider_once, loopback, mint_pki, pick_free_port, pick_free_udp_port, Pki,
+    Pki, install_provider_once, loopback, mint_pki, pick_free_port, pick_free_udp_port,
+    s2s_network_test_guard,
 };
-
-/// Serializes tests in this file so concurrent `pick_free_port` calls can't
-/// hand the same OS-ephemeral port to two managers before either binds it.
-/// On Windows that race surfaces as `WSAEADDRINUSE` (10048).
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn config_for(pki: &Pki, node_idx: usize, tcp: SocketAddr) -> TransportConfig {
     let (cert, key) = &pki.nodes[node_idx];
@@ -57,7 +53,7 @@ fn config_with_udp(pki: &Pki, node_idx: usize, udp: SocketAddr) -> TransportConf
 /// assumptions from `D:\mumble\src\murmur`.
 #[tokio::test]
 async fn two_node_tcp_data_roundtrip() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[1, 2]);
 
@@ -134,7 +130,7 @@ async fn two_node_tcp_data_roundtrip() {
 /// shitspeak's side-channel precedent (`D:\shitspeak\slavehub.go`).
 #[tokio::test]
 async fn probe_throughput_reports_idle_link_bandwidth() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[100, 200]);
     let port_a = pick_free_port().await;
@@ -188,7 +184,7 @@ async fn probe_throughput_reports_idle_link_bandwidth() {
 /// an unreliable path is unavailable.
 #[tokio::test]
 async fn upward_fallback_uses_tcp_for_best_effort() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[10, 20]);
     let port_a = pick_free_port().await;
@@ -233,7 +229,7 @@ async fn upward_fallback_uses_tcp_for_best_effort() {
 /// verifies this crate's S2S encrypted-datagram transport equivalent.
 #[tokio::test]
 async fn two_node_udp_packet_encryption_roundtrip() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[111, 222]);
     let port_a = pick_free_udp_port().await;
@@ -300,7 +296,7 @@ async fn two_node_udp_packet_encryption_roundtrip() {
 
 #[tokio::test]
 async fn simultaneous_udp_packet_encryption_dials_converge() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[121, 232]);
     let port_a = pick_free_udp_port().await;
@@ -364,7 +360,7 @@ async fn simultaneous_udp_packet_encryption_dials_converge() {
 
 #[tokio::test]
 async fn simultaneous_kcp_dials_converge_without_tls_role_collision() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[131, 242]);
     let port_a = pick_free_udp_port().await;

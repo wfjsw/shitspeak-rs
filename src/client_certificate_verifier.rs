@@ -1,8 +1,8 @@
 use rustls::{
+    DigitallySignedStruct, DistinguishedName, Error, SignatureScheme,
     client::danger::HandshakeSignatureValid,
     pki_types::{CertificateDer, UnixTime},
     server::danger::{ClientCertVerified, ClientCertVerifier},
-    DigitallySignedStruct, DistinguishedName, Error, SignatureScheme,
 };
 
 #[derive(Debug)]

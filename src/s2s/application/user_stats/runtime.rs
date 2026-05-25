@@ -1,8 +1,8 @@
 //! `ServiceInbound` adapter, central dispatch task, and the caller-facing
 //! send API for the UserStats RPC. See [`super`] for the design.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,8 +15,8 @@ use tracing::trace;
 
 use crate::s2s::application::error::ApplicationError;
 use crate::s2s::application::proto::{
-    self, UserStatsEnvelope, UserStatsKind, UserStatsReply, UserStatsRequest,
-    USER_STATS_SERVICE_TAG,
+    self, USER_STATS_SERVICE_TAG, UserStatsEnvelope, UserStatsKind, UserStatsReply,
+    UserStatsRequest,
 };
 use crate::s2s::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
 use crate::s2s::transport::{MessageClass, ServiceLevel};

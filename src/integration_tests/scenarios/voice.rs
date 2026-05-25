@@ -11,7 +11,7 @@ use bytes::Bytes;
 
 use crate::channels::Channel;
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
-use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
+use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{AudioPayload, PacketFormat};
 

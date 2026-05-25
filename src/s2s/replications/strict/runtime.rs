@@ -15,20 +15,20 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
-use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
 use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::proto::{
-    self as repl_proto, CatchupOp, ReplBody, ReplicationMessage, StrictBody, StrictCatchupReq,
-    StrictCatchupResp, StrictClockTick, StrictCommit, StrictPropose, StrictProposeAck,
-    StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq, REPLICATION_SERVICE_TAG,
+    self as repl_proto, CatchupOp, REPLICATION_SERVICE_TAG, ReplBody, ReplicationMessage,
+    StrictBody, StrictCatchupReq, StrictCatchupResp, StrictClockTick, StrictCommit, StrictPropose,
+    StrictProposeAck, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
 };
 use super::super::topic::ErasedStrictRuntime;
 use super::{HistoryMetadata, LogSlice, StrictReplicable};
-use crate::s2s::overlay::{MembershipEvent, OverlayNetwork};
+use crate::s2s::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use crate::s2s::transport::{MessageClass, RoutingMetric, ServiceLevel};
 use crate::types::NodeIdentifier;
 
@@ -66,11 +66,7 @@ pub(crate) fn make_op_id(self_id: NodeIdentifier, boot_epoch: u64, counter: u64)
 /// pin the values across cluster sizes.
 #[inline]
 pub(crate) fn fast_quorum_size(n: usize) -> usize {
-    if n == 0 {
-        0
-    } else {
-        (3 * n).div_ceil(4)
-    }
+    if n == 0 { 0 } else { (3 * n).div_ceil(4) }
 }
 
 // ---------- Network abstraction ----------
@@ -113,16 +109,22 @@ impl StrictNet for OverlayStrictNet {
         topic: &str,
         body: StrictBody,
     ) -> Result<(), ReplicationError> {
+        let options = if matches!(&body, StrictBody::CatchupResp(_)) {
+            OverlaySendOptions::default().allow_l1_compression()
+        } else {
+            OverlaySendOptions::default()
+        };
         let msg = repl_proto::wrap_strict(topic, body);
         let bytes = repl_proto::encode(&msg)?;
         self.overlay
-            .send_unicast_unordered_with_routing_metric(
+            .send_unicast_unordered_with_routing_metric_and_options(
                 dst,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 RoutingMetric::ReliableCost,
                 MessageClass::Regular,
                 bytes,
+                options,
             )
             .await?;
         Ok(())
@@ -677,11 +679,7 @@ pub(crate) struct RecoveryPrepareAck {
 
 #[inline]
 pub(crate) fn recovery_quorum_size(n: usize) -> usize {
-    if n == 0 {
-        0
-    } else {
-        n / 2 + 1
-    }
+    if n == 0 { 0 } else { n / 2 + 1 }
 }
 
 #[inline]
@@ -2079,21 +2077,27 @@ mod tests {
             node_id: 8,
         };
 
-        assert!(HistoryRank {
-            version: 11,
-            ..base
-        }
-        .beats(base));
-        assert!(HistoryRank {
-            freshness: 101,
-            ..base
-        }
-        .beats(base));
-        assert!(HistoryRank {
-            runtime_started_at: 49,
-            ..base
-        }
-        .beats(base));
+        assert!(
+            HistoryRank {
+                version: 11,
+                ..base
+            }
+            .beats(base)
+        );
+        assert!(
+            HistoryRank {
+                freshness: 101,
+                ..base
+            }
+            .beats(base)
+        );
+        assert!(
+            HistoryRank {
+                runtime_started_at: 49,
+                ..base
+            }
+            .beats(base)
+        );
         assert!(HistoryRank { node_id: 7, ..base }.beats(base));
         assert!(!HistoryRank { node_id: 9, ..base }.beats(base));
     }

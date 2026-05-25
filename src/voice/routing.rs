@@ -9,7 +9,7 @@ use super::codec::{self, Audio, PacketFormat};
 use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, DatagramBatch};
 use crate::{
-    client::{crypt::CryptState, Client},
+    client::{Client, crypt::CryptState},
     constants::PROTOBUF_INTRODUCED_VERSION,
     messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget},
     s2s::application::proto::{

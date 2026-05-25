@@ -11,11 +11,11 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::agreement;
 use aws_lc_rs::digest;
 use aws_lc_rs::hkdf;
@@ -26,8 +26,8 @@ use prost::Message as _;
 use rustls::SignatureScheme;
 use rustls_pki_types::CertificateDer;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{interval, Interval};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::time::{Instant as TokioInstant, Interval, interval_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -35,19 +35,22 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
 
+use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
-use super::super::frame::{build_frame, FrameType};
-use super::super::identity::{parse_peer_cn, NodeIdentity};
+use super::super::frame::{FrameType, build_frame};
+use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
+use super::super::probe_schedule::{StartupBandwidthProbe, bandwidth_probe_startup_jitter};
 use super::super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
 use super::super::tls;
-use super::{bind_reusable_udp_socket, Endpoint};
+use super::{Endpoint, bind_reusable_udp_socket};
 
 const MAGIC: [u8; 4] = *b"SSU1";
 const HEADER_LEN: usize = 20;
 const TAG_LEN: usize = 16;
 const X25519_PUBLIC_KEY_LEN: usize = 32;
 const MAX_HANDSHAKE_DATAGRAM: usize = 16 * 1024;
+const UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD: usize = 3;
 const KEX_TRANSCRIPT_DOMAIN: &[u8] = b"shitspeak-s2s-udp-kex-v1";
 const KEX_KEY_INFO: &[u8] = b"shitspeak-s2s-udp-packet-keys-v1";
 const SUPPORTED_SIGNATURE_SCHEMES: &[SignatureScheme] = &[
@@ -212,6 +215,20 @@ impl UdpSocketState {
             .await
             .insert(session.peer_node, session);
     }
+
+    async fn remove_session_if_current(
+        &self,
+        node: NodeIdentifier,
+        session: &Arc<UdpCryptoSession>,
+    ) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&node)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            sessions.remove(&node);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -270,8 +287,10 @@ struct UdpCryptoSession {
     seal_key: LessSafeKey,
     open_key: LessSafeKey,
     send_seq: AtomicU64,
+    consecutive_keepalive_misses: AtomicUsize,
     replay: parking_lot::Mutex<ReplayWindow>,
     pending: Arc<parking_lot::Mutex<PendingPings>>,
+    startup_probe_ready: Notify,
 }
 
 impl UdpCryptoSession {
@@ -292,10 +311,12 @@ impl UdpCryptoSession {
             seal_key,
             open_key,
             send_seq: AtomicU64::new(1),
+            consecutive_keepalive_misses: AtomicUsize::new(0),
             replay: parking_lot::Mutex::new(ReplayWindow::default()),
             pending: Arc::new(parking_lot::Mutex::new(PendingPings::new(
                 max_pending_pings,
             ))),
+            startup_probe_ready: Notify::new(),
         })
     }
 
@@ -634,6 +655,7 @@ async fn handle_udp_datagram(
         &peer,
         inner.inbound(),
         TransportKind::Udp.service_level(),
+        inner.cfg().max_frame_bytes(),
         inner.cfg().udp_mtu(),
     )
     .await
@@ -733,12 +755,13 @@ async fn start_key_exchange(
     peer_node: NodeIdentifier,
     peer_addr: SocketAddr,
 ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
+    // A dial target may come from stale discovery state. Treat it as observed
+    // only after the signed key exchange authenticates the peer.
     let peer = inner.get_or_create_peer(peer_node);
-    peer.note_udp_seen(peer_addr);
 
     if let Some(existing) = state.session(peer_node).await {
         existing.update_addr(peer_addr);
-        install_active_stream(inner, peer, existing, peer_addr, true);
+        install_active_stream(inner, &state, peer, existing, peer_addr, true);
         let (tx, rx) = oneshot::channel();
         let _ = tx.send(Ok(()));
         return Ok(rx);
@@ -774,7 +797,7 @@ async fn install_session(
         session.replay.lock().accept(seq);
     }
     state.insert_session(session.clone()).await;
-    install_active_stream(inner, peer, session.clone(), peer_addr, is_dialer);
+    install_active_stream(inner, state, peer, session.clone(), peer_addr, is_dialer);
     Ok(session)
 }
 
@@ -1630,16 +1653,33 @@ fn key_schedule_salt(ordered: &OrderedOfferMaterial<'_>) -> [u8; 32] {
 
 fn install_active_stream(
     inner: &Arc<ManagerInner>,
+    state: &Arc<UdpSocketState>,
     peer: Arc<PeerState>,
     session: Arc<UdpCryptoSession>,
     peer_addr: SocketAddr,
     is_dialer: bool,
 ) {
-    let active = spawn_udp_write_pump(session, peer.clone(), inner.clone(), peer_addr, is_dialer);
+    if inner.shutdown().is_cancelled() {
+        return;
+    }
+
+    let active = spawn_udp_write_pump(
+        state.clone(),
+        session,
+        peer.clone(),
+        inner.clone(),
+        peer_addr,
+        is_dialer,
+    );
+    if inner.shutdown().is_cancelled() {
+        active.cancel();
+        return;
+    }
     peer.install_stream(active);
 }
 
 fn spawn_udp_write_pump(
+    state: Arc<UdpSocketState>,
     session: Arc<UdpCryptoSession>,
     peer: Arc<PeerState>,
     inner: Arc<ManagerInner>,
@@ -1647,12 +1687,13 @@ fn spawn_udp_write_pump(
     is_dialer: bool,
 ) -> ActiveStream {
     let (tx, rx) = mpsc::channel::<OutboundFrame>(inner.cfg().outbound_capacity());
-    let closed = CancellationToken::new();
-    tokio::spawn(run_write(session, peer, inner, rx, closed.clone()));
+    let closed = inner.shutdown().child_token();
+    tokio::spawn(run_write(state, session, peer, inner, rx, closed.clone()));
     ActiveStream::new(TransportKind::Udp, Some(peer_addr), tx, closed, is_dialer)
 }
 
 async fn run_write(
+    state: Arc<UdpSocketState>,
     session: Arc<UdpCryptoSession>,
     peer: Arc<PeerState>,
     inner: Arc<ManagerInner>,
@@ -1661,6 +1702,16 @@ async fn run_write(
 ) {
     let level = TransportKind::Udp.service_level();
     let probe_enabled = inner.cfg().bandwidth_probe_size() > 0;
+    let startup_probe_delay = bandwidth_probe_startup_jitter(
+        inner.self_id(),
+        peer.node_id(),
+        TransportKind::Udp,
+        inner.cfg().ping_interval(),
+    );
+    let mut startup_probe = StartupBandwidthProbe::new(
+        probe_enabled && !inner.cfg().bandwidth_probe_interval().is_zero(),
+        startup_probe_delay,
+    );
     let pending_timeout = inner
         .cfg()
         .ping_interval()
@@ -1668,7 +1719,10 @@ async fn run_write(
         .max(Duration::from_secs(1));
     let mut ping_tick = MaybeInterval::maybe(inner.cfg().ping_interval());
     let mut probe_tick = if probe_enabled {
-        MaybeInterval::maybe(inner.cfg().bandwidth_probe_interval())
+        MaybeInterval::maybe_with_initial_delay(
+            inner.cfg().bandwidth_probe_interval(),
+            startup_probe_delay,
+        )
     } else {
         MaybeInterval::Disabled
     };
@@ -1682,15 +1736,22 @@ async fn run_write(
         now_us(),
         Bytes::new(),
     );
-    if let Err(e) = session
-        .send_frame(&hello, &peer, inner.cfg().udp_mtu())
-        .await
-    {
+    let hello_result = tokio::select! {
+        biased;
+
+        _ = closed.cancelled() => return,
+        result = session.send_frame(&hello, &peer, inner.cfg().udp_mtu()) => result,
+    };
+    if let Err(e) = hello_result {
         warn!(peer=%peer.node_id(), error=%e, "udp encrypted hello failed");
+        state
+            .remove_session_if_current(peer.node_id(), &session)
+            .await;
         closed.cancel();
         return;
     }
 
+    let mut remove_session_on_exit = false;
     loop {
         tokio::select! {
             biased;
@@ -1698,7 +1759,8 @@ async fn run_write(
 
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
-                let frame = build_frame(
+                let original_payload_len = out.payload().len();
+                let mut frame = build_frame(
                     inner.self_id(),
                     peer.node_id(),
                     level,
@@ -1707,19 +1769,56 @@ async fn run_write(
                     now_us(),
                     out.payload().clone(),
                 );
+                if let Err(e) = maybe_compress_frame_payload(
+                    &mut frame,
+                    out.options(),
+                    inner.cfg().compression_config(),
+                    inner.cfg().max_frame_bytes(),
+                ) {
+                    warn!(peer=%peer.node_id(), error=%e, "udp payload compression failed");
+                    remove_session_on_exit = true;
+                    break;
+                }
                 match session.send_frame(&frame, &peer, inner.cfg().udp_mtu()).await {
                     Ok(_) => peer
                         .metrics()
-                        .record_payload_sent(TransportKind::Udp, out.payload().len()),
+                        .record_payload_sent(TransportKind::Udp, original_payload_len),
                     Err(e) => {
                         warn!(peer=%peer.node_id(), error=%e, "udp encrypted write failed");
+                        remove_session_on_exit = true;
                         break;
                     }
                 }
             }
 
+            _ = session.startup_probe_ready.notified() => {
+                startup_probe.arm();
+            }
+
+            _ = startup_probe.tick() => {
+                startup_probe.complete();
+                if record_expired_udp_pending(&session, &peer, pending_timeout) {
+                    warn!(peer=%peer.node_id(), misses=UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD, "udp keepalive pongs missed; closing session");
+                    remove_session_on_exit = true;
+                    break;
+                }
+                if send_udp_bandwidth_probes(
+                    &session,
+                    &peer,
+                    inner.self_id(),
+                    inner.cfg(),
+                ).await.is_err() {
+                    remove_session_on_exit = true;
+                    break;
+                }
+            }
+
             _ = ping_tick.tick() => {
-                record_expired_udp_pending(&session, &peer, pending_timeout);
+                if record_expired_udp_pending(&session, &peer, pending_timeout) {
+                    warn!(peer=%peer.node_id(), misses=UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD, "udp keepalive pongs missed; closing session");
+                    remove_session_on_exit = true;
+                    break;
+                }
                 let ts = now_us();
                 let frame = build_frame(
                     inner.self_id(), peer.node_id(), level,
@@ -1734,51 +1833,78 @@ async fn run_write(
                     }
                     Err(e) => {
                         warn!(peer=%peer.node_id(), error=%e, "udp encrypted keepalive failed");
+                        remove_session_on_exit = true;
                         break;
                     }
                 }
             }
 
             _ = probe_tick.tick() => {
-                record_expired_udp_pending(&session, &peer, pending_timeout);
-                let mut ts = now_us();
-                for shape in ServiceShape::ALL {
-                    match send_service_probe(
-                        &session,
-                        &peer,
-                        inner.self_id(),
-                        shape,
-                        inner.cfg().service_probe_payload_size(shape),
-                        inner.cfg().udp_mtu(),
-                        ts,
-                    ).await {
-                        Ok(true) => {
-                            if session
-                                .pending
-                                .lock()
-                                .insert(
-                                    ts,
-                                    Some(shape),
-                                    inner.cfg().service_probe_payload_size(shape),
-                                )
-                                .is_some()
-                            {
-                                peer.metrics().record_probe_lost(TransportKind::Udp);
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            warn!(peer=%peer.node_id(), service=%shape.name(), error=%e, "udp encrypted probe failed");
-                            break;
-                        }
-                    }
-                    ts = ts.saturating_add(1);
+                if record_expired_udp_pending(&session, &peer, pending_timeout) {
+                    warn!(peer=%peer.node_id(), misses=UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD, "udp keepalive pongs missed; closing session");
+                    remove_session_on_exit = true;
+                    break;
+                }
+                if send_udp_bandwidth_probes(
+                    &session,
+                    &peer,
+                    inner.self_id(),
+                    inner.cfg(),
+                ).await.is_err() {
+                    remove_session_on_exit = true;
+                    break;
                 }
             }
         }
     }
+    if remove_session_on_exit {
+        state
+            .remove_session_if_current(peer.node_id(), &session)
+            .await;
+    }
     closed.cancel();
     trace!(peer=%peer.node_id(), "udp encrypted write pump exited");
+}
+
+async fn send_udp_bandwidth_probes(
+    session: &Arc<UdpCryptoSession>,
+    peer: &PeerState,
+    local_id: NodeIdentifier,
+    cfg: &super::super::config::TransportConfig,
+) -> io::Result<()> {
+    let mut ts = now_us();
+    for shape in ServiceShape::ALL {
+        let payload_size = cfg.service_probe_payload_size(shape);
+        match send_service_probe(
+            session,
+            peer,
+            local_id,
+            shape,
+            payload_size,
+            cfg.udp_mtu(),
+            ts,
+        )
+        .await
+        {
+            Ok(true) => {
+                if session
+                    .pending
+                    .lock()
+                    .insert(ts, Some(shape), payload_size)
+                    .is_some()
+                {
+                    peer.metrics().record_probe_lost(TransportKind::Udp);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(peer=%peer.node_id(), service=%shape.name(), error=%e, "udp encrypted probe failed");
+                return Err(e);
+            }
+        }
+        ts = ts.saturating_add(1);
+    }
+    Ok(())
 }
 
 async fn send_service_probe(
@@ -1814,21 +1940,32 @@ fn record_expired_udp_pending(
     session: &UdpCryptoSession,
     peer: &PeerState,
     pending_timeout: Duration,
-) {
-    for _ in 0..session.pending.lock().expire_older_than(pending_timeout) {
+) -> bool {
+    let expired = session.pending.lock().expire_older_than(pending_timeout);
+    for _ in 0..expired.total {
         peer.metrics().record_probe_lost(TransportKind::Udp);
     }
+    if expired.keepalive == 0 {
+        return false;
+    }
+    let misses = session
+        .consecutive_keepalive_misses
+        .fetch_add(expired.keepalive, Ordering::Relaxed)
+        + expired.keepalive;
+    misses >= UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD
 }
 
 async fn handle_frame(
-    frame: pb::Frame,
+    mut frame: pb::Frame,
     session: &Arc<UdpCryptoSession>,
     local_id: NodeIdentifier,
     peer: &PeerState,
     inbound: &InboundDispatch,
     level: ServiceLevel,
+    max_frame_bytes: usize,
     udp_mtu: usize,
 ) -> io::Result<()> {
+    validate_and_decode_payload(&mut frame, max_frame_bytes)?;
     let ty = match pb::FrameType::try_from(frame.frame_type) {
         Ok(v) => v,
         Err(_) => return Ok(()),
@@ -1866,7 +2003,13 @@ async fn handle_frame(
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(TransportKind::Udp, rtt);
                 if let Some(pending) = session.pending.lock().take(frame.ts_us) {
+                    session
+                        .consecutive_keepalive_misses
+                        .store(0, Ordering::Relaxed);
                     peer.metrics().record_probe_delivered(TransportKind::Udp);
+                    if pending.shape.is_none() {
+                        session.startup_probe_ready.notify_one();
+                    }
                     if let Some(shape) = pending.shape {
                         peer.metrics().record_probe(
                             TransportKind::Udp,
@@ -1889,6 +2032,12 @@ async fn handle_frame(
 struct PendingPings {
     inner: VecDeque<(u64, PendingPing)>,
     cap: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ExpiredPings {
+    total: usize,
+    keepalive: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1959,17 +2108,21 @@ impl PendingPings {
         })
     }
 
-    fn expire_older_than(&mut self, timeout: Duration) -> usize {
+    fn expire_older_than(&mut self, timeout: Duration) -> ExpiredPings {
         let now = Instant::now();
-        let mut expired = 0;
+        let mut expired = ExpiredPings::default();
         while self.inner.front().is_some_and(|(_, pending)| {
             let sent_at = match pending {
                 PendingPing::Probe { sent_at, .. } => *sent_at,
             };
             now.saturating_duration_since(sent_at) >= timeout
         }) {
-            self.inner.pop_front();
-            expired += 1;
+            if let Some((_, pending)) = self.inner.pop_front() {
+                expired.total += 1;
+                if pending.shape().is_none() {
+                    expired.keepalive += 1;
+                }
+            }
         }
         expired
     }
@@ -1990,7 +2143,18 @@ impl MaybeInterval {
         if duration.is_zero() {
             Self::Disabled
         } else {
-            Self::Enabled(interval(duration))
+            Self::Enabled(interval_at(TokioInstant::now(), duration))
+        }
+    }
+
+    fn maybe_with_initial_delay(duration: Duration, initial_delay: Duration) -> Self {
+        if duration.is_zero() {
+            Self::Disabled
+        } else {
+            Self::Enabled(interval_at(
+                TokioInstant::now() + duration.saturating_add(initial_delay),
+                duration,
+            ))
         }
     }
 
@@ -2047,6 +2211,18 @@ mod tests {
                 .seq,
             42
         );
+    }
+
+    #[test]
+    fn pending_expiration_counts_keepalives_separately() {
+        let mut pending = PendingPings::new(4);
+
+        pending.insert(1, None, 0);
+        pending.insert(2, Some(ServiceShape::Voice), 160);
+
+        let expired = pending.expire_older_than(Duration::ZERO);
+        assert_eq!(expired.total, 2);
+        assert_eq!(expired.keepalive, 1);
     }
 
     #[test]

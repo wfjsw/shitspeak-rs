@@ -11,13 +11,13 @@ use crate::ban_repository::{BanEntry, BanOp};
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::config::{S2sConfig, S2sSeedAddressConfig, S2sTransportKindConfig};
 use crate::integration_tests::harness::{
-    spawn_s2s_test_server, spawn_s2s_test_server_with_config, TestClient, TestS2sServerOpts,
-    TestServer, TestServerOpts,
+    TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
+    spawn_s2s_test_server_with_config,
 };
-use crate::messages::encoder::{Ping, PluginDataTransmission, UserStats};
 use crate::messages::Message;
+use crate::messages::encoder::{Ping, PluginDataTransmission, UserStats};
 use crate::s2s::testing::{
-    loopback, mint_pki, pick_free_port, pick_free_udp_port, wait_until, Pki,
+    Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port, s2s_network_test_guard, wait_until,
 };
 use crate::s2s::transport::ServiceLevel;
 use crate::voice::codec::AudioPayload;
@@ -25,8 +25,6 @@ use crate::voice::codec::AudioPayload;
 const S2S_DEADLINE: Duration = Duration::from_secs(10);
 const CLIENT_DEADLINE: Duration = Duration::from_secs(4);
 const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
-
-static S2S_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn spawn_s2s_pair() -> (TestServer, TestServer) {
     let pki = Arc::new(mint_pki(&[1, 2]));
@@ -227,7 +225,7 @@ fn opus_frame(payload: &AudioPayload) -> &[u8] {
 /// `D:\shitspeak\slavehub.go` and this crate's S2S overlay design.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_enabled_servers_discover_seed_addresses_without_node_ids() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
 
     wait_for_s2s_pair(&a, &b).await;
@@ -244,7 +242,7 @@ async fn s2s_enabled_servers_discover_seed_addresses_without_node_ids() {
 /// while this crate extends delivery across S2S.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_cross_node_user_stats_rpc() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
@@ -285,7 +283,7 @@ async fn s2s_cross_node_user_stats_rpc() {
 /// stamped by server A and the payload preserved over S2S.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_cross_node_plugin_data_transmission_routes_to_remote_recipient() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
@@ -337,7 +335,7 @@ async fn s2s_cross_node_plugin_data_transmission_routes_to_remote_recipient() {
 /// delivery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_cross_node_moderation_applies_to_owner() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
@@ -384,7 +382,7 @@ async fn s2s_cross_node_moderation_applies_to_owner() {
 /// `D:\shitspeak\client.go`; this crate extends the receiver set over S2S.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_cross_node_voice_routes_normal_channel() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
@@ -417,7 +415,7 @@ async fn s2s_cross_node_voice_routes_normal_channel() {
 /// replication supplies the cross-node log propagation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_channel_replication_propagates() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
@@ -457,7 +455,7 @@ async fn s2s_channel_replication_propagates() {
 /// replication extends it across servers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_client_replication_propagates_add_update_remove() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
@@ -578,7 +576,7 @@ async fn s2s_client_replication_propagates_add_update_remove() {
 /// while a normal client can still authenticate and receive a TCP ping reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_client_connects_when_s2s_transport_startup_fails() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let pki = Arc::new(mint_pki(&[1]));
     let server = spawn_s2s_test_server_with_config(
         TestServerOpts::default(),
@@ -621,7 +619,7 @@ async fn native_client_connects_when_s2s_transport_startup_fails() {
 /// client stays connected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_client_replication_recovers_after_node_restart() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let pki = Arc::new(mint_pki(&[1, 2]));
     let a_s2s_port = pick_free_port().await;
     let b_s2s_port = pick_free_port().await;
@@ -686,7 +684,7 @@ async fn s2s_client_replication_recovers_after_node_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_client_replication_catches_up_when_second_node_starts_later() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let pki = Arc::new(mint_pki(&[1, 2]));
     let a_s2s_port = pick_free_port().await;
     let b_s2s_port = pick_free_port().await;
@@ -732,7 +730,7 @@ async fn s2s_client_replication_catches_up_when_second_node_starts_later() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_client_replication_catches_up_with_demo_transport_mix() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let pki = Arc::new(mint_pki(&[1, 2]));
 
     let a_tcp = loopback(pick_free_port().await);
@@ -788,7 +786,7 @@ async fn s2s_client_replication_catches_up_with_demo_transport_mix() {
 /// actual channels, even though the reconnecting client itself starts in root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
@@ -905,7 +903,7 @@ async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
 /// cross-node propagation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_ban_replication_propagates() {
-    let _guard = S2S_TEST_LOCK.lock().await;
+    let _guard = s2s_network_test_guard().await;
     let (a, b) = spawn_s2s_pair().await;
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);

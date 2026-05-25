@@ -1,6 +1,6 @@
 use std::error::Error;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use serde::Deserialize;
 use shitspeak_rs::config::S2sConfig;

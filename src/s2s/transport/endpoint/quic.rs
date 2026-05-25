@@ -17,13 +17,16 @@ use tracing::{debug, warn};
 use super::super::connection::PeerState;
 use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
+use super::super::native_stats;
 use super::super::service_level::TransportKind;
-use super::{install_stream_session, Endpoint};
+use super::{Endpoint, install_stream_session};
 
 /// QUIC endpoint state. Owns the bound `quinn::Endpoint` and the QUIC
 /// client config used for outbound connections.
 pub(crate) struct QuicEndpoint {
-    handle: QuinnEndpoint,
+    accept_handle: Option<QuinnEndpoint>,
+    client_v4: Option<QuinnEndpoint>,
+    client_v6: Option<QuinnEndpoint>,
     client_cfg: QuinnClientConfig,
     listen_addr: Option<SocketAddr>,
 }
@@ -47,23 +50,78 @@ impl QuicEndpoint {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
         let client_cfg = QuinnClientConfig::new(Arc::new(qcc));
 
-        let handle = match listen_addr {
+        let accept_handle = match listen_addr {
             Some(addr) => {
                 let qsc: QuicServerConfig = server_tls
                     .try_into()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
                 let server_cfg = QuinnServerConfig::with_crypto(Arc::new(qsc));
-                QuinnEndpoint::server(server_cfg, addr)?
+                Some(QuinnEndpoint::server(server_cfg, addr)?)
             }
-            None => QuinnEndpoint::client("[::]:0".parse().unwrap())?,
+            None => None,
         };
+        let (client_v4, client_v6) = build_client_endpoints()?;
 
         Ok(Self {
-            handle,
+            accept_handle,
+            client_v4,
+            client_v6,
             client_cfg,
             listen_addr,
         })
     }
+
+    fn client_handle(&self, addr: SocketAddr) -> io::Result<&QuinnEndpoint> {
+        if addr.is_ipv4() {
+            self.client_v4
+                .as_ref()
+                .or_else(|| self.accept_handle_for_family(addr))
+                .ok_or_else(|| missing_client_socket(addr))
+        } else {
+            self.client_v6
+                .as_ref()
+                .or_else(|| self.accept_handle_for_family(addr))
+                .ok_or_else(|| missing_client_socket(addr))
+        }
+    }
+
+    fn accept_handle_for_family(&self, addr: SocketAddr) -> Option<&QuinnEndpoint> {
+        let handle = self.accept_handle.as_ref()?;
+        let local = handle.local_addr().ok()?;
+        (local.is_ipv4() == addr.is_ipv4()).then_some(handle)
+    }
+}
+
+fn build_client_endpoints() -> io::Result<(Option<QuinnEndpoint>, Option<QuinnEndpoint>)> {
+    let client_v4 = bind_client_endpoint(SocketAddr::from(([0, 0, 0, 0], 0)));
+    let client_v6 = bind_client_endpoint(SocketAddr::from(([0u16; 8], 0)));
+
+    match (client_v4, client_v6) {
+        (Ok(v4), Ok(v6)) => Ok((Some(v4), Some(v6))),
+        (Ok(v4), Err(e)) => {
+            debug!(error=%e, "quic IPv6 client socket unavailable");
+            Ok((Some(v4), None))
+        }
+        (Err(e), Ok(v6)) => {
+            debug!(error=%e, "quic IPv4 client socket unavailable");
+            Ok((None, Some(v6)))
+        }
+        (Err(v4), Err(v6)) => Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("quic client socket bind failed for IPv4 ({v4}) and IPv6 ({v6})"),
+        )),
+    }
+}
+
+fn bind_client_endpoint(addr: SocketAddr) -> io::Result<QuinnEndpoint> {
+    QuinnEndpoint::client(addr)
+}
+
+fn missing_client_socket(addr: SocketAddr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        format!("no quic client socket is available for {addr}"),
+    )
 }
 
 impl Endpoint for QuicEndpoint {
@@ -77,8 +135,12 @@ impl Endpoint for QuicEndpoint {
             if self.listen_addr.is_none() {
                 return Ok(());
             }
-            debug!(addr=?self.handle.local_addr().ok(), "quic listener up");
-            tokio::spawn(accept_loop(self.clone(), inner));
+            let handle = self
+                .accept_handle
+                .clone()
+                .ok_or_else(|| io::Error::other("quic listener missing accept endpoint"))?;
+            debug!(addr=?handle.local_addr().ok(), "quic listener up");
+            tokio::spawn(accept_loop(handle, inner));
             Ok(())
         }
     }
@@ -91,7 +153,7 @@ impl Endpoint for QuicEndpoint {
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
             let connecting = self
-                .handle
+                .client_handle(addr)?
                 .connect_with(
                     self.client_cfg.clone(),
                     addr,
@@ -118,6 +180,7 @@ impl Endpoint for QuicEndpoint {
                     format!("peer cn {peer_node} != expected {}", peer.node_id()),
                 ));
             }
+            let native_sampler = Some(native_stats::quic_sampler(conn.clone()));
             let (send, recv) = conn
                 .open_bi()
                 .await
@@ -129,6 +192,7 @@ impl Endpoint for QuicEndpoint {
                 Some(addr),
                 true,
                 BiStream { send, recv },
+                native_sampler,
             );
             Ok(())
         }
@@ -141,7 +205,7 @@ impl Endpoint for QuicEndpoint {
     ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
         async move {
             let connecting = self
-                .handle
+                .client_handle(addr)?
                 .connect_with(self.client_cfg.clone(), addr, "s2s-seed.local")
                 .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
             let conn = connecting
@@ -164,6 +228,7 @@ impl Endpoint for QuicEndpoint {
                     "self-loop rejected",
                 ));
             }
+            let native_sampler = Some(native_stats::quic_sampler(conn.clone()));
             let (send, recv) = conn
                 .open_bi()
                 .await
@@ -175,17 +240,18 @@ impl Endpoint for QuicEndpoint {
                 Some(addr),
                 true,
                 BiStream { send, recv },
+                native_sampler,
             );
             Ok(peer_node)
         }
     }
 }
 
-async fn accept_loop(ep: Arc<QuicEndpoint>, inner: Arc<ManagerInner>) {
+async fn accept_loop(handle: QuinnEndpoint, inner: Arc<ManagerInner>) {
     loop {
         tokio::select! {
             _ = inner.shutdown().cancelled() => return,
-            incoming = ep.handle.accept() => {
+            incoming = handle.accept() => {
                 let Some(incoming) = incoming else { return };
                 let inner_c = inner.clone();
                 tokio::spawn(async move {
@@ -234,7 +300,8 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
     }
     inner
         .get_or_create_peer(peer_node)
-        .note_observed_remote_addr(remote_addr);
+        .note_observed_remote_addr(TransportKind::Quic, remote_addr);
+    let native_sampler = Some(native_stats::quic_sampler(conn.clone()));
     let (send, recv) = conn
         .accept_bi()
         .await
@@ -246,6 +313,7 @@ async fn handle_incoming(inner: Arc<ManagerInner>, incoming: quinn::Incoming) ->
         Some(remote_addr),
         false,
         BiStream { send, recv },
+        native_sampler,
     );
     Ok(())
 }

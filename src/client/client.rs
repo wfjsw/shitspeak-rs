@@ -16,7 +16,7 @@ use tokio::{
     io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
     net::TcpStream,
     sync::{
-        mpsc, watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard,
+        Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard, mpsc, watch,
     },
 };
 use tokio_rustls::server::TlsStream;
@@ -30,9 +30,9 @@ use crate::{
     },
     client_repository::ClientRepository,
     errors::{ReadProtoMessageError, WriteProtoMessageError},
-    messages::{encoder as msg_encoder, Message, ReadMessageExt, WriteMessageExt},
+    messages::{Message, ReadMessageExt, WriteMessageExt, encoder as msg_encoder},
     protocol_version::ProtocolVersion,
-    types::{ScopedSessionId, DEFAULT_SERVER_ID},
+    types::{DEFAULT_SERVER_ID, ScopedSessionId},
     voice::VoiceRoutingPayload,
 };
 

@@ -893,9 +893,11 @@ mod tests {
         assert_eq!(cfg.server_entrypoints[0].sni.len(), 2);
         assert_eq!(cfg.server_entrypoints[1].server_id, "tenant-b");
         assert!(cfg.server_entrypoints[1].listen.is_none());
-        assert!(cfg.server_entrypoints[1]
-            .udp_ping_status_server_id
-            .is_none());
+        assert!(
+            cfg.server_entrypoints[1]
+                .udp_ping_status_server_id
+                .is_none()
+        );
     }
 
     #[test]
@@ -1013,6 +1015,10 @@ mod tests {
             stale_probe_age_secs = 3601
             unselected_link_probe_interval_secs = 41
             max_outgoing_connections = 777
+            compression_enabled = false
+            compression_min_bytes = 2048
+            compression_min_savings_percent = 25
+            compression_level = 3
         "#;
         let cfg: S2sConfig = parse_s2s(raw).expect("s2s config parses");
         assert!(cfg.is_enabled());
@@ -1067,6 +1073,10 @@ mod tests {
             Duration::from_secs(41)
         );
         assert_eq!(transport.max_outgoing_connections(), 777);
+        assert!(!transport.compression_enabled());
+        assert_eq!(transport.compression_min_bytes(), 2048);
+        assert_eq!(transport.compression_min_savings_percent(), 25);
+        assert_eq!(transport.compression_level(), 3);
         assert!(cfg.overlay_config().persistence_dir().is_some());
     }
 

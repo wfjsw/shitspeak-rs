@@ -1,6 +1,6 @@
 //! Routing-aware forwarding for `OverlayData` and ordered-lane repair control.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,26 +9,43 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use crate::s2s::overlay::config::OverlayConfig;
 use crate::s2s::overlay::LaneId;
-use crate::s2s::transport::{ConnectionManager, MessageClass, ServiceLevel};
+use crate::s2s::overlay::config::OverlayConfig;
+use crate::s2s::transport::{
+    ConnectionManager, MessageClass, SendOptions as TransportSendOptions, ServiceLevel,
+};
 use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::super::error::OverlayError;
 use super::super::proto::{
-    class_from_wire, class_to_wire, encode_message, level_from_wire, level_to_wire, node_from_wire,
-    node_to_wire, route_metric_from_wire, route_metric_to_wire, wrap, OverlayBody,
-    OverlayControlBody,
+    OverlayBody, OverlayControlBody, class_from_wire, class_to_wire, encode_message,
+    level_from_wire, level_to_wire, node_from_wire, node_to_wire, route_metric_from_wire,
+    route_metric_to_wire, wrap,
 };
-use super::super::routing::{RoutingHandle, RoutingMetric};
+use super::super::routing::{RoutingHandle, RoutingMetric, RoutingTables};
 use super::delivery;
 use super::ordering::OverlayOrdering;
-use super::ServiceRegistry;
+use super::{OverlaySendOptions, ServiceRegistry};
 
 const FORWARD_PAYLOAD_LOG_BYTES: usize = 256;
 const CONTROL_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
 const CONTROL_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectFallbackReason {
+    NoRoute,
+    Loop { next_hop: NodeIdentifier },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardNextHop {
+    Send {
+        next_hop: NodeIdentifier,
+        fallback: Option<DirectFallbackReason>,
+    },
+    DropAlreadyVisited,
+}
 
 fn payload_hex_preview(payload: &[u8]) -> String {
     let shown = payload.len().min(FORWARD_PAYLOAD_LOG_BYTES);
@@ -58,6 +75,7 @@ pub async fn originate(
     body: Bytes,
     lane: Option<LaneId>,
     process_on_transit: bool,
+    options: OverlaySendOptions,
 ) -> Result<(), OverlayError> {
     let dsts: Vec<NodeIdentifier> = dsts.into_iter().filter(|dst| *dst != self_id).collect();
     if dsts.is_empty() {
@@ -81,6 +99,7 @@ pub async fn originate(
             lane_id: None,
             origin_boot_epoch: boot_epoch,
             origin_message_id: 0,
+            allow_l1_compression: options.l1_compression_allowed(),
         };
         return forward_pb_as(
             transport, routing, self_id, data, class, /*is_originator=*/ true,
@@ -119,6 +138,7 @@ pub async fn originate(
             lane_id: Some(lane.get()),
             origin_boot_epoch: boot_epoch,
             origin_message_id: message_id,
+            allow_l1_compression: options.l1_compression_allowed(),
         };
         ordering.store_pending(lane, data.clone()).await;
         ordering.cache_ordered_packet(&data).await;
@@ -516,7 +536,7 @@ async fn forward_pb_as(
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let tables = routing.load();
 
-    let path_trace_set: std::collections::HashSet<u32> = data.path_trace.iter().copied().collect();
+    let path_trace_set: HashSet<u32> = data.path_trace.iter().copied().collect();
     let mut buckets: HashMap<NodeIdentifier, Vec<u32>> = HashMap::new();
     for dst_wire in &data.dsts {
         let Some(dst) = node_from_wire(*dst_wire) else {
@@ -525,21 +545,33 @@ async fn forward_pb_as(
         if dst == self_id {
             continue;
         }
-        let entry = match tables.lookup_with_metric(dst, level, routing_metric) {
-            Some(e) => e,
-            None => {
-                if is_originator {
-                    return Err(OverlayError::NoRoute { dst, level });
+        match select_forward_next_hop(
+            &tables,
+            dst,
+            level,
+            routing_metric,
+            &path_trace_set,
+            is_originator,
+        )? {
+            ForwardNextHop::Send { next_hop, fallback } => {
+                if let Some(reason) = fallback {
+                    debug!(
+                        self_id = %self_id,
+                        src = %node_from_wire(data.src).unwrap_or(0),
+                        %dst,
+                        %next_hop,
+                        ?reason,
+                        ?level,
+                        ?routing_metric,
+                        "routing snapshot unstable; falling back to direct next hop"
+                    );
                 }
-                warn!(%dst, ?level, "no route; dropping dst");
-                continue;
+                buckets.entry(next_hop).or_default().push(*dst_wire);
             }
-        };
-        if path_trace_set.contains(&node_to_wire(entry.next_hop)) {
-            warn!(%dst, next_hop=%entry.next_hop, "next_hop in path_trace; dropping");
-            continue;
+            ForwardNextHop::DropAlreadyVisited => {
+                warn!(%dst, "destination already in path_trace; dropping");
+            }
         }
-        buckets.entry(entry.next_hop).or_default().push(*dst_wire);
     }
     if buckets.is_empty() {
         return Ok(());
@@ -552,23 +584,7 @@ async fn forward_pb_as(
     }
     let mut first_err: Option<OverlayError> = None;
     for (next_hop, bucket_dsts) in buckets {
-        let pb_msg = pb::OverlayData {
-            src: data.src,
-            dsts: bucket_dsts,
-            path_trace: new_trace.clone(),
-            service_tag: data.service_tag,
-            service_level: data.service_level,
-            message_class: data.message_class,
-            payload: data.payload.clone(),
-            process_on_transit: data.process_on_transit,
-            route_metric: data.route_metric,
-            ordered_delivery: data.ordered_delivery,
-            ordering_seq: data.ordering_seq,
-            ordering_dst: data.ordering_dst,
-            lane_id: data.lane_id,
-            origin_boot_epoch: data.origin_boot_epoch,
-            origin_message_id: data.origin_message_id,
-        };
+        let pb_msg = reconstruct_forwarded_data(&data, bucket_dsts, new_trace.clone());
         if tracing::enabled!(tracing::Level::TRACE) {
             let dsts: Vec<NodeIdentifier> = pb_msg
                 .dsts
@@ -597,6 +613,7 @@ async fn forward_pb_as(
             );
         }
 
+        let send_options = transport_options_for_overlay_data(&pb_msg);
         let payload = match encode_message(&wrap(OverlayBody::Data(pb_msg))) {
             Ok(b) => b,
             Err(e) => {
@@ -608,12 +625,13 @@ async fn forward_pb_as(
             }
         };
         match transport
-            .send(
+            .send_with_options(
                 next_hop,
                 level,
                 Some(routing_metric),
                 transport_class,
                 payload,
+                send_options,
             )
             .await
         {
@@ -631,6 +649,90 @@ async fn forward_pb_as(
         return Err(e);
     }
     Ok(())
+}
+
+fn reconstruct_forwarded_data(
+    data: &pb::OverlayData,
+    dsts: Vec<u32>,
+    path_trace: Vec<u32>,
+) -> pb::OverlayData {
+    pb::OverlayData {
+        src: data.src,
+        dsts,
+        path_trace,
+        service_tag: data.service_tag,
+        service_level: data.service_level,
+        message_class: data.message_class,
+        payload: data.payload.clone(),
+        process_on_transit: data.process_on_transit,
+        route_metric: data.route_metric,
+        ordered_delivery: data.ordered_delivery,
+        ordering_seq: data.ordering_seq,
+        ordering_dst: data.ordering_dst,
+        lane_id: data.lane_id,
+        origin_boot_epoch: data.origin_boot_epoch,
+        origin_message_id: data.origin_message_id,
+        allow_l1_compression: data.allow_l1_compression,
+    }
+}
+
+fn transport_options_for_overlay_data(data: &pb::OverlayData) -> TransportSendOptions {
+    let options = TransportSendOptions::default();
+    if data.allow_l1_compression {
+        options.allow_l1_compression()
+    } else {
+        options
+    }
+}
+
+fn select_forward_next_hop(
+    tables: &RoutingTables,
+    dst: NodeIdentifier,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    path_trace_set: &HashSet<u32>,
+    is_originator: bool,
+) -> Result<ForwardNextHop, OverlayError> {
+    let dst_wire = node_to_wire(dst);
+    let Some(entry) = tables.lookup_with_metric(dst, level, routing_metric) else {
+        if is_originator {
+            return Err(OverlayError::NoRoute { dst, level });
+        }
+        return direct_fallback(dst, path_trace_set, DirectFallbackReason::NoRoute);
+    };
+
+    if path_trace_set.contains(&node_to_wire(entry.next_hop)) {
+        return direct_fallback(
+            dst,
+            path_trace_set,
+            DirectFallbackReason::Loop {
+                next_hop: entry.next_hop,
+            },
+        );
+    }
+
+    if path_trace_set.contains(&dst_wire) {
+        return Ok(ForwardNextHop::DropAlreadyVisited);
+    }
+
+    Ok(ForwardNextHop::Send {
+        next_hop: entry.next_hop,
+        fallback: None,
+    })
+}
+
+fn direct_fallback(
+    dst: NodeIdentifier,
+    path_trace_set: &HashSet<u32>,
+    reason: DirectFallbackReason,
+) -> Result<ForwardNextHop, OverlayError> {
+    if path_trace_set.contains(&node_to_wire(dst)) {
+        return Ok(ForwardNextHop::DropAlreadyVisited);
+    }
+    Ok(ForwardNextHop::Send {
+        next_hop: dst,
+        fallback: Some(reason),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -660,7 +762,30 @@ async fn send_encoded_to_target(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::proto::decode_message;
+    use super::super::super::routing::RouteEntry;
     use super::*;
+
+    fn test_overlay_data(allow_l1_compression: bool) -> pb::OverlayData {
+        pb::OverlayData {
+            src: node_to_wire(1),
+            dsts: vec![node_to_wire(4)],
+            path_trace: vec![node_to_wire(1)],
+            service_tag: 7,
+            service_level: level_to_wire(ServiceLevel::Reliable),
+            message_class: class_to_wire(MessageClass::Regular),
+            payload: Bytes::from_static(b"payload"),
+            process_on_transit: false,
+            route_metric: route_metric_to_wire(RoutingMetric::ReliableCost),
+            ordered_delivery: false,
+            ordering_seq: 0,
+            ordering_dst: 0,
+            lane_id: None,
+            origin_boot_epoch: 11,
+            origin_message_id: 22,
+            allow_l1_compression,
+        }
+    }
 
     #[test]
     fn payload_hex_preview_is_bounded() {
@@ -671,5 +796,127 @@ mod tests {
         let preview = payload_hex_preview(&payload);
         assert!(preview.starts_with(&"ff".repeat(FORWARD_PAYLOAD_LOG_BYTES)));
         assert!(preview.ends_with("...(+2 bytes)"));
+    }
+
+    #[test]
+    fn overlay_data_compression_flag_survives_encode_decode() {
+        let data = test_overlay_data(true);
+        let encoded = encode_message(&wrap(OverlayBody::Data(data))).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+
+        let Some(OverlayBody::Data(decoded)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert!(decoded.allow_l1_compression);
+    }
+
+    #[test]
+    fn forwarding_reconstruction_preserves_compression_flag() {
+        let data = test_overlay_data(true);
+        let forwarded = reconstruct_forwarded_data(
+            &data,
+            vec![node_to_wire(5), node_to_wire(6)],
+            vec![node_to_wire(1), node_to_wire(2)],
+        );
+
+        assert!(forwarded.allow_l1_compression);
+        assert_eq!(forwarded.payload, data.payload);
+        assert_eq!(forwarded.dsts, vec![node_to_wire(5), node_to_wire(6)]);
+        assert_eq!(forwarded.path_trace, vec![node_to_wire(1), node_to_wire(2)]);
+    }
+
+    #[test]
+    fn transit_no_route_uses_direct_fallback() {
+        let tables = RoutingTables::empty();
+        let path_trace = HashSet::from([node_to_wire(1)]);
+
+        let selected = select_forward_next_hop(
+            &tables,
+            4,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected,
+            ForwardNextHop::Send {
+                next_hop: 4,
+                fallback: Some(DirectFallbackReason::NoRoute),
+            }
+        );
+    }
+
+    #[test]
+    fn origin_no_route_still_errors() {
+        let tables = RoutingTables::empty();
+        let path_trace = HashSet::new();
+
+        let err = select_forward_next_hop(
+            &tables,
+            4,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, OverlayError::NoRoute { dst: 4, .. }));
+    }
+
+    #[test]
+    fn transit_loop_uses_direct_fallback() {
+        let mut tables = RoutingTables::empty();
+        tables.insert_table(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            HashMap::from([(
+                4,
+                RouteEntry {
+                    next_hop: 1,
+                    cost: 1,
+                },
+            )]),
+        );
+        let path_trace = HashSet::from([node_to_wire(1)]);
+
+        let selected = select_forward_next_hop(
+            &tables,
+            4,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected,
+            ForwardNextHop::Send {
+                next_hop: 4,
+                fallback: Some(DirectFallbackReason::Loop { next_hop: 1 }),
+            }
+        );
+    }
+
+    #[test]
+    fn already_visited_destination_drops() {
+        let tables = RoutingTables::empty();
+        let path_trace = HashSet::from([node_to_wire(4)]);
+
+        let selected = select_forward_next_hop(
+            &tables,
+            4,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(selected, ForwardNextHop::DropAlreadyVisited);
     }
 }

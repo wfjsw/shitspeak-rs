@@ -5,7 +5,7 @@ use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::PluginDataTransmission, Message},
+    messages::{Message, encoder::PluginDataTransmission},
     s2s::application::proto::PluginDataEnvelope,
     server::Server,
 };

@@ -10,12 +10,12 @@ use super::error::ReplicationError;
 use crate::s2s_replication_proto as pb;
 
 pub use pb::{
+    BlobChunk, BlobChunkReq, BlobFind, BlobMessage, BlobOffer, CatchupOp, OwnerCatchupReq,
+    OwnerCatchupResp, OwnerMessage, OwnerOp, ReplicationMessage, StrictCatchupReq,
+    StrictCatchupResp, StrictClockTick, StrictCommit, StrictMessage, StrictPropose,
+    StrictProposeAck, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
     blob_message::Body as BlobBody, owner_message::Body as OwnerBody,
-    replication_message::Body as ReplBody, strict_message::Body as StrictBody, BlobChunk,
-    BlobChunkReq, BlobFind, BlobMessage, BlobOffer, CatchupOp, OwnerCatchupReq, OwnerCatchupResp,
-    OwnerMessage, OwnerOp, ReplicationMessage, StrictCatchupReq, StrictCatchupResp,
-    StrictClockTick, StrictCommit, StrictMessage, StrictPropose, StrictProposeAck,
-    StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
+    replication_message::Body as ReplBody, strict_message::Body as StrictBody,
 };
 
 /// Encode a `ReplicationMessage` to bytes ready for the overlay payload.

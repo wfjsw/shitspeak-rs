@@ -7,11 +7,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
-use crate::messages::encoder::PluginDataTransmission;
 use crate::messages::Message;
+use crate::messages::encoder::PluginDataTransmission;
 use crate::s2s::application::error::ApplicationError;
-use crate::s2s::application::proto::{self, PluginDataEnvelope, PLUGIN_DATA_SERVICE_TAG};
-use crate::s2s::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
+use crate::s2s::application::proto::{self, PLUGIN_DATA_SERVICE_TAG, PluginDataEnvelope};
+use crate::s2s::overlay::{
+    OverlayInboundMessage, OverlayNetwork, OverlaySendOptions, ServiceInbound,
+};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::server::Server;
 use crate::types::NodeIdentifier;
@@ -32,12 +34,13 @@ pub struct OverlayPluginDataTransport {
 impl PluginDataTransport for OverlayPluginDataTransport {
     async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
-            .send_unicast(
+            .send_unicast_with_options(
                 dst,
                 PLUGIN_DATA_SERVICE_TAG,
                 PLUGIN_DATA_LEVEL,
                 PLUGIN_DATA_CLASS,
                 body,
+                OverlaySendOptions::default().allow_l1_compression(),
             )
             .await?;
         Ok(())

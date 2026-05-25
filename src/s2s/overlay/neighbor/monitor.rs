@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
@@ -38,6 +38,10 @@ pub struct NeighborSnapshot {
     pub throughput_bps: u64,
     pub transports_mask: u32,
     pub loss_ppm: u32,
+    pub probe_loss_ppm: u32,
+    pub native_loss_ppm: u32,
+    pub data_health_ppm: u32,
+    pub loss_sample_count: u64,
 }
 
 #[derive(Debug)]
@@ -86,20 +90,21 @@ fn prune_loss_samples(st: &mut NeighborState, now: Instant, window: Duration) {
     }
 }
 
-fn packet_loss_ppm(st: &mut NeighborState, now: Instant, window: Duration) -> u32 {
+fn packet_loss_snapshot(st: &mut NeighborState, now: Instant, window: Duration) -> (u32, u64, u64) {
     prune_loss_samples(st, now, window);
     let total = st.loss_samples.len();
     if total == 0 {
-        return 0;
+        return (0, 0, 0);
     }
     let lost = st
         .loss_samples
         .iter()
         .filter(|(_, sample_lost)| *sample_lost)
         .count();
-    ((lost as f64 / total as f64) * 1_000_000.0)
+    let ppm = ((lost as f64 / total as f64) * 1_000_000.0)
         .round()
-        .clamp(0.0, 1_000_000.0) as u32
+        .clamp(0.0, 1_000_000.0) as u32;
+    (ppm, total as u64, lost as u64)
 }
 
 /// Direct-neighbor table.
@@ -157,14 +162,33 @@ impl NeighborMonitor {
             if !st.is_up {
                 continue;
             }
-            let (rtt_us, jitter_us, throughput_bps, kinds) = match metrics.for_node(*nid) {
+            let (hello_loss_ppm, hello_loss_samples, _) =
+                packet_loss_snapshot(st, now, loss_window);
+            let mut probe_loss_ppm = hello_loss_ppm;
+            let mut native_loss_ppm = 0;
+            let mut data_health_ppm = 0;
+            let mut loss_ppm = hello_loss_ppm;
+            let mut loss_sample_count = hello_loss_samples;
+            let kinds = self
+                .transport
+                .inner
+                .get_peer(*nid)
+                .map(|peer| peer.live_kinds())
+                .unwrap_or_default();
+            let (rtt_us, jitter_us, throughput_bps) = match metrics.for_node(*nid) {
                 Some(per_t) => {
                     let mut best_rtt: Option<f64> = None;
                     let mut best_jitter: Option<f64> = None;
                     let mut total_tput: f64 = 0.0;
-                    let mut kinds: Vec<TransportKind> = Vec::new();
                     for (k, m) in per_t {
-                        kinds.push(*k);
+                        if !kinds.contains(k) {
+                            continue;
+                        }
+                        probe_loss_ppm = probe_loss_ppm.max(m.probe_loss_ppm());
+                        native_loss_ppm = native_loss_ppm.max(m.native_loss_ppm());
+                        data_health_ppm = data_health_ppm.max(m.data_health_ppm());
+                        loss_ppm = loss_ppm.max(m.effective_packet_loss_ppm());
+                        loss_sample_count = loss_sample_count.saturating_add(m.loss_sample_count());
                         if m.rtt_us() > 0.0 {
                             best_rtt = Some(match best_rtt {
                                 Some(prev) => prev.min(m.rtt_us()),
@@ -181,10 +205,9 @@ impl NeighborMonitor {
                         best_rtt.unwrap_or(0.0) as u64,
                         best_jitter.unwrap_or(0.0) as u64,
                         total_tput as u64,
-                        kinds,
                     )
                 }
-                None => (0, 0, 0, Vec::new()),
+                None => (0, 0, 0),
             };
             let transports_mask = transports_to_mask(&kinds);
             out.push(NeighborSnapshot {
@@ -193,7 +216,11 @@ impl NeighborMonitor {
                 jitter_us,
                 throughput_bps,
                 transports_mask,
-                loss_ppm: packet_loss_ppm(st, now, loss_window),
+                loss_ppm,
+                probe_loss_ppm,
+                native_loss_ppm,
+                data_health_ppm,
+                loss_sample_count,
             });
         }
         out.sort_by_key(|n| n.node_id);

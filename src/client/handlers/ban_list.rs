@@ -5,7 +5,7 @@ use crate::{
     ban_repository::{BanEntry, BanOp},
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::BanList, Message, WriteMessageExt},
+    messages::{Message, WriteMessageExt, encoder::BanList},
     server::Server,
 };
 

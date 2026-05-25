@@ -30,6 +30,13 @@ enum MessageClass {
   CLASS_CONTROL = 2;
 }
 
+// Encoding applied to Frame.payload on the L1 wire. Receivers restore
+// IDENTITY bytes before dispatching to L2 and above.
+enum PayloadEncoding {
+  IDENTITY = 0;
+  ZSTD = 1;
+}
+
 // Carried by every send on every transport.
 // Stream wire: [u32 BE encoded_len][prost-encoded Frame].
 // Datagram wire (UDP): one prost-encoded Frame per datagram.
@@ -43,4 +50,6 @@ message Frame {
   // transport-level ordering moved to the overlay protocol.
   uint64 ts_us = 7;               // sender monotonic microseconds (ping RTT)
   bytes payload = 8;              // domain payload, opaque to transport
+  PayloadEncoding payload_encoding = 9;
+  uint64 uncompressed_payload_len = 10;
 }

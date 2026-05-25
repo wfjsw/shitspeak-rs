@@ -22,6 +22,6 @@
 pub mod runtime;
 
 pub use runtime::{
-    ModerationApplier, ModerationDelivery, ModerationInbound, ModerationService,
-    ModerationTransport, OverlayModerationTransport, MODERATION_CLASS, MODERATION_LEVEL,
+    MODERATION_CLASS, MODERATION_LEVEL, ModerationApplier, ModerationDelivery, ModerationInbound,
+    ModerationService, ModerationTransport, OverlayModerationTransport,
 };

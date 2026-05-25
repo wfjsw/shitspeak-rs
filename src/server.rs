@@ -6,23 +6,24 @@ use std::sync::{Arc, RwLock as StdRwLock};
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock as ParkingRwLock};
+use rand::RngExt;
 
 use cidr::AnyIpCidr;
 use prost::{EncodeError, Message as _};
-use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use rustls::version::{TLS12, TLS13};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
-use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 
 use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::channel_handler::SessionChannelShadow;
 use crate::channel_repository::{ChannelOperation, ChannelRepoTuning, ChannelRepository};
 use crate::client::{
-    client_session_identifier::ClientSessionIdentifier, state_log::ClientStateBroadcastPayload,
-    visibility::UserVisibilityState, AsyncMessageHandlerExt, Client,
+    AsyncMessageHandlerExt, Client, client_session_identifier::ClientSessionIdentifier,
+    state_log::ClientStateBroadcastPayload, visibility::UserVisibilityState,
 };
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError};
@@ -36,13 +37,15 @@ use crate::{
     config::{Config, ServerEntrypointConfig, UdpPingUserCountScope},
     constants::MTU,
     s2s::S2SManager,
-    types::{default_server_id, NodeIdentifier, DEFAULT_SERVER_ID},
+    types::{DEFAULT_SERVER_ID, NodeIdentifier, default_server_id},
 };
 
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
 type UdpPacket = (Bytes, std::net::SocketAddr, std::net::SocketAddr);
-const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 32;
+const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 128;
+const DYNAMIC_ENTRYPOINT_MIN_PORT: u16 = 49152;
+const DYNAMIC_ENTRYPOINT_MAX_PORT: u16 = 65535;
 
 fn startup_file_error(
     config_key: &str,
@@ -73,29 +76,44 @@ async fn bind_entrypoint_socket_pair(
         return bind_entrypoint_socket_pair_once(address).await;
     }
 
-    let mut last_udp_bind_error = None;
+    let mut last_bind_error = None;
     for attempt in 1..=DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS {
-        let tcp_listener = tokio::net::TcpListener::bind(address).await?;
-        let bound_address = tcp_listener.local_addr()?;
-        match tokio::net::UdpSocket::bind(bound_address).await {
-            Ok(udp_socket) => return Ok((tcp_listener, Arc::new(udp_socket))),
-            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+        let candidate = dynamic_entrypoint_bind_candidate(address, attempt);
+        let udp_socket = match tokio::net::UdpSocket::bind(candidate).await {
+            Ok(socket) => socket,
+            Err(err) if dynamic_bind_error_is_retryable(&err) => {
+                tracing::debug!(
+                    attempt,
+                    attempts = DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS,
+                    %candidate,
+                    error = ?err,
+                    "entrypoint UDP candidate is unavailable; retrying entrypoint bind"
+                );
+                last_bind_error = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let bound_address = udp_socket.local_addr()?;
+        match tokio::net::TcpListener::bind(bound_address).await {
+            Ok(tcp_listener) => return Ok((tcp_listener, Arc::new(udp_socket))),
+            Err(err) if dynamic_bind_error_is_retryable(&err) => {
                 tracing::debug!(
                     attempt,
                     attempts = DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS,
                     %bound_address,
                     error = ?err,
-                    "ephemeral TCP port's UDP address is unavailable; retrying entrypoint bind"
+                    "ephemeral UDP port's TCP address is unavailable; retrying entrypoint bind"
                 );
-                last_udp_bind_error = Some(err);
+                last_bind_error = Some(err);
             }
             Err(err) => return Err(err.into()),
         }
     }
 
-    let detail = last_udp_bind_error
+    let detail = last_bind_error
         .map(|err| err.to_string())
-        .unwrap_or_else(|| "no UDP bind attempt was made".to_owned());
+        .unwrap_or_else(|| "no retryable bind error was recorded".to_owned());
     Err(std::io::Error::new(
         std::io::ErrorKind::AddrInUse,
         format!(
@@ -103,6 +121,23 @@ async fn bind_entrypoint_socket_pair(
         ),
     )
     .into())
+}
+
+fn dynamic_entrypoint_bind_candidate(address: SocketAddr, attempt: usize) -> SocketAddr {
+    if attempt == 1 {
+        return address;
+    }
+    SocketAddr::new(
+        address.ip(),
+        rand::rng().random_range(DYNAMIC_ENTRYPOINT_MIN_PORT..=DYNAMIC_ENTRYPOINT_MAX_PORT),
+    )
+}
+
+fn dynamic_bind_error_is_retryable(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 async fn bind_entrypoint_socket_pair_once(
@@ -365,13 +400,15 @@ mod tests {
 
         assert_eq!(bindings.tcp_listeners.len(), 2);
         assert_eq!(bindings.udp_sockets.len(), 2);
-        assert!(!bindings.server_id_by_port.contains_key(
-            &bindings.tcp_listeners[0]
-                .listener
-                .local_addr()
-                .unwrap()
-                .port()
-        ));
+        assert!(
+            !bindings.server_id_by_port.contains_key(
+                &bindings.tcp_listeners[0]
+                    .listener
+                    .local_addr()
+                    .unwrap()
+                    .port()
+            )
+        );
         assert_eq!(
             bindings
                 .server_id_by_port
@@ -448,6 +485,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dynamic_bind_retry_covers_windows_permission_denied() {
+        assert!(dynamic_bind_error_is_retryable(&std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "port already in use"
+        )));
+        assert!(dynamic_bind_error_is_retryable(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "port excluded by the OS"
+        )));
+        assert!(!dynamic_bind_error_is_retryable(&std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a bind race"
+        )));
+    }
+
+    #[test]
+    fn dynamic_bind_retry_randomizes_candidates_after_first_attempt() {
+        let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        assert_eq!(dynamic_entrypoint_bind_candidate(address, 1), address);
+
+        let candidate = dynamic_entrypoint_bind_candidate(address, 2);
+        assert_eq!(candidate.ip(), address.ip());
+        assert!(
+            (DYNAMIC_ENTRYPOINT_MIN_PORT..=DYNAMIC_ENTRYPOINT_MAX_PORT).contains(&candidate.port())
+        );
+    }
+
     #[tokio::test]
     async fn apply_entrypoint_config_accepts_config_absent_server_id_scope() {
         install_default_provider();
@@ -474,10 +540,12 @@ mod tests {
                 .map(String::as_str),
             Some("tenant-from-existing-state")
         );
-        assert!(entrypoints
-            .server_id_by_port
-            .values()
-            .any(|server_id| { server_id == "tenant-from-existing-state" }));
+        assert!(
+            entrypoints
+                .server_id_by_port
+                .values()
+                .any(|server_id| { server_id == "tenant-from-existing-state" })
+        );
     }
 
     #[tokio::test]
@@ -521,16 +589,20 @@ mod tests {
             .disconnect_idle_local_clients(chrono::Utc::now() + chrono::Duration::seconds(1), 0)
             .await;
 
-        assert!(server
-            .clients
-            .get_client_in_server(DEFAULT_SERVER_ID, local_sid)
-            .await
-            .is_none());
-        assert!(server
-            .clients
-            .get_client_in_server(DEFAULT_SERVER_ID, remote_sid)
-            .await
-            .is_some());
+        assert!(
+            server
+                .clients
+                .get_client_in_server(DEFAULT_SERVER_ID, local_sid)
+                .await
+                .is_none()
+        );
+        assert!(
+            server
+                .clients
+                .get_client_in_server(DEFAULT_SERVER_ID, remote_sid)
+                .await
+                .is_some()
+        );
     }
 }
 
@@ -1147,13 +1219,21 @@ impl Server {
                                     found = Some(c);
                                 }
                                 Some(Err(e)) => {
-                                    tracing::trace!("UDP address-match decrypt failed for {:?} from {}: {:?}, removing stale binding", c.get_session_id(), src_addr, e);
+                                    tracing::trace!(
+                                        "UDP address-match decrypt failed for {:?} from {}: {:?}, removing stale binding",
+                                        c.get_session_id(),
+                                        src_addr,
+                                        e
+                                    );
                                     server
                                         .clients
                                         .unbind_client_udp_endpoint(local_addr, src_addr);
                                 }
                                 None => {
-                                    tracing::trace!("UDP address-matched client {:?} has no crypt state, removing stale binding", c.get_session_id());
+                                    tracing::trace!(
+                                        "UDP address-matched client {:?} has no crypt state, removing stale binding",
+                                        c.get_session_id()
+                                    );
                                     server
                                         .clients
                                         .unbind_client_udp_endpoint(local_addr, src_addr);
@@ -1167,7 +1247,10 @@ impl Server {
                         let mut matched = None;
                         for c in &candidates {
                             if !c.is_authenticated() {
-                                tracing::trace!("UDP client {:?} is not authenticated, skipping for IP fallback", c.get_session_id());
+                                tracing::trace!(
+                                    "UDP client {:?} is not authenticated, skipping for IP fallback",
+                                    c.get_session_id()
+                                );
                                 continue;
                             }
 
@@ -1178,17 +1261,29 @@ impl Server {
                                         let mut decrypted = BytesMut::new();
                                         match state.decrypt(&mut decrypted, &packet) {
                                             Ok(()) => {
-                                                tracing::trace!("UDP packet from {} successfully decrypted with client {:?} during IP fallback", src_addr, c.get_session_id());
+                                                tracing::trace!(
+                                                    "UDP packet from {} successfully decrypted with client {:?} during IP fallback",
+                                                    src_addr,
+                                                    c.get_session_id()
+                                                );
                                                 Some(decrypted)
                                             }
                                             Err(e) => {
-                                                tracing::trace!("UDP packet from {} failed to decrypt with client {:?} during IP fallback: {:?}", src_addr, c.get_session_id(), e);
+                                                tracing::trace!(
+                                                    "UDP packet from {} failed to decrypt with client {:?} during IP fallback: {:?}",
+                                                    src_addr,
+                                                    c.get_session_id(),
+                                                    e
+                                                );
                                                 None
                                             }
                                         }
                                     }
                                     None => {
-                                        tracing::trace!("UDP client {:?} has no crypt state yet, skipping for IP fallback", c.get_session_id());
+                                        tracing::trace!(
+                                            "UDP client {:?} has no crypt state yet, skipping for IP fallback",
+                                            c.get_session_id()
+                                        );
                                         None
                                     }
                                 }
@@ -1307,7 +1402,12 @@ impl Server {
                     Ok(crate::voice::codec::IncomingUdpPacket::Audio(decoded_audio)) => {
                         tracing::trace!(
                             "UDP audio packet from {}: sender_session={:?}, frame_number={}, format={:?}, payload_len={}",
-                            src_addr, decoded_audio.sender_session, decoded_audio.frame_number, decoded_audio.format, decoded_audio.audio_payload.len());
+                            src_addr,
+                            decoded_audio.sender_session,
+                            decoded_audio.frame_number,
+                            decoded_audio.format,
+                            decoded_audio.audio_payload.len()
+                        );
                         client.push_voice_routing(decoded_audio);
                     }
                     Err(e) => {

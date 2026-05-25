@@ -2,6 +2,7 @@
 //! LSDB graph and swapped atomically via `ArcSwap`.
 
 pub mod dijkstra;
+pub mod dynamic;
 pub mod recompute;
 
 use std::collections::HashMap;

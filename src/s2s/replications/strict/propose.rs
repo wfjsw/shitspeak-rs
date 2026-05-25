@@ -16,8 +16,8 @@ use tracing::trace;
 
 use super::super::error::ReplicationError;
 use super::super::proto::{StrictBody, StrictPropose, StrictProposeAck};
-use super::runtime::{Proposal, StrictRuntime};
 use super::StrictReplicable;
+use super::runtime::{Proposal, StrictRuntime};
 
 impl<R: StrictReplicable> StrictRuntime<R> {
     /// Begin a local proposal. Stores a waker in the proposal that the

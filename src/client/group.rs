@@ -108,11 +108,7 @@ pub fn is_member_in_group(
         },
     };
 
-    if invert {
-        !in_group
-    } else {
-        in_group
-    }
+    if invert { !in_group } else { in_group }
 }
 
 fn evaluate_group_string_match_type<'a>(

@@ -19,14 +19,14 @@ use crate::client::user_info::Credential;
 use crate::client::visibility::UserVisibilityState;
 use crate::client::{AsyncMessageHandlerExt, Client};
 use crate::config::{WebAuthMode, WebConfig};
-use crate::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
 use crate::messages::Message;
+use crate::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
 use crate::server::Server;
 use crate::web::peer::{PeerSignal, WebRtcPeer};
 use crate::web::protocol::{
-    encode_server_event, AuthRequest, ClientCommand, ServerEvent, VoiceTarget, WebChannelState,
-    WebCodecVersion, WebGatewayConfig, WebMoqGatewayConfig, WebPermissionDenied, WebServerConfig,
-    WebServerSync, WebTransportKind, WebUserRemove, WebUserState, WebVolumeAdjustment,
+    AuthRequest, ClientCommand, ServerEvent, VoiceTarget, WebChannelState, WebCodecVersion,
+    WebGatewayConfig, WebMoqGatewayConfig, WebPermissionDenied, WebServerConfig, WebServerSync,
+    WebTransportKind, WebUserRemove, WebUserState, WebVolumeAdjustment, encode_server_event,
 };
 
 pub const ALPN_HTTP_1_1: &[u8] = b"http/1.1";

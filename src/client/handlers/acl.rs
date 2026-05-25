@@ -1,12 +1,12 @@
 use crate::{
-    acl::{ACLPermissions, ACL},
+    acl::{ACL, ACLPermissions},
     channel_repository::ChannelOp,
     client::Client,
     errors::MessageHandlerError,
-    localization::{text, TextKey},
+    localization::{TextKey, text},
     messages::{
-        encoder::{Acl as EncoderAcl, ChanAcl},
         Message, WriteMessageExt,
+        encoder::{Acl as EncoderAcl, ChanAcl},
     },
     server::Server,
 };

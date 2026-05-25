@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 
 use crate::types::NodeIdentifier;
 
+use super::SendOptions;
 use super::config::TransportConfig;
 use super::connection::{BackoffState, OutboundFrame, PeerState};
 use super::endpoint::{
@@ -480,6 +481,26 @@ impl ConnectionManager {
         class: MessageClass,
         payload: Bytes,
     ) -> Result<(), SendError> {
+        self.send_with_options(
+            node,
+            level,
+            routing_metric,
+            class,
+            payload,
+            SendOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn send_with_options(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: Option<RoutingMetric>,
+        class: MessageClass,
+        payload: Bytes,
+        options: SendOptions,
+    ) -> Result<(), SendError> {
         let routing_metric =
             routing_metric.unwrap_or_else(|| RoutingMetric::default_for_level(level));
         let peer = self
@@ -495,7 +516,7 @@ impl ConnectionManager {
         let mut first_err = None;
         for chosen in choices {
             match self
-                .send_stream(&peer, chosen, class, payload.clone())
+                .send_stream(&peer, chosen, class, payload.clone(), options)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -519,11 +540,24 @@ impl ConnectionManager {
         class: MessageClass,
         payload: Bytes,
     ) -> Result<(), SendError> {
+        self.send_via_with_options(node, transport, class, payload, SendOptions::default())
+            .await
+    }
+
+    pub async fn send_via_with_options(
+        &self,
+        node: NodeIdentifier,
+        transport: TransportKind,
+        class: MessageClass,
+        payload: Bytes,
+        options: SendOptions,
+    ) -> Result<(), SendError> {
         let peer = self
             .inner
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
-        self.send_stream(&peer, transport, class, payload).await
+        self.send_stream(&peer, transport, class, payload, options)
+            .await
     }
 
     async fn send_stream(
@@ -532,13 +566,14 @@ impl ConnectionManager {
         kind: TransportKind,
         class: MessageClass,
         payload: Bytes,
+        options: SendOptions,
     ) -> Result<(), SendError> {
         let sender = peer.try_get_stream(kind).ok_or(SendError::StreamClosed {
             node: peer.node_id(),
             transport: kind,
         })?;
         sender
-            .try_send(OutboundFrame::new(class, payload))
+            .try_send(OutboundFrame::with_options(class, payload, options))
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => SendError::Backpressure {
                     node: peer.node_id(),

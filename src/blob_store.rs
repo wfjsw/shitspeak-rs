@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
+use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use bytes::Bytes;
 use tokio::fs;
 use tokio::io::AsyncWriteExt as _;

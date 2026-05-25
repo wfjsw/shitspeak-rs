@@ -27,7 +27,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tokio::time::{interval, Interval};
+use tokio::time::{Instant as TokioInstant, Interval, interval_at};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -35,9 +35,14 @@ use tracing::{debug, trace, warn};
 use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
 
+use super::compression::{
+    CompressionConfig, maybe_compress_frame_payload, validate_and_decode_payload,
+};
 use super::connection::{ActiveStream, OutboundFrame, PeerState};
-use super::frame::{build_frame, stream_codec, FrameType};
+use super::frame::{FrameType, build_frame, stream_codec};
 use super::manager::InboundDispatch;
+use super::native_stats::BoxedNativeLossSampler;
+use super::probe_schedule::{StartupBandwidthProbe, bandwidth_probe_startup_jitter};
 use super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
 
 /// Tunables for a single stream pump. Cloned per stream.
@@ -51,6 +56,8 @@ pub(crate) struct StreamPumpConfig {
     ping_interval: Duration,
     bandwidth_probe_interval: Duration,
     bandwidth_probe_size: usize,
+    native_stats_interval: Duration,
+    compression: CompressionConfig,
     /// Cap on how many in-flight pings we remember. Older entries are
     /// dropped when the buffer fills, preventing unbounded memory if pongs
     /// are lost.
@@ -68,6 +75,8 @@ impl StreamPumpConfig {
         ping_interval: Duration,
         bandwidth_probe_interval: Duration,
         bandwidth_probe_size: usize,
+        native_stats_interval: Duration,
+        compression: CompressionConfig,
         max_pending_pings: usize,
     ) -> Self {
         Self {
@@ -79,6 +88,8 @@ impl StreamPumpConfig {
             ping_interval,
             bandwidth_probe_interval,
             bandwidth_probe_size,
+            native_stats_interval,
+            compression,
             max_pending_pings,
         }
     }
@@ -93,16 +104,25 @@ pub(crate) fn spawn_stream_pump<S>(
     inbound: InboundDispatch,
     remote_addr: Option<SocketAddr>,
     is_dialer: bool,
+    closed: CancellationToken,
+    native_sampler: Option<BoxedNativeLossSampler>,
 ) -> ActiveStream
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (tx, rx) = mpsc::channel::<OutboundFrame>(cfg.outbound_capacity);
-    let closed = CancellationToken::new();
 
     let active = ActiveStream::new(cfg.transport, remote_addr, tx, closed.clone(), is_dialer);
 
-    tokio::spawn(run_pump(stream, cfg, peer, inbound, rx, closed));
+    tokio::spawn(run_pump(
+        stream,
+        cfg,
+        peer,
+        inbound,
+        rx,
+        closed,
+        native_sampler,
+    ));
 
     active
 }
@@ -182,10 +202,18 @@ impl MaybeInterval {
         if period.is_zero() {
             Self::Disabled
         } else {
-            let mut iv = interval(period);
-            // burn the immediate first tick
-            iv.reset();
-            Self::Active(iv)
+            Self::Active(interval_at(TokioInstant::now() + period, period))
+        }
+    }
+
+    fn maybe_with_initial_delay(period: Duration, initial_delay: Duration) -> Self {
+        if period.is_zero() {
+            Self::Disabled
+        } else {
+            Self::Active(interval_at(
+                TokioInstant::now() + period.saturating_add(initial_delay),
+                period,
+            ))
         }
     }
 
@@ -225,6 +253,7 @@ async fn run_pump<S>(
     inbound: InboundDispatch,
     mut rx: mpsc::Receiver<OutboundFrame>,
     closed: CancellationToken,
+    mut native_sampler: Option<BoxedNativeLossSampler>,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -232,8 +261,23 @@ async fn run_pump<S>(
     let mut framed = Framed::new(stream, codec);
     let mut ping_tick = MaybeInterval::maybe(cfg.ping_interval);
     let probe_enabled = cfg.bandwidth_probe_size > 0;
+    let startup_probe_delay = bandwidth_probe_startup_jitter(
+        cfg.local_node,
+        cfg.peer_node,
+        cfg.transport,
+        cfg.ping_interval,
+    );
+    let mut startup_probe = StartupBandwidthProbe::new(
+        probe_enabled && !cfg.bandwidth_probe_interval.is_zero(),
+        startup_probe_delay,
+    );
     let mut probe_tick = if probe_enabled {
-        MaybeInterval::maybe(cfg.bandwidth_probe_interval)
+        MaybeInterval::maybe_with_initial_delay(cfg.bandwidth_probe_interval, startup_probe_delay)
+    } else {
+        MaybeInterval::Disabled
+    };
+    let mut native_tick = if native_sampler.is_some() {
+        MaybeInterval::maybe(cfg.native_stats_interval)
     } else {
         MaybeInterval::Disabled
     };
@@ -253,7 +297,13 @@ async fn run_pump<S>(
         now_us(),
         Bytes::new(),
     );
-    if let Err(e) = encode_and_send(&mut framed, &hello, cfg.transport, &peer).await {
+    let hello_result = tokio::select! {
+        biased;
+
+        _ = closed.cancelled() => return,
+        result = encode_and_send(&mut framed, &hello, cfg.transport, &peer) => result,
+    };
+    if let Err(e) = hello_result {
         if is_peer_closed_initial_write(&e) {
             debug!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "hello write closed by peer");
         } else {
@@ -276,6 +326,7 @@ async fn run_pump<S>(
                 let buf = match maybe_in {
                     Some(Ok(b)) => b,
                     Some(Err(e)) => {
+                        peer.metrics().record_data_health_failure(cfg.transport);
                         if is_tls_close_notify_eof(&e) {
                             debug!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream closed without TLS close_notify");
                         } else {
@@ -285,11 +336,12 @@ async fn run_pump<S>(
                     }
                     None => { debug!(peer=%peer.node_id(), transport=?cfg.transport, "stream EOF"); break; }
                 };
+                peer.metrics().record_data_health_success(cfg.transport);
                 let recv_size = buf.len();
                 peer.metrics().record_recv(cfg.transport, recv_size);
                 match pb::Frame::decode(buf.as_ref()) {
                     Ok(frame) => {
-                        if let Err(e) = handle_inbound(
+                        match handle_inbound(
                             frame,
                             recv_size,
                             &cfg,
@@ -299,11 +351,19 @@ async fn run_pump<S>(
                             &mut pending,
                             level_for_metrics,
                         ).await {
-                            warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "inbound handling failed");
-                            break;
+                            Ok(transport_link_stable) => {
+                                if transport_link_stable {
+                                    startup_probe.arm();
+                                }
+                            }
+                            Err(e) => {
+                                warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "inbound handling failed");
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
+                        peer.metrics().record_data_health_failure(cfg.transport);
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "frame decode error; dropping connection");
                         break;
                     }
@@ -312,7 +372,8 @@ async fn run_pump<S>(
 
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
-                let frame = build_frame(
+                let original_payload_len = out.payload().len();
+                let mut frame = build_frame(
                     cfg.local_node,
                     cfg.peer_node,
                     level_for_metrics,
@@ -321,10 +382,19 @@ async fn run_pump<S>(
                     now_us(),
                     out.payload().clone(),
                 );
+                if let Err(e) = maybe_compress_frame_payload(
+                    &mut frame,
+                    out.options(),
+                    cfg.compression,
+                    cfg.max_frame_bytes,
+                ) {
+                    warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream payload compression failed");
+                    break;
+                }
                 match encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
                     Ok(()) => peer
                         .metrics()
-                        .record_payload_sent(cfg.transport, out.payload().len()),
+                        .record_payload_sent(cfg.transport, original_payload_len),
                     Err(e) => {
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream write failed");
                         break;
@@ -357,39 +427,40 @@ async fn run_pump<S>(
                 }
             }
 
+            _ = startup_probe.tick() => {
+                startup_probe.complete();
+                if send_bandwidth_probes(
+                    &mut framed,
+                    &cfg,
+                    &peer,
+                    &mut pending,
+                    pending_timeout,
+                ).await.is_err() {
+                    break;
+                }
+            }
+
             _ = probe_tick.tick() => {
-                record_expired_pending(&mut pending, pending_timeout, cfg.transport, &peer);
-                let mut ts = now_us();
-                for shape in ServiceShape::ALL {
-                    let payload_bytes = shape.probe_payload_bytes(cfg.bandwidth_probe_size);
-                    if payload_bytes == 0 {
-                        continue;
+                if send_bandwidth_probes(
+                    &mut framed,
+                    &cfg,
+                    &peer,
+                    &mut pending,
+                    pending_timeout,
+                ).await.is_err() {
+                    break;
+                }
+            }
+
+            _ = native_tick.tick() => {
+                if let Some(sampler) = native_sampler.as_mut() {
+                    if let Some(sample) = sampler.sample() {
+                        peer.metrics().record_native_loss_sample(
+                            cfg.transport,
+                            sample.sent_units(),
+                            sample.lost_units(),
+                        );
                     }
-                    let payload = BytesMut::zeroed(payload_bytes).freeze();
-                    let frame = build_frame(
-                        cfg.local_node,
-                        cfg.peer_node,
-                        shape.service_level(),
-                        FrameType::Ping,
-                        shape.message_class(),
-                        ts,
-                        payload,
-                    );
-                    if frame.encoded_len() > cfg.max_frame_bytes {
-                        continue;
-                    }
-                    match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
-                        Ok(_) => {
-                            if pending.insert(ts, Some(shape), payload_bytes).is_some() {
-                                peer.metrics().record_probe_lost(cfg.transport);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(peer=%peer.node_id(), transport=?cfg.transport, service=%shape.name(), error=%e, "probe write failed");
-                            break;
-                        }
-                    }
-                    ts = ts.saturating_add(1);
                 }
             }
         }
@@ -397,6 +468,52 @@ async fn run_pump<S>(
 
     closed.cancel();
     trace!(peer=%peer.node_id(), transport=?cfg.transport, "stream pump exiting");
+}
+
+async fn send_bandwidth_probes<S>(
+    framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
+    cfg: &StreamPumpConfig,
+    peer: &PeerState,
+    pending: &mut PendingPings,
+    pending_timeout: Duration,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    record_expired_pending(pending, pending_timeout, cfg.transport, peer);
+    let mut ts = now_us();
+    for shape in ServiceShape::ALL {
+        let payload_bytes = shape.probe_payload_bytes(cfg.bandwidth_probe_size);
+        if payload_bytes == 0 {
+            continue;
+        }
+        let payload = BytesMut::zeroed(payload_bytes).freeze();
+        let frame = build_frame(
+            cfg.local_node,
+            cfg.peer_node,
+            shape.service_level(),
+            FrameType::Ping,
+            shape.message_class(),
+            ts,
+            payload,
+        );
+        if frame.encoded_len() > cfg.max_frame_bytes {
+            continue;
+        }
+        match encode_and_send_returning_size(framed, &frame, cfg.transport, peer).await {
+            Ok(_) => {
+                if pending.insert(ts, Some(shape), payload_bytes).is_some() {
+                    peer.metrics().record_probe_lost(cfg.transport);
+                }
+            }
+            Err(e) => {
+                warn!(peer=%peer.node_id(), transport=?cfg.transport, service=%shape.name(), error=%e, "probe write failed");
+                return Err(e);
+            }
+        }
+        ts = ts.saturating_add(1);
+    }
+    Ok(())
 }
 
 fn record_expired_pending(
@@ -437,13 +554,17 @@ where
         .encode(&mut buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let len = buf.len();
-    framed.send(buf.freeze()).await?;
+    if let Err(error) = framed.send(buf.freeze()).await {
+        peer.metrics().record_data_health_failure(transport);
+        return Err(error);
+    }
     peer.metrics().record_sent(transport, len);
+    peer.metrics().record_data_health_success(transport);
     Ok(len)
 }
 
 async fn handle_inbound<S>(
-    frame: pb::Frame,
+    mut frame: pb::Frame,
     _incoming_wire_size: usize,
     cfg: &StreamPumpConfig,
     peer: &PeerState,
@@ -451,13 +572,15 @@ async fn handle_inbound<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     pending: &mut PendingPings,
     level: ServiceLevel,
-) -> std::io::Result<()>
+) -> std::io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
+    validate_and_decode_payload(&mut frame, cfg.max_frame_bytes)?;
+    let mut transport_link_stable = false;
     let ty = match pb::FrameType::try_from(frame.frame_type) {
         Ok(v) => v,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(false),
     };
     match ty {
         pb::FrameType::FrameData => {
@@ -498,6 +621,9 @@ where
                 peer.metrics().record_rtt(cfg.transport, rtt);
                 if let Some(pending) = pending.take(frame.ts_us) {
                     peer.metrics().record_probe_delivered(cfg.transport);
+                    if pending.shape.is_none() {
+                        transport_link_stable = true;
+                    }
                     if let Some(shape) = pending.shape {
                         peer.metrics().record_probe(
                             cfg.transport,
@@ -519,7 +645,7 @@ where
             ));
         }
     }
-    Ok(())
+    Ok(transport_link_stable)
 }
 
 #[inline]

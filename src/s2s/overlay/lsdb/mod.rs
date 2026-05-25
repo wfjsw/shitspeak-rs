@@ -6,11 +6,12 @@ pub mod store;
 pub mod sync;
 
 pub use advert::{
-    capture_boot_epoch, emit_once, flood_to_neighbors, handle_flood, spawn_emitter_task, LsaEmitter,
+    LsaEmitter, LsaFloodPacer, capture_boot_epoch, emit_once, flood_to_neighbors, handle_flood,
+    spawn_emitter_task,
 };
 pub use store::{
-    spawn_floor_persister, AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry, LsaFloor,
-    OriginVersion,
+    AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry, LsaFloor, OriginVersion,
+    spawn_floor_persister,
 };
 pub use sync::{
     full_pull, handle_request as handle_sync_request, handle_response as handle_sync_response,

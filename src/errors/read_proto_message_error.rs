@@ -1,6 +1,6 @@
 use crate::errors::{
-    from_proto_to_message_error::FromProtoToMessageError, MessageLengthExceededError,
-    UnknownMessageTypeError,
+    MessageLengthExceededError, UnknownMessageTypeError,
+    from_proto_to_message_error::FromProtoToMessageError,
 };
 
 #[derive(Debug)]

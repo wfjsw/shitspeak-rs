@@ -7,6 +7,7 @@
 //! dial the peer immediately while preserving a wall-clock `last_seen` so
 //! old peers are probed less aggressively than freshly seen peers.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -140,8 +141,10 @@ pub fn load(persistence_dir: &Path) -> Result<Vec<PersistedPeerRecord>, OverlayE
         );
         return Ok(Vec::new());
     }
+    let address_peer_counts = parsed_address_peer_counts(&parsed.peers);
     let mut out = Vec::with_capacity(parsed.peers.len());
     let mut dropped_addresses = 0usize;
+    let mut dropped_ambiguous_addresses = 0usize;
     let mut dropped_peers = 0usize;
     for p in parsed.peers {
         let mut addrs = Vec::with_capacity(p.addresses.len());
@@ -153,6 +156,13 @@ pub fn load(persistence_dir: &Path) -> Result<Vec<PersistedPeerRecord>, OverlayE
             let addr = PeerAddress::new(sa, a.transport.into());
             if !persisted_address_is_usable(addr) || addrs.contains(&addr) {
                 dropped_addresses += 1;
+                continue;
+            }
+            if address_peer_counts
+                .get(&addr)
+                .is_some_and(|count| *count > 1)
+            {
+                dropped_ambiguous_addresses += 1;
                 continue;
             }
             addrs.push(addr);
@@ -167,10 +177,11 @@ pub fn load(persistence_dir: &Path) -> Result<Vec<PersistedPeerRecord>, OverlayE
             p.last_seen_unix_ms.map(system_time_from_unix_ms),
         ));
     }
-    if dropped_addresses > 0 || dropped_peers > 0 {
+    if dropped_addresses > 0 || dropped_ambiguous_addresses > 0 || dropped_peers > 0 {
         tracing::warn!(
             file = %path.display(),
             dropped_addresses,
+            dropped_ambiguous_addresses,
             dropped_peers,
             "cleaned invalid addresses from persisted overlay peers"
         );
@@ -194,22 +205,31 @@ pub fn save(persistence_dir: &Path, peers: &[PersistedPeerRecord]) -> Result<(),
     })?;
     let final_path = dir.join(FILE_NAME);
     let tmp_path = dir.join(format!("{FILE_NAME}.tmp"));
+    let address_peer_counts = record_address_peer_counts(peers);
 
     let payload = PersistedPeers {
         version: SCHEMA_VERSION,
         peers: peers
             .iter()
-            .map(|peer| PersistedPeer {
-                node_id: peer.node_id,
-                addresses: peer
+            .filter_map(|peer| {
+                let addresses: Vec<_> = peer
                     .addresses
                     .iter()
+                    .filter(|addr| {
+                        address_peer_counts
+                            .get(addr)
+                            .is_none_or(|count| *count <= 1)
+                    })
                     .map(|a| PersistedAddress {
                         addr: a.addr().to_string(),
                         transport: a.transport().into(),
                     })
-                    .collect(),
-                last_seen_unix_ms: peer.last_seen.and_then(unix_ms_from_system_time),
+                    .collect();
+                (!addresses.is_empty()).then(|| PersistedPeer {
+                    node_id: peer.node_id,
+                    addresses,
+                    last_seen_unix_ms: peer.last_seen.and_then(unix_ms_from_system_time),
+                })
             })
             .collect(),
     };
@@ -260,6 +280,36 @@ fn persisted_address_is_usable(addr: PeerAddress) -> bool {
 
 fn persisted_ip_is_usable(ip: IpAddr) -> bool {
     !ip.is_unspecified() && !ip.is_multicast()
+}
+
+fn parsed_address_peer_counts(peers: &[PersistedPeer]) -> HashMap<PeerAddress, usize> {
+    let mut counts = HashMap::new();
+    for peer in peers {
+        let mut seen_for_peer = HashSet::new();
+        for addr in &peer.addresses {
+            let Ok(socket) = addr.addr.parse::<SocketAddr>() else {
+                continue;
+            };
+            let peer_addr = PeerAddress::new(socket, addr.transport.into());
+            if persisted_address_is_usable(peer_addr) && seen_for_peer.insert(peer_addr) {
+                *counts.entry(peer_addr).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+fn record_address_peer_counts(peers: &[PersistedPeerRecord]) -> HashMap<PeerAddress, usize> {
+    let mut counts = HashMap::new();
+    for peer in peers {
+        let mut seen_for_peer = HashSet::new();
+        for addr in &peer.addresses {
+            if seen_for_peer.insert(*addr) {
+                *counts.entry(*addr).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
 }
 
 #[cfg(test)]
@@ -351,6 +401,110 @@ mod tests {
         assert_eq!(cleaned.peers[0].node_id, 7);
         assert_eq!(cleaned.peers[0].addresses.len(), 1);
         assert_eq!(cleaned.peers[0].addresses[0].addr, "10.0.0.1:64739");
+    }
+
+    #[test]
+    fn load_removes_addresses_shared_by_multiple_peer_ids() {
+        let dir = TempDir::new().unwrap();
+        let overlay_dir = dir.path().join(SUBDIR);
+        fs::create_dir_all(&overlay_dir).unwrap();
+        let path = overlay_dir.join(FILE_NAME);
+        fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "peers": [
+    {
+      "node_id": 7,
+      "addresses": [
+        { "addr": "10.0.0.1:64739", "transport": "tcp" },
+        { "addr": "10.0.0.7:64739", "transport": "tcp" }
+      ]
+    },
+    {
+      "node_id": 8,
+      "addresses": [
+        { "addr": "10.0.0.1:64739", "transport": "tcp" },
+        { "addr": "10.0.0.8:64739", "transport": "tcp" }
+      ]
+    },
+    {
+      "node_id": 9,
+      "addresses": [
+        { "addr": "10.0.0.1:64739", "transport": "tcp" }
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let loaded = load(dir.path()).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].node_id(), 7);
+        assert_eq!(
+            loaded[0].addresses(),
+            &[PeerAddress::new(
+                "10.0.0.7:64739".parse().unwrap(),
+                TransportKind::Tcp
+            )]
+        );
+        assert_eq!(loaded[1].node_id(), 8);
+        assert_eq!(
+            loaded[1].addresses(),
+            &[PeerAddress::new(
+                "10.0.0.8:64739".parse().unwrap(),
+                TransportKind::Tcp
+            )]
+        );
+
+        let cleaned: PersistedPeers =
+            serde_json::from_slice(&fs::read(path).unwrap()).expect("cleaned peers json");
+        assert_eq!(cleaned.peers.len(), 2);
+        assert!(
+            cleaned
+                .peers
+                .iter()
+                .all(|peer| peer.addresses.iter().all(|a| a.addr != "10.0.0.1:64739"))
+        );
+    }
+
+    #[test]
+    fn save_skips_addresses_shared_by_multiple_peer_ids() {
+        let dir = TempDir::new().unwrap();
+        let shared = PeerAddress::new("10.0.0.1:64739".parse().unwrap(), TransportKind::Tcp);
+        let peers = vec![
+            PersistedPeerRecord::new(
+                7,
+                vec![
+                    shared,
+                    PeerAddress::new("10.0.0.7:64739".parse().unwrap(), TransportKind::Tcp),
+                ],
+                None,
+            ),
+            PersistedPeerRecord::new(
+                8,
+                vec![
+                    shared,
+                    PeerAddress::new("10.0.0.8:64739".parse().unwrap(), TransportKind::Tcp),
+                ],
+                None,
+            ),
+        ];
+
+        save(dir.path(), &peers).unwrap();
+
+        let written: PersistedPeers =
+            serde_json::from_slice(&fs::read(peers_file(dir.path())).unwrap())
+                .expect("persisted peers json");
+        assert_eq!(written.peers.len(), 2);
+        assert!(
+            written
+                .peers
+                .iter()
+                .all(|peer| peer.addresses.iter().all(|a| a.addr != "10.0.0.1:64739"))
+        );
     }
 
     #[test]

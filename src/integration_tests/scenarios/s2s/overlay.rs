@@ -14,9 +14,9 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::s2s::testing::{
-    full_mesh_seeds, install_provider_once, line_seeds, loopback, mint_pki, overlay_cfg,
-    pick_free_port, transport_cfg, wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
-    Capture, Cluster, MessageType,
+    Capture, Cluster, MessageType, full_mesh_seeds, install_provider_once, line_seeds, loopback,
+    mint_pki, overlay_cfg, pick_free_port, s2s_network_test_guard, transport_cfg,
+    wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
 };
 use crate::s2s::transport::{
     ConnectionManager, MessageClass, PeerAddress, ServiceLevel, TransportKind,
@@ -460,9 +460,11 @@ async fn transit_routing_disabled_nodes_are_not_route_intermediates() {
         err,
         crate::s2s::overlay::OverlayError::NoRoute { dst: 3, .. }
     ));
-    assert!(timeout(Duration::from_millis(500), rx_c.recv())
-        .await
-        .is_err());
+    assert!(
+        timeout(Duration::from_millis(500), rx_c.recv())
+            .await
+            .is_err()
+    );
 
     cluster.shutdown_all().await;
 }
@@ -474,6 +476,7 @@ async fn transit_routing_disabled_nodes_are_not_route_intermediates() {
 /// from ordinary joins/leaves.
 #[tokio::test]
 async fn restart_detection_via_hello() {
+    let _guard = s2s_network_test_guard().await;
     install_provider_once();
     // Keep the PKI alive across the B restart by minting once and
     // building two transports against the same cert/key pair.
@@ -688,6 +691,50 @@ async fn anti_entropy_repairs_lost_lsa() {
         a.overlay.alive_members().contains(&3),
         "A never saw C: alive = {:?}",
         a.overlay.alive_members()
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// Checks that paced flooding still converges after a burst of local LSA
+/// updates. Expected: every node eventually sees the newest max-user value
+/// for every origin even when flood frames are coalesced and chunked.
+#[tokio::test]
+async fn paced_lsa_flood_burst_converges() {
+    let cluster = Cluster::build_with_cfg(&[1, 2, 3, 4], full_mesh_seeds, |_idx, base| {
+        base.with_lsa_flood_pacing_interval(Duration::from_millis(50))
+            .with_lsa_flood_max_batch_lsas(2)
+    })
+    .await;
+
+    assert!(
+        wait_for_full_routing(&cluster, Duration::from_secs(12)).await,
+        "cluster did not route before burst"
+    );
+
+    for round in 0..5u64 {
+        for node in &cluster.nodes {
+            node.overlay
+                .update_local_max_users(node.id as u64 * 100 + round);
+        }
+    }
+
+    let expected_round = 4u64;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            cluster.nodes.iter().all(|observer| {
+                let seen = observer.overlay.link_state_snapshot();
+                cluster.nodes.iter().all(|origin| {
+                    seen.iter().any(|lsa| {
+                        lsa.origin == origin.id
+                            && lsa.max_users == origin.id as u64 * 100 + expected_round
+                    })
+                })
+            })
+        })
+        .await,
+        "paced burst did not converge; node1 lsdb = {:?}",
+        cluster.node(1).overlay.link_state_snapshot()
     );
 
     cluster.shutdown_all().await;

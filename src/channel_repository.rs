@@ -31,22 +31,22 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use enumflags2::BitFlags;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use scc::HashCache;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
-use crate::acl::ACLPermissions;
 use crate::acl::ACL;
+use crate::acl::ACLPermissions;
 use crate::channels::{Channel, ChannelPatch, PendingDeleteState};
 use crate::config::Config;
 use crate::errors::ChannelRepoError;
-use crate::types::{default_server_id, DEFAULT_SERVER_ID};
+use crate::types::{DEFAULT_SERVER_ID, default_server_id};
 
 pub(crate) type ChannelStateSubscription = broadcast::Receiver<Arc<ChannelOperation>>;
 
@@ -953,11 +953,7 @@ impl ChannelRepository {
             .copied()
             .unwrap_or(0);
         let base = max_id + 1;
-        if temporary {
-            base | 0x8000_0000
-        } else {
-            base
-        }
+        if temporary { base | 0x8000_0000 } else { base }
     }
 
     pub async fn create_channel(

@@ -1,8 +1,8 @@
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use enumflags2::BitFlags;
-use shitspeak_rs::acl::{evaluate_permission, ACLPermissions, ACL};
+use shitspeak_rs::acl::{ACL, ACLPermissions, evaluate_permission};
 use shitspeak_rs::channels::Channel;
 use shitspeak_rs::client::group::ClientMembershipQuery;
 

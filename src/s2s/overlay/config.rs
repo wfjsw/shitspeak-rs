@@ -60,6 +60,10 @@ pub struct OverlayConfig {
     lsa_refresh_interval: Duration,
     lsa_max_age: Duration,
     tombstone_in_memory_age: Duration,
+    lsa_flood_pacing_interval: Duration,
+    lsa_flood_max_batch_lsas: usize,
+    lsa_refresh_reduction_enabled: bool,
+    lsa_unchanged_refresh_interval: Duration,
 
     // ── Anti-entropy ──
     anti_entropy_interval: Duration,
@@ -69,6 +73,7 @@ pub struct OverlayConfig {
 
     // ── Routing recompute debounce ──
     routing_recompute_debounce: Duration,
+    routing_dynamic_spf_enabled: bool,
 
     // ── Cost-function knobs (operator-tunable; see crate docs) ──
     reliable_throughput_penalty_us_kbps: f64,
@@ -115,11 +120,16 @@ impl OverlayConfig {
             lsa_refresh_interval: Duration::from_secs(30),
             lsa_max_age: Duration::from_secs(120),
             tombstone_in_memory_age: Duration::from_secs(300),
+            lsa_flood_pacing_interval: Duration::from_millis(1000),
+            lsa_flood_max_batch_lsas: 4096,
+            lsa_refresh_reduction_enabled: true,
+            lsa_unchanged_refresh_interval: Duration::from_secs(90),
 
             anti_entropy_interval: Duration::from_secs(60),
 
             peer_persistence_interval: Duration::from_secs(30),
             routing_recompute_debounce: Duration::from_millis(25),
+            routing_dynamic_spf_enabled: true,
 
             reliable_throughput_penalty_us_kbps: 1_000_000.0,
             rll_jitter_weight: 4.0,
@@ -132,7 +142,7 @@ impl OverlayConfig {
             cost_rerun_throughput_pct: 0.50,
 
             route_transit_messages: true,
-            lsdb_sync_max_response_lsas: 256,
+            lsdb_sync_max_response_lsas: 2048,
             ordered_lane_cap: NonZeroUsize::new(64).expect("non-zero ordered lane cap"),
             ordered_pending_window_packets: 1024,
             ordered_reorder_buffer_packets: 1024,
@@ -166,6 +176,18 @@ impl OverlayConfig {
     pub fn tombstone_in_memory_age(&self) -> Duration {
         self.tombstone_in_memory_age
     }
+    pub fn lsa_flood_pacing_interval(&self) -> Duration {
+        self.lsa_flood_pacing_interval
+    }
+    pub fn lsa_flood_max_batch_lsas(&self) -> usize {
+        self.lsa_flood_max_batch_lsas
+    }
+    pub fn lsa_refresh_reduction_enabled(&self) -> bool {
+        self.lsa_refresh_reduction_enabled
+    }
+    pub fn lsa_unchanged_refresh_interval(&self) -> Duration {
+        self.lsa_unchanged_refresh_interval
+    }
     pub fn anti_entropy_interval(&self) -> Duration {
         self.anti_entropy_interval
     }
@@ -174,6 +196,9 @@ impl OverlayConfig {
     }
     pub fn routing_recompute_debounce(&self) -> Duration {
         self.routing_recompute_debounce
+    }
+    pub fn routing_dynamic_spf_enabled(&self) -> bool {
+        self.routing_dynamic_spf_enabled
     }
     pub fn reliable_throughput_penalty_us_kbps(&self) -> f64 {
         self.reliable_throughput_penalty_us_kbps
@@ -262,6 +287,22 @@ impl OverlayConfig {
         self.tombstone_in_memory_age = d;
         self
     }
+    pub fn with_lsa_flood_pacing_interval(mut self, d: Duration) -> Self {
+        self.lsa_flood_pacing_interval = d;
+        self
+    }
+    pub fn with_lsa_flood_max_batch_lsas(mut self, n: usize) -> Self {
+        self.lsa_flood_max_batch_lsas = n.max(1);
+        self
+    }
+    pub fn with_lsa_refresh_reduction_enabled(mut self, enabled: bool) -> Self {
+        self.lsa_refresh_reduction_enabled = enabled;
+        self
+    }
+    pub fn with_lsa_unchanged_refresh_interval(mut self, d: Duration) -> Self {
+        self.lsa_unchanged_refresh_interval = d;
+        self
+    }
     pub fn with_anti_entropy_interval(mut self, d: Duration) -> Self {
         self.anti_entropy_interval = d;
         self
@@ -272,6 +313,10 @@ impl OverlayConfig {
     }
     pub fn with_routing_recompute_debounce(mut self, d: Duration) -> Self {
         self.routing_recompute_debounce = d;
+        self
+    }
+    pub fn with_routing_dynamic_spf_enabled(mut self, enabled: bool) -> Self {
+        self.routing_dynamic_spf_enabled = enabled;
         self
     }
     pub fn with_reliable_throughput_penalty_us_kbps(mut self, v: f64) -> Self {
@@ -382,6 +427,23 @@ pub struct OverlayTuning {
     #[serde(default = "default_lsdb_sync_max_response_lsas")]
     pub lsdb_sync_max_response_lsas: usize,
 
+    /// Milliseconds to coalesce LSA floods before sending.
+    #[serde(default = "default_lsa_flood_pacing_interval_ms")]
+    pub lsa_flood_pacing_interval_ms: u64,
+
+    /// Max LSAs per paced `LsaFlood` frame.
+    #[serde(default = "default_lsa_flood_max_batch_lsas")]
+    pub lsa_flood_max_batch_lsas: usize,
+
+    #[serde(default = "default_lsa_refresh_reduction_enabled")]
+    pub lsa_refresh_reduction_enabled: bool,
+
+    #[serde(default = "default_lsa_unchanged_refresh_interval_secs")]
+    pub lsa_unchanged_refresh_interval_secs: u64,
+
+    #[serde(default = "default_routing_dynamic_spf_enabled")]
+    pub routing_dynamic_spf_enabled: bool,
+
     #[serde(default = "default_ordered_lane_cap")]
     pub ordered_lane_cap: usize,
     #[serde(default = "default_ordered_pending_window_packets")]
@@ -403,6 +465,11 @@ impl Default for OverlayTuning {
         Self {
             route_transit_messages: default_route_transit_messages(),
             lsdb_sync_max_response_lsas: default_lsdb_sync_max_response_lsas(),
+            lsa_flood_pacing_interval_ms: default_lsa_flood_pacing_interval_ms(),
+            lsa_flood_max_batch_lsas: default_lsa_flood_max_batch_lsas(),
+            lsa_refresh_reduction_enabled: default_lsa_refresh_reduction_enabled(),
+            lsa_unchanged_refresh_interval_secs: default_lsa_unchanged_refresh_interval_secs(),
+            routing_dynamic_spf_enabled: default_routing_dynamic_spf_enabled(),
             ordered_lane_cap: default_ordered_lane_cap(),
             ordered_pending_window_packets: default_ordered_pending_window_packets(),
             ordered_reorder_buffer_packets: default_ordered_reorder_buffer_packets(),
@@ -420,6 +487,15 @@ impl OverlayTuning {
     pub fn apply(&self, cfg: OverlayConfig) -> OverlayConfig {
         cfg.with_route_transit_messages(self.route_transit_messages)
             .with_lsdb_sync_max_response_lsas(self.lsdb_sync_max_response_lsas)
+            .with_lsa_flood_pacing_interval(Duration::from_millis(
+                self.lsa_flood_pacing_interval_ms,
+            ))
+            .with_lsa_flood_max_batch_lsas(self.lsa_flood_max_batch_lsas)
+            .with_lsa_refresh_reduction_enabled(self.lsa_refresh_reduction_enabled)
+            .with_lsa_unchanged_refresh_interval(Duration::from_secs(
+                self.lsa_unchanged_refresh_interval_secs,
+            ))
+            .with_routing_dynamic_spf_enabled(self.routing_dynamic_spf_enabled)
             .with_ordered_lane_cap(
                 NonZeroUsize::new(self.ordered_lane_cap)
                     .unwrap_or_else(|| NonZeroUsize::new(default_ordered_lane_cap()).unwrap()),
@@ -438,7 +514,27 @@ fn default_route_transit_messages() -> bool {
 }
 
 fn default_lsdb_sync_max_response_lsas() -> usize {
-    256
+    2048
+}
+
+fn default_lsa_flood_pacing_interval_ms() -> u64 {
+    1000
+}
+
+fn default_lsa_flood_max_batch_lsas() -> usize {
+    4096
+}
+
+fn default_lsa_refresh_reduction_enabled() -> bool {
+    true
+}
+
+fn default_lsa_unchanged_refresh_interval_secs() -> u64 {
+    90
+}
+
+fn default_routing_dynamic_spf_enabled() -> bool {
+    true
 }
 
 fn default_ordered_lane_cap() -> usize {

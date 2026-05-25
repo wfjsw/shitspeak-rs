@@ -15,9 +15,10 @@ use tracing::{debug, warn};
 use super::super::connection::PeerState;
 use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
+use super::super::native_stats;
 use super::super::service_level::TransportKind;
 use super::{
-    bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket, install_stream_session, Endpoint,
+    Endpoint, bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket, install_stream_session,
 };
 
 pub(crate) struct KcpEndpoint {
@@ -75,6 +76,7 @@ impl Endpoint for KcpEndpoint {
             let sock = KcpStream::connect_with_socket(&cfg, socket, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
+            let native_sampler = native_stats::kcp_sampler(&sock);
             let connector = TlsConnector::from(self.client_tls.clone());
             let server_name = ServerName::try_from(format!("node-{}", peer.node_id()))
                 .expect("static name parses");
@@ -91,7 +93,15 @@ impl Endpoint for KcpEndpoint {
                     format!("peer cn {peer_node} != expected {}", peer.node_id()),
                 ));
             }
-            install_stream_session(&inner, peer_node, TransportKind::Kcp, Some(addr), true, tls);
+            install_stream_session(
+                &inner,
+                peer_node,
+                TransportKind::Kcp,
+                Some(addr),
+                true,
+                tls,
+                native_sampler,
+            );
             Ok(())
         }
     }
@@ -107,6 +117,7 @@ impl Endpoint for KcpEndpoint {
             let sock = KcpStream::connect_with_socket(&cfg, socket, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
+            let native_sampler = native_stats::kcp_sampler(&sock);
             let connector = TlsConnector::from(self.client_tls.clone());
             let server_name = ServerName::try_from("s2s-seed.local").expect("static name parses");
             let tls = connector.connect(server_name, sock).await?;
@@ -122,7 +133,15 @@ impl Endpoint for KcpEndpoint {
                     "self-loop rejected",
                 ));
             }
-            install_stream_session(&inner, peer_node, TransportKind::Kcp, Some(addr), true, tls);
+            install_stream_session(
+                &inner,
+                peer_node,
+                TransportKind::Kcp,
+                Some(addr),
+                true,
+                tls,
+                native_sampler,
+            );
             Ok(peer_node)
         }
     }
@@ -155,6 +174,7 @@ async fn handle_inbound(
     sock: KcpStream,
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
+    let native_sampler = native_stats::kcp_sampler(&sock);
     let tls = acceptor.accept(sock).await?;
     let (_, server) = tls.get_ref();
     let chain = server
@@ -170,7 +190,7 @@ async fn handle_inbound(
     }
     inner
         .get_or_create_peer(peer_node)
-        .note_observed_remote_addr(peer_addr);
+        .note_observed_remote_addr(TransportKind::Kcp, peer_addr);
     install_stream_session(
         &inner,
         peer_node,
@@ -178,6 +198,7 @@ async fn handle_inbound(
         Some(peer_addr),
         false,
         tls,
+        native_sampler,
     );
     Ok(())
 }

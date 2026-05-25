@@ -17,7 +17,7 @@ pub mod user_version;
 pub(crate) mod visibility;
 pub mod voice_target;
 
-pub(crate) use client::random_client_instance_id;
 pub(crate) use client::ClientStateSubscription;
+pub(crate) use client::random_client_instance_id;
 pub use client::{Client, ClientInstanceId, ClientTransportKind};
 pub use handlers::AsyncMessageHandlerExt;

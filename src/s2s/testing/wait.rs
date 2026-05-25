@@ -15,7 +15,7 @@ pub async fn wait_until<F: FnMut() -> bool>(deadline: Duration, mut predicate: F
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+    predicate()
 }
 
 /// As `wait_until` but with a custom poll interval.
@@ -31,7 +31,7 @@ pub async fn wait_until_with<F: FnMut() -> bool>(
         }
         tokio::time::sleep(poll).await;
     }
-    false
+    predicate()
 }
 
 /// Wait until every (a, b) pair from `from` × `to` (where a ≠ b) has

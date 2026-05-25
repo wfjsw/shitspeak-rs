@@ -358,7 +358,7 @@ stale_probe_age_secs = 3600
 max_outgoing_connections = 1024
 
 [s2s.overlay]
-lsdb_sync_max_response_lsas = 256
+lsdb_sync_max_response_lsas = 2048
 route_transit_messages = true
 
 [s2s.replications]

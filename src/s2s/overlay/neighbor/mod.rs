@@ -9,7 +9,7 @@ pub mod hello;
 pub mod monitor;
 
 pub use hello::{
-    handle_hello_ack, respond_to_hello, send_hello, spawn_hello_task, spawn_link_up_watcher,
-    HelloContext,
+    HelloContext, handle_hello_ack, respond_to_hello, send_hello, spawn_hello_task,
+    spawn_link_up_watcher,
 };
 pub use monitor::{NeighborMonitor, NeighborSnapshot};

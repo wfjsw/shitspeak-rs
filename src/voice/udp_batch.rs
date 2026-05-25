@@ -264,7 +264,7 @@ fn socket_addr_to_storage(addr: &std::net::SocketAddr) -> SocketAddrStorage {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn flush_batch_sends_to_ipv4_destination() {

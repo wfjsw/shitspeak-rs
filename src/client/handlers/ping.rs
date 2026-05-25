@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::Ping, Message},
+    messages::{Message, encoder::Ping},
     server::Server,
 };
 

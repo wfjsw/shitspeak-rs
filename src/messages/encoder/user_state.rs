@@ -3,7 +3,7 @@ use core::option::Option;
 
 use crate::{
     client::client_session_identifier::ClientSessionIdentifier,
-    messages::{errors::UserStateProtocolError, Message},
+    messages::{Message, errors::UserStateProtocolError},
 };
 
 #[derive(Debug, Clone)]

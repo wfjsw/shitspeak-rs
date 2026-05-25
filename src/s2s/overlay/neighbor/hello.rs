@@ -9,8 +9,8 @@
 //! the neighbor monitor's snapshot), an `LsdbSync` full pull is issued
 //! against it so any LSAs we missed during the partition are re-learned.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -24,8 +24,8 @@ use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::super::config::OverlayConfig;
-use super::super::lsdb::{full_pull, LinkStateDb};
-use super::super::proto::{encode_message, node_to_wire, wrap, OverlayBody};
+use super::super::lsdb::{LinkStateDb, full_pull};
+use super::super::proto::{OverlayBody, encode_message, node_to_wire, wrap};
 use super::monitor::NeighborMonitor;
 
 /// Mutable state shared by the Hello ticker.
@@ -60,7 +60,6 @@ fn now_us() -> u64 {
 /// we can match the corresponding HelloAck back to a sent_at Instant.
 pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
     let nonce = ctx.next_nonce();
-    ctx.monitor.record_outbound_ping(dst, nonce);
     let ts = now_us();
     let body = OverlayBody::Hello(pb::Hello {
         src_node: node_to_wire(ctx.self_id),
@@ -75,7 +74,7 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
             return;
         }
     };
-    if let Err(e) = ctx
+    match ctx
         .transport
         .send(
             dst,
@@ -86,7 +85,8 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
         )
         .await
     {
-        trace!(peer=%dst, error=%e, "hello send failed");
+        Ok(()) => ctx.monitor.record_outbound_ping(dst, nonce),
+        Err(e) => trace!(peer=%dst, error=%e, "hello send failed"),
     }
 }
 

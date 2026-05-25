@@ -8,8 +8,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     channel_repository::{ChannelOp, ChannelOperation, ChannelRepository},
-    client::{client_session_identifier::ClientSessionIdentifier, Client},
-    messages::{encoder::ChannelState, Message},
+    client::{Client, client_session_identifier::ClientSessionIdentifier},
+    messages::{Message, encoder::ChannelState},
     server::Server,
 };
 

@@ -1,4 +1,4 @@
-use crate::messages::{errors::PingProtocolError, Message};
+use crate::messages::{Message, errors::PingProtocolError};
 
 #[derive(Debug, Clone)]
 pub struct Ping {

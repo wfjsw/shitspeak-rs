@@ -1,11 +1,11 @@
 //! Auth-flow scenarios: success, wrong password, unknown user, server full,
 //! and `cert_required` rejection.
 
-use crate::acl::{ACLPermissions, ACL};
-use crate::integration_tests::harness::{spawn_test_server, TestClient, TestServerOpts};
+use crate::acl::{ACL, ACLPermissions};
+use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::localization::Language;
-use crate::messages::encoder::{ContextActionModify, RejectType};
 use crate::messages::Message;
+use crate::messages::encoder::{ContextActionModify, RejectType};
 
 /// Checks that two registered users can authenticate concurrently.
 /// Expected: each client gets a distinct session, its registered user id, and
@@ -122,12 +122,14 @@ async fn auth_selected_server_id_absent_from_config_scopes_client() {
             .await,
         0
     );
-    assert!(server
-        .server
-        .get_clients()
-        .get_client_in_server("tenant-auth", alice.server_session)
-        .await
-        .is_some());
+    assert!(
+        server
+            .server
+            .get_clients()
+            .get_client_in_server("tenant-auth", alice.server_session)
+            .await
+            .is_some()
+    );
 }
 
 #[tokio::test]

@@ -57,7 +57,11 @@ message LinkAdvert {
   uint64 jitter_us       = 3;
   uint64 throughput_bps  = 4;
   uint32 transports_mask = 5;  // bitmap of TransportKind values; 1<<Tcp etc.
-  uint32 loss_ppm        = 6;  // Rolling-window packet loss estimate, parts per million.
+  uint32 loss_ppm        = 6;  // Conservative effective loss, parts per million.
+  uint32 probe_loss_ppm  = 7;  // Probe/keepalive loss, parts per million.
+  uint32 native_loss_ppm = 8;  // Native transport loss/retransmit rate, parts per million.
+  uint32 data_health_ppm = 9;  // Stream data-health failure rate, parts per million.
+  uint64 loss_sample_count = 10; // Samples behind the current loss breakdown.
 }
 
 // Address entry (kept compatible with Phase 1's existing AddressEntry).
@@ -114,6 +118,7 @@ message OverlayData {
   optional uint32 lane_id = 13;  // present => ordered lane; absent => unordered
   uint64 origin_boot_epoch = 14;
   uint64 origin_message_id = 15;
+  bool allow_l1_compression = 16;
 }
 
 message OverlayControl {

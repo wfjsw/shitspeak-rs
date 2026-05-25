@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::s2s::testing::{
-    full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing, Cluster,
+    Cluster, full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing,
 };
 
 use super::super::{

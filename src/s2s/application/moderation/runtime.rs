@@ -31,8 +31,8 @@ use tracing::trace;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::s2s::application::error::ApplicationError;
 use crate::s2s::application::proto::{
-    self, ModerationCommand, ModerationEnvelope, UserRemovePatch, UserStatePatch,
-    MODERATION_SERVICE_TAG,
+    self, MODERATION_SERVICE_TAG, ModerationCommand, ModerationEnvelope, UserRemovePatch,
+    UserStatePatch,
 };
 use crate::s2s::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
 use crate::s2s::transport::{MessageClass, ServiceLevel};

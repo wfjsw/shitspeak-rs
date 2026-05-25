@@ -82,12 +82,26 @@ stale_probe_age_secs = 3600
 unselected_link_probe_interval_secs = 30
 # Soft cap on live outbound S2S transport sessions. Inbound is still accepted.
 max_outgoing_connections = 1024
+# Selective L1 payload compression. Callers still opt in per send.
+compression_enabled = true
+compression_min_bytes = 1024
+compression_min_savings_percent = 10
+compression_level = 1
 
 # ── L2 overlay tunables ───────────────────────────────────────────────
 [s2s.overlay]
 # Max LSAs per `LsdbSyncResp` frame. Larger = fewer round trips on a
 # big diff but bigger response packets.
-lsdb_sync_max_response_lsas = 256
+lsdb_sync_max_response_lsas = 2048
+# Milliseconds to coalesce LSA floods before sending.
+lsa_flood_pacing_interval_ms = 1000
+# Max LSAs per paced `LsaFlood` frame.
+lsa_flood_max_batch_lsas = 4096
+# Suppress unchanged periodic refresh LSAs until the unchanged interval.
+lsa_refresh_reduction_enabled = true
+lsa_unchanged_refresh_interval_secs = 90
+# Maintain routing tables incrementally after startup.
+routing_dynamic_spf_enabled = true
 # Whether this node may be used as a transit router for other nodes' S2S
 # overlay data. Local delivery and locally originated messages still work.
 route_transit_messages = true

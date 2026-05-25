@@ -1,7 +1,7 @@
 use aws_lc_rs::rand::SecureRandom;
 use bytes::Bytes;
 
-use crate::client::crypt::{aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops, CryptoMode};
+use crate::client::crypt::{CryptoMode, aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops};
 
 const BLOCK_SIZE: usize = 16;
 /// Hard upper bound on plaintext we ever encrypt in one OCB2 call. The Mumble
@@ -527,10 +527,8 @@ mod tests {
             _name: "OCB2-AES-128-005",
             key: "000102030405060708090A0B0C0D0E0F",
             nonce: "000102030405060708090A0B0C0D0E0F",
-            plaintext:
-                "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627",
-            ciphertext:
-                "F75D6BC8B4DC8D66B836A2B08B32A6369F1CD3C5228D79FD6C267F5F6AA7B231C7DFB9D59951AE9C",
+            plaintext: "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627",
+            ciphertext: "F75D6BC8B4DC8D66B836A2B08B32A6369F1CD3C5228D79FD6C267F5F6AA7B231C7DFB9D59951AE9C",
             tag: "9DB0CDF880F73E3E10D4EB3217766688",
         },
     ];

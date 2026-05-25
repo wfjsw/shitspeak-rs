@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use crate::acl::ACLPermissions;
 use crate::channel_handler::SessionChannelShadow;
-use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::Client;
-use crate::messages::encoder::{UserRemove, UserState};
+use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::messages::Message;
+use crate::messages::encoder::{UserRemove, UserState};
 use crate::server::Server;
 
 #[derive(Debug, Clone, Default)]
@@ -401,13 +401,15 @@ async fn reconcile_target(
                 if adds.is_empty() && removes.is_empty() {
                     Vec::new()
                 } else {
-                    vec![UserState {
-                        session: Some(session),
-                        listening_channel_add: adds,
-                        listening_channel_remove: removes,
-                        ..Default::default()
-                    }
-                    .into()]
+                    vec![
+                        UserState {
+                            session: Some(session),
+                            listening_channel_add: adds,
+                            listening_channel_remove: removes,
+                            ..Default::default()
+                        }
+                        .into(),
+                    ]
                 }
             }
         }

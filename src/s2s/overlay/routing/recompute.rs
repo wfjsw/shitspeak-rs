@@ -18,6 +18,7 @@ use crate::types::NodeIdentifier;
 use super::super::config::OverlayConfig;
 use super::super::lsdb::LinkStateDb;
 use super::dijkstra;
+use super::dynamic::DynamicSpf;
 use super::{RoutingMetric, RoutingTables};
 
 pub fn spawn_recomputer(
@@ -31,7 +32,15 @@ pub fn spawn_recomputer(
     tokio::spawn(async move {
         // Compute once at start so the table reflects an empty graph
         // before any LSAs land.
-        recompute_now(&lsdb, self_id, &tables, &transport, &cfg);
+        let mut dynamic = if cfg.routing_dynamic_spf_enabled() {
+            Some(recompute_dynamic_full(
+                &lsdb, self_id, &tables, &transport, &cfg,
+            ))
+        } else {
+            recompute_now(&lsdb, self_id, &tables, &transport, &cfg);
+            None
+        };
+        lsdb.drain_dirty_origins();
 
         loop {
             tokio::select! {
@@ -43,9 +52,46 @@ pub fn spawn_recomputer(
                 _ = shutdown.cancelled() => return,
                 _ = tokio::time::sleep(cfg.routing_recompute_debounce()) => {}
             }
-            recompute_now(&lsdb, self_id, &tables, &transport, &cfg);
+            if cfg.routing_dynamic_spf_enabled() {
+                let dirty = lsdb.drain_dirty_origins();
+                let engine =
+                    dynamic.get_or_insert_with(|| DynamicSpf::rebuild(&lsdb, self_id, &cfg));
+                let new = engine.update(&lsdb, dirty, &cfg);
+                transport
+                    .set_required_outgoing_nodes(component_bridge_targets(engine.graph(), self_id));
+                trace!(
+                    reliable = new.for_level(ServiceLevel::Reliable).len(),
+                    rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
+                    best_effort = new.for_level(ServiceLevel::BestEffort).len(),
+                    "routing dynamically recomputed"
+                );
+                tables.store(Arc::new(new));
+            } else {
+                recompute_now(&lsdb, self_id, &tables, &transport, &cfg);
+                lsdb.drain_dirty_origins();
+            }
         }
     });
+}
+
+fn recompute_dynamic_full(
+    lsdb: &LinkStateDb,
+    self_id: NodeIdentifier,
+    tables: &Arc<ArcSwap<RoutingTables>>,
+    transport: &ConnectionManager,
+    cfg: &OverlayConfig,
+) -> DynamicSpf {
+    let engine = DynamicSpf::rebuild(lsdb, self_id, cfg);
+    transport.set_required_outgoing_nodes(component_bridge_targets(engine.graph(), self_id));
+    let new = engine.routing_tables();
+    trace!(
+        reliable = new.for_level(ServiceLevel::Reliable).len(),
+        rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
+        best_effort = new.for_level(ServiceLevel::BestEffort).len(),
+        "routing dynamically rebuilt"
+    );
+    tables.store(Arc::new(new));
+    engine
 }
 
 fn recompute_now(
@@ -158,6 +204,10 @@ mod tests {
                     throughput_bps: 1_000_000,
                     transports_mask: transport_bit(TransportKind::Tcp),
                     loss_ppm: 0,
+                    probe_loss_ppm: 0,
+                    native_loss_ppm: 0,
+                    data_health_ppm: 0,
+                    loss_sample_count: 0,
                 })
                 .collect(),
             max_users: 0,

@@ -15,10 +15,10 @@ use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 pub use crate::s2s_overlay_proto::{
-    overlay_control::Body as OverlayControlBody, overlay_message::Body as OverlayBody,
     AddressEntry, DigestEntry, Hello, HelloAck, LinkAdvert, LinkStateAdvert, LsaFlood, LsdbSync,
     LsdbSyncResp, OverlayAck, OverlayControl, OverlayData, OverlayMessage, OverlayRepairRequest,
-    OverlayRepairResponse,
+    OverlayRepairResponse, overlay_control::Body as OverlayControlBody,
+    overlay_message::Body as OverlayBody,
 };
 
 /// Encode an `OverlayMessage` to a fresh `Bytes` ready for `transport.send(...)`.

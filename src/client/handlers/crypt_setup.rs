@@ -6,8 +6,8 @@ use crate::{
     client::Client,
     errors::MessageHandlerError,
     messages::{
-        encoder::{CryptSetup, RejectType},
         Message, WriteMessageExt,
+        encoder::{CryptSetup, RejectType},
     },
     server::Server,
 };

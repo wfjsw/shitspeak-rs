@@ -4,17 +4,17 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
+use crate::s2s::application::ApplicationLayer;
 use crate::s2s::application::config::ApplicationConfig;
 use crate::s2s::application::moderation::runtime::testing::RecordingApplier;
 use crate::s2s::application::proto::{
     ModerationCommand, UserStatePatch, VoiceIntent, VoiceIntentKind, VoiceIntentNormal,
 };
 use crate::s2s::application::voice::sink::testing::RecordingSink;
-use crate::s2s::application::ApplicationLayer;
-use crate::s2s::overlay::{config::SeedPeer, RoutingMetric};
+use crate::s2s::overlay::{RoutingMetric, config::SeedPeer};
 use crate::s2s::testing::{
-    full_mesh_seeds, line_seeds, wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
-    Cluster,
+    Cluster, full_mesh_seeds, line_seeds, wait_for_full_alive_mesh, wait_for_full_routing,
+    wait_until,
 };
 use crate::s2s::transport::{PeerAddress, ServiceLevel, TransportKind};
 

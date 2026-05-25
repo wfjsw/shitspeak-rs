@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{encoder::QueryUsers, Message, WriteMessageExt},
+    messages::{Message, WriteMessageExt, encoder::QueryUsers},
     server::Server,
 };
 

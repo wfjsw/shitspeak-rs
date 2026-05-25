@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::types::NodeIdentifier;
 
+use super::SendOptions;
 use super::metrics::{MetricsTuning, PeerMetrics};
 use super::service_level::{MessageClass, PeerAddress, TransportKind};
 
@@ -29,11 +30,20 @@ const BACKOFF_JITTER_DIVISOR: u64 = 5;
 pub(crate) struct OutboundFrame {
     class: MessageClass,
     payload: Bytes,
+    options: SendOptions,
 }
 
 impl OutboundFrame {
     pub fn new(class: MessageClass, payload: Bytes) -> Self {
-        Self { class, payload }
+        Self::with_options(class, payload, SendOptions::default())
+    }
+
+    pub fn with_options(class: MessageClass, payload: Bytes, options: SendOptions) -> Self {
+        Self {
+            class,
+            payload,
+            options,
+        }
     }
 
     pub fn class(&self) -> MessageClass {
@@ -42,6 +52,10 @@ impl OutboundFrame {
 
     pub fn payload(&self) -> &Bytes {
         &self.payload
+    }
+
+    pub fn options(&self) -> SendOptions {
+        self.options
     }
 }
 
@@ -192,9 +206,9 @@ pub(crate) struct PeerState {
     streams: Mutex<HashMap<StreamKey, ActiveStream>>,
     udp_seen_at: Mutex<Option<Instant>>,
     udp_addr: Mutex<Option<std::net::SocketAddr>>,
-    /// Authenticated inbound remote IPs. Source ports are often ephemeral; the
-    /// IPs are combined with published service ports to form dial candidates.
-    observed_remote_ips: Mutex<Vec<std::net::IpAddr>>,
+    /// Authenticated inbound remote IPs by transport. Source ports are often
+    /// ephemeral; IPs are combined only with same-transport service ports.
+    observed_remote_ips: Mutex<HashMap<TransportKind, Vec<std::net::IpAddr>>>,
     last_seen_wall: Mutex<Option<SystemTime>>,
     metrics: Arc<PeerMetrics>,
     backoff_initial: Duration,
@@ -217,7 +231,7 @@ impl PeerState {
             streams: Mutex::new(HashMap::new()),
             udp_seen_at: Mutex::new(None),
             udp_addr: Mutex::new(None),
-            observed_remote_ips: Mutex::new(Vec::new()),
+            observed_remote_ips: Mutex::new(HashMap::new()),
             last_seen_wall: Mutex::new(None),
             metrics: Arc::new(PeerMetrics::new(bandwidth_window, metrics_tuning)),
             backoff_initial,
@@ -315,12 +329,13 @@ impl PeerState {
             .record_success();
     }
 
-    pub fn note_observed_remote_addr(&self, addr: std::net::SocketAddr) {
+    pub fn note_observed_remote_addr(&self, transport: TransportKind, addr: std::net::SocketAddr) {
         let ip = addr.ip();
         if ip_looks_unusable(ip) {
             return;
         }
-        let mut observed = self.observed_remote_ips.lock();
+        let mut observed_by_transport = self.observed_remote_ips.lock();
+        let observed = observed_by_transport.entry(transport).or_default();
         if let Some(pos) = observed.iter().position(|candidate| *candidate == ip) {
             observed.remove(pos);
         }
@@ -333,10 +348,15 @@ impl PeerState {
 
     pub fn address_candidates(&self, addr: PeerAddress) -> Vec<PeerAddress> {
         let published = addr.addr();
-        let observed = self.observed_remote_ips.lock().clone();
+        let observed = self
+            .observed_remote_ips
+            .lock()
+            .get(&addr.transport())
+            .cloned()
+            .unwrap_or_default();
         let mut candidates = Vec::new();
 
-        if published_ip_looks_usable(published.ip(), &observed) {
+        if published_ip_looks_usable(published.ip()) {
             push_unique_candidate(&mut candidates, addr);
         }
 
@@ -408,6 +428,9 @@ impl PeerState {
         let key = stream.key();
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
+        if stream.transport() == TransportKind::Udp {
+            drop_udp_streams(&mut g);
+        }
         if let Some(prev) = g.insert(key, stream) {
             prev.closed.cancel();
         }
@@ -419,6 +442,9 @@ impl PeerState {
         let key = new_stream.key();
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
+        if new_stream.transport() == TransportKind::Udp {
+            drop_udp_streams(&mut g);
+        }
         if g.get(&key).is_some_and(ActiveStream::is_alive) {
             return Err(new_stream);
         }
@@ -446,11 +472,9 @@ impl PeerState {
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
         if addr.transport() == TransportKind::Udp {
-            return g.values().any(|stream| {
-                stream.transport == TransportKind::Udp
-                    && stream.remote_addr == Some(addr.addr())
-                    && stream.is_alive()
-            });
+            return g
+                .values()
+                .any(|stream| stream.transport == TransportKind::Udp && stream.is_alive());
         }
         g.get(&key).is_some_and(ActiveStream::is_alive)
     }
@@ -517,7 +541,7 @@ impl PeerState {
     pub fn note_udp_seen(&self, addr: std::net::SocketAddr) {
         *self.udp_seen_at.lock() = Some(Instant::now());
         *self.udp_addr.lock() = Some(addr);
-        self.note_observed_remote_addr(addr);
+        self.note_observed_remote_addr(TransportKind::Udp, addr);
     }
 
     pub fn udp_addr(&self) -> Option<std::net::SocketAddr> {
@@ -536,21 +560,29 @@ fn prune_dead_streams(streams: &mut HashMap<StreamKey, ActiveStream>) {
     });
 }
 
+fn drop_udp_streams(streams: &mut HashMap<StreamKey, ActiveStream>) {
+    streams.retain(|key, stream| {
+        if key.transport() == TransportKind::Udp {
+            stream.cancel();
+            false
+        } else {
+            true
+        }
+    });
+}
+
 fn push_unique_candidate(candidates: &mut Vec<PeerAddress>, addr: PeerAddress) {
     if addr.is_dialable() && !candidates.contains(&addr) {
         candidates.push(addr);
     }
 }
 
-fn published_ip_looks_usable(published: std::net::IpAddr, observed: &[std::net::IpAddr]) -> bool {
-    if ip_looks_unusable(published) {
-        return false;
-    }
-    !(published.is_loopback() && observed.iter().any(|ip| !ip.is_loopback()))
-        && !(!ip_looks_public(published) && observed.iter().any(|ip| ip_looks_public(*ip)))
+fn published_ip_looks_usable(published: std::net::IpAddr) -> bool {
+    !ip_looks_unusable(published)
 }
 
 fn should_add_observed_candidate(published: std::net::IpAddr, observed: std::net::IpAddr) -> bool {
+    // Never add an observed IP that cannot be dialed.
     if ip_looks_unusable(observed) || observed == published {
         return false;
     }
@@ -559,29 +591,6 @@ fn should_add_observed_candidate(published: std::net::IpAddr, observed: std::net
 
 fn ip_looks_unusable(ip: std::net::IpAddr) -> bool {
     ip.is_unspecified() || ip.is_multicast()
-}
-
-fn ip_looks_private(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            ip.is_private()
-                || ip.is_link_local()
-                || ip.is_documentation()
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
-        }
-        std::net::IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            ((segments[0] & 0xfe00) == 0xfc00)
-                || ((segments[0] & 0xffc0) == 0xfe80)
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        }
-    }
-}
-
-fn ip_looks_public(ip: std::net::IpAddr) -> bool {
-    !ip_looks_unusable(ip) && !ip.is_loopback() && !ip_looks_private(ip)
 }
 
 pub(crate) fn retry_cap_for_last_seen_age(
@@ -772,6 +781,22 @@ mod tests {
     }
 
     #[test]
+    fn udp_stream_replaces_existing_udp_path() {
+        let peer = peer_for_address_tests();
+        let first_addr = "10.1.2.3:64742".parse().unwrap();
+        let second_addr = "10.1.2.4:64742".parse().unwrap();
+        let (first, _first_rx) = active_stream_for_test(TransportKind::Udp, first_addr, true);
+        let (second, _second_rx) = active_stream_for_test(TransportKind::Udp, second_addr, true);
+
+        peer.install_stream(first);
+        peer.install_stream(second);
+
+        assert_eq!(peer.outgoing_live_count(), 1);
+        assert!(peer.has_live_outgoing_to(PeerAddress::new(first_addr, TransportKind::Udp)));
+        assert!(peer.has_live_outgoing_to(PeerAddress::new(second_addr, TransportKind::Udp)));
+    }
+
+    #[test]
     fn exact_duplicate_stream_key_is_rejected() {
         let peer = peer_for_address_tests();
         let addr = "10.1.2.3:64739".parse().unwrap();
@@ -839,8 +864,8 @@ mod tests {
     #[test]
     fn observed_remote_ips_create_candidates_for_wildcard_advertised_address() {
         let peer = peer_for_address_tests();
-        peer.note_observed_remote_addr("10.1.2.3:51000".parse().unwrap());
-        peer.note_observed_remote_addr("10.1.2.4:52000".parse().unwrap());
+        peer.note_observed_remote_addr(TransportKind::Kcp, "10.1.2.3:51000".parse().unwrap());
+        peer.note_observed_remote_addr(TransportKind::Kcp, "10.1.2.4:52000".parse().unwrap());
 
         let candidates = peer.address_candidates(PeerAddress::new(
             "0.0.0.0:64740".parse().unwrap(),
@@ -857,10 +882,11 @@ mod tests {
     }
 
     #[test]
-    fn observed_remote_ip_replaces_remote_loopback_advertised_address() {
+    fn observed_remote_ip_is_appended_to_remote_loopback_advertised_address() {
         let peer = peer_for_address_tests();
-        peer.note_observed_remote_addr("10.1.2.3:51000".parse().unwrap());
+        peer.note_observed_remote_addr(TransportKind::Tcp, "10.1.2.3:51000".parse().unwrap());
 
+        let published = PeerAddress::new("127.0.0.1:64739".parse().unwrap(), TransportKind::Tcp);
         let candidates = peer.address_candidates(PeerAddress::new(
             "127.0.0.1:64739".parse().unwrap(),
             TransportKind::Tcp,
@@ -868,33 +894,61 @@ mod tests {
 
         assert_eq!(
             candidates,
-            vec![PeerAddress::new(
-                "10.1.2.3:64739".parse().unwrap(),
-                TransportKind::Tcp
-            )]
+            vec![
+                published,
+                PeerAddress::new("10.1.2.3:64739".parse().unwrap(), TransportKind::Tcp)
+            ]
         );
     }
 
     #[test]
-    fn concrete_advertised_address_and_observed_ips_are_all_candidates() {
+    fn concrete_private_advertised_address_appends_private_observed_candidate() {
         let peer = peer_for_address_tests();
-        peer.note_observed_remote_addr("10.1.2.3:51000".parse().unwrap());
+        peer.note_observed_remote_addr(TransportKind::Quic, "10.1.2.3:51000".parse().unwrap());
 
         let published = PeerAddress::new("10.4.5.6:64741".parse().unwrap(), TransportKind::Quic);
         assert_eq!(
             peer.address_candidates(published),
             vec![
                 published,
-                PeerAddress::new("10.1.2.3:64741".parse().unwrap(), TransportKind::Quic),
+                PeerAddress::new("10.1.2.3:64741".parse().unwrap(), TransportKind::Quic)
             ]
         );
     }
 
     #[test]
-    fn public_observation_rules_out_private_published_address() {
+    fn observed_remote_ips_only_create_candidates_for_same_transport() {
         let peer = peer_for_address_tests();
-        peer.note_observed_remote_addr("8.8.8.8:51000".parse().unwrap());
+        peer.note_observed_remote_addr(TransportKind::Tcp, "10.1.2.3:51000".parse().unwrap());
 
+        assert_eq!(
+            peer.address_candidates(PeerAddress::new(
+                "0.0.0.0:64740".parse().unwrap(),
+                TransportKind::Kcp,
+            )),
+            Vec::<PeerAddress>::new()
+        );
+
+        peer.note_observed_remote_addr(TransportKind::Kcp, "10.1.2.4:52000".parse().unwrap());
+
+        assert_eq!(
+            peer.address_candidates(PeerAddress::new(
+                "0.0.0.0:64740".parse().unwrap(),
+                TransportKind::Kcp,
+            )),
+            vec![PeerAddress::new(
+                "10.1.2.4:64740".parse().unwrap(),
+                TransportKind::Kcp,
+            )]
+        );
+    }
+
+    #[test]
+    fn public_observation_is_appended_to_private_published_address() {
+        let peer = peer_for_address_tests();
+        peer.note_observed_remote_addr(TransportKind::Quic, "8.8.8.8:51000".parse().unwrap());
+
+        let published = PeerAddress::new("10.4.5.6:64741".parse().unwrap(), TransportKind::Quic);
         let candidates = peer.address_candidates(PeerAddress::new(
             "10.4.5.6:64741".parse().unwrap(),
             TransportKind::Quic,
@@ -902,10 +956,10 @@ mod tests {
 
         assert_eq!(
             candidates,
-            vec![PeerAddress::new(
-                "8.8.8.8:64741".parse().unwrap(),
-                TransportKind::Quic
-            )]
+            vec![
+                published,
+                PeerAddress::new("8.8.8.8:64741".parse().unwrap(), TransportKind::Quic)
+            ]
         );
     }
 

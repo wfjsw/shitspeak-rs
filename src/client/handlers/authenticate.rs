@@ -5,12 +5,12 @@ use bytes::Bytes;
 use crate::{
     api::{AuthenticateAuxiliaryData, AuthenticationRejection},
     channel_handler::build_channel_state_message,
-    client::{user_info::Credential, Client},
+    client::{Client, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
-    localization::{text, TextKey},
+    localization::{TextKey, text},
     messages::{
-        encoder::{Authenticate, ChannelState, CodecVersion, RejectType, ServerConfig, ServerSync},
         Message, WriteMessageExt,
+        encoder::{Authenticate, ChannelState, CodecVersion, RejectType, ServerConfig, ServerSync},
     },
     server::Server,
 };
@@ -99,21 +99,21 @@ pub async fn handle_authenticate(
                 RejectType::InvalidUsername,
                 sender.language(),
             )
-            .into())
+            .into());
         }
         Err(AuthenticationRejection::WrongPassword) => {
             return Err(AuthRejection::new_with_language(
                 RejectType::WrongUserPw,
                 sender.language(),
             )
-            .into())
+            .into());
         }
         Err(AuthenticationRejection::RetryLater) => {
             return Err(AuthRejection::new_with_language(
                 RejectType::AuthenticatorFail,
                 sender.language(),
             )
-            .into())
+            .into());
         }
     };
     let channel_cache_key =
@@ -390,7 +390,7 @@ pub async fn handle_authenticate(
         // BFS ordering: root first, then children in order
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(0u32); // root channel id
-                               // Map id -> channel for quick lookup
+        // Map id -> channel for quick lookup
         let ch_map: std::collections::HashMap<u32, _> =
             all_channels.into_iter().map(|c| (c.id, c)).collect();
 

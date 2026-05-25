@@ -3,7 +3,7 @@ use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 
 use crate::{
-    client::crypt::{errors::CryptError, CryptoMode, Ocb2},
+    client::crypt::{CryptoMode, Ocb2, errors::CryptError},
     messages::encoder::Ping,
 };
 

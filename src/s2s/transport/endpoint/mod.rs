@@ -30,10 +30,11 @@ use tracing::debug;
 use crate::types::NodeIdentifier;
 
 use super::config::TransportConfig;
-use super::connection::{retry_cap_for_last_seen_age, PeerState, StreamKey};
+use super::connection::{PeerState, StreamKey, retry_cap_for_last_seen_age};
 use super::manager::ManagerInner;
+use super::native_stats::BoxedNativeLossSampler;
 use super::service_level::{PeerAddress, ServiceShape, TransportKind};
-use super::stream_io::{spawn_stream_pump, StreamPumpConfig};
+use super::stream_io::{StreamPumpConfig, spawn_stream_pump};
 
 pub(crate) mod kcp;
 pub(crate) mod quic;
@@ -197,9 +198,14 @@ pub(crate) fn install_stream_session<S>(
     remote_addr: Option<SocketAddr>,
     is_dialer: bool,
     stream: S,
+    native_sampler: Option<BoxedNativeLossSampler>,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    if inner.shutdown().is_cancelled() {
+        return;
+    }
+
     let peer = inner.get_or_create_peer(peer_node);
     let cfg = StreamPumpConfig::new(
         inner.self_id(),
@@ -210,6 +216,8 @@ pub(crate) fn install_stream_session<S>(
         inner.cfg().ping_interval(),
         inner.cfg().bandwidth_probe_interval(),
         inner.cfg().bandwidth_probe_size(),
+        inner.cfg().native_stats_interval(),
+        inner.cfg().compression_config(),
         inner.cfg().max_pending_pings(),
     );
     let active = spawn_stream_pump(
@@ -219,7 +227,13 @@ pub(crate) fn install_stream_session<S>(
         inner.inbound().clone(),
         remote_addr,
         is_dialer,
+        inner.shutdown().child_token(),
+        native_sampler,
     );
+    if inner.shutdown().is_cancelled() {
+        active.cancel();
+        return;
+    }
     if let Err(rejected) = peer.try_install_stream(active) {
         // The exact connection key is already live; close the duplicate without
         // disturbing the survivor.

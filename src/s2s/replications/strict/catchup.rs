@@ -13,7 +13,7 @@ use tracing::warn;
 
 use super::super::proto::{CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp};
 use super::runtime::{
-    HistoryElectionCandidate, HistoryRank, StrictRuntime, HISTORY_ELECTION_SNAPSHOT_TOKEN,
+    HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryElectionCandidate, HistoryRank, StrictRuntime,
 };
 use super::{LogSlice, StrictReplicable};
 use crate::types::NodeIdentifier;
