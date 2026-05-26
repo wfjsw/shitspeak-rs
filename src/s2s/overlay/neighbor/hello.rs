@@ -6,8 +6,9 @@
 //! EWMA via `PeerMetrics::record_rtt`.
 //!
 //! When a direct link is observed up for the first time (it appears in
-//! the neighbor monitor's snapshot), an `LsdbSync` full pull is issued
-//! against it so any LSAs we missed during the partition are re-learned.
+//! the neighbor monitor's snapshot), an `LsdbSync` full pull and snapshot
+//! push are issued so both sides exchange LSAs that may have been learned
+//! before the link was considered floodable.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +25,7 @@ use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::super::config::OverlayConfig;
-use super::super::lsdb::{LinkStateDb, full_pull};
+use super::super::lsdb::{LinkStateDb, full_pull, push_snapshot};
 use super::super::proto::{OverlayBody, encode_message, node_to_wire, wrap};
 use super::monitor::NeighborMonitor;
 
@@ -109,7 +110,7 @@ pub fn spawn_hello_task(ctx: Arc<HelloContext>) {
 }
 
 /// Spawn the link-up watcher: every time the monitor signals a link-up,
-/// schedule a full LSDB pull against the new neighbor.
+/// schedule a full LSDB pull and push against the current neighbors.
 pub fn spawn_link_up_watcher(ctx: Arc<HelloContext>, on_link_up: Arc<Notify>) {
     tokio::spawn(async move {
         loop {
@@ -122,6 +123,13 @@ pub fn spawn_link_up_watcher(ctx: Arc<HelloContext>, on_link_up: Arc<Notify>) {
             let snap = ctx.monitor.snapshot();
             for n in snap {
                 full_pull(&ctx.transport, ctx.self_id, n.node_id).await;
+                push_snapshot(
+                    &ctx.lsdb,
+                    &ctx.transport,
+                    n.node_id,
+                    ctx.cfg.lsdb_sync_max_response_lsas(),
+                )
+                .await;
             }
         }
     });

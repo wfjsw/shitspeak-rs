@@ -17,7 +17,7 @@
 //! re-flooded to every direct neighbor *except* the sender. Stale/below-
 //! floor LSAs are dropped silently — flood quiesces naturally.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,7 +37,12 @@ use super::super::config::OverlayConfig;
 use super::super::discovery::learn_from_lsa;
 use super::super::neighbor::monitor::{NeighborMonitor, NeighborSnapshot};
 use super::super::proto::{OverlayBody, encode_message, node_from_wire, node_to_wire, wrap};
+use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 use super::store::{AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry, is_strictly_newer};
+
+const RTT_GATE_BUCKET_US: u64 = 25_000;
+const JITTER_GATE_BUCKET_US: u64 = 10_000;
+const LOSS_GATE_BUCKET_PPM: u32 = 50_000;
 
 /// Local-LSA emitter state.
 pub struct LsaEmitter {
@@ -50,9 +55,7 @@ pub struct LsaEmitter {
     transit_disabled: AtomicBool,
     /// Last cost/breakdown tuple per neighbor we published. Used to apply the
     /// cost-change-threshold filter.
-    last_published: parking_lot::Mutex<
-        std::collections::HashMap<NodeIdentifier, (u64, u64, u64, u32, u32, u32, u32, u64)>,
-    >,
+    last_published: parking_lot::Mutex<HashMap<NodeIdentifier, LinkGate>>,
     /// Local listen addresses. Captured at construction.
     self_addresses: Vec<crate::s2s::transport::PeerAddress>,
     /// Notify to wake the emitter task on neighbor change.
@@ -75,7 +78,7 @@ impl LsaEmitter {
             force_next_emit: AtomicBool::new(false),
             transit_disabled: AtomicBool::new(!route_transit_messages),
             next_seq: AtomicU64::new(1),
-            last_published: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            last_published: parking_lot::Mutex::new(HashMap::new()),
             self_addresses,
             trigger: Notify::new(),
             last_emitted_content: parking_lot::Mutex::new(None),
@@ -174,7 +177,114 @@ fn stamp_local_lsa(emitter: &LsaEmitter, content: LsaContent) -> LsaEntry {
     }
 }
 
-fn content_fingerprint(content: &LsaContent) -> u64 {
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct LinkGate {
+    rtt_us: u64,
+    jitter_us: u64,
+    throughput_bps: u64,
+    transports_mask: u32,
+    loss_ppm: u32,
+    loss_confident: bool,
+    excessive_loss: bool,
+}
+
+impl LinkGate {
+    fn from_snapshot(n: &NeighborSnapshot, cfg: &OverlayConfig) -> Self {
+        Self::from_parts(
+            n.rtt_us,
+            n.jitter_us,
+            n.throughput_bps,
+            n.transports_mask,
+            n.loss_ppm,
+            n.loss_sample_count,
+            cfg,
+        )
+    }
+
+    fn from_link(link: &LinkAdvertised, cfg: &OverlayConfig) -> Self {
+        Self::from_parts(
+            link.rtt_us,
+            link.jitter_us,
+            link.throughput_bps,
+            link.transports_mask,
+            link.loss_ppm,
+            link.loss_sample_count,
+            cfg,
+        )
+    }
+
+    fn from_parts(
+        rtt_us: u64,
+        jitter_us: u64,
+        throughput_bps: u64,
+        transports_mask: u32,
+        loss_ppm: u32,
+        loss_sample_count: u64,
+        cfg: &OverlayConfig,
+    ) -> Self {
+        let loss_confident = loss_sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let loss_ppm = round_up_u32(loss_ppm, LOSS_GATE_BUCKET_PPM).min(1_000_000);
+        Self {
+            rtt_us: round_up_u64(rtt_us, RTT_GATE_BUCKET_US),
+            jitter_us: round_up_u64(jitter_us, JITTER_GATE_BUCKET_US),
+            throughput_bps: round_down_throughput_gate(throughput_bps),
+            transports_mask,
+            loss_ppm,
+            loss_confident,
+            excessive_loss: loss_confident && loss_ppm >= cfg.max_route_packet_loss_ppm(),
+        }
+    }
+}
+
+fn round_up_u64(value: u64, bucket: u64) -> u64 {
+    if value == 0 || bucket == 0 {
+        return value;
+    }
+    value
+        .saturating_add(bucket - 1)
+        .saturating_div(bucket)
+        .saturating_mul(bucket)
+}
+
+fn round_up_u32(value: u32, bucket: u32) -> u32 {
+    if value == 0 || bucket == 0 {
+        return value;
+    }
+    value
+        .saturating_add(bucket - 1)
+        .saturating_div(bucket)
+        .saturating_mul(bucket)
+}
+
+fn round_down_throughput_gate(value: u64) -> u64 {
+    if value <= 1 {
+        return value;
+    }
+
+    // Throughput improves as the value increases, so gate it at the lower
+    // edge of a roughly 10% bucket. This keeps routing conservative while
+    // preventing tiny estimator movement from changing the LSA fingerprint.
+    let mut gate = 1u64;
+    loop {
+        let step = gate.saturating_add(9) / 10;
+        let next = gate.saturating_add(step.max(1));
+        if next > value || next <= gate {
+            return gate;
+        }
+        gate = next;
+    }
+}
+
+fn gate_delta_ratio_changed(previous: u64, current: u64, pct: f64) -> bool {
+    if previous > 0 {
+        let delta = current.abs_diff(previous);
+        delta > 0 && (delta as f64) / (previous as f64) >= pct
+    } else {
+        current > 0
+    }
+}
+
+fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.tombstone.hash(&mut hasher);
     for addr in &content.addresses {
@@ -182,15 +292,7 @@ fn content_fingerprint(content: &LsaContent) -> u64 {
     }
     for link in &content.links {
         link.neighbor.hash(&mut hasher);
-        link.rtt_us.hash(&mut hasher);
-        link.jitter_us.hash(&mut hasher);
-        link.throughput_bps.hash(&mut hasher);
-        link.transports_mask.hash(&mut hasher);
-        link.loss_ppm.hash(&mut hasher);
-        link.probe_loss_ppm.hash(&mut hasher);
-        link.native_loss_ppm.hash(&mut hasher);
-        link.data_health_ppm.hash(&mut hasher);
-        link.loss_sample_count.hash(&mut hasher);
+        LinkGate::from_link(link, cfg).hash(&mut hasher);
     }
     content.max_users.hash(&mut hasher);
     content.transit_disabled.hash(&mut hasher);
@@ -212,79 +314,47 @@ pub fn build_local_lsa(
 pub fn cost_changed_significantly(
     emitter: &LsaEmitter,
     snap: &[NeighborSnapshot],
-    rtt_pct: f64,
-    tput_pct: f64,
+    cfg: &OverlayConfig,
 ) -> bool {
     let last = emitter.last_published.lock();
-    let prev_set: std::collections::HashSet<NodeIdentifier> = last.keys().copied().collect();
-    let now_set: std::collections::HashSet<NodeIdentifier> =
-        snap.iter().map(|n| n.node_id).collect();
+    let prev_set: HashSet<NodeIdentifier> = last.keys().copied().collect();
+    let now_set: HashSet<NodeIdentifier> = snap.iter().map(|n| n.node_id).collect();
     if prev_set != now_set {
         return true;
     }
     for n in snap {
-        let Some((
-            prev_rtt,
-            prev_jitter,
-            prev_tput,
-            prev_loss,
-            prev_probe_loss,
-            prev_native_loss,
-            prev_data_health,
-            prev_loss_samples,
-        )) = last.get(&n.node_id).copied()
-        else {
+        let Some(previous) = last.get(&n.node_id).copied() else {
             return true;
         };
-        if prev_rtt > 0 {
-            let delta = (n.rtt_us as i64 - prev_rtt as i64).unsigned_abs();
-            if (delta as f64) / (prev_rtt as f64) >= rtt_pct {
-                return true;
-            }
-        } else if n.rtt_us > 0 {
+        let current = LinkGate::from_snapshot(n, cfg);
+        if previous.transports_mask != current.transports_mask {
             return true;
         }
-        if prev_jitter > 0 {
-            let delta = (n.jitter_us as i64 - prev_jitter as i64).unsigned_abs();
-            if (delta as f64) / (prev_jitter as f64) >= rtt_pct {
-                return true;
-            }
-        } else if n.jitter_us > 0 {
+        if gate_delta_ratio_changed(previous.rtt_us, current.rtt_us, cfg.cost_rerun_rtt_pct()) {
             return true;
         }
-        if prev_tput > 0 {
-            let delta = (n.throughput_bps as i64 - prev_tput as i64).unsigned_abs();
-            if (delta as f64) / (prev_tput as f64) >= tput_pct {
-                return true;
-            }
-        } else if n.throughput_bps > 0 {
+        if gate_delta_ratio_changed(
+            previous.jitter_us,
+            current.jitter_us,
+            cfg.cost_rerun_rtt_pct(),
+        ) {
             return true;
         }
-        if prev_loss > 0 {
-            let delta = (n.loss_ppm as i64 - prev_loss as i64).unsigned_abs();
-            if (delta as f64) / (prev_loss as f64) >= rtt_pct {
-                return true;
-            }
-        } else if n.loss_ppm >= 10_000 {
+        if gate_delta_ratio_changed(
+            previous.throughput_bps,
+            current.throughput_bps,
+            cfg.cost_rerun_throughput_pct(),
+        ) {
             return true;
         }
-        for (current, previous) in [
-            (n.probe_loss_ppm, prev_probe_loss),
-            (n.native_loss_ppm, prev_native_loss),
-            (n.data_health_ppm, prev_data_health),
-        ] {
-            if previous > 0 {
-                let delta = (current as i64 - previous as i64).unsigned_abs();
-                if (delta as f64) / (previous as f64) >= rtt_pct {
-                    return true;
-                }
-            } else if current >= 10_000 {
-                return true;
-            }
+        if previous.loss_confident != current.loss_confident {
+            return true;
         }
-        if prev_loss_samples != n.loss_sample_count
-            && (prev_loss_samples == 0 || n.loss_sample_count == 0)
-        {
+        if previous.excessive_loss != current.excessive_loss {
+            return true;
+        }
+        let loss_delta = previous.loss_ppm.abs_diff(current.loss_ppm);
+        if loss_delta > 0 && loss_delta >= cfg.cost_rerun_loss_ppm() {
             return true;
         }
     }
@@ -293,23 +363,11 @@ pub fn cost_changed_significantly(
 
 /// Stamp the published-baseline so future change-detection compares
 /// against the snapshot we just emitted.
-pub fn record_published(emitter: &LsaEmitter, snap: &[NeighborSnapshot]) {
+pub fn record_published(emitter: &LsaEmitter, snap: &[NeighborSnapshot], cfg: &OverlayConfig) {
     let mut last = emitter.last_published.lock();
     last.clear();
     for n in snap {
-        last.insert(
-            n.node_id,
-            (
-                n.rtt_us,
-                n.jitter_us,
-                n.throughput_bps,
-                n.loss_ppm,
-                n.probe_loss_ppm,
-                n.native_loss_ppm,
-                n.data_health_ppm,
-                n.loss_sample_count,
-            ),
-        );
+        last.insert(n.node_id, LinkGate::from_snapshot(n, cfg));
     }
 }
 
@@ -524,12 +582,7 @@ pub fn spawn_emitter_task(
                 _ = shutdown.cancelled() => return,
                 _ = emitter.trigger.notified() => {
                     let snap = monitor.snapshot();
-                    let changed = cost_changed_significantly(
-                        &emitter,
-                        &snap,
-                        cfg.cost_rerun_rtt_pct(),
-                        cfg.cost_rerun_throughput_pct(),
-                    );
+                    let changed = cost_changed_significantly(&emitter, &snap, &cfg);
                     if emitter.force_next_emit.swap(false, Ordering::Relaxed) || changed {
                         emit_once_with_reason(
                             &emitter,
@@ -623,14 +676,14 @@ async fn emit_once_with_reason(
     let snap = monitor.snapshot();
     let tombstone = reason == EmitReason::Tombstone;
     let content = build_local_lsa_content(emitter, &snap, tombstone);
-    let fingerprint = content_fingerprint(&content);
+    let fingerprint = content_gate_fingerprint(&content, cfg);
     if !should_emit_content(emitter, fingerprint, reason, cfg) {
         trace!("unchanged local lsa refresh suppressed");
         return;
     }
     let lsa = stamp_local_lsa(emitter, content);
     let pb_lsa = lsa.to_pb();
-    record_published(emitter, &snap);
+    record_published(emitter, &snap, cfg);
     let _ = lsdb.admit(lsa);
     record_emitted_content(emitter, fingerprint);
     if tombstone {
@@ -708,6 +761,14 @@ mod tests {
             .collect()
     }
 
+    fn one_neighbor() -> NeighborSnapshot {
+        snap(&[2]).into_iter().next().unwrap()
+    }
+
+    fn test_emitter() -> LsaEmitter {
+        LsaEmitter::new(1, 100, vec![], Arc::new(AtomicU64::new(10)), true)
+    }
+
     fn pb_lsa(origin: NodeIdentifier, seq: u64) -> pb::LinkStateAdvert {
         pb::LinkStateAdvert {
             origin: node_to_wire(origin),
@@ -745,6 +806,139 @@ mod tests {
     }
 
     #[test]
+    fn rounded_rtt_movement_inside_bucket_does_not_emit() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.rtt_us = 101_000;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].rtt_us = 124_000;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+
+        changed[0].rtt_us = 160_000;
+        assert!(cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn rounded_jitter_and_loss_movement_inside_buckets_do_not_emit() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.jitter_us = 11_000;
+        base.loss_ppm = 101_000;
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].jitter_us = 19_000;
+        changed[0].loss_ppm = 149_000;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn throughput_gate_is_conservative_and_ignores_tiny_changes() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.throughput_bps = 1_234_567;
+        let base_gate = LinkGate::from_snapshot(&base, &cfg).throughput_bps;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].throughput_bps = 1_234_568;
+        let changed_gate = LinkGate::from_snapshot(&changed[0], &cfg).throughput_bps;
+        assert!(base_gate <= base[0].throughput_bps);
+        assert_eq!(base_gate, changed_gate);
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn effective_loss_emits_on_confidence_max_crossing_or_configured_delta() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES - 1;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        assert!(cost_changed_significantly(&emitter, &changed, &cfg));
+
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.loss_ppm = 425_000;
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].loss_ppm = 451_000;
+        assert!(cost_changed_significantly(&emitter, &changed, &cfg));
+
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.loss_ppm = 101_000;
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].loss_ppm = 201_000;
+        assert!(cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn raw_loss_breakdown_and_sample_count_inside_confidence_class_do_not_emit() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.loss_ppm = 101_000;
+        base.loss_sample_count = 0;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES - 1;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.loss_ppm = 101_000;
+        base.probe_loss_ppm = 10_000;
+        base.native_loss_ppm = 20_000;
+        base.data_health_ppm = 30_000;
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].probe_loss_ppm = 300_000;
+        changed[0].native_loss_ppm = 400_000;
+        changed[0].data_health_ppm = 500_000;
+        changed[0].loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES + 64;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn transport_mask_and_neighbor_set_changes_emit_immediately() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let base = snap(&[2]);
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].transports_mask = 0b11;
+        assert!(cost_changed_significantly(&emitter, &changed, &cfg));
+        assert!(cost_changed_significantly(&emitter, &[], &cfg));
+    }
+
+    #[test]
     fn refresh_reduction_suppresses_unchanged_periodic_lsa() {
         let max_users = Arc::new(AtomicU64::new(10));
         let emitter = LsaEmitter::new(1, 100, vec![], max_users.clone(), true);
@@ -753,7 +947,7 @@ mod tests {
             .with_lsa_unchanged_refresh_interval(Duration::from_secs(90));
 
         let content = build_local_lsa_content(&emitter, &[], false);
-        let fingerprint = content_fingerprint(&content);
+        let fingerprint = content_gate_fingerprint(&content, &cfg);
         assert!(should_emit_content(
             &emitter,
             fingerprint,
@@ -781,7 +975,44 @@ mod tests {
         let changed = build_local_lsa_content(&emitter, &[], false);
         assert!(should_emit_content(
             &emitter,
-            content_fingerprint(&changed),
+            content_gate_fingerprint(&changed, &cfg),
+            EmitReason::Periodic,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn refresh_reduction_uses_rounded_gate_fingerprint() {
+        let cfg = OverlayConfig::new(vec![])
+            .with_lsa_max_age(Duration::from_secs(120))
+            .with_lsa_unchanged_refresh_interval(Duration::from_secs(90));
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.rtt_us = 101_000;
+        base.jitter_us = 11_000;
+        base.loss_ppm = 101_000;
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let base = vec![base];
+
+        let content = build_local_lsa_content(&emitter, &base, false);
+        let fingerprint = content_gate_fingerprint(&content, &cfg);
+        record_emitted_content(&emitter, fingerprint);
+
+        let mut changed = base.clone();
+        changed[0].rtt_us = 124_000;
+        changed[0].jitter_us = 19_000;
+        changed[0].loss_ppm = 149_000;
+        changed[0].probe_loss_ppm = 900_000;
+        changed[0].native_loss_ppm = 900_000;
+        changed[0].data_health_ppm = 900_000;
+        changed[0].loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES + 16;
+        let changed_content = build_local_lsa_content(&emitter, &changed, false);
+        let changed_fingerprint = content_gate_fingerprint(&changed_content, &cfg);
+
+        assert_eq!(fingerprint, changed_fingerprint);
+        assert!(!should_emit_content(
+            &emitter,
+            changed_fingerprint,
             EmitReason::Periodic,
             &cfg
         ));

@@ -86,6 +86,8 @@ pub struct OverlayConfig {
     // ── Cost-change re-emit thresholds ──
     cost_rerun_rtt_pct: f64, // re-emit when RTT shifts >= this fraction
     cost_rerun_throughput_pct: f64, // re-emit when throughput shifts >= this fraction
+    cost_rerun_min_interval: Duration,
+    cost_rerun_loss_ppm: u32,
 
     // ── Transit routing ──
     /// When enabled, inbound overlay data for other nodes may be forwarded
@@ -140,6 +142,8 @@ impl OverlayConfig {
 
             cost_rerun_rtt_pct: 0.25,
             cost_rerun_throughput_pct: 0.50,
+            cost_rerun_min_interval: Duration::from_secs(5),
+            cost_rerun_loss_ppm: 100_000,
 
             route_transit_messages: true,
             lsdb_sync_max_response_lsas: 2048,
@@ -223,6 +227,12 @@ impl OverlayConfig {
     }
     pub fn cost_rerun_throughput_pct(&self) -> f64 {
         self.cost_rerun_throughput_pct
+    }
+    pub fn cost_rerun_min_interval(&self) -> Duration {
+        self.cost_rerun_min_interval
+    }
+    pub fn cost_rerun_loss_ppm(&self) -> u32 {
+        self.cost_rerun_loss_ppm
     }
 
     pub fn route_transit_messages(&self) -> bool {
@@ -343,6 +353,14 @@ impl OverlayConfig {
         self.max_route_packet_loss_ppm = ppm.min(1_000_000);
         self
     }
+    pub fn with_cost_rerun_min_interval(mut self, d: Duration) -> Self {
+        self.cost_rerun_min_interval = d;
+        self
+    }
+    pub fn with_cost_rerun_loss_ppm(mut self, ppm: u32) -> Self {
+        self.cost_rerun_loss_ppm = ppm.min(1_000_000);
+        self
+    }
 
     pub fn with_route_transit_messages(mut self, enabled: bool) -> Self {
         self.route_transit_messages = enabled;
@@ -444,6 +462,11 @@ pub struct OverlayTuning {
     #[serde(default = "default_routing_dynamic_spf_enabled")]
     pub routing_dynamic_spf_enabled: bool,
 
+    #[serde(default = "default_cost_rerun_min_interval_ms")]
+    pub cost_rerun_min_interval_ms: u64,
+    #[serde(default = "default_cost_rerun_loss_ppm")]
+    pub cost_rerun_loss_ppm: u32,
+
     #[serde(default = "default_ordered_lane_cap")]
     pub ordered_lane_cap: usize,
     #[serde(default = "default_ordered_pending_window_packets")]
@@ -470,6 +493,8 @@ impl Default for OverlayTuning {
             lsa_refresh_reduction_enabled: default_lsa_refresh_reduction_enabled(),
             lsa_unchanged_refresh_interval_secs: default_lsa_unchanged_refresh_interval_secs(),
             routing_dynamic_spf_enabled: default_routing_dynamic_spf_enabled(),
+            cost_rerun_min_interval_ms: default_cost_rerun_min_interval_ms(),
+            cost_rerun_loss_ppm: default_cost_rerun_loss_ppm(),
             ordered_lane_cap: default_ordered_lane_cap(),
             ordered_pending_window_packets: default_ordered_pending_window_packets(),
             ordered_reorder_buffer_packets: default_ordered_reorder_buffer_packets(),
@@ -496,6 +521,8 @@ impl OverlayTuning {
                 self.lsa_unchanged_refresh_interval_secs,
             ))
             .with_routing_dynamic_spf_enabled(self.routing_dynamic_spf_enabled)
+            .with_cost_rerun_min_interval(Duration::from_millis(self.cost_rerun_min_interval_ms))
+            .with_cost_rerun_loss_ppm(self.cost_rerun_loss_ppm)
             .with_ordered_lane_cap(
                 NonZeroUsize::new(self.ordered_lane_cap)
                     .unwrap_or_else(|| NonZeroUsize::new(default_ordered_lane_cap()).unwrap()),
@@ -535,6 +562,13 @@ fn default_lsa_unchanged_refresh_interval_secs() -> u64 {
 
 fn default_routing_dynamic_spf_enabled() -> bool {
     true
+}
+
+fn default_cost_rerun_min_interval_ms() -> u64 {
+    5_000
+}
+fn default_cost_rerun_loss_ppm() -> u32 {
+    100_000
 }
 
 fn default_ordered_lane_cap() -> usize {

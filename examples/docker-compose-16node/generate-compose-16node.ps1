@@ -33,11 +33,11 @@ if (-not ("System.Security.Cryptography.PemEncoding" -as [type])) {
 $scriptDir = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\.."))
 if (-not $BinaryPath) {
-    $BinaryPath = Join-Path $repoRoot "target\x86_64-unknown-linux-musl\release\shitspeak-rs"
+    $BinaryPath = Join-Path $repoRoot "target\x86_64-unknown-linux-musl\debug\shitspeak-rs"
 }
 $BinaryPath = [System.IO.Path]::GetFullPath($BinaryPath)
 if (-not (Test-Path -LiteralPath $BinaryPath)) {
-    throw "Linux musl binary not found at $BinaryPath. Build it first, for example: cross build --target=x86_64-unknown-linux-musl --release"
+    throw "Linux musl binary not found at $BinaryPath. Build it first, for example: cross build --target=x86_64-unknown-linux-musl"
 }
 
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)

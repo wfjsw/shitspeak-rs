@@ -30,7 +30,7 @@ use super::super::config::OverlayConfig;
 use super::super::lsdb::{LinkAdvertised, LinkStateDb, LsaEntry};
 use super::RoutingMetric;
 
-const MIN_ROUTE_LOSS_EXCLUSION_SAMPLES: u64 = 32;
+pub(crate) const MIN_ROUTE_LOSS_EXCLUSION_SAMPLES: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteEntry {

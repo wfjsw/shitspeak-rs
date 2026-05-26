@@ -99,7 +99,16 @@ pub async fn handle_request(
         trace!(peer=%sender, "lsdb sync: nothing to send");
         return;
     }
-    for chunk in delta.chunks(max_response_lsas.max(1)) {
+    send_response_chunks(transport, sender, &delta, max_response_lsas).await;
+}
+
+async fn send_response_chunks(
+    transport: &ConnectionManager,
+    dst: NodeIdentifier,
+    entries: &[LsaEntry],
+    max_response_lsas: usize,
+) {
+    for chunk in entries.chunks(max_response_lsas.max(1)) {
         let body = OverlayBody::LsdbSyncResp(pb::LsdbSyncResp {
             delta: chunk.iter().map(|e| e.to_pb()).collect(),
         });
@@ -112,7 +121,7 @@ pub async fn handle_request(
         };
         if let Err(e) = transport
             .send_with_options(
-                sender,
+                dst,
                 ServiceLevel::Reliable,
                 None,
                 MessageClass::Regular,
@@ -121,11 +130,30 @@ pub async fn handle_request(
             )
             .await
         {
-            trace!(peer=%sender, error=%e, "lsdb sync resp send failed");
+            trace!(peer=%dst, error=%e, "lsdb sync resp send failed");
             return;
         }
     }
-    debug!(peer=%sender, count = delta.len(), "lsdb sync resp sent");
+    debug!(peer=%dst, count = entries.len(), "lsdb sync resp sent");
+}
+
+/// Push the current LSDB contents to a direct neighbor.
+///
+/// The normal full-pull path repairs what *we* are missing from a newly-up
+/// neighbor. This push covers the opposite direction: LSAs we already learned
+/// before that neighbor was considered up and therefore may not have flooded
+/// to it.
+pub async fn push_snapshot(
+    lsdb: &LinkStateDb,
+    transport: &ConnectionManager,
+    dst: NodeIdentifier,
+    max_response_lsas: usize,
+) {
+    let entries = lsdb.snapshot();
+    if entries.is_empty() {
+        return;
+    }
+    send_response_chunks(transport, dst, &entries, max_response_lsas).await;
 }
 
 /// Handle an inbound `LsdbSyncResp`. Each LSA goes through the normal

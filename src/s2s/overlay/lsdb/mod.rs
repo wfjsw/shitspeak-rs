@@ -15,5 +15,5 @@ pub use store::{
 };
 pub use sync::{
     full_pull, handle_request as handle_sync_request, handle_response as handle_sync_response,
-    spawn_anti_entropy,
+    push_snapshot, spawn_anti_entropy,
 };

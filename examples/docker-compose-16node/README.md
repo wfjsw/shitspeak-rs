@@ -9,7 +9,7 @@ The demo uses the already-built Linux musl binary so Docker does not need to reb
 Build the Linux binary from the repository root first:
 
 ```powershell
-cross build --target=x86_64-unknown-linux-musl --release
+cross build --target=x86_64-unknown-linux-musl
 ```
 
 Generate or refresh the Compose material:

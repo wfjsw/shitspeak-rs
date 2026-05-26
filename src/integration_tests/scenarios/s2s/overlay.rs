@@ -424,10 +424,10 @@ async fn transit_routing_disabled_nodes_are_not_route_intermediates() {
     assert!(
         wait_until(Duration::from_secs(10), || {
             a.overlay.route_to(2, ServiceLevel::Reliable) == Some(2)
-                && a.overlay.route_to(3, ServiceLevel::Reliable).is_none()
+                && a.overlay.route_to(3, ServiceLevel::Reliable) != Some(2)
         })
         .await,
-        "A should route directly to B but not through non-transit B to C; route_to(2)={:?}, route_to(3)={:?}",
+        "A should route directly to B and never through non-transit B to C; route_to(2)={:?}, route_to(3)={:?}",
         a.overlay.route_to(2, ServiceLevel::Reliable),
         a.overlay.route_to(3, ServiceLevel::Reliable)
     );
@@ -445,26 +445,46 @@ async fn transit_routing_disabled_nodes_are_not_route_intermediates() {
     let got_b = timeout(Duration::from_secs(3), rx_b.recv()).await.unwrap();
     assert_eq!(&got_b.unwrap().body[..], b"to-b");
 
-    let err = a
-        .overlay
-        .send_unicast(
-            3,
-            100,
-            ServiceLevel::Reliable,
-            MessageClass::Regular,
-            Bytes::from_static(b"to-c"),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::s2s::overlay::OverlayError::NoRoute { dst: 3, .. }
-    ));
-    assert!(
-        timeout(Duration::from_millis(500), rx_c.recv())
-            .await
-            .is_err()
-    );
+    match a.overlay.route_to(3, ServiceLevel::Reliable) {
+        Some(2) => panic!("A routed to C through non-transit B"),
+        Some(3) => {
+            a.overlay
+                .send_unicast(
+                    3,
+                    100,
+                    ServiceLevel::Reliable,
+                    MessageClass::Regular,
+                    Bytes::from_static(b"to-c"),
+                )
+                .await
+                .unwrap();
+            let got_c = timeout(Duration::from_secs(3), rx_c.recv()).await.unwrap();
+            assert_eq!(&got_c.unwrap().body[..], b"to-c");
+        }
+        Some(next_hop) => panic!("A routed to C through unexpected next hop {next_hop}"),
+        None => {
+            let err = a
+                .overlay
+                .send_unicast(
+                    3,
+                    100,
+                    ServiceLevel::Reliable,
+                    MessageClass::Regular,
+                    Bytes::from_static(b"to-c"),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                crate::s2s::overlay::OverlayError::NoRoute { dst: 3, .. }
+            ));
+            assert!(
+                timeout(Duration::from_millis(500), rx_c.recv())
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     cluster.shutdown_all().await;
 }

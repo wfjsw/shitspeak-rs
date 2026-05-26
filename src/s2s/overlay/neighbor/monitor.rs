@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::s2s::transport::{ConnectionManager, TransportKind};
 use crate::types::NodeIdentifier;
@@ -50,6 +50,7 @@ struct NeighborState {
     last_ack_at: Option<Instant>,
     miss_count: u32,
     is_up: bool,
+    transports_mask: u32,
     loss_samples: VecDeque<(Instant, bool)>,
     /// Pending pings by nonce -> when sent (for RTT calculation on ack).
     pending: HashMap<u64, Instant>,
@@ -62,6 +63,7 @@ impl NeighborState {
             last_ack_at: None,
             miss_count: 0,
             is_up: false,
+            transports_mask: 0,
             loss_samples: VecDeque::new(),
             pending: HashMap::new(),
         }
@@ -107,6 +109,45 @@ fn packet_loss_snapshot(st: &mut NeighborState, now: Instant, window: Duration) 
     (ppm, total as u64, lost as u64)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectiveLossCandidate {
+    transport: TransportKind,
+    loss_ppm: u32,
+    sample_count: u64,
+}
+
+fn consider_loss_candidate(
+    best: &mut Option<EffectiveLossCandidate>,
+    candidate: EffectiveLossCandidate,
+) {
+    if candidate.sample_count == 0 && candidate.loss_ppm == 0 {
+        return;
+    }
+    let replace = best.is_none_or(|current| {
+        candidate.loss_ppm < current.loss_ppm
+            || (candidate.loss_ppm == current.loss_ppm
+                && candidate.sample_count > current.sample_count)
+    });
+    if replace {
+        *best = Some(candidate);
+    }
+}
+
+fn selected_edge_loss(
+    hello_loss_ppm: u32,
+    hello_loss_samples: u64,
+    best_reliable: Option<EffectiveLossCandidate>,
+    best_any: Option<EffectiveLossCandidate>,
+) -> (u32, u64) {
+    // Routing can choose among live transports for a next hop. A single bad
+    // UDP/KCP/TCP/QUIC session should not rewrite the whole edge when another
+    // usable transport to the same peer is healthier.
+    best_reliable
+        .or(best_any)
+        .map(|candidate| (candidate.loss_ppm, candidate.sample_count))
+        .unwrap_or((hello_loss_ppm, hello_loss_samples))
+}
+
 /// Direct-neighbor table.
 pub struct NeighborMonitor {
     self_id: NodeIdentifier,
@@ -116,6 +157,8 @@ pub struct NeighborMonitor {
     /// Notified whenever a neighbor goes up/down or boot_epoch changes.
     /// Wakes the LSA emitter and the LSDB sync trigger.
     on_change: Arc<Notify>,
+    /// Notified when only volatile quality metrics changed.
+    on_metric_change: Arc<Notify>,
     /// To emit `Restarted` events directly on Hello-driven boot_epoch
     /// increase (faster than waiting for the LSA).
     membership_events: broadcast::Sender<MembershipEvent>,
@@ -137,6 +180,7 @@ impl NeighborMonitor {
             cfg,
             state: Mutex::new(HashMap::new()),
             on_change: Arc::new(Notify::new()),
+            on_metric_change: Arc::new(Notify::new()),
             membership_events,
             on_link_up: Arc::new(Notify::new()),
         }
@@ -144,6 +188,10 @@ impl NeighborMonitor {
 
     pub fn on_change(&self) -> Arc<Notify> {
         self.on_change.clone()
+    }
+
+    pub fn on_metric_change(&self) -> Arc<Notify> {
+        self.on_metric_change.clone()
     }
 
     pub fn on_link_up(&self) -> Arc<Notify> {
@@ -169,6 +217,8 @@ impl NeighborMonitor {
             let mut data_health_ppm = 0;
             let mut loss_ppm = hello_loss_ppm;
             let mut loss_sample_count = hello_loss_samples;
+            let mut best_reliable_loss = None;
+            let mut best_any_loss = None;
             let kinds = self
                 .transport
                 .inner
@@ -187,8 +237,15 @@ impl NeighborMonitor {
                         probe_loss_ppm = probe_loss_ppm.max(m.probe_loss_ppm());
                         native_loss_ppm = native_loss_ppm.max(m.native_loss_ppm());
                         data_health_ppm = data_health_ppm.max(m.data_health_ppm());
-                        loss_ppm = loss_ppm.max(m.effective_packet_loss_ppm());
-                        loss_sample_count = loss_sample_count.saturating_add(m.loss_sample_count());
+                        let candidate = EffectiveLossCandidate {
+                            transport: *k,
+                            loss_ppm: m.effective_packet_loss_ppm(),
+                            sample_count: m.loss_sample_count(),
+                        };
+                        consider_loss_candidate(&mut best_any_loss, candidate);
+                        if *k != TransportKind::Udp {
+                            consider_loss_candidate(&mut best_reliable_loss, candidate);
+                        }
                         if m.rtt_us() > 0.0 {
                             best_rtt = Some(match best_rtt {
                                 Some(prev) => prev.min(m.rtt_us()),
@@ -201,6 +258,12 @@ impl NeighborMonitor {
                         }
                         total_tput += m.estimated_throughput_bps();
                     }
+                    (loss_ppm, loss_sample_count) = selected_edge_loss(
+                        hello_loss_ppm,
+                        hello_loss_samples,
+                        best_reliable_loss,
+                        best_any_loss,
+                    );
                     (
                         best_rtt.unwrap_or(0.0) as u64,
                         best_jitter.unwrap_or(0.0) as u64,
@@ -210,6 +273,7 @@ impl NeighborMonitor {
                 None => (0, 0, 0),
             };
             let transports_mask = transports_to_mask(&kinds);
+            st.transports_mask = transports_mask;
             out.push(NeighborSnapshot {
                 node_id: *nid,
                 rtt_us,
@@ -255,7 +319,7 @@ impl NeighborMonitor {
                 for _ in 0..expired {
                     record_loss_sample(st, now, self.cfg.hello_dead_interval(), true);
                 }
-                self.on_change.notify_one();
+                self.on_metric_change.notify_one();
             }
         }
         st.pending.insert(nonce, now);
@@ -265,16 +329,18 @@ impl NeighborMonitor {
     /// boot_epoch tracking and returns `Restarted` if this is a higher
     /// boot_epoch than we'd seen for `from`.
     pub fn record_hello(&self, from: NodeIdentifier, boot_epoch: u64) {
-        let became_up = {
+        let (became_up, restarted) = {
             let mut g = self.state.lock();
             let st = g.entry(from).or_insert_with(NeighborState::new);
             let was_up = st.is_up;
             let prev_be = st.boot_epoch;
+            let mut restarted = false;
             if boot_epoch > prev_be {
                 st.boot_epoch = boot_epoch;
                 // Only emit Restarted if we'd seen a *previous* epoch (>0).
                 // First-ever boot_epoch is just initial state.
                 if prev_be > 0 {
+                    restarted = true;
                     let _ = self
                         .membership_events
                         .send(MembershipEvent::Restarted(from));
@@ -284,15 +350,17 @@ impl NeighborMonitor {
             st.last_ack_at = Some(Instant::now());
             st.miss_count = 0;
             st.is_up = true;
-            if !was_up {
+            if !was_up || restarted {
                 st.reset_quality_samples();
             }
-            !was_up
+            (!was_up, restarted)
         };
         if became_up {
             debug!(peer=%from, "direct link up");
             self.on_change.notify_one();
             self.on_link_up.notify_one();
+        } else if restarted {
+            self.on_change.notify_one();
         }
     }
 
@@ -304,18 +372,20 @@ impl NeighborMonitor {
         from: NodeIdentifier,
         boot_epoch: u64,
         nonce: u64,
-        ts_send_us: u64,
+        _ts_send_us: u64,
         peer_metrics_target: Option<TransportKind>,
     ) {
         let now = Instant::now();
-        let (was_up, mut sent_at_instant) = {
+        let (was_up, sent_at_instant, restarted) = {
             let mut g = self.state.lock();
             let st = g.entry(from).or_insert_with(NeighborState::new);
             let was_up = st.is_up;
             let prev_be = st.boot_epoch;
+            let mut restarted = false;
             if boot_epoch > prev_be {
                 st.boot_epoch = boot_epoch;
                 if prev_be > 0 {
+                    restarted = true;
                     let _ = self
                         .membership_events
                         .send(MembershipEvent::Restarted(from));
@@ -326,7 +396,7 @@ impl NeighborMonitor {
             // RTT calc — prefer the recorded ts_send (echoed) over our own
             // pending table since either is a valid round-trip measurement.
             let sent_at_instant: Option<Instant> = st.pending.remove(&nonce);
-            if !was_up {
+            if !was_up || restarted {
                 st.reset_quality_samples();
             }
             if sent_at_instant.is_some() {
@@ -338,29 +408,25 @@ impl NeighborMonitor {
                 let cutoff = now - Duration::from_secs(60);
                 st.pending.retain(|_, t| *t > cutoff);
             }
-            (was_up, sent_at_instant)
+            (was_up, sent_at_instant, restarted)
         };
         let matched_ack = sent_at_instant.is_some();
-        let rtt = if let Some(t) = sent_at_instant.take() {
-            now.saturating_duration_since(t)
-        } else {
-            // Reconstruct from echoed wall-clock if we lost track of the
-            // pending entry. ts_send_us is microseconds-since-arbitrary;
-            // we cannot reliably convert to a duration-since-now without
-            // a shared epoch. Skip RTT in that case.
-            return;
-        };
+        let rtt = sent_at_instant.map(|t| now.saturating_duration_since(t));
         let kind = peer_metrics_target.unwrap_or(TransportKind::Tcp);
-        if let Some(peer) = self.transport.inner.get_peer(from) {
-            peer.metrics().record_rtt(kind, rtt);
+        if let Some(rtt) = rtt {
+            if let Some(peer) = self.transport.inner.get_peer(from) {
+                peer.metrics().record_rtt(kind, rtt);
+            }
         }
         let became_up = !was_up;
         if became_up {
             debug!(peer=%from, ?rtt, "direct link up");
             self.on_change.notify_one();
             self.on_link_up.notify_one();
-        } else if matched_ack {
+        } else if restarted {
             self.on_change.notify_one();
+        } else if matched_ack {
+            self.on_metric_change.notify_one();
         }
     }
 
@@ -372,11 +438,16 @@ impl NeighborMonitor {
     pub fn sweep_and_collect_targets(&self) -> Vec<(NodeIdentifier, Vec<TransportKind>)> {
         let live_peers = self.live_peers();
         let live_ids: HashSet<NodeIdentifier> = live_peers.iter().map(|(n, _)| *n).collect();
+        let live_masks: HashMap<NodeIdentifier, u32> = live_peers
+            .iter()
+            .map(|(n, kinds)| (*n, transports_to_mask(kinds)))
+            .collect();
         let now = Instant::now();
         let dead = self.cfg.hello_dead_interval();
-        let transitions = {
+        let (transitions, mask_changes) = {
             let mut g = self.state.lock();
             let mut transitions = Vec::new();
+            let mut mask_changes = Vec::new();
 
             // Sweep existing entries.
             let mut to_remove: Vec<NodeIdentifier> = Vec::new();
@@ -384,6 +455,7 @@ impl NeighborMonitor {
                 if !live_ids.contains(nid) {
                     if st.is_up {
                         st.is_up = false;
+                        st.transports_mask = 0;
                         transitions.push((*nid, false));
                     }
                     // L1 also dropped; eventually purge.
@@ -394,6 +466,13 @@ impl NeighborMonitor {
                         to_remove.push(*nid);
                     }
                     continue;
+                }
+                let current_mask = live_masks.get(nid).copied().unwrap_or(0);
+                if st.is_up && st.transports_mask != current_mask {
+                    st.transports_mask = current_mask;
+                    mask_changes.push((*nid, current_mask));
+                } else if !st.is_up {
+                    st.transports_mask = current_mask;
                 }
                 if let Some(last) = st.last_ack_at {
                     if now.duration_since(last) >= dead {
@@ -408,6 +487,7 @@ impl NeighborMonitor {
                         }
                         if st.is_up {
                             st.is_up = false;
+                            st.transports_mask = 0;
                             transitions.push((*nid, false));
                         }
                     }
@@ -416,13 +496,16 @@ impl NeighborMonitor {
             for n in to_remove {
                 g.remove(&n);
             }
-            transitions
+            (transitions, mask_changes)
         };
 
         for (n, _) in &transitions {
             debug!(peer=%n, "direct link down (hello dead-interval)");
         }
-        if !transitions.is_empty() {
+        for (n, mask) in &mask_changes {
+            debug!(peer=%n, transports_mask=*mask, "direct link transport set changed");
+        }
+        if !transitions.is_empty() || !mask_changes.is_empty() {
             self.on_change.notify_one();
         }
         live_peers
@@ -441,5 +524,80 @@ impl NeighborMonitor {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(
+        transport: TransportKind,
+        loss_ppm: u32,
+        sample_count: u64,
+    ) -> EffectiveLossCandidate {
+        EffectiveLossCandidate {
+            transport,
+            loss_ppm,
+            sample_count,
+        }
+    }
+
+    #[test]
+    fn selected_edge_loss_prefers_best_reliable_transport_over_bad_udp() {
+        let mut best_any = None;
+        let mut best_reliable = None;
+        for candidate in [
+            candidate(TransportKind::Udp, 500_000, 128),
+            candidate(TransportKind::Tcp, 50_000, 96),
+            candidate(TransportKind::Quic, 200_000, 256),
+        ] {
+            consider_loss_candidate(&mut best_any, candidate);
+            if candidate.transport != TransportKind::Udp {
+                consider_loss_candidate(&mut best_reliable, candidate);
+            }
+        }
+
+        assert_eq!(
+            selected_edge_loss(0, 0, best_reliable, best_any),
+            (50_000, 96)
+        );
+    }
+
+    #[test]
+    fn selected_edge_loss_ignores_unsampled_zero_candidate() {
+        let mut best_any = None;
+        let mut best_reliable = None;
+        for candidate in [
+            candidate(TransportKind::Tcp, 0, 0),
+            candidate(TransportKind::Kcp, 200_000, 64),
+        ] {
+            consider_loss_candidate(&mut best_any, candidate);
+            if candidate.transport != TransportKind::Udp {
+                consider_loss_candidate(&mut best_reliable, candidate);
+            }
+        }
+
+        assert_eq!(
+            selected_edge_loss(0, 0, best_reliable, best_any),
+            (200_000, 64)
+        );
+    }
+
+    #[test]
+    fn selected_edge_loss_falls_back_to_udp_when_no_reliable_transport_is_sampled() {
+        let mut best_any = None;
+        let best_reliable = None;
+        consider_loss_candidate(&mut best_any, candidate(TransportKind::Udp, 250_000, 40));
+
+        assert_eq!(
+            selected_edge_loss(0, 0, best_reliable, best_any),
+            (250_000, 40)
+        );
+    }
+
+    #[test]
+    fn selected_edge_loss_falls_back_to_hello_when_no_transport_is_sampled() {
+        assert_eq!(selected_edge_loss(333_333, 4, None, None), (333_333, 4));
     }
 }

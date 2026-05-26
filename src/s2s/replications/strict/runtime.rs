@@ -1630,10 +1630,7 @@ fn spawn_clock_tick_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             }
             let clock = {
                 let mut s = rt.state.lock();
-                let c = s.clock;
-                // Keep our own peer_clocks slot in sync.
-                s.peer_clocks.insert(rt.self_id, c);
-                c
+                advance_clock_for_tick(&mut s, rt.self_id)
             };
             let body = StrictBody::ClockTick(StrictClockTick {
                 src_node: rt.self_id as u32,
@@ -1644,6 +1641,13 @@ fn spawn_clock_tick_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             }
         }
     });
+}
+
+fn advance_clock_for_tick(state: &mut StrictState, self_id: NodeIdentifier) -> u64 {
+    let clock = state.tick_clock();
+    // Keep our own peer_clocks slot in sync.
+    state.peer_clocks.insert(self_id, clock);
+    clock
 }
 
 /// Periodic catchup-bootstrap retry loop. Runs while a history election is
@@ -1793,6 +1797,19 @@ mod tests {
         // If peer's clock is lower, our clock just ticks.
         let new_clock = s.advance_clock(3);
         assert_eq!(new_clock, 12);
+    }
+
+    #[test]
+    fn clock_tick_advances_local_clock_and_peer_slot() {
+        let mut s = StrictState::new();
+        s.clock = 7;
+        s.peer_clocks.insert(10, 7);
+
+        let tick = advance_clock_for_tick(&mut s, 10);
+
+        assert_eq!(tick, 8);
+        assert_eq!(s.clock, 8);
+        assert_eq!(s.peer_clocks[&10], 8);
     }
 
     #[test]

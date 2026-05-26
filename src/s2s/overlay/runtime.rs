@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -136,6 +137,38 @@ impl OverlayInner {
                         _ = on_change.notified() => {}
                     }
                     em.poke();
+                }
+            });
+        }
+
+        // Forward volatile metric changes through a debounce so link-quality
+        // sampling cannot wake the LSA emitter on every HelloAck.
+        {
+            let mon = self.neighbor.clone();
+            let em = self.emitter.clone();
+            let shutdown = self.shutdown.clone();
+            let on_metric_change = mon.on_metric_change();
+            let min_interval = self.cfg.cost_rerun_min_interval();
+            tokio::spawn(async move {
+                let mut last_poke = Instant::now();
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = on_metric_change.notified() => {}
+                    }
+
+                    let remaining = min_interval
+                        .checked_sub(last_poke.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    if !remaining.is_zero() {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            _ = tokio::time::sleep(remaining) => {}
+                        }
+                    }
+
+                    em.poke();
+                    last_poke = Instant::now();
                 }
             });
         }

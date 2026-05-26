@@ -23,7 +23,7 @@ pub async fn apply_permission_info_to_channel_state(
     cs_proto: &crate::messages::Message,
     channels: &Arc<ChannelRepository>,
 ) -> Option<crate::messages::Message> {
-    if let crate::messages::Message::ChannelState(ref cs_proto) = cs_proto {
+    if let crate::messages::Message::ChannelState(cs_proto) = cs_proto {
         if let Some(ch_id) = cs_proto.channel_id {
             let server_id = client.server_id();
             if let Some(ch) = channels.get_channel_in_server(&server_id, ch_id).await {
