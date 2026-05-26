@@ -68,6 +68,8 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
         nonce,
         ts_send_us: ts,
     });
+    #[cfg(debug_assertions)]
+    let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
     let payload = match encode_message(&wrap(body)) {
         Ok(b) => b,
         Err(e) => {
@@ -75,6 +77,8 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
             return;
         }
     };
+    #[cfg(debug_assertions)]
+    let payload_len = payload.len();
     match ctx
         .transport
         .send(
@@ -86,7 +90,11 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
         )
         .await
     {
-        Ok(()) => ctx.monitor.record_outbound_ping(dst, nonce),
+        Ok(()) => {
+            #[cfg(debug_assertions)]
+            crate::s2s::debug_io::record_sent(packet_kind, payload_len);
+            ctx.monitor.record_outbound_ping(dst, nonce);
+        }
         Err(e) => trace!(peer=%dst, error=%e, "hello send failed"),
     }
 }
@@ -144,6 +152,8 @@ pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: p
         nonce: hello.nonce,
         ts_send_us: hello.ts_send_us,
     });
+    #[cfg(debug_assertions)]
+    let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
     let payload = match encode_message(&wrap(body)) {
         Ok(b) => b,
         Err(e) => {
@@ -151,7 +161,9 @@ pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: p
             return;
         }
     };
-    if let Err(e) = ctx
+    #[cfg(debug_assertions)]
+    let payload_len = payload.len();
+    match ctx
         .transport
         .send(
             from,
@@ -162,7 +174,11 @@ pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: p
         )
         .await
     {
-        trace!(peer=%from, error=%e, "hello_ack send failed");
+        Ok(()) => {
+            #[cfg(debug_assertions)]
+            crate::s2s::debug_io::record_sent(packet_kind, payload_len);
+        }
+        Err(e) => trace!(peer=%from, error=%e, "hello_ack send failed"),
     }
 }
 

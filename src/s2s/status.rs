@@ -23,6 +23,8 @@ struct TopologySnapshot {
     links: Vec<TopologyLink>,
     routes: Vec<TopologyRoute>,
     local_metrics: Vec<TransportMetric>,
+    #[cfg(debug_assertions)]
+    debug_packet_io: Vec<crate::s2s::debug_io::PacketIoSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -389,6 +391,8 @@ fn build_topology_snapshot(
         links,
         routes,
         local_metrics,
+        #[cfg(debug_assertions)]
+        debug_packet_io: crate::s2s::debug_io::snapshot(),
     }
 }
 
@@ -502,6 +506,7 @@ th { color: var(--muted); font-weight: 600; background: #fafbfc; }
   </section>
   <section class="tables">
     <div class="panel"><h2>Nodes</h2><table><thead><tr><th>Node</th><th>Status</th><th>LSA</th><th>Addresses</th></tr></thead><tbody id="nodes"></tbody></table></div>
+    <div class="panel"><h2>Packet IO</h2><table><thead><tr><th>Kind</th><th>Total</th><th>Sent</th><th>Recv</th><th>Count</th><th>Avg</th></tr></thead><tbody id="packet-io"></tbody></table></div>
     <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Loss</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Voice</th><th>Control</th><th>Bulk</th></tr></thead><tbody id="metrics"></tbody></table></div>
     <div class="panel"><h2>Routes</h2><table><thead><tr><th>Metric</th><th>Level</th><th>Dst</th><th>Next hop</th><th>Cost</th></tr></thead><tbody id="routes"></tbody></table></div>
   </section>
@@ -511,6 +516,7 @@ th { color: var(--muted); font-weight: 600; background: #fafbfc; }
 const graph = document.getElementById('graph');
 const meta = document.getElementById('meta');
 const nodesTbody = document.getElementById('nodes');
+const packetIoTbody = document.getElementById('packet-io');
 const metricsTbody = document.getElementById('metrics');
 const routesTbody = document.getElementById('routes');
 let network;
@@ -519,6 +525,7 @@ let graphEdges;
 let currentLocalNode = null;
 let graphTopologyKey = '';
 function fmtUs(v) { return v ? (v / 1000).toFixed(1) + ' ms' : '-'; }
+function fmtBytes(v) { if (!v) return '-'; const u = ['B','KB','MB','GB']; let i = 0; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return v.toFixed(i ? 1 : 0) + ' ' + u[i]; }
 function fmtBps(v) { if (!v) return '-'; const u = ['B/s','KB/s','MB/s','GB/s']; let i = 0; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return v.toFixed(i ? 1 : 0) + ' ' + u[i]; }
 function fmtLoss(v) { return v ? (v / 10000).toFixed(2) + '%' : '0%'; }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -668,7 +675,11 @@ function renderGraph(data) {
 }
 function renderTables(data) {
   nodesTbody.innerHTML = data.nodes.map(n => `<tr><td>${n.node_id}</td><td><span class="pill ${n.status}">${n.status}</span></td><td>seq ${n.lsa_seq ?? '-'}<br>${n.lsa_age_ms ?? '-'} ms</td><td>${n.addresses.map(a => `<span class="transport">${esc(a.transport)}</span> ${esc(a.addr)}`).join('<br>')}</td></tr>`).join('');
-    metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
+  const packetRows = data.debug_packet_io || [];
+  packetIoTbody.innerHTML = packetRows.length
+    ? packetRows.map(p => `<tr><td>${esc(p.kind)}</td><td>${fmtBytes(p.total_bytes)}</td><td>${fmtBytes(p.sent_bytes)}<br><span class="transport">${p.sent_count}</span></td><td>${fmtBytes(p.recv_bytes)}<br><span class="transport">${p.recv_count}</span></td><td>${p.total_count}</td><td>${fmtBps(p.avg_total_bps)}</td></tr>`).join('')
+    : `<tr><td colspan="6" class="transport">-</td></tr>`;
+  metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
   routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${r.cost}</td></tr>`).join('');
 }
 async function refresh() {
@@ -719,6 +730,8 @@ mod tests {
         assert!(STATUS_HTML.contains("dragNodes: true"));
         assert!(STATUS_HTML.contains("solver: 'repulsion'"));
         assert!(STATUS_HTML.contains("tooltipHtml(["));
+        assert!(STATUS_HTML.contains("Packet IO"));
+        assert!(STATUS_HTML.contains("debug_packet_io"));
         assert!(STATUS_HTML.contains("network.setOptions({ physics: false })"));
     }
 }

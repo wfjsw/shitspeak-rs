@@ -1,4 +1,6 @@
 pub mod application;
+#[cfg(debug_assertions)]
+pub(crate) mod debug_io;
 pub mod overlay;
 pub mod replications;
 pub mod status;

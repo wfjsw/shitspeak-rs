@@ -485,8 +485,13 @@ async fn send_control_to(
     if target == self_id {
         return Ok(());
     }
-    let payload = encode_message(&wrap(OverlayBody::Control(control)))?;
-    send_encoded_to_target(
+    let body = OverlayBody::Control(control);
+    #[cfg(debug_assertions)]
+    let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
+    let payload = encode_message(&wrap(body))?;
+    #[cfg(debug_assertions)]
+    let payload_len = payload.len();
+    let result = send_encoded_to_target(
         transport,
         routing,
         self_id,
@@ -497,7 +502,12 @@ async fn send_control_to(
         payload,
         true,
     )
-    .await
+    .await;
+    #[cfg(debug_assertions)]
+    if result.is_ok() {
+        crate::s2s::debug_io::record_sent(packet_kind, payload_len);
+    }
+    result
 }
 
 fn preflight_routes(
@@ -614,7 +624,10 @@ async fn forward_pb_as(
         }
 
         let send_options = transport_options_for_overlay_data(&pb_msg);
-        let payload = match encode_message(&wrap(OverlayBody::Data(pb_msg))) {
+        let body = OverlayBody::Data(pb_msg);
+        #[cfg(debug_assertions)]
+        let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
+        let payload = match encode_message(&wrap(body)) {
             Ok(b) => b,
             Err(e) => {
                 if is_originator {
@@ -624,6 +637,8 @@ async fn forward_pb_as(
                 continue;
             }
         };
+        #[cfg(debug_assertions)]
+        let payload_len = payload.len();
         match transport
             .send_with_options(
                 next_hop,
@@ -635,7 +650,11 @@ async fn forward_pb_as(
             )
             .await
         {
-            Ok(()) => trace!(%next_hop, ?level, "forwarded"),
+            Ok(()) => {
+                #[cfg(debug_assertions)]
+                crate::s2s::debug_io::record_sent(packet_kind, payload_len);
+                trace!(%next_hop, ?level, "forwarded");
+            }
             Err(e) => {
                 if is_originator && first_err.is_none() {
                     first_err = Some(OverlayError::Send(e));

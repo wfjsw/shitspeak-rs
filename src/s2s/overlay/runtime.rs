@@ -21,6 +21,7 @@ use crate::types::NodeIdentifier;
 
 use super::config::OverlayConfig;
 use super::error::OverlayError;
+use super::lsdb::advert::cost_changed_significantly;
 use super::lsdb::{
     LinkStateDb, LsaEmitter, LsaFloodPacer, LsaFloor, capture_boot_epoch, emit_once,
     spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
@@ -30,6 +31,8 @@ use super::messaging::{ServiceRegistry, ordering::OverlayOrdering};
 use super::neighbor::hello::{HelloContext, spawn_hello_task, spawn_link_up_watcher};
 use super::neighbor::monitor::NeighborMonitor;
 use super::routing::{RoutingHandle, new_handle as new_routing_handle, spawn_recomputer};
+
+const METRIC_CHANGE_STABLE_CHECKS: u8 = 3;
 
 pub(crate) struct OverlayInner {
     pub self_id: NodeIdentifier,
@@ -149,8 +152,10 @@ impl OverlayInner {
             let shutdown = self.shutdown.clone();
             let on_metric_change = mon.on_metric_change();
             let min_interval = self.cfg.cost_rerun_min_interval();
+            let cfg = self.cfg.clone();
             tokio::spawn(async move {
                 let mut last_poke = Instant::now();
+                let mut stable_checks = 0u8;
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => return,
@@ -167,7 +172,16 @@ impl OverlayInner {
                         }
                     }
 
-                    em.poke();
+                    let snap = mon.snapshot();
+                    if cost_changed_significantly(&em, &snap, &cfg) {
+                        stable_checks = stable_checks.saturating_add(1);
+                        if stable_checks >= METRIC_CHANGE_STABLE_CHECKS {
+                            em.poke();
+                            stable_checks = 0;
+                        }
+                    } else {
+                        stable_checks = 0;
+                    }
                     last_poke = Instant::now();
                 }
             });

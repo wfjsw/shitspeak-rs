@@ -53,9 +53,13 @@ pub async fn send_request(
             })
             .collect(),
     });
+    #[cfg(debug_assertions)]
+    let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
     match encode_message(&wrap(body)) {
         Ok(payload) => {
-            if let Err(e) = transport
+            #[cfg(debug_assertions)]
+            let payload_len = payload.len();
+            match transport
                 .send_with_options(
                     dst,
                     ServiceLevel::Reliable,
@@ -66,7 +70,11 @@ pub async fn send_request(
                 )
                 .await
             {
-                trace!(peer=%dst, error=%e, "lsdb sync send failed");
+                Ok(()) => {
+                    #[cfg(debug_assertions)]
+                    crate::s2s::debug_io::record_sent(packet_kind, payload_len);
+                }
+                Err(e) => trace!(peer=%dst, error=%e, "lsdb sync send failed"),
             }
         }
         Err(e) => warn!(error=%e, "lsdb sync encode failed"),
@@ -112,6 +120,8 @@ async fn send_response_chunks(
         let body = OverlayBody::LsdbSyncResp(pb::LsdbSyncResp {
             delta: chunk.iter().map(|e| e.to_pb()).collect(),
         });
+        #[cfg(debug_assertions)]
+        let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
         let payload = match encode_message(&wrap(body)) {
             Ok(b) => b,
             Err(e) => {
@@ -119,7 +129,9 @@ async fn send_response_chunks(
                 return;
             }
         };
-        if let Err(e) = transport
+        #[cfg(debug_assertions)]
+        let payload_len = payload.len();
+        match transport
             .send_with_options(
                 dst,
                 ServiceLevel::Reliable,
@@ -130,8 +142,14 @@ async fn send_response_chunks(
             )
             .await
         {
-            trace!(peer=%dst, error=%e, "lsdb sync resp send failed");
-            return;
+            Ok(()) => {
+                #[cfg(debug_assertions)]
+                crate::s2s::debug_io::record_sent(packet_kind, payload_len);
+            }
+            Err(e) => {
+                trace!(peer=%dst, error=%e, "lsdb sync resp send failed");
+                return;
+            }
         }
     }
     debug!(peer=%dst, count = entries.len(), "lsdb sync resp sent");

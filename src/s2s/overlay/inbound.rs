@@ -102,6 +102,11 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
     let Some(body) = decoded.body else {
         return;
     };
+    #[cfg(debug_assertions)]
+    {
+        let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
+        crate::s2s::debug_io::record_received(packet_kind, raw.len());
+    }
     match body {
         OverlayBody::Hello(h) => respond_to_hello(&ctx.hello, from, h).await,
         OverlayBody::HelloAck(a) => handle_hello_ack(&ctx.hello, from, a, kind),

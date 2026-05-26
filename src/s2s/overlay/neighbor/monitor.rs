@@ -28,6 +28,7 @@ use crate::types::NodeIdentifier;
 use super::super::config::OverlayConfig;
 use super::super::membership::MembershipEvent;
 use super::super::proto::transports_to_mask;
+use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 
 /// Snapshot suitable for embedding as a `LinkAdvert` in an outbound LSA.
 #[derive(Clone, Debug)]
@@ -124,9 +125,13 @@ fn consider_loss_candidate(
         return;
     }
     let replace = best.is_none_or(|current| {
-        candidate.loss_ppm < current.loss_ppm
-            || (candidate.loss_ppm == current.loss_ppm
-                && candidate.sample_count > current.sample_count)
+        let candidate_confident = candidate.sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let current_confident = current.sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        (candidate_confident && !current_confident)
+            || (candidate_confident == current_confident
+                && (candidate.loss_ppm < current.loss_ppm
+                    || (candidate.loss_ppm == current.loss_ppm
+                        && candidate.sample_count > current.sample_count)))
     });
     if replace {
         *best = Some(candidate);
@@ -581,6 +586,26 @@ mod tests {
         assert_eq!(
             selected_edge_loss(0, 0, best_reliable, best_any),
             (200_000, 64)
+        );
+    }
+
+    #[test]
+    fn selected_edge_loss_prefers_confident_reliable_candidate() {
+        let mut best_any = None;
+        let mut best_reliable = None;
+        for candidate in [
+            candidate(TransportKind::Tcp, 50_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES),
+            candidate(TransportKind::Quic, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES - 1),
+        ] {
+            consider_loss_candidate(&mut best_any, candidate);
+            if candidate.transport != TransportKind::Udp {
+                consider_loss_candidate(&mut best_reliable, candidate);
+            }
+        }
+
+        assert_eq!(
+            selected_edge_loss(0, 0, best_reliable, best_any),
+            (50_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)
         );
     }
 

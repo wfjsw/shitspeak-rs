@@ -60,7 +60,7 @@ pub struct LsaEmitter {
     self_addresses: Vec<crate::s2s::transport::PeerAddress>,
     /// Notify to wake the emitter task on neighbor change.
     pub trigger: Notify,
-    last_emitted_content: parking_lot::Mutex<Option<(u64, Instant)>>,
+    last_emitted_content: parking_lot::Mutex<Option<(ContentFingerprint, Instant)>>,
 }
 
 impl LsaEmitter {
@@ -117,6 +117,12 @@ struct LsaContent {
     links: Vec<LinkAdvertised>,
     max_users: u64,
     transit_disabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContentFingerprint {
+    identity: u64,
+    gate: u64,
 }
 
 fn build_local_lsa_content(
@@ -275,10 +281,10 @@ fn round_down_throughput_gate(value: u64) -> u64 {
     }
 }
 
-fn gate_delta_ratio_changed(previous: u64, current: u64, pct: f64) -> bool {
+fn gate_delta_ratio_changed(previous: u64, current: u64, pct: f64, min_delta: u64) -> bool {
     if previous > 0 {
         let delta = current.abs_diff(previous);
-        delta > 0 && (delta as f64) / (previous as f64) >= pct
+        delta >= min_delta && (delta as f64) / (previous as f64) >= pct
     } else {
         current > 0
     }
@@ -297,6 +303,28 @@ fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     content.max_users.hash(&mut hasher);
     content.transit_disabled.hash(&mut hasher);
     hasher.finish()
+}
+
+fn content_identity_fingerprint(content: &LsaContent) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.tombstone.hash(&mut hasher);
+    for addr in &content.addresses {
+        addr.hash(&mut hasher);
+    }
+    for link in &content.links {
+        link.neighbor.hash(&mut hasher);
+        link.transports_mask.hash(&mut hasher);
+    }
+    content.max_users.hash(&mut hasher);
+    content.transit_disabled.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn content_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> ContentFingerprint {
+    ContentFingerprint {
+        identity: content_identity_fingerprint(content),
+        gate: content_gate_fingerprint(content, cfg),
+    }
 }
 
 /// Build a fresh local LSA from the current neighbor snapshot.
@@ -320,41 +348,104 @@ pub fn cost_changed_significantly(
     let prev_set: HashSet<NodeIdentifier> = last.keys().copied().collect();
     let now_set: HashSet<NodeIdentifier> = snap.iter().map(|n| n.node_id).collect();
     if prev_set != now_set {
+        trace!(
+            previous = ?prev_set,
+            current = ?now_set,
+            "local lsa change gate crossed: neighbor set"
+        );
         return true;
     }
     for n in snap {
         let Some(previous) = last.get(&n.node_id).copied() else {
+            trace!(
+                peer = %n.node_id,
+                "local lsa change gate crossed: missing published baseline"
+            );
             return true;
         };
         let current = LinkGate::from_snapshot(n, cfg);
         if previous.transports_mask != current.transports_mask {
+            trace!(
+                peer = %n.node_id,
+                previous = previous.transports_mask,
+                current = current.transports_mask,
+                "local lsa change gate crossed: transport mask"
+            );
             return true;
         }
-        if gate_delta_ratio_changed(previous.rtt_us, current.rtt_us, cfg.cost_rerun_rtt_pct()) {
+        if gate_delta_ratio_changed(
+            previous.rtt_us,
+            current.rtt_us,
+            cfg.cost_rerun_rtt_pct(),
+            RTT_GATE_BUCKET_US * 2,
+        ) {
+            trace!(
+                peer = %n.node_id,
+                previous = previous.rtt_us,
+                current = current.rtt_us,
+                threshold_pct = cfg.cost_rerun_rtt_pct(),
+                "local lsa change gate crossed: rtt"
+            );
             return true;
         }
         if gate_delta_ratio_changed(
             previous.jitter_us,
             current.jitter_us,
             cfg.cost_rerun_rtt_pct(),
+            JITTER_GATE_BUCKET_US * 2,
         ) {
+            trace!(
+                peer = %n.node_id,
+                previous = previous.jitter_us,
+                current = current.jitter_us,
+                threshold_pct = cfg.cost_rerun_rtt_pct(),
+                "local lsa change gate crossed: jitter"
+            );
             return true;
         }
         if gate_delta_ratio_changed(
             previous.throughput_bps,
             current.throughput_bps,
             cfg.cost_rerun_throughput_pct(),
+            1,
         ) {
+            trace!(
+                peer = %n.node_id,
+                previous = previous.throughput_bps,
+                current = current.throughput_bps,
+                threshold_pct = cfg.cost_rerun_throughput_pct(),
+                "local lsa change gate crossed: throughput"
+            );
             return true;
         }
         if previous.loss_confident != current.loss_confident {
+            trace!(
+                peer = %n.node_id,
+                previous = previous.loss_confident,
+                current = current.loss_confident,
+                "local lsa change gate crossed: loss confidence"
+            );
             return true;
         }
         if previous.excessive_loss != current.excessive_loss {
+            trace!(
+                peer = %n.node_id,
+                previous = previous.excessive_loss,
+                current = current.excessive_loss,
+                max_route_packet_loss_ppm = cfg.max_route_packet_loss_ppm(),
+                "local lsa change gate crossed: excessive loss"
+            );
             return true;
         }
         let loss_delta = previous.loss_ppm.abs_diff(current.loss_ppm);
         if loss_delta > 0 && loss_delta >= cfg.cost_rerun_loss_ppm() {
+            trace!(
+                peer = %n.node_id,
+                previous = previous.loss_ppm,
+                current = current.loss_ppm,
+                threshold_ppm = cfg.cost_rerun_loss_ppm(),
+                "local lsa change gate crossed: loss"
+            );
             return true;
         }
     }
@@ -504,16 +595,21 @@ async fn send_lsa_flood(
     if lsas.is_empty() {
         return;
     }
-    let payload = match encode_message(&wrap(OverlayBody::LsaFlood(pb::LsaFlood {
+    let body = OverlayBody::LsaFlood(pb::LsaFlood {
         advertisements: lsas,
-    }))) {
+    });
+    #[cfg(debug_assertions)]
+    let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
+    let payload = match encode_message(&wrap(body)) {
         Ok(b) => b,
         Err(e) => {
             warn!(error=%e, "encode lsa flood failed");
             return;
         }
     };
-    if let Err(e) = transport
+    #[cfg(debug_assertions)]
+    let payload_len = payload.len();
+    match transport
         .send_with_options(
             dst,
             ServiceLevel::Reliable,
@@ -524,7 +620,11 @@ async fn send_lsa_flood(
         )
         .await
     {
-        trace!(peer=%dst, error=%e, "lsa flood send failed");
+        Ok(()) => {
+            #[cfg(debug_assertions)]
+            crate::s2s::debug_io::record_sent(packet_kind, payload_len);
+        }
+        Err(e) => trace!(peer=%dst, error=%e, "lsa flood send failed"),
     }
 }
 
@@ -625,23 +725,26 @@ fn unchanged_refresh_deadline(cfg: &OverlayConfig) -> Duration {
 
 fn should_emit_content(
     emitter: &LsaEmitter,
-    fingerprint: u64,
+    fingerprint: ContentFingerprint,
     reason: EmitReason,
     cfg: &OverlayConfig,
 ) -> bool {
     if reason != EmitReason::Periodic || !cfg.lsa_refresh_reduction_enabled() {
         return true;
     }
-    let Some((last_fingerprint, last_at)) = *emitter.last_emitted_content.lock() else {
+    let Some((last, last_at)) = *emitter.last_emitted_content.lock() else {
         return true;
     };
-    if last_fingerprint != fingerprint {
+    if last.identity != fingerprint.identity {
         return true;
+    }
+    if last.gate != fingerprint.gate {
+        trace!("sub-threshold metric movement ignored for local lsa refresh");
     }
     last_at.elapsed() >= unchanged_refresh_deadline(cfg)
 }
 
-fn record_emitted_content(emitter: &LsaEmitter, fingerprint: u64) {
+fn record_emitted_content(emitter: &LsaEmitter, fingerprint: ContentFingerprint) {
     *emitter.last_emitted_content.lock() = Some((fingerprint, Instant::now()));
 }
 
@@ -676,7 +779,7 @@ async fn emit_once_with_reason(
     let snap = monitor.snapshot();
     let tombstone = reason == EmitReason::Tombstone;
     let content = build_local_lsa_content(emitter, &snap, tombstone);
-    let fingerprint = content_gate_fingerprint(&content, cfg);
+    let fingerprint = content_fingerprint(&content, cfg);
     if !should_emit_content(emitter, fingerprint, reason, cfg) {
         trace!("unchanged local lsa refresh suppressed");
         return;
@@ -823,6 +926,23 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_rtt_bucket_movement_does_not_emit() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.rtt_us = 76_000;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].rtt_us = 101_000;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+
+        changed[0].rtt_us = 126_000;
+        assert!(cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
     fn rounded_jitter_and_loss_movement_inside_buckets_do_not_emit() {
         let cfg = OverlayConfig::new(vec![]);
         let emitter = test_emitter();
@@ -837,6 +957,23 @@ mod tests {
         changed[0].jitter_us = 19_000;
         changed[0].loss_ppm = 149_000;
         assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn adjacent_jitter_bucket_movement_does_not_emit() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.jitter_us = 31_000;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].jitter_us = 41_000;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+
+        changed[0].jitter_us = 51_000;
+        assert!(cost_changed_significantly(&emitter, &changed, &cfg));
     }
 
     #[test]
@@ -947,7 +1084,7 @@ mod tests {
             .with_lsa_unchanged_refresh_interval(Duration::from_secs(90));
 
         let content = build_local_lsa_content(&emitter, &[], false);
-        let fingerprint = content_gate_fingerprint(&content, &cfg);
+        let fingerprint = content_fingerprint(&content, &cfg);
         assert!(should_emit_content(
             &emitter,
             fingerprint,
@@ -973,9 +1110,10 @@ mod tests {
 
         max_users.store(20, Ordering::Relaxed);
         let changed = build_local_lsa_content(&emitter, &[], false);
+        let changed_fingerprint = content_fingerprint(&changed, &cfg);
         assert!(should_emit_content(
             &emitter,
-            content_gate_fingerprint(&changed, &cfg),
+            changed_fingerprint,
             EmitReason::Periodic,
             &cfg
         ));
@@ -995,7 +1133,7 @@ mod tests {
         let base = vec![base];
 
         let content = build_local_lsa_content(&emitter, &base, false);
-        let fingerprint = content_gate_fingerprint(&content, &cfg);
+        let fingerprint = content_fingerprint(&content, &cfg);
         record_emitted_content(&emitter, fingerprint);
 
         let mut changed = base.clone();
@@ -1007,9 +1145,41 @@ mod tests {
         changed[0].data_health_ppm = 900_000;
         changed[0].loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES + 16;
         let changed_content = build_local_lsa_content(&emitter, &changed, false);
-        let changed_fingerprint = content_gate_fingerprint(&changed_content, &cfg);
+        let changed_fingerprint = content_fingerprint(&changed_content, &cfg);
 
-        assert_eq!(fingerprint, changed_fingerprint);
+        assert_eq!(fingerprint.gate, changed_fingerprint.gate);
+        assert_eq!(fingerprint.identity, changed_fingerprint.identity);
+        assert!(!should_emit_content(
+            &emitter,
+            changed_fingerprint,
+            EmitReason::Periodic,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn refresh_reduction_suppresses_sub_threshold_metric_gate_movement() {
+        let cfg = OverlayConfig::new(vec![])
+            .with_lsa_max_age(Duration::from_secs(120))
+            .with_lsa_unchanged_refresh_interval(Duration::from_secs(90));
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.rtt_us = 76_000;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let content = build_local_lsa_content(&emitter, &base, false);
+        let fingerprint = content_fingerprint(&content, &cfg);
+        record_emitted_content(&emitter, fingerprint);
+
+        let mut changed = base.clone();
+        changed[0].rtt_us = 101_000;
+        let changed_content = build_local_lsa_content(&emitter, &changed, false);
+        let changed_fingerprint = content_fingerprint(&changed_content, &cfg);
+
+        assert_ne!(fingerprint.gate, changed_fingerprint.gate);
+        assert_eq!(fingerprint.identity, changed_fingerprint.identity);
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
         assert!(!should_emit_content(
             &emitter,
             changed_fingerprint,
