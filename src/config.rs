@@ -1013,6 +1013,9 @@ mod tests {
             recent_probe_retry_cap_secs = 31
             stale_probe_retry_cap_secs = 601
             stale_probe_age_secs = 3601
+            unconfirmed_address_retry_floor_secs = 301
+            unconfirmed_address_retry_cap_secs = 1801
+            unconfirmed_address_decay_failures = 7
             unselected_link_probe_interval_secs = 41
             max_outgoing_connections = 777
             compression_enabled = false
@@ -1068,6 +1071,15 @@ mod tests {
         assert_eq!(transport.backoff_cap(), Duration::from_secs(31));
         assert_eq!(transport.stale_backoff_cap(), Duration::from_secs(601));
         assert_eq!(transport.stale_backoff_after(), Duration::from_secs(3601));
+        assert_eq!(
+            transport.unconfirmed_address_retry_floor(),
+            Duration::from_secs(301)
+        );
+        assert_eq!(
+            transport.unconfirmed_address_retry_cap(),
+            Duration::from_secs(1801)
+        );
+        assert_eq!(transport.unconfirmed_address_decay_failures(), 7);
         assert_eq!(
             transport.unselected_link_probe_interval(),
             Duration::from_secs(41)

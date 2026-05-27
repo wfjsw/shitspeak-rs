@@ -67,22 +67,17 @@ pub fn bootstrap(cfg: &OverlayConfig, transport: &ConnectionManager) {
     );
 }
 
-/// Add addresses learned from an accepted non-tombstone LSA into the
-/// transport address book. Seeing a fresh LSA also refreshes the peer's
+/// Synchronize addresses learned from an accepted LSA into the transport
+/// address book. Seeing a fresh non-tombstone LSA also refreshes the peer's
 /// last-seen time even if all addresses were already known.
 pub fn learn_from_lsa(transport: &ConnectionManager, lsa: &LsaEntry) {
-    if lsa.tombstone || lsa.addresses.is_empty() {
-        return;
-    }
     let seen_at = SystemTime::now();
-    for addr in &lsa.addresses {
-        let t = transport.clone();
-        let addr = *addr;
-        let node = lsa.origin;
-        tokio::spawn(async move {
-            t.add_address_seen_at(node, addr, seen_at).await;
-        });
-    }
+    let addrs = if lsa.tombstone {
+        Vec::new()
+    } else {
+        lsa.addresses.clone()
+    };
+    transport.replace_advertised_addresses_seen_at(lsa.origin, addrs, seen_at);
 }
 
 /// Spawn the debounced persister. The persister writes the transport address

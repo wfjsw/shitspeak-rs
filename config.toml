@@ -77,6 +77,12 @@ recent_probe_retry_cap_secs = 30
 stale_probe_retry_cap_secs = 600
 # Age where a peer is considered old enough to use the stale retry cap.
 stale_probe_age_secs = 3600
+# When another direct path to a peer is already live, failed addresses that
+# are neither currently advertised nor on the live remote IP back off in this
+# 5-30 minute range and are removed after repeated capped failures.
+unconfirmed_address_retry_floor_secs = 300
+unconfirmed_address_retry_cap_secs = 1800
+unconfirmed_address_decay_failures = 5
 # How often to sample one otherwise unselected peer/transport while the
 # outgoing cap is full. Set to 0 to disable.
 unselected_link_probe_interval_secs = 30

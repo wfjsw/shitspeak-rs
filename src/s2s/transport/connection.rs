@@ -4,7 +4,7 @@
 //! the dial address book, the set of currently-active streams, reconnect
 //! backoff, and aggregated metrics.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -198,6 +198,15 @@ impl BackoffState {
         self.last_attempt = Some(Instant::now());
     }
 
+    pub fn record_failure_with_floor(&mut self, retry_floor: Duration, retry_cap: Duration) {
+        let retry_cap = retry_cap.max(retry_floor);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let doubled = self.next_delay.saturating_mul(2);
+        self.next_delay = doubled.max(retry_floor).min(retry_cap);
+        self.retry_delay = jittered_delay(self.next_delay, retry_cap);
+        self.last_attempt = Some(Instant::now());
+    }
+
     pub fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.next_delay = self.initial;
@@ -232,6 +241,7 @@ fn jittered_delay(base: Duration, cap: Duration) -> Duration {
 pub(crate) struct PeerState {
     node_id: NodeIdentifier,
     addresses: Mutex<Vec<PeerAddress>>,
+    advertised_addresses: Mutex<HashSet<PeerAddress>>,
     streams: Mutex<HashMap<StreamKey, ActiveStream>>,
     udp_seen_at: Mutex<Option<Instant>>,
     udp_addr: Mutex<Option<std::net::SocketAddr>>,
@@ -257,6 +267,7 @@ impl PeerState {
         Arc::new(Self {
             node_id,
             addresses: Mutex::new(Vec::new()),
+            advertised_addresses: Mutex::new(HashSet::new()),
             streams: Mutex::new(HashMap::new()),
             udp_seen_at: Mutex::new(None),
             udp_addr: Mutex::new(None),
@@ -355,6 +366,20 @@ impl PeerState {
         backoff.snapshot()
     }
 
+    pub fn record_address_failure_with_floor(
+        &self,
+        addr: PeerAddress,
+        retry_floor: Duration,
+        retry_cap: Duration,
+    ) -> BackoffSnapshot {
+        let mut address_backoffs = self.address_backoffs.lock();
+        let backoff = address_backoffs
+            .entry(addr)
+            .or_insert_with(|| BackoffState::new(self.backoff_initial));
+        backoff.record_failure_with_floor(retry_floor, retry_cap);
+        backoff.snapshot()
+    }
+
     pub fn record_address_success(&self, addr: PeerAddress) {
         self.address_backoffs
             .lock()
@@ -409,6 +434,32 @@ impl PeerState {
         candidates
     }
 
+    pub fn replace_advertised_addresses(&self, addrs: &[PeerAddress]) {
+        let mut advertised = self.advertised_addresses.lock();
+        advertised.clear();
+        advertised.extend(addrs.iter().copied());
+    }
+
+    pub fn address_is_actively_advertised(&self, addr: PeerAddress) -> bool {
+        self.advertised_addresses.lock().contains(&addr)
+    }
+
+    pub fn address_matches_live_remote_ip(&self, addr: PeerAddress) -> bool {
+        let ip = addr.addr().ip();
+        let mut streams = self.streams.lock();
+        prune_dead_streams(&mut streams);
+        streams.values().any(|stream| {
+            stream.is_alive()
+                && stream
+                    .remote_addr
+                    .is_some_and(|remote_addr| remote_addr.ip() == ip)
+        })
+    }
+
+    pub fn address_is_currently_confirmed(&self, addr: PeerAddress) -> bool {
+        self.address_is_actively_advertised(addr) || self.address_matches_live_remote_ip(addr)
+    }
+
     pub fn confirm_address(&self, addr: PeerAddress) {
         let mut g = self.addresses.lock();
         if let Some(pos) = g.iter().position(|candidate| *candidate == addr) {
@@ -450,6 +501,7 @@ impl PeerState {
         drop(g);
         if removed {
             self.address_backoffs.lock().remove(&addr);
+            self.advertised_addresses.lock().remove(&addr);
         }
         removed
     }
@@ -690,6 +742,22 @@ mod tests {
     }
 
     #[test]
+    fn backoff_failure_with_floor_jumps_to_floor_then_caps() {
+        let mut b = BackoffState::new(Duration::from_millis(250));
+        let floor = Duration::from_secs(5 * 60);
+        let cap = Duration::from_secs(30 * 60);
+
+        b.record_failure_with_floor(floor, cap);
+        assert_eq!(b.next_delay, floor);
+        b.record_failure_with_floor(floor, cap);
+        assert_eq!(b.next_delay, Duration::from_secs(10 * 60));
+        b.record_failure_with_floor(floor, cap);
+        assert_eq!(b.next_delay, Duration::from_secs(20 * 60));
+        b.record_failure_with_floor(floor, cap);
+        assert_eq!(b.next_delay, cap);
+    }
+
+    #[test]
     fn backoff_waits_from_failure_completion() {
         let mut b = BackoffState::new(Duration::from_millis(250));
         b.record_attempt();
@@ -773,11 +841,14 @@ mod tests {
         let addr = PeerAddress::new("10.1.2.3:64739".parse().unwrap(), TransportKind::Tcp);
 
         peer.add_address(addr);
+        peer.replace_advertised_addresses(&[addr]);
         peer.record_address_failure(addr, Duration::from_secs(30));
         assert!(peer.address_backoffs.lock().contains_key(&addr));
+        assert!(peer.address_is_actively_advertised(addr));
 
         assert!(peer.remove_address(addr));
         assert!(!peer.address_backoffs.lock().contains_key(&addr));
+        assert!(!peer.address_is_actively_advertised(addr));
     }
 
     fn active_stream_for_test(
@@ -893,6 +964,23 @@ mod tests {
         assert!(peer.try_install_stream(inbound).is_ok());
 
         assert!(!peer.has_live_outgoing_to(PeerAddress::new(addr, TransportKind::Tcp)));
+    }
+
+    #[test]
+    fn address_confirmation_uses_active_advertisement_or_live_remote_ip() {
+        let peer = peer_for_address_tests();
+        let advertised = PeerAddress::new("10.1.2.3:64739".parse().unwrap(), TransportKind::Tcp);
+        let same_ip = PeerAddress::new("10.1.2.4:64740".parse().unwrap(), TransportKind::Quic);
+        let other = PeerAddress::new("10.1.2.5:64741".parse().unwrap(), TransportKind::Quic);
+        let (stream, _rx) =
+            active_stream_for_test(TransportKind::Tcp, "10.1.2.4:51000".parse().unwrap(), false);
+
+        peer.replace_advertised_addresses(&[advertised]);
+        assert!(peer.try_install_stream(stream).is_ok());
+
+        assert!(peer.address_is_currently_confirmed(advertised));
+        assert!(peer.address_is_currently_confirmed(same_ip));
+        assert!(!peer.address_is_currently_confirmed(other));
     }
 
     #[test]

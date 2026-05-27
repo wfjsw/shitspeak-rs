@@ -453,6 +453,48 @@ impl ConnectionManager {
         }
     }
 
+    pub(crate) fn replace_advertised_addresses_seen_at(
+        &self,
+        node: NodeIdentifier,
+        addrs: Vec<PeerAddress>,
+        seen_at: std::time::SystemTime,
+    ) {
+        if node == self.inner.self_id {
+            return;
+        }
+        let peer = self.inner.get_or_create_peer(node);
+        let mut advertised = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            if !advertised.contains(&addr) {
+                advertised.push(addr);
+            }
+        }
+        peer.replace_advertised_addresses(&advertised);
+        peer.note_seen_at(seen_at);
+
+        for addr in advertised {
+            let candidates = peer.address_candidates(addr);
+            if candidates.is_empty() {
+                debug!(peer=%node, ?addr, "ignored unusable advertised peer address");
+                continue;
+            }
+            for candidate in candidates {
+                let added = peer.add_address_seen_at(candidate, seen_at);
+                if added {
+                    if candidate != addr {
+                        debug!(
+                            peer=%node,
+                            advertised=?addr,
+                            candidate=?candidate,
+                            "derived peer address candidate using observed remote IP"
+                        );
+                    }
+                    debug!(peer=%node, ?candidate, "advertised address added");
+                }
+            }
+        }
+    }
+
     pub async fn remove_address(&self, node: NodeIdentifier, addr: PeerAddress) {
         if let Some(peer) = self.inner.get_peer(node) {
             peer.remove_address(addr);

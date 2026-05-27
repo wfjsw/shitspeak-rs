@@ -38,6 +38,9 @@ pub struct TransportConfig {
     backoff_cap: Duration,
     stale_backoff_cap: Duration,
     stale_backoff_after: Duration,
+    unconfirmed_address_retry_floor: Duration,
+    unconfirmed_address_retry_cap: Duration,
+    unconfirmed_address_decay_failures: u32,
     reconnect_check_interval: Duration,
     /// Per-address outbound dial deadline. Zero disables the deadline.
     dial_attempt_timeout: Duration,
@@ -113,6 +116,9 @@ impl TransportConfig {
             backoff_cap: Duration::from_secs(30),
             stale_backoff_cap: Duration::from_secs(10 * 60),
             stale_backoff_after: Duration::from_secs(60 * 60),
+            unconfirmed_address_retry_floor: Duration::from_secs(5 * 60),
+            unconfirmed_address_retry_cap: Duration::from_secs(30 * 60),
+            unconfirmed_address_decay_failures: 5,
             reconnect_check_interval: Duration::from_secs(1),
             dial_attempt_timeout: Duration::from_secs(10),
             unselected_link_probe_interval: Duration::from_secs(30),
@@ -217,6 +223,18 @@ impl TransportConfig {
 
     pub fn stale_backoff_after(&self) -> Duration {
         self.stale_backoff_after
+    }
+
+    pub fn unconfirmed_address_retry_floor(&self) -> Duration {
+        self.unconfirmed_address_retry_floor
+    }
+
+    pub fn unconfirmed_address_retry_cap(&self) -> Duration {
+        self.unconfirmed_address_retry_cap
+    }
+
+    pub fn unconfirmed_address_decay_failures(&self) -> u32 {
+        self.unconfirmed_address_decay_failures
     }
 
     pub fn reconnect_check_interval(&self) -> Duration {
@@ -433,6 +451,21 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_unconfirmed_address_retry_floor(mut self, d: Duration) -> Self {
+        self.unconfirmed_address_retry_floor = d;
+        self
+    }
+
+    pub fn with_unconfirmed_address_retry_cap(mut self, d: Duration) -> Self {
+        self.unconfirmed_address_retry_cap = d;
+        self
+    }
+
+    pub fn with_unconfirmed_address_decay_failures(mut self, failures: u32) -> Self {
+        self.unconfirmed_address_decay_failures = failures;
+        self
+    }
+
     pub fn with_reconnect_check_interval(mut self, d: Duration) -> Self {
         self.reconnect_check_interval = d;
         self
@@ -598,6 +631,12 @@ pub struct TransportTuning {
     pub stale_probe_retry_cap_secs: u64,
     #[serde(default = "default_stale_probe_age_secs")]
     pub stale_probe_age_secs: u64,
+    #[serde(default = "default_unconfirmed_address_retry_floor_secs")]
+    pub unconfirmed_address_retry_floor_secs: u64,
+    #[serde(default = "default_unconfirmed_address_retry_cap_secs")]
+    pub unconfirmed_address_retry_cap_secs: u64,
+    #[serde(default = "default_unconfirmed_address_decay_failures")]
+    pub unconfirmed_address_decay_failures: u32,
     /// Per-address outbound dial deadline. Set to zero to disable.
     #[serde(default = "default_dial_attempt_timeout_secs")]
     pub dial_attempt_timeout_secs: u64,
@@ -627,6 +666,9 @@ impl Default for TransportTuning {
             recent_probe_retry_cap_secs: default_recent_probe_retry_cap_secs(),
             stale_probe_retry_cap_secs: default_stale_probe_retry_cap_secs(),
             stale_probe_age_secs: default_stale_probe_age_secs(),
+            unconfirmed_address_retry_floor_secs: default_unconfirmed_address_retry_floor_secs(),
+            unconfirmed_address_retry_cap_secs: default_unconfirmed_address_retry_cap_secs(),
+            unconfirmed_address_decay_failures: default_unconfirmed_address_decay_failures(),
             dial_attempt_timeout_secs: default_dial_attempt_timeout_secs(),
             unselected_link_probe_interval_secs: default_unselected_link_probe_interval_secs(),
             max_outgoing_connections: default_max_outgoing_connections(),
@@ -650,6 +692,13 @@ impl TransportTuning {
             .with_backoff_cap(Duration::from_secs(self.recent_probe_retry_cap_secs))
             .with_stale_backoff_cap(Duration::from_secs(self.stale_probe_retry_cap_secs))
             .with_stale_backoff_after(Duration::from_secs(self.stale_probe_age_secs))
+            .with_unconfirmed_address_retry_floor(Duration::from_secs(
+                self.unconfirmed_address_retry_floor_secs,
+            ))
+            .with_unconfirmed_address_retry_cap(Duration::from_secs(
+                self.unconfirmed_address_retry_cap_secs,
+            ))
+            .with_unconfirmed_address_decay_failures(self.unconfirmed_address_decay_failures)
             .with_dial_attempt_timeout(Duration::from_secs(self.dial_attempt_timeout_secs))
             .with_unselected_link_probe_interval(Duration::from_secs(
                 self.unselected_link_probe_interval_secs,
@@ -688,6 +737,15 @@ fn default_stale_probe_retry_cap_secs() -> u64 {
 }
 fn default_stale_probe_age_secs() -> u64 {
     60 * 60
+}
+fn default_unconfirmed_address_retry_floor_secs() -> u64 {
+    5 * 60
+}
+fn default_unconfirmed_address_retry_cap_secs() -> u64 {
+    30 * 60
+}
+fn default_unconfirmed_address_decay_failures() -> u32 {
+    5
 }
 fn default_dial_attempt_timeout_secs() -> u64 {
     10

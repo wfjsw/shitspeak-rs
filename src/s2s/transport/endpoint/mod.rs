@@ -441,14 +441,13 @@ fn peer_retry_ready(
     now: Instant,
     wall_now: SystemTime,
 ) -> bool {
-    let retry_cap = retry_cap_for_last_seen_age(
-        peer.last_seen_age(wall_now),
-        cfg.backoff_cap(),
-        cfg.stale_backoff_cap(),
-        cfg.stale_backoff_after(),
-    );
+    let has_live_connection = peer.has_any_live_stream();
     peer.snapshot_addresses().iter().any(|addr| {
-        !peer.has_live_outgoing_to(*addr) && peer.address_retry_ready(*addr, now, retry_cap)
+        if peer.has_live_outgoing_to(*addr) {
+            return false;
+        }
+        let retry_policy = address_retry_policy(peer, cfg, *addr, wall_now, has_live_connection);
+        peer.address_retry_ready(*addr, now, retry_policy.retry_cap())
     })
 }
 
@@ -470,6 +469,76 @@ fn compare_dial_candidates(
 /// True iff at least one known address candidate has no live outbound session.
 fn needs_dial(peer: &PeerState, cfg: &TransportConfig, now: Instant, wall_now: SystemTime) -> bool {
     peer_retry_ready(peer, cfg, now, wall_now)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AddressRetryPolicy {
+    retry_floor: Duration,
+    retry_cap: Duration,
+    unconfirmed_while_connected: bool,
+}
+
+impl AddressRetryPolicy {
+    fn normal(retry_cap: Duration) -> Self {
+        Self {
+            retry_floor: Duration::ZERO,
+            retry_cap,
+            unconfirmed_while_connected: false,
+        }
+    }
+
+    fn unconfirmed_while_connected(retry_floor: Duration, retry_cap: Duration) -> Self {
+        Self {
+            retry_floor,
+            retry_cap: retry_cap.max(retry_floor),
+            unconfirmed_while_connected: true,
+        }
+    }
+
+    fn retry_cap(&self) -> Duration {
+        self.retry_cap
+    }
+
+    fn retry_floor(&self) -> Duration {
+        self.retry_floor
+    }
+
+    fn is_unconfirmed_while_connected(&self) -> bool {
+        self.unconfirmed_while_connected
+    }
+}
+
+fn address_retry_policy(
+    peer: &PeerState,
+    cfg: &TransportConfig,
+    addr: PeerAddress,
+    wall_now: SystemTime,
+    has_live_connection: bool,
+) -> AddressRetryPolicy {
+    if has_live_connection && !peer.address_is_currently_confirmed(addr) {
+        return AddressRetryPolicy::unconfirmed_while_connected(
+            cfg.unconfirmed_address_retry_floor(),
+            cfg.unconfirmed_address_retry_cap(),
+        );
+    }
+
+    AddressRetryPolicy::normal(retry_cap_for_last_seen_age(
+        peer.last_seen_age(wall_now),
+        cfg.backoff_cap(),
+        cfg.stale_backoff_cap(),
+        cfg.stale_backoff_after(),
+    ))
+}
+
+fn should_decay_unconfirmed_address(
+    retry_policy: AddressRetryPolicy,
+    backoff: super::connection::BackoffSnapshot,
+    cfg: &TransportConfig,
+) -> bool {
+    retry_policy.is_unconfirmed_while_connected()
+        && cfg.unconfirmed_address_decay_failures() > 0
+        && backoff.consecutive_failures() >= cfg.unconfirmed_address_decay_failures()
+        && backoff.next_delay() >= retry_policy.retry_cap()
 }
 
 fn peer_priority(peer: &PeerState) -> f64 {
@@ -557,12 +626,8 @@ async fn try_dial_peer(
         return Ok(());
     }
 
-    let retry_cap = retry_cap_for_last_seen_age(
-        peer.last_seen_age(SystemTime::now()),
-        inner.cfg().backoff_cap(),
-        inner.cfg().stale_backoff_cap(),
-        inner.cfg().stale_backoff_after(),
-    );
+    let wall_now = SystemTime::now();
+    let has_live_connection = peer.has_any_live_stream();
     let now = Instant::now();
 
     let mut attempts = Vec::new();
@@ -572,7 +637,9 @@ async fn try_dial_peer(
         if peer.has_live_outgoing_to(addr) {
             continue;
         }
-        if !peer.address_retry_ready(addr, now, retry_cap) {
+        let retry_policy =
+            address_retry_policy(peer, inner.cfg(), addr, wall_now, has_live_connection);
+        if !peer.address_retry_ready(addr, now, retry_policy.retry_cap()) {
             continue;
         }
         if inner.outgoing_connection_count() + planned_outgoing
@@ -625,28 +692,62 @@ async fn try_dial_peer(
                         "removed peer address candidate after identity/ping validation failure"
                     );
                 } else {
-                    let retry_cap = retry_cap_for_last_seen_age(
-                        peer.last_seen_age(SystemTime::now()),
-                        inner.cfg().backoff_cap(),
-                        inner.cfg().stale_backoff_cap(),
-                        inner.cfg().stale_backoff_after(),
+                    let retry_policy = address_retry_policy(
+                        peer,
+                        inner.cfg(),
+                        addr,
+                        SystemTime::now(),
+                        peer.has_any_live_stream(),
                     );
-                    let backoff = peer.record_address_failure(addr, retry_cap);
-                    debug!(
-                        peer=%peer.node_id(),
-                        ?addr,
-                        transport=?transport,
-                        error=%e,
-                        retry_in_ms=backoff.retry_delay().as_millis(),
-                        retry_cap_ms=retry_cap.as_millis(),
-                        next_backoff_base_ms=backoff.next_delay().as_millis(),
-                        consecutive_failures=backoff.consecutive_failures(),
-                        "dial failed; will retry with exponential backoff"
-                    );
-                    last_err = Some(e);
-                    continue;
+                    let backoff = if retry_policy.is_unconfirmed_while_connected() {
+                        peer.record_address_failure_with_floor(
+                            addr,
+                            retry_policy.retry_floor(),
+                            retry_policy.retry_cap(),
+                        )
+                    } else {
+                        peer.record_address_failure(addr, retry_policy.retry_cap())
+                    };
+                    if should_decay_unconfirmed_address(retry_policy, backoff, inner.cfg())
+                        && peer.remove_address(addr)
+                    {
+                        debug!(
+                            peer=%peer.node_id(),
+                            ?addr,
+                            transport=?transport,
+                            error=%e,
+                            retry_cap_ms=retry_policy.retry_cap().as_millis(),
+                            next_backoff_base_ms=backoff.next_delay().as_millis(),
+                            consecutive_failures=backoff.consecutive_failures(),
+                            "decayed unconfirmed peer address after repeated dial failures"
+                        );
+                    } else if retry_policy.is_unconfirmed_while_connected() {
+                        debug!(
+                            peer=%peer.node_id(),
+                            ?addr,
+                            transport=?transport,
+                            error=%e,
+                            retry_in_ms=backoff.retry_delay().as_millis(),
+                            retry_floor_ms=retry_policy.retry_floor().as_millis(),
+                            retry_cap_ms=retry_policy.retry_cap().as_millis(),
+                            next_backoff_base_ms=backoff.next_delay().as_millis(),
+                            consecutive_failures=backoff.consecutive_failures(),
+                            "dial failed for unconfirmed peer address; will retry with stale-address backoff"
+                        );
+                    } else {
+                        debug!(
+                            peer=%peer.node_id(),
+                            ?addr,
+                            transport=?transport,
+                            error=%e,
+                            retry_in_ms=backoff.retry_delay().as_millis(),
+                            retry_cap_ms=retry_policy.retry_cap().as_millis(),
+                            next_backoff_base_ms=backoff.next_delay().as_millis(),
+                            consecutive_failures=backoff.consecutive_failures(),
+                            "dial failed; will retry with exponential backoff"
+                        );
+                    }
                 }
-                debug!(peer=%peer.node_id(), ?addr, transport=?transport, error=%e, "dial failed");
                 last_err = Some(e);
             }
         }
@@ -812,6 +913,18 @@ mod tests {
         ));
     }
 
+    fn install_live_stream_at(peer: &PeerState, remote_addr: &str) {
+        let (tx, rx) = mpsc::channel(1);
+        std::mem::forget(rx);
+        peer.install_stream(ActiveStream::new(
+            TransportKind::Tcp,
+            Some(remote_addr.parse().unwrap()),
+            tx,
+            CancellationToken::new(),
+            false,
+        ));
+    }
+
     #[test]
     fn backbone_offsets_cover_successor_and_far_nodes() {
         assert_eq!(backbone_offsets(1), Vec::<usize>::new());
@@ -893,6 +1006,96 @@ mod tests {
             .expect("ready non-mandatory peer should be selected");
 
         assert_eq!(selected.0, 4);
+    }
+
+    #[test]
+    fn retry_policy_uses_stale_address_backoff_only_when_peer_is_connected() {
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into())
+            .with_backoff_cap(Duration::from_secs(30))
+            .with_unconfirmed_address_retry_floor(Duration::from_secs(5 * 60))
+            .with_unconfirmed_address_retry_cap(Duration::from_secs(30 * 60));
+        let peer = peer_with_tcp_address(2);
+        let addr = tcp_peer_address(2);
+
+        let disconnected = address_retry_policy(
+            &peer,
+            &cfg,
+            addr,
+            SystemTime::now(),
+            peer.has_any_live_stream(),
+        );
+        assert!(!disconnected.is_unconfirmed_while_connected());
+        assert_eq!(disconnected.retry_cap(), Duration::from_secs(30));
+
+        install_live_stream_at(&peer, "10.9.9.9:51000");
+        let connected = address_retry_policy(
+            &peer,
+            &cfg,
+            addr,
+            SystemTime::now(),
+            peer.has_any_live_stream(),
+        );
+        assert!(connected.is_unconfirmed_while_connected());
+        assert_eq!(connected.retry_floor(), Duration::from_secs(5 * 60));
+        assert_eq!(connected.retry_cap(), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn retry_policy_keeps_normal_backoff_for_advertised_or_observed_addresses() {
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into())
+            .with_backoff_cap(Duration::from_secs(30));
+        let peer = peer_with_tcp_address(2);
+        let advertised = tcp_peer_address(2);
+        let observed_ip = PeerAddress::new("10.9.9.9:64741".parse().unwrap(), TransportKind::Quic);
+        peer.replace_advertised_addresses(&[advertised]);
+        install_live_stream_at(&peer, "10.9.9.9:51000");
+
+        let advertised_policy = address_retry_policy(
+            &peer,
+            &cfg,
+            advertised,
+            SystemTime::now(),
+            peer.has_any_live_stream(),
+        );
+        let observed_policy = address_retry_policy(
+            &peer,
+            &cfg,
+            observed_ip,
+            SystemTime::now(),
+            peer.has_any_live_stream(),
+        );
+
+        assert!(!advertised_policy.is_unconfirmed_while_connected());
+        assert!(!observed_policy.is_unconfirmed_while_connected());
+        assert_eq!(advertised_policy.retry_cap(), Duration::from_secs(30));
+        assert_eq!(observed_policy.retry_cap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn stale_address_decay_waits_for_capped_failures() {
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into())
+            .with_unconfirmed_address_retry_floor(Duration::from_secs(5 * 60))
+            .with_unconfirmed_address_retry_cap(Duration::from_secs(30 * 60))
+            .with_unconfirmed_address_decay_failures(5);
+        let policy = AddressRetryPolicy::unconfirmed_while_connected(
+            cfg.unconfirmed_address_retry_floor(),
+            cfg.unconfirmed_address_retry_cap(),
+        );
+        let peer = peer_with_tcp_address(2);
+        let addr = tcp_peer_address(2);
+
+        for _ in 0..4 {
+            let backoff = peer.record_address_failure_with_floor(
+                addr,
+                policy.retry_floor(),
+                policy.retry_cap(),
+            );
+            assert!(!should_decay_unconfirmed_address(policy, backoff, &cfg));
+        }
+
+        let backoff =
+            peer.record_address_failure_with_floor(addr, policy.retry_floor(), policy.retry_cap());
+        assert!(should_decay_unconfirmed_address(policy, backoff, &cfg));
     }
 
     #[test]
