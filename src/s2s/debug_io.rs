@@ -181,6 +181,14 @@ pub(crate) fn record_received(kind: PacketKind, bytes: usize) {
     COUNTERS.lock().record_received(kind, bytes);
 }
 
+pub(crate) fn record_named_sent(kind: &'static str, bytes: usize) {
+    record_sent(PacketKind::from_static(kind), bytes);
+}
+
+pub(crate) fn record_named_received(kind: &'static str, bytes: usize) {
+    record_received(PacketKind::from_static(kind), bytes);
+}
+
 pub(crate) fn snapshot() -> Vec<PacketIoSnapshot> {
     COUNTERS.lock().snapshot()
 }

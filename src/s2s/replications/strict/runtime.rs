@@ -34,6 +34,15 @@ use crate::types::NodeIdentifier;
 
 // ---------- Tunables ----------
 
+/// Maximum number of clock ticks emitted in one demand-driven active burst.
+///
+/// A single tick should normally be enough after a commit because commit
+/// handlers first raise the local clock to `ts_final`; the extra ticks cover
+/// crossed wakeups and delayed peer observations without returning to the old
+/// always-on heartbeat behavior.
+const CLOCK_TICK_ACTIVE_BURST_TICKS: usize = 3;
+const CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER: u32 = 4;
+
 /// Compute p95 of a slice of edge RTTs, clamped to
 /// `[cfg.min_clock_tick(), cfg.max_clock_tick()]`. Empty input
 /// → `cfg.fallback_clock_tick()`. Uses nearest-rank:
@@ -697,6 +706,7 @@ pub(crate) struct StrictRuntime<R: StrictReplicable> {
     pub net: Arc<dyn StrictNet>,
     pub state: Mutex<StrictState>,
     pub deliver_signal: Notify,
+    clock_tick_signal: Notify,
     pub propose_semaphore: Arc<Semaphore>,
     pub next_op_counter: AtomicU64,
     /// Monotonically increasing per-takeover-attempt counter, used as the
@@ -737,6 +747,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             net,
             state: Mutex::new(StrictState::new()),
             deliver_signal: Notify::new(),
+            clock_tick_signal: Notify::new(),
             propose_semaphore,
             next_op_counter: AtomicU64::new(1),
             recovery_attempt_counter: AtomicU64::new(1),
@@ -756,6 +767,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         spawn_delivery_loop(self.clone());
         spawn_clock_tick_loop(self.clone());
         spawn_bootstrap_retry_loop(self.clone());
+    }
+
+    fn wake_clock_tick_loop(&self) {
+        self.clock_tick_signal.notify_one();
+    }
+
+    fn wake_delivery_and_clock_tick(&self) {
+        self.deliver_signal.notify_one();
+        self.wake_clock_tick_loop();
     }
 
     /// Send startup election probes while no strict traffic has been
@@ -797,6 +817,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.state
             .lock()
             .begin_history_election(peers.iter().copied());
+        self.wake_clock_tick_loop();
         for dst in peers {
             let body = StrictBody::CatchupReq(StrictCatchupReq {
                 src_node: self.self_id as u32,
@@ -964,7 +985,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             Some((body, dsts))
         };
 
-        self.deliver_signal.notify_one();
+        self.wake_delivery_and_clock_tick();
 
         if let Some((body, dsts)) = to_send {
             if let Err(e) = self.net.send_multicast(&dsts, &self.topic, body).await {
@@ -1006,7 +1027,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         }
         if notify {
-            self.deliver_signal.notify_one();
+            self.wake_delivery_and_clock_tick();
         }
     }
 
@@ -1219,7 +1240,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         }
         if notify {
-            self.deliver_signal.notify_one();
+            self.wake_delivery_and_clock_tick();
         }
 
         let dsts: Vec<NodeIdentifier> = target
@@ -1284,7 +1305,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         }
         if notify {
-            self.deliver_signal.notify_one();
+            self.wake_delivery_and_clock_tick();
         }
     }
 
@@ -1481,6 +1502,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         );
         if peer_added {
             self.state.lock().request_history_election();
+            self.wake_clock_tick_loop();
             let weak = self.weak_self.lock().clone();
             if let Some(weak) = weak {
                 tokio::spawn(async move {
@@ -1490,6 +1512,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 });
             }
         }
+
+        self.deliver_signal.notify_one();
     }
 }
 
@@ -1619,28 +1643,100 @@ fn spawn_clock_tick_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             return;
         };
         loop {
-            // Recompute the interval each iteration: the LSDB's RTT
-            // measurements drift with network conditions, and we don't
-            // want to pin to whatever the cluster looked like at start.
-            let samples = rt.net.edge_rtt_snapshot();
-            let interval = p95_clock_tick_interval(&samples, &rt.cfg);
             tokio::select! {
                 _ = rt.shutdown.cancelled() => return,
-                _ = tokio::time::sleep(interval) => {}
+                _ = rt.clock_tick_signal.notified() => {}
             }
-            let clock = {
-                let mut s = rt.state.lock();
-                advance_clock_for_tick(&mut s, rt.self_id)
-            };
-            let body = StrictBody::ClockTick(StrictClockTick {
-                src_node: rt.self_id as u32,
-                src_clock: clock,
-            });
-            if let Err(e) = rt.net.send_broadcast(&rt.topic, body).await {
-                trace!(error=%e, "clock tick broadcast failed");
+            loop {
+                // Every wake publishes at least one fresh local clock. The
+                // local commit buffer may have drained already, but peers can
+                // still be waiting for this node's clock to cross their
+                // delivery high-water.
+                emit_clock_tick(&rt).await;
+                let mut last_interval = rt.current_clock_tick_interval();
+                for _ in 1..CLOCK_TICK_ACTIVE_BURST_TICKS {
+                    if !rt.clock_tick_needed() {
+                        break;
+                    }
+                    if !sleep_or_shutdown(&rt, last_interval).await {
+                        return;
+                    }
+                    emit_clock_tick(&rt).await;
+                    last_interval = rt.current_clock_tick_interval();
+                }
+                if !rt.clock_tick_needed() {
+                    break;
+                }
+                let cooldown = clock_tick_burst_cooldown(last_interval, &rt.cfg);
+                tokio::select! {
+                    _ = rt.shutdown.cancelled() => return,
+                    _ = rt.clock_tick_signal.notified() => {},
+                    _ = tokio::time::sleep(cooldown) => {},
+                }
             }
         }
     });
+}
+
+impl<R: StrictReplicable> StrictRuntime<R> {
+    fn current_clock_tick_interval(&self) -> Duration {
+        // Recompute every time: LSDB RTT measurements drift with network
+        // conditions, and clock bursts should follow current link latency.
+        let samples = self.net.edge_rtt_snapshot();
+        p95_clock_tick_interval(&samples, &self.cfg)
+    }
+
+    fn clock_tick_needed(&self) -> bool {
+        let alive = self.net.alive_members();
+        let state = self.state.lock();
+        clock_tick_needed_for_state(&state, self.self_id, &alive)
+    }
+}
+
+fn clock_tick_needed_for_state(
+    state: &StrictState,
+    self_id: NodeIdentifier,
+    alive: &[NodeIdentifier],
+) -> bool {
+    if !state.commit_buffer.is_empty() {
+        return true;
+    }
+    alive
+        .iter()
+        .copied()
+        .filter(|node| *node != self_id)
+        .any(|node| !state.peer_clocks.contains_key(&node))
+}
+
+async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
+    let clock = {
+        let mut s = rt.state.lock();
+        advance_clock_for_tick(&mut s, rt.self_id)
+    };
+    let body = StrictBody::ClockTick(StrictClockTick {
+        src_node: rt.self_id as u32,
+        src_clock: clock,
+    });
+    if let Err(e) = rt.net.send_broadcast(&rt.topic, body).await {
+        trace!(error=%e, "clock tick broadcast failed");
+    }
+}
+
+async fn sleep_or_shutdown<R: StrictReplicable>(
+    rt: &Arc<StrictRuntime<R>>,
+    duration: Duration,
+) -> bool {
+    tokio::select! {
+        _ = rt.shutdown.cancelled() => false,
+        _ = tokio::time::sleep(duration) => true,
+    }
+}
+
+fn clock_tick_burst_cooldown(interval: Duration, cfg: &ReplicationConfig) -> Duration {
+    interval
+        .checked_mul(CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER)
+        .unwrap_or_else(|| cfg.max_clock_tick())
+        .clamp(cfg.min_clock_tick(), cfg.max_clock_tick())
 }
 
 fn advance_clock_for_tick(state: &mut StrictState, self_id: NodeIdentifier) -> u64 {
@@ -1810,6 +1906,42 @@ mod tests {
         assert_eq!(tick, 8);
         assert_eq!(s.clock, 8);
         assert_eq!(s.peer_clocks[&10], 8);
+    }
+
+    #[test]
+    fn clock_tick_not_needed_when_idle_and_alive_peers_observed() {
+        let mut s = StrictState::new();
+        s.finish_history_election();
+        s.peer_clocks.insert(20, 3);
+        s.peer_clocks.insert(30, 5);
+
+        assert!(!clock_tick_needed_for_state(&s, 10, &[10, 20, 30]));
+    }
+
+    #[test]
+    fn clock_tick_needed_for_pending_commit_buffer() {
+        let mut s = StrictState::new();
+        s.finish_history_election();
+        s.peer_clocks.insert(20, 3);
+        s.buffer_commit((1, 1), 5, Bytes::new());
+
+        assert!(clock_tick_needed_for_state(&s, 10, &[10, 20]));
+    }
+
+    #[test]
+    fn clock_tick_needed_for_unobserved_alive_peer() {
+        let mut s = StrictState::new();
+        s.finish_history_election();
+        s.peer_clocks.insert(20, 3);
+
+        assert!(clock_tick_needed_for_state(&s, 10, &[10, 20, 30]));
+    }
+
+    #[test]
+    fn clock_tick_not_needed_for_history_election_alone() {
+        let s = StrictState::new();
+
+        assert!(!clock_tick_needed_for_state(&s, 10, &[10]));
     }
 
     #[test]

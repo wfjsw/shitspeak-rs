@@ -341,6 +341,11 @@ async fn run_pump<S>(
                 peer.metrics().record_recv(cfg.transport, recv_size);
                 match pb::Frame::decode(buf.as_ref()) {
                     Ok(frame) => {
+                        #[cfg(debug_assertions)]
+                        crate::s2s::debug_io::record_named_received(
+                            stream_frame_kind_name(cfg.transport, frame.frame_type),
+                            recv_size,
+                        );
                         match handle_inbound(
                             frame,
                             recv_size,
@@ -559,8 +564,55 @@ where
         return Err(error);
     }
     peer.metrics().record_sent(transport, len);
+    #[cfg(debug_assertions)]
+    crate::s2s::debug_io::record_named_sent(
+        stream_frame_kind_name(transport, frame.frame_type),
+        len,
+    );
     peer.metrics().record_data_health_success(transport);
     Ok(len)
+}
+
+#[cfg(debug_assertions)]
+fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static str {
+    match transport {
+        TransportKind::Tcp => match pb::FrameType::try_from(frame_type) {
+            Ok(pb::FrameType::FrameData) => "transport.tcp.frame.data",
+            Ok(pb::FrameType::FramePing) => "transport.tcp.frame.ping",
+            Ok(pb::FrameType::FramePong) => "transport.tcp.frame.pong",
+            Ok(pb::FrameType::FrameKeepalive) => "transport.tcp.frame.keepalive",
+            Ok(pb::FrameType::FrameHello) => "transport.tcp.frame.hello",
+            Ok(pb::FrameType::FrameBye) => "transport.tcp.frame.bye",
+            Err(_) => "transport.tcp.frame.unknown",
+        },
+        TransportKind::Kcp => match pb::FrameType::try_from(frame_type) {
+            Ok(pb::FrameType::FrameData) => "transport.kcp.frame.data",
+            Ok(pb::FrameType::FramePing) => "transport.kcp.frame.ping",
+            Ok(pb::FrameType::FramePong) => "transport.kcp.frame.pong",
+            Ok(pb::FrameType::FrameKeepalive) => "transport.kcp.frame.keepalive",
+            Ok(pb::FrameType::FrameHello) => "transport.kcp.frame.hello",
+            Ok(pb::FrameType::FrameBye) => "transport.kcp.frame.bye",
+            Err(_) => "transport.kcp.frame.unknown",
+        },
+        TransportKind::Quic => match pb::FrameType::try_from(frame_type) {
+            Ok(pb::FrameType::FrameData) => "transport.quic.frame.data",
+            Ok(pb::FrameType::FramePing) => "transport.quic.frame.ping",
+            Ok(pb::FrameType::FramePong) => "transport.quic.frame.pong",
+            Ok(pb::FrameType::FrameKeepalive) => "transport.quic.frame.keepalive",
+            Ok(pb::FrameType::FrameHello) => "transport.quic.frame.hello",
+            Ok(pb::FrameType::FrameBye) => "transport.quic.frame.bye",
+            Err(_) => "transport.quic.frame.unknown",
+        },
+        TransportKind::Udp => match pb::FrameType::try_from(frame_type) {
+            Ok(pb::FrameType::FrameData) => "transport.udp.stream_frame.data",
+            Ok(pb::FrameType::FramePing) => "transport.udp.stream_frame.ping",
+            Ok(pb::FrameType::FramePong) => "transport.udp.stream_frame.pong",
+            Ok(pb::FrameType::FrameKeepalive) => "transport.udp.stream_frame.keepalive",
+            Ok(pb::FrameType::FrameHello) => "transport.udp.stream_frame.hello",
+            Ok(pb::FrameType::FrameBye) => "transport.udp.stream_frame.bye",
+            Err(_) => "transport.udp.stream_frame.unknown",
+        },
+    }
 }
 
 async fn handle_inbound<S>(
@@ -675,5 +727,17 @@ mod tests {
         let error = io::Error::new(io::ErrorKind::UnexpectedEof, "short frame");
 
         assert!(!is_tls_close_notify_eof(&error));
+    }
+
+    #[test]
+    fn stream_frame_kind_names_include_transport_and_type() {
+        assert_eq!(
+            stream_frame_kind_name(TransportKind::Tcp, pb::FrameType::FrameData as i32),
+            "transport.tcp.frame.data"
+        );
+        assert_eq!(
+            stream_frame_kind_name(TransportKind::Quic, pb::FrameType::FrameKeepalive as i32),
+            "transport.quic.frame.keepalive"
+        );
     }
 }

@@ -221,12 +221,20 @@ impl UdpSocketState {
         node: NodeIdentifier,
         session: &Arc<UdpCryptoSession>,
     ) {
-        let mut sessions = self.sessions.lock().await;
-        if sessions
-            .get(&node)
-            .is_some_and(|current| Arc::ptr_eq(current, session))
-        {
-            sessions.remove(&node);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(&node)
+                .is_some_and(|current| Arc::ptr_eq(current, session))
+            {
+                sessions.remove(&node);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.exchanges.lock().await.remove(&node);
         }
     }
 }
@@ -338,6 +346,8 @@ impl UdpCryptoSession {
             .await
             .map_err(|e| io::Error::other(format!("udp send: {e}")))?;
         peer.metrics().record_sent(TransportKind::Udp, n);
+        #[cfg(debug_assertions)]
+        crate::s2s::debug_io::record_named_sent(udp_frame_kind_name(frame.frame_type), n);
         Ok(n)
     }
 
@@ -484,6 +494,28 @@ impl UdpPacketHeader {
     }
 }
 
+#[cfg(debug_assertions)]
+fn udp_datagram_kind_name(kind: UdpPacketKind) -> &'static str {
+    match kind {
+        UdpPacketKind::KeyOffer => "transport.udp.datagram.key_offer",
+        UdpPacketKind::KeyReady => "transport.udp.datagram.key_ready",
+        UdpPacketKind::Data => "transport.udp.datagram.data",
+    }
+}
+
+#[cfg(debug_assertions)]
+fn udp_frame_kind_name(frame_type: i32) -> &'static str {
+    match pb::FrameType::try_from(frame_type) {
+        Ok(pb::FrameType::FrameData) => "transport.udp.frame.data",
+        Ok(pb::FrameType::FramePing) => "transport.udp.frame.ping",
+        Ok(pb::FrameType::FramePong) => "transport.udp.frame.pong",
+        Ok(pb::FrameType::FrameKeepalive) => "transport.udp.frame.keepalive",
+        Ok(pb::FrameType::FrameHello) => "transport.udp.frame.hello",
+        Ok(pb::FrameType::FrameBye) => "transport.udp.frame.bye",
+        Err(_) => "transport.udp.frame.unknown",
+    }
+}
+
 fn packet_nonce(
     kind: UdpPacketKind,
     src: NodeIdentifier,
@@ -587,7 +619,24 @@ async fn handle_udp_datagram(
     packet: &[u8],
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
-    let header = UdpPacketHeader::decode(packet)?;
+    let header = match UdpPacketHeader::decode(packet) {
+        Ok(header) => {
+            #[cfg(debug_assertions)]
+            crate::s2s::debug_io::record_named_received(
+                udp_datagram_kind_name(header.kind),
+                packet.len(),
+            );
+            header
+        }
+        Err(error) => {
+            #[cfg(debug_assertions)]
+            crate::s2s::debug_io::record_named_received(
+                "transport.udp.datagram.decode_error",
+                packet.len(),
+            );
+            return Err(error);
+        }
+    };
     match header.kind {
         UdpPacketKind::KeyOffer => {
             return handle_key_offer(state, inner, identity, packet, header, peer_addr).await;
@@ -640,6 +689,11 @@ async fn handle_udp_datagram(
 
     let frame = pb::Frame::decode(&plaintext[..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    #[cfg(debug_assertions)]
+    crate::s2s::debug_io::record_named_received(
+        udp_frame_kind_name(frame.frame_type),
+        packet.len(),
+    );
     if frame.src_node != u32::from(header.src) || frame.dst_node != u32::from(inner.self_id()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -670,6 +724,10 @@ async fn handle_key_offer(
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
     validate_exchange_header(header, inner.self_id())?;
+    if let Some(existing) = state.session(header.src).await {
+        existing.update_addr(peer_addr);
+        return Ok(());
+    }
     let offer = UdpHandshakeBody::decode(packet)?;
     verify_peer_identity(identity, &offer.cert_chain, header.src)?;
 
@@ -710,6 +768,10 @@ async fn handle_key_ready(
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
     validate_exchange_header(header, inner.self_id())?;
+    if let Some(existing) = state.session(header.src).await {
+        existing.update_addr(peer_addr);
+        return Ok(());
+    }
     let (packets, promote) = accept_key_ready(
         state,
         inner.self_id(),
@@ -1065,6 +1127,13 @@ fn accept_ready_packet(
 }
 
 fn exchange_packets(exchange: &PeerKeyExchange) -> Vec<Vec<u8>> {
+    if exchange
+        .candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.promoted)
+    {
+        return Vec::new();
+    }
     let mut packets = Vec::new();
     if let Some(local) = &exchange.local {
         packets.push(local.packet.clone());
@@ -1110,11 +1179,20 @@ async fn send_exchange_packets(
     packets: Vec<Vec<u8>>,
 ) -> io::Result<()> {
     for packet in packets {
-        state
+        let n = state
             .socket
             .send_to(&packet, peer_addr)
             .await
             .map_err(|e| io::Error::other(format!("udp key exchange send to {peer_node}: {e}")))?;
+        #[cfg(debug_assertions)]
+        match UdpPacketHeader::decode(&packet) {
+            Ok(header) => {
+                crate::s2s::debug_io::record_named_sent(udp_datagram_kind_name(header.kind), n);
+            }
+            Err(_) => {
+                crate::s2s::debug_io::record_named_sent("transport.udp.datagram.encode_error", n);
+            }
+        }
     }
     Ok(())
 }
@@ -2243,5 +2321,41 @@ mod tests {
         assert_eq!(low_keys.low_to_high, high_keys.low_to_high);
         assert_eq!(low_keys.high_to_low, high_keys.high_to_low);
         assert_ne!(low_keys.low_to_high, low_keys.high_to_low);
+    }
+
+    #[test]
+    fn promoted_key_exchange_stops_retransmitting_handshake_packets() {
+        let mut exchange = PeerKeyExchange {
+            local: Some(LocalKeyOffer {
+                offer_id: 11,
+                private_key: None,
+                public_key: vec![1; X25519_PUBLIC_KEY_LEN],
+                packet: vec![0xaa],
+            }),
+            peer: Some(PeerKeyOffer {
+                offer_id: 13,
+                public_key: vec![2; X25519_PUBLIC_KEY_LEN],
+            }),
+            candidate: Some(KeyCandidate {
+                exchange_id: 17,
+                peer_addr: SocketAddr::from(([127, 0, 0, 1], 64742)),
+                seal_key: [3; 32],
+                open_key: [4; 32],
+                ready_packet: vec![0xbb],
+                ready_received: true,
+                promoted: false,
+            }),
+            early_ready: Vec::new(),
+            waiters: Vec::new(),
+            local_initiated: true,
+        };
+
+        assert_eq!(exchange_packets(&exchange), vec![vec![0xaa], vec![0xbb]]);
+
+        let promote = promote_if_ready(&mut exchange, 1, 2);
+
+        assert!(promote.is_some());
+        assert!(exchange_packets(&exchange).is_empty());
+        assert!(promote_if_ready(&mut exchange, 1, 2).is_none());
     }
 }

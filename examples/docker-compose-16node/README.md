@@ -51,6 +51,21 @@ docker compose -f deploy/docker-compose-16node/compose.yaml down
 
 Runtime state is bind-mounted into each per-node folder. For example, node 1 stores server data in `nodes/node-01/data` and S2S state in `nodes/node-01/s2s-state`.
 
+## Transport IO Survey
+
+For debug builds, `survey-transports.ps1` runs the 16-node stack once per S2S
+transport and records a steady-state packet/byte breakdown from the topology
+debug counters plus container `eth0` and `/proc/net/snmp` counters:
+
+```powershell
+cd examples/docker-compose-16node
+.\survey-transports.ps1 -Transport all -CleanState
+```
+
+Results are written under `.transport-survey/results-*`. The script temporarily
+rewrites generated node configs to isolate each transport, stops compose between
+runs, and restores the configs when it exits.
+
 ## Ports
 
 Each container listens on the same internal ports as the UTD bundle:
