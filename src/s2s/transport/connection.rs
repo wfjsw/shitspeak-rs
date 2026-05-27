@@ -142,6 +142,27 @@ pub(crate) struct BackoffState {
     consecutive_failures: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BackoffSnapshot {
+    retry_delay: Duration,
+    next_delay: Duration,
+    consecutive_failures: u32,
+}
+
+impl BackoffSnapshot {
+    pub fn retry_delay(&self) -> Duration {
+        self.retry_delay
+    }
+
+    pub fn next_delay(&self) -> Duration {
+        self.next_delay
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
 impl BackoffState {
     pub fn new(initial: Duration) -> Self {
         Self {
@@ -181,6 +202,14 @@ impl BackoffState {
         self.consecutive_failures = 0;
         self.next_delay = self.initial;
         self.retry_delay = self.initial;
+    }
+
+    fn snapshot(&self) -> BackoffSnapshot {
+        BackoffSnapshot {
+            retry_delay: self.retry_delay,
+            next_delay: self.next_delay,
+            consecutive_failures: self.consecutive_failures,
+        }
     }
 }
 
@@ -313,12 +342,17 @@ impl PeerState {
             .record_attempt();
     }
 
-    pub fn record_address_failure(&self, addr: PeerAddress, retry_cap: Duration) {
-        self.address_backoffs
-            .lock()
+    pub fn record_address_failure(
+        &self,
+        addr: PeerAddress,
+        retry_cap: Duration,
+    ) -> BackoffSnapshot {
+        let mut address_backoffs = self.address_backoffs.lock();
+        let backoff = address_backoffs
             .entry(addr)
-            .or_insert_with(|| BackoffState::new(self.backoff_initial))
-            .record_failure(retry_cap);
+            .or_insert_with(|| BackoffState::new(self.backoff_initial));
+        backoff.record_failure(retry_cap);
+        backoff.snapshot()
     }
 
     pub fn record_address_success(&self, addr: PeerAddress) {

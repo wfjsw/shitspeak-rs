@@ -631,9 +631,22 @@ async fn try_dial_peer(
                         inner.cfg().stale_backoff_cap(),
                         inner.cfg().stale_backoff_after(),
                     );
-                    peer.record_address_failure(addr, retry_cap);
+                    let backoff = peer.record_address_failure(addr, retry_cap);
+                    debug!(
+                        peer=%peer.node_id(),
+                        ?addr,
+                        transport=?transport,
+                        error=%e,
+                        retry_in_ms=backoff.retry_delay().as_millis(),
+                        retry_cap_ms=retry_cap.as_millis(),
+                        next_backoff_base_ms=backoff.next_delay().as_millis(),
+                        consecutive_failures=backoff.consecutive_failures(),
+                        "dial failed; will retry with exponential backoff"
+                    );
+                    last_err = Some(e);
+                    continue;
                 }
-                debug!(peer=%peer.node_id(), transport=?transport, error=%e, "dial failed");
+                debug!(peer=%peer.node_id(), ?addr, transport=?transport, error=%e, "dial failed");
                 last_err = Some(e);
             }
         }

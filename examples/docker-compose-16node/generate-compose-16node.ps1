@@ -442,7 +442,7 @@ function Write-ComposeFile {
         [void]$sb.AppendLine("    stop_signal: SIGINT")
         [void]$sb.AppendLine("    working_dir: /app")
         [void]$sb.AppendLine("    environment:")
-        [void]$sb.AppendLine("      RUST_LOG: debug")
+        [void]$sb.AppendLine("      RUST_LOG: shitspeak_rs=debug")
         [void]$sb.AppendLine("    ports:")
         [void]$sb.AppendLine("      - `"${clientPort}:64738/tcp`"")
         [void]$sb.AppendLine("      - `"${clientPort}:64738/udp`"")
