@@ -20,10 +20,10 @@ pub struct TransportConfig {
     cert_path: PathBuf,
     key_path: PathBuf,
 
-    tcp_listen: Option<SocketAddr>,
-    kcp_listen: Option<SocketAddr>,
-    quic_listen: Option<SocketAddr>,
-    udp_listen: Option<SocketAddr>,
+    tcp_listen: Vec<SocketAddr>,
+    kcp_listen: Vec<SocketAddr>,
+    quic_listen: Vec<SocketAddr>,
+    udp_listen: Vec<SocketAddr>,
     tcp_advertise: Vec<SocketAddr>,
     kcp_advertise: Vec<SocketAddr>,
     quic_advertise: Vec<SocketAddr>,
@@ -48,6 +48,7 @@ pub struct TransportConfig {
     /// exploratory dial while the outgoing cap is full. Set to zero to disable.
     unselected_link_probe_interval: Duration,
     ping_interval: Duration,
+    idle_ping_interval: Duration,
     bandwidth_window: Duration,
 
     /// How often to send a bandwidth-probe Ping (in addition to the small,
@@ -99,10 +100,10 @@ impl TransportConfig {
             ca_path,
             cert_path,
             key_path,
-            tcp_listen: None,
-            kcp_listen: None,
-            quic_listen: None,
-            udp_listen: None,
+            tcp_listen: Vec::new(),
+            kcp_listen: Vec::new(),
+            quic_listen: Vec::new(),
+            udp_listen: Vec::new(),
             tcp_advertise: Vec::new(),
             kcp_advertise: Vec::new(),
             quic_advertise: Vec::new(),
@@ -123,6 +124,7 @@ impl TransportConfig {
             dial_attempt_timeout: Duration::from_secs(10),
             unselected_link_probe_interval: Duration::from_secs(30),
             ping_interval: Duration::from_secs(2),
+            idle_ping_interval: Duration::from_secs(10),
             bandwidth_window: Duration::from_secs(5),
             bandwidth_probe_interval: Duration::from_secs(3 * 60 * 60),
             bandwidth_probe_size: 64 * 1024,
@@ -158,19 +160,35 @@ impl TransportConfig {
     }
 
     pub fn tcp_listen(&self) -> Option<SocketAddr> {
-        self.tcp_listen
+        self.tcp_listen.first().copied()
     }
 
     pub fn kcp_listen(&self) -> Option<SocketAddr> {
-        self.kcp_listen
+        self.kcp_listen.first().copied()
     }
 
     pub fn quic_listen(&self) -> Option<SocketAddr> {
-        self.quic_listen
+        self.quic_listen.first().copied()
     }
 
     pub fn udp_listen(&self) -> Option<SocketAddr> {
-        self.udp_listen
+        self.udp_listen.first().copied()
+    }
+
+    pub fn tcp_listen_addrs(&self) -> &[SocketAddr] {
+        &self.tcp_listen
+    }
+
+    pub fn kcp_listen_addrs(&self) -> &[SocketAddr] {
+        &self.kcp_listen
+    }
+
+    pub fn quic_listen_addrs(&self) -> &[SocketAddr] {
+        &self.quic_listen
+    }
+
+    pub fn udp_listen_addrs(&self) -> &[SocketAddr] {
+        &self.udp_listen
     }
 
     pub fn tcp_advertise(&self) -> &[SocketAddr] {
@@ -251,6 +269,9 @@ impl TransportConfig {
 
     pub fn ping_interval(&self) -> Duration {
         self.ping_interval
+    }
+    pub fn idle_ping_interval(&self) -> Duration {
+        self.idle_ping_interval
     }
 
     pub fn bandwidth_window(&self) -> Duration {
@@ -358,22 +379,50 @@ impl TransportConfig {
     // --- Chainable setters ---
 
     pub fn with_tcp_listen(mut self, addr: SocketAddr) -> Self {
-        self.tcp_listen = Some(addr);
+        push_unique_socket_addr(&mut self.tcp_listen, addr);
         self
     }
 
     pub fn with_kcp_listen(mut self, addr: SocketAddr) -> Self {
-        self.kcp_listen = Some(addr);
+        push_unique_socket_addr(&mut self.kcp_listen, addr);
         self
     }
 
     pub fn with_quic_listen(mut self, addr: SocketAddr) -> Self {
-        self.quic_listen = Some(addr);
+        push_unique_socket_addr(&mut self.quic_listen, addr);
         self
     }
 
     pub fn with_udp_listen(mut self, addr: SocketAddr) -> Self {
-        self.udp_listen = Some(addr);
+        push_unique_socket_addr(&mut self.udp_listen, addr);
+        self
+    }
+
+    pub fn with_tcp_listen_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        for addr in addrs {
+            push_unique_socket_addr(&mut self.tcp_listen, addr);
+        }
+        self
+    }
+
+    pub fn with_kcp_listen_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        for addr in addrs {
+            push_unique_socket_addr(&mut self.kcp_listen, addr);
+        }
+        self
+    }
+
+    pub fn with_quic_listen_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        for addr in addrs {
+            push_unique_socket_addr(&mut self.quic_listen, addr);
+        }
+        self
+    }
+
+    pub fn with_udp_listen_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        for addr in addrs {
+            push_unique_socket_addr(&mut self.udp_listen, addr);
+        }
         self
     }
 
@@ -483,6 +532,11 @@ impl TransportConfig {
 
     pub fn with_ping_interval(mut self, d: Duration) -> Self {
         self.ping_interval = d;
+        self
+    }
+
+    pub fn with_idle_ping_interval(mut self, d: Duration) -> Self {
+        self.idle_ping_interval = d;
         self
     }
 
@@ -607,6 +661,12 @@ impl TransportConfig {
     }
 }
 
+fn push_unique_socket_addr(out: &mut Vec<SocketAddr>, addr: SocketAddr) {
+    if !out.contains(&addr) {
+        out.push(addr);
+    }
+}
+
 /// TOML-deserializable shadow of the per-link metrics smoothing, ping-cap,
 /// and connection-selection knobs. Only these tunables are surfaced here; other [`TransportConfig`]
 /// fields (listen addrs, PKI paths, queue sizes, etc.) stay Rust-builder-
@@ -621,6 +681,10 @@ pub struct TransportTuning {
     pub throughput_ewma_alpha: f64,
     #[serde(default = "default_packet_loss_ewma_alpha")]
     pub packet_loss_ewma_alpha: f64,
+    #[serde(default = "default_ping_interval_secs")]
+    pub ping_interval_secs: u64,
+    #[serde(default = "default_idle_ping_interval_secs")]
+    pub idle_ping_interval_secs: u64,
     #[serde(default = "default_native_stats_interval_secs")]
     pub native_stats_interval_secs: u64,
     #[serde(default = "default_max_pending_pings")]
@@ -661,6 +725,8 @@ impl Default for TransportTuning {
             jitter_ewma_alpha: default_jitter_ewma_alpha(),
             throughput_ewma_alpha: default_throughput_ewma_alpha(),
             packet_loss_ewma_alpha: default_packet_loss_ewma_alpha(),
+            ping_interval_secs: default_ping_interval_secs(),
+            idle_ping_interval_secs: default_idle_ping_interval_secs(),
             native_stats_interval_secs: default_native_stats_interval_secs(),
             max_pending_pings: default_max_pending_pings(),
             recent_probe_retry_cap_secs: default_recent_probe_retry_cap_secs(),
@@ -687,6 +753,8 @@ impl TransportTuning {
             .with_jitter_ewma_alpha(self.jitter_ewma_alpha)
             .with_throughput_ewma_alpha(self.throughput_ewma_alpha)
             .with_packet_loss_ewma_alpha(self.packet_loss_ewma_alpha)
+            .with_ping_interval(Duration::from_secs(self.ping_interval_secs))
+            .with_idle_ping_interval(Duration::from_secs(self.idle_ping_interval_secs))
             .with_native_stats_interval(Duration::from_secs(self.native_stats_interval_secs))
             .with_max_pending_pings(self.max_pending_pings)
             .with_backoff_cap(Duration::from_secs(self.recent_probe_retry_cap_secs))
@@ -722,6 +790,12 @@ fn default_throughput_ewma_alpha() -> f64 {
 }
 fn default_packet_loss_ewma_alpha() -> f64 {
     0.02
+}
+fn default_ping_interval_secs() -> u64 {
+    2
+}
+fn default_idle_ping_interval_secs() -> u64 {
+    10
 }
 fn default_native_stats_interval_secs() -> u64 {
     1

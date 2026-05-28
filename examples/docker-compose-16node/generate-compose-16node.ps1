@@ -292,7 +292,7 @@ function New-NodeConfig {
 
     return @"
 node_id = $NodeId
-listen = "0.0.0.0:64738"
+listen = "[::]:64738"
 register_name = "ShitSpeak Compose node $NodeId"
 register_hostname = "$HostName"
 cert_path = "cert.pem"
@@ -332,15 +332,15 @@ enabled = true
 ca_path = "s2s-ca-cert.pem"
 cert_path = "s2s-cert.pem"
 key_path = "s2s-key.pem"
-tcp_listen = "0.0.0.0:64739"
-kcp_listen = "0.0.0.0:64740"
-quic_listen = "0.0.0.0:64741"
-udp_listen = "0.0.0.0:64742"
+tcp_listen = "[::]:64739"
+kcp_listen = "[::]:64740"
+quic_listen = "[::]:64741"
+udp_listen = "[::]:64742"
 tcp_advertise = ["${HostName}:64739"]
 kcp_advertise = ["${HostName}:64740"]
 quic_advertise = ["${HostName}:64741"]
 udp_advertise = ["${HostName}:64742"]
-status_http_listen = "0.0.0.0:64750"
+status_http_listen = "[::]:64750"
 persistence_dir = "s2s-state"
 seed_addresses = [
 $seedBlock
@@ -351,6 +351,9 @@ latency_ewma_alpha = 0.2
 jitter_ewma_alpha = 0.0625
 throughput_ewma_alpha = 0.3
 packet_loss_ewma_alpha = 0.02
+ping_interval_secs = 2
+idle_ping_interval_secs = 10
+native_stats_interval_secs = 10
 max_pending_pings = 64
 recent_probe_retry_cap_secs = 30
 stale_probe_retry_cap_secs = 600
@@ -383,7 +386,7 @@ blob_unused_grace_ms = 600000
 
 [web]
 enabled = false
-listen = "0.0.0.0:64740"
+listen = "[::]:64740"
 public_base_url = "https://${HostName}:64740"
 allowed_origins = ["https://${HostName}:64740"]
 
@@ -408,7 +411,7 @@ ice_servers = [
 
 [web.moq]
 enabled = false
-listen = "0.0.0.0:64741"
+listen = "[::]:64741"
 public_url = "https://${HostName}:64741/web/moq"
 max_speaker_tracks = 64
 audio_bitrate = 64000

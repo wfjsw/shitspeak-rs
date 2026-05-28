@@ -150,6 +150,7 @@ impl KcpSession {
                                                    n, err, ByteStr::new(input_buffer));
                                         }
                                     }
+                                    session.notify();
                                 }
                             }
                         }
@@ -170,6 +171,7 @@ impl KcpSession {
                                                input_buffer.len(), err, ByteStr::new(&input_buffer));
                                     }
                                 }
+                                session.notify();
                             }
                         }
                     }
@@ -184,6 +186,7 @@ impl KcpSession {
                 while !session.closed.load(Ordering::Relaxed) {
                     let next = {
                         let mut socket = session.socket.lock();
+                        let mut next = None;
 
                         let is_closed = session.closed.load(Ordering::Acquire);
                         if is_closed && socket.can_close() {
@@ -196,6 +199,11 @@ impl KcpSession {
                             // If this is a server stream, close it automatically after a period of time
                             let last_update_time = socket.last_update_time();
                             let elapsed = last_update_time.elapsed();
+                            next = Some(Instant::from_std(
+                                last_update_time
+                                    .checked_add(session.session_expire)
+                                    .unwrap_or_else(std::time::Instant::now),
+                            ));
 
                             if elapsed > session.session_expire {
                                 if elapsed > session.session_expire * 2 {
@@ -216,6 +224,7 @@ impl KcpSession {
                                     );
                                     session.closed.store(true, Ordering::Release);
                                 }
+                                next = Some(Instant::now() + session.session_expire);
                             }
                         }
 
@@ -224,18 +233,28 @@ impl KcpSession {
                             let _ = socket.flush();
                         }
 
-                        match socket.update() {
-                            Ok(next_next) => Instant::from_std(next_next),
-                            Err(err) => {
-                                error!("[SESSION] KCP update failed, error: {}", err);
-                                Instant::now() + Duration::from_millis(10)
-                            }
+                        if socket.needs_update() {
+                            next = Some(match socket.update() {
+                                Ok(next_next) => Instant::from_std(next_next),
+                                Err(err) => {
+                                    error!("[SESSION] KCP update failed, error: {}", err);
+                                    Instant::now() + Duration::from_millis(10)
+                                }
+                            });
                         }
+                        next
                     };
 
-                    tokio::select! {
-                        _ = time::sleep_until(next) => {},
-                        _ = session.notifier.notified() => {},
+                    match next {
+                        Some(next) => {
+                            tokio::select! {
+                                _ = time::sleep_until(next) => {},
+                                _ = session.notifier.notified() => {},
+                            }
+                        }
+                        None => {
+                            session.notifier.notified().await;
+                        }
                     }
                 }
 

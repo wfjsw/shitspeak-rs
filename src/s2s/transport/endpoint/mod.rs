@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::future::join_all;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{sleep, timeout};
 use tracing::debug;
 
@@ -41,7 +41,46 @@ pub(crate) mod quic;
 pub(crate) mod tcp;
 pub(crate) mod udp;
 
-pub(crate) async fn bind_reusable_udp_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
+pub(crate) fn ipv6_only_for_address(addr: SocketAddr, listen_addrs: &[SocketAddr]) -> bool {
+    addr.is_ipv6()
+        && listen_addrs
+            .iter()
+            .any(|candidate| candidate.is_ipv4() && candidate.port() == addr.port())
+}
+
+pub(crate) fn socket_addr_supports_remote(
+    local_addr: SocketAddr,
+    ipv6_only: bool,
+    remote_addr: SocketAddr,
+) -> bool {
+    local_addr.is_ipv4() == remote_addr.is_ipv4()
+        || (remote_addr.is_ipv4()
+            && local_addr.is_ipv6()
+            && !ipv6_only
+            && local_addr.ip().is_unspecified())
+}
+
+pub(crate) async fn bind_tcp_listener(
+    addr: SocketAddr,
+    ipv6_only: bool,
+) -> io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    set_socket_ipv6_only(&socket, addr, ipv6_only);
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
+}
+
+pub(crate) async fn bind_reusable_udp_socket_with_ipv6_only(
+    addr: SocketAddr,
+    ipv6_only: bool,
+) -> io::Result<UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::DGRAM,
@@ -50,9 +89,18 @@ pub(crate) async fn bind_reusable_udp_socket(addr: SocketAddr) -> io::Result<Udp
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
+    set_socket_ipv6_only(&socket, addr, ipv6_only);
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     UdpSocket::from_std(socket.into())
+}
+
+fn set_socket_ipv6_only(socket: &socket2::Socket, addr: SocketAddr, ipv6_only: bool) {
+    if addr.is_ipv6() {
+        if let Err(e) = socket.set_only_v6(ipv6_only) {
+            debug!(%addr, %ipv6_only, error=%e, "unable to set IPv6-only socket mode");
+        }
+    }
 }
 
 /// Bind an exclusive ephemeral UDP socket for outbound stream-style dials.
@@ -85,8 +133,8 @@ pub(crate) trait Endpoint: Send + Sync + 'static {
     /// Bind any listeners and spawn accept tasks. Called once after every
     /// endpoint has been registered. Returns once listeners are bound;
     /// accept tasks run in the background until `inner.shutdown` fires.
-    /// If the endpoint is configured with `listen_addr = None` this is a
-    /// no-op and dial-only operation is preserved.
+    /// If the endpoint is configured with no listen addresses this is a no-op
+    /// and dial-only operation is preserved.
     fn start(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,
@@ -214,6 +262,7 @@ pub(crate) fn install_stream_session<S>(
         inner.cfg().max_frame_bytes(),
         inner.cfg().outbound_capacity(),
         inner.cfg().ping_interval(),
+        inner.cfg().idle_ping_interval(),
         inner.cfg().bandwidth_probe_interval(),
         inner.cfg().bandwidth_probe_size(),
         inner.cfg().native_stats_interval(),
@@ -931,6 +980,25 @@ mod tests {
         assert_eq!(backbone_offsets(2), vec![1]);
         assert_eq!(backbone_offsets(7), vec![1, 2, 3, 4]);
         assert_eq!(backbone_offsets(16), vec![1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn ipv6_wildcard_is_dual_stack_unless_v4_socket_is_also_configured() {
+        let v6: SocketAddr = "[::]:64739".parse().unwrap();
+        let v4: SocketAddr = "0.0.0.0:64739".parse().unwrap();
+
+        assert!(!ipv6_only_for_address(v6, &[v6]));
+        assert!(socket_addr_supports_remote(
+            v6,
+            false,
+            "172.23.0.7:64739".parse().unwrap()
+        ));
+        assert!(ipv6_only_for_address(v6, &[v4, v6]));
+        assert!(!socket_addr_supports_remote(
+            v6,
+            true,
+            "172.23.0.7:64739".parse().unwrap()
+        ));
     }
 
     #[test]

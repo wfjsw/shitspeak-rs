@@ -25,14 +25,14 @@ pub struct S2sConfig {
     #[serde(default)]
     pub key_path: Option<PathBuf>,
 
-    #[serde(default)]
-    pub tcp_listen: Option<SocketAddr>,
-    #[serde(default)]
-    pub kcp_listen: Option<SocketAddr>,
-    #[serde(default)]
-    pub quic_listen: Option<SocketAddr>,
-    #[serde(default)]
-    pub udp_listen: Option<SocketAddr>,
+    #[serde(default, deserialize_with = "deserialize_listen_addrs")]
+    pub tcp_listen: Vec<SocketAddr>,
+    #[serde(default, deserialize_with = "deserialize_listen_addrs")]
+    pub kcp_listen: Vec<SocketAddr>,
+    #[serde(default, deserialize_with = "deserialize_listen_addrs")]
+    pub quic_listen: Vec<SocketAddr>,
+    #[serde(default, deserialize_with = "deserialize_listen_addrs")]
+    pub udp_listen: Vec<SocketAddr>,
     #[serde(default, deserialize_with = "deserialize_advertise_overrides")]
     pub tcp_advertise: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_advertise_overrides")]
@@ -103,23 +103,16 @@ impl S2sConfig {
             .ok_or_else(|| "s2s.enabled=true requires s2s.key_path".to_string())?;
 
         let mut cfg = TransportConfig::new(ca_path, cert_path, key_path);
-        if let Some(addr) = self.tcp_listen {
-            cfg = cfg.with_tcp_listen(addr);
-        }
-        if let Some(addr) = self.kcp_listen {
-            cfg = cfg.with_kcp_listen(addr);
-        }
-        if let Some(addr) = self.quic_listen {
-            cfg = cfg.with_quic_listen(addr);
-        }
-        if let Some(addr) = self.udp_listen {
-            cfg = cfg.with_udp_listen(addr);
-        }
+        cfg = cfg
+            .with_tcp_listen_addrs(self.tcp_listen.iter().copied())
+            .with_kcp_listen_addrs(self.kcp_listen.iter().copied())
+            .with_quic_listen_addrs(self.quic_listen.iter().copied())
+            .with_udp_listen_addrs(self.udp_listen.iter().copied());
         let tcp_advertise = resolve_s2s_advertise_overrides(
             "s2s.tcp_advertise",
             &self.tcp_advertise,
             auto_advertise_host,
-            self.tcp_listen,
+            &self.tcp_listen,
         )?;
         for addr in tcp_advertise.addrs {
             cfg = if tcp_advertise.is_override {
@@ -132,7 +125,7 @@ impl S2sConfig {
             "s2s.kcp_advertise",
             &self.kcp_advertise,
             auto_advertise_host,
-            self.kcp_listen,
+            &self.kcp_listen,
         )?;
         for addr in kcp_advertise.addrs {
             cfg = if kcp_advertise.is_override {
@@ -145,7 +138,7 @@ impl S2sConfig {
             "s2s.quic_advertise",
             &self.quic_advertise,
             auto_advertise_host,
-            self.quic_listen,
+            &self.quic_listen,
         )?;
         for addr in quic_advertise.addrs {
             cfg = if quic_advertise.is_override {
@@ -158,7 +151,7 @@ impl S2sConfig {
             "s2s.udp_advertise",
             &self.udp_advertise,
             auto_advertise_host,
-            self.udp_listen,
+            &self.udp_listen,
         )?;
         for addr in udp_advertise.addrs {
             cfg = if udp_advertise.is_override {
@@ -221,9 +214,33 @@ enum AdvertiseOverrides {
     Many(Vec<String>),
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ListenAddrs {
+    One(SocketAddr),
+    Many(Vec<SocketAddr>),
+}
+
 struct ResolvedAdvertiseAddrs {
     addrs: Vec<SocketAddr>,
     is_override: bool,
+}
+
+fn deserialize_listen_addrs<'de, D>(deserializer: D) -> Result<Vec<SocketAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = ListenAddrs::deserialize(deserializer)?;
+    let mut addrs = Vec::new();
+    match raw {
+        ListenAddrs::One(addr) => push_unique_socket_addr(&mut addrs, addr),
+        ListenAddrs::Many(values) => {
+            for addr in values {
+                push_unique_socket_addr(&mut addrs, addr);
+            }
+        }
+    }
+    Ok(addrs)
 }
 
 fn deserialize_advertise_overrides<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -246,12 +263,14 @@ fn resolve_s2s_advertise_overrides(
     label: &str,
     values: &[String],
     auto_advertise_host: Option<&str>,
-    listen: Option<SocketAddr>,
+    listen: &[SocketAddr],
 ) -> Result<ResolvedAdvertiseAddrs, String> {
     let mut resolved = Vec::new();
     if !values.is_empty() {
         for value in values {
-            push_unique_socket_addrs(&mut resolved, resolve_s2s_advertise_addrs(label, value)?);
+            let addrs = resolve_s2s_advertise_addrs(label, value)?;
+            let addrs = filter_advertise_addrs_for_listen(label, value, addrs, listen)?;
+            push_unique_socket_addrs(&mut resolved, addrs);
         }
         return Ok(ResolvedAdvertiseAddrs {
             addrs: resolved,
@@ -268,25 +287,66 @@ fn resolve_s2s_advertise_overrides(
             is_override: false,
         });
     };
-    let Some(listen) = listen else {
+    if listen.is_empty() {
         return Ok(ResolvedAdvertiseAddrs {
             addrs: Vec::new(),
             is_override: false,
         });
     };
-    let value = format_host_port(host, listen.port());
-    push_unique_socket_addrs(&mut resolved, resolve_s2s_advertise_addrs(label, &value)?);
+    for listen_addr in listen {
+        let value = format_host_port(host, listen_addr.port());
+        let addrs = resolve_s2s_advertise_addrs(label, &value)?;
+        let addrs = filter_advertise_addrs_for_listen(
+            label,
+            &value,
+            addrs,
+            std::slice::from_ref(listen_addr),
+        )?;
+        push_unique_socket_addrs(&mut resolved, addrs);
+    }
     Ok(ResolvedAdvertiseAddrs {
         addrs: resolved,
         is_override: false,
     })
 }
 
+fn filter_advertise_addrs_for_listen(
+    label: &str,
+    value: &str,
+    addrs: Vec<SocketAddr>,
+    listen: &[SocketAddr],
+) -> Result<Vec<SocketAddr>, String> {
+    if listen.is_empty() {
+        return Ok(addrs);
+    }
+    let filtered = addrs
+        .into_iter()
+        .filter(|addr| listen_supports_advertise_family(listen, *addr))
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Err(format!(
+            "{label} {value:?} did not resolve to any addresses compatible with listen addresses {listen:?}"
+        ));
+    }
+    Ok(filtered)
+}
+
+fn listen_supports_advertise_family(listen: &[SocketAddr], advertise: SocketAddr) -> bool {
+    listen.iter().any(|listen_addr| {
+        listen_addr.is_ipv4() == advertise.is_ipv4()
+            || (advertise.is_ipv4() && listen_addr.is_ipv6() && listen_addr.ip().is_unspecified())
+    })
+}
+
+fn push_unique_socket_addr(out: &mut Vec<SocketAddr>, addr: SocketAddr) {
+    if !out.contains(&addr) {
+        out.push(addr);
+    }
+}
+
 fn push_unique_socket_addrs(out: &mut Vec<SocketAddr>, addrs: Vec<SocketAddr>) {
     for addr in addrs {
-        if !out.contains(&addr) {
-            out.push(addr);
-        }
+        push_unique_socket_addr(out, addr);
     }
 }
 
@@ -1010,6 +1070,9 @@ mod tests {
             ]
 
             [transport]
+            ping_interval_secs = 7
+            idle_ping_interval_secs = 19
+            native_stats_interval_secs = 11
             recent_probe_retry_cap_secs = 31
             stale_probe_retry_cap_secs = 601
             stale_probe_age_secs = 3601
@@ -1048,6 +1111,22 @@ mod tests {
             .transport_config()
             .expect("valid transport config")
             .expect("s2s enabled");
+        assert_eq!(
+            transport.tcp_listen_addrs(),
+            &["0.0.0.0:64739".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            transport.kcp_listen_addrs(),
+            &["0.0.0.0:64740".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            transport.quic_listen_addrs(),
+            &["0.0.0.0:64741".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            transport.udp_listen_addrs(),
+            &["0.0.0.0:64742".parse::<SocketAddr>().unwrap()]
+        );
         assert_eq!(transport.seed_addresses().len(), 3);
         assert_eq!(
             transport.tcp_advertise(),
@@ -1084,6 +1163,9 @@ mod tests {
             transport.unselected_link_probe_interval(),
             Duration::from_secs(41)
         );
+        assert_eq!(transport.ping_interval(), Duration::from_secs(7));
+        assert_eq!(transport.idle_ping_interval(), Duration::from_secs(19));
+        assert_eq!(transport.native_stats_interval(), Duration::from_secs(11));
         assert_eq!(transport.max_outgoing_connections(), 777);
         assert!(!transport.compression_enabled());
         assert_eq!(transport.compression_min_bytes(), 2048);
@@ -1127,6 +1209,35 @@ mod tests {
             ]
         "#;
         assert!(parse_s2s(raw).is_err());
+    }
+
+    #[test]
+    fn s2s_listen_fields_accept_scalar_or_array_values() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = ["0.0.0.0:64739", "[::]:64739", "0.0.0.0:64739"]
+            kcp_listen = "0.0.0.0:64740"
+        "#;
+        let cfg = parse_s2s(raw).expect("s2s config parses");
+        let transport = cfg
+            .transport_config()
+            .expect("valid transport config")
+            .expect("s2s enabled");
+
+        assert_eq!(
+            transport.tcp_listen_addrs(),
+            &[
+                "0.0.0.0:64739".parse::<SocketAddr>().unwrap(),
+                "[::]:64739".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(
+            transport.kcp_listen_addrs(),
+            &["0.0.0.0:64740".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     #[test]
@@ -1179,6 +1290,23 @@ mod tests {
     }
 
     #[test]
+    fn s2s_rejects_advertise_address_with_incompatible_listen_family() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+            tcp_advertise = ["[fd00::1]:64739"]
+        "#;
+        let cfg = parse_s2s(raw).expect("advertise address text deserializes");
+        let err = cfg
+            .transport_config()
+            .expect_err("IPv6 advertise is not reachable through an IPv4 listener");
+        assert!(err.contains("compatible with listen addresses"));
+    }
+
+    #[test]
     fn s2s_rejects_hostname_advertise_without_routable_addresses() {
         let raw = r#"
             enabled = true
@@ -1200,6 +1328,43 @@ mod tests {
         assert!(is_routable_advertise_ip("fd00::1".parse().unwrap()));
         assert!(!is_routable_advertise_ip("127.0.0.1".parse().unwrap()));
         assert!(!is_routable_advertise_ip("169.254.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn s2s_advertise_resolution_keeps_only_listener_ip_family() {
+        let addrs = vec![
+            "172.23.0.15:64740".parse::<SocketAddr>().unwrap(),
+            "[fd31:8224:7cf6:5::f]:64740".parse::<SocketAddr>().unwrap(),
+        ];
+        let filtered = filter_advertise_addrs_for_listen(
+            "s2s.kcp_advertise",
+            "node-2:64740",
+            addrs,
+            &["0.0.0.0:64740".parse().unwrap()],
+        )
+        .expect("one resolved address matches the IPv4 listener");
+
+        assert_eq!(
+            filtered,
+            vec!["172.23.0.15:64740".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn s2s_advertise_resolution_treats_unspecified_ipv6_listen_as_dual_stack() {
+        let addrs = vec![
+            "172.23.0.7:64739".parse::<SocketAddr>().unwrap(),
+            "[fd31:8224:7cf6:5::7]:64739".parse::<SocketAddr>().unwrap(),
+        ];
+        let filtered = filter_advertise_addrs_for_listen(
+            "s2s.tcp_advertise",
+            "node-1:64739",
+            addrs.clone(),
+            &["[::]:64739".parse().unwrap()],
+        )
+        .expect("[::] listener can accept both resolved families in the verified Docker setup");
+
+        assert_eq!(filtered, addrs);
     }
 
     #[test]

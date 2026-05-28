@@ -188,7 +188,7 @@ impl OverlayInner {
         }
 
         spawn_hello_task(self.hello.clone());
-        spawn_link_up_watcher(self.hello.clone(), self.neighbor.on_link_up());
+        spawn_link_up_watcher(self.hello.clone(), self.neighbor.subscribe_link_up());
         self.flood_pacer
             .clone()
             .spawn(self.cfg.clone(), self.shutdown.clone());

@@ -18,25 +18,26 @@ use super::super::manager::ManagerInner;
 use super::super::native_stats;
 use super::super::service_level::TransportKind;
 use super::{
-    Endpoint, bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket, install_stream_session,
+    Endpoint, bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only,
+    install_stream_session, ipv6_only_for_address,
 };
 
 pub(crate) struct KcpEndpoint {
     server_tls: Arc<rustls::ServerConfig>,
     client_tls: Arc<rustls::ClientConfig>,
-    listen_addr: Option<SocketAddr>,
+    listen_addrs: Vec<SocketAddr>,
 }
 
 impl KcpEndpoint {
     pub fn new(
         server_tls: Arc<rustls::ServerConfig>,
         client_tls: Arc<rustls::ClientConfig>,
-        listen_addr: Option<SocketAddr>,
+        listen_addrs: impl IntoIterator<Item = SocketAddr>,
     ) -> Self {
         Self {
             server_tls,
             client_tls,
-            listen_addr,
+            listen_addrs: listen_addrs.into_iter().collect(),
         }
     }
 }
@@ -49,17 +50,17 @@ impl Endpoint for KcpEndpoint {
         inner: Arc<ManagerInner>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let Some(addr) = self.listen_addr else {
-                return Ok(());
-            };
             let cfg = KcpConfig::default();
-            let socket = bind_reusable_udp_socket(addr).await?;
-            let listener = KcpListener::from_socket(cfg, socket)
-                .await
-                .map_err(|e| io::Error::other(format!("kcp bind: {e}")))?;
             let acceptor = TlsAcceptor::from(self.server_tls.clone());
-            debug!(%addr, "kcp listener up");
-            tokio::spawn(accept_loop(listener, acceptor, inner));
+            for addr in self.listen_addrs.iter().copied() {
+                let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
+                let socket = bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?;
+                let listener = KcpListener::from_socket(cfg.clone(), socket)
+                    .await
+                    .map_err(|e| io::Error::other(format!("kcp bind {addr}: {e}")))?;
+                debug!(%addr, %ipv6_only, "kcp listener up");
+                tokio::spawn(accept_loop(listener, acceptor.clone(), inner.clone()));
+            }
             Ok(())
         }
     }

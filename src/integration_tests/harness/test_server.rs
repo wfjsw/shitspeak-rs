@@ -108,7 +108,7 @@ pub async fn spawn_s2s_test_server(
         ca_path: Some(pki.ca_path.clone()),
         cert_path: Some(cert_path.clone()),
         key_path: Some(key_path.clone()),
-        tcp_listen: Some(s2s_opts.tcp_listen),
+        tcp_listen: vec![s2s_opts.tcp_listen],
         persistence_dir: Some(persistence_dir.path().to_path_buf()),
         seed_addresses: s2s_opts.seed_addresses,
         ..S2sConfig::default()

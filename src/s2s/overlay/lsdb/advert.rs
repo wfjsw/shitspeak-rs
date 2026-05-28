@@ -228,8 +228,8 @@ impl LinkGate {
         loss_sample_count: u64,
         cfg: &OverlayConfig,
     ) -> Self {
-        let loss_confident = loss_sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
         let loss_ppm = round_up_u32(loss_ppm, LOSS_GATE_BUCKET_PPM).min(1_000_000);
+        let loss_confident = loss_sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
         Self {
             rtt_us: round_up_u64(rtt_us, RTT_GATE_BUCKET_US),
             jitter_us: round_up_u64(jitter_us, JITTER_GATE_BUCKET_US),
@@ -418,7 +418,9 @@ pub fn cost_changed_significantly(
             );
             return true;
         }
-        if previous.loss_confident != current.loss_confident {
+        if previous.loss_confident != current.loss_confident
+            && (previous.loss_ppm > 0 || current.loss_ppm > 0)
+        {
             trace!(
                 peer = %n.node_id,
                 previous = previous.loss_confident,
@@ -474,6 +476,25 @@ impl LsaFloodPending {
         lsas: Vec<pb::LinkStateAdvert>,
         exclude: Option<NodeIdentifier>,
     ) {
+        self.enqueue_to_neighbors_inner(snap, lsas, exclude, false);
+    }
+
+    fn enqueue_reflood_to_neighbors(
+        &mut self,
+        snap: &[NeighborSnapshot],
+        lsas: Vec<pb::LinkStateAdvert>,
+        exclude: Option<NodeIdentifier>,
+    ) {
+        self.enqueue_to_neighbors_inner(snap, lsas, exclude, true);
+    }
+
+    fn enqueue_to_neighbors_inner(
+        &mut self,
+        snap: &[NeighborSnapshot],
+        lsas: Vec<pb::LinkStateAdvert>,
+        exclude: Option<NodeIdentifier>,
+        suppress_origin_neighbors: bool,
+    ) {
         if lsas.is_empty() {
             return;
         }
@@ -486,6 +507,11 @@ impl LsaFloodPending {
                 let Some(origin) = node_from_wire(lsa.origin) else {
                     continue;
                 };
+                if suppress_origin_neighbors
+                    && (origin == n.node_id || lsa_lists_direct_neighbor(lsa, n.node_id))
+                {
+                    continue;
+                }
                 match pending.get(&origin) {
                     Some(existing)
                         if !is_strictly_newer(
@@ -524,6 +550,12 @@ impl LsaFloodPending {
     }
 }
 
+fn lsa_lists_direct_neighbor(lsa: &pb::LinkStateAdvert, peer: NodeIdentifier) -> bool {
+    lsa.links
+        .iter()
+        .any(|link| node_from_wire(link.neighbor) == Some(peer))
+}
+
 /// Coalesces LSA floods for a short interval so a burst of accepted LSAs
 /// becomes fewer frames without changing LSDB admission semantics.
 pub struct LsaFloodPacer {
@@ -548,6 +580,17 @@ impl LsaFloodPacer {
         self.pending
             .lock()
             .enqueue_to_neighbors(snap, lsas, exclude);
+    }
+
+    pub fn enqueue_reflood_to_neighbors(
+        &self,
+        snap: &[NeighborSnapshot],
+        lsas: Vec<pb::LinkStateAdvert>,
+        exclude: Option<NodeIdentifier>,
+    ) {
+        self.pending
+            .lock()
+            .enqueue_reflood_to_neighbors(snap, lsas, exclude);
     }
 
     pub fn spawn(self: Arc<Self>, cfg: OverlayConfig, shutdown: CancellationToken) {
@@ -828,7 +871,7 @@ pub async fn handle_flood(
     }
     if !accepted.is_empty() {
         let snap = monitor.snapshot();
-        pacer.enqueue_to_neighbors(&snap, accepted, Some(sender));
+        pacer.enqueue_reflood_to_neighbors(&snap, accepted, Some(sender));
     }
 }
 
@@ -881,6 +924,24 @@ mod tests {
         }
     }
 
+    fn pb_lsa_with_links(
+        origin: NodeIdentifier,
+        seq: u64,
+        links: &[NodeIdentifier],
+    ) -> pb::LinkStateAdvert {
+        pb::LinkStateAdvert {
+            links: links
+                .iter()
+                .copied()
+                .map(|neighbor| pb::LinkAdvert {
+                    neighbor: node_to_wire(neighbor),
+                    ..Default::default()
+                })
+                .collect(),
+            ..pb_lsa(origin, seq)
+        }
+    }
+
     #[test]
     fn pending_flood_coalesces_newest_and_excludes_sender() {
         let mut pending = LsaFloodPending::default();
@@ -906,6 +967,21 @@ mod tests {
                 (3, node_to_wire(8), 1),
             ]
         );
+    }
+
+    #[test]
+    fn pending_reflood_skips_origin_and_origin_direct_neighbors() {
+        let mut pending = LsaFloodPending::default();
+        pending.enqueue_reflood_to_neighbors(
+            &snap(&[1, 2, 3, 4, 7]),
+            vec![pb_lsa_with_links(7, 1, &[1, 3])],
+            Some(2),
+        );
+
+        let batches = pending.drain_batches(8);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0, 4);
+        assert_eq!(batches[0].1[0].origin, node_to_wire(7));
     }
 
     #[test]
@@ -999,6 +1075,7 @@ mod tests {
         let cfg = OverlayConfig::new(vec![]);
         let emitter = test_emitter();
         let mut base = one_neighbor();
+        base.loss_ppm = 50_000;
         base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES - 1;
         let base = vec![base];
         record_published(&emitter, &base, &cfg);
@@ -1028,6 +1105,36 @@ mod tests {
         let mut changed = base.clone();
         changed[0].loss_ppm = 201_000;
         assert!(cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn zero_effective_loss_confidence_movement_does_not_emit() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.loss_ppm = 0;
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES - 1;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn tiny_effective_loss_movement_below_loss_delta_does_not_emit() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.loss_ppm = 0;
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].loss_ppm = 1;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
     }
 
     #[test]

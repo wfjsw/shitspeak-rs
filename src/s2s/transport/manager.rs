@@ -364,22 +364,22 @@ impl ConnectionManager {
 
         addrs.extend(advertised_addresses(
             cfg.tcp_advertise(),
-            cfg.tcp_listen(),
+            cfg.tcp_listen_addrs(),
             TransportKind::Tcp,
         ));
         addrs.extend(advertised_addresses(
             cfg.kcp_advertise(),
-            cfg.kcp_listen(),
+            cfg.kcp_listen_addrs(),
             TransportKind::Kcp,
         ));
         addrs.extend(advertised_addresses(
             cfg.quic_advertise(),
-            cfg.quic_listen(),
+            cfg.quic_listen_addrs(),
             TransportKind::Quic,
         ));
         addrs.extend(advertised_addresses(
             cfg.udp_advertise(),
-            cfg.udp_listen(),
+            cfg.udp_listen_addrs(),
             TransportKind::Udp,
         ));
 
@@ -556,9 +556,18 @@ impl ConnectionManager {
         }
 
         let mut first_err = None;
-        for chosen in choices {
+        let choice_count = choices.len();
+        for (idx, chosen) in choices.into_iter().enumerate() {
+            let wait_for_space = idx + 1 == choice_count;
             match self
-                .send_stream(&peer, chosen, class, payload.clone(), options)
+                .send_stream(
+                    &peer,
+                    chosen,
+                    class,
+                    payload.clone(),
+                    options,
+                    wait_for_space,
+                )
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -598,7 +607,7 @@ impl ConnectionManager {
             .inner
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
-        self.send_stream(&peer, transport, class, payload, options)
+        self.send_stream(&peer, transport, class, payload, options, true)
             .await
     }
 
@@ -609,24 +618,31 @@ impl ConnectionManager {
         class: MessageClass,
         payload: Bytes,
         options: SendOptions,
+        wait_for_space: bool,
     ) -> Result<(), SendError> {
         let sender = peer.try_get_stream(kind).ok_or(SendError::StreamClosed {
             node: peer.node_id(),
             transport: kind,
         })?;
-        sender
-            .try_send(OutboundFrame::with_options(class, payload, options))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => SendError::Backpressure {
+        let frame = OutboundFrame::with_options(class, payload, options);
+        match sender.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(frame)) if wait_for_space => sender
+                .send(frame)
+                .await
+                .map_err(|_| SendError::StreamClosed {
                     node: peer.node_id(),
                     transport: kind,
-                },
-                mpsc::error::TrySendError::Closed(_) => SendError::StreamClosed {
-                    node: peer.node_id(),
-                    transport: kind,
-                },
-            })?;
-        Ok(())
+                }),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SendError::Backpressure {
+                node: peer.node_id(),
+                transport: kind,
+            }),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SendError::StreamClosed {
+                node: peer.node_id(),
+                transport: kind,
+            }),
+        }
     }
 
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
@@ -748,7 +764,7 @@ fn kind_order(k: TransportKind) -> u8 {
 
 fn advertised_addresses(
     explicit: &[SocketAddr],
-    listen: Option<SocketAddr>,
+    listen: &[SocketAddr],
     transport: TransportKind,
 ) -> Vec<PeerAddress> {
     if !explicit.is_empty() {
@@ -768,20 +784,20 @@ fn advertised_addresses(
         return addrs;
     }
 
-    let Some(addr) = listen else {
-        return Vec::new();
-    };
-    let peer_addr = PeerAddress::new(addr, transport);
-    if peer_addr.is_dialable() {
-        vec![peer_addr]
-    } else {
-        debug!(
-            ?transport,
-            %addr,
-            "not advertising wildcard S2S listen address; configure the matching *_advertise address"
-        );
-        Vec::new()
+    let mut addrs = Vec::with_capacity(listen.len());
+    for addr in listen.iter().copied() {
+        let peer_addr = PeerAddress::new(addr, transport);
+        if peer_addr.is_dialable() {
+            addrs.push(peer_addr);
+        } else {
+            debug!(
+                ?transport,
+                %addr,
+                "not advertising wildcard S2S listen address; configure the matching *_advertise address"
+            );
+        }
     }
+    addrs
 }
 
 fn add_public_ip_advertise_addresses(
@@ -793,28 +809,28 @@ fn add_public_ip_advertise_addresses(
         addrs,
         public_ips,
         cfg.tcp_advertise_override(),
-        cfg.tcp_listen(),
+        cfg.tcp_listen_addrs(),
         TransportKind::Tcp,
     );
     push_public_ip_advertise_addresses(
         addrs,
         public_ips,
         cfg.kcp_advertise_override(),
-        cfg.kcp_listen(),
+        cfg.kcp_listen_addrs(),
         TransportKind::Kcp,
     );
     push_public_ip_advertise_addresses(
         addrs,
         public_ips,
         cfg.quic_advertise_override(),
-        cfg.quic_listen(),
+        cfg.quic_listen_addrs(),
         TransportKind::Quic,
     );
     push_public_ip_advertise_addresses(
         addrs,
         public_ips,
         cfg.udp_advertise_override(),
-        cfg.udp_listen(),
+        cfg.udp_listen_addrs(),
         TransportKind::Udp,
     );
 }
@@ -823,24 +839,31 @@ fn push_public_ip_advertise_addresses(
     addrs: &mut Vec<PeerAddress>,
     public_ips: &[IpAddr],
     explicit_override: bool,
-    listen: Option<SocketAddr>,
+    listen: &[SocketAddr],
     transport: TransportKind,
 ) {
     if explicit_override {
         return;
     }
-    let Some(listen) = listen else {
-        return;
-    };
-    if listen.port() == 0 || listen.ip().is_loopback() {
-        return;
-    }
-    for ip in public_ips.iter().copied() {
-        let candidate = PeerAddress::new(SocketAddr::new(ip, listen.port()), transport);
-        if candidate.is_dialable() && !addrs.contains(&candidate) {
-            addrs.push(candidate);
+    for listen_addr in listen.iter().copied() {
+        if listen_addr.port() == 0 || listen_addr.ip().is_loopback() {
+            continue;
+        }
+        for ip in public_ips.iter().copied() {
+            if !listen_supports_ip_family(listen_addr, ip) {
+                continue;
+            }
+            let candidate = PeerAddress::new(SocketAddr::new(ip, listen_addr.port()), transport);
+            if candidate.is_dialable() && !addrs.contains(&candidate) {
+                addrs.push(candidate);
+            }
         }
     }
+}
+
+fn listen_supports_ip_family(listen: SocketAddr, ip: IpAddr) -> bool {
+    listen.is_ipv4() == ip.is_ipv4()
+        || (ip.is_ipv4() && listen.is_ipv6() && listen.ip().is_unspecified())
 }
 
 /// Build every endpoint for which the corresponding `<kind>_listen` is set.
@@ -858,37 +881,40 @@ fn build_endpoints(
             .any(|addr| addr.transport() == kind)
     };
 
-    let tcp = (cfg.tcp_listen().is_some() || has_seed(TransportKind::Tcp)).then(|| {
+    let tcp = (!cfg.tcp_listen_addrs().is_empty() || has_seed(TransportKind::Tcp)).then(|| {
         Arc::new(TcpEndpoint::new(
             server_tls.clone(),
             client_tls.clone(),
-            cfg.tcp_listen(),
+            cfg.tcp_listen_addrs().iter().copied(),
         ))
     });
-    let kcp = (cfg.kcp_listen().is_some() || has_seed(TransportKind::Kcp)).then(|| {
+    let kcp = (!cfg.kcp_listen_addrs().is_empty() || has_seed(TransportKind::Kcp)).then(|| {
         Arc::new(KcpEndpoint::new(
             server_tls.clone(),
             client_tls.clone(),
-            cfg.kcp_listen(),
+            cfg.kcp_listen_addrs().iter().copied(),
         ))
     });
-    let quic = if cfg.quic_listen().is_some() || has_seed(TransportKind::Quic) {
-        match cfg.quic_listen() {
-            Some(addr) => Some(Arc::new(
-                QuicEndpoint::new(server_tls.clone(), client_tls.clone(), Some(addr))
-                    .map_err(|source| TransportError::Bind { addr, source })?,
-            )),
-            None => Some(Arc::new(QuicEndpoint::new(
-                server_tls.clone(),
-                client_tls.clone(),
-                None,
-            )?)),
-        }
+    let quic = if !cfg.quic_listen_addrs().is_empty() || has_seed(TransportKind::Quic) {
+        let endpoint = QuicEndpoint::new(
+            server_tls.clone(),
+            client_tls.clone(),
+            cfg.quic_listen_addrs().iter().copied(),
+        )
+        .map_err(|e| {
+            let (addr, source) = e.into_parts();
+            TransportError::Bind { addr, source }
+        })?;
+        Some(Arc::new(endpoint))
     } else {
         None
     };
-    let udp = (cfg.udp_listen().is_some() || has_seed(TransportKind::Udp))
-        .then(|| Arc::new(UdpEndpoint::new(identity, cfg.udp_listen())));
+    let udp = (!cfg.udp_listen_addrs().is_empty() || has_seed(TransportKind::Udp)).then(|| {
+        Arc::new(UdpEndpoint::new(
+            identity,
+            cfg.udp_listen_addrs().iter().copied(),
+        ))
+    });
 
     Ok(EndpointRegistry::new(tcp, kcp, quic, udp))
 }
@@ -1027,7 +1053,7 @@ mod tests {
     #[test]
     fn advertised_addresses_skip_wildcard_listen_without_advertise() {
         assert_eq!(
-            advertised_addresses(&[], Some(socket("0.0.0.0:64739")), TransportKind::Tcp),
+            advertised_addresses(&[], &[socket("0.0.0.0:64739")], TransportKind::Tcp),
             Vec::<PeerAddress>::new()
         );
     }
@@ -1037,7 +1063,7 @@ mod tests {
         assert_eq!(
             advertised_addresses(
                 &[socket("127.0.0.1:64740"), socket("127.0.0.2:64740")],
-                Some(socket("0.0.0.0:64740")),
+                &[socket("0.0.0.0:64740")],
                 TransportKind::Kcp,
             ),
             vec![
@@ -1050,7 +1076,7 @@ mod tests {
     #[test]
     fn advertised_addresses_use_concrete_listen_when_no_advertise_set() {
         assert_eq!(
-            advertised_addresses(&[], Some(socket("127.0.0.1:64741")), TransportKind::Quic),
+            advertised_addresses(&[], &[socket("127.0.0.1:64741")], TransportKind::Quic),
             vec![PeerAddress::new(
                 socket("127.0.0.1:64741"),
                 TransportKind::Quic
@@ -1063,10 +1089,25 @@ mod tests {
         assert_eq!(
             advertised_addresses(
                 &[socket("0.0.0.0:64742")],
-                Some(socket("127.0.0.1:64742")),
+                &[socket("127.0.0.1:64742")],
                 TransportKind::Udp,
             ),
             Vec::<PeerAddress>::new()
+        );
+    }
+
+    #[test]
+    fn advertised_addresses_use_all_concrete_listen_addresses() {
+        assert_eq!(
+            advertised_addresses(
+                &[],
+                &[socket("192.0.2.10:64739"), socket("[2001:db8::10]:64739")],
+                TransportKind::Tcp,
+            ),
+            vec![
+                PeerAddress::new(socket("192.0.2.10:64739"), TransportKind::Tcp),
+                PeerAddress::new(socket("[2001:db8::10]:64739"), TransportKind::Tcp),
+            ]
         );
     }
 
@@ -1089,7 +1130,6 @@ mod tests {
             addrs,
             vec![
                 PeerAddress::new(socket("8.8.8.8:64739"), TransportKind::Tcp),
-                PeerAddress::new(socket("[2001:4860:4860::8888]:64739"), TransportKind::Tcp),
                 PeerAddress::new(socket("8.8.8.8:64741"), TransportKind::Quic),
                 PeerAddress::new(socket("[2001:4860:4860::8888]:64741"), TransportKind::Quic),
             ]

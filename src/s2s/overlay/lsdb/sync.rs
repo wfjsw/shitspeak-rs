@@ -32,6 +32,7 @@ use super::super::config::OverlayConfig;
 use super::super::discovery::learn_from_lsa;
 use super::super::neighbor::monitor::NeighborMonitor;
 use super::super::proto::{OverlayBody, encode_message, node_from_wire, node_to_wire, wrap};
+use super::advert::LsaFloodPacer;
 use super::store::{AdmissionResult, LinkStateDb, LsaEntry, OriginVersion};
 
 /// Send an `LsdbSync` request to `dst`. `have` is our digest; pass `&[]`
@@ -175,21 +176,32 @@ pub async fn push_snapshot(
 }
 
 /// Handle an inbound `LsdbSyncResp`. Each LSA goes through the normal
-/// admission rule (including the floor check). Accepted LSAs are NOT
-/// re-flooded — sync is point-to-point.
-pub fn handle_response(lsdb: &LinkStateDb, transport: &ConnectionManager, resp: pb::LsdbSyncResp) {
+/// admission rule (including the floor check). Accepted LSAs are re-flooded
+/// just like flood-admitted LSAs so point-to-point repair can propagate.
+pub fn handle_response(
+    lsdb: &LinkStateDb,
+    monitor: &NeighborMonitor,
+    transport: &ConnectionManager,
+    pacer: &LsaFloodPacer,
+    sender: NodeIdentifier,
+    resp: pb::LsdbSyncResp,
+) {
     let mut accepted = 0usize;
+    let mut accepted_lsas = Vec::new();
     for pb_lsa in resp.delta {
         let Some(lsa) = LsaEntry::from_pb(&pb_lsa) else {
             continue;
         };
         if matches!(lsdb.admit(lsa.clone()), AdmissionResult::Accepted) {
             learn_from_lsa(transport, &lsa);
+            accepted_lsas.push(pb_lsa);
             accepted += 1;
         }
     }
     if accepted > 0 {
         trace!(accepted, "lsdb sync resp processed");
+        let snap = monitor.snapshot();
+        pacer.enqueue_reflood_to_neighbors(&snap, accepted_lsas, Some(sender));
     }
 }
 

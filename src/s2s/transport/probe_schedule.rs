@@ -52,11 +52,9 @@ pub(crate) fn bandwidth_probe_startup_jitter(
     local: NodeIdentifier,
     peer: NodeIdentifier,
     transport: TransportKind,
-    ping_interval: Duration,
+    _ping_interval: Duration,
 ) -> Duration {
-    let spread = ping_interval
-        .max(STARTUP_PROBE_MIN_SPREAD)
-        .min(STARTUP_PROBE_MAX_SPREAD);
+    let spread = STARTUP_PROBE_MAX_SPREAD.max(STARTUP_PROBE_MIN_SPREAD);
     let spread_nanos = spread.as_nanos().min(u128::from(u64::MAX)) as u64;
     if spread_nanos == 0 {
         return Duration::ZERO;
@@ -68,6 +66,13 @@ pub(crate) fn bandwidth_probe_startup_jitter(
     peer.hash(&mut hasher);
     transport.hash(&mut hasher);
     Duration::from_nanos(hasher.finish() % (spread_nanos + 1))
+}
+
+pub(crate) fn stabilized_ping_interval(active: Duration, idle: Duration) -> Duration {
+    if active.is_zero() || idle.is_zero() {
+        return active;
+    }
+    idle.max(active)
 }
 
 #[cfg(test)]
@@ -82,6 +87,26 @@ mod tests {
             bandwidth_probe_startup_jitter(1, 2, TransportKind::Tcp, Duration::from_secs(2));
 
         assert_eq!(delay_a, delay_b);
-        assert!(delay_a <= Duration::from_secs(2));
+        assert!(delay_a <= STARTUP_PROBE_MAX_SPREAD);
+    }
+
+    #[test]
+    fn stabilized_ping_interval_never_shortens_active_interval() {
+        assert_eq!(
+            stabilized_ping_interval(Duration::from_secs(2), Duration::ZERO),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            stabilized_ping_interval(Duration::from_secs(2), Duration::from_secs(1)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            stabilized_ping_interval(Duration::from_secs(2), Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            stabilized_ping_interval(Duration::ZERO, Duration::from_secs(10)),
+            Duration::ZERO
+        );
     }
 }

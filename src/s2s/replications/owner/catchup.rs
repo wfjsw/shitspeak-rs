@@ -165,11 +165,9 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         }
     }
 
-    {
-        let mut s = rt.state.lock();
-        s.catchup_in_flight.remove(&origin);
-    }
-
+    // Keep the request timestamp after a response arrives. It is the retry
+    // gate, not just an in-flight marker; clearing it here lets fast empty
+    // responses bypass `owner_catchup_timeout`.
     for cop in resp.ops {
         rt.process_remote_op(
             origin,

@@ -69,6 +69,12 @@ jitter_ewma_alpha = 0.0625
 throughput_ewma_alpha = 0.3
 # Smoothing coefficient for the long-term packet loss EWMA.
 packet_loss_ewma_alpha = 0.02
+# Fast transport keepalive interval used before a link has proven stable.
+ping_interval_secs = 2
+# Slower keepalive interval used after the first keepalive pong on a link.
+idle_ping_interval_secs = 10
+# How often stream transports sample native loss counters; zero disables it.
+native_stats_interval_secs = 10
 # Cap on in-flight pings remembered per stream/UDP session.
 max_pending_pings = 64
 # Exponential probing retry cap for peers seen recently.

@@ -40,10 +40,15 @@ use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::super::frame::{FrameType, build_frame};
 use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
-use super::super::probe_schedule::{StartupBandwidthProbe, bandwidth_probe_startup_jitter};
+use super::super::probe_schedule::{
+    StartupBandwidthProbe, bandwidth_probe_startup_jitter, stabilized_ping_interval,
+};
 use super::super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
 use super::super::tls;
-use super::{Endpoint, bind_reusable_udp_socket};
+use super::{
+    Endpoint, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
+    socket_addr_supports_remote,
+};
 
 const MAGIC: [u8; 4] = *b"SSU1";
 const HEADER_LEN: usize = 20;
@@ -64,17 +69,41 @@ const SUPPORTED_SIGNATURE_SCHEMES: &[SignatureScheme] = &[
 
 pub(crate) struct UdpEndpoint {
     identity: Arc<NodeIdentity>,
-    listen_addr: Option<SocketAddr>,
+    listen_addrs: Vec<SocketAddr>,
     sockets: Mutex<UdpSocketSet>,
 }
 
 impl UdpEndpoint {
-    pub fn new(identity: Arc<NodeIdentity>, listen_addr: Option<SocketAddr>) -> Self {
+    pub fn new(
+        identity: Arc<NodeIdentity>,
+        listen_addrs: impl IntoIterator<Item = SocketAddr>,
+    ) -> Self {
         Self {
             identity,
-            listen_addr,
+            listen_addrs: listen_addrs.into_iter().collect(),
             sockets: Mutex::new(UdpSocketSet::default()),
         }
+    }
+
+    async fn ensure_listen_socket(
+        &self,
+        addr: SocketAddr,
+        inner: Arc<ManagerInner>,
+    ) -> io::Result<Arc<UdpSocketState>> {
+        let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
+        let mut sockets = self.sockets.lock().await;
+        if let Some(existing) = sockets.for_bound_addr(addr, ipv6_only) {
+            return Ok(existing.clone());
+        }
+
+        let state = Arc::new(UdpSocketState::bind(addr, ipv6_only).await?);
+        sockets.insert(addr, ipv6_only, state.clone());
+        tokio::spawn(run_socket_read_loop(
+            state.clone(),
+            inner,
+            self.identity.clone(),
+        ));
+        Ok(state)
     }
 
     async fn ensure_socket(
@@ -87,9 +116,9 @@ impl UdpEndpoint {
             return Ok(existing.clone());
         }
 
-        let bind_addr = bind_addr_for_udp_socket(self.listen_addr, remote_addr);
-        let state = Arc::new(UdpSocketState::bind(bind_addr).await?);
-        sockets.set_for_addr(remote_addr, state.clone());
+        let bind = bind_addr_for_udp_socket(&self.listen_addrs, remote_addr);
+        let state = Arc::new(UdpSocketState::bind(bind.addr, bind.ipv6_only).await?);
+        sockets.insert(bind.addr, bind.ipv6_only, state.clone());
         tokio::spawn(run_socket_read_loop(
             state.clone(),
             inner,
@@ -107,11 +136,11 @@ impl Endpoint for UdpEndpoint {
         inner: Arc<ManagerInner>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let Some(addr) = self.listen_addr else {
-                return Ok(());
-            };
-            self.ensure_socket(addr, inner).await?;
-            debug!(%addr, "udp packet-encryption listener up");
+            for addr in self.listen_addrs.iter().copied() {
+                let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
+                self.ensure_listen_socket(addr, inner.clone()).await?;
+                debug!(%addr, %ipv6_only, "udp packet-encryption listener up");
+            }
             Ok(())
         }
     }
@@ -151,41 +180,68 @@ impl Endpoint for UdpEndpoint {
 
 #[derive(Default)]
 struct UdpSocketSet {
-    ipv4: Option<Arc<UdpSocketState>>,
-    ipv6: Option<Arc<UdpSocketState>>,
+    entries: Vec<UdpSocketEntry>,
+}
+
+struct UdpSocketEntry {
+    addr: SocketAddr,
+    ipv6_only: bool,
+    state: Arc<UdpSocketState>,
 }
 
 impl UdpSocketSet {
     fn for_addr(&self, addr: SocketAddr) -> Option<&Arc<UdpSocketState>> {
-        if addr.is_ipv4() {
-            self.ipv4.as_ref()
-        } else {
-            self.ipv6.as_ref()
-        }
+        self.entries
+            .iter()
+            .find(|entry| socket_addr_supports_remote(entry.addr, entry.ipv6_only, addr))
+            .map(|entry| &entry.state)
     }
 
-    fn set_for_addr(&mut self, addr: SocketAddr, state: Arc<UdpSocketState>) {
-        if addr.is_ipv4() {
-            self.ipv4 = Some(state);
+    fn for_bound_addr(&self, addr: SocketAddr, ipv6_only: bool) -> Option<&Arc<UdpSocketState>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.addr == addr && entry.ipv6_only == ipv6_only)
+            .map(|entry| &entry.state)
+    }
+
+    fn insert(&mut self, addr: SocketAddr, ipv6_only: bool, state: Arc<UdpSocketState>) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.addr == addr && entry.ipv6_only == ipv6_only)
+        {
+            entry.state = state;
         } else {
-            self.ipv6 = Some(state);
+            self.entries.push(UdpSocketEntry {
+                addr,
+                ipv6_only,
+                state,
+            });
         }
     }
 }
 
-fn bind_addr_for_udp_socket(
-    listen_addr: Option<SocketAddr>,
-    remote_addr: SocketAddr,
-) -> SocketAddr {
-    listen_addr
-        .filter(|addr| addr.is_ipv4() == remote_addr.is_ipv4())
-        .unwrap_or_else(|| {
-            if remote_addr.is_ipv4() {
-                SocketAddr::from(([0, 0, 0, 0], 0))
-            } else {
-                SocketAddr::from(([0u16; 8], 0))
-            }
-        })
+#[derive(Clone, Copy)]
+struct UdpBindAddr {
+    addr: SocketAddr,
+    ipv6_only: bool,
+}
+
+fn bind_addr_for_udp_socket(listen_addrs: &[SocketAddr], remote_addr: SocketAddr) -> UdpBindAddr {
+    for addr in listen_addrs.iter().copied() {
+        let ipv6_only = ipv6_only_for_address(addr, listen_addrs);
+        if socket_addr_supports_remote(addr, ipv6_only, remote_addr) {
+            return UdpBindAddr { addr, ipv6_only };
+        }
+    }
+    UdpBindAddr {
+        addr: if remote_addr.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        },
+        ipv6_only: false,
+    }
 }
 
 struct UdpSocketState {
@@ -196,9 +252,9 @@ struct UdpSocketState {
 }
 
 impl UdpSocketState {
-    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+    async fn bind(addr: SocketAddr, ipv6_only: bool) -> io::Result<Self> {
         Ok(Self {
-            socket: Arc::new(bind_reusable_udp_socket(addr).await?),
+            socket: Arc::new(bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?),
             sessions: Mutex::new(HashMap::new()),
             exchanges: Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
@@ -1790,16 +1846,20 @@ async fn run_write(
         probe_enabled && !inner.cfg().bandwidth_probe_interval().is_zero(),
         startup_probe_delay,
     );
-    let pending_timeout = inner
-        .cfg()
-        .ping_interval()
+    let active_ping_interval = inner.cfg().ping_interval();
+    let stable_ping_interval =
+        stabilized_ping_interval(active_ping_interval, inner.cfg().idle_ping_interval());
+    let mut stable_ping_interval_armed = false;
+    let pending_timeout = active_ping_interval
+        .max(stable_ping_interval)
         .saturating_mul(2)
         .max(Duration::from_secs(1));
-    let mut ping_tick = MaybeInterval::maybe(inner.cfg().ping_interval());
+    let mut ping_tick = MaybeInterval::maybe(active_ping_interval);
+    let periodic_probe_delay = startup_probe_delay.min(inner.cfg().bandwidth_probe_interval());
     let mut probe_tick = if probe_enabled {
         MaybeInterval::maybe_with_initial_delay(
             inner.cfg().bandwidth_probe_interval(),
-            startup_probe_delay,
+            periodic_probe_delay,
         )
     } else {
         MaybeInterval::Disabled
@@ -1871,6 +1931,12 @@ async fn run_write(
 
             _ = session.startup_probe_ready.notified() => {
                 startup_probe.arm();
+                if !stable_ping_interval_armed
+                    && stable_ping_interval != active_ping_interval
+                {
+                    ping_tick = MaybeInterval::maybe(stable_ping_interval);
+                    stable_ping_interval_armed = true;
+                }
             }
 
             _ = startup_probe.tick() => {

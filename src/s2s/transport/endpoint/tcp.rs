@@ -15,7 +15,7 @@ use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
 use super::super::native_stats;
 use super::super::service_level::TransportKind;
-use super::{Endpoint, install_stream_session};
+use super::{Endpoint, bind_tcp_listener, install_stream_session, ipv6_only_for_address};
 
 /// TCP endpoint state. Holds the rustls server/client configs and the
 /// listen address. The TLS configs are shared (and built once) by the
@@ -23,19 +23,19 @@ use super::{Endpoint, install_stream_session};
 pub(crate) struct TcpEndpoint {
     server_tls: Arc<rustls::ServerConfig>,
     client_tls: Arc<rustls::ClientConfig>,
-    listen_addr: Option<SocketAddr>,
+    listen_addrs: Vec<SocketAddr>,
 }
 
 impl TcpEndpoint {
     pub fn new(
         server_tls: Arc<rustls::ServerConfig>,
         client_tls: Arc<rustls::ClientConfig>,
-        listen_addr: Option<SocketAddr>,
+        listen_addrs: impl IntoIterator<Item = SocketAddr>,
     ) -> Self {
         Self {
             server_tls,
             client_tls,
-            listen_addr,
+            listen_addrs: listen_addrs.into_iter().collect(),
         }
     }
 }
@@ -48,13 +48,13 @@ impl Endpoint for TcpEndpoint {
         inner: Arc<ManagerInner>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let Some(addr) = self.listen_addr else {
-                return Ok(());
-            };
-            let listener = TcpListener::bind(addr).await?;
             let acceptor = TlsAcceptor::from(self.server_tls.clone());
-            debug!(%addr, "tcp listener up");
-            tokio::spawn(accept_loop(listener, acceptor, inner));
+            for addr in self.listen_addrs.iter().copied() {
+                let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
+                let listener = bind_tcp_listener(addr, ipv6_only).await?;
+                debug!(%addr, %ipv6_only, "tcp listener up");
+                tokio::spawn(accept_loop(listener, acceptor.clone(), inner.clone()));
+            }
             Ok(())
         }
     }

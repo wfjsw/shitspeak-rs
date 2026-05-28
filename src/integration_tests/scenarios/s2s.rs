@@ -128,10 +128,10 @@ fn all_transport_s2s_config(
 ) -> S2sConfig {
     S2sConfig {
         enabled: true,
-        tcp_listen: Some(tcp_listen),
-        kcp_listen: Some(kcp_listen),
-        quic_listen: Some(quic_listen),
-        udp_listen: Some(udp_listen),
+        tcp_listen: vec![tcp_listen],
+        kcp_listen: vec![kcp_listen],
+        quic_listen: vec![quic_listen],
+        udp_listen: vec![udp_listen],
         tcp_advertise: vec![tcp_listen.to_string()],
         kcp_advertise: vec![kcp_listen.to_string()],
         quic_advertise: vec![quic_listen.to_string()],

@@ -23,7 +23,7 @@
 //!   * `HelloAck`      → feed RTT + bump liveness in neighbor table.
 //!   * `LsaFlood`      → admit each LSA + re-flood accepted ones.
 //!   * `LsdbSync`      → respond with the LSAs the peer is missing.
-//!   * `LsdbSyncResp`  → admit the LSAs in the delta (no re-flood).
+//!   * `LsdbSyncResp`  → admit the LSAs in the delta + re-flood accepted repairs.
 //!   * `OverlayData`   → deliver locally if applicable, forward the rest.
 
 use std::sync::Arc;
@@ -131,7 +131,14 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
             )
             .await
         }
-        OverlayBody::LsdbSyncResp(resp) => handle_sync_response(&ctx.lsdb, &ctx.transport, resp),
+        OverlayBody::LsdbSyncResp(resp) => handle_sync_response(
+            &ctx.lsdb,
+            &ctx.monitor,
+            &ctx.transport,
+            &ctx.flood_pacer,
+            from,
+            resp,
+        ),
         OverlayBody::Control(control) => {
             messaging_forward::handle_control(
                 &ctx.transport,

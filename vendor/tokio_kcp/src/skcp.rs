@@ -78,6 +78,7 @@ pub struct KcpSocket {
     pending_receiver: Option<Waker>,
     closed: bool,
     allow_recv_empty_packet: bool,
+    pending_update: bool,
 }
 
 impl KcpSocket {
@@ -114,6 +115,7 @@ impl KcpSocket {
             pending_receiver: None,
             closed: false,
             allow_recv_empty_packet: c.allow_recv_empty_packet,
+            pending_update: true,
         })
     }
 
@@ -131,6 +133,8 @@ impl KcpSocket {
 
         if self.flush_ack_input {
             self.kcp.flush_ack()?;
+        } else {
+            self.pending_update = true;
         }
 
         Ok(self.try_wake_pending_waker())
@@ -172,6 +176,7 @@ impl KcpSocket {
 
         let n = self.kcp.send(buf)?;
         self.sent_first = true;
+        self.pending_update = true;
 
         if self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize {
             self.kcp.flush()?;
@@ -245,6 +250,7 @@ impl KcpSocket {
 
     pub fn flush(&mut self) -> KcpResult<()> {
         self.kcp.flush()?;
+        self.pending_update = self.kcp.wait_snd() > 0 || self.kcp.waiting_conv();
         self.last_update = Instant::now();
         Ok(())
     }
@@ -279,12 +285,26 @@ impl KcpSocket {
 
     pub fn update(&mut self) -> KcpResult<Instant> {
         let now = now_millis();
+        // An early wake may run before KCP's delayed flush time. Keep the
+        // pending flag armed so the updater sleeps until the due tick instead
+        // of parking with ACKs or writes still waiting inside KCP.
+        let due_now = self.kcp.check(now) == 0;
         self.kcp.update(now)?;
+        if due_now {
+            self.pending_update = false;
+        }
         let next = self.kcp.check(now);
 
         self.try_wake_pending_waker();
 
         Ok(Instant::now() + Duration::from_millis(next as u64))
+    }
+
+    pub fn needs_update(&self) -> bool {
+        self.pending_update
+            || self.kcp.wait_snd() > 0
+            || self.kcp.waiting_conv()
+            || self.need_flush()
     }
 
     pub fn close(&mut self) {
@@ -349,6 +369,39 @@ mod test {
 
     use super::KcpSocket;
     use crate::config::KcpConfig;
+
+    #[tokio::test]
+    async fn pending_update_survives_early_update_until_due_tick() {
+        static CONV: u32 = 0xfeedbeef;
+
+        let s1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let s1_addr = s1.local_addr().unwrap();
+        let s2_addr = s2.local_addr().unwrap();
+
+        let s1 = Arc::new(s1);
+        let s2 = Arc::new(s2);
+
+        let config = KcpConfig::default();
+        let mut sender = KcpSocket::new(&config, CONV, s1.clone(), s2_addr, true).unwrap();
+        let mut receiver = KcpSocket::new(&config, CONV, s2.clone(), s1_addr, true).unwrap();
+
+        sender.send(b"hello").await.unwrap();
+        sender.flush().unwrap();
+
+        let mut packet = [0u8; 1500];
+        let n = s2.recv(&mut packet).await.unwrap();
+        receiver.input(&packet[..n]).unwrap();
+
+        assert!(receiver.pending_update);
+        let next = receiver.update().unwrap();
+        assert!(receiver.pending_update);
+
+        time::sleep_until(Instant::from_std(next)).await;
+        receiver.update().unwrap();
+        assert!(!receiver.pending_update);
+    }
 
     #[tokio::test]
     async fn kcp_echo() {

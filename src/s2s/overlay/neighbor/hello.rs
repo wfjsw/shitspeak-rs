@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use tokio::sync::Notify;
+use tokio::sync::broadcast;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
@@ -117,28 +117,36 @@ pub fn spawn_hello_task(ctx: Arc<HelloContext>) {
     });
 }
 
-/// Spawn the link-up watcher: every time the monitor signals a link-up,
-/// schedule a full LSDB pull and push against the current neighbors.
-pub fn spawn_link_up_watcher(ctx: Arc<HelloContext>, on_link_up: Arc<Notify>) {
+/// Spawn the link-up watcher: every time the monitor reports a newly-up peer,
+/// schedule a full LSDB pull and push against only that peer.
+pub fn spawn_link_up_watcher(
+    ctx: Arc<HelloContext>,
+    mut link_up_events: broadcast::Receiver<NodeIdentifier>,
+) {
     tokio::spawn(async move {
         loop {
-            tokio::select! {
+            let peer = tokio::select! {
                 _ = ctx.shutdown.cancelled() => return,
-                _ = on_link_up.notified() => {}
+                event = link_up_events.recv() => match event {
+                    Ok(peer) => peer,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "link-up sync watcher lagged; skipped stale events");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+            };
+            if !ctx.monitor.is_up(peer) {
+                continue;
             }
-            // For each currently-up neighbor, send a full pull. The peer
-            // responds only with LSAs we are missing — idempotent.
-            let snap = ctx.monitor.snapshot();
-            for n in snap {
-                full_pull(&ctx.transport, ctx.self_id, n.node_id).await;
-                push_snapshot(
-                    &ctx.lsdb,
-                    &ctx.transport,
-                    n.node_id,
-                    ctx.cfg.lsdb_sync_max_response_lsas(),
-                )
-                .await;
-            }
+            full_pull(&ctx.transport, ctx.self_id, peer).await;
+            push_snapshot(
+                &ctx.lsdb,
+                &ctx.transport,
+                peer,
+                ctx.cfg.lsdb_sync_max_response_lsas(),
+            )
+            .await;
         }
     });
 }

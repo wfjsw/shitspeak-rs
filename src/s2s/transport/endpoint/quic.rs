@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
-    ClientConfig as QuinnClientConfig, Endpoint as QuinnEndpoint, ServerConfig as QuinnServerConfig,
+    ClientConfig as QuinnClientConfig, Endpoint as QuinnEndpoint, EndpointConfig,
+    ServerConfig as QuinnServerConfig, default_runtime,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, warn};
@@ -19,27 +20,42 @@ use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
 use super::super::native_stats;
 use super::super::service_level::TransportKind;
-use super::{Endpoint, install_stream_session};
+use super::{Endpoint, install_stream_session, ipv6_only_for_address, socket_addr_supports_remote};
 
 /// QUIC endpoint state. Owns the bound `quinn::Endpoint` and the QUIC
 /// client config used for outbound connections.
 pub(crate) struct QuicEndpoint {
-    accept_handle: Option<QuinnEndpoint>,
+    accept_handles: Vec<AcceptEndpoint>,
     client_v4: Option<QuinnEndpoint>,
     client_v6: Option<QuinnEndpoint>,
     client_cfg: QuinnClientConfig,
-    listen_addr: Option<SocketAddr>,
+}
+
+struct AcceptEndpoint {
+    handle: QuinnEndpoint,
+    ipv6_only: bool,
+}
+
+pub(crate) struct QuicBindError {
+    addr: SocketAddr,
+    source: io::Error,
+}
+
+impl QuicBindError {
+    pub(crate) fn into_parts(self) -> (SocketAddr, io::Error) {
+        (self.addr, self.source)
+    }
 }
 
 impl QuicEndpoint {
-    /// Build a `QuicEndpoint`. If `listen_addr` is `Some`, the endpoint is
-    /// bound in server mode at that address (and can also be used to dial).
-    /// If `None`, the endpoint binds an ephemeral client-only socket.
+    /// Build a `QuicEndpoint`. If `listen_addrs` is non-empty, each address is
+    /// bound in server mode. Empty listeners preserve dial-only operation.
     pub fn new(
         server_tls: Arc<rustls::ServerConfig>,
         client_tls: Arc<rustls::ClientConfig>,
-        listen_addr: Option<SocketAddr>,
-    ) -> io::Result<Self> {
+        listen_addrs: impl IntoIterator<Item = SocketAddr>,
+    ) -> Result<Self, QuicBindError> {
+        let listen_addrs = listen_addrs.into_iter().collect::<Vec<_>>();
         let mut server_tls = (*server_tls).clone();
         server_tls.alpn_protocols = vec![b"s2s/1".to_vec()];
 
@@ -47,27 +63,35 @@ impl QuicEndpoint {
         client_tls.alpn_protocols = vec![b"s2s/1".to_vec()];
         let qcc: QuicClientConfig = client_tls
             .try_into()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
+            .map_err(|e| quic_config_error(SocketAddr::from(([0, 0, 0, 0], 0)), e))?;
         let client_cfg = QuinnClientConfig::new(Arc::new(qcc));
 
-        let accept_handle = match listen_addr {
-            Some(addr) => {
-                let qsc: QuicServerConfig = server_tls
-                    .try_into()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
-                let server_cfg = QuinnServerConfig::with_crypto(Arc::new(qsc));
-                Some(QuinnEndpoint::server(server_cfg, addr)?)
-            }
-            None => None,
-        };
-        let (client_v4, client_v6) = build_client_endpoints()?;
+        let qsc: QuicServerConfig = server_tls
+            .try_into()
+            .map_err(|e| quic_config_error(first_listen_addr(&listen_addrs), e))?;
+        let server_cfg = QuinnServerConfig::with_crypto(Arc::new(qsc));
+        let mut accept_handles = Vec::with_capacity(listen_addrs.len());
+        for addr in listen_addrs.iter().copied() {
+            let ipv6_only = ipv6_only_for_address(addr, &listen_addrs);
+            let handle =
+                bind_server_endpoint(server_cfg.clone(), addr, ipv6_only).map_err(|e| {
+                    QuicBindError {
+                        addr,
+                        source: io::Error::new(e.kind(), format!("quic bind {addr}: {e}")),
+                    }
+                })?;
+            accept_handles.push(AcceptEndpoint { handle, ipv6_only });
+        }
+        let (client_v4, client_v6) = build_client_endpoints().map_err(|source| QuicBindError {
+            addr: first_listen_addr(&listen_addrs),
+            source,
+        })?;
 
         Ok(Self {
-            accept_handle,
+            accept_handles,
             client_v4,
             client_v6,
             client_cfg,
-            listen_addr,
         })
     }
 
@@ -86,10 +110,53 @@ impl QuicEndpoint {
     }
 
     fn accept_handle_for_family(&self, addr: SocketAddr) -> Option<&QuinnEndpoint> {
-        let handle = self.accept_handle.as_ref()?;
-        let local = handle.local_addr().ok()?;
-        (local.is_ipv4() == addr.is_ipv4()).then_some(handle)
+        self.accept_handles.iter().find_map(|accept| {
+            let local = accept.handle.local_addr().ok()?;
+            socket_addr_supports_remote(local, accept.ipv6_only, addr).then_some(&accept.handle)
+        })
     }
+}
+
+fn first_listen_addr(listen_addrs: &[SocketAddr]) -> SocketAddr {
+    listen_addrs
+        .first()
+        .copied()
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)))
+}
+
+fn quic_config_error<E: std::fmt::Debug>(addr: SocketAddr, error: E) -> QuicBindError {
+    QuicBindError {
+        addr,
+        source: io::Error::new(io::ErrorKind::InvalidInput, format!("{error:?}")),
+    }
+}
+
+fn bind_server_endpoint(
+    server_cfg: QuinnServerConfig,
+    addr: SocketAddr,
+    ipv6_only: bool,
+) -> io::Result<QuinnEndpoint> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    if addr.is_ipv6() {
+        if let Err(e) = socket.set_only_v6(ipv6_only) {
+            debug!(%addr, %ipv6_only, error=%e, "unable to set QUIC IPv6-only socket mode");
+        }
+    }
+    socket.bind(&addr.into())?;
+    let runtime = default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+    QuinnEndpoint::new(
+        EndpointConfig::default(),
+        Some(server_cfg),
+        socket.into(),
+        runtime,
+    )
 }
 
 fn build_client_endpoints() -> io::Result<(Option<QuinnEndpoint>, Option<QuinnEndpoint>)> {
@@ -132,15 +199,15 @@ impl Endpoint for QuicEndpoint {
         inner: Arc<ManagerInner>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            if self.listen_addr.is_none() {
-                return Ok(());
+            for accept in &self.accept_handles {
+                let handle = accept.handle.clone();
+                debug!(
+                    addr=?handle.local_addr().ok(),
+                    ipv6_only=%accept.ipv6_only,
+                    "quic listener up"
+                );
+                tokio::spawn(accept_loop(handle, inner.clone()));
             }
-            let handle = self
-                .accept_handle
-                .clone()
-                .ok_or_else(|| io::Error::other("quic listener missing accept endpoint"))?;
-            debug!(addr=?handle.local_addr().ok(), "quic listener up");
-            tokio::spawn(accept_loop(handle, inner));
             Ok(())
         }
     }

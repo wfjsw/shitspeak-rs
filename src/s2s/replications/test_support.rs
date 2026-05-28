@@ -749,4 +749,42 @@ mod e2e_tests {
         );
         assert_eq!(repo.known_versions().get(&2), Some(&(200, 5)));
     }
+
+    #[tokio::test]
+    async fn owner_empty_catchup_response_keeps_retry_gate() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let repo = CountingOwnerRepo::new();
+        let rt = OwnerRuntime::new(
+            repo.clone(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            default_cfg(),
+        );
+
+        let timeout = rt.cfg.owner_catchup_timeout();
+        let t0 = std::time::Instant::now();
+        assert!(rt.state.lock().arm_catchup(2, t0, timeout));
+
+        rt.recv_catchup_resp(
+            3,
+            OwnerCatchupResp {
+                origin_node: 2,
+                origin_epoch: 200,
+                snapshot_version: 0,
+                snapshot_msgpack: Bytes::new(),
+                ops: vec![],
+                has_more: false,
+                next_chunk_token: 0,
+                too_old_use_snapshot: false,
+            },
+        )
+        .await;
+
+        let mut state = rt.state.lock();
+        assert!(state.catchup_in_flight.get(&2).is_some());
+        assert!(!state.arm_catchup(2, t0 + Duration::from_millis(1), timeout));
+    }
 }

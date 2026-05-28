@@ -706,9 +706,15 @@ async fn anti_entropy_repairs_lost_lsa() {
         c.overlay.alive_members()
     );
 
-    // Sanity: A also learns C (the chaos was C-side only).
+    // Sanity: A also learns C (the chaos was C-side only). This direction
+    // usually arrives by ordinary reflood, but paced startup/link-up sync can
+    // put it just behind C's anti-entropy repair.
+    let reverse_learned = wait_until(Duration::from_secs(4), || {
+        a.overlay.alive_members().contains(&3)
+    })
+    .await;
     assert!(
-        a.overlay.alive_members().contains(&3),
+        reverse_learned,
         "A never saw C: alive = {:?}",
         a.overlay.alive_members()
     );

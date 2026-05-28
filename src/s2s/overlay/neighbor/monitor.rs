@@ -167,9 +167,9 @@ pub struct NeighborMonitor {
     /// To emit `Restarted` events directly on Hello-driven boot_epoch
     /// increase (faster than waiting for the LSA).
     membership_events: broadcast::Sender<MembershipEvent>,
-    /// Notified after a "link up" so the runtime can schedule a full
-    /// `LsdbSync` pull.
-    on_link_up: Arc<Notify>,
+    /// Emits the peer id after a "link up" so the runtime can schedule a
+    /// targeted `LsdbSync` pull/push repair for that peer.
+    link_up_events: broadcast::Sender<NodeIdentifier>,
 }
 
 impl NeighborMonitor {
@@ -187,7 +187,7 @@ impl NeighborMonitor {
             on_change: Arc::new(Notify::new()),
             on_metric_change: Arc::new(Notify::new()),
             membership_events,
-            on_link_up: Arc::new(Notify::new()),
+            link_up_events: broadcast::channel(256).0,
         }
     }
 
@@ -199,8 +199,8 @@ impl NeighborMonitor {
         self.on_metric_change.clone()
     }
 
-    pub fn on_link_up(&self) -> Arc<Notify> {
-        self.on_link_up.clone()
+    pub fn subscribe_link_up(&self) -> broadcast::Receiver<NodeIdentifier> {
+        self.link_up_events.subscribe()
     }
 
     /// Build a snapshot of every currently-up neighbor with live cost
@@ -363,7 +363,7 @@ impl NeighborMonitor {
         if became_up {
             debug!(peer=%from, "direct link up");
             self.on_change.notify_one();
-            self.on_link_up.notify_one();
+            let _ = self.link_up_events.send(from);
         } else if restarted {
             self.on_change.notify_one();
         }
@@ -427,7 +427,7 @@ impl NeighborMonitor {
         if became_up {
             debug!(peer=%from, ?rtt, "direct link up");
             self.on_change.notify_one();
-            self.on_link_up.notify_one();
+            let _ = self.link_up_events.send(from);
         } else if restarted {
             self.on_change.notify_one();
         } else if matched_ack {

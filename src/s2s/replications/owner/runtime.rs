@@ -115,8 +115,9 @@ pub(crate) struct OwnerState {
     /// Per-origin buffer of received-out-of-order ops, keyed by version.
     /// Cleared on epoch reset.
     pub pending_buffers: HashMap<NodeIdentifier, BTreeMap<u64, OwnerBufferedOp>>,
-    /// Last time we issued a catchup request for `origin`. Used to suppress
-    /// duplicate requests within `CATCHUP_TIMEOUT`.
+    /// Last time we issued a catchup request for `origin`. Despite the
+    /// historical name, this remains set after a response so periodic
+    /// anti-entropy cannot retry faster than `CATCHUP_TIMEOUT`.
     pub catchup_in_flight: HashMap<NodeIdentifier, Instant>,
 }
 
