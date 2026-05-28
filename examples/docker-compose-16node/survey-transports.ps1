@@ -464,6 +464,65 @@ function Get-NetDeltas {
     }
 }
 
+function Convert-CpuPercent {
+    param([Parameter(Mandatory)] [string]$Value)
+
+    $trimmed = $Value.Trim().TrimEnd("%")
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return 0.0
+    }
+    return [double]::Parse(
+        $trimmed,
+        [System.Globalization.CultureInfo]::InvariantCulture
+    )
+}
+
+function Get-CpuSnapshot {
+    $rows = @()
+    $output = & docker stats --no-stream --format "{{.Name}}|{{.CPUPerc}}"
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker stats failed with exit code $LASTEXITCODE"
+    }
+
+    foreach ($line in $output) {
+        $parts = $line -split "\|", 2
+        if ($parts.Count -ne 2 -or $parts[0] -notlike "shitspeak-node-*") {
+            continue
+        }
+        $rows += [pscustomobject]@{
+            container = $parts[0]
+            cpu_percent = Convert-CpuPercent -Value $parts[1]
+        }
+    }
+
+    return @($rows | Sort-Object cpu_percent -Descending)
+}
+
+function Get-CpuSummary {
+    param([Parameter(Mandatory)] [array]$Rows)
+
+    if ($Rows.Count -eq 0) {
+        return [pscustomobject]@{
+            total_percent = 0.0
+            avg_percent = 0.0
+            max_percent = 0.0
+            top_nodes = @()
+        }
+    }
+
+    $total = 0.0
+    foreach ($row in $Rows) {
+        $total += [double]$row.cpu_percent
+    }
+
+    return [pscustomobject]@{
+        total_percent = [Math]::Round($total, 2)
+        avg_percent = [Math]::Round($total / $Rows.Count, 2)
+        max_percent = [Math]::Round([double]$Rows[0].cpu_percent, 2)
+        top_nodes = @($Rows | Select-Object -First 5)
+    }
+}
+
 function Get-UpArgs {
     $upArgs = @("up", "-d")
     if ($Build) {
@@ -538,12 +597,15 @@ function Invoke-TransportSurvey {
 
         $topologyBefore = Get-TopologySnapshots
         $netBefore = Get-NetCounters
+        $cpuBefore = Get-CpuSnapshot
         Start-Sleep -Seconds $WindowSeconds
+        $cpuAfter = Get-CpuSnapshot
         $netAfter = Get-NetCounters
         $topologyAfter = Get-TopologySnapshots
 
         $packetDeltas = Get-PacketDeltas -Before $topologyBefore -After $topologyAfter
         $netDeltas = Get-NetDeltas -Before $netBefore -After $netAfter
+        $cpuSummary = Get-CpuSummary -Rows $cpuAfter
         $topologySummary = Get-TopologySummary -Topology $topologyAfter
 
         $result = [pscustomobject]@{
@@ -554,6 +616,9 @@ function Invoke-TransportSurvey {
             topology_summary = $topologySummary
             packet_deltas = @($packetDeltas)
             net_delta = $netDeltas
+            cpu_before = @($cpuBefore)
+            cpu_after = @($cpuAfter)
+            cpu_summary = $cpuSummary
             topology = @($topologyAfter | Select-Object port, local_node, nodes, links, routes, error)
         }
 
@@ -565,6 +630,7 @@ function Invoke-TransportSurvey {
         )
 
         Write-Host "Wire bytes over ${WindowSeconds}s: rx=$($netDeltas.rx_bytes) tx=$($netDeltas.tx_bytes) total=$($netDeltas.total_bytes)"
+        Write-Host "Docker CPU snapshot: total=$($cpuSummary.total_percent)% avg=$($cpuSummary.avg_percent)% max=$($cpuSummary.max_percent)%"
         Write-Host "Topology: nodes=$($topologySummary.min_nodes)..$($topologySummary.max_nodes) links=$($topologySummary.min_links)..$($topologySummary.max_links) routes=$($topologySummary.min_routes)..$($topologySummary.max_routes)"
         if ($topologySummary.min_nodes -lt $NodeCount) {
             Write-Warning "$title topology did not converge to all $NodeCount nodes during the measurement"
@@ -603,6 +669,9 @@ try {
             udp_datagrams = $_.net_delta.udp_in_datagrams + $_.net_delta.udp_out_datagrams
             udp_errors = $_.net_delta.udp_in_errors
             udp_rcvbuf_errors = $_.net_delta.udp_rcvbuf_errors
+            cpu_total_percent = $_.cpu_summary.total_percent
+            cpu_avg_percent = $_.cpu_summary.avg_percent
+            cpu_max_percent = $_.cpu_summary.max_percent
             top_kinds = (($top | ForEach-Object { "$($_.kind)=$($_.bytes)" }) -join "; ")
         }
     })

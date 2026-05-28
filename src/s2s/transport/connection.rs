@@ -5,7 +5,7 @@
 //! backoff, and aggregated metrics.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -389,7 +389,7 @@ impl PeerState {
     }
 
     pub fn note_observed_remote_addr(&self, transport: TransportKind, addr: std::net::SocketAddr) {
-        let ip = addr.ip();
+        let ip = canonical_ip(addr.ip());
         if ip_looks_unusable(ip) {
             return;
         }
@@ -406,7 +406,8 @@ impl PeerState {
     }
 
     pub fn address_candidates(&self, addr: PeerAddress) -> Vec<PeerAddress> {
-        let published = addr.addr();
+        let published = canonical_socket_addr(addr.addr());
+        let published_addr = PeerAddress::new(published, addr.transport());
         let observed = self
             .observed_remote_ips
             .lock()
@@ -416,7 +417,7 @@ impl PeerState {
         let mut candidates = Vec::new();
 
         if published_ip_looks_usable(published.ip()) {
-            push_unique_candidate(&mut candidates, addr);
+            push_unique_candidate(&mut candidates, published_addr);
         }
 
         for observed_ip in observed {
@@ -424,7 +425,10 @@ impl PeerState {
                 push_unique_candidate(
                     &mut candidates,
                     PeerAddress::new(
-                        std::net::SocketAddr::new(observed_ip, published.port()),
+                        canonical_socket_addr(std::net::SocketAddr::new(
+                            observed_ip,
+                            published.port(),
+                        )),
                         addr.transport(),
                     ),
                 );
@@ -445,14 +449,14 @@ impl PeerState {
     }
 
     pub fn address_matches_live_remote_ip(&self, addr: PeerAddress) -> bool {
-        let ip = addr.addr().ip();
+        let ip = canonical_ip(addr.addr().ip());
         let mut streams = self.streams.lock();
         prune_dead_streams(&mut streams);
         streams.values().any(|stream| {
             stream.is_alive()
                 && stream
                     .remote_addr
-                    .is_some_and(|remote_addr| remote_addr.ip() == ip)
+                    .is_some_and(|remote_addr| canonical_ip(remote_addr.ip()) == ip)
         })
     }
 
@@ -658,8 +662,9 @@ fn drop_udp_streams(streams: &mut HashMap<StreamKey, ActiveStream>) {
 }
 
 fn push_unique_candidate(candidates: &mut Vec<PeerAddress>, addr: PeerAddress) {
-    if addr.is_dialable() && !candidates.contains(&addr) {
-        candidates.push(addr);
+    let canonical = PeerAddress::new(canonical_socket_addr(addr.addr()), addr.transport());
+    if canonical.is_dialable() && !candidates.contains(&canonical) {
+        candidates.push(canonical);
     }
 }
 
@@ -668,6 +673,8 @@ fn published_ip_looks_usable(published: std::net::IpAddr) -> bool {
 }
 
 fn should_add_observed_candidate(published: std::net::IpAddr, observed: std::net::IpAddr) -> bool {
+    let published = canonical_ip(published);
+    let observed = canonical_ip(observed);
     // Never add an observed IP that cannot be dialed.
     if ip_looks_unusable(observed) || observed == published {
         return false;
@@ -677,6 +684,20 @@ fn should_add_observed_candidate(published: std::net::IpAddr, observed: std::net
 
 fn ip_looks_unusable(ip: std::net::IpAddr) -> bool {
     ip.is_unspecified() || ip.is_multicast()
+}
+
+fn canonical_socket_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(canonical_ip(addr.ip()), addr.port())
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+    }
 }
 
 pub(crate) fn retry_cap_for_last_seen_age(
@@ -984,6 +1005,21 @@ mod tests {
     }
 
     #[test]
+    fn address_confirmation_canonicalizes_ipv4_mapped_live_remote_ip() {
+        let peer = peer_for_address_tests();
+        let same_ip = PeerAddress::new("10.1.2.4:64740".parse().unwrap(), TransportKind::Quic);
+        let (stream, _rx) = active_stream_for_test(
+            TransportKind::Tcp,
+            "[::ffff:10.1.2.4]:51000".parse().unwrap(),
+            false,
+        );
+
+        assert!(peer.try_install_stream(stream).is_ok());
+
+        assert!(peer.address_is_currently_confirmed(same_ip));
+    }
+
+    #[test]
     fn observed_remote_ips_create_candidates_for_wildcard_advertised_address() {
         let peer = peer_for_address_tests();
         peer.note_observed_remote_addr(TransportKind::Kcp, "10.1.2.3:51000".parse().unwrap());
@@ -1021,6 +1057,31 @@ mod tests {
                 PeerAddress::new("10.1.2.3:64739".parse().unwrap(), TransportKind::Tcp)
             ]
         );
+    }
+
+    #[test]
+    fn observed_ipv4_mapped_remote_ip_matches_ipv4_published_address() {
+        let peer = peer_for_address_tests();
+        peer.note_observed_remote_addr(
+            TransportKind::Tcp,
+            "[::ffff:10.1.2.3]:51000".parse().unwrap(),
+        );
+
+        let published = PeerAddress::new("10.1.2.3:64739".parse().unwrap(), TransportKind::Tcp);
+
+        assert_eq!(peer.address_candidates(published), vec![published]);
+    }
+
+    #[test]
+    fn mapped_published_address_is_canonicalized_to_ipv4_candidate() {
+        let peer = peer_for_address_tests();
+        let mapped = PeerAddress::new(
+            "[::ffff:10.1.2.3]:64739".parse().unwrap(),
+            TransportKind::Tcp,
+        );
+        let canonical = PeerAddress::new("10.1.2.3:64739".parse().unwrap(), TransportKind::Tcp);
+
+        assert_eq!(peer.address_candidates(mapped), vec![canonical]);
     }
 
     #[test]
