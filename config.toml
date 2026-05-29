@@ -99,6 +99,14 @@ compression_enabled = true
 compression_min_bytes = 1024
 compression_min_savings_percent = 10
 compression_level = 1
+# Learn per-stream zstd dictionaries from recent S2S payloads. Stream peers
+# advertise support in transport Hello before dictionary frames are sent.
+# UDP continues to use only identity/plain zstd unless an explicit dictionary is configured.
+compression_adaptive_dictionary_enabled = true
+# Optional static zstd dictionary for S2S L1 payload compression. Stream peers
+# require a matching dictionary fingerprint; UDP peers have no dictionary
+# negotiation, so configure identical bytes before using static dictionaries on UDP.
+# compression_dictionary_path = "s2s-transport.zdict"
 
 # ── L2 overlay tunables ───────────────────────────────────────────────
 [s2s.overlay]

@@ -766,6 +766,7 @@ async fn handle_udp_datagram(
         inner.inbound(),
         TransportKind::Udp.service_level(),
         inner.cfg().max_frame_bytes(),
+        inner.cfg().compression_config(),
         inner.cfg().udp_mtu(),
     )
     .await
@@ -2107,9 +2108,10 @@ async fn handle_frame(
     inbound: &InboundDispatch,
     level: ServiceLevel,
     max_frame_bytes: usize,
+    compression: &super::super::compression::CompressionConfig,
     udp_mtu: usize,
 ) -> io::Result<()> {
-    validate_and_decode_payload(&mut frame, max_frame_bytes)?;
+    validate_and_decode_payload(&mut frame, max_frame_bytes, compression)?;
     let ty = match pb::FrameType::try_from(frame.frame_type) {
         Ok(v) => v,
         Err(_) => return Ok(()),

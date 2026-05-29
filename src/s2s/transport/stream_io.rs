@@ -36,7 +36,8 @@ use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::compression::{
-    CompressionConfig, maybe_compress_frame_payload, validate_and_decode_payload,
+    AdaptiveCompressionState, CompressionConfig, DICTIONARY_FINGERPRINT_BYTES,
+    maybe_compress_frame_payload, validate_and_decode_payload,
 };
 use super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::frame::{FrameType, build_frame, stream_codec};
@@ -46,6 +47,25 @@ use super::probe_schedule::{
     StartupBandwidthProbe, bandwidth_probe_startup_jitter, stabilized_ping_interval,
 };
 use super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
+
+const DICTIONARY_COMPRESSION_HELLO_CAPABILITY: &[u8] = b"shitspeak-s2s-l1-zstd-dict-v1";
+const DICTIONARY_COMPRESSION_ADAPTIVE_FLAG: u8 = 0x01;
+const DICTIONARY_COMPRESSION_CONFIGURED_FLAG: u8 = 0x02;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PeerDictionaryCompressionSupport {
+    adaptive: bool,
+    configured_fingerprint: Option<[u8; DICTIONARY_FINGERPRINT_BYTES]>,
+}
+
+impl PeerDictionaryCompressionSupport {
+    fn supports_configured_dictionary(
+        self,
+        fingerprint: [u8; DICTIONARY_FINGERPRINT_BYTES],
+    ) -> bool {
+        self.configured_fingerprint == Some(fingerprint)
+    }
+}
 
 /// Tunables for a single stream pump. Cloned per stream.
 #[derive(Clone)]
@@ -301,6 +321,10 @@ async fn run_pump<S>(
         .saturating_mul(2)
         .max(Duration::from_secs(1));
     let level_for_metrics = cfg.transport.service_level();
+    let mut outbound_compression = AdaptiveCompressionState::new(cfg.compression.clone());
+    let mut inbound_compression = AdaptiveCompressionState::new(cfg.compression.clone());
+    let plain_outbound_compression = cfg.compression.clone().without_dictionary();
+    let mut peer_dictionary_support = PeerDictionaryCompressionSupport::default();
 
     let hello = build_frame(
         cfg.local_node,
@@ -309,7 +333,7 @@ async fn run_pump<S>(
         FrameType::Hello,
         MessageClass::Regular,
         now_us(),
-        Bytes::new(),
+        dictionary_compression_hello_payload(&cfg.compression),
     );
     let hello_result = tokio::select! {
         biased;
@@ -368,6 +392,8 @@ async fn run_pump<S>(
                             &inbound,
                             &mut framed,
                             &mut pending,
+                            &mut inbound_compression,
+                            &mut peer_dictionary_support,
                             level_for_metrics,
                         ).await {
                             Ok(transport_link_stable) => {
@@ -410,16 +436,23 @@ async fn run_pump<S>(
                 if let Err(e) = maybe_compress_frame_payload(
                     &mut frame,
                     out.options(),
-                    cfg.compression,
+                    outbound_compression_config(
+                        outbound_compression.config(),
+                        &plain_outbound_compression,
+                        peer_dictionary_support,
+                    ),
                     cfg.max_frame_bytes,
                 ) {
                     warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream payload compression failed");
                     break;
                 }
                 match encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
-                    Ok(()) => peer
-                        .metrics()
-                        .record_payload_sent(cfg.transport, original_payload_len),
+                    Ok(()) => {
+                        peer
+                            .metrics()
+                            .record_payload_sent(cfg.transport, original_payload_len);
+                        outbound_compression.record_sample(out.payload());
+                    }
                     Err(e) => {
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream write failed");
                         break;
@@ -657,12 +690,18 @@ async fn handle_inbound<S>(
     inbound: &InboundDispatch,
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     pending: &mut PendingPings,
+    inbound_compression: &mut AdaptiveCompressionState,
+    peer_dictionary_support: &mut PeerDictionaryCompressionSupport,
     level: ServiceLevel,
 ) -> std::io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
-    validate_and_decode_payload(&mut frame, cfg.max_frame_bytes)?;
+    validate_and_decode_payload(
+        &mut frame,
+        cfg.max_frame_bytes,
+        inbound_compression.config(),
+    )?;
     let mut transport_link_stable = false;
     let ty = match pb::FrameType::try_from(frame.frame_type) {
         Ok(v) => v,
@@ -675,6 +714,7 @@ where
                 .unwrap_or(MessageClass::Regular);
             peer.metrics()
                 .record_payload_recv(cfg.transport, frame.payload.len());
+            inbound_compression.record_sample(&frame.payload);
             inbound.dispatch(super::manager::InboundMessage::new(
                 cfg.peer_node,
                 level,
@@ -722,6 +762,8 @@ where
             }
         }
         pb::FrameType::FrameHello => {
+            *peer_dictionary_support =
+                parse_dictionary_compression_hello_payload(frame.payload.as_ref());
             trace!(peer=%cfg.peer_node, transport=?cfg.transport, "received transport hello");
         }
         pb::FrameType::FrameBye => {
@@ -732,6 +774,90 @@ where
         }
     }
     Ok(transport_link_stable)
+}
+
+fn dictionary_compression_supported(cfg: &CompressionConfig) -> bool {
+    cfg.enabled() && (cfg.dictionary_len().is_some() || cfg.adaptive_dictionary_enabled())
+}
+
+fn dictionary_compression_hello_payload(cfg: &CompressionConfig) -> Bytes {
+    if !dictionary_compression_supported(cfg) {
+        return Bytes::new();
+    }
+
+    let configured_fingerprint = cfg.configured_dictionary_fingerprint();
+    let mut flags = 0;
+    if cfg.adaptive_dictionary_enabled() {
+        flags |= DICTIONARY_COMPRESSION_ADAPTIVE_FLAG;
+    }
+    if configured_fingerprint.is_some() {
+        flags |= DICTIONARY_COMPRESSION_CONFIGURED_FLAG;
+    }
+
+    let mut payload = Vec::with_capacity(
+        DICTIONARY_COMPRESSION_HELLO_CAPABILITY.len()
+            + 1
+            + configured_fingerprint
+                .map(|_| DICTIONARY_FINGERPRINT_BYTES)
+                .unwrap_or_default(),
+    );
+    payload.extend_from_slice(DICTIONARY_COMPRESSION_HELLO_CAPABILITY);
+    payload.push(flags);
+    if let Some(fingerprint) = configured_fingerprint {
+        payload.extend_from_slice(&fingerprint);
+    }
+    Bytes::from(payload)
+}
+
+fn parse_dictionary_compression_hello_payload(payload: &[u8]) -> PeerDictionaryCompressionSupport {
+    if !payload.starts_with(DICTIONARY_COMPRESSION_HELLO_CAPABILITY)
+        || payload.len() <= DICTIONARY_COMPRESSION_HELLO_CAPABILITY.len()
+    {
+        return PeerDictionaryCompressionSupport::default();
+    }
+
+    let flags = payload[DICTIONARY_COMPRESSION_HELLO_CAPABILITY.len()];
+    let mut offset = DICTIONARY_COMPRESSION_HELLO_CAPABILITY.len() + 1;
+    let configured_fingerprint = if flags & DICTIONARY_COMPRESSION_CONFIGURED_FLAG != 0 {
+        if payload.len() < offset + DICTIONARY_FINGERPRINT_BYTES {
+            return PeerDictionaryCompressionSupport::default();
+        }
+        let mut fingerprint = [0; DICTIONARY_FINGERPRINT_BYTES];
+        fingerprint.copy_from_slice(&payload[offset..offset + DICTIONARY_FINGERPRINT_BYTES]);
+        offset += DICTIONARY_FINGERPRINT_BYTES;
+        Some(fingerprint)
+    } else {
+        None
+    };
+
+    if offset != payload.len() {
+        return PeerDictionaryCompressionSupport::default();
+    }
+
+    PeerDictionaryCompressionSupport {
+        adaptive: flags & DICTIONARY_COMPRESSION_ADAPTIVE_FLAG != 0,
+        configured_fingerprint,
+    }
+}
+
+fn outbound_compression_config<'a>(
+    candidate: &'a CompressionConfig,
+    plain: &'a CompressionConfig,
+    peer_support: PeerDictionaryCompressionSupport,
+) -> &'a CompressionConfig {
+    if let Some(fingerprint) = candidate.configured_dictionary_fingerprint() {
+        return if peer_support.supports_configured_dictionary(fingerprint) {
+            candidate
+        } else {
+            plain
+        };
+    }
+
+    if candidate.has_adaptive_dictionary() && !peer_support.adaptive {
+        return plain;
+    }
+
+    candidate
 }
 
 #[inline]
@@ -772,6 +898,73 @@ mod tests {
         assert_eq!(
             stream_frame_kind_name(TransportKind::Quic, pb::FrameType::FrameKeepalive as i32),
             "transport.quic.frame.keepalive"
+        );
+    }
+
+    #[test]
+    fn dictionary_capability_requires_compression_enabled() {
+        assert!(dictionary_compression_supported(
+            &CompressionConfig::default()
+        ));
+
+        let disabled = CompressionConfig::default().with_enabled(false);
+        assert!(!dictionary_compression_supported(&disabled));
+        assert!(dictionary_compression_hello_payload(&disabled).is_empty());
+    }
+
+    #[test]
+    fn dictionary_hello_advertises_adaptive_and_configured_support_separately() {
+        let cfg = CompressionConfig::default()
+            .with_dictionary_bytes(
+                b"configured s2s transport zstd dictionary bytes for tests".to_vec(),
+            )
+            .unwrap();
+
+        let support = parse_dictionary_compression_hello_payload(
+            dictionary_compression_hello_payload(&cfg).as_ref(),
+        );
+
+        assert!(support.adaptive);
+        assert_eq!(
+            support.configured_fingerprint,
+            cfg.configured_dictionary_fingerprint()
+        );
+    }
+
+    #[test]
+    fn legacy_dictionary_hello_marker_is_ignored_as_ambiguous() {
+        let support =
+            parse_dictionary_compression_hello_payload(DICTIONARY_COMPRESSION_HELLO_CAPABILITY);
+
+        assert!(!support.adaptive);
+        assert!(support.configured_fingerprint.is_none());
+    }
+
+    #[test]
+    fn configured_dictionary_requires_peer_fingerprint_match() {
+        let cfg = CompressionConfig::default()
+            .with_dictionary_bytes(
+                b"configured s2s transport zstd dictionary bytes for tests".to_vec(),
+            )
+            .unwrap();
+        let plain = cfg.clone().without_dictionary();
+        let adaptive_only_peer = PeerDictionaryCompressionSupport {
+            adaptive: true,
+            configured_fingerprint: None,
+        };
+
+        assert_eq!(
+            outbound_compression_config(&cfg, &plain, adaptive_only_peer).dictionary_len(),
+            None
+        );
+
+        let matching_peer = PeerDictionaryCompressionSupport {
+            adaptive: true,
+            configured_fingerprint: cfg.configured_dictionary_fingerprint(),
+        };
+        assert_eq!(
+            outbound_compression_config(&cfg, &plain, matching_peer).dictionary_len(),
+            cfg.dictionary_len()
         );
     }
 

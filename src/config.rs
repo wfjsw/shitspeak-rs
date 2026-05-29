@@ -167,7 +167,7 @@ impl S2sConfig {
                 .map(S2sSeedAddressConfig::peer_address)
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        Ok(Some(self.transport.apply(cfg)))
+        Ok(Some(self.transport.try_apply(cfg)?))
     }
 
     pub fn overlay_config(&self) -> crate::s2s::overlay::OverlayConfig {
@@ -1047,6 +1047,10 @@ mod tests {
 
     #[test]
     fn s2s_enabled_flat_seed_addresses_parse() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dictionary_path = temp.path().join("s2s-transport.zdict");
+        let dictionary = b"OverlayData ReplicationMessage StrictCatchupResp channel clients";
+        std::fs::write(&dictionary_path, dictionary).expect("write compression dictionary");
         let raw = r#"
             enabled = true
             ca_path = "s2s-ca.pem"
@@ -1085,8 +1089,11 @@ mod tests {
             compression_min_bytes = 2048
             compression_min_savings_percent = 25
             compression_level = 3
-        "#;
-        let cfg: S2sConfig = parse_s2s(raw).expect("s2s config parses");
+            compression_adaptive_dictionary_enabled = true
+            compression_dictionary_path = '__DICT__'
+        "#
+        .replace("__DICT__", &dictionary_path.display().to_string());
+        let cfg: S2sConfig = parse_s2s(&raw).expect("s2s config parses");
         assert!(cfg.is_enabled());
         assert_eq!(cfg.seed_addresses.len(), 3);
         assert_eq!(
@@ -1171,6 +1178,11 @@ mod tests {
         assert_eq!(transport.compression_min_bytes(), 2048);
         assert_eq!(transport.compression_min_savings_percent(), 25);
         assert_eq!(transport.compression_level(), 3);
+        assert!(transport.compression_adaptive_dictionary_enabled());
+        assert_eq!(
+            transport.compression_dictionary_len(),
+            Some(dictionary.len())
+        );
         assert!(cfg.overlay_config().persistence_dir().is_some());
     }
 

@@ -1,12 +1,28 @@
-use std::io::{self, Cursor, Read};
+use std::collections::VecDeque;
+use std::fmt;
+use std::io;
+use std::sync::Arc;
 
+use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use bytes::Bytes;
+use zstd::dict::{DecoderDictionary, EncoderDictionary};
 
 use crate::s2s_transport_proto as pb;
 
 const DEFAULT_COMPRESSION_MIN_BYTES: usize = 1024;
 const DEFAULT_COMPRESSION_MIN_SAVINGS_PERCENT: u8 = 10;
 const DEFAULT_COMPRESSION_LEVEL: i32 = 1;
+const DEFAULT_COMPRESSION_ADAPTIVE_DICTIONARY_ENABLED: bool = true;
+const MIN_ZSTD_DICTIONARY_BYTES: usize = 8;
+const ADAPTIVE_MIN_SAMPLES: usize = 16;
+const ADAPTIVE_RETRAIN_SAMPLES: usize = 16;
+const ADAPTIVE_MIN_BYTES: usize = 32 * 1024;
+const ADAPTIVE_MAX_SAMPLES: usize = 128;
+const ADAPTIVE_MAX_BYTES: usize = 256 * 1024;
+const ADAPTIVE_MAX_DICTIONARY_BYTES: usize = 16 * 1024;
+const ADAPTIVE_MIN_SAMPLE_BYTES: usize = 64;
+const ADAPTIVE_MAX_SAMPLE_BYTES: usize = 64 * 1024;
+pub(crate) const DICTIONARY_FINGERPRINT_BYTES: usize = 20;
 
 /// Per-send transport options. Defaults are intentionally raw so only
 /// non-latency-sensitive callers opt in to L1 compression.
@@ -34,13 +50,127 @@ impl Default for SendOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct CompressionConfig {
     enabled: bool,
     min_bytes: usize,
     min_savings_percent: u8,
     level: i32,
+    adaptive_dictionary_enabled: bool,
+    dictionary: Option<Arc<CompressionDictionary>>,
 }
+
+impl fmt::Debug for CompressionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompressionConfig")
+            .field("enabled", &self.enabled)
+            .field("min_bytes", &self.min_bytes)
+            .field("min_savings_percent", &self.min_savings_percent)
+            .field("level", &self.level)
+            .field(
+                "adaptive_dictionary_enabled",
+                &self.adaptive_dictionary_enabled,
+            )
+            .field("dictionary", &self.dictionary)
+            .finish()
+    }
+}
+
+impl PartialEq for CompressionConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.min_bytes == other.min_bytes
+            && self.min_savings_percent == other.min_savings_percent
+            && self.level == other.level
+            && self.adaptive_dictionary_enabled == other.adaptive_dictionary_enabled
+            && self.dictionary.as_deref() == other.dictionary.as_deref()
+    }
+}
+
+impl Eq for CompressionConfig {}
+
+struct CompressionDictionary {
+    bytes: Bytes,
+    encoder: EncoderDictionary<'static>,
+    decoder: DecoderDictionary<'static>,
+    id: Option<u32>,
+    fingerprint: [u8; DICTIONARY_FINGERPRINT_BYTES],
+    kind: CompressionDictionaryKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressionDictionaryKind {
+    Configured,
+    Adaptive,
+}
+
+impl CompressionDictionary {
+    fn new(bytes: Vec<u8>, level: i32, kind: CompressionDictionaryKind) -> io::Result<Self> {
+        if bytes.len() < MIN_ZSTD_DICTIONARY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("zstd dictionary must be at least {MIN_ZSTD_DICTIONARY_BYTES} bytes"),
+            ));
+        }
+
+        let bytes = Bytes::from(bytes);
+        let mut fingerprint = [0; DICTIONARY_FINGERPRINT_BYTES];
+        fingerprint.copy_from_slice(digest(&SHA1_FOR_LEGACY_USE_ONLY, bytes.as_ref()).as_ref());
+        let encoder = EncoderDictionary::copy(bytes.as_ref(), level);
+        let decoder = DecoderDictionary::copy(bytes.as_ref());
+        let id = encoder.as_cdict().get_dict_id().map(|id| id.get());
+        Ok(Self {
+            bytes,
+            encoder,
+            decoder,
+            id,
+            fingerprint,
+            kind,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.id
+    }
+
+    fn fingerprint(&self) -> [u8; DICTIONARY_FINGERPRINT_BYTES] {
+        self.fingerprint
+    }
+
+    fn kind(&self) -> CompressionDictionaryKind {
+        self.kind
+    }
+
+    fn encoder(&self) -> &EncoderDictionary<'static> {
+        &self.encoder
+    }
+
+    fn decoder(&self) -> &DecoderDictionary<'static> {
+        &self.decoder
+    }
+}
+
+impl fmt::Debug for CompressionDictionary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompressionDictionary")
+            .field("len", &self.len())
+            .field("id", &self.id())
+            .field("kind", &self.kind())
+            .finish()
+    }
+}
+
+impl PartialEq for CompressionDictionary {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes && self.id == other.id && self.kind == other.kind
+    }
+}
+
+impl Eq for CompressionDictionary {}
 
 impl CompressionConfig {
     pub(crate) fn new(
@@ -54,7 +184,67 @@ impl CompressionConfig {
             min_bytes,
             min_savings_percent: min_savings_percent.min(100),
             level,
+            adaptive_dictionary_enabled: DEFAULT_COMPRESSION_ADAPTIVE_DICTIONARY_ENABLED,
+            dictionary: None,
         }
+    }
+
+    pub(crate) fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub(crate) fn with_min_bytes(mut self, min_bytes: usize) -> Self {
+        self.min_bytes = min_bytes;
+        self
+    }
+
+    pub(crate) fn with_min_savings_percent(mut self, min_savings_percent: u8) -> Self {
+        self.min_savings_percent = min_savings_percent.min(100);
+        self
+    }
+
+    pub(crate) fn with_level(mut self, level: i32) -> Self {
+        if self.level != level {
+            self.dictionary = self
+                .dictionary
+                .as_ref()
+                .map(|dict| {
+                    CompressionDictionary::new(dict.bytes.to_vec(), level, dict.kind())
+                        .expect("existing compression dictionary remains valid")
+                })
+                .map(Arc::new);
+            self.level = level;
+        }
+        self
+    }
+
+    pub(crate) fn with_adaptive_dictionary_enabled(mut self, enabled: bool) -> Self {
+        self.adaptive_dictionary_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn with_dictionary_bytes(mut self, dictionary: Vec<u8>) -> io::Result<Self> {
+        self.dictionary = Some(Arc::new(CompressionDictionary::new(
+            dictionary,
+            self.level,
+            CompressionDictionaryKind::Configured,
+        )?));
+        Ok(self)
+    }
+
+    fn with_adaptive_dictionary_bytes(mut self, dictionary: Vec<u8>) -> io::Result<Self> {
+        self.dictionary = Some(Arc::new(CompressionDictionary::new(
+            dictionary,
+            self.level,
+            CompressionDictionaryKind::Adaptive,
+        )?));
+        Ok(self)
+    }
+
+    pub(crate) fn without_dictionary(mut self) -> Self {
+        self.dictionary = None;
+        self
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -72,6 +262,36 @@ impl CompressionConfig {
     pub(crate) fn level(&self) -> i32 {
         self.level
     }
+
+    pub(crate) fn adaptive_dictionary_enabled(&self) -> bool {
+        self.adaptive_dictionary_enabled
+    }
+
+    pub(crate) fn dictionary_len(&self) -> Option<usize> {
+        self.dictionary.as_ref().map(|dict| dict.len())
+    }
+
+    pub(crate) fn dictionary_id(&self) -> Option<u32> {
+        self.dictionary.as_ref().and_then(|dict| dict.id())
+    }
+
+    pub(crate) fn configured_dictionary_fingerprint(
+        &self,
+    ) -> Option<[u8; DICTIONARY_FINGERPRINT_BYTES]> {
+        self.dictionary.as_ref().and_then(|dict| {
+            (dict.kind() == CompressionDictionaryKind::Configured).then(|| dict.fingerprint())
+        })
+    }
+
+    pub(crate) fn has_adaptive_dictionary(&self) -> bool {
+        self.dictionary
+            .as_ref()
+            .is_some_and(|dict| dict.kind() == CompressionDictionaryKind::Adaptive)
+    }
+
+    fn dictionary(&self) -> Option<&CompressionDictionary> {
+        self.dictionary.as_deref()
+    }
 }
 
 impl Default for CompressionConfig {
@@ -82,6 +302,73 @@ impl Default for CompressionConfig {
             DEFAULT_COMPRESSION_MIN_SAVINGS_PERCENT,
             DEFAULT_COMPRESSION_LEVEL,
         )
+    }
+}
+
+pub(crate) struct AdaptiveCompressionState {
+    config: CompressionConfig,
+    samples: VecDeque<Bytes>,
+    sample_bytes: usize,
+    samples_since_train: usize,
+}
+
+impl AdaptiveCompressionState {
+    pub(crate) fn new(config: CompressionConfig) -> Self {
+        Self {
+            config,
+            samples: VecDeque::new(),
+            sample_bytes: 0,
+            samples_since_train: 0,
+        }
+    }
+
+    pub(crate) fn config(&self) -> &CompressionConfig {
+        &self.config
+    }
+
+    pub(crate) fn record_sample(&mut self, payload: &Bytes) {
+        if !self.config.enabled()
+            || !self.config.adaptive_dictionary_enabled()
+            || payload.len() < ADAPTIVE_MIN_SAMPLE_BYTES
+        {
+            return;
+        }
+
+        let sample_len = payload.len().min(ADAPTIVE_MAX_SAMPLE_BYTES);
+        let sample = Bytes::copy_from_slice(&payload[..sample_len]);
+        self.sample_bytes = self.sample_bytes.saturating_add(sample.len());
+        self.samples_since_train = self.samples_since_train.saturating_add(1);
+        self.samples.push_back(sample);
+        self.trim_samples();
+
+        if self.samples.len() < ADAPTIVE_MIN_SAMPLES
+            || self.sample_bytes < ADAPTIVE_MIN_BYTES
+            || self.samples_since_train < ADAPTIVE_RETRAIN_SAMPLES
+        {
+            return;
+        }
+
+        let samples: Vec<&Bytes> = self.samples.iter().collect();
+        if let Ok(dictionary) = zstd::dict::from_samples(&samples, ADAPTIVE_MAX_DICTIONARY_BYTES) {
+            if let Ok(next_config) = self
+                .config
+                .clone()
+                .with_adaptive_dictionary_bytes(dictionary)
+            {
+                self.config = next_config;
+                self.samples_since_train = 0;
+            }
+        }
+    }
+
+    fn trim_samples(&mut self) {
+        while self.samples.len() > ADAPTIVE_MAX_SAMPLES || self.sample_bytes > ADAPTIVE_MAX_BYTES {
+            if let Some(sample) = self.samples.pop_front() {
+                self.sample_bytes = self.sample_bytes.saturating_sub(sample.len());
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -101,10 +388,14 @@ pub(crate) fn default_compression_level() -> i32 {
     CompressionConfig::default().level()
 }
 
+pub(crate) fn default_compression_adaptive_dictionary_enabled() -> bool {
+    CompressionConfig::default().adaptive_dictionary_enabled()
+}
+
 pub(crate) fn maybe_compress_frame_payload(
     frame: &mut pb::Frame,
     options: SendOptions,
-    cfg: CompressionConfig,
+    cfg: &CompressionConfig,
     max_frame_bytes: usize,
 ) -> io::Result<()> {
     frame.payload_encoding = pb::PayloadEncoding::Identity as i32;
@@ -128,14 +419,17 @@ pub(crate) fn maybe_compress_frame_payload(
         ));
     }
 
-    let compressed = zstd::stream::encode_all(Cursor::new(frame.payload.as_ref()), cfg.level())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let compressed = encode_zstd(frame.payload.as_ref(), cfg)?;
     if !meets_savings_threshold(original_len, compressed.len(), cfg.min_savings_percent()) {
         return Ok(());
     }
 
     frame.payload = Bytes::from(compressed);
-    frame.payload_encoding = pb::PayloadEncoding::Zstd as i32;
+    frame.payload_encoding = if cfg.dictionary().is_some() {
+        pb::PayloadEncoding::ZstdDict as i32
+    } else {
+        pb::PayloadEncoding::Zstd as i32
+    };
     frame.uncompressed_payload_len = original_len as u64;
     Ok(())
 }
@@ -143,6 +437,7 @@ pub(crate) fn maybe_compress_frame_payload(
 pub(crate) fn validate_and_decode_payload(
     frame: &mut pb::Frame,
     max_frame_bytes: usize,
+    cfg: &CompressionConfig,
 ) -> io::Result<()> {
     let encoding = pb::PayloadEncoding::try_from(frame.payload_encoding).map_err(|_| {
         io::Error::new(
@@ -162,7 +457,7 @@ pub(crate) fn validate_and_decode_payload(
             }
             Ok(())
         }
-        pb::PayloadEncoding::Zstd => {
+        pb::PayloadEncoding::Zstd | pb::PayloadEncoding::ZstdDict => {
             if !is_data {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -188,14 +483,40 @@ pub(crate) fn validate_and_decode_payload(
                 ));
             }
 
-            let decoded =
-                decode_zstd_bounded(frame.payload.as_ref(), declared_len, max_frame_bytes)?;
+            let dictionary = match encoding {
+                pb::PayloadEncoding::Zstd => None,
+                pb::PayloadEncoding::ZstdDict => Some(cfg.dictionary().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "dictionary-compressed payload received without compression dictionary",
+                    )
+                })?),
+                pb::PayloadEncoding::Identity => unreachable!(),
+            };
+            let decoded = decode_zstd_bounded(
+                frame.payload.as_ref(),
+                declared_len,
+                max_frame_bytes,
+                dictionary,
+            )?;
             frame.payload = Bytes::from(decoded);
             frame.payload_encoding = pb::PayloadEncoding::Identity as i32;
             frame.uncompressed_payload_len = 0;
             Ok(())
         }
     }
+}
+
+fn encode_zstd(payload: &[u8], cfg: &CompressionConfig) -> io::Result<Vec<u8>> {
+    let mut compressor = if let Some(dictionary) = cfg.dictionary() {
+        zstd::bulk::Compressor::with_prepared_dictionary(dictionary.encoder())
+    } else {
+        zstd::bulk::Compressor::new(cfg.level())
+    }
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    compressor
+        .compress(payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn meets_savings_threshold(
@@ -214,14 +535,17 @@ fn decode_zstd_bounded(
     payload: &[u8],
     declared_len: usize,
     max_frame_bytes: usize,
+    dictionary: Option<&CompressionDictionary>,
 ) -> io::Result<Vec<u8>> {
-    let decoder = zstd::stream::read::Decoder::new(Cursor::new(payload))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let limit = max_frame_bytes.saturating_add(1) as u64;
-    let mut limited = decoder.take(limit);
-    let mut out = Vec::with_capacity(declared_len);
-    limited
-        .read_to_end(&mut out)
+    let capacity = max_frame_bytes.saturating_add(1);
+    let mut decompressor = if let Some(dictionary) = dictionary {
+        zstd::bulk::Decompressor::with_prepared_dictionary(dictionary.decoder())
+    } else {
+        zstd::bulk::Decompressor::new()
+    }
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let out = decompressor
+        .decompress(payload, capacity)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if out.len() > max_frame_bytes {
         return Err(io::Error::new(
@@ -262,15 +586,40 @@ mod tests {
         CompressionConfig::new(true, 1, 10, 1)
     }
 
+    fn dictionary_cfg() -> CompressionConfig {
+        CompressionConfig::new(true, 1, 0, 1)
+            .with_dictionary_bytes(
+                b"OverlayData ReplicationMessage StrictCatchupResp OwnerCatchupResp LsaFlood \
+                  LinkStateAdvert PluginDataEnvelope channel clients blobs session user state"
+                    .to_vec(),
+            )
+            .unwrap()
+    }
+
+    fn adaptive_cfg() -> CompressionConfig {
+        CompressionConfig::new(true, 1, 0, 1).with_adaptive_dictionary_enabled(true)
+    }
+
+    fn adaptive_sample(i: usize) -> Bytes {
+        Bytes::from(
+            format!(
+                "OverlayData ReplicationMessage StrictCatchupResp channel clients session user \
+                 state version={i:04} "
+            )
+            .repeat(24),
+        )
+    }
+
     #[test]
     fn l1_compression_round_trips() {
         let original = Bytes::from(vec![0x42; 4096]);
         let mut frame = data_frame(original.clone());
+        let cfg = compression_cfg();
 
         maybe_compress_frame_payload(
             &mut frame,
             SendOptions::default().allow_l1_compression(),
-            compression_cfg(),
+            &cfg,
             8192,
         )
         .unwrap();
@@ -282,7 +631,7 @@ mod tests {
         assert!(frame.payload.len() < original.len());
         assert_eq!(frame.uncompressed_payload_len, original.len() as u64);
 
-        validate_and_decode_payload(&mut frame, 8192).unwrap();
+        validate_and_decode_payload(&mut frame, 8192, &cfg).unwrap();
         assert_eq!(frame.payload, original);
         assert_eq!(
             pb::PayloadEncoding::try_from(frame.payload_encoding).unwrap(),
@@ -292,12 +641,114 @@ mod tests {
     }
 
     #[test]
+    fn l1_dictionary_compression_round_trips() {
+        let original = Bytes::from(
+            b"OverlayData ReplicationMessage StrictCatchupResp channel clients session user state "
+                .repeat(64),
+        );
+        let mut frame = data_frame(original.clone());
+        let cfg = dictionary_cfg();
+
+        maybe_compress_frame_payload(
+            &mut frame,
+            SendOptions::default().allow_l1_compression(),
+            &cfg,
+            8192,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pb::PayloadEncoding::try_from(frame.payload_encoding).unwrap(),
+            pb::PayloadEncoding::ZstdDict
+        );
+        assert!(frame.payload.len() < original.len());
+        assert_eq!(frame.uncompressed_payload_len, original.len() as u64);
+
+        validate_and_decode_payload(&mut frame, 8192, &cfg).unwrap();
+        assert_eq!(frame.payload, original);
+        assert_eq!(
+            pb::PayloadEncoding::try_from(frame.payload_encoding).unwrap(),
+            pb::PayloadEncoding::Identity
+        );
+    }
+
+    #[test]
+    fn dictionary_payload_requires_dictionary_config() {
+        let original = Bytes::from(
+            b"OverlayData ReplicationMessage StrictCatchupResp channel clients session user state "
+                .repeat(64),
+        );
+        let cfg = dictionary_cfg();
+        let mut frame = data_frame(original);
+
+        maybe_compress_frame_payload(
+            &mut frame,
+            SendOptions::default().allow_l1_compression(),
+            &cfg,
+            8192,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pb::PayloadEncoding::try_from(frame.payload_encoding).unwrap(),
+            pb::PayloadEncoding::ZstdDict
+        );
+        assert!(validate_and_decode_payload(&mut frame, 8192, &compression_cfg()).is_err());
+    }
+
+    #[test]
+    fn adaptive_dictionary_learns_from_matching_stream_history() {
+        let mut sender = AdaptiveCompressionState::new(adaptive_cfg());
+        let mut receiver = AdaptiveCompressionState::new(adaptive_cfg());
+        for i in 0..ADAPTIVE_MIN_SAMPLES {
+            let sample = adaptive_sample(i);
+            sender.record_sample(&sample);
+            receiver.record_sample(&sample);
+        }
+
+        assert!(sender.config().dictionary_len().is_some());
+        assert_eq!(
+            sender.config().dictionary_id(),
+            receiver.config().dictionary_id()
+        );
+
+        let original = adaptive_sample(ADAPTIVE_MIN_SAMPLES + 1);
+        let mut frame = data_frame(original.clone());
+        maybe_compress_frame_payload(
+            &mut frame,
+            SendOptions::default().allow_l1_compression(),
+            sender.config(),
+            8192,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pb::PayloadEncoding::try_from(frame.payload_encoding).unwrap(),
+            pb::PayloadEncoding::ZstdDict
+        );
+
+        validate_and_decode_payload(&mut frame, 8192, receiver.config()).unwrap();
+        assert_eq!(frame.payload, original);
+    }
+
+    #[test]
+    fn adaptive_dictionary_does_not_train_when_compression_disabled() {
+        let cfg = adaptive_cfg().with_enabled(false);
+        let mut state = AdaptiveCompressionState::new(cfg);
+        for i in 0..ADAPTIVE_MIN_SAMPLES * 2 {
+            state.record_sample(&adaptive_sample(i));
+        }
+
+        assert!(state.config().dictionary_len().is_none());
+    }
+
+    #[test]
     fn below_size_threshold_stays_identity() {
         let mut frame = data_frame(Bytes::from_static(b"small"));
         maybe_compress_frame_payload(
             &mut frame,
             SendOptions::default().allow_l1_compression(),
-            CompressionConfig::new(true, 1024, 10, 1),
+            &CompressionConfig::new(true, 1024, 10, 1),
             1024,
         )
         .unwrap();
@@ -315,7 +766,7 @@ mod tests {
         maybe_compress_frame_payload(
             &mut frame,
             SendOptions::default().allow_l1_compression(),
-            CompressionConfig::new(true, 1, 100, 1),
+            &CompressionConfig::new(true, 1, 100, 1),
             8192,
         )
         .unwrap();
@@ -332,7 +783,7 @@ mod tests {
         frame.payload_encoding = pb::PayloadEncoding::Zstd as i32;
         frame.uncompressed_payload_len = 16;
 
-        assert!(validate_and_decode_payload(&mut frame, 1024).is_err());
+        assert!(validate_and_decode_payload(&mut frame, 1024, &compression_cfg()).is_err());
     }
 
     #[test]
@@ -340,7 +791,7 @@ mod tests {
         let mut frame = data_frame(Bytes::from_static(b"hello"));
         frame.payload_encoding = 99;
 
-        assert!(validate_and_decode_payload(&mut frame, 1024).is_err());
+        assert!(validate_and_decode_payload(&mut frame, 1024, &compression_cfg()).is_err());
     }
 
     #[test]
@@ -349,7 +800,7 @@ mod tests {
         frame.payload_encoding = pb::PayloadEncoding::Zstd as i32;
         frame.uncompressed_payload_len = 2048;
 
-        assert!(validate_and_decode_payload(&mut frame, 1024).is_err());
+        assert!(validate_and_decode_payload(&mut frame, 1024, &compression_cfg()).is_err());
     }
 
     #[test]
@@ -366,7 +817,7 @@ mod tests {
         frame.payload_encoding = pb::PayloadEncoding::Zstd as i32;
         frame.uncompressed_payload_len = 4;
 
-        assert!(validate_and_decode_payload(&mut frame, 1024).is_err());
+        assert!(validate_and_decode_payload(&mut frame, 1024, &compression_cfg()).is_err());
     }
 
     #[test]
@@ -410,10 +861,11 @@ mod tests {
         assert!(encoded.len() > 1024);
 
         let mut frame = data_frame(Bytes::from(encoded.clone()));
+        let cfg = CompressionConfig::default();
         maybe_compress_frame_payload(
             &mut frame,
             SendOptions::default().allow_l1_compression(),
-            CompressionConfig::default(),
+            &cfg,
             encoded.len() + 512,
         )
         .unwrap();
@@ -422,7 +874,7 @@ mod tests {
             pb::PayloadEncoding::try_from(frame.payload_encoding).unwrap(),
             pb::PayloadEncoding::Zstd
         );
-        validate_and_decode_payload(&mut frame, encoded.len() + 512).unwrap();
+        validate_and_decode_payload(&mut frame, encoded.len() + 512, &cfg).unwrap();
         assert_eq!(frame.payload, Bytes::from(encoded));
     }
 }

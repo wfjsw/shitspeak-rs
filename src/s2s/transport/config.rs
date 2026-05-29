@@ -1,3 +1,5 @@
+use std::fs;
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -5,8 +7,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::compression::{
-    CompressionConfig, default_compression_enabled, default_compression_level,
-    default_compression_min_bytes, default_compression_min_savings_percent,
+    CompressionConfig, default_compression_adaptive_dictionary_enabled,
+    default_compression_enabled, default_compression_level, default_compression_min_bytes,
+    default_compression_min_savings_percent,
 };
 use super::service_level::{PeerAddress, ServiceShape, TransportKind};
 
@@ -344,8 +347,20 @@ impl TransportConfig {
         self.compression.level()
     }
 
-    pub(crate) fn compression_config(&self) -> CompressionConfig {
-        self.compression
+    pub fn compression_adaptive_dictionary_enabled(&self) -> bool {
+        self.compression.adaptive_dictionary_enabled()
+    }
+
+    pub fn compression_dictionary_len(&self) -> Option<usize> {
+        self.compression.dictionary_len()
+    }
+
+    pub fn compression_dictionary_id(&self) -> Option<u32> {
+        self.compression.dictionary_id()
+    }
+
+    pub(crate) fn compression_config(&self) -> &CompressionConfig {
+        &self.compression
     }
 
     pub fn latency_ewma_alpha(&self) -> f64 {
@@ -586,42 +601,40 @@ impl TransportConfig {
     }
 
     pub fn with_compression_enabled(mut self, enabled: bool) -> Self {
-        self.compression = CompressionConfig::new(
-            enabled,
-            self.compression.min_bytes(),
-            self.compression.min_savings_percent(),
-            self.compression.level(),
-        );
+        self.compression = self.compression.with_enabled(enabled);
         self
     }
 
     pub fn with_compression_min_bytes(mut self, n: usize) -> Self {
-        self.compression = CompressionConfig::new(
-            self.compression.enabled(),
-            n,
-            self.compression.min_savings_percent(),
-            self.compression.level(),
-        );
+        self.compression = self.compression.with_min_bytes(n);
         self
     }
 
     pub fn with_compression_min_savings_percent(mut self, percent: u8) -> Self {
-        self.compression = CompressionConfig::new(
-            self.compression.enabled(),
-            self.compression.min_bytes(),
-            percent,
-            self.compression.level(),
-        );
+        self.compression = self.compression.with_min_savings_percent(percent);
         self
     }
 
     pub fn with_compression_level(mut self, level: i32) -> Self {
-        self.compression = CompressionConfig::new(
-            self.compression.enabled(),
-            self.compression.min_bytes(),
-            self.compression.min_savings_percent(),
-            level,
-        );
+        self.compression = self.compression.with_level(level);
+        self
+    }
+
+    pub fn with_compression_adaptive_dictionary_enabled(mut self, enabled: bool) -> Self {
+        self.compression = self.compression.with_adaptive_dictionary_enabled(enabled);
+        self
+    }
+
+    pub fn try_with_compression_dictionary_bytes(
+        mut self,
+        dictionary: Vec<u8>,
+    ) -> io::Result<Self> {
+        self.compression = self.compression.with_dictionary_bytes(dictionary)?;
+        Ok(self)
+    }
+
+    pub fn without_compression_dictionary(mut self) -> Self {
+        self.compression = self.compression.without_dictionary();
         self
     }
 
@@ -716,6 +729,13 @@ pub struct TransportTuning {
     compression_min_savings_percent: u8,
     #[serde(default = "default_compression_level")]
     compression_level: i32,
+    #[serde(default = "default_compression_adaptive_dictionary_enabled")]
+    compression_adaptive_dictionary_enabled: bool,
+    /// Optional static zstd dictionary file for L1 payload compression. Stream
+    /// peers require a matching dictionary fingerprint before static
+    /// dictionary frames are sent; UDP has no dictionary negotiation.
+    #[serde(default)]
+    compression_dictionary_path: Option<PathBuf>,
 }
 
 impl Default for TransportTuning {
@@ -742,6 +762,9 @@ impl Default for TransportTuning {
             compression_min_bytes: default_compression_min_bytes(),
             compression_min_savings_percent: default_compression_min_savings_percent(),
             compression_level: default_compression_level(),
+            compression_adaptive_dictionary_enabled:
+                default_compression_adaptive_dictionary_enabled(),
+            compression_dictionary_path: None,
         }
     }
 }
@@ -776,6 +799,31 @@ impl TransportTuning {
             .with_compression_min_bytes(self.compression_min_bytes)
             .with_compression_min_savings_percent(self.compression_min_savings_percent)
             .with_compression_level(self.compression_level)
+            .with_compression_adaptive_dictionary_enabled(
+                self.compression_adaptive_dictionary_enabled,
+            )
+    }
+
+    /// Apply tunables and load the optional compression dictionary from disk.
+    pub fn try_apply(&self, cfg: TransportConfig) -> Result<TransportConfig, String> {
+        let mut cfg = self.apply(cfg);
+        if let Some(path) = &self.compression_dictionary_path {
+            let dictionary = fs::read(path).map_err(|e| {
+                format!(
+                    "failed to read s2s.transport.compression_dictionary_path {}: {e}",
+                    path.display()
+                )
+            })?;
+            cfg = cfg
+                .try_with_compression_dictionary_bytes(dictionary)
+                .map_err(|e| {
+                    format!(
+                        "invalid s2s.transport.compression_dictionary_path {}: {e}",
+                        path.display()
+                    )
+                })?;
+        }
+        Ok(cfg)
     }
 }
 

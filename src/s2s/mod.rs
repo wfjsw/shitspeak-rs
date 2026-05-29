@@ -212,6 +212,14 @@ impl S2SManager {
         self.transport_tuning.apply(cfg)
     }
 
+    /// Fallible variant that also loads any configured compression dictionary.
+    pub fn try_apply_transport_tuning(
+        &self,
+        cfg: transport::TransportConfig,
+    ) -> Result<transport::TransportConfig, String> {
+        self.transport_tuning.try_apply(cfg)
+    }
+
     /// Apply the operator-configured overlay tunables on top of a
     /// caller-built [`overlay::OverlayConfig`].
     pub fn apply_overlay_tuning(&self, cfg: overlay::OverlayConfig) -> overlay::OverlayConfig {

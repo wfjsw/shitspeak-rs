@@ -223,6 +223,9 @@ fn decode_l1_frame(encoded: &Bytes) -> Bytes {
         transport_pb::PayloadEncoding::Zstd => {
             Bytes::from(zstd::stream::decode_all(Cursor::new(frame.payload.as_ref())).unwrap())
         }
+        transport_pb::PayloadEncoding::ZstdDict => {
+            panic!("benchmark decoder was not configured with a zstd dictionary")
+        }
     }
 }
 

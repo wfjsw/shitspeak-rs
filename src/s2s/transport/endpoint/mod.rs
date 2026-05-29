@@ -266,7 +266,7 @@ pub(crate) fn install_stream_session<S>(
         inner.cfg().bandwidth_probe_interval(),
         inner.cfg().bandwidth_probe_size(),
         inner.cfg().native_stats_interval(),
-        inner.cfg().compression_config(),
+        inner.cfg().compression_config().clone(),
         inner.cfg().max_pending_pings(),
     );
     let active = spawn_stream_pump(

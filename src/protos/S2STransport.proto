@@ -35,6 +35,9 @@ enum MessageClass {
 enum PayloadEncoding {
   IDENTITY = 0;
   ZSTD = 1;
+  // Zstd payload compressed with a negotiated configured or adaptive dictionary.
+  // Stream peers advertise dictionary capability before this encoding is sent.
+  ZSTD_DICT = 2;
 }
 
 // Carried by every send on every transport.

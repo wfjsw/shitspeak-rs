@@ -14,6 +14,7 @@ use tokio::time::timeout;
 use super::config::TransportConfig;
 use super::manager::{ConnectionManager, Inbound};
 use super::service_level::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
+use super::{LinkMetrics, SendOptions};
 use crate::s2s::testing::{
     Pki, install_provider_once, loopback, mint_pki, pick_free_port, pick_free_udp_port,
     s2s_network_test_guard,
@@ -42,6 +43,64 @@ fn config_with_udp(pki: &Pki, node_idx: usize, udp: SocketAddr) -> TransportConf
         .with_bandwidth_probe_interval(Duration::from_secs(60)) // off for these tests
         .with_bandwidth_probe_size(0)
         .with_udp_mtu(1400)
+}
+
+fn config_for_compression(pki: &Pki, node_idx: usize, tcp: SocketAddr) -> TransportConfig {
+    let (cert, key) = &pki.nodes[node_idx];
+    TransportConfig::new(pki.ca_path.clone(), cert.clone(), key.clone())
+        .with_tcp_listen(tcp)
+        .with_reconnect_check_interval(Duration::from_millis(50))
+        .with_backoff_initial(Duration::from_millis(20))
+        .with_backoff_cap(Duration::from_millis(200))
+        .with_ping_interval(Duration::from_secs(60))
+        .with_idle_ping_interval(Duration::from_secs(60))
+        .with_bandwidth_probe_interval(Duration::from_secs(60))
+        .with_bandwidth_probe_size(0)
+        .with_bandwidth_window(Duration::from_secs(30))
+        .with_compression_min_bytes(1)
+        .with_compression_min_savings_percent(0)
+        .with_compression_level(1)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompressionScenario {
+    Identity,
+    Zstd,
+    AdaptiveZstd,
+}
+
+impl CompressionScenario {
+    fn apply(self, cfg: TransportConfig) -> TransportConfig {
+        match self {
+            Self::Identity => cfg.with_compression_enabled(false),
+            Self::Zstd => cfg
+                .with_compression_enabled(true)
+                .with_compression_adaptive_dictionary_enabled(false),
+            Self::AdaptiveZstd => cfg
+                .with_compression_enabled(true)
+                .with_compression_adaptive_dictionary_enabled(true),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WireEfficiency {
+    payload_bytes: u64,
+    wire_bytes: u64,
+}
+
+impl WireEfficiency {
+    fn wire_ratio(self) -> f64 {
+        self.wire_bytes as f64 / self.payload_bytes.max(1) as f64
+    }
+
+    fn savings_vs(self, baseline: Self) -> f64 {
+        if baseline.wire_bytes == 0 {
+            return 0.0;
+        }
+        100.0 * (baseline.wire_bytes.saturating_sub(self.wire_bytes) as f64)
+            / baseline.wire_bytes as f64
+    }
 }
 
 /// Checks that two S2S transport managers establish mTLS over TCP and exchange
@@ -175,6 +234,77 @@ async fn probe_throughput_reports_idle_link_bandwidth() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("never recorded a probe round trip");
+}
+
+/// Checks adaptive L1 compression over a real mTLS TCP transport.
+/// Expected: after a warmup phase, the learned dictionary keeps delivery
+/// correct and reduces measured transport-frame bytes far below identity,
+/// while staying competitive with ordinary zstd on the same payload shape.
+#[tokio::test]
+async fn adaptive_compression_reduces_tcp_wire_bytes_after_warmup() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+
+    let identity =
+        measure_tcp_wire_efficiency(151, 252, CompressionScenario::Identity, false).await;
+    let zstd = measure_tcp_wire_efficiency(153, 254, CompressionScenario::Zstd, false).await;
+    let adaptive =
+        measure_tcp_wire_efficiency(155, 256, CompressionScenario::AdaptiveZstd, true).await;
+
+    eprintln!(
+        "adaptive compression efficiency: payload={}B identity_wire={}B zstd_wire={}B adaptive_wire={}B adaptive_ratio={:.3} savings_vs_identity={:.1}% savings_vs_zstd={:.1}%",
+        adaptive.payload_bytes,
+        identity.wire_bytes,
+        zstd.wire_bytes,
+        adaptive.wire_bytes,
+        adaptive.wire_ratio(),
+        adaptive.savings_vs(identity),
+        adaptive.savings_vs(zstd),
+    );
+
+    assert_eq!(identity.payload_bytes, adaptive.payload_bytes);
+    assert_eq!(zstd.payload_bytes, adaptive.payload_bytes);
+    assert!(
+        adaptive.wire_bytes * 100 <= identity.wire_bytes * 45,
+        "adaptive compression should save at least 55% vs identity; identity={identity:?} adaptive={adaptive:?}"
+    );
+    assert!(
+        adaptive.wire_bytes <= zstd.wire_bytes,
+        "adaptive dictionary should not be larger than plain zstd for this repeated S2S payload shape; zstd={zstd:?} adaptive={adaptive:?}"
+    );
+}
+
+/// Checks mixed capability safety for rolling upgrades or per-node opt-out.
+/// Expected: an adaptive sender trains locally, but because the receiver does
+/// not advertise dictionary support in transport Hello, the sender keeps using
+/// identity/plain-zstd frames and delivery continues after warmup.
+#[tokio::test]
+async fn adaptive_compression_waits_for_peer_dictionary_capability() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[157, 258]);
+    let port_a = pick_free_port().await;
+    let port_b = pick_free_port().await;
+    let cfg_a = config_for_compression(&pki, 0, loopback(port_a))
+        .with_compression_adaptive_dictionary_enabled(true);
+    let cfg_b = config_for_compression(&pki, 1, loopback(port_b))
+        .with_compression_adaptive_dictionary_enabled(false);
+
+    let (mgr_a, _inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+
+    mgr_a
+        .add_address(258, PeerAddress::new(loopback(port_b), TransportKind::Tcp))
+        .await;
+    wait_for_link(&mgr_a, 258, TransportKind::Tcp).await;
+    wait_for_link(&mgr_b, 157, TransportKind::Tcp).await;
+
+    for i in 0..120 {
+        send_tcp_compression_sample(&mgr_a, &mut inbound_b, 258, i).await;
+    }
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
 }
 
 /// Checks service-level fallback when only TCP is available.
@@ -454,4 +584,106 @@ async fn wait_for_link(mgr: &ConnectionManager, node: u16, kind: TransportKind) 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("link to {node} via {kind:?} never came up");
+}
+
+async fn measure_tcp_wire_efficiency(
+    node_a: u16,
+    node_b: u16,
+    scenario: CompressionScenario,
+    warmup: bool,
+) -> WireEfficiency {
+    let pki = mint_pki(&[node_a, node_b]);
+    let port_a = pick_free_port().await;
+    let port_b = pick_free_port().await;
+    let cfg_a = scenario.apply(config_for_compression(&pki, 0, loopback(port_a)));
+    let cfg_b = scenario.apply(config_for_compression(&pki, 1, loopback(port_b)));
+
+    let (mgr_a, _inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+
+    mgr_a
+        .add_address(
+            node_b,
+            PeerAddress::new(loopback(port_b), TransportKind::Tcp),
+        )
+        .await;
+    wait_for_link(&mgr_a, node_b, TransportKind::Tcp).await;
+    wait_for_link(&mgr_b, node_a, TransportKind::Tcp).await;
+
+    if warmup {
+        for i in 0..96 {
+            send_tcp_compression_sample(&mgr_a, &mut inbound_b, node_b, i).await;
+        }
+    }
+
+    let before = tcp_metrics(&mgr_a, node_b);
+    for i in 128..152 {
+        send_tcp_compression_sample(&mgr_a, &mut inbound_b, node_b, i).await;
+    }
+    let after = tcp_metrics(&mgr_a, node_b);
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
+
+    WireEfficiency {
+        payload_bytes: after.sent_bytes().saturating_sub(before.sent_bytes()),
+        wire_bytes: after
+            .wire_sent_bytes()
+            .saturating_sub(before.wire_sent_bytes()),
+    }
+}
+
+async fn send_tcp_compression_sample(
+    mgr: &ConnectionManager,
+    inbound: &mut Inbound,
+    node: u16,
+    seq: usize,
+) {
+    let payload = adaptive_compression_payload(seq);
+    mgr.send_via_with_options(
+        node,
+        TransportKind::Tcp,
+        MessageClass::Regular,
+        payload.clone(),
+        SendOptions::default().allow_l1_compression(),
+    )
+    .await
+    .unwrap();
+
+    let recv = timeout(Duration::from_secs(3), inbound.regular().recv())
+        .await
+        .expect("adaptive compression recv timeout")
+        .expect("adaptive compression recv channel closed");
+    assert_eq!(recv.transport(), TransportKind::Tcp);
+    assert_eq!(recv.payload(), &payload);
+}
+
+fn adaptive_compression_payload(seq: usize) -> Bytes {
+    Bytes::from(format!(
+        "topic=channels;kind=StrictCatchupResp;server_id=default;\
+         origin_node={};snapshot_version={};history_version={};history_freshness=170000{};\
+         channel_path=/Root/Team/{}/Room/{};actor_session={};target_session={};\
+         permissions=TextMessage,Enter,Speak,Whisper,Traverse;\
+         groups=admin,moderator,authenticated,registered;\
+         acl_read=true;acl_write=false;codec=opus;comment_hash=0123456789abcdef;\
+         plugin_context=overlay-replication-application-transport;\
+         checksum={:08x};",
+        100 + (seq % 7),
+        10_000 + seq,
+        50_000 + seq,
+        seq % 1000,
+        seq % 12,
+        seq % 31,
+        1_000 + seq,
+        2_000 + seq,
+        seq.wrapping_mul(2_654_435_761usize) as u32,
+    ))
+}
+
+fn tcp_metrics(mgr: &ConnectionManager, node: u16) -> LinkMetrics {
+    mgr.metrics_snapshot()
+        .for_node(node)
+        .and_then(|per_transport| per_transport.get(&TransportKind::Tcp))
+        .cloned()
+        .expect("tcp metrics")
 }
