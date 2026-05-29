@@ -28,6 +28,11 @@ const DEFAULT_RLL_JITTER_WEIGHT: f64 = 4.0;
 const MAX_PACKET_LOSS_PPM: u32 = 1_000_000;
 const DEFAULT_PACKET_LOSS_EWMA_ALPHA: f64 = 0.02;
 const PACKET_LOSS_EWMA_METRIC_WEIGHT: f64 = 0.25;
+// On reliable streams, an expired ping means "pong was not observed before our
+// timeout", not necessarily packet loss. Native/data health counters are the
+// stronger loss sources for TCP/KCP/QUIC, so stream probe loss is bounded.
+const STREAM_PROBE_LOSS_METRIC_WEIGHT: f64 = 0.25;
+const STREAM_PROBE_LOSS_EFFECTIVE_CAP_PPM: u32 = 100_000;
 const NATIVE_LOSS_METRIC_WEIGHT: f64 = 0.5;
 const DATA_HEALTH_METRIC_WEIGHT: f64 = 0.25;
 const NATIVE_LOSS_EFFECTIVE_CAP_PPM: u32 = 250_000;
@@ -136,6 +141,14 @@ pub struct LinkMetrics {
     wire_recv_bytes: u64,
     /// Encoded transport-frame bytes sent since the window started.
     wire_sent_bytes: u64,
+    /// Original data payload bytes sent through the L1 compression path.
+    l1_uncompressed_sent_bytes: u64,
+    /// Encoded data payload bytes sent after L1 compression or identity.
+    l1_encoded_sent_bytes: u64,
+    /// Original data payload bytes received through the L1 compression path.
+    l1_uncompressed_recv_bytes: u64,
+    /// Encoded data payload bytes received before L1 decompression.
+    l1_encoded_recv_bytes: u64,
     /// The wall-clock window over which `recv_bytes` / `sent_bytes` apply.
     window: Duration,
     /// Transport health loss breakdown. The legacy `packet_loss_ppm()` getter
@@ -157,6 +170,7 @@ pub struct LossBreakdown {
     effective_loss_ppm: u32,
     probe_sample_count: u64,
     lost_probe_sample_count: u64,
+    probe_loss_ewma_sample_count: u64,
     native_sample_count: u64,
     native_lost_sample_count: u64,
     data_health_sample_count: u64,
@@ -167,8 +181,10 @@ pub struct LossBreakdown {
 impl LossBreakdown {
     #[allow(clippy::too_many_arguments)]
     fn from_components(
+        transport: TransportKind,
         probe_loss_ppm: u32,
         probe_loss_ewma_ppm: u32,
+        probe_loss_ewma_sample_count: u64,
         probe_sample_count: u64,
         lost_probe_sample_count: u64,
         native_loss_ppm: u32,
@@ -180,8 +196,11 @@ impl LossBreakdown {
         data_health_failure_count: u64,
     ) -> Self {
         let effective_loss_ppm = effective_loss_ppm(
+            transport,
             probe_loss_ppm,
             probe_loss_ewma_ppm,
+            probe_loss_ewma_sample_count,
+            probe_sample_count,
             native_loss_ppm,
             native_sample_count,
             data_health_ppm,
@@ -196,6 +215,7 @@ impl LossBreakdown {
             effective_loss_ppm,
             probe_sample_count,
             lost_probe_sample_count,
+            probe_loss_ewma_sample_count,
             native_sample_count,
             native_lost_sample_count,
             data_health_sample_count,
@@ -236,6 +256,10 @@ impl LossBreakdown {
 
     pub fn lost_probe_sample_count(&self) -> u64 {
         self.lost_probe_sample_count
+    }
+
+    pub fn probe_loss_ewma_sample_count(&self) -> u64 {
+        self.probe_loss_ewma_sample_count
     }
 
     pub fn native_sample_count(&self) -> u64 {
@@ -298,6 +322,22 @@ impl LinkMetrics {
 
     pub fn wire_sent_bytes(&self) -> u64 {
         self.wire_sent_bytes
+    }
+
+    pub fn l1_uncompressed_sent_bytes(&self) -> u64 {
+        self.l1_uncompressed_sent_bytes
+    }
+
+    pub fn l1_encoded_sent_bytes(&self) -> u64 {
+        self.l1_encoded_sent_bytes
+    }
+
+    pub fn l1_uncompressed_recv_bytes(&self) -> u64 {
+        self.l1_uncompressed_recv_bytes
+    }
+
+    pub fn l1_encoded_recv_bytes(&self) -> u64 {
+        self.l1_encoded_recv_bytes
     }
 
     pub fn window(&self) -> Duration {
@@ -424,6 +464,23 @@ impl LinkMetrics {
         (self.wire_sent_bytes as f64) / self.window.as_secs_f64()
     }
 
+    pub fn l1_compression_sent_ratio(&self) -> Option<f64> {
+        compression_ratio(self.l1_encoded_sent_bytes, self.l1_uncompressed_sent_bytes)
+    }
+
+    pub fn l1_compression_recv_ratio(&self) -> Option<f64> {
+        compression_ratio(self.l1_encoded_recv_bytes, self.l1_uncompressed_recv_bytes)
+    }
+
+    pub fn l1_compression_total_ratio(&self) -> Option<f64> {
+        compression_ratio(
+            self.l1_encoded_sent_bytes
+                .saturating_add(self.l1_encoded_recv_bytes),
+            self.l1_uncompressed_sent_bytes
+                .saturating_add(self.l1_uncompressed_recv_bytes),
+        )
+    }
+
     /// Best estimate of the link's available throughput. Returns whichever is
     /// larger of (a) actual bytes flowing in/out across the rolling window
     /// and (b) the active probe's measured throughput. This ensures an idle
@@ -493,11 +550,45 @@ impl LinkMetrics {
     }
 }
 
-fn probe_effective_loss_ppm(rolling_ppm: u32, ewma_ppm: u32) -> u32 {
-    let weighted_ewma = (ewma_ppm as f64 * PACKET_LOSS_EWMA_METRIC_WEIGHT)
-        .round()
-        .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32;
-    rolling_ppm.max(weighted_ewma)
+fn compression_ratio(encoded_bytes: u64, uncompressed_bytes: u64) -> Option<f64> {
+    if uncompressed_bytes == 0 {
+        None
+    } else {
+        Some(encoded_bytes as f64 / uncompressed_bytes as f64)
+    }
+}
+
+fn probe_effective_loss_ppm(
+    transport: TransportKind,
+    rolling_ppm: u32,
+    ewma_ppm: u32,
+    ewma_sample_count: u64,
+    rolling_sample_count: u64,
+) -> u32 {
+    let rolling_effective = if rolling_sample_count >= LOSS_EFFECTIVE_SAMPLE_FLOOR {
+        rolling_ppm
+    } else {
+        0
+    };
+    let ewma_effective = if ewma_sample_count >= LOSS_EFFECTIVE_SAMPLE_FLOOR {
+        capped_weighted_ppm(
+            ewma_ppm,
+            PACKET_LOSS_EWMA_METRIC_WEIGHT,
+            MAX_PACKET_LOSS_PPM,
+        )
+    } else {
+        0
+    };
+    let raw_effective = rolling_effective.max(ewma_effective);
+    if transport.is_stream() {
+        capped_weighted_ppm(
+            raw_effective,
+            STREAM_PROBE_LOSS_METRIC_WEIGHT,
+            STREAM_PROBE_LOSS_EFFECTIVE_CAP_PPM,
+        )
+    } else {
+        raw_effective
+    }
 }
 
 fn capped_weighted_ppm(ppm: u32, weight: f64, cap: u32) -> u32 {
@@ -505,14 +596,23 @@ fn capped_weighted_ppm(ppm: u32, weight: f64, cap: u32) -> u32 {
 }
 
 fn effective_loss_ppm(
+    transport: TransportKind,
     probe_loss_ppm: u32,
     probe_loss_ewma_ppm: u32,
+    probe_loss_ewma_sample_count: u64,
+    probe_sample_count: u64,
     native_loss_ppm: u32,
     native_sample_count: u64,
     data_health_ppm: u32,
     data_health_sample_count: u64,
 ) -> u32 {
-    let probe_effective = probe_effective_loss_ppm(probe_loss_ppm, probe_loss_ewma_ppm);
+    let probe_effective = probe_effective_loss_ppm(
+        transport,
+        probe_loss_ppm,
+        probe_loss_ewma_ppm,
+        probe_loss_ewma_sample_count,
+        probe_sample_count,
+    );
     let native_effective = if native_sample_count >= LOSS_EFFECTIVE_SAMPLE_FLOOR {
         capped_weighted_ppm(
             native_loss_ppm,
@@ -637,6 +737,10 @@ struct LinkInner {
     recv: SlidingCounters,
     wire_sent: SlidingCounters,
     wire_recv: SlidingCounters,
+    l1_uncompressed_sent: SlidingCounters,
+    l1_encoded_sent: SlidingCounters,
+    l1_uncompressed_recv: SlidingCounters,
+    l1_encoded_recv: SlidingCounters,
     probe_loss: LossWindow,
     probe_loss_ewma_ppm: f64,
     probe_loss_ewma_samples: u64,
@@ -665,6 +769,10 @@ impl LinkInner {
             recv: SlidingCounters::new(window),
             wire_sent: SlidingCounters::new(window),
             wire_recv: SlidingCounters::new(window),
+            l1_uncompressed_sent: SlidingCounters::new(window),
+            l1_encoded_sent: SlidingCounters::new(window),
+            l1_uncompressed_recv: SlidingCounters::new(window),
+            l1_encoded_recv: SlidingCounters::new(window),
             probe_loss: LossWindow::new(window),
             probe_loss_ewma_ppm: 0.0,
             probe_loss_ewma_samples: 0,
@@ -793,6 +901,40 @@ impl PeerMetrics {
             .record(bytes as u64);
     }
 
+    pub fn record_l1_compression_sent(
+        &self,
+        transport: TransportKind,
+        uncompressed_bytes: usize,
+        encoded_bytes: usize,
+    ) {
+        if uncompressed_bytes == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
+        entry.l1_uncompressed_sent.record(uncompressed_bytes as u64);
+        entry.l1_encoded_sent.record(encoded_bytes as u64);
+    }
+
+    pub fn record_l1_compression_recv(
+        &self,
+        transport: TransportKind,
+        uncompressed_bytes: usize,
+        encoded_bytes: usize,
+    ) {
+        if uncompressed_bytes == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
+        entry.l1_uncompressed_recv.record(uncompressed_bytes as u64);
+        entry.l1_encoded_recv.record(encoded_bytes as u64);
+    }
+
     pub fn record_probe_delivered(&self, transport: TransportKind) {
         let mut g = self.inner.lock();
         let entry = g
@@ -882,6 +1024,12 @@ impl PeerMetrics {
                 let (recv_bytes, recv_age) = inner.recv.snapshot();
                 let (wire_sent_bytes, wire_sent_age) = inner.wire_sent.snapshot();
                 let (wire_recv_bytes, wire_recv_age) = inner.wire_recv.snapshot();
+                let (l1_uncompressed_sent_bytes, l1_uncompressed_sent_age) =
+                    inner.l1_uncompressed_sent.snapshot();
+                let (l1_encoded_sent_bytes, l1_encoded_sent_age) = inner.l1_encoded_sent.snapshot();
+                let (l1_uncompressed_recv_bytes, l1_uncompressed_recv_age) =
+                    inner.l1_uncompressed_recv.snapshot();
+                let (l1_encoded_recv_bytes, l1_encoded_recv_age) = inner.l1_encoded_recv.snapshot();
                 let (probe_delivered, probe_lost, probe_loss_age) = inner.probe_loss.snapshot();
                 let (native_delivered, native_lost, native_loss_age) = inner.native_loss.snapshot();
                 let (data_health_ok, data_health_failed, data_health_age) =
@@ -893,11 +1041,13 @@ impl PeerMetrics {
                 let native_loss_ppm = loss_ppm(native_lost, native_samples);
                 let data_health_ppm = loss_ppm(data_health_failed, data_health_samples);
                 let loss = LossBreakdown::from_components(
+                    *t,
                     probe_loss_ppm,
                     inner
                         .probe_loss_ewma_ppm
                         .round()
                         .clamp(0.0, MAX_PACKET_LOSS_PPM as f64) as u32,
+                    inner.probe_loss_ewma_samples,
                     probe_packets,
                     probe_lost,
                     native_loss_ppm,
@@ -916,6 +1066,10 @@ impl PeerMetrics {
                         .max(sent_age)
                         .max(wire_recv_age)
                         .max(wire_sent_age)
+                        .max(l1_uncompressed_sent_age)
+                        .max(l1_encoded_sent_age)
+                        .max(l1_uncompressed_recv_age)
+                        .max(l1_encoded_recv_age)
                         .max(probe_loss_age)
                         .max(native_loss_age)
                         .max(data_health_age)
@@ -928,6 +1082,10 @@ impl PeerMetrics {
                     recv_bytes,
                     wire_sent_bytes,
                     wire_recv_bytes,
+                    l1_uncompressed_sent_bytes,
+                    l1_encoded_sent_bytes,
+                    l1_uncompressed_recv_bytes,
+                    l1_encoded_recv_bytes,
                     window,
                     loss,
                     samples: inner.samples,
@@ -1165,8 +1323,10 @@ mod tests {
         let candidates = [TransportKind::Udp, TransportKind::Quic];
 
         m.record_rtt(TransportKind::Udp, Duration::from_millis(10));
-        m.record_probe_delivered(TransportKind::Udp);
-        m.record_probe_lost(TransportKind::Udp);
+        for _ in 0..16 {
+            m.record_probe_delivered(TransportKind::Udp);
+            m.record_probe_lost(TransportKind::Udp);
+        }
 
         m.record_rtt(TransportKind::Quic, Duration::from_millis(15));
         m.record_probe_delivered(TransportKind::Quic);
@@ -1203,8 +1363,9 @@ mod tests {
 
         let snap = m.snapshot_per_transport();
         let tcp = snap.get(&TransportKind::Tcp).unwrap();
-        assert_eq!(tcp.packet_loss_ppm(), 500_000);
+        assert_eq!(tcp.probe_loss_ppm(), 500_000);
         assert_eq!(tcp.packet_loss_ewma_ppm(), 500_000);
+        assert_eq!(tcp.packet_loss_ppm(), 0);
     }
 
     #[test]
@@ -1215,11 +1376,39 @@ mod tests {
             ..LinkMetrics::default()
         };
         let historical_loss = LinkMetrics {
-            loss: LossBreakdown::from_components(0, 400_000, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            loss: LossBreakdown::from_components(
+                TransportKind::Udp,
+                0,
+                400_000,
+                LOSS_EFFECTIVE_SAMPLE_FLOOR,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
             ..clean.clone()
         };
         let current_loss = LinkMetrics {
-            loss: LossBreakdown::from_components(200_000, 400_000, 5, 1, 0, 0, 0, 0, 0, 0, 0),
+            loss: LossBreakdown::from_components(
+                TransportKind::Udp,
+                200_000,
+                400_000,
+                LOSS_EFFECTIVE_SAMPLE_FLOOR,
+                LOSS_EFFECTIVE_SAMPLE_FLOOR,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
             ..clean.clone()
         };
 
@@ -1241,8 +1430,67 @@ mod tests {
     }
 
     #[test]
+    fn stream_probe_loss_waits_for_sample_floor_and_is_capped() {
+        let sparse = LossBreakdown::from_components(
+            TransportKind::Kcp,
+            MAX_PACKET_LOSS_PPM,
+            MAX_PACKET_LOSS_PPM,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR - 1,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR - 1,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR - 1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(sparse.effective_loss_ppm(), 0);
+
+        let stream = LossBreakdown::from_components(
+            TransportKind::Kcp,
+            MAX_PACKET_LOSS_PPM,
+            MAX_PACKET_LOSS_PPM,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(
+            stream.effective_loss_ppm(),
+            STREAM_PROBE_LOSS_EFFECTIVE_CAP_PPM
+        );
+
+        let datagram = LossBreakdown::from_components(
+            TransportKind::Udp,
+            MAX_PACKET_LOSS_PPM,
+            MAX_PACKET_LOSS_PPM,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR,
+            LOSS_EFFECTIVE_SAMPLE_FLOOR,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(datagram.effective_loss_ppm(), MAX_PACKET_LOSS_PPM);
+    }
+
+    #[test]
     fn native_loss_waits_for_sample_floor_then_applies_cap() {
         let below_floor = LossBreakdown::from_components(
+            TransportKind::Tcp,
+            0,
             0,
             0,
             0,
@@ -1258,6 +1506,8 @@ mod tests {
         assert_eq!(below_floor.effective_loss_ppm(), 0);
 
         let above_floor = LossBreakdown::from_components(
+            TransportKind::Tcp,
+            0,
             0,
             0,
             0,
@@ -1279,6 +1529,8 @@ mod tests {
     #[test]
     fn data_health_waits_for_sample_floor_and_is_capped() {
         let below_floor = LossBreakdown::from_components(
+            TransportKind::Tcp,
+            0,
             0,
             0,
             0,
@@ -1294,6 +1546,8 @@ mod tests {
         assert_eq!(below_floor.effective_loss_ppm(), 0);
 
         let above_floor = LossBreakdown::from_components(
+            TransportKind::Tcp,
+            0,
             0,
             0,
             0,
@@ -1428,5 +1682,23 @@ mod tests {
         assert_eq!(tcp.recv_bytes, 512);
         assert_eq!(tcp.wire_sent_bytes(), 2048);
         assert_eq!(tcp.wire_recv_bytes(), 1536);
+    }
+
+    #[test]
+    fn l1_compression_counters_report_ratios() {
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        m.record_l1_compression_sent(TransportKind::Tcp, 1_000, 400);
+        m.record_l1_compression_recv(TransportKind::Tcp, 2_000, 1_000);
+
+        let snap = m.snapshot_per_transport();
+        let tcp = snap.get(&TransportKind::Tcp).unwrap();
+
+        assert_eq!(tcp.l1_uncompressed_sent_bytes(), 1_000);
+        assert_eq!(tcp.l1_encoded_sent_bytes(), 400);
+        assert_eq!(tcp.l1_uncompressed_recv_bytes(), 2_000);
+        assert_eq!(tcp.l1_encoded_recv_bytes(), 1_000);
+        assert_eq!(tcp.l1_compression_sent_ratio(), Some(0.4));
+        assert_eq!(tcp.l1_compression_recv_ratio(), Some(0.5));
+        assert_eq!(tcp.l1_compression_total_ratio(), Some(1_400.0 / 3_000.0));
     }
 }

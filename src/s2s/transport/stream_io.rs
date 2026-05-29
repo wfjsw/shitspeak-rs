@@ -16,7 +16,7 @@
 //!         `bandwidth_probe_interval` for throughput estimation;
 //!   * exits on EOF, write error, or `closed` cancellation.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,8 +36,9 @@ use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
 
 use super::compression::{
-    AdaptiveCompressionState, CompressionConfig, DICTIONARY_FINGERPRINT_BYTES,
-    maybe_compress_frame_payload, validate_and_decode_payload,
+    AdaptiveCompressionState, CompressionConfig, CompressionDictionary, CompressionDictionaryKind,
+    DICTIONARY_FINGERPRINT_BYTES, maybe_compress_frame_payload_with_dictionary,
+    train_adaptive_dictionary, validate_and_decode_payload_with_dictionary,
 };
 use super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::frame::{FrameType, build_frame, stream_codec};
@@ -49,12 +50,14 @@ use super::probe_schedule::{
 use super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
 
 const DICTIONARY_COMPRESSION_HELLO_CAPABILITY: &[u8] = b"shitspeak-s2s-l1-zstd-dict-v1";
-const DICTIONARY_COMPRESSION_ADAPTIVE_FLAG: u8 = 0x01;
+const DICTIONARY_COMPRESSION_LEGACY_ADAPTIVE_FLAG: u8 = 0x01;
 const DICTIONARY_COMPRESSION_CONFIGURED_FLAG: u8 = 0x02;
+const DICTIONARY_COMPRESSION_ADAPTIVE_ADVERTISEMENT_FLAG: u8 = 0x04;
+const MAX_ADAPTIVE_DICTIONARIES_PER_STREAM: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PeerDictionaryCompressionSupport {
-    adaptive: bool,
+    adaptive_advertisement: bool,
     configured_fingerprint: Option<[u8; DICTIONARY_FINGERPRINT_BYTES]>,
 }
 
@@ -66,6 +69,45 @@ impl PeerDictionaryCompressionSupport {
         self.configured_fingerprint == Some(fingerprint)
     }
 }
+
+struct AdaptiveDictionaryStore {
+    by_id: HashMap<u64, Arc<CompressionDictionary>>,
+    order: VecDeque<u64>,
+    cap: usize,
+}
+
+impl AdaptiveDictionaryStore {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_id: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, dictionary: Arc<CompressionDictionary>) {
+        let id = dictionary.wire_id();
+        if !self.by_id.contains_key(&id) {
+            self.order.push_back(id);
+        }
+        self.by_id.insert(id, dictionary);
+        while self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_id.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<&CompressionDictionary> {
+        self.by_id.get(&id).map(Arc::as_ref)
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.by_id.contains_key(&id)
+    }
+}
+
+type AdaptiveTrainingResult = io::Result<Arc<CompressionDictionary>>;
 
 /// Tunables for a single stream pump. Cloned per stream.
 #[derive(Clone)]
@@ -323,8 +365,15 @@ async fn run_pump<S>(
     let level_for_metrics = cfg.transport.service_level();
     let mut outbound_compression = AdaptiveCompressionState::new(cfg.compression.clone());
     let mut inbound_compression = AdaptiveCompressionState::new(cfg.compression.clone());
-    let plain_outbound_compression = cfg.compression.clone().without_dictionary();
     let mut peer_dictionary_support = PeerDictionaryCompressionSupport::default();
+    let mut local_adaptive_dictionaries =
+        AdaptiveDictionaryStore::new(MAX_ADAPTIVE_DICTIONARIES_PER_STREAM);
+    let mut peer_adaptive_dictionaries =
+        AdaptiveDictionaryStore::new(MAX_ADAPTIVE_DICTIONARIES_PER_STREAM);
+    let mut active_adaptive_dictionary_id = None;
+    let mut pending_adaptive_dictionary_id = None;
+    let mut training_in_flight = false;
+    let (training_tx, mut training_rx) = mpsc::channel::<AdaptiveTrainingResult>(1);
 
     let hello = build_frame(
         cfg.local_node,
@@ -352,6 +401,15 @@ async fn run_pump<S>(
     }
 
     loop {
+        maybe_start_adaptive_training(
+            &mut outbound_compression,
+            peer_dictionary_support,
+            active_adaptive_dictionary_id,
+            pending_adaptive_dictionary_id,
+            &mut training_in_flight,
+            &training_tx,
+        );
+
         tokio::select! {
             biased;
 
@@ -393,6 +451,10 @@ async fn run_pump<S>(
                             &mut framed,
                             &mut pending,
                             &mut inbound_compression,
+                            &mut peer_adaptive_dictionaries,
+                            &local_adaptive_dictionaries,
+                            &mut active_adaptive_dictionary_id,
+                            &mut pending_adaptive_dictionary_id,
                             &mut peer_dictionary_support,
                             level_for_metrics,
                         ).await {
@@ -421,6 +483,29 @@ async fn run_pump<S>(
                 }
             }
 
+            maybe_dictionary = training_rx.recv() => {
+                training_in_flight = false;
+                let Some(result) = maybe_dictionary else { break };
+                match result {
+                    Ok(dictionary) => {
+                        let dictionary_id = dictionary.wire_id();
+                        local_adaptive_dictionaries.insert(dictionary.clone());
+                        if peer_dictionary_support.adaptive_advertisement {
+                            let frame = dictionary_advertisement_frame(&cfg, dictionary.as_ref());
+                            if let Err(e) = encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
+                                warn!(peer=%peer.node_id(), transport=?cfg.transport, dictionary_id, error=%e, "adaptive dictionary advertisement failed");
+                                break;
+                            }
+                            pending_adaptive_dictionary_id = Some(dictionary_id);
+                            trace!(peer=%peer.node_id(), transport=?cfg.transport, dictionary_id, "advertised adaptive dictionary");
+                        }
+                    }
+                    Err(e) => {
+                        debug!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "adaptive dictionary training failed");
+                    }
+                }
+            }
+
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
                 let original_payload_len = out.payload().len();
@@ -433,24 +518,33 @@ async fn run_pump<S>(
                     now_us(),
                     out.payload().clone(),
                 );
-                if let Err(e) = maybe_compress_frame_payload(
+                let dictionary = outbound_compression_dictionary(
+                    outbound_compression.config(),
+                    &local_adaptive_dictionaries,
+                    active_adaptive_dictionary_id,
+                    peer_dictionary_support,
+                );
+                if let Err(e) = maybe_compress_frame_payload_with_dictionary(
                     &mut frame,
                     out.options(),
-                    outbound_compression_config(
-                        outbound_compression.config(),
-                        &plain_outbound_compression,
-                        peer_dictionary_support,
-                    ),
+                    outbound_compression.config(),
+                    dictionary,
                     cfg.max_frame_bytes,
                 ) {
                     warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream payload compression failed");
                     break;
                 }
+                let encoded_payload_len = frame.payload.len();
                 match encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
                     Ok(()) => {
                         peer
                             .metrics()
                             .record_payload_sent(cfg.transport, original_payload_len);
+                        peer.metrics().record_l1_compression_sent(
+                            cfg.transport,
+                            original_payload_len,
+                            encoded_payload_len,
+                        );
                         outbound_compression.record_sample(out.payload());
                     }
                     Err(e) => {
@@ -599,6 +693,148 @@ fn record_evicted_pending(
     }
 }
 
+fn maybe_start_adaptive_training(
+    state: &mut AdaptiveCompressionState,
+    peer_support: PeerDictionaryCompressionSupport,
+    active_adaptive_dictionary_id: Option<u64>,
+    pending_adaptive_dictionary_id: Option<u64>,
+    training_in_flight: &mut bool,
+    training_tx: &mpsc::Sender<AdaptiveTrainingResult>,
+) {
+    if *training_in_flight
+        || active_adaptive_dictionary_id.is_some()
+        || pending_adaptive_dictionary_id.is_some()
+        || !peer_support.adaptive_advertisement
+    {
+        return;
+    }
+
+    let Some(snapshot) = state.training_snapshot_if_ready() else {
+        return;
+    };
+
+    *training_in_flight = true;
+    let training_tx = training_tx.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || train_adaptive_dictionary(snapshot))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .and_then(|result| result);
+        let _ = training_tx.send(result).await;
+    });
+}
+
+fn outbound_compression_dictionary<'a>(
+    cfg: &'a CompressionConfig,
+    local_adaptive_dictionaries: &'a AdaptiveDictionaryStore,
+    active_adaptive_dictionary_id: Option<u64>,
+    peer_support: PeerDictionaryCompressionSupport,
+) -> Option<&'a CompressionDictionary> {
+    if let Some(fingerprint) = cfg.configured_dictionary_fingerprint() {
+        if peer_support.supports_configured_dictionary(fingerprint) {
+            return cfg.dictionary();
+        }
+    }
+
+    if !peer_support.adaptive_advertisement {
+        return None;
+    }
+
+    active_adaptive_dictionary_id.and_then(|id| local_adaptive_dictionaries.get(id))
+}
+
+fn inbound_compression_dictionary<'a>(
+    frame: &pb::Frame,
+    cfg: &'a CompressionConfig,
+    peer_adaptive_dictionaries: &'a AdaptiveDictionaryStore,
+) -> Option<&'a CompressionDictionary> {
+    if pb::PayloadEncoding::try_from(frame.payload_encoding) != Ok(pb::PayloadEncoding::ZstdDict) {
+        return None;
+    }
+
+    if frame.payload_dictionary_id == 0 {
+        return cfg.dictionary();
+    }
+
+    if cfg.dictionary_wire_id() == Some(frame.payload_dictionary_id) {
+        return cfg.dictionary();
+    }
+
+    peer_adaptive_dictionaries.get(frame.payload_dictionary_id)
+}
+
+fn dictionary_advertisement_frame(
+    cfg: &StreamPumpConfig,
+    dictionary: &CompressionDictionary,
+) -> pb::Frame {
+    let mut frame = build_frame(
+        cfg.local_node,
+        cfg.peer_node,
+        cfg.transport.service_level(),
+        FrameType::Dictionary,
+        MessageClass::Control,
+        now_us(),
+        dictionary.bytes(),
+    );
+    frame.payload_dictionary_id = dictionary.wire_id();
+    frame
+}
+
+fn dictionary_ack_frame(cfg: &StreamPumpConfig, dictionary_id: u64) -> pb::Frame {
+    let mut frame = build_frame(
+        cfg.local_node,
+        cfg.peer_node,
+        cfg.transport.service_level(),
+        FrameType::DictionaryAck,
+        MessageClass::Control,
+        now_us(),
+        Bytes::new(),
+    );
+    frame.payload_dictionary_id = dictionary_id;
+    frame
+}
+
+async fn handle_dictionary_advertisement<S>(
+    frame: pb::Frame,
+    cfg: &StreamPumpConfig,
+    peer: &PeerState,
+    framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
+    peer_adaptive_dictionaries: &mut AdaptiveDictionaryStore,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    if !cfg.compression.enabled() || !cfg.compression.adaptive_dictionary_enabled() {
+        return Ok(());
+    }
+
+    let dictionary_id = frame.payload_dictionary_id;
+    if dictionary_id == 0 || frame.payload.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "adaptive dictionary advertisement missing dictionary id or bytes",
+        ));
+    }
+
+    let dictionary = Arc::new(CompressionDictionary::new(
+        frame.payload.to_vec(),
+        cfg.compression.level(),
+        CompressionDictionaryKind::Adaptive,
+    )?);
+    if dictionary.wire_id() != dictionary_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "adaptive dictionary advertisement id does not match bytes",
+        ));
+    }
+
+    peer_adaptive_dictionaries.insert(dictionary);
+    let ack = dictionary_ack_frame(cfg, dictionary_id);
+    encode_and_send(framed, &ack, cfg.transport, peer).await?;
+    trace!(peer=%cfg.peer_node, transport=?cfg.transport, dictionary_id, "accepted adaptive dictionary");
+    Ok(())
+}
+
 async fn encode_and_send<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     frame: &pb::Frame,
@@ -650,6 +886,8 @@ fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static
             Ok(pb::FrameType::FrameKeepalive) => "transport.tcp.frame.keepalive",
             Ok(pb::FrameType::FrameHello) => "transport.tcp.frame.hello",
             Ok(pb::FrameType::FrameBye) => "transport.tcp.frame.bye",
+            Ok(pb::FrameType::FrameDictionary) => "transport.tcp.frame.dictionary",
+            Ok(pb::FrameType::FrameDictionaryAck) => "transport.tcp.frame.dictionary_ack",
             Err(_) => "transport.tcp.frame.unknown",
         },
         TransportKind::Kcp => match pb::FrameType::try_from(frame_type) {
@@ -659,6 +897,8 @@ fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static
             Ok(pb::FrameType::FrameKeepalive) => "transport.kcp.frame.keepalive",
             Ok(pb::FrameType::FrameHello) => "transport.kcp.frame.hello",
             Ok(pb::FrameType::FrameBye) => "transport.kcp.frame.bye",
+            Ok(pb::FrameType::FrameDictionary) => "transport.kcp.frame.dictionary",
+            Ok(pb::FrameType::FrameDictionaryAck) => "transport.kcp.frame.dictionary_ack",
             Err(_) => "transport.kcp.frame.unknown",
         },
         TransportKind::Quic => match pb::FrameType::try_from(frame_type) {
@@ -668,6 +908,8 @@ fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static
             Ok(pb::FrameType::FrameKeepalive) => "transport.quic.frame.keepalive",
             Ok(pb::FrameType::FrameHello) => "transport.quic.frame.hello",
             Ok(pb::FrameType::FrameBye) => "transport.quic.frame.bye",
+            Ok(pb::FrameType::FrameDictionary) => "transport.quic.frame.dictionary",
+            Ok(pb::FrameType::FrameDictionaryAck) => "transport.quic.frame.dictionary_ack",
             Err(_) => "transport.quic.frame.unknown",
         },
         TransportKind::Udp => match pb::FrameType::try_from(frame_type) {
@@ -677,6 +919,8 @@ fn stream_frame_kind_name(transport: TransportKind, frame_type: i32) -> &'static
             Ok(pb::FrameType::FrameKeepalive) => "transport.udp.stream_frame.keepalive",
             Ok(pb::FrameType::FrameHello) => "transport.udp.stream_frame.hello",
             Ok(pb::FrameType::FrameBye) => "transport.udp.stream_frame.bye",
+            Ok(pb::FrameType::FrameDictionary) => "transport.udp.stream_frame.dictionary",
+            Ok(pb::FrameType::FrameDictionaryAck) => "transport.udp.stream_frame.dictionary_ack",
             Err(_) => "transport.udp.stream_frame.unknown",
         },
     }
@@ -691,17 +935,30 @@ async fn handle_inbound<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     pending: &mut PendingPings,
     inbound_compression: &mut AdaptiveCompressionState,
+    peer_adaptive_dictionaries: &mut AdaptiveDictionaryStore,
+    local_adaptive_dictionaries: &AdaptiveDictionaryStore,
+    active_adaptive_dictionary_id: &mut Option<u64>,
+    pending_adaptive_dictionary_id: &mut Option<u64>,
     peer_dictionary_support: &mut PeerDictionaryCompressionSupport,
     level: ServiceLevel,
 ) -> std::io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
-    validate_and_decode_payload(
-        &mut frame,
-        cfg.max_frame_bytes,
-        inbound_compression.config(),
-    )?;
+    let encoded_payload_len = frame.payload.len();
+    {
+        let dictionary = inbound_compression_dictionary(
+            &frame,
+            inbound_compression.config(),
+            peer_adaptive_dictionaries,
+        );
+        validate_and_decode_payload_with_dictionary(
+            &mut frame,
+            cfg.max_frame_bytes,
+            inbound_compression.config(),
+            dictionary,
+        )?;
+    }
     let mut transport_link_stable = false;
     let ty = match pb::FrameType::try_from(frame.frame_type) {
         Ok(v) => v,
@@ -712,8 +969,14 @@ where
             let class = pb::MessageClass::try_from(frame.message_class)
                 .map(MessageClass::from)
                 .unwrap_or(MessageClass::Regular);
+            let original_payload_len = frame.payload.len();
             peer.metrics()
-                .record_payload_recv(cfg.transport, frame.payload.len());
+                .record_payload_recv(cfg.transport, original_payload_len);
+            peer.metrics().record_l1_compression_recv(
+                cfg.transport,
+                original_payload_len,
+                encoded_payload_len,
+            );
             inbound_compression.record_sample(&frame.payload);
             inbound.dispatch(super::manager::InboundMessage::new(
                 cfg.peer_node,
@@ -766,6 +1029,21 @@ where
                 parse_dictionary_compression_hello_payload(frame.payload.as_ref());
             trace!(peer=%cfg.peer_node, transport=?cfg.transport, "received transport hello");
         }
+        pb::FrameType::FrameDictionary => {
+            handle_dictionary_advertisement(frame, cfg, peer, framed, peer_adaptive_dictionaries)
+                .await?;
+        }
+        pb::FrameType::FrameDictionaryAck => {
+            let dictionary_id = frame.payload_dictionary_id;
+            if acknowledge_adaptive_dictionary(
+                dictionary_id,
+                local_adaptive_dictionaries,
+                active_adaptive_dictionary_id,
+                pending_adaptive_dictionary_id,
+            ) {
+                trace!(peer=%cfg.peer_node, transport=?cfg.transport, dictionary_id, "adaptive dictionary acknowledged");
+            }
+        }
         pb::FrameType::FrameBye => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
@@ -774,6 +1052,25 @@ where
         }
     }
     Ok(transport_link_stable)
+}
+
+fn acknowledge_adaptive_dictionary(
+    dictionary_id: u64,
+    local_adaptive_dictionaries: &AdaptiveDictionaryStore,
+    active_adaptive_dictionary_id: &mut Option<u64>,
+    pending_adaptive_dictionary_id: &mut Option<u64>,
+) -> bool {
+    if dictionary_id == 0 || *pending_adaptive_dictionary_id != Some(dictionary_id) {
+        return false;
+    }
+
+    if !local_adaptive_dictionaries.contains(dictionary_id) {
+        return false;
+    }
+
+    *active_adaptive_dictionary_id = Some(dictionary_id);
+    *pending_adaptive_dictionary_id = None;
+    true
 }
 
 fn dictionary_compression_supported(cfg: &CompressionConfig) -> bool {
@@ -788,7 +1085,7 @@ fn dictionary_compression_hello_payload(cfg: &CompressionConfig) -> Bytes {
     let configured_fingerprint = cfg.configured_dictionary_fingerprint();
     let mut flags = 0;
     if cfg.adaptive_dictionary_enabled() {
-        flags |= DICTIONARY_COMPRESSION_ADAPTIVE_FLAG;
+        flags |= DICTIONARY_COMPRESSION_ADAPTIVE_ADVERTISEMENT_FLAG;
     }
     if configured_fingerprint.is_some() {
         flags |= DICTIONARY_COMPRESSION_CONFIGURED_FLAG;
@@ -835,29 +1132,9 @@ fn parse_dictionary_compression_hello_payload(payload: &[u8]) -> PeerDictionaryC
     }
 
     PeerDictionaryCompressionSupport {
-        adaptive: flags & DICTIONARY_COMPRESSION_ADAPTIVE_FLAG != 0,
+        adaptive_advertisement: flags & DICTIONARY_COMPRESSION_ADAPTIVE_ADVERTISEMENT_FLAG != 0,
         configured_fingerprint,
     }
-}
-
-fn outbound_compression_config<'a>(
-    candidate: &'a CompressionConfig,
-    plain: &'a CompressionConfig,
-    peer_support: PeerDictionaryCompressionSupport,
-) -> &'a CompressionConfig {
-    if let Some(fingerprint) = candidate.configured_dictionary_fingerprint() {
-        return if peer_support.supports_configured_dictionary(fingerprint) {
-            candidate
-        } else {
-            plain
-        };
-    }
-
-    if candidate.has_adaptive_dictionary() && !peer_support.adaptive {
-        return plain;
-    }
-
-    candidate
 }
 
 #[inline]
@@ -924,7 +1201,7 @@ mod tests {
             dictionary_compression_hello_payload(&cfg).as_ref(),
         );
 
-        assert!(support.adaptive);
+        assert!(support.adaptive_advertisement);
         assert_eq!(
             support.configured_fingerprint,
             cfg.configured_dictionary_fingerprint()
@@ -936,7 +1213,18 @@ mod tests {
         let support =
             parse_dictionary_compression_hello_payload(DICTIONARY_COMPRESSION_HELLO_CAPABILITY);
 
-        assert!(!support.adaptive);
+        assert!(!support.adaptive_advertisement);
+        assert!(support.configured_fingerprint.is_none());
+    }
+
+    #[test]
+    fn legacy_adaptive_hello_flag_is_not_treated_as_advertisement_support() {
+        let mut payload = DICTIONARY_COMPRESSION_HELLO_CAPABILITY.to_vec();
+        payload.push(DICTIONARY_COMPRESSION_LEGACY_ADAPTIVE_FLAG);
+
+        let support = parse_dictionary_compression_hello_payload(&payload);
+
+        assert!(!support.adaptive_advertisement);
         assert!(support.configured_fingerprint.is_none());
     }
 
@@ -947,25 +1235,95 @@ mod tests {
                 b"configured s2s transport zstd dictionary bytes for tests".to_vec(),
             )
             .unwrap();
-        let plain = cfg.clone().without_dictionary();
+        let local_adaptive_dictionaries =
+            AdaptiveDictionaryStore::new(MAX_ADAPTIVE_DICTIONARIES_PER_STREAM);
         let adaptive_only_peer = PeerDictionaryCompressionSupport {
-            adaptive: true,
+            adaptive_advertisement: true,
             configured_fingerprint: None,
         };
 
-        assert_eq!(
-            outbound_compression_config(&cfg, &plain, adaptive_only_peer).dictionary_len(),
-            None
+        assert!(
+            outbound_compression_dictionary(
+                &cfg,
+                &local_adaptive_dictionaries,
+                None,
+                adaptive_only_peer
+            )
+            .is_none()
         );
 
         let matching_peer = PeerDictionaryCompressionSupport {
-            adaptive: true,
+            adaptive_advertisement: true,
             configured_fingerprint: cfg.configured_dictionary_fingerprint(),
         };
         assert_eq!(
-            outbound_compression_config(&cfg, &plain, matching_peer).dictionary_len(),
-            cfg.dictionary_len()
+            outbound_compression_dictionary(
+                &cfg,
+                &local_adaptive_dictionaries,
+                None,
+                matching_peer
+            )
+            .map(CompressionDictionary::wire_id),
+            cfg.dictionary_wire_id()
         );
+    }
+
+    #[test]
+    fn adaptive_dictionary_ack_must_match_pending_local_dictionary() {
+        let dictionary = Arc::new(
+            CompressionDictionary::new(
+                b"adaptive s2s transport zstd dictionary bytes for ack tests".to_vec(),
+                CompressionConfig::default().level(),
+                CompressionDictionaryKind::Adaptive,
+            )
+            .unwrap(),
+        );
+        let dictionary_id = dictionary.wire_id();
+        let unrelated_id = if dictionary_id == u64::MAX {
+            1
+        } else {
+            dictionary_id + 1
+        };
+        let mut local_adaptive_dictionaries =
+            AdaptiveDictionaryStore::new(MAX_ADAPTIVE_DICTIONARIES_PER_STREAM);
+        local_adaptive_dictionaries.insert(dictionary);
+        let mut active_adaptive_dictionary_id = None;
+        let mut pending_adaptive_dictionary_id = None;
+
+        assert!(!acknowledge_adaptive_dictionary(
+            dictionary_id,
+            &local_adaptive_dictionaries,
+            &mut active_adaptive_dictionary_id,
+            &mut pending_adaptive_dictionary_id,
+        ));
+        assert_eq!(active_adaptive_dictionary_id, None);
+
+        pending_adaptive_dictionary_id = Some(unrelated_id);
+        assert!(!acknowledge_adaptive_dictionary(
+            dictionary_id,
+            &local_adaptive_dictionaries,
+            &mut active_adaptive_dictionary_id,
+            &mut pending_adaptive_dictionary_id,
+        ));
+        assert_eq!(active_adaptive_dictionary_id, None);
+        assert_eq!(pending_adaptive_dictionary_id, Some(unrelated_id));
+
+        pending_adaptive_dictionary_id = Some(dictionary_id);
+        assert!(acknowledge_adaptive_dictionary(
+            dictionary_id,
+            &local_adaptive_dictionaries,
+            &mut active_adaptive_dictionary_id,
+            &mut pending_adaptive_dictionary_id,
+        ));
+        assert_eq!(active_adaptive_dictionary_id, Some(dictionary_id));
+        assert_eq!(pending_adaptive_dictionary_id, None);
+
+        assert!(!acknowledge_adaptive_dictionary(
+            dictionary_id,
+            &local_adaptive_dictionaries,
+            &mut active_adaptive_dictionary_id,
+            &mut pending_adaptive_dictionary_id,
+        ));
     }
 
     #[test]

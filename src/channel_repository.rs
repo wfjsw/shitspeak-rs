@@ -140,6 +140,7 @@ impl ChannelOperation {
                 // ACL changes produce PermissionQuery messages, not ChannelState.
                 None
             }
+            ChannelOp::InstallSnapshot { .. } => None,
         }
     }
 }
@@ -221,6 +222,11 @@ pub enum ChannelOp {
         channel_id: u32,
         inherit_acl: bool,
         acls: Vec<ACL>,
+    },
+    /// Synthetic local notification emitted when S2S installs a channel snapshot.
+    InstallSnapshot {
+        channels: Vec<Channel>,
+        removed: Vec<u32>,
     },
 }
 
@@ -1795,27 +1801,49 @@ impl ChannelRepository {
         channels_snapshot: Vec<Channel>,
         freshness: i64,
     ) -> Result<(), ChannelRepoError> {
-        let valid_channel_ids = {
+        let (valid_channel_ids, notification_channels, removed_channel_ids) = {
             let mut ids = HashSet::new();
+            let mut notification_channels = Vec::new();
+            let mut removed_channel_ids = Vec::new();
             {
                 let mut all_channels = self.channels.write();
                 let channels = all_channels.entry(server_id.to_owned()).or_default();
+                let old_ids: HashSet<u32> = channels.keys().copied().collect();
                 channels.clear();
                 for channel in channels_snapshot {
                     channels.insert(channel.id, channel);
                 }
                 ensure_root_channel(channels);
                 ids.extend(channels.keys().copied());
+                notification_channels.extend(channels.values().cloned());
+                removed_channel_ids.extend(
+                    old_ids
+                        .difference(&ids)
+                        .copied()
+                        .filter(|channel_id| *channel_id != 0),
+                );
                 self.versions.write().insert(server_id.to_owned(), version);
                 self.log.write().retain(|op| op.server_id != server_id);
             }
-            ids
+            (ids, notification_channels, removed_channel_ids)
         };
         self.history_freshness
             .write()
             .insert(server_id.to_owned(), freshness);
         self.channel_acl_generation.fetch_add(1, Ordering::AcqRel);
         self.acl_cache.clear_sync();
+
+        let _ = self.tx.send(Arc::new(ChannelOperation {
+            server_id: server_id.to_owned(),
+            version,
+            node_id: self.node_id,
+            timestamp: freshness,
+            emits_client_message: true,
+            op: ChannelOp::InstallSnapshot {
+                channels: notification_channels,
+                removed: removed_channel_ids,
+            },
+        }));
 
         let client_repo = self.client_repo.lock().clone();
         if let Some(client_repo) = client_repo {
@@ -1965,6 +1993,7 @@ impl ChannelRepository {
                     return Err(ChannelRepoError::NotFound(*channel_id));
                 }
             }
+            ChannelOp::InstallSnapshot { .. } => {}
         }
         Ok(())
     }
@@ -2160,6 +2189,15 @@ fn apply_op_to_map(channels: &mut HashMap<u32, Channel>, op: &ChannelOp, origin_
                 ch.acls = acls.clone();
             }
         }
+        ChannelOp::InstallSnapshot {
+            channels: snapshot, ..
+        } => {
+            channels.clear();
+            for channel in snapshot {
+                channels.insert(channel.id, channel.clone());
+            }
+            ensure_root_channel(channels);
+        }
     }
 }
 
@@ -2193,7 +2231,8 @@ fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
     match op {
         ChannelOp::CreateChannel { .. }
         | ChannelOp::DeleteChannel { .. }
-        | ChannelOp::SetAcls { .. } => true,
+        | ChannelOp::SetAcls { .. }
+        | ChannelOp::InstallSnapshot { .. } => true,
         ChannelOp::UpdateChannel { patch, .. } | ChannelOp::EditChannel { patch, .. } => {
             patch.parent_id.is_some()
         }

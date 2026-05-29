@@ -198,6 +198,43 @@ impl PeerAddress {
     }
 }
 
+/// A configured seed address. Unlike [`PeerAddress`], this keeps hostname
+/// seeds unresolved so DNS failures can use the normal seed retry path instead
+/// of preventing startup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SeedAddress {
+    addr: String,
+    transport: TransportKind,
+}
+
+impl SeedAddress {
+    pub fn new(addr: impl Into<String>, transport: TransportKind) -> Self {
+        Self {
+            addr: addr.into(),
+            transport,
+        }
+    }
+
+    pub fn from_peer_address(addr: PeerAddress) -> Self {
+        Self::new(addr.addr().to_string(), addr.transport())
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    pub fn transport(&self) -> TransportKind {
+        self.transport
+    }
+
+    pub fn as_static_peer_address(&self) -> Option<PeerAddress> {
+        self.addr
+            .parse::<SocketAddr>()
+            .ok()
+            .map(|addr| PeerAddress::new(addr, self.transport))
+    }
+}
+
 /// Lookup convenience: who is asking? Used by the supervisor when iterating
 /// peers waiting on a reconnect attempt.
 #[derive(Debug, Clone, Copy)]

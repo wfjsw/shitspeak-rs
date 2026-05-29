@@ -22,9 +22,13 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
         return;
     };
 
-    let known = rt.repo.known_versions();
-    let (origin_epoch, _origin_version) = match known.get(&origin) {
-        Some(p) => *p,
+    let repo_known = rt.repo.known_versions();
+    let runtime_known = {
+        let state = rt.state.lock();
+        state.known.get(&origin).copied()
+    };
+    let (origin_epoch, _origin_version) = match repo_known.get(&origin).copied().or(runtime_known) {
+        Some(p) => p,
         None => {
             // We don't know about this origin — respond empty.
             let _ = rt
@@ -107,6 +111,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
 
 pub(crate) async fn apply_response<R: OwnerReplicable>(
     rt: &OwnerRuntime<R>,
+    from: NodeIdentifier,
     resp: OwnerCatchupResp,
 ) {
     let Some(origin) = node_from_u32(resp.origin_node) else {
@@ -187,7 +192,9 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             .into_iter()
             .filter(|n| *n != rt.self_id && *n != origin)
             .collect();
-        let dst = if !peers.is_empty() {
+        let dst = if from == origin {
+            origin
+        } else if !peers.is_empty() {
             let mut rng = rand::rng();
             peers.shuffle(&mut rng);
             peers[0]
@@ -197,13 +204,6 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         let since = {
             let s = rt.state.lock();
             s.known.get(&origin).map(|(_, v)| *v).unwrap_or(0)
-        };
-        let req = OwnerCatchupReq {
-            origin_node: origin as u32,
-            src_node: rt.self_id as u32,
-            known_epoch: resp_epoch,
-            since_version: since,
-            chunk_token: resp.next_chunk_token,
         };
         // Re-arm the in-flight gate so we don't double-trigger on
         // out-of-order ops arriving meanwhile.
@@ -216,8 +216,19 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             );
         }
         let _ = rt
-            .net
-            .send_unicast(dst, &rt.topic, OwnerBody::CatchupReq(req))
+            .send_catchup_req_to(dst, origin, resp_epoch, since, resp.next_chunk_token)
+            .await;
+        return;
+    }
+
+    let version_after = {
+        let s = rt.state.lock();
+        s.known.get(&origin).map(|(_, v)| *v).unwrap_or(0)
+    };
+    if from != origin && origin != rt.self_id && rt.net.alive_members().contains(&origin) {
+        let known_epoch = rt.net.member_boot_epoch(origin).unwrap_or(resp_epoch);
+        let _ = rt
+            .send_catchup_req_to(origin, origin, known_epoch, version_after, 0)
             .await;
     }
 }

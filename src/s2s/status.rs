@@ -80,6 +80,9 @@ struct TransportMetric {
     sent_bps: f64,
     wire_recv_bps: f64,
     wire_sent_bps: f64,
+    compression_recv_ratio: Option<f64>,
+    compression_sent_ratio: Option<f64>,
+    compression_total_ratio: Option<f64>,
     packet_loss_ppm: u32,
     probe_loss_ppm: u32,
     probe_loss_ewma_ppm: u32,
@@ -358,6 +361,9 @@ fn build_topology_snapshot(
                 sent_bps: metric.sent_bps(),
                 wire_recv_bps: metric.wire_recv_bps(),
                 wire_sent_bps: metric.wire_sent_bps(),
+                compression_recv_ratio: metric.l1_compression_recv_ratio(),
+                compression_sent_ratio: metric.l1_compression_sent_ratio(),
+                compression_total_ratio: metric.l1_compression_total_ratio(),
                 packet_loss_ppm: metric.packet_loss_ppm(),
                 probe_loss_ppm: metric.probe_loss_ppm(),
                 probe_loss_ewma_ppm: metric.probe_loss_ewma_ppm(),
@@ -507,7 +513,7 @@ th { color: var(--muted); font-weight: 600; background: #fafbfc; }
   <section class="tables">
     <div class="panel"><h2>Nodes</h2><table><thead><tr><th>Node</th><th>Status</th><th>LSA</th><th>Addresses</th></tr></thead><tbody id="nodes"></tbody></table></div>
     <div class="panel"><h2>Packet IO</h2><table><thead><tr><th>Kind</th><th>Total</th><th>Sent</th><th>Recv</th><th>Count</th><th>Avg</th></tr></thead><tbody id="packet-io"></tbody></table></div>
-    <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Loss</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Voice</th><th>Control</th><th>Bulk</th></tr></thead><tbody id="metrics"></tbody></table></div>
+    <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Loss</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Compression</th><th>Voice</th><th>Control</th><th>Bulk</th></tr></thead><tbody id="metrics"></tbody></table></div>
     <div class="panel"><h2>Routes</h2><table><thead><tr><th>Metric</th><th>Level</th><th>Dst</th><th>Next hop</th><th>Cost</th></tr></thead><tbody id="routes"></tbody></table></div>
   </section>
 </main>
@@ -530,6 +536,16 @@ function fmtBps(v) { if (!v) return '-'; const u = ['B/s','KB/s','MB/s','GB/s'];
 function fmtLoss(v) { return v ? (v / 10000).toFixed(2) + '%' : '0%'; }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtPair(a, b) { const v = Math.max(a || 0, b || 0); return fmtBps(v); }
+function fmtCompressionRatio(v) {
+    if (v === null || v === undefined || !Number.isFinite(Number(v)) || v <= 0) return '-';
+    const factor = 1 / v;
+    const savings = (1 - v) * 100;
+    return `${factor.toFixed(factor >= 10 ? 1 : 2)}x / ${savings.toFixed(1)}%`;
+}
+function compressionCell(item) {
+    if (item.compression_total_ratio === null || item.compression_total_ratio === undefined) return '-';
+    return `${fmtCompressionRatio(item.compression_total_ratio)}<br><span class="transport">sent ${fmtCompressionRatio(item.compression_sent_ratio)} &middot; recv ${fmtCompressionRatio(item.compression_recv_ratio)}</span>`;
+}
 function lossBreakdown(item) {
     return `eff ${fmtLoss(item.loss_ppm ?? item.packet_loss_ppm)}<br><span class="transport">probe ${fmtLoss(item.probe_loss_ppm)} &middot; native ${fmtLoss(item.native_loss_ppm)} &middot; data ${fmtLoss(item.data_health_ppm)}</span>`;
 }
@@ -679,7 +695,7 @@ function renderTables(data) {
   packetIoTbody.innerHTML = packetRows.length
     ? packetRows.map(p => `<tr><td>${esc(p.kind)}</td><td>${fmtBytes(p.total_bytes)}</td><td>${fmtBytes(p.sent_bytes)}<br><span class="transport">${p.sent_count}</span></td><td>${fmtBytes(p.recv_bytes)}<br><span class="transport">${p.recv_count}</span></td><td>${p.total_count}</td><td>${fmtBps(p.avg_total_bps)}</td></tr>`).join('')
     : `<tr><td colspan="6" class="transport">-</td></tr>`;
-  metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
+  metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${compressionCell(m)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
   routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${r.cost}</td></tr>`).join('');
 }
 async function refresh() {
@@ -732,6 +748,8 @@ mod tests {
         assert!(STATUS_HTML.contains("tooltipHtml(["));
         assert!(STATUS_HTML.contains("Packet IO"));
         assert!(STATUS_HTML.contains("debug_packet_io"));
+        assert!(STATUS_HTML.contains("Compression"));
+        assert!(STATUS_HTML.contains("compression_total_ratio"));
         assert!(STATUS_HTML.contains("network.setOptions({ physics: false })"));
     }
 }

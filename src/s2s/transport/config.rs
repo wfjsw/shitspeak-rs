@@ -11,7 +11,7 @@ use super::compression::{
     default_compression_enabled, default_compression_level, default_compression_min_bytes,
     default_compression_min_savings_percent,
 };
-use super::service_level::{PeerAddress, ServiceShape, TransportKind};
+use super::service_level::{PeerAddress, SeedAddress, ServiceShape, TransportKind};
 
 const PROBE_FRAME_OVERHEAD_BUDGET: usize = 128;
 
@@ -36,6 +36,7 @@ pub struct TransportConfig {
     quic_advertise_override: bool,
     udp_advertise_override: bool,
     seed_addresses: Vec<PeerAddress>,
+    seed_targets: Vec<SeedAddress>,
 
     backoff_initial: Duration,
     backoff_cap: Duration,
@@ -116,6 +117,7 @@ impl TransportConfig {
             quic_advertise_override: false,
             udp_advertise_override: false,
             seed_addresses: Vec::new(),
+            seed_targets: Vec::new(),
             backoff_initial: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
             stale_backoff_cap: Duration::from_secs(10 * 60),
@@ -228,6 +230,23 @@ impl TransportConfig {
 
     pub fn seed_addresses(&self) -> &[PeerAddress] {
         &self.seed_addresses
+    }
+
+    pub fn seed_address_count(&self) -> usize {
+        self.seed_addresses
+            .len()
+            .saturating_add(self.seed_targets.len())
+    }
+
+    pub(crate) fn seed_targets(&self) -> Vec<SeedAddress> {
+        let mut targets = self.seed_targets.clone();
+        targets.extend(
+            self.seed_addresses
+                .iter()
+                .copied()
+                .map(SeedAddress::from_peer_address),
+        );
+        targets
     }
 
     pub fn backoff_initial(&self) -> Duration {
@@ -492,6 +511,16 @@ impl TransportConfig {
 
     pub fn with_seed_address(mut self, addr: PeerAddress) -> Self {
         self.seed_addresses.push(addr);
+        self
+    }
+
+    pub fn with_seed_targets(mut self, targets: Vec<SeedAddress>) -> Self {
+        self.seed_targets = targets;
+        self
+    }
+
+    pub fn with_seed_target(mut self, target: SeedAddress) -> Self {
+        self.seed_targets.push(target);
         self
     }
 

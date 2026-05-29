@@ -611,9 +611,14 @@ async fn measure_tcp_wire_efficiency(
     wait_for_link(&mgr_b, node_a, TransportKind::Tcp).await;
 
     if warmup {
-        for i in 0..96 {
+        for i in 0..160 {
             send_tcp_compression_sample(&mgr_a, &mut inbound_b, node_b, i).await;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for i in 160..176 {
+            send_tcp_compression_sample(&mgr_a, &mut inbound_b, node_b, i).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     let before = tcp_metrics(&mgr_a, node_b);

@@ -19,7 +19,7 @@ use crate::messages::encoder::{Ping, PluginDataTransmission, UserStats};
 use crate::s2s::testing::{
     Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port, s2s_network_test_guard, wait_until,
 };
-use crate::s2s::transport::ServiceLevel;
+use crate::s2s::transport::{PeerAddress, ServiceLevel, TransportKind};
 use crate::voice::codec::AudioPayload;
 
 const S2S_DEADLINE: Duration = Duration::from_secs(10);
@@ -167,6 +167,54 @@ async fn wait_for_s2s_pair(a: &TestServer, b: &TestServer) {
     .await;
 
     assert!(ready, "S2S pair did not discover each other in time");
+}
+
+async fn wait_for_s2s_cluster(nodes: &[(&TestServer, u16)]) {
+    let ready = wait_until(S2S_DEADLINE, || {
+        nodes.iter().all(|(server, node_id)| {
+            let mgr = server.server.s2s_manager();
+            let Some(overlay) = mgr.overlay() else {
+                return false;
+            };
+            mgr.application().is_some()
+                && mgr.replications().is_some()
+                && nodes.iter().all(|(_, peer_id)| {
+                    node_id == peer_id
+                        || (overlay.alive_members().contains(peer_id)
+                            && overlay.route_to(*peer_id, ServiceLevel::Reliable).is_some())
+                })
+        })
+    })
+    .await;
+
+    assert!(ready, "S2S cluster did not converge in time");
+}
+
+async fn wait_for_s2s_runtime(server: &TestServer) {
+    let ready = wait_until(S2S_DEADLINE, || {
+        let mgr = server.server.s2s_manager();
+        mgr.transport().is_some()
+            && mgr.overlay().is_some()
+            && mgr.application().is_some()
+            && mgr.replications().is_some()
+    })
+    .await;
+
+    assert!(ready, "S2S runtime did not start in time");
+}
+
+async fn add_s2s_peer_address(server: &TestServer, node_id: u16, port: u16) {
+    let transport = server
+        .server
+        .s2s_manager()
+        .transport()
+        .expect("s2s transport should be running");
+    transport
+        .add_address(
+            node_id,
+            PeerAddress::new(loopback(port), TransportKind::Tcp),
+        )
+        .await;
 }
 
 fn register_pair_users(a: &TestServer, b: &TestServer) {
@@ -447,6 +495,276 @@ async fn s2s_channel_replication_propagates() {
     assert!(replicated, "Server B should advance its channel log");
 }
 
+/// Checks that a node joining with a divergent channel history reconciles the
+/// channel tree before remote client state can expose channels from the losing
+/// history. Expected: the higher-version channel history wins, both connected
+/// clients receive the repaired layout, and Alice never sees Bob in B's
+/// discarded channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_divergent_channel_layout_converges_before_client_integration() {
+    let _guard = s2s_network_test_guard().await;
+    let pki = Arc::new(mint_pki(&[1, 2]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+
+    let a = spawn_s2s_test_server(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        TestS2sServerOpts {
+            node_id: 1,
+            cert_index: 0,
+            tcp_listen: loopback(a_s2s_port),
+            seed_addresses: Vec::new(),
+        },
+    )
+    .await;
+    let b = spawn_s2s_test_server(
+        TestServerOpts::default(),
+        pki,
+        TestS2sServerOpts {
+            node_id: 2,
+            cert_index: 1,
+            tcp_listen: loopback(b_s2s_port),
+            seed_addresses: Vec::new(),
+        },
+    )
+    .await;
+    wait_for_s2s_runtime(&a).await;
+    wait_for_s2s_runtime(&b).await;
+
+    a.server
+        .get_channels()
+        .create_channel(crate::channels::Channel::new(
+            42,
+            "Elected Lobby".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create A channel 42");
+    a.server
+        .get_channels()
+        .create_channel(crate::channels::Channel::new(
+            43,
+            "Elected Annex".to_owned(),
+            1,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create A channel 43");
+    b.server
+        .get_channels()
+        .create_channel(crate::channels::Channel::new(
+            84,
+            "Discarded Lobby".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create B-only channel 84");
+
+    register_pair_users(&a, &b);
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+    alice.move_to_channel(42).await;
+    bob.move_to_channel(84).await;
+
+    let local_moves_applied = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            let alice_channel = handle
+                .block_on(a.server.get_clients().get_client(alice.server_session))
+                .map(|client| client.get_current_channel_id());
+            let bob_channel = handle
+                .block_on(b.server.get_clients().get_client(bob.server_session))
+                .map(|client| client.get_current_channel_id());
+            alice_channel == Some(42) && bob_channel == Some(84)
+        })
+    })
+    .await;
+    assert!(
+        local_moves_applied,
+        "local clients should start in their pre-merge layouts"
+    );
+
+    alice.drain_now().await;
+    bob.drain_now().await;
+
+    add_s2s_peer_address(&a, 2, b_s2s_port).await;
+    add_s2s_peer_address(&b, 1, a_s2s_port).await;
+    wait_for_s2s_pair(&a, &b).await;
+
+    let channel_layout_converged = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            a.server.get_channels().current_version() == 2
+                && b.server.get_channels().current_version() == 2
+                && handle
+                    .block_on(a.server.get_channels().get_channel(42))
+                    .is_some()
+                && handle
+                    .block_on(a.server.get_channels().get_channel(43))
+                    .is_some()
+                && handle
+                    .block_on(a.server.get_channels().get_channel(84))
+                    .is_none()
+                && handle
+                    .block_on(b.server.get_channels().get_channel(42))
+                    .is_some()
+                && handle
+                    .block_on(b.server.get_channels().get_channel(43))
+                    .is_some()
+                && handle
+                    .block_on(b.server.get_channels().get_channel(84))
+                    .is_none()
+        })
+    })
+    .await;
+    assert!(
+        channel_layout_converged,
+        "servers should converge on A's channel layout before client integration"
+    );
+
+    let bob_received_repaired_layout = tokio::time::timeout(S2S_DEADLINE, async {
+        let mut saw_42 = bob.initial_channel_states.iter().any(|channel| {
+            channel.channel_id == Some(42) && channel.name.as_deref() == Some("Elected Lobby")
+        });
+        let mut saw_43 = bob.initial_channel_states.iter().any(|channel| {
+            channel.channel_id == Some(43) && channel.name.as_deref() == Some("Elected Annex")
+        });
+        let mut saw_remove_84 = false;
+
+        while !(saw_42 && saw_43 && saw_remove_84) {
+            let Some(message) = bob.recv(CLIENT_DEADLINE).await else {
+                return false;
+            };
+            match message {
+                Message::ChannelState(channel) => {
+                    if channel.channel_id == Some(42)
+                        && channel.name.as_deref() == Some("Elected Lobby")
+                    {
+                        saw_42 = true;
+                    }
+                    if channel.channel_id == Some(43)
+                        && channel.name.as_deref() == Some("Elected Annex")
+                    {
+                        saw_43 = true;
+                    }
+                }
+                Message::ChannelRemove(remove) if remove.channel_id == 84 => {
+                    saw_remove_84 = true;
+                }
+                _ => {}
+            }
+        }
+        true
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        bob_received_repaired_layout,
+        "Bob should receive the elected channels and removal of his discarded local channel"
+    );
+
+    let final_client_state_safe = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            let bob_on_a = handle.block_on(a.server.get_clients().get_client(bob.server_session));
+            let bob_on_b = handle.block_on(b.server.get_clients().get_client(bob.server_session));
+            bob_on_a
+                .as_ref()
+                .is_some_and(|client| client.get_current_channel_id() != 84)
+                && bob_on_b
+                    .as_ref()
+                    .is_some_and(|client| client.get_current_channel_id() != 84)
+        })
+    })
+    .await;
+    assert!(
+        final_client_state_safe,
+        "Bob should be materialized only in channels from the elected layout; A client versions={:?}, B client versions={:?}",
+        a.server.get_clients().snapshot_with_versions().await.1,
+        b.server.get_clients().snapshot_with_versions().await.1,
+    );
+
+    let mut alice_buffered = alice.drain_now().await;
+    assert!(
+        !alice_buffered.iter().any(|message| {
+            matches!(message, Message::UserState(state)
+                if state.session == Some(bob.session_id) && state.channel_id == Some(84))
+        }),
+        "Alice must not receive Bob in the discarded B-only channel"
+    );
+
+    let alice_saw_bob_safely = if alice_buffered.iter().any(|message| {
+        matches!(message, Message::UserState(state)
+            if state.session == Some(bob.session_id)
+                && state.name.as_deref() == Some("bob")
+                && state.channel_id != Some(84))
+    }) {
+        true
+    } else {
+        tokio::time::timeout(S2S_DEADLINE, async {
+            loop {
+                let Some(message) = alice.recv(S2S_DEADLINE).await else {
+                    return false;
+                };
+                match message {
+                    Message::UserState(state)
+                        if state.session == Some(bob.session_id)
+                            && state.channel_id == Some(84) =>
+                    {
+                        return false;
+                    }
+                    Message::UserState(state)
+                        if state.session == Some(bob.session_id)
+                            && state.name.as_deref() == Some("bob") =>
+                    {
+                        return true;
+                    }
+                    other => alice_buffered.push(other),
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    };
+    assert!(
+        alice_saw_bob_safely,
+        "Alice should eventually see Bob only after his state is safe for the elected layout"
+    );
+
+    let late_bob_view = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("late bob observer");
+    assert!(
+        late_bob_view.initial_channel_states.iter().any(|channel| {
+            channel.channel_id == Some(42) && channel.name.as_deref() == Some("Elected Lobby")
+        }),
+        "new clients on B should receive channel 42 from the elected layout"
+    );
+    assert!(
+        late_bob_view.initial_channel_states.iter().any(|channel| {
+            channel.channel_id == Some(43) && channel.name.as_deref() == Some("Elected Annex")
+        }),
+        "new clients on B should receive channel 43 from the elected layout"
+    );
+    assert!(
+        late_bob_view
+            .initial_channel_states
+            .iter()
+            .all(|channel| channel.channel_id != Some(84)),
+        "new clients on B should not receive the discarded channel"
+    );
+}
+
 /// Checks client add, update, and remove replication across S2S nodes.
 /// Expected: Bob sees Alice join, self-mute, and leave, and server B's remote
 /// client index materializes then removes Alice. The user-state/remove
@@ -725,6 +1043,90 @@ async fn s2s_client_replication_catches_up_when_second_node_starts_later() {
     assert!(
         client_sees_user_state(&bob, alice.server_session, "alice").await,
         "Bob should catch up Alice when node B starts later"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_client_replication_catches_up_preexisting_clients_when_node_joins_overlay() {
+    let _guard = s2s_network_test_guard().await;
+    let pki = Arc::new(mint_pki(&[1, 2, 3]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+    let c_s2s_port = pick_free_port().await;
+
+    let a = spawn_s2s_test_server(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        TestS2sServerOpts {
+            node_id: 1,
+            cert_index: 0,
+            tcp_listen: loopback(a_s2s_port),
+            seed_addresses: vec![S2sSeedAddressConfig::new(
+                S2sTransportKindConfig::Tcp,
+                loopback(c_s2s_port),
+            )],
+        },
+    )
+    .await;
+    let c = spawn_s2s_test_server(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        TestS2sServerOpts {
+            node_id: 3,
+            cert_index: 2,
+            tcp_listen: loopback(c_s2s_port),
+            seed_addresses: vec![S2sSeedAddressConfig::new(
+                S2sTransportKindConfig::Tcp,
+                loopback(a_s2s_port),
+            )],
+        },
+    )
+    .await;
+    wait_for_s2s_cluster(&[(&a, 1), (&c, 3)]).await;
+
+    a.authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+
+    let b = spawn_s2s_test_server(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        TestS2sServerOpts {
+            node_id: 2,
+            cert_index: 1,
+            tcp_listen: loopback(b_s2s_port),
+            seed_addresses: Vec::new(),
+        },
+    )
+    .await;
+    wait_for_s2s_runtime(&b).await;
+    b.authenticator.register_user("bob", None, Some(2), vec![]);
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    assert!(
+        !a.server
+            .s2s_manager()
+            .overlay()
+            .expect("A overlay")
+            .alive_members()
+            .contains(&2),
+        "B should not be in the overlay before the test links it"
+    );
+
+    add_s2s_peer_address(&a, 2, b_s2s_port).await;
+    add_s2s_peer_address(&b, 1, a_s2s_port).await;
+    add_s2s_peer_address(&b, 3, c_s2s_port).await;
+    add_s2s_peer_address(&c, 2, b_s2s_port).await;
+    wait_for_s2s_cluster(&[(&a, 1), (&b, 2), (&c, 3)]).await;
+
+    wait_for_server_to_track_client(&a, bob.server_session).await;
+    assert!(
+        client_sees_user_state(&alice, bob.server_session, "bob").await,
+        "Alice should see Bob after node B joins with Bob already online"
     );
 }
 

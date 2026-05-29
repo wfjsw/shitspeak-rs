@@ -1,8 +1,9 @@
 //! Native transport loss samplers.
 //!
-//! These samplers convert cumulative transport counters into per-window loss
-//! samples for [`super::metrics::PeerMetrics`]. They intentionally report only
-//! deltas; the first observation seeds the baseline and does not affect routing.
+//! These samplers convert cumulative transport sent/declared-lost counters into
+//! per-window loss samples for [`super::metrics::PeerMetrics`]. They
+//! intentionally report only deltas; the first observation seeds the baseline
+//! and does not affect routing.
 
 use tokio::net::TcpStream;
 
@@ -128,7 +129,7 @@ impl KcpNativeLossSampler {
 impl NativeLossSampler for KcpNativeLossSampler {
     fn sample(&mut self) -> Option<NativeLossSample> {
         let stats = self.handle.stats();
-        let current = RawNativeCounters::new(stats.sent_segments(), stats.retransmitted_segments());
+        let current = RawNativeCounters::new(stats.sent_segments(), stats.lost_segments());
         delta_from_counters(&mut self.previous, current)
     }
 }

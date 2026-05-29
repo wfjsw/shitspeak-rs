@@ -20,6 +20,10 @@ enum FrameType {
   FRAME_PONG = 3;
   FRAME_KEEPALIVE = 4;
   FRAME_BYE = 5;
+  // Stream-only control frame carrying an adaptive zstd dictionary in payload.
+  FRAME_DICTIONARY = 6;
+  // Stream-only control frame acknowledging an adaptive dictionary id.
+  FRAME_DICTIONARY_ACK = 7;
 }
 
 // Receiver-side routing class. Selected by the sender to direct the frame
@@ -55,4 +59,8 @@ message Frame {
   bytes payload = 8;              // domain payload, opaque to transport
   PayloadEncoding payload_encoding = 9;
   uint64 uncompressed_payload_len = 10;
+  // Non-zero for ZSTD_DICT frames and dictionary control frames. For adaptive
+  // dictionaries this is a transport-generated id derived from the dictionary
+  // bytes; peers must advertise and ack it before it is used for data.
+  uint64 payload_dictionary_id = 11;
 }

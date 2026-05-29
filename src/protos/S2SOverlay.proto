@@ -59,7 +59,7 @@ message LinkAdvert {
   uint32 transports_mask = 5;  // bitmap of TransportKind values; 1<<Tcp etc.
   uint32 loss_ppm        = 6;  // Conservative effective loss, parts per million.
   uint32 probe_loss_ppm  = 7;  // Probe/keepalive loss, parts per million.
-  uint32 native_loss_ppm = 8;  // Native transport loss/retransmit rate, parts per million.
+  uint32 native_loss_ppm = 8;  // Native transport declared-loss rate, parts per million.
   uint32 data_health_ppm = 9;  // Stream data-health failure rate, parts per million.
   uint64 loss_sample_count = 10; // Samples behind the current loss breakdown.
 }

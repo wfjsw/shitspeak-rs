@@ -568,6 +568,8 @@ fn udp_frame_kind_name(frame_type: i32) -> &'static str {
         Ok(pb::FrameType::FrameKeepalive) => "transport.udp.frame.keepalive",
         Ok(pb::FrameType::FrameHello) => "transport.udp.frame.hello",
         Ok(pb::FrameType::FrameBye) => "transport.udp.frame.bye",
+        Ok(pb::FrameType::FrameDictionary) => "transport.udp.frame.dictionary",
+        Ok(pb::FrameType::FrameDictionaryAck) => "transport.udp.frame.dictionary_ack",
         Err(_) => "transport.udp.frame.unknown",
     }
 }
@@ -2170,6 +2172,7 @@ async fn handle_frame(
         pb::FrameType::FrameHello => {
             trace!(peer=%peer.node_id(), "received udp encrypted transport hello");
         }
+        pb::FrameType::FrameDictionary | pb::FrameType::FrameDictionaryAck => {}
         pb::FrameType::FrameBye => {}
     }
     Ok(())

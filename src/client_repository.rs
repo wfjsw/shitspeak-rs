@@ -1466,11 +1466,30 @@ impl ClientRepository {
 
     /// Return all local log entries with `version > since_version`.
     pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<ClientStateLogEntry>> {
-        self.register
-            .read()
+        self.get_log_since_for_node(self.local_node_id, since_version)
             .await
-            .local_log
-            .iter()
+    }
+
+    pub(crate) async fn get_log_since_for_node(
+        &self,
+        node_id: u16,
+        since_version: u64,
+    ) -> Vec<Arc<ClientStateLogEntry>> {
+        let register = self.register.read().await;
+        if node_id == self.local_node_id {
+            return register
+                .local_log
+                .iter()
+                .filter(|op| op.version > since_version)
+                .cloned()
+                .collect();
+        }
+
+        register
+            .remote_logs
+            .get(&node_id)
+            .into_iter()
+            .flat_map(|log| log.iter())
             .filter(|op| op.version > since_version)
             .cloned()
             .collect()

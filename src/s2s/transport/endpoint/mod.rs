@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,7 +33,7 @@ use super::config::TransportConfig;
 use super::connection::{PeerState, StreamKey, retry_cap_for_last_seen_age};
 use super::manager::ManagerInner;
 use super::native_stats::BoxedNativeLossSampler;
-use super::service_level::{PeerAddress, ServiceShape, TransportKind};
+use super::service_level::{PeerAddress, SeedAddress, ServiceShape, TransportKind};
 use super::stream_io::{StreamPumpConfig, spawn_stream_pump};
 
 pub(crate) mod kcp;
@@ -368,13 +368,13 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
             }
         }
 
-        for addr in inner.cfg().seed_addresses().iter().copied() {
-            if seed_address_registered(&inner, addr) {
+        for addr in inner.cfg().seed_targets() {
+            if seed_address_registered(&inner, &addr) {
                 continue;
             }
             let inner_c = inner.clone();
             tokio::spawn(async move {
-                match probe_seed_address(&inner_c, addr).await {
+                match probe_seed_address(&inner_c, addr.clone()).await {
                     Some(Ok(node)) => debug!(peer=%node, ?addr, "seed dial succeeded"),
                     Some(Err(e)) => debug!(?addr, error=%e, "seed dial failed"),
                     None => {}
@@ -658,7 +658,17 @@ fn kind_sort_order(key: StreamKey) -> u8 {
     key.transport() as u8
 }
 
-fn seed_address_registered(inner: &ManagerInner, addr: PeerAddress) -> bool {
+fn seed_address_registered(inner: &ManagerInner, addr: &SeedAddress) -> bool {
+    if let Some(peer_addr) = inner.successful_seed_address(addr) {
+        return peer_address_registered(inner, peer_addr);
+    }
+    let Some(peer_addr) = addr.as_static_peer_address() else {
+        return false;
+    };
+    peer_address_registered(inner, peer_addr)
+}
+
+fn peer_address_registered(inner: &ManagerInner, addr: PeerAddress) -> bool {
     inner
         .iter_peers()
         .into_iter()
@@ -865,7 +875,7 @@ fn should_remove_failed_address(error: &io::Error) -> bool {
         || message.contains("certificate not valid for name")
 }
 
-pub(crate) async fn dial_seed_address(
+async fn dial_resolved_seed_address(
     inner: &Arc<ManagerInner>,
     addr: PeerAddress,
 ) -> io::Result<NodeIdentifier> {
@@ -892,11 +902,57 @@ pub(crate) async fn dial_seed_address(
     Ok(node)
 }
 
+fn resolve_seed_address(seed: &SeedAddress) -> io::Result<Vec<PeerAddress>> {
+    let mut addrs = Vec::new();
+    for addr in seed.addr().to_socket_addrs()? {
+        let peer_addr = PeerAddress::new(addr, seed.transport());
+        if peer_addr.is_dialable() && !addrs.contains(&peer_addr) {
+            addrs.push(peer_addr);
+        }
+    }
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!(
+                "seed address {:?} resolved to no dialable addresses",
+                seed.addr()
+            ),
+        ));
+    }
+    Ok(addrs)
+}
+
+pub(crate) async fn dial_seed_address(
+    inner: &Arc<ManagerInner>,
+    seed: &SeedAddress,
+) -> io::Result<NodeIdentifier> {
+    let addrs = resolve_seed_address(seed)?;
+    let mut last_err = None;
+    for addr in addrs {
+        match dial_resolved_seed_address(inner, addr).await {
+            Ok(node) => {
+                inner.mark_seed_successful(seed.clone(), addr);
+                return Ok(node);
+            }
+            Err(error) => last_err = Some(error),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("seed address {:?} resolved to no addresses", seed.addr()),
+        )
+    }))
+}
+
 pub(crate) async fn probe_seed_address(
     inner: &Arc<ManagerInner>,
-    addr: PeerAddress,
+    addr: SeedAddress,
 ) -> Option<io::Result<NodeIdentifier>> {
-    let backoff = inner.seed_backoff(addr);
+    if seed_address_registered(inner, &addr) {
+        return None;
+    }
+    let backoff = inner.seed_backoff(addr.clone());
     {
         let mut bo = backoff.lock();
         if !bo.ready(Instant::now(), inner.cfg().backoff_cap()) {
@@ -905,9 +961,11 @@ pub(crate) async fn probe_seed_address(
         bo.record_attempt();
     }
 
-    let result = dial_seed_address(inner, addr).await;
+    let result = dial_seed_address(inner, &addr).await;
     match &result {
-        Ok(_) => backoff.lock().record_success(),
+        Ok(_) => {
+            backoff.lock().record_success();
+        }
         Err(_) => backoff.lock().record_failure(inner.cfg().backoff_cap()),
     }
     Some(result)

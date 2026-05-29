@@ -37,5 +37,6 @@ pub(crate) use metrics::{
     conversational_quality_score,
 };
 pub use service_level::{
-    MessageClass, PeerAddress, RoutingMetric, ServiceLevel, ServiceShape, TransportKind,
+    MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, ServiceShape,
+    TransportKind,
 };

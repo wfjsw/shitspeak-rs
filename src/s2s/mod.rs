@@ -28,7 +28,7 @@ use crate::ban_repository::{BanEntry, BanOp, BanOperation, BanRepository};
 use crate::blob_store::ChannelBlobStore;
 use crate::channel_repository::{ChannelOp, ChannelOperation, ChannelRepository};
 use crate::client::client_session_identifier::ClientSessionIdentifier;
-use crate::client::state_log::ClientStateLogEntry;
+use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
 use crate::client_repository::ClientRepository;
 use crate::server::Server;
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
@@ -251,6 +251,10 @@ impl S2SManager {
         self.state.read().overlay.clone()
     }
 
+    pub(crate) fn transport(&self) -> Option<ConnectionManager> {
+        self.state.read().transport.clone()
+    }
+
     pub fn update_max_users(&self, max_users: u64) {
         self.max_users
             .store(max_users, std::sync::atomic::Ordering::Relaxed);
@@ -289,7 +293,7 @@ impl S2SManager {
         let seed_count = self
             .transport_config
             .as_ref()
-            .map(|cfg| cfg.seed_addresses().len())
+            .map(|cfg| cfg.seed_address_count())
             .unwrap_or(0);
         info!(seed_count, "s2s enabled");
     }
@@ -1904,6 +1908,77 @@ impl ClientReplicationAdapter {
             local_epoch,
         }
     }
+
+    async fn sanitize_channel_dependencies(
+        &self,
+        entry: &mut ClientStateLogEntry,
+        current_channel_version: u64,
+    ) {
+        if entry.channel_version_dep.unwrap_or(0) > current_channel_version {
+            return;
+        }
+
+        let server_id = entry.op.server_id().to_owned();
+        let valid_channels: HashSet<u32> = self
+            .channels
+            .get_all_in_server(&server_id)
+            .await
+            .into_iter()
+            .map(|channel| channel.id)
+            .collect();
+
+        match &mut entry.op {
+            ClientStateOperation::AddClient { initial_state, .. } => {
+                sanitize_initial_client_channels(initial_state, &valid_channels);
+            }
+            ClientStateOperation::UpdateGlobalState { delta, .. } => {
+                sanitize_update_client_channels(delta, &valid_channels);
+            }
+            ClientStateOperation::RemoveClient { .. } => {}
+        }
+    }
+}
+
+fn sanitize_initial_client_channels(
+    delta: &mut ClientGlobalStateDelta,
+    valid_channels: &HashSet<u32>,
+) {
+    if delta
+        .current_channel_id
+        .is_some_and(|channel_id| !valid_channels.contains(&channel_id))
+    {
+        delta.current_channel_id = Some(0);
+    }
+    retain_valid_channel_delta(delta, valid_channels);
+}
+
+fn sanitize_update_client_channels(
+    delta: &mut ClientGlobalStateDelta,
+    valid_channels: &HashSet<u32>,
+) {
+    if delta
+        .current_channel_id
+        .is_some_and(|channel_id| !valid_channels.contains(&channel_id))
+    {
+        delta.current_channel_id = None;
+        delta.suppress = None;
+    }
+    retain_valid_channel_delta(delta, valid_channels);
+}
+
+fn retain_valid_channel_delta(delta: &mut ClientGlobalStateDelta, valid_channels: &HashSet<u32>) {
+    if let Some(channel_ids) = delta.listening_channel_add.as_mut() {
+        channel_ids.retain(|channel_id| valid_channels.contains(channel_id));
+        if channel_ids.is_empty() {
+            delta.listening_channel_add = None;
+        }
+    }
+    if let Some(channel_ids) = delta.listening_channel_remove.as_mut() {
+        channel_ids.retain(|channel_id| valid_channels.contains(channel_id));
+        if channel_ids.is_empty() {
+            delta.listening_channel_remove = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1955,12 +2030,10 @@ impl OwnerReplicable for ClientReplicationAdapter {
         origin: NodeIdentifier,
         since: u64,
     ) -> replications::owner::LogSlice<Self::Op> {
-        if origin != self.clients.local_node_id() {
-            return replications::owner::LogSlice::Available(Vec::new());
-        }
         let clients = self.clients.clone();
-        let entries =
-            block_in_place_or_current(|handle| handle.block_on(clients.get_log_since(since)));
+        let entries = block_in_place_or_current(|handle| {
+            handle.block_on(clients.get_log_since_for_node(origin, since))
+        });
         match entries {
             Some(entries) => replications::owner::LogSlice::Available(
                 entries
@@ -1982,6 +2055,8 @@ impl OwnerReplicable for ClientReplicationAdapter {
         op.node_id = origin;
         op.version = version;
         let current_channel_version = self.channels.current_version_in_server(op.op.server_id());
+        self.sanitize_channel_dependencies(&mut op, current_channel_version)
+            .await;
         if let Err(()) = self
             .clients
             .apply_remote_operation(Arc::new(op), current_channel_version)
@@ -2010,6 +2085,8 @@ impl OwnerReplicable for ClientReplicationAdapter {
             let current_channel_version = self
                 .channels
                 .current_version_in_server(entry.op.server_id());
+            self.sanitize_channel_dependencies(&mut entry, current_channel_version)
+                .await;
             if let Err(()) = self
                 .clients
                 .apply_remote_operation(Arc::new(entry), current_channel_version)

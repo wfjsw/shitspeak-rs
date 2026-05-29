@@ -4,7 +4,10 @@
 //! with optional permission info and ACL handling. Useful for authentication, gap replay,
 //! subscription broadcasts, and future features like S2S replication and admin APIs.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use crate::{
     channel_repository::{ChannelOp, ChannelOperation, ChannelRepository},
@@ -105,6 +108,23 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
                 if let Some(msg) = op.to_message() {
                     messages.push(msg);
                 }
+            }
+        }
+        ChannelOp::InstallSnapshot { channels, removed } => {
+            for channel in ordered_snapshot_channels(channels) {
+                messages.push(
+                    build_channel_state_message(server, client, &channel)
+                        .await
+                        .into(),
+                );
+            }
+            for channel_id in removed {
+                messages.push(
+                    crate::messages::encoder::ChannelRemove {
+                        channel_id: *channel_id,
+                    }
+                    .into(),
+                );
             }
         }
         _ => {
@@ -390,6 +410,59 @@ pub async fn replay_channel_log_gap(
     }
 
     Ok(())
+}
+
+fn ordered_snapshot_channels(
+    channels: &[crate::channels::Channel],
+) -> Vec<crate::channels::Channel> {
+    let by_id: HashMap<u32, &crate::channels::Channel> = channels
+        .iter()
+        .map(|channel| (channel.id, channel))
+        .collect();
+    let mut children: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
+    for channel in channels {
+        children
+            .entry(channel.parent_id)
+            .or_default()
+            .push(channel.id);
+    }
+    for child_ids in children.values_mut() {
+        child_ids.sort_by_key(|id| {
+            by_id
+                .get(id)
+                .map(|channel| (channel.position, channel.id))
+                .unwrap_or((0, *id))
+        });
+    }
+
+    let mut out = Vec::with_capacity(channels.len());
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    if by_id.contains_key(&0) {
+        queue.push_back(0);
+    }
+
+    while let Some(id) = queue.pop_front() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let Some(channel) = by_id.get(&id) else {
+            continue;
+        };
+        out.push((*channel).clone());
+        if let Some(child_ids) = children.get(&Some(id)) {
+            queue.extend(child_ids.iter().copied());
+        }
+    }
+
+    let mut remaining: Vec<_> = channels
+        .iter()
+        .filter(|channel| !visited.contains(&channel.id))
+        .cloned()
+        .collect();
+    remaining.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
+    out.extend(remaining);
+    out
 }
 
 /// Build a ChannelState encoder message, optionally with permission info.

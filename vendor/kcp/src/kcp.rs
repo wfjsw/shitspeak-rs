@@ -149,16 +149,18 @@ impl<O: Write> Write for KcpOutput<O> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KcpStats {
     sent_segments: u64,
-    retransmitted_segments: u64,
+    lost_segments: u64,
 }
 
 impl KcpStats {
+    /// Number of KCP segment transmissions attempted.
     pub fn sent_segments(&self) -> u64 {
         self.sent_segments
     }
 
-    pub fn retransmitted_segments(&self) -> u64 {
-        self.retransmitted_segments
+    /// Number of KCP segment transmissions declared lost by timeout or fast ACK.
+    pub fn lost_segments(&self) -> u64 {
+        self.lost_segments
     }
 }
 
@@ -250,7 +252,7 @@ pub struct Kcp<Output: Write> {
     input_conv: bool,
 
     sent_segments: u64,
-    retransmitted_segments: u64,
+    lost_segments: u64,
 
     output: KcpOutput<Output>,
 }
@@ -297,7 +299,7 @@ impl<Output: Write> Debug for Kcp<Output> {
             .field("stream", &self.stream)
             .field("input_conv", &self.input_conv)
             .field("sent_segments", &self.sent_segments)
-            .field("retransmitted_segments", &self.retransmitted_segments)
+            .field("lost_segments", &self.lost_segments)
             .finish()
     }
 }
@@ -367,7 +369,7 @@ impl<Output: Write> Kcp<Output> {
 
             input_conv: false,
             sent_segments: 0,
-            retransmitted_segments: 0,
+            lost_segments: 0,
             output: KcpOutput(output),
         }
     }
@@ -995,7 +997,6 @@ impl<Output: Write> Kcp<Output> {
 
         for snd_segment in &mut self.snd_buf {
             let mut need_send = false;
-            let mut retransmit = false;
 
             if snd_segment.xmit == 0 {
                 need_send = true;
@@ -1004,7 +1005,7 @@ impl<Output: Write> Kcp<Output> {
                 snd_segment.resendts = self.current + snd_segment.rto + rtomin;
             } else if timediff(self.current, snd_segment.resendts) >= 0 {
                 need_send = true;
-                retransmit = true;
+                self.lost_segments = self.lost_segments.saturating_add(1);
                 snd_segment.xmit += 1;
                 self.xmit += 1;
                 if !self.nodelay {
@@ -1018,7 +1019,7 @@ impl<Output: Write> Kcp<Output> {
             } else if snd_segment.fastack >= resent {
                 if snd_segment.xmit <= self.fastlimit || self.fastlimit <= 0 {
                     need_send = true;
-                    retransmit = true;
+                    self.lost_segments = self.lost_segments.saturating_add(1);
                     snd_segment.xmit += 1;
                     snd_segment.fastack = 0;
                     snd_segment.resendts = self.current + snd_segment.rto;
@@ -1028,10 +1029,6 @@ impl<Output: Write> Kcp<Output> {
 
             if need_send {
                 self.sent_segments = self.sent_segments.saturating_add(1);
-                if retransmit {
-                    self.retransmitted_segments =
-                        self.retransmitted_segments.saturating_add(1);
-                }
                 snd_segment.ts = self.current;
                 snd_segment.wnd = segment.wnd;
                 snd_segment.una = self.rcv_nxt;
@@ -1287,14 +1284,14 @@ impl<Output: Write> Kcp<Output> {
     pub fn stats(&self) -> KcpStats {
         KcpStats {
             sent_segments: self.sent_segments,
-            retransmitted_segments: self.retransmitted_segments,
+            lost_segments: self.lost_segments,
         }
     }
 
     #[cfg(test)]
-    fn force_stats_for_test(&mut self, sent_segments: u64, retransmitted_segments: u64) {
+    fn force_stats_for_test(&mut self, sent_segments: u64, lost_segments: u64) {
         self.sent_segments = sent_segments;
-        self.retransmitted_segments = retransmitted_segments;
+        self.lost_segments = lost_segments;
     }
 
     /// Set maximum resend times
@@ -1320,6 +1317,28 @@ mod stats_tests {
         kcp.force_stats_for_test(42, 3);
         let stats = kcp.stats();
         assert_eq!(stats.sent_segments(), 42);
-        assert_eq!(stats.retransmitted_segments(), 3);
+        assert_eq!(stats.lost_segments(), 3);
+    }
+
+    #[test]
+    fn stats_count_segments_declared_lost_by_timeout() {
+        let mut kcp = Kcp::new(7, Vec::new());
+        kcp.update(0).unwrap();
+        kcp.send(b"hello").unwrap();
+        kcp.flush().unwrap();
+
+        let stats = kcp.stats();
+        assert_eq!(stats.sent_segments(), 1);
+        assert_eq!(stats.lost_segments(), 0);
+
+        kcp.update(300).unwrap();
+        let stats = kcp.stats();
+        assert_eq!(stats.sent_segments(), 2);
+        assert_eq!(stats.lost_segments(), 1);
+
+        kcp.update(1000).unwrap();
+        let stats = kcp.stats();
+        assert_eq!(stats.sent_segments(), 3);
+        assert_eq!(stats.lost_segments(), 2);
     }
 }

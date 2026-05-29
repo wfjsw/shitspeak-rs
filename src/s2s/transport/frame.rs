@@ -25,6 +25,8 @@ pub enum FrameType {
     Pong,
     KeepAlive,
     Bye,
+    Dictionary,
+    DictionaryAck,
 }
 
 impl From<FrameType> for pb::FrameType {
@@ -36,6 +38,8 @@ impl From<FrameType> for pb::FrameType {
             FrameType::Pong => pb::FrameType::FramePong,
             FrameType::KeepAlive => pb::FrameType::FrameKeepalive,
             FrameType::Bye => pb::FrameType::FrameBye,
+            FrameType::Dictionary => pb::FrameType::FrameDictionary,
+            FrameType::DictionaryAck => pb::FrameType::FrameDictionaryAck,
         }
     }
 }
@@ -49,6 +53,8 @@ impl From<pb::FrameType> for FrameType {
             pb::FrameType::FramePong => FrameType::Pong,
             pb::FrameType::FrameKeepalive => FrameType::KeepAlive,
             pb::FrameType::FrameBye => FrameType::Bye,
+            pb::FrameType::FrameDictionary => FrameType::Dictionary,
+            pb::FrameType::FrameDictionaryAck => FrameType::DictionaryAck,
         }
     }
 }
@@ -191,6 +197,7 @@ pub fn build_frame(
         payload,
         payload_encoding: pb::PayloadEncoding::Identity as i32,
         uncompressed_payload_len: 0,
+        payload_dictionary_id: 0,
     }
 }
 

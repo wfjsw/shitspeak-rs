@@ -28,7 +28,9 @@ use super::endpoint::{
 use super::error::{ConfigError, SendError, TransportError};
 use super::identity::NodeIdentity;
 use super::metrics::{MetricsSnapshot, MetricsTuning, assemble_snapshot};
-use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
+use super::service_level::{
+    MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, TransportKind,
+};
 use super::tls::build_tls_configs;
 
 #[derive(Debug, Clone)]
@@ -195,7 +197,8 @@ impl InboundDispatch {
 pub(crate) struct ManagerInner {
     self_id: NodeIdentifier,
     peers: Arc<SccMap<NodeIdentifier, Arc<PeerState>>>,
-    seed_backoff: Arc<SccMap<PeerAddress, Arc<parking_lot::Mutex<BackoffState>>>>,
+    seed_backoff: Arc<SccMap<SeedAddress, Arc<parking_lot::Mutex<BackoffState>>>>,
+    successful_seeds: Arc<SccMap<SeedAddress, PeerAddress>>,
     required_outgoing: Arc<RwLock<HashSet<NodeIdentifier>>>,
     inbound: InboundDispatch,
     shutdown: CancellationToken,
@@ -280,7 +283,7 @@ impl ManagerInner {
         *self.required_outgoing.write() = nodes;
     }
 
-    pub fn seed_backoff(&self, addr: PeerAddress) -> Arc<parking_lot::Mutex<BackoffState>> {
+    pub fn seed_backoff(&self, addr: SeedAddress) -> Arc<parking_lot::Mutex<BackoffState>> {
         if let Some(existing) = self.seed_backoff.get_sync(&addr) {
             return existing.get().clone();
         }
@@ -292,6 +295,24 @@ impl ManagerInner {
             scc::hash_map::Entry::Vacant(e) => {
                 e.insert_entry(new.clone());
                 new
+            }
+        }
+    }
+
+    pub fn successful_seed_address(&self, addr: &SeedAddress) -> Option<PeerAddress> {
+        self.successful_seeds
+            .get_sync(addr)
+            .map(|entry| *entry.get())
+    }
+
+    pub fn mark_seed_successful(&self, addr: SeedAddress, resolved: PeerAddress) {
+        if self.successful_seeds.get_sync(&addr).is_some() {
+            return;
+        }
+        match self.successful_seeds.entry_sync(addr) {
+            scc::hash_map::Entry::Occupied(_) => {}
+            scc::hash_map::Entry::Vacant(e) => {
+                e.insert_entry(resolved);
             }
         }
     }
@@ -328,6 +349,7 @@ impl ConnectionManager {
             self_id: identity.node_id(),
             peers: Arc::new(SccMap::new()),
             seed_backoff: Arc::new(SccMap::new()),
+            successful_seeds: Arc::new(SccMap::new()),
             required_outgoing: Arc::new(RwLock::new(HashSet::new())),
             inbound,
             shutdown: CancellationToken::new(),
@@ -336,10 +358,10 @@ impl ConnectionManager {
         });
 
         super::endpoint::start_all(inner.clone()).await?;
-        for addr in inner.cfg().seed_addresses().iter().copied() {
+        for addr in inner.cfg().seed_targets() {
             let inner_c = inner.clone();
             tokio::spawn(async move {
-                match super::endpoint::probe_seed_address(&inner_c, addr).await {
+                match super::endpoint::probe_seed_address(&inner_c, addr.clone()).await {
                     Some(Ok(node)) => debug!(peer=%node, ?addr, "initial seed dial succeeded"),
                     Some(Err(e)) => debug!(?addr, error=%e, "initial seed dial failed"),
                     None => {}
@@ -876,7 +898,7 @@ fn build_endpoints(
     client_tls: Arc<rustls::ClientConfig>,
 ) -> Result<EndpointRegistry, TransportError> {
     let has_seed = |kind| {
-        cfg.seed_addresses()
+        cfg.seed_targets()
             .iter()
             .any(|addr| addr.transport() == kind)
     };

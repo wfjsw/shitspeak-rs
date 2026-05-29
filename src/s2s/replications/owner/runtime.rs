@@ -533,6 +533,11 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         since_version: Option<u64>,
     ) {
         let alive = self.net.alive_members();
+        let since = since_version.unwrap_or_else(|| {
+            let s = self.state.lock();
+            s.known.get(&origin).map(|(_, v)| *v).unwrap_or(0)
+        });
+
         // Prefer a non-origin alive peer; fall back to origin.
         let mut candidates: Vec<NodeIdentifier> = alive
             .iter()
@@ -550,21 +555,37 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             // No one to ask.
             return;
         };
-        let since = since_version.unwrap_or_else(|| {
-            let s = self.state.lock();
-            s.known.get(&origin).map(|(_, v)| *v).unwrap_or(0)
-        });
+        if self
+            .send_catchup_req_to(pick, origin, known_epoch, since, 0)
+            .await
+            .is_err()
+            && pick != origin
+            && alive.contains(&origin)
+        {
+            let _ = self
+                .send_catchup_req_to(origin, origin, known_epoch, since, 0)
+                .await;
+        }
+    }
+
+    pub(super) async fn send_catchup_req_to(
+        &self,
+        dst: NodeIdentifier,
+        origin: NodeIdentifier,
+        known_epoch: u64,
+        since_version: u64,
+        chunk_token: u64,
+    ) -> Result<(), ReplicationError> {
         let req = OwnerCatchupReq {
             origin_node: origin as u32,
             src_node: self.self_id as u32,
             known_epoch,
-            since_version: since,
-            chunk_token: 0,
+            since_version,
+            chunk_token,
         };
-        let _ = self
-            .net
-            .send_unicast(pick, &self.topic, OwnerBody::CatchupReq(req))
-            .await;
+        self.net
+            .send_unicast(dst, &self.topic, OwnerBody::CatchupReq(req))
+            .await
     }
 
     pub async fn recv_catchup_req(&self, from: NodeIdentifier, req: OwnerCatchupReq) {
@@ -573,10 +594,10 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
 
     pub async fn recv_catchup_resp(
         &self,
-        _from: NodeIdentifier,
+        from: NodeIdentifier,
         resp: super::super::proto::OwnerCatchupResp,
     ) {
-        super::catchup::apply_response(self, resp).await
+        super::catchup::apply_response(self, from, resp).await
     }
 
     /// Handle a membership event. Offline removes transient owner state;

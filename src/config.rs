@@ -10,7 +10,9 @@ use serde::{Deserialize, Deserializer};
 use crate::s2s::application::ApplicationConfig;
 use crate::s2s::overlay::OverlayTuning;
 use crate::s2s::replications::ReplicationTuning;
-use crate::s2s::transport::{PeerAddress, TransportConfig, TransportKind, TransportTuning};
+use crate::s2s::transport::{
+    PeerAddress, SeedAddress, TransportConfig, TransportKind, TransportTuning,
+};
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct S2sConfig {
@@ -161,10 +163,10 @@ impl S2sConfig {
             };
         }
 
-        cfg = cfg.with_seed_addresses(
+        cfg = cfg.with_seed_targets(
             self.seed_addresses
                 .iter()
-                .map(S2sSeedAddressConfig::peer_address)
+                .map(S2sSeedAddressConfig::seed_address)
                 .collect::<Result<Vec<_>, _>>()?,
         );
         Ok(Some(self.transport.try_apply(cfg)?))
@@ -204,6 +206,11 @@ impl S2sSeedAddressConfig {
     pub fn peer_address(&self) -> Result<PeerAddress, String> {
         let addr = resolve_s2s_addr("s2s seed address", &self.addr)?;
         Ok(PeerAddress::new(addr, self.transport.into()))
+    }
+
+    pub fn seed_address(&self) -> Result<SeedAddress, String> {
+        validate_s2s_seed_addr("s2s seed address", &self.addr)?;
+        Ok(SeedAddress::new(self.addr.clone(), self.transport.into()))
     }
 }
 
@@ -399,6 +406,56 @@ fn resolve_s2s_addr(label: &str, value: &str) -> Result<SocketAddr, String> {
         ));
     }
     Ok(addr)
+}
+
+fn validate_s2s_seed_addr(label: &str, value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("invalid {label} {value:?}: address is empty"));
+    }
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        if addr.ip().is_unspecified() {
+            return Err(format!(
+                "{label} {value:?} must not resolve to an unspecified address"
+            ));
+        }
+        return Ok(());
+    }
+
+    let Some((host, port)) = split_seed_host_port(value) else {
+        return Err(format!(
+            "invalid {label} {value:?}: expected host:port with numeric port"
+        ));
+    };
+    if host.is_empty() {
+        return Err(format!("invalid {label} {value:?}: host is empty"));
+    }
+    port.parse::<u16>()
+        .map_err(|_| format!("invalid {label} {value:?}: port must be 0..65535"))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_unspecified() {
+            return Err(format!(
+                "{label} {value:?} must not resolve to an unspecified address"
+            ));
+        }
+        return Err(format!(
+            "invalid {label} {value:?}: IPv6 literal seed addresses must use [addr]:port"
+        ));
+    }
+    Ok(())
+}
+
+fn split_seed_host_port(value: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?;
+        return Some((host, port));
+    }
+    let (host, port) = value.rsplit_once(':')?;
+    if host.contains(':') {
+        return None;
+    }
+    Some((host, port))
 }
 
 fn is_routable_advertise_ip(ip: std::net::IpAddr) -> bool {
@@ -1134,7 +1191,9 @@ mod tests {
             transport.udp_listen_addrs(),
             &["0.0.0.0:64742".parse::<SocketAddr>().unwrap()]
         );
-        assert_eq!(transport.seed_addresses().len(), 3);
+        assert_eq!(transport.seed_address_count(), 3);
+        assert_eq!(transport.seed_targets().len(), 3);
+        assert_eq!(transport.seed_targets()[1].addr(), "localhost:64741");
         assert_eq!(
             transport.tcp_advertise(),
             &[
@@ -1265,6 +1324,30 @@ mod tests {
         "#;
         let cfg = parse_s2s(raw).expect("seed address text deserializes");
         assert!(cfg.transport_config().is_err());
+    }
+
+    #[test]
+    fn s2s_keeps_unresolved_seed_address_for_runtime_retry() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "127.0.0.1:64739"
+            seed_addresses = [
+                { transport = "tcp", addr = "missing-seed.invalid:64739" },
+            ]
+        "#;
+        let cfg = parse_s2s(raw).expect("seed address text deserializes");
+        let transport = cfg
+            .transport_config()
+            .expect("unresolved seed host does not block transport config")
+            .expect("s2s enabled");
+        assert_eq!(transport.seed_address_count(), 1);
+        assert_eq!(
+            transport.seed_targets()[0].addr(),
+            "missing-seed.invalid:64739"
+        );
     }
 
     #[test]
