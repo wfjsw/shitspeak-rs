@@ -37,9 +37,11 @@ pub fn bootstrap(cfg: &OverlayConfig, transport: &ConnectionManager) {
                         let t = transport.clone();
                         let node = peer.node_id();
                         let addr = *a;
+                        let backoff = peer.address_backoff(addr);
                         let last_seen = peer.last_seen().unwrap_or_else(SystemTime::now);
                         tokio::spawn(async move {
-                            t.add_address_seen_at(node, addr, last_seen).await;
+                            t.add_address_seen_at_with_backoff(node, addr, last_seen, backoff)
+                                .await;
                         });
                     }
                 }
@@ -123,9 +125,10 @@ fn persist_now(
 }
 
 fn peer_record_from_snapshot(snapshot: PeerAddressSnapshot) -> persistence::PersistedPeerRecord {
-    persistence::PersistedPeerRecord::new(
+    persistence::PersistedPeerRecord::new_with_address_backoffs(
         snapshot.node_id(),
         snapshot.addresses().to_vec(),
+        snapshot.address_backoffs().clone(),
         snapshot.last_seen(),
     )
 }

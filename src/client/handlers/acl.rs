@@ -73,14 +73,21 @@ pub async fn handle_acl(
             .get_ancestors_in_server(&server_id, channel_id)
             .await;
 
-        let mut flattened_acls: Vec<ChanAcl> = Vec::with_capacity(ancestors.len() * 5); // heuristic initial capacity
-        let mut inherit = true;
+        let mut flattened_acls: Vec<ChanAcl> = Vec::with_capacity((ancestors.len() + 1) * 5);
+        let mut chain: Vec<&crate::channels::Channel> = Vec::with_capacity(ancestors.len() + 1);
+        chain.push(&channel);
+        if channel.inherit_acl {
+            for ancestor in &ancestors {
+                chain.push(ancestor);
+                if !ancestor.inherit_acl {
+                    break;
+                }
+            }
+        }
 
-        // Collect ACLs from target channel and ancestors
-        let mut chain: Vec<crate::channels::Channel> = vec![channel.clone()];
-        chain.extend(ancestors.clone());
-
-        for ch in &chain {
+        // Mumble sends ACLs in root-to-target order so local entries stay below
+        // inherited entries in the client editor after a query/reload cycle.
+        for ch in chain.into_iter().rev() {
             let inherited = ch.id != channel_id;
             // For inherited (ancestor) channels, only include ACLs that apply to subs
             flattened_acls.extend(
@@ -97,11 +104,6 @@ pub async fn handle_acl(
                         deny: acl.deny.bits(),
                     }),
             );
-
-            inherit = ch.inherit_acl;
-            if !inherit {
-                break;
-            }
         }
 
         // Send back a single ACL response with target + inherited ACL entries.

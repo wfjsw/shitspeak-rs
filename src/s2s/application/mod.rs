@@ -33,9 +33,6 @@ pub mod proto;
 pub mod user_stats;
 pub mod voice;
 
-#[cfg(test)]
-mod integration_tests;
-
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;

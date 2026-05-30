@@ -264,13 +264,13 @@ async fn resolve_voice_intent(
             }
 
             if let Some(sender) = sender {
-                let linked_ids: Vec<u32> = server
+                let linked_ids = server
                     .get_channels()
-                    .get_channel_in_server(server_id, source_channel)
-                    .await
-                    .map(|ch| ch.links.into_iter().collect())
-                    .unwrap_or_default();
-                for linked_id in linked_ids {
+                    .effective_link_group_in_server(server_id, source_channel);
+                for linked_id in linked_ids.iter().flat_map(|group| group.iter()).copied() {
+                    if linked_id == source_channel {
+                        continue;
+                    }
                     let perms = crate::client::acl::compute_permissions_for_client(
                         server, sender, linked_id,
                     )
@@ -370,12 +370,11 @@ async fn resolve_voice_intent(
                 if ch_target.links {
                     let mut linked_ids = Vec::new();
                     for &ch_id in &channel_ids {
-                        if let Some(ch) = server
+                        if let Some(group) = server
                             .get_channels()
-                            .get_channel_in_server(server_id, ch_id)
-                            .await
+                            .effective_link_group_in_server(server_id, ch_id)
                         {
-                            for linked_id in ch.links {
+                            for &linked_id in group.iter() {
                                 if !channel_ids.contains(&linked_id)
                                     && !linked_ids.contains(&linked_id)
                                 {

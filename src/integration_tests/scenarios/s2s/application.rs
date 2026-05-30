@@ -11,7 +11,7 @@ use crate::s2s::application::proto::{
     ModerationCommand, UserStatePatch, VoiceIntent, VoiceIntentKind, VoiceIntentNormal,
 };
 use crate::s2s::application::voice::sink::testing::RecordingSink;
-use crate::s2s::overlay::{RoutingMetric, config::SeedPeer};
+use crate::s2s::overlay::{RoutingMetric, SeedPeer};
 use crate::s2s::testing::{
     Cluster, full_mesh_seeds, line_seeds, wait_for_full_alive_mesh, wait_for_full_routing,
     wait_until,

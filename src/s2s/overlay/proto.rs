@@ -85,18 +85,7 @@ pub fn mask_to_transports(mask: u32) -> Vec<TransportKind> {
 /// Convert a domain `NodeIdentifier` to the `u32` field on the wire.
 #[inline]
 pub fn node_to_wire(id: NodeIdentifier) -> u32 {
-    id as u32
-}
-
-/// Convert a wire `u32` to a `NodeIdentifier`. Returns `None` if the value
-/// does not fit in `u16`.
-#[inline]
-pub fn node_from_wire(v: u32) -> Option<NodeIdentifier> {
-    if v <= u16::MAX as u32 {
-        Some(v as NodeIdentifier)
-    } else {
-        None
-    }
+    u32::from(id)
 }
 
 /// Convert a `ServiceLevel` to its u32 wire value.

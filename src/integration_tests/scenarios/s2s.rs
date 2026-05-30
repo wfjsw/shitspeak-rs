@@ -1,6 +1,9 @@
 //! S2S-enabled server scenarios.
 
+pub mod application;
 pub mod overlay;
+pub mod replications;
+pub mod transport;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -102,6 +102,10 @@ impl AdaptiveDictionaryStore {
         self.by_id.get(&id).map(Arc::as_ref)
     }
 
+    fn latest(&self) -> Option<&CompressionDictionary> {
+        self.order.back().and_then(|id| self.get(*id))
+    }
+
     fn contains(&self, id: u64) -> bool {
         self.by_id.contains_key(&id)
     }
@@ -366,8 +370,7 @@ async fn run_pump<S>(
     let mut outbound_compression = AdaptiveCompressionState::new(cfg.compression.clone());
     let mut inbound_compression = AdaptiveCompressionState::new(cfg.compression.clone());
     let mut peer_dictionary_support = PeerDictionaryCompressionSupport::default();
-    let mut local_adaptive_dictionaries =
-        AdaptiveDictionaryStore::new(MAX_ADAPTIVE_DICTIONARIES_PER_STREAM);
+    let mut local_adaptive_dictionaries = local_adaptive_dictionary_store(&cfg.compression);
     let mut peer_adaptive_dictionaries =
         AdaptiveDictionaryStore::new(MAX_ADAPTIVE_DICTIONARIES_PER_STREAM);
     let mut active_adaptive_dictionary_id = None;
@@ -459,6 +462,18 @@ async fn run_pump<S>(
                             level_for_metrics,
                         ).await {
                             Ok(transport_link_stable) => {
+                                if let Err(e) = maybe_advertise_local_adaptive_dictionary(
+                                    &cfg,
+                                    &peer,
+                                    &mut framed,
+                                    &local_adaptive_dictionaries,
+                                    peer_dictionary_support,
+                                    active_adaptive_dictionary_id,
+                                    &mut pending_adaptive_dictionary_id,
+                                ).await {
+                                    warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "adaptive dictionary advertisement failed");
+                                    break;
+                                }
                                 if transport_link_stable {
                                     startup_probe.arm();
                                     if !stable_ping_interval_armed
@@ -490,14 +505,24 @@ async fn run_pump<S>(
                     Ok(dictionary) => {
                         let dictionary_id = dictionary.wire_id();
                         local_adaptive_dictionaries.insert(dictionary.clone());
-                        if peer_dictionary_support.adaptive_advertisement {
-                            let frame = dictionary_advertisement_frame(&cfg, dictionary.as_ref());
-                            if let Err(e) = encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
-                                warn!(peer=%peer.node_id(), transport=?cfg.transport, dictionary_id, error=%e, "adaptive dictionary advertisement failed");
-                                break;
-                            }
-                            pending_adaptive_dictionary_id = Some(dictionary_id);
-                            trace!(peer=%peer.node_id(), transport=?cfg.transport, dictionary_id, "advertised adaptive dictionary");
+                        if let Err(e) = outbound_compression
+                            .config()
+                            .cache_adaptive_dictionary(dictionary)
+                            .await
+                        {
+                            warn!(peer=%peer.node_id(), transport=?cfg.transport, dictionary_id, error=%e, "adaptive dictionary cache write failed");
+                        }
+                        if let Err(e) = maybe_advertise_local_adaptive_dictionary(
+                            &cfg,
+                            &peer,
+                            &mut framed,
+                            &local_adaptive_dictionaries,
+                            peer_dictionary_support,
+                            active_adaptive_dictionary_id,
+                            &mut pending_adaptive_dictionary_id,
+                        ).await {
+                            warn!(peer=%peer.node_id(), transport=?cfg.transport, dictionary_id, error=%e, "adaptive dictionary advertisement failed");
+                            break;
                         }
                     }
                     Err(e) => {
@@ -693,6 +718,14 @@ fn record_evicted_pending(
     }
 }
 
+fn local_adaptive_dictionary_store(cfg: &CompressionConfig) -> AdaptiveDictionaryStore {
+    let mut store = AdaptiveDictionaryStore::new(MAX_ADAPTIVE_DICTIONARIES_PER_STREAM);
+    if let Some(dictionary) = cfg.cached_adaptive_dictionary() {
+        store.insert(dictionary);
+    }
+    store
+}
+
 fn maybe_start_adaptive_training(
     state: &mut AdaptiveCompressionState,
     peer_support: PeerDictionaryCompressionSupport,
@@ -722,6 +755,51 @@ fn maybe_start_adaptive_training(
             .and_then(|result| result);
         let _ = training_tx.send(result).await;
     });
+}
+
+async fn maybe_advertise_local_adaptive_dictionary<S>(
+    cfg: &StreamPumpConfig,
+    peer: &PeerState,
+    framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
+    local_adaptive_dictionaries: &AdaptiveDictionaryStore,
+    peer_support: PeerDictionaryCompressionSupport,
+    active_adaptive_dictionary_id: Option<u64>,
+    pending_adaptive_dictionary_id: &mut Option<u64>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    let Some(dictionary) = next_adaptive_dictionary_to_advertise(
+        local_adaptive_dictionaries,
+        peer_support,
+        active_adaptive_dictionary_id,
+        *pending_adaptive_dictionary_id,
+    ) else {
+        return Ok(());
+    };
+
+    let dictionary_id = dictionary.wire_id();
+    let frame = dictionary_advertisement_frame(cfg, dictionary);
+    encode_and_send(framed, &frame, cfg.transport, peer).await?;
+    *pending_adaptive_dictionary_id = Some(dictionary_id);
+    trace!(peer=%cfg.peer_node, transport=?cfg.transport, dictionary_id, "advertised adaptive dictionary");
+    Ok(())
+}
+
+fn next_adaptive_dictionary_to_advertise(
+    local_adaptive_dictionaries: &AdaptiveDictionaryStore,
+    peer_support: PeerDictionaryCompressionSupport,
+    active_adaptive_dictionary_id: Option<u64>,
+    pending_adaptive_dictionary_id: Option<u64>,
+) -> Option<&CompressionDictionary> {
+    if !peer_support.adaptive_advertisement
+        || active_adaptive_dictionary_id.is_some()
+        || pending_adaptive_dictionary_id.is_some()
+    {
+        return None;
+    }
+
+    local_adaptive_dictionaries.latest()
 }
 
 fn outbound_compression_dictionary<'a>(
@@ -1265,6 +1343,64 @@ mod tests {
             )
             .map(CompressionDictionary::wire_id),
             cfg.dictionary_wire_id()
+        );
+    }
+
+    #[test]
+    fn cached_adaptive_dictionary_is_ready_for_startup_advertisement() {
+        let dictionary = Arc::new(
+            CompressionDictionary::new(
+                b"cached adaptive s2s transport zstd dictionary bytes for startup".to_vec(),
+                CompressionConfig::default().level(),
+                CompressionDictionaryKind::Adaptive,
+            )
+            .unwrap(),
+        );
+        let dictionary_id = dictionary.wire_id();
+        let mut local_adaptive_dictionaries =
+            AdaptiveDictionaryStore::new(MAX_ADAPTIVE_DICTIONARIES_PER_STREAM);
+        local_adaptive_dictionaries.insert(dictionary);
+        let peer_support = PeerDictionaryCompressionSupport {
+            adaptive_advertisement: true,
+            configured_fingerprint: None,
+        };
+
+        assert_eq!(
+            next_adaptive_dictionary_to_advertise(
+                &local_adaptive_dictionaries,
+                peer_support,
+                None,
+                None
+            )
+            .map(CompressionDictionary::wire_id),
+            Some(dictionary_id)
+        );
+        assert!(
+            next_adaptive_dictionary_to_advertise(
+                &local_adaptive_dictionaries,
+                PeerDictionaryCompressionSupport::default(),
+                None,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            next_adaptive_dictionary_to_advertise(
+                &local_adaptive_dictionaries,
+                peer_support,
+                Some(dictionary_id),
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            next_adaptive_dictionary_to_advertise(
+                &local_adaptive_dictionaries,
+                peer_support,
+                None,
+                Some(dictionary_id)
+            )
+            .is_none()
         );
     }
 

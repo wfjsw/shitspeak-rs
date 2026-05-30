@@ -9,18 +9,19 @@ use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
-use super::super::config::ReplicationConfig;
-use super::super::error::ReplicationError;
-use super::super::proto::{self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG};
-use super::super::strict::{HistoryMetadata, LogSlice};
-use super::super::test_support::{CountingOwnerRepo, CountingStrictRepo};
-use super::super::topic::{InboundBody, InboundFrame};
-use super::super::{OwnerReplicable, StrictReplicable};
 use super::harness::ReplCluster;
 use crate::channel_repository::{
     ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository,
 };
 use crate::channels::Channel;
+use crate::s2s::replications::proto::{
+    self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG,
+};
+use crate::s2s::replications::strict::{HistoryMetadata, LogSlice};
+use crate::s2s::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
+use crate::s2s::replications::{
+    OwnerReplicable, ReplicationConfig, ReplicationError, StrictReplicable,
+};
 use crate::s2s::testing::chaos::MessageType;
 use crate::s2s::testing::{wait_for_full_routing, wait_until};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
@@ -877,11 +878,9 @@ async fn owner_gap_triggers_catchup() {
 
     // A's manager: drop ANY OwnerOp for origin = B's id, version = 2.
     let b_id = cluster.cluster.nodes[1].overlay.local_node_id();
-    cluster.managers[0].set_inbound_filter(move |frame: &InboundFrame| {
-        if let InboundBody::Owner(OwnerBody::Op(op)) = &frame.body {
-            if (op.origin_node as u16) == b_id && op.origin_version == 2 {
-                return false; // drop
-            }
+    cluster.managers[0].set_owner_op_inbound_filter(move |origin_node, origin_version| {
+        if origin_node == b_id && origin_version == 2 {
+            return false;
         }
         true
     });

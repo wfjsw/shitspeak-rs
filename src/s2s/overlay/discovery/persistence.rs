@@ -4,8 +4,9 @@
 //! `<persistence_dir>/overlay/peers.json`. On startup, the file (if present)
 //! is loaded and used as a second source of seed addresses (in addition to
 //! `OverlayConfig::seed_peers`). Each entry lets the transport supervisor
-//! dial the peer immediately while preserving a wall-clock `last_seen` so
-//! old peers are probed less aggressively than freshly seen peers.
+//! dial the peer immediately while preserving a wall-clock `last_seen` and
+//! per-address retry backoff so old peers are probed less aggressively than
+//! freshly seen peers and restart does not reset failed-address timers.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -16,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::s2s::transport::{PeerAddress, TransportKind};
+use crate::s2s::transport::{AddressBackoffSnapshot, PeerAddress, TransportKind};
 use crate::types::NodeIdentifier;
 
 use super::super::error::OverlayError;
@@ -44,6 +45,17 @@ pub(crate) struct PersistedAddress {
     /// SocketAddr text form (e.g., "127.0.0.1:9000" or "[::1]:9000").
     pub addr: String,
     pub transport: PersistedTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backoff: Option<PersistedAddressBackoff>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistedAddressBackoff {
+    retry_delay_ms: u64,
+    next_delay_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after_unix_ms: Option<u64>,
+    consecutive_failures: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +93,7 @@ impl From<PersistedTransport> for TransportKind {
 pub(crate) struct PersistedPeerRecord {
     node_id: NodeIdentifier,
     addresses: Vec<PeerAddress>,
+    address_backoffs: HashMap<PeerAddress, AddressBackoffSnapshot>,
     last_seen: Option<SystemTime>,
 }
 
@@ -93,6 +106,21 @@ impl PersistedPeerRecord {
         Self {
             node_id,
             addresses,
+            address_backoffs: HashMap::new(),
+            last_seen,
+        }
+    }
+
+    pub(crate) fn new_with_address_backoffs(
+        node_id: NodeIdentifier,
+        addresses: Vec<PeerAddress>,
+        address_backoffs: HashMap<PeerAddress, AddressBackoffSnapshot>,
+        last_seen: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            node_id,
+            addresses,
+            address_backoffs,
             last_seen,
         }
     }
@@ -103,6 +131,10 @@ impl PersistedPeerRecord {
 
     pub(crate) fn addresses(&self) -> &[PeerAddress] {
         &self.addresses
+    }
+
+    pub(crate) fn address_backoff(&self, addr: PeerAddress) -> Option<AddressBackoffSnapshot> {
+        self.address_backoffs.get(&addr).copied()
     }
 
     pub(crate) fn last_seen(&self) -> Option<SystemTime> {
@@ -148,6 +180,7 @@ pub fn load(persistence_dir: &Path) -> Result<Vec<PersistedPeerRecord>, OverlayE
     let mut dropped_peers = 0usize;
     for p in parsed.peers {
         let mut addrs = Vec::with_capacity(p.addresses.len());
+        let mut backoffs = HashMap::new();
         for a in p.addresses {
             let Ok(sa) = a.addr.parse::<SocketAddr>() else {
                 dropped_addresses += 1;
@@ -165,15 +198,19 @@ pub fn load(persistence_dir: &Path) -> Result<Vec<PersistedPeerRecord>, OverlayE
                 dropped_ambiguous_addresses += 1;
                 continue;
             }
+            if let Some(backoff) = a.backoff.map(address_backoff_from_persisted) {
+                backoffs.insert(addr, backoff);
+            }
             addrs.push(addr);
         }
         if addrs.is_empty() {
             dropped_peers += 1;
             continue;
         }
-        out.push(PersistedPeerRecord::new(
+        out.push(PersistedPeerRecord::new_with_address_backoffs(
             p.node_id,
             addrs,
+            backoffs,
             p.last_seen_unix_ms.map(system_time_from_unix_ms),
         ));
     }
@@ -223,6 +260,11 @@ pub fn save(persistence_dir: &Path, peers: &[PersistedPeerRecord]) -> Result<(),
                     .map(|a| PersistedAddress {
                         addr: a.addr().to_string(),
                         transport: a.transport().into(),
+                        backoff: peer
+                            .address_backoffs
+                            .get(a)
+                            .copied()
+                            .map(persisted_address_backoff_from_snapshot),
                     })
                     .collect();
                 (!addresses.is_empty()).then(|| PersistedPeer {
@@ -271,6 +313,30 @@ fn unix_ms_from_system_time(value: SystemTime) -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn millis_from_duration(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn persisted_address_backoff_from_snapshot(
+    value: AddressBackoffSnapshot,
+) -> PersistedAddressBackoff {
+    PersistedAddressBackoff {
+        retry_delay_ms: millis_from_duration(value.retry_delay()),
+        next_delay_ms: millis_from_duration(value.next_delay()),
+        retry_after_unix_ms: value.retry_after().and_then(unix_ms_from_system_time),
+        consecutive_failures: value.consecutive_failures(),
+    }
+}
+
+fn address_backoff_from_persisted(value: PersistedAddressBackoff) -> AddressBackoffSnapshot {
+    AddressBackoffSnapshot::new(
+        Duration::from_millis(value.retry_delay_ms),
+        Duration::from_millis(value.next_delay_ms),
+        value.retry_after_unix_ms.map(system_time_from_unix_ms),
+        value.consecutive_failures,
+    )
 }
 
 fn persisted_address_is_usable(addr: PeerAddress) -> bool {
@@ -347,6 +413,44 @@ mod tests {
         expected.sort_by_key(|peer| peer.node_id());
         actual.sort_by_key(|peer| peer.node_id());
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn roundtrip_preserves_address_backoff_state() {
+        let dir = TempDir::new().unwrap();
+        let addr = PeerAddress::new("10.0.0.7:64739".parse().unwrap(), TransportKind::Tcp);
+        let retry_after = UNIX_EPOCH + Duration::from_millis(1_700_000_005_000);
+        let backoff = AddressBackoffSnapshot::new(
+            Duration::from_millis(750),
+            Duration::from_secs(2),
+            Some(retry_after),
+            3,
+        );
+        let peers = vec![PersistedPeerRecord::new_with_address_backoffs(
+            7,
+            vec![addr],
+            HashMap::from([(addr, backoff)]),
+            Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)),
+        )];
+
+        save(dir.path(), &peers).unwrap();
+
+        let written: PersistedPeers =
+            serde_json::from_slice(&fs::read(peers_file(dir.path())).unwrap())
+                .expect("persisted peers json");
+        let persisted_backoff = written.peers[0].addresses[0]
+            .backoff
+            .expect("persisted address backoff");
+        assert_eq!(persisted_backoff.retry_delay_ms, 750);
+        assert_eq!(persisted_backoff.next_delay_ms, 2_000);
+        assert_eq!(
+            persisted_backoff.retry_after_unix_ms,
+            Some(1_700_000_005_000)
+        );
+        assert_eq!(persisted_backoff.consecutive_failures, 3);
+
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded, peers);
     }
 
     #[test]

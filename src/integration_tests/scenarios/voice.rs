@@ -174,8 +174,8 @@ async fn voice_tcp_server_mute_silences_sender() {
     );
 }
 
-/// Checks that regular speech crosses linked channels.
-/// Expected: Bob in a linked channel receives Alice's normal-channel voice.
+/// Checks that regular speech crosses effective linked-channel groups.
+/// Expected: Bob receives Alice's normal-channel voice through a link chain.
 /// Mumble explicitly walks linked channels with Speak permission in
 /// `D:\mumble\src\murmur\Server.cpp::processMsg`; shitspeak exposes the same
 /// linked-channel voice-target behavior through `D:\shitspeak\voicetarget.go`.
@@ -194,7 +194,12 @@ async fn voice_tcp_linked_channel_routes() {
         .create_channel(Channel::new(70, "Lobby".to_owned(), 0, 0, Some(0)))
         .await
         .unwrap();
+    chans
+        .create_channel(Channel::new(71, "Side".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
     chans.add_link(0, 70).await.unwrap();
+    chans.add_link(70, 71).await.unwrap();
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -203,7 +208,7 @@ async fn voice_tcp_linked_channel_routes() {
         .await
         .expect("bob");
 
-    bob.move_to_channel(70).await;
+    bob.move_to_channel(71).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     alice
@@ -211,8 +216,9 @@ async fn voice_tcp_linked_channel_routes() {
         .await;
 
     let received = bob.recv_voice_tcp(VOICE_DEADLINE).await;
-    let audio =
-        received.expect("Bob in a linked channel should receive Alice's voice over TCP tunnel");
+    let audio = received.expect(
+        "Bob in a transitively linked channel should receive Alice's voice over TCP tunnel",
+    );
     assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
     assert_eq!(audio.sender_session, Some(alice.server_session));
 }

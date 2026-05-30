@@ -163,6 +163,46 @@ impl BackoffSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AddressBackoffSnapshot {
+    retry_delay: Duration,
+    next_delay: Duration,
+    retry_after: Option<SystemTime>,
+    consecutive_failures: u32,
+}
+
+impl AddressBackoffSnapshot {
+    pub(crate) fn new(
+        retry_delay: Duration,
+        next_delay: Duration,
+        retry_after: Option<SystemTime>,
+        consecutive_failures: u32,
+    ) -> Self {
+        Self {
+            retry_delay,
+            next_delay,
+            retry_after,
+            consecutive_failures,
+        }
+    }
+
+    pub(crate) fn retry_delay(&self) -> Duration {
+        self.retry_delay
+    }
+
+    pub(crate) fn next_delay(&self) -> Duration {
+        self.next_delay
+    }
+
+    pub(crate) fn retry_after(&self) -> Option<SystemTime> {
+        self.retry_after
+    }
+
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
 impl BackoffState {
     pub fn new(initial: Duration) -> Self {
         Self {
@@ -171,6 +211,36 @@ impl BackoffState {
             retry_delay: initial,
             last_attempt: None,
             consecutive_failures: 0,
+        }
+    }
+
+    fn from_snapshot(
+        initial: Duration,
+        snapshot: AddressBackoffSnapshot,
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> Self {
+        let mut retry_delay = nonzero_or(snapshot.retry_delay(), initial);
+        let next_delay = nonzero_or(snapshot.next_delay(), initial);
+        let last_attempt = snapshot.retry_after().and_then(|retry_after| {
+            let remaining = retry_after.duration_since(wall_now).ok()?;
+            if remaining.is_zero() {
+                return None;
+            }
+            if remaining > retry_delay {
+                retry_delay = remaining;
+                return Some(now);
+            }
+            let elapsed = retry_delay.saturating_sub(remaining);
+            now.checked_sub(elapsed).or(Some(now))
+        });
+
+        Self {
+            initial,
+            next_delay,
+            retry_delay,
+            last_attempt,
+            consecutive_failures: snapshot.consecutive_failures(),
         }
     }
 
@@ -220,6 +290,26 @@ impl BackoffState {
             consecutive_failures: self.consecutive_failures,
         }
     }
+
+    fn address_snapshot(&self, now: Instant, wall_now: SystemTime) -> AddressBackoffSnapshot {
+        let retry_after = self.last_attempt.map(|last_attempt| {
+            let elapsed = now
+                .checked_duration_since(last_attempt)
+                .unwrap_or(Duration::ZERO);
+            let remaining = self.retry_delay.saturating_sub(elapsed);
+            wall_now.checked_add(remaining).unwrap_or(wall_now)
+        });
+        AddressBackoffSnapshot::new(
+            self.retry_delay,
+            self.next_delay,
+            retry_after,
+            self.consecutive_failures,
+        )
+    }
+}
+
+fn nonzero_or(value: Duration, fallback: Duration) -> Duration {
+    if value.is_zero() { fallback } else { value }
 }
 
 fn jittered_delay(base: Duration, cap: Duration) -> Duration {
@@ -326,11 +416,48 @@ impl PeerState {
         true
     }
 
+    pub fn add_address_seen_at_with_backoff(
+        &self,
+        addr: PeerAddress,
+        seen_at: SystemTime,
+        backoff: Option<AddressBackoffSnapshot>,
+    ) -> bool {
+        self.note_seen_at(seen_at);
+        let mut g = self.addresses.lock();
+        let added = if g.contains(&addr) {
+            false
+        } else {
+            g.push(addr);
+            true
+        };
+        drop(g);
+
+        if let Some(backoff) = backoff {
+            self.restore_address_backoff(addr, backoff);
+        } else {
+            self.ensure_address_backoff(addr);
+        }
+
+        added
+    }
+
     fn ensure_address_backoff(&self, addr: PeerAddress) {
         self.address_backoffs
             .lock()
             .entry(addr)
             .or_insert_with(|| BackoffState::new(self.backoff_initial));
+    }
+
+    pub fn restore_address_backoff(&self, addr: PeerAddress, backoff: AddressBackoffSnapshot) {
+        self.address_backoffs.lock().insert(
+            addr,
+            BackoffState::from_snapshot(
+                self.backoff_initial,
+                backoff,
+                Instant::now(),
+                SystemTime::now(),
+            ),
+        );
     }
 
     pub fn address_retry_ready(
@@ -512,6 +639,23 @@ impl PeerState {
 
     pub fn snapshot_addresses(&self) -> Vec<PeerAddress> {
         self.addresses.lock().clone()
+    }
+
+    pub fn snapshot_address_backoffs(
+        &self,
+        addresses: &[PeerAddress],
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> HashMap<PeerAddress, AddressBackoffSnapshot> {
+        let backoffs = self.address_backoffs.lock();
+        addresses
+            .iter()
+            .filter_map(|addr| {
+                backoffs
+                    .get(addr)
+                    .map(|backoff| (*addr, backoff.address_snapshot(now, wall_now)))
+            })
+            .collect()
     }
 
     pub fn install_stream(&self, stream: ActiveStream) {
@@ -793,6 +937,43 @@ mod tests {
             Duration::from_secs(30)
         ));
         assert!(b.ready(last_attempt + retry_delay, Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn restored_backoff_preserves_future_retry_deadline() {
+        let now = Instant::now();
+        let wall_now = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let snapshot = AddressBackoffSnapshot::new(
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            Some(wall_now + Duration::from_secs(5)),
+            2,
+        );
+
+        let b = BackoffState::from_snapshot(Duration::from_millis(250), snapshot, now, wall_now);
+
+        assert!(!b.ready(now + Duration::from_secs(4), Duration::from_secs(30)));
+        assert!(b.ready(now + Duration::from_secs(5), Duration::from_secs(30)));
+        assert_eq!(b.next_delay, Duration::from_secs(20));
+        assert_eq!(b.consecutive_failures, 2);
+    }
+
+    #[test]
+    fn restored_expired_backoff_is_immediately_ready() {
+        let now = Instant::now();
+        let wall_now = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let snapshot = AddressBackoffSnapshot::new(
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            Some(wall_now - Duration::from_secs(1)),
+            2,
+        );
+
+        let b = BackoffState::from_snapshot(Duration::from_millis(250), snapshot, now, wall_now);
+
+        assert!(b.ready(now, Duration::from_secs(30)));
+        assert_eq!(b.next_delay, Duration::from_secs(20));
+        assert_eq!(b.consecutive_failures, 2);
     }
 
     #[test]

@@ -163,18 +163,7 @@ pub fn stream_codec(max_frame_bytes: usize) -> LengthDelimitedCodec {
 /// Convert a domain `NodeIdentifier` (u16) into the on-wire `u32` field.
 #[inline]
 pub fn node_to_wire(id: NodeIdentifier) -> u32 {
-    id as u32
-}
-
-/// Convert an on-wire `u32` into a domain `NodeIdentifier`. Returns `None` if
-/// the value does not fit in `u16`.
-#[inline]
-pub fn node_from_wire(v: u32) -> Option<NodeIdentifier> {
-    if v <= u16::MAX as u32 {
-        Some(v as NodeIdentifier)
-    } else {
-        None
-    }
+    u32::from(id)
 }
 
 /// Construct a `Frame` from domain-typed inputs.
@@ -255,9 +244,12 @@ mod tests {
     fn node_id_helpers() {
         assert_eq!(node_to_wire(0), 0);
         assert_eq!(node_to_wire(u16::MAX), u16::MAX as u32);
-        assert_eq!(node_from_wire(0), Some(0));
-        assert_eq!(node_from_wire(u16::MAX as u32), Some(u16::MAX));
-        assert_eq!(node_from_wire(u16::MAX as u32 + 1), None);
+        assert_eq!(NodeIdentifier::try_from(0).ok(), Some(0));
+        assert_eq!(
+            NodeIdentifier::try_from(u16::MAX as u32).ok(),
+            Some(u16::MAX)
+        );
+        assert_eq!(NodeIdentifier::try_from(u16::MAX as u32 + 1).ok(), None);
     }
 
     #[test]

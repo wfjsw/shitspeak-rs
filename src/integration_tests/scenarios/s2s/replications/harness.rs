@@ -4,18 +4,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::s2s::replications::{
+    OwnerHandle, OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager,
+    StrictHandle, StrictReplicable,
+};
 use crate::s2s::testing::{
     Cluster, full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing,
 };
 
-use super::super::{
-    OwnerHandle, OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager,
-    StrictHandle, StrictReplicable,
-};
-
-pub struct ReplCluster {
-    pub cluster: Cluster,
-    pub managers: Vec<Arc<ReplicationManager>>,
+pub(crate) struct ReplCluster {
+    pub(crate) cluster: Cluster,
+    pub(crate) managers: Vec<Arc<ReplicationManager>>,
 }
 
 impl ReplCluster {

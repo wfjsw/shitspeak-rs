@@ -20,8 +20,8 @@ use crate::types::NodeIdentifier;
 use super::super::error::OverlayError;
 use super::super::proto::{
     OverlayBody, OverlayControlBody, class_from_wire, class_to_wire, encode_message,
-    level_from_wire, level_to_wire, node_from_wire, node_to_wire, route_metric_from_wire,
-    route_metric_to_wire, wrap,
+    level_from_wire, level_to_wire, node_to_wire, route_metric_from_wire, route_metric_to_wire,
+    wrap,
 };
 use super::super::routing::{RoutingHandle, RoutingMetric, RoutingTables};
 use super::delivery;
@@ -173,15 +173,15 @@ pub async fn handle_inbound(
     ordering.cache_ordered_packet(&data).await;
     let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
-    let src = node_from_wire(data.src).unwrap_or(0);
+    let src = NodeIdentifier::try_from(data.src).unwrap_or(0);
     let is_for_self = data
         .dsts
         .iter()
-        .any(|d| node_from_wire(*d) == Some(self_id));
+        .any(|d| NodeIdentifier::try_from(*d).ok() == Some(self_id));
 
     if is_for_self {
         if let Some(lane) = data.lane_id.and_then(|id| LaneId::try_from(id).ok()) {
-            if node_from_wire(data.ordering_dst) == Some(self_id) {
+            if NodeIdentifier::try_from(data.ordering_dst).ok() == Some(self_id) {
                 if let Some(outcome) = ordering.accept_inbound(self_id, &data, level, class).await {
                     send_ack(
                         transport,
@@ -242,7 +242,7 @@ pub async fn handle_inbound(
     let remaining: Vec<u32> = data
         .dsts
         .iter()
-        .filter(|d| node_from_wire(**d) != Some(self_id))
+        .filter(|d| NodeIdentifier::try_from(**d).ok() != Some(self_id))
         .copied()
         .collect();
     if remaining.is_empty() {
@@ -272,13 +272,13 @@ pub async fn handle_control(
     _from: NodeIdentifier,
     control: pb::OverlayControl,
 ) {
-    let Some(origin) = node_from_wire(control.origin) else {
+    let Ok(origin) = NodeIdentifier::try_from(control.origin) else {
         return;
     };
-    let Some(final_dst) = node_from_wire(control.final_dst) else {
+    let Ok(final_dst) = NodeIdentifier::try_from(control.final_dst) else {
         return;
     };
-    let Some(requester) = node_from_wire(control.requester) else {
+    let Ok(requester) = NodeIdentifier::try_from(control.requester) else {
         return;
     };
     let Ok(lane) = LaneId::try_from(control.lane_id) else {
@@ -407,7 +407,7 @@ async fn send_ack(
     lane: LaneId,
     next_seq: u64,
 ) {
-    let Some(origin) = node_from_wire(data.src) else {
+    let Ok(origin) = NodeIdentifier::try_from(data.src) else {
         return;
     };
     let control = pb::OverlayControl {
@@ -430,7 +430,7 @@ async fn send_repair_request(
     first_seq: u64,
     last_seq: u64,
 ) {
-    let Some(origin) = node_from_wire(data.src) else {
+    let Ok(origin) = NodeIdentifier::try_from(data.src) else {
         return;
     };
     let control = pb::OverlayControl {
@@ -549,7 +549,7 @@ async fn forward_pb_as(
     let path_trace_set: HashSet<u32> = data.path_trace.iter().copied().collect();
     let mut buckets: HashMap<NodeIdentifier, Vec<u32>> = HashMap::new();
     for dst_wire in &data.dsts {
-        let Some(dst) = node_from_wire(*dst_wire) else {
+        let Ok(dst) = NodeIdentifier::try_from(*dst_wire) else {
             continue;
         };
         if dst == self_id {
@@ -567,7 +567,7 @@ async fn forward_pb_as(
                 if let Some(reason) = fallback {
                     debug!(
                         self_id = %self_id,
-                        src = %node_from_wire(data.src).unwrap_or(0),
+                        src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
                         %dst,
                         %next_hop,
                         ?reason,
@@ -599,17 +599,17 @@ async fn forward_pb_as(
             let dsts: Vec<NodeIdentifier> = pb_msg
                 .dsts
                 .iter()
-                .filter_map(|dst| node_from_wire(*dst))
+                .filter_map(|dst| NodeIdentifier::try_from(*dst).ok())
                 .collect();
             let path_trace: Vec<NodeIdentifier> = pb_msg
                 .path_trace
                 .iter()
-                .filter_map(|node| node_from_wire(*node))
+                .filter_map(|node| NodeIdentifier::try_from(*node).ok())
                 .collect();
             let payload_hex = payload_hex_preview(&pb_msg.payload);
             trace!(
                 %next_hop,
-                src = %node_from_wire(pb_msg.src).unwrap_or(0),
+                src = %NodeIdentifier::try_from(pb_msg.src).unwrap_or(0),
                 dsts = ?dsts,
                 path_trace = ?path_trace,
                 service_tag = pb_msg.service_tag,

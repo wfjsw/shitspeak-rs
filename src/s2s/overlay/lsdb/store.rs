@@ -272,14 +272,13 @@ impl LsaEntry {
     /// Build from a wire LSA. Returns `None` if `origin` is not a valid
     /// `NodeIdentifier` (overflows u16).
     pub fn from_pb(pb: &pb::LinkStateAdvert) -> Option<Self> {
-        use super::super::proto::node_from_wire;
-        let origin = node_from_wire(pb.origin)?;
+        let origin = NodeIdentifier::try_from(pb.origin).ok()?;
         let addresses = pb.addresses.iter().filter_map(address_from_pb).collect();
         let links = pb
             .links
             .iter()
             .filter_map(|l| {
-                let neighbor = node_from_wire(l.neighbor)?;
+                let neighbor = NodeIdentifier::try_from(l.neighbor).ok()?;
                 Some(LinkAdvertised {
                     neighbor,
                     rtt_us: l.rtt_us,

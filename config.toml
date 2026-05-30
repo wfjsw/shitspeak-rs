@@ -101,6 +101,8 @@ compression_min_savings_percent = 10
 compression_level = 1
 # Learn per-stream zstd dictionaries from recent S2S payloads. Stream peers
 # advertise support in transport Hello before dictionary frames are sent.
+# When s2s.persistence_dir is set, the latest learned stream dictionary is
+# cached below it and re-advertised for ack on restart before it is reused.
 # UDP continues to use only identity/plain zstd unless an explicit dictionary is configured.
 compression_adaptive_dictionary_enabled = true
 # Optional static zstd dictionary for S2S L1 payload compression. Stream peers

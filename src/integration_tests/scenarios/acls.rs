@@ -143,6 +143,97 @@ async fn acl_query_returns_chain() {
 }
 
 #[tokio::test]
+async fn acl_query_returns_inherited_entries_before_local_entries() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(42, "Outer".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(43, "Middle".to_owned(), 0, 0, Some(42)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(44, "Inner".to_owned(), 0, 0, Some(43)))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            42,
+            true,
+            vec![acl_for_group(
+                "outer",
+                ACLPermissions::Traverse.into(),
+                enumflags2::BitFlags::empty(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            43,
+            true,
+            vec![acl_for_group(
+                "middle",
+                ACLPermissions::Enter.into(),
+                enumflags2::BitFlags::empty(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            44,
+            true,
+            vec![acl_for_group(
+                "inner",
+                ACLPermissions::Speak.into(),
+                enumflags2::BitFlags::empty(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    alice.query_acls(44).await;
+
+    let Some(Message::ACL(resp)) = alice
+        .recv_until(
+            |m| matches!(m, Message::ACL(a) if a.channel_id == 44),
+            Duration::from_secs(2),
+        )
+        .await
+    else {
+        panic!("Alice should receive an ACL response for channel 44");
+    };
+
+    let groups: Vec<_> = resp
+        .acls
+        .iter()
+        .map(|acl| acl.group.as_deref().unwrap_or(""))
+        .collect();
+    let inherited: Vec<_> = resp
+        .acls
+        .iter()
+        .map(|acl| acl.inherited.unwrap_or(true))
+        .collect();
+
+    assert_eq!(groups, vec!["outer", "middle", "inner"]);
+    assert_eq!(inherited, vec![true, true, false]);
+}
+
+#[tokio::test]
 async fn traverse_visibility_gate_off_keeps_existing_user_visibility() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

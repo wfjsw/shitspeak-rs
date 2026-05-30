@@ -23,11 +23,9 @@ mod service_level;
 mod stream_io;
 mod tls;
 
-#[cfg(test)]
-mod integration_tests;
-
 pub use compression::SendOptions;
 pub use config::{TransportConfig, TransportTuning};
+pub(crate) use connection::AddressBackoffSnapshot;
 pub use error::{ConfigError, SendError, TransportError};
 pub(crate) use manager::PeerAddressSnapshot;
 pub use manager::{ConnectionManager, Inbound, InboundMessage};

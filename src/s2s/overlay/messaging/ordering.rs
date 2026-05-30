@@ -269,7 +269,7 @@ impl OverlayOrdering {
     }
 
     pub(crate) async fn store_pending(&self, lane: LaneId, data: pb::OverlayData) {
-        let Some(dst) = node_from_wire(data.ordering_dst) else {
+        let Ok(dst) = NodeIdentifier::try_from(data.ordering_dst) else {
             return;
         };
         let key = OutboundKey { dst, lane };
@@ -350,10 +350,10 @@ impl OverlayOrdering {
         let Some(lane) = data.lane_id.and_then(|id| LaneId::try_from(id).ok()) else {
             return;
         };
-        let Some(origin) = node_from_wire(data.src) else {
+        let Ok(origin) = NodeIdentifier::try_from(data.src) else {
             return;
         };
-        let Some(final_dst) = node_from_wire(data.ordering_dst) else {
+        let Ok(final_dst) = NodeIdentifier::try_from(data.ordering_dst) else {
             return;
         };
         let key = RepairKey {
@@ -389,8 +389,8 @@ impl OverlayOrdering {
         class: MessageClass,
     ) -> Option<AcceptOutcome> {
         let lane = data.lane_id.and_then(|id| LaneId::try_from(id).ok())?;
-        let src = node_from_wire(data.src)?;
-        let final_dst = node_from_wire(data.ordering_dst)?;
+        let src = NodeIdentifier::try_from(data.src).ok()?;
+        let final_dst = NodeIdentifier::try_from(data.ordering_dst).ok()?;
         if final_dst != self_id {
             return None;
         }
@@ -545,15 +545,6 @@ impl OrderedDelivery {
 
     pub(crate) fn body(&self) -> Bytes {
         self.body.clone()
-    }
-}
-
-#[inline]
-fn node_from_wire(v: u32) -> Option<NodeIdentifier> {
-    if v <= u16::MAX as u32 {
-        Some(v as NodeIdentifier)
-    } else {
-        None
     }
 }
 

@@ -38,9 +38,6 @@ mod topic;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-#[cfg(test)]
-mod integration_tests;
-
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -500,6 +497,18 @@ impl ReplicationManager {
         self.inner
             .overlay
             .register_service(REPLICATION_SERVICE_TAG, handler);
+    }
+
+    pub(crate) fn set_owner_op_inbound_filter<F>(&self, predicate: F)
+    where
+        F: Fn(NodeIdentifier, u64) -> bool + Send + Sync + 'static,
+    {
+        self.set_inbound_filter(move |frame| {
+            if let InboundBody::Owner(OwnerBody::Op(op)) = &frame.body {
+                return predicate(op.origin_node as NodeIdentifier, op.origin_version);
+            }
+            true
+        });
     }
 }
 

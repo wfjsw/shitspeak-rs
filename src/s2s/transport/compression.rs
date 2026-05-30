@@ -1,10 +1,16 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use bytes::Bytes;
+use parking_lot::RwLock;
+use tokio::io::AsyncWriteExt;
 use zstd::dict::{DecoderDictionary, EncoderDictionary};
 
 use crate::s2s_transport_proto as pb;
@@ -22,8 +28,11 @@ const ADAPTIVE_MAX_BYTES: usize = 256 * 1024;
 const ADAPTIVE_MAX_DICTIONARY_BYTES: usize = 16 * 1024;
 const ADAPTIVE_MIN_SAMPLE_BYTES: usize = 64;
 const ADAPTIVE_MAX_SAMPLE_BYTES: usize = 64 * 1024;
+const ADAPTIVE_DICTIONARY_CACHE_SUBDIR: &str = "transport";
+const ADAPTIVE_DICTIONARY_CACHE_FILE: &str = "adaptive-compression.zdict";
 pub(crate) const DICTIONARY_FINGERPRINT_BYTES: usize = 20;
 const DICTIONARY_WIRE_ID_BYTES: usize = 8;
+static ADAPTIVE_DICTIONARY_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-send transport options. Defaults are intentionally raw so only
 /// non-latency-sensitive callers opt in to L1 compression.
@@ -59,6 +68,7 @@ pub(crate) struct CompressionConfig {
     level: i32,
     adaptive_dictionary_enabled: bool,
     dictionary: Option<Arc<CompressionDictionary>>,
+    adaptive_dictionary_cache: Option<Arc<AdaptiveDictionaryCache>>,
 }
 
 impl fmt::Debug for CompressionConfig {
@@ -73,6 +83,14 @@ impl fmt::Debug for CompressionConfig {
                 &self.adaptive_dictionary_enabled,
             )
             .field("dictionary", &self.dictionary)
+            .field(
+                "adaptive_dictionary_cache_path",
+                &self.adaptive_dictionary_cache_path(),
+            )
+            .field(
+                "cached_adaptive_dictionary",
+                &self.cached_adaptive_dictionary(),
+            )
             .finish()
     }
 }
@@ -85,6 +103,9 @@ impl PartialEq for CompressionConfig {
             && self.level == other.level
             && self.adaptive_dictionary_enabled == other.adaptive_dictionary_enabled
             && self.dictionary.as_deref() == other.dictionary.as_deref()
+            && self.adaptive_dictionary_cache_path() == other.adaptive_dictionary_cache_path()
+            && self.cached_adaptive_dictionary_wire_id()
+                == other.cached_adaptive_dictionary_wire_id()
     }
 }
 
@@ -196,6 +217,143 @@ fn dictionary_wire_id(fingerprint: &[u8; DICTIONARY_FINGERPRINT_BYTES]) -> u64 {
     if id == 0 { 1 } else { id }
 }
 
+pub(crate) fn adaptive_dictionary_cache_file(persistence_dir: &Path) -> PathBuf {
+    persistence_dir
+        .join(ADAPTIVE_DICTIONARY_CACHE_SUBDIR)
+        .join(ADAPTIVE_DICTIONARY_CACHE_FILE)
+}
+
+pub(crate) struct AdaptiveDictionaryCache {
+    path: PathBuf,
+    latest: RwLock<Option<Arc<CompressionDictionary>>>,
+}
+
+impl AdaptiveDictionaryCache {
+    fn open(path: PathBuf, level: i32) -> Arc<Self> {
+        let latest = load_cached_adaptive_dictionary(&path, level);
+        Arc::new(Self {
+            path,
+            latest: RwLock::new(latest),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn latest(&self) -> Option<Arc<CompressionDictionary>> {
+        self.latest.read().clone()
+    }
+
+    fn rebuild_for_level(&self, level: i32) {
+        let Some(dictionary) = self.latest() else {
+            return;
+        };
+
+        match CompressionDictionary::new(
+            dictionary.bytes.to_vec(),
+            level,
+            CompressionDictionaryKind::Adaptive,
+        ) {
+            Ok(rebuilt) => {
+                *self.latest.write() = Some(Arc::new(rebuilt));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %error,
+                    "ignoring cached adaptive compression dictionary after level change"
+                );
+                *self.latest.write() = None;
+            }
+        }
+    }
+
+    async fn store(&self, dictionary: Arc<CompressionDictionary>) -> io::Result<()> {
+        if dictionary.kind() != CompressionDictionaryKind::Adaptive {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only adaptive compression dictionaries can be cached",
+            ));
+        }
+
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let tmp_path = self.tmp_path();
+        let result = async {
+            {
+                let mut file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&tmp_path)
+                    .await?;
+                file.write_all(dictionary.bytes.as_ref()).await?;
+                file.sync_data().await?;
+            }
+            tokio::fs::rename(&tmp_path, &self.path).await
+        }
+        .await;
+
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(error);
+        }
+
+        *self.latest.write() = Some(dictionary);
+        Ok(())
+    }
+
+    fn tmp_path(&self) -> PathBuf {
+        let seq = ADAPTIVE_DICTIONARY_CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(ADAPTIVE_DICTIONARY_CACHE_FILE);
+        self.path
+            .with_file_name(format!("{file_name}.{}.{}.tmp", std::process::id(), seq))
+    }
+}
+
+impl fmt::Debug for AdaptiveDictionaryCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdaptiveDictionaryCache")
+            .field("path", &self.path)
+            .field("latest", &self.latest())
+            .finish()
+    }
+}
+
+fn load_cached_adaptive_dictionary(path: &Path, level: i32) -> Option<Arc<CompressionDictionary>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "ignoring unreadable adaptive compression dictionary cache"
+            );
+            return None;
+        }
+    };
+
+    match CompressionDictionary::new(bytes, level, CompressionDictionaryKind::Adaptive) {
+        Ok(dictionary) => Some(Arc::new(dictionary)),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "ignoring invalid adaptive compression dictionary cache"
+            );
+            None
+        }
+    }
+}
+
 impl CompressionConfig {
     pub(crate) fn new(
         enabled: bool,
@@ -210,6 +368,7 @@ impl CompressionConfig {
             level,
             adaptive_dictionary_enabled: DEFAULT_COMPRESSION_ADAPTIVE_DICTIONARY_ENABLED,
             dictionary: None,
+            adaptive_dictionary_cache: None,
         }
     }
 
@@ -238,6 +397,9 @@ impl CompressionConfig {
                         .expect("existing compression dictionary remains valid")
                 })
                 .map(Arc::new);
+            if let Some(cache) = &self.adaptive_dictionary_cache {
+                cache.rebuild_for_level(level);
+            }
             self.level = level;
         }
         self
@@ -268,6 +430,11 @@ impl CompressionConfig {
 
     pub(crate) fn without_dictionary(mut self) -> Self {
         self.dictionary = None;
+        self
+    }
+
+    pub(crate) fn with_adaptive_dictionary_cache_file(mut self, path: PathBuf) -> Self {
+        self.adaptive_dictionary_cache = Some(AdaptiveDictionaryCache::open(path, self.level));
         self
     }
 
@@ -319,6 +486,40 @@ impl CompressionConfig {
 
     pub(crate) fn dictionary(&self) -> Option<&CompressionDictionary> {
         self.dictionary.as_deref()
+    }
+
+    pub(crate) fn cached_adaptive_dictionary(&self) -> Option<Arc<CompressionDictionary>> {
+        if !self.enabled || !self.adaptive_dictionary_enabled {
+            return None;
+        }
+        self.adaptive_dictionary_cache
+            .as_ref()
+            .and_then(|cache| cache.latest())
+    }
+
+    pub(crate) async fn cache_adaptive_dictionary(
+        &self,
+        dictionary: Arc<CompressionDictionary>,
+    ) -> io::Result<()> {
+        if !self.enabled || !self.adaptive_dictionary_enabled {
+            return Ok(());
+        }
+        let Some(cache) = &self.adaptive_dictionary_cache else {
+            return Ok(());
+        };
+        cache.store(dictionary).await
+    }
+
+    fn adaptive_dictionary_cache_path(&self) -> Option<&Path> {
+        self.adaptive_dictionary_cache
+            .as_ref()
+            .map(|cache| cache.path())
+    }
+
+    fn cached_adaptive_dictionary_wire_id(&self) -> Option<u64> {
+        self.cached_adaptive_dictionary()
+            .as_ref()
+            .map(|dict| dict.wire_id())
     }
 }
 
@@ -694,6 +895,31 @@ mod tests {
             )
             .repeat(24),
         )
+    }
+
+    #[tokio::test]
+    async fn adaptive_dictionary_cache_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = adaptive_dictionary_cache_file(dir.path());
+        let dictionary = Arc::new(
+            CompressionDictionary::new(
+                b"adaptive s2s transport zstd dictionary cache bytes for restart".to_vec(),
+                1,
+                CompressionDictionaryKind::Adaptive,
+            )
+            .unwrap(),
+        );
+        let dictionary_id = dictionary.wire_id();
+
+        let cache = AdaptiveDictionaryCache::open(path.clone(), 1);
+        assert!(cache.latest().is_none());
+        cache.store(dictionary.clone()).await.unwrap();
+
+        let reloaded = AdaptiveDictionaryCache::open(path, 3);
+        let cached = reloaded.latest().expect("cached adaptive dictionary");
+        assert_eq!(cached.bytes(), dictionary.bytes());
+        assert_eq!(cached.wire_id(), dictionary_id);
+        assert_eq!(cached.kind(), CompressionDictionaryKind::Adaptive);
     }
 
     #[test]

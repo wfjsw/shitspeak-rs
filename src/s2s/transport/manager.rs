@@ -5,10 +5,10 @@
 //! (TLS configs, bound listener, `quinn::Endpoint`, etc.) so the manager
 //! itself stays free of transport-specific fields.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -21,7 +21,7 @@ use crate::types::NodeIdentifier;
 
 use super::SendOptions;
 use super::config::TransportConfig;
-use super::connection::{BackoffState, OutboundFrame, PeerState};
+use super::connection::{AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerState};
 use super::endpoint::{
     EndpointRegistry, kcp::KcpEndpoint, quic::QuicEndpoint, tcp::TcpEndpoint, udp::UdpEndpoint,
 };
@@ -37,6 +37,7 @@ use super::tls::build_tls_configs;
 pub(crate) struct PeerAddressSnapshot {
     node_id: NodeIdentifier,
     addresses: Vec<PeerAddress>,
+    address_backoffs: HashMap<PeerAddress, AddressBackoffSnapshot>,
     last_seen: Option<SystemTime>,
 }
 
@@ -47,6 +48,10 @@ impl PeerAddressSnapshot {
 
     pub(crate) fn addresses(&self) -> &[PeerAddress] {
         &self.addresses
+    }
+
+    pub(crate) fn address_backoffs(&self) -> &HashMap<PeerAddress, AddressBackoffSnapshot> {
+        &self.address_backoffs
     }
 
     pub(crate) fn last_seen(&self) -> Option<SystemTime> {
@@ -475,6 +480,38 @@ impl ConnectionManager {
         }
     }
 
+    pub(crate) async fn add_address_seen_at_with_backoff(
+        &self,
+        node: NodeIdentifier,
+        addr: PeerAddress,
+        seen_at: std::time::SystemTime,
+        backoff: Option<AddressBackoffSnapshot>,
+    ) {
+        if node == self.inner.self_id {
+            return;
+        }
+        let peer = self.inner.get_or_create_peer(node);
+        let candidates = peer.address_candidates(addr);
+        if candidates.is_empty() {
+            debug!(peer=%node, ?addr, "ignored unusable peer address");
+            return;
+        }
+        for candidate in candidates {
+            let added = peer.add_address_seen_at_with_backoff(candidate, seen_at, backoff);
+            if added {
+                if candidate != addr {
+                    debug!(
+                        peer=%node,
+                        advertised=?addr,
+                        candidate=?candidate,
+                        "derived peer address candidate using observed remote IP"
+                    );
+                }
+                debug!(peer=%node, ?candidate, "address added");
+            }
+        }
+    }
+
     pub(crate) fn replace_advertised_addresses_seen_at(
         &self,
         node: NodeIdentifier,
@@ -678,6 +715,8 @@ impl ConnectionManager {
     }
 
     pub(crate) fn peer_address_snapshot(&self) -> Vec<PeerAddressSnapshot> {
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
         let mut out: Vec<_> = self
             .inner
             .iter_peers()
@@ -687,9 +726,11 @@ impl ConnectionManager {
                 if addresses.is_empty() {
                     return None;
                 }
+                let address_backoffs = peer.snapshot_address_backoffs(&addresses, now, wall_now);
                 Some(PeerAddressSnapshot {
                     node_id,
                     addresses,
+                    address_backoffs,
                     last_seen: peer.last_seen(),
                 })
             })

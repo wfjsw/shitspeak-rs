@@ -29,7 +29,7 @@ use rand::RngExt;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use crate::s2s::overlay::proto::{OverlayBody, decode_message, node_from_wire};
+use crate::s2s::overlay::proto::{OverlayBody, decode_message};
 use crate::s2s::transport::{Inbound, InboundMessage, MessageClass};
 use crate::types::NodeIdentifier;
 
@@ -84,7 +84,9 @@ fn logical_sender(msg: &InboundMessage) -> NodeIdentifier {
         return msg.from();
     };
     match decoded.body {
-        Some(OverlayBody::Data(data)) => node_from_wire(data.src).unwrap_or_else(|| msg.from()),
+        Some(OverlayBody::Data(data)) => {
+            NodeIdentifier::try_from(data.src).unwrap_or_else(|_| msg.from())
+        }
         _ => msg.from(),
     }
 }

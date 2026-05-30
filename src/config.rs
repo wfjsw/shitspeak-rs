@@ -169,7 +169,11 @@ impl S2sConfig {
                 .map(S2sSeedAddressConfig::seed_address)
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        Ok(Some(self.transport.try_apply(cfg)?))
+        let mut cfg = self.transport.try_apply(cfg)?;
+        if let Some(dir) = self.persistence_dir.clone() {
+            cfg = cfg.with_compression_adaptive_dictionary_cache_dir(dir);
+        }
+        Ok(Some(cfg))
     }
 
     pub fn overlay_config(&self) -> crate::s2s::overlay::OverlayConfig {
@@ -1243,6 +1247,43 @@ mod tests {
             Some(dictionary.len())
         );
         assert!(cfg.overlay_config().persistence_dir().is_some());
+    }
+
+    #[test]
+    fn s2s_transport_loads_adaptive_dictionary_cache_from_persistence_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let persistence_dir = temp.path().join("s2s-state");
+        let cache_dir = persistence_dir.join("transport");
+        std::fs::create_dir_all(&cache_dir).expect("create adaptive dictionary cache dir");
+        let dictionary =
+            b"cached adaptive s2s transport zstd dictionary bytes from persistence dir";
+        std::fs::write(cache_dir.join("adaptive-compression.zdict"), dictionary)
+            .expect("write adaptive dictionary cache");
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "127.0.0.1:64739"
+            persistence_dir = '__PERSISTENCE__'
+
+            [transport]
+            compression_enabled = true
+            compression_adaptive_dictionary_enabled = true
+        "#
+        .replace("__PERSISTENCE__", &persistence_dir.display().to_string());
+        let cfg: S2sConfig = parse_s2s(&raw).expect("s2s config parses");
+
+        let transport = cfg
+            .transport_config()
+            .expect("valid transport config")
+            .expect("s2s enabled");
+        let cached = transport
+            .compression_config()
+            .cached_adaptive_dictionary()
+            .expect("cached adaptive dictionary");
+
+        assert_eq!(cached.len(), dictionary.len());
     }
 
     #[test]

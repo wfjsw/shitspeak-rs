@@ -31,7 +31,7 @@ use crate::types::NodeIdentifier;
 use super::super::config::OverlayConfig;
 use super::super::discovery::learn_from_lsa;
 use super::super::neighbor::monitor::NeighborMonitor;
-use super::super::proto::{OverlayBody, encode_message, node_from_wire, node_to_wire, wrap};
+use super::super::proto::{OverlayBody, encode_message, node_to_wire, wrap};
 use super::advert::LsaFloodPacer;
 use super::store::{AdmissionResult, LinkStateDb, LsaEntry, OriginVersion};
 
@@ -93,7 +93,7 @@ pub async fn handle_request(
 ) {
     let mut peer_digest: HashMap<NodeIdentifier, OriginVersion> = HashMap::new();
     for d in &req.have {
-        if let Some(origin) = node_from_wire(d.origin) {
+        if let Ok(origin) = NodeIdentifier::try_from(d.origin) {
             peer_digest.insert(
                 origin,
                 OriginVersion {

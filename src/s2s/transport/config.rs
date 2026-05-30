@@ -7,8 +7,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::compression::{
-    CompressionConfig, default_compression_adaptive_dictionary_enabled,
-    default_compression_enabled, default_compression_level, default_compression_min_bytes,
+    CompressionConfig, adaptive_dictionary_cache_file,
+    default_compression_adaptive_dictionary_enabled, default_compression_enabled,
+    default_compression_level, default_compression_min_bytes,
     default_compression_min_savings_percent,
 };
 use super::service_level::{PeerAddress, SeedAddress, ServiceShape, TransportKind};
@@ -664,6 +665,16 @@ impl TransportConfig {
 
     pub fn without_compression_dictionary(mut self) -> Self {
         self.compression = self.compression.without_dictionary();
+        self
+    }
+
+    pub fn with_compression_adaptive_dictionary_cache_dir(
+        mut self,
+        persistence_dir: PathBuf,
+    ) -> Self {
+        self.compression = self
+            .compression
+            .with_adaptive_dictionary_cache_file(adaptive_dictionary_cache_file(&persistence_dir));
         self
     }
 

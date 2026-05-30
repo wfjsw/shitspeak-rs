@@ -36,7 +36,7 @@ use crate::types::NodeIdentifier;
 use super::super::config::OverlayConfig;
 use super::super::discovery::learn_from_lsa;
 use super::super::neighbor::monitor::{NeighborMonitor, NeighborSnapshot};
-use super::super::proto::{OverlayBody, encode_message, node_from_wire, node_to_wire, wrap};
+use super::super::proto::{OverlayBody, encode_message, node_to_wire, wrap};
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 use super::store::{AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry, is_strictly_newer};
 
@@ -504,7 +504,7 @@ impl LsaFloodPending {
             }
             let pending = self.by_peer.entry(n.node_id).or_default();
             for lsa in &lsas {
-                let Some(origin) = node_from_wire(lsa.origin) else {
+                let Ok(origin) = NodeIdentifier::try_from(lsa.origin) else {
                     continue;
                 };
                 if suppress_origin_neighbors
@@ -553,7 +553,7 @@ impl LsaFloodPending {
 fn lsa_lists_direct_neighbor(lsa: &pb::LinkStateAdvert, peer: NodeIdentifier) -> bool {
     lsa.links
         .iter()
-        .any(|link| node_from_wire(link.neighbor) == Some(peer))
+        .any(|link| NodeIdentifier::try_from(link.neighbor).ok() == Some(peer))
 }
 
 /// Coalesces LSA floods for a short interval so a burst of accepted LSAs

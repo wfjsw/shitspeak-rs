@@ -135,7 +135,7 @@ The main tunables are:
 
 The server to server subsystem supports multi node operation with transport metrics, overlay routing, state replication, and content addressed channel blob transfer. Configuration is split across `[s2s]`, `[s2s.transport]`, `[s2s.overlay]`, and `[s2s.replications]`.
 
-A clustered deployment must provide unique node ids, S2S certificates, listener addresses, advertised addresses, seed peers, and a persistence directory for cluster state. The included Docker Compose demo shows one concrete 16 node layout.
+A clustered deployment must provide unique node ids, S2S certificates, listener addresses, advertised addresses, seed peers, and a persistence directory for cluster state. When `s2s.persistence_dir` is set, the transport also caches the latest learned adaptive compression dictionary under that directory and renegotiates it with peers after restart. The included Docker Compose demo shows one concrete 16 node layout.
 
 Generate S2S test certificates with:
 

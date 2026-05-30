@@ -11,13 +11,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::time::timeout;
 
-use super::config::TransportConfig;
-use super::manager::{ConnectionManager, Inbound};
-use super::service_level::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
-use super::{LinkMetrics, SendOptions};
 use crate::s2s::testing::{
     Pki, install_provider_once, loopback, mint_pki, pick_free_port, pick_free_udp_port,
     s2s_network_test_guard,
+};
+use crate::s2s::transport::{
+    ConnectionManager, Inbound, LinkMetrics, MessageClass, PeerAddress, SendOptions, ServiceLevel,
+    TransportConfig, TransportKind,
 };
 
 fn config_for(pki: &Pki, node_idx: usize, tcp: SocketAddr) -> TransportConfig {
