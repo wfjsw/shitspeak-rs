@@ -136,6 +136,7 @@ pub async fn handle_user_remove(
     // drive the UserRemove broadcast to all per-client subscribers.
     // No need to broadcast manually.
 
+    let old_channel_id = target.get_current_channel_id();
     let removed = server
         .get_clients()
         .remove_client_in_server(&server_id, target_session)
@@ -148,6 +149,12 @@ pub async fn handle_user_remove(
             "failed to gracefully disconnect removed client",
         );
     }
+    crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+        server,
+        &server_id,
+        old_channel_id,
+    )
+    .await;
 
     Ok(())
 }

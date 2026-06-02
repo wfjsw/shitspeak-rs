@@ -48,6 +48,8 @@ use crate::config::Config;
 use crate::errors::ChannelRepoError;
 use crate::types::{DEFAULT_SERVER_ID, default_server_id};
 
+const TEMPORARY_CHANNEL_ID_BIT: u32 = 0x8000_0000;
+
 pub(crate) type ChannelStateSubscription = broadcast::Receiver<Arc<ChannelOperation>>;
 
 #[derive(Debug, Clone, Copy)]
@@ -1049,17 +1051,13 @@ impl ChannelRepository {
     pub async fn next_channel_id_in_server(&self, server_id: &str, temporary: bool) -> u32 {
         let channels = self.channels.read();
         let Some(channels) = channels.get(server_id) else {
-            return if temporary { 0x8000_0001 } else { 1 };
+            return if temporary {
+                TEMPORARY_CHANNEL_ID_BIT | 1
+            } else {
+                1
+            };
         };
-        // Find the highest non-temporary ID and increment.
-        let max_id = channels
-            .keys()
-            .filter(|id| **id & 0x8000_0000 == 0)
-            .max()
-            .copied()
-            .unwrap_or(0);
-        let base = max_id + 1;
-        if temporary { base | 0x8000_0000 } else { base }
+        next_available_channel_id(channels, temporary)
     }
 
     pub async fn create_channel(
@@ -1085,6 +1083,10 @@ impl ChannelRepository {
                 if !channels.contains_key(&pid) && pid != 0 {
                     return Err(ChannelRepoError::ParentNotFound(pid));
                 }
+            }
+
+            if channels.contains_key(&channel.id) {
+                channel.id = next_available_channel_id(channels, channel.is_temporary());
             }
 
             // Validate name uniqueness within parent
@@ -2210,6 +2212,34 @@ impl ChannelRepository {
 
 // ─── free functions used both by open() replay and by mutation methods ────────
 
+fn next_available_channel_id(channels: &HashMap<u32, Channel>, temporary: bool) -> u32 {
+    let max_non_temporary_id = channels
+        .keys()
+        .filter(|id| **id & TEMPORARY_CHANNEL_ID_BIT == 0)
+        .max()
+        .copied()
+        .unwrap_or(0);
+    let mut base = max_non_temporary_id
+        .checked_add(1)
+        .filter(|id| *id & TEMPORARY_CHANNEL_ID_BIT == 0)
+        .expect("channel id space exhausted");
+
+    loop {
+        let candidate = if temporary {
+            base | TEMPORARY_CHANNEL_ID_BIT
+        } else {
+            base
+        };
+        if !channels.contains_key(&candidate) {
+            return candidate;
+        }
+        base = base
+            .checked_add(1)
+            .filter(|id| *id & TEMPORARY_CHANNEL_ID_BIT == 0)
+            .expect("channel id space exhausted");
+    }
+}
+
 /// Apply a `ChannelOp` to the in-memory channel map.
 fn apply_op_to_map(channels: &mut HashMap<u32, Channel>, op: &ChannelOp, origin_node: u16) {
     match op {
@@ -2634,6 +2664,32 @@ mod tests {
         );
         assert_eq!(repo.len_in_server("alpha").await, 2);
         assert_eq!(repo.len_in_server("beta").await, 2);
+    }
+
+    #[tokio::test]
+    async fn stale_allocated_channel_id_does_not_overwrite_existing_channel() {
+        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let stale_id = repo.next_channel_id(true).await;
+
+        repo.create_channel(Channel::new(stale_id, "first", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(stale_id, "second", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        let first = repo
+            .get_channel(stale_id)
+            .await
+            .expect("first channel should still exist at its original id");
+        assert_eq!(first.name, "first");
+        assert!(
+            repo.get_all()
+                .await
+                .into_iter()
+                .any(|channel| channel.id != stale_id && channel.name == "second"),
+            "second channel should be assigned a fresh id instead of replacing the first"
+        );
     }
 
     #[tokio::test]

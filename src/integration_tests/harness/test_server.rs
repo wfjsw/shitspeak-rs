@@ -29,7 +29,9 @@ pub struct TestServerOpts {
     pub default_channel: u32,
     pub send_permission_info: bool,
     pub hide_users_without_traverse: bool,
+    pub debug_acl_enter: bool,
     pub server_protocol_version: ProtocolVersion,
+    pub channel_log_max_entries: usize,
 }
 
 impl Default for TestServerOpts {
@@ -43,7 +45,9 @@ impl Default for TestServerOpts {
             default_channel: 0,
             send_permission_info: false,
             hide_users_without_traverse: false,
+            debug_acl_enter: true,
             server_protocol_version: APP_PROTO_VER,
+            channel_log_max_entries: 10_000,
         }
     }
 }
@@ -182,7 +186,7 @@ async fn spawn_test_server_with_pki(
         default_channel: opts.default_channel,
         cert_required: opts.cert_required,
         blob_storage_dir: None,
-        channel_log_max_entries: 10_000,
+        channel_log_max_entries: opts.channel_log_max_entries,
         client_log_max_entries: 10_000,
         channel_snapshot_every_ops: 10,
         channel_snapshot_every_secs: 60,
@@ -196,6 +200,7 @@ async fn spawn_test_server_with_pki(
         required_groups: Vec::new(),
         send_permission_info: opts.send_permission_info,
         hide_users_without_traverse: opts.hide_users_without_traverse,
+        debug: crate::config::DebugConfig::new(opts.debug_acl_enter),
         s2s,
         web: WebConfig::default(),
     };

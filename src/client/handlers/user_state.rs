@@ -664,5 +664,14 @@ pub async fn handle_user_state(
         }
     }
 
+    if requested_channel_change.is_some() {
+        crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+            server,
+            &server_id,
+            target_current_channel_id,
+        )
+        .await;
+    }
+
     Ok(())
 }

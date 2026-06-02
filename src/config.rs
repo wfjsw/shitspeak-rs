@@ -674,6 +674,32 @@ impl From<S2sTransportKindConfig> for TransportKind {
     }
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DebugConfig {
+    /// When true, superusers ignore channel Enter ACLs. Default preserves the
+    /// historical superuser behavior.
+    #[serde(default = "default_true")]
+    debug_acl_enter: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            debug_acl_enter: true,
+        }
+    }
+}
+
+impl DebugConfig {
+    pub fn new(debug_acl_enter: bool) -> Self {
+        Self { debug_acl_enter }
+    }
+
+    pub fn debug_acl_enter(&self) -> bool {
+        self.debug_acl_enter
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub node_id: u16,
@@ -801,6 +827,10 @@ pub struct Config {
     /// whose current channel they can Traverse. Default: `false`.
     #[serde(default)]
     pub hide_users_without_traverse: bool,
+
+    // ── Debug behavior toggles ───────────────────────────────────────────
+    #[serde(default)]
+    pub debug: DebugConfig,
 
     // ── S2S cluster bootstrap ───────────────────────────────────────────
     #[serde(default)]
@@ -940,6 +970,29 @@ mod tests {
         assert_eq!(cfg.web.webrtc.max_speaker_ssrcs, 64);
         assert!(!cfg.web.moq.enabled);
         assert_eq!(cfg.web.moq.max_speaker_tracks, 64);
+        assert!(cfg.debug.debug_acl_enter());
+    }
+
+    #[test]
+    fn debug_acl_enter_defaults_true_and_parses_false() {
+        let default_cfg: DebugConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str("", ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert!(default_cfg.debug_acl_enter());
+
+        let cfg: DebugConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                "debug_acl_enter = false",
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert!(!cfg.debug_acl_enter());
     }
 
     #[test]

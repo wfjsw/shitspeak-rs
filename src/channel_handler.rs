@@ -17,6 +17,21 @@ use crate::{
 };
 
 pub type SessionChannelShadow = HashMap<ClientSessionIdentifier, u32>;
+pub type ChannelTreeShadow = HashSet<u32>;
+
+pub fn sync_channel_tree_shadow(shadow: &mut ChannelTreeShadow, message: &Message) {
+    match message {
+        Message::ChannelState(channel_state) => {
+            if let Some(channel_id) = channel_state.channel_id {
+                shadow.insert(channel_id);
+            }
+        }
+        Message::ChannelRemove(channel_remove) => {
+            shadow.remove(&channel_remove.channel_id);
+        }
+        _ => {}
+    }
+}
 
 /// Helper to add permission information to a ChannelState message.
 /// Applied when `send_permission_info` is enabled.
@@ -332,6 +347,7 @@ pub async fn replay_channel_log_gap(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channels: &Arc<ChannelRepository>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     session_channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut crate::client::visibility::UserVisibilityState,
     session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
@@ -351,13 +367,52 @@ pub async fn replay_channel_log_gap(
 
     let server_id = client.server_id();
     let missed = channels.get_log_since_in_server(&server_id, last).await;
-    if missed.is_empty() && last > 0 {
+    if missed.is_empty() {
+        let latest = channels.current_version_in_server(&server_id);
+        if latest <= last {
+            return Ok(());
+        }
         tracing::error!(
-            "Client {:?} channel log gap unrecoverable (last={})",
+            "Client {:?} channel log gap outside replay window; sending channel snapshot (last={}, latest={})",
             session_id,
             last,
+            latest,
         );
-        return Err(());
+        return replay_channel_snapshot(
+            server,
+            client,
+            channels,
+            channel_tree_shadow,
+            session_channel_shadow,
+            user_visibility,
+            &server_id,
+            latest,
+        )
+        .await;
+    }
+    if missed
+        .first()
+        .is_some_and(|entry| entry.version > last.saturating_add(1))
+    {
+        let latest = channels.current_version_in_server(&server_id);
+        tracing::error!(
+            "Client {:?} channel log gap starts after last seen version; sending channel snapshot (last={}, first_retained={}, latest={})",
+            session_id,
+            last,
+            missed[0].version,
+            latest,
+        );
+        return replay_channel_snapshot(
+            server,
+            client,
+            channels,
+            channel_tree_shadow,
+            session_channel_shadow,
+            user_visibility,
+            &server_id,
+            latest,
+        )
+        .await;
     }
 
     for entry in &missed {
@@ -383,6 +438,7 @@ pub async fn replay_channel_log_gap(
             )
             .await;
             for msg in projected {
+                sync_channel_tree_shadow(channel_tree_shadow, &msg);
                 if client.write_proto_message(&msg).await.is_err() {
                     return Err(());
                 }
@@ -401,6 +457,7 @@ pub async fn replay_channel_log_gap(
             )
             .await;
             for msg in projected {
+                sync_channel_tree_shadow(channel_tree_shadow, &msg);
                 if client.write_proto_message(&msg).await.is_err() {
                     return Err(());
                 }
@@ -409,6 +466,59 @@ pub async fn replay_channel_log_gap(
         client.set_last_channel_version(entry.version).await;
     }
 
+    Ok(())
+}
+
+async fn replay_channel_snapshot(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut crate::client::visibility::UserVisibilityState,
+    server_id: &str,
+    latest: u64,
+) -> Result<(), ()> {
+    let snapshot = channels.get_all_in_server(server_id).await;
+    let current: ChannelTreeShadow = snapshot.iter().map(|channel| channel.id).collect();
+    let mut removed = channel_tree_shadow
+        .difference(&current)
+        .copied()
+        .collect::<Vec<_>>();
+    removed.sort_unstable();
+
+    let mut messages = Vec::with_capacity(snapshot.len() + removed.len());
+    for channel in ordered_snapshot_channels(&snapshot) {
+        messages.push(
+            build_channel_state_message(server, client, &channel)
+                .await
+                .into(),
+        );
+    }
+    for channel_id in removed {
+        messages.push(crate::messages::encoder::ChannelRemove { channel_id }.into());
+    }
+
+    for msg in messages {
+        let projected = crate::client::visibility::project_message_with_shadow(
+            server,
+            client,
+            user_visibility,
+            session_channel_shadow,
+            server_id,
+            &msg,
+        )
+        .await;
+        for msg in projected {
+            sync_channel_tree_shadow(channel_tree_shadow, &msg);
+            if client.write_proto_message(&msg).await.is_err() {
+                return Err(());
+            }
+        }
+    }
+
+    *channel_tree_shadow = current;
+    client.set_last_channel_version(latest).await;
     Ok(())
 }
 

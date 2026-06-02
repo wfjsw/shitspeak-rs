@@ -309,7 +309,7 @@ max_bandwidth = 72000
 allow_html = true
 max_text_message_length = 5000
 max_image_message_length = 131072
-default_channel = 0
+default_channel = 1
 cert_required = false
 
 udp_voice_enabled = true
@@ -326,6 +326,9 @@ client_log_max_entries = 10000
 channel_snapshot_every_ops = 10
 channel_snapshot_every_secs = 60
 channel_wal_compaction_expire_count = 2000
+
+[debug]
+debug_acl_enter = false
 
 [s2s]
 enabled = true

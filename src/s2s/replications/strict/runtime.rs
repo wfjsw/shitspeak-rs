@@ -42,6 +42,7 @@ use crate::types::NodeIdentifier;
 /// always-on heartbeat behavior.
 const CLOCK_TICK_ACTIVE_BURST_TICKS: usize = 3;
 const CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER: u32 = 4;
+const COMMIT_FANOUT_RETRY_TICKS: usize = 8;
 
 /// Compute p95 of a slice of edge RTTs, clamped to
 /// `[cfg.min_clock_tick(), cfg.max_clock_tick()]`. Empty input
@@ -972,6 +973,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
             let clock_now = s.clock;
             s.peer_clocks.insert(self.self_id, clock_now);
+            s.mark_committed(op_id, ts_final);
             s.buffer_commit(op_id, ts_final, op_bytes.clone());
 
             let body = StrictBody::Commit(StrictCommit {
@@ -988,15 +990,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.wake_delivery_and_clock_tick();
 
         if let Some((body, dsts)) = to_send {
-            if let Err(e) = self.net.send_multicast(&dsts, &self.topic, body).await {
+            if let Err(e) = self
+                .net
+                .send_multicast(&dsts, &self.topic, body.clone())
+                .await
+            {
                 trace!(error=%e, "send commit multicast failed");
             }
+            spawn_commit_fanout_retries(
+                self.net.clone(),
+                self.shutdown.clone(),
+                self.topic.clone(),
+                dsts,
+                body,
+                self.cfg.delivery_tick_interval(),
+            );
         }
     }
 
     pub async fn recv_commit(&self, from: NodeIdentifier, c: StrictCommit) {
         let op_id: OpId = (c.op_id_hi, c.op_id_lo);
         let mut notify = false;
+        let mut gossip: Option<StrictBody> = None;
         {
             let mut s = self.state.lock();
             s.observe_peer(from, c.src_clock);
@@ -1022,12 +1037,44 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     );
                 }
             } else if s.mark_committed(op_id, c.ts_final) {
-                s.buffer_commit(op_id, c.ts_final, Bytes::from(c.op_msgpack));
+                let op_msgpack = Bytes::from(c.op_msgpack);
+                s.buffer_commit(op_id, c.ts_final, op_msgpack.clone());
                 notify = true;
+                gossip = Some(StrictBody::Commit(StrictCommit {
+                    coord_node: c.coord_node,
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                    ts_final: c.ts_final,
+                    op_msgpack,
+                    src_clock: clock_now,
+                }));
             }
         }
         if notify {
             self.wake_delivery_and_clock_tick();
+        }
+        if let Some(body) = gossip {
+            let dsts: Vec<NodeIdentifier> = self
+                .net
+                .alive_members()
+                .into_iter()
+                .filter(|node| *node != self.self_id)
+                .collect();
+            if let Err(e) = self
+                .net
+                .send_multicast(&dsts, &self.topic, body.clone())
+                .await
+            {
+                trace!(error=%e, "send commit gossip multicast failed");
+            }
+            spawn_commit_fanout_retries(
+                self.net.clone(),
+                self.shutdown.clone(),
+                self.topic.clone(),
+                dsts,
+                body,
+                self.cfg.delivery_tick_interval(),
+            );
         }
     }
 
@@ -1552,6 +1599,30 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
 }
 
 // ---------- Background loops ----------
+
+fn spawn_commit_fanout_retries(
+    net: Arc<dyn StrictNet>,
+    shutdown: CancellationToken,
+    topic: String,
+    dsts: Vec<NodeIdentifier>,
+    body: StrictBody,
+    interval: Duration,
+) {
+    if dsts.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for _ in 0..COMMIT_FANOUT_RETRY_TICKS {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {},
+            }
+            if let Err(e) = net.send_multicast(&dsts, &topic, body.clone()).await {
+                trace!(error=%e, "commit fanout retry failed");
+            }
+        }
+    });
+}
 
 fn spawn_delivery_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
     let weak = {
@@ -2186,6 +2257,57 @@ mod tests {
 
         s.record_pending_propose((1, 1), 10, Bytes::from_static(b"op"), 1, Instant::now());
         assert!(!s.can_bootstrap_catchup());
+    }
+
+    #[tokio::test]
+    async fn first_seen_commit_is_gossiped_with_local_clock() {
+        let net = MockNet::new(2, vec![1, 2, 3, 4]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            2,
+            0,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let op_msgpack = Bytes::from(rmp_serde::to_vec(&1234u64).unwrap());
+
+        rt.recv_commit(
+            1,
+            StrictCommit {
+                coord_node: 1,
+                op_id_hi: 1,
+                op_id_lo: 7,
+                ts_final: 10,
+                op_msgpack,
+                src_clock: 9,
+            },
+        )
+        .await;
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        match &captures[0] {
+            crate::s2s::replications::test_support::CapturedFrame::StrictMulticast {
+                dsts,
+                body,
+                ..
+            } => {
+                assert_eq!(dsts, &[1, 3, 4]);
+                match body {
+                    StrictBody::Commit(commit) => {
+                        assert_eq!(commit.coord_node, 1);
+                        assert_eq!(commit.op_id_hi, 1);
+                        assert_eq!(commit.op_id_lo, 7);
+                        assert_eq!(commit.ts_final, 10);
+                        assert_eq!(commit.src_clock, 10);
+                    }
+                    other => panic!("unexpected gossip body: {other:?}"),
+                }
+            }
+            other => panic!("unexpected capture: {other:?}"),
+        }
     }
 
     #[tokio::test]

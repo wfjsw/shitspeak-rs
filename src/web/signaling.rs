@@ -520,13 +520,21 @@ where
                         }
                         if let Some(server) = context.server.as_ref() {
                             if let Some(client) = session.client.as_ref() {
+                                let server_id = client.server_id();
+                                let old_channel_id = client.get_current_channel_id();
                                 server
                                     .get_clients()
                                     .remove_client_in_server(
-                                        &client.server_id(),
+                                        &server_id,
                                         client.get_session_id(),
                                     )
                                     .await;
+                                crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+                                    server,
+                                    &server_id,
+                                    old_channel_id,
+                                )
+                                .await;
                             }
                         }
                         write_websocket_frame(&mut stream, WebSocketOpcode::Close, &[]).await?;
@@ -2678,6 +2686,7 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
+            debug: crate::config::DebugConfig::default(),
             s2s: crate::config::S2sConfig::default(),
             web: WebConfig::default(),
         };

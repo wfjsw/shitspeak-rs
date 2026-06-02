@@ -498,6 +498,237 @@ async fn s2s_channel_replication_propagates() {
     assert!(replicated, "Server B should advance its channel log");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_temporary_channel_creation_moves_creator() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let _bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    alice.create_channel(0, "S2S Temp", true).await;
+
+    let created = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::ChannelState(cs)
+                    if cs.name.as_deref() == Some("S2S Temp")
+                        && cs.temporary == Some(true)
+                        && cs.channel_id.is_some())
+            },
+            S2S_DEADLINE,
+        )
+        .await
+        .expect("Alice should receive the temporary channel creation");
+    let temp_channel_id = match created {
+        Message::ChannelState(cs) => cs.channel_id.expect("created channel id"),
+        other => panic!("expected ChannelState, got {other:?}"),
+    };
+
+    let moved = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice.session_id)
+                        && us.channel_id == Some(temp_channel_id))
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+    assert!(
+        moved.is_some(),
+        "temporary channel creator should be moved immediately in S2S mode"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_empty_temporary_channel_delete_replicates_to_peer_node() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    alice.create_channel(0, "S2S Temp Delete", true).await;
+
+    let created = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::ChannelState(cs)
+                    if cs.name.as_deref() == Some("S2S Temp Delete")
+                        && cs.temporary == Some(true)
+                        && cs.channel_id.is_some())
+            },
+            S2S_DEADLINE,
+        )
+        .await
+        .expect("Bob should receive the replicated temporary channel creation");
+    let temp_channel_id = match created {
+        Message::ChannelState(cs) => cs.channel_id.expect("created channel id"),
+        other => panic!("expected ChannelState, got {other:?}"),
+    };
+
+    let moved = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice.session_id)
+                        && us.channel_id == Some(temp_channel_id))
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+    assert!(
+        moved.is_some(),
+        "precondition: Alice should be inside the temporary channel"
+    );
+
+    alice.move_to_channel(0).await;
+
+    let removed = bob
+        .recv_until(
+            |m| matches!(m, Message::ChannelRemove(cr) if cr.channel_id == temp_channel_id),
+            S2S_DEADLINE,
+        )
+        .await;
+    assert!(
+        removed.is_some(),
+        "temporary channel deletion should replicate to peer-node clients"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_temporary_channel_survives_when_remote_creator_remains_inside() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    alice.create_channel(0, "S2S Temp Occupied", true).await;
+
+    let created = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::ChannelState(cs)
+                    if cs.name.as_deref() == Some("S2S Temp Occupied")
+                        && cs.temporary == Some(true)
+                        && cs.channel_id.is_some())
+            },
+            S2S_DEADLINE,
+        )
+        .await
+        .expect("Bob should receive the replicated temporary channel creation");
+    let temp_channel_id = match created {
+        Message::ChannelState(cs) => cs.channel_id.expect("created channel id"),
+        other => panic!("expected ChannelState, got {other:?}"),
+    };
+
+    let alice_moved = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice.session_id)
+                        && us.channel_id == Some(temp_channel_id))
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+    assert!(
+        alice_moved.is_some(),
+        "precondition: Alice should be inside the temporary channel"
+    );
+
+    bob.move_to_channel(temp_channel_id).await;
+
+    let bob_joined_locally = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(b.server.get_clients().get_client(bob.server_session))
+                .is_some_and(|client| client.get_current_channel_id() == temp_channel_id)
+        })
+    })
+    .await;
+    assert!(
+        bob_joined_locally,
+        "Bob should join the temp channel on node B"
+    );
+
+    let alice_replicated_to_b = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(b.server.get_clients().get_client(alice.server_session))
+                .is_some_and(|client| client.get_current_channel_id() == temp_channel_id)
+        })
+    })
+    .await;
+    assert!(
+        alice_replicated_to_b,
+        "node B should know Alice still occupies the temp channel before Bob leaves"
+    );
+
+    alice.drain_now().await;
+    bob.drain_now().await;
+
+    bob.move_to_channel(0).await;
+
+    let bob_left = wait_until(CLIENT_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(b.server.get_clients().get_client(bob.server_session))
+                .is_some_and(|client| client.get_current_channel_id() == 0)
+        })
+    })
+    .await;
+    assert!(bob_left, "Bob should leave the temp channel");
+
+    let removed = alice
+        .recv_until(
+            |m| matches!(m, Message::ChannelRemove(cr) if cr.channel_id == temp_channel_id),
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        removed.is_none(),
+        "temporary channel must not be removed while Alice still occupies it on node A"
+    );
+
+    assert!(
+        a.server
+            .get_channels()
+            .get_channel(temp_channel_id)
+            .await
+            .is_some(),
+        "node A should retain the occupied temporary channel"
+    );
+    assert!(
+        b.server
+            .get_channels()
+            .get_channel(temp_channel_id)
+            .await
+            .is_some(),
+        "node B should retain the occupied temporary channel"
+    );
+}
+
 /// Checks that a node joining with a divergent channel history reconciles the
 /// channel tree before remote client state can expose channels from the losing
 /// history. Expected: the higher-version channel history wins, both connected

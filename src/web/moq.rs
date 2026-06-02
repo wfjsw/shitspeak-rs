@@ -675,11 +675,19 @@ impl MoqSessionRuntime {
         let Some(client) = self.client.take() else {
             return;
         };
+        let server_id = client.server_id();
+        let old_channel_id = client.get_current_channel_id();
         server
             .get_clients()
             .as_ref()
-            .remove_client_in_server(&client.server_id(), client.get_session_id())
+            .remove_client_in_server(&server_id, client.get_session_id())
             .await;
+        crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+            &server,
+            &server_id,
+            old_channel_id,
+        )
+        .await;
         self.voice_rx = None;
     }
 
@@ -1920,6 +1928,7 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
+            debug: crate::config::DebugConfig::default(),
             s2s: crate::config::S2sConfig::default(),
             web: WebConfig::default(),
         }

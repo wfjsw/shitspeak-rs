@@ -127,21 +127,40 @@ pub async fn handle_channel_state(
                     permission: None,
                 }));
             }
-            if !server
+            let proposed_s2s = server
                 .s2s_manager()
                 .propose_channel_op(Some(&server_id), op.clone())
-                .await
-            {
-                if let Err(e) = channels.create_channel_in_server(&server_id, new_ch).await {
-                    tracing::warn!("create_channel failed: {:?}", e);
-                    return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
-                        r#type: DenyType::Text,
-                        session: u32::from(sender.get_session_id()),
-                        channel_id: None,
-                        reason: Some(format!("Failed to create channel: {:?}", e).into()),
-                        name: None,
-                        permission: None,
-                    }));
+                .await;
+            if proposed_s2s {
+                if is_temp {
+                    sender.set_current_channel_id(
+                        new_id,
+                        server.get_clients(),
+                        channels.current_version_in_server(&server_id),
+                    );
+                }
+            } else {
+                let created = match channels.create_channel_in_server(&server_id, new_ch).await {
+                    Ok(channel) => channel,
+                    Err(e) => {
+                        tracing::warn!("create_channel failed: {:?}", e);
+                        return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                            r#type: DenyType::Text,
+                            session: u32::from(sender.get_session_id()),
+                            channel_id: None,
+                            reason: Some(format!("Failed to create channel: {:?}", e).into()),
+                            name: None,
+                            permission: None,
+                        }));
+                    }
+                };
+                // Move the creator into the newly created temporary channel.
+                if is_temp {
+                    sender.set_current_channel_id(
+                        created.id,
+                        server.get_clients(),
+                        channels.current_version_in_server(&server_id),
+                    );
                 }
             }
         }

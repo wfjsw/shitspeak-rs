@@ -1591,6 +1591,7 @@ async fn apply_user_remove_patch(
         );
     }
 
+    let old_channel_id = target.get_current_channel_id();
     let removed = server
         .get_clients()
         .remove_client_in_server(server_id, target_id)
@@ -1603,6 +1604,12 @@ async fn apply_user_remove_patch(
             "s2s moderation failed to gracefully disconnect removed client",
         );
     }
+    crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+        server,
+        server_id,
+        old_channel_id,
+    )
+    .await;
 }
 
 fn server_id_from_channel_topic(topic: &str) -> Option<String> {

@@ -302,6 +302,7 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         required_groups: Vec::new(),
         send_permission_info: false,
         hide_users_without_traverse: false,
+        debug: shitspeak_rs::config::DebugConfig::default(),
         s2s: S2sConfig::default(),
         web: shitspeak_rs::config::WebConfig::default(),
     }

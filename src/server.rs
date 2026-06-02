@@ -19,7 +19,7 @@ use tokio_rustls::server::TlsStream;
 
 use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
-use crate::channel_handler::SessionChannelShadow;
+use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use crate::channel_repository::{ChannelOperation, ChannelRepoTuning, ChannelRepository};
 use crate::client::{
     AsyncMessageHandlerExt, Client, client_session_identifier::ClientSessionIdentifier,
@@ -382,6 +382,7 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
+            debug: crate::config::DebugConfig::default(),
             s2s: crate::config::S2sConfig::default(),
             web: crate::config::WebConfig::default(),
         }
@@ -688,6 +689,7 @@ async fn activate_client_subscriptions(
     client_session_id: ClientSessionIdentifier,
     client_log_rx: &mut Option<ClientLogReceiver>,
     channel_log_rx: &mut Option<ChannelLogReceiver>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     session_channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
 ) -> Result<(), HandleIncomingConnectionError> {
@@ -705,6 +707,15 @@ async fn activate_client_subscriptions(
     client
         .set_last_channel_version(channel_snapshot_version)
         .await;
+    channel_tree_shadow.clear();
+    channel_tree_shadow.extend(
+        server
+            .channels
+            .get_all_in_server(&server_id)
+            .await
+            .into_iter()
+            .map(|channel| channel.id),
+    );
 
     server
         .clients
@@ -760,6 +771,7 @@ async fn finish_handler_result(
     client_session_id: ClientSessionIdentifier,
     client_log_rx: &mut Option<ClientLogReceiver>,
     channel_log_rx: &mut Option<ChannelLogReceiver>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     session_channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     result: Result<(), MessageHandlerError>,
@@ -771,6 +783,7 @@ async fn finish_handler_result(
         client_session_id,
         client_log_rx,
         channel_log_rx,
+        channel_tree_shadow,
         session_channel_shadow,
         user_visibility,
     )
@@ -1712,6 +1725,7 @@ impl Server {
             if now - last_ping > timeout {
                 let sid = client.get_session_id();
                 let server_id = client.server_id();
+                let old_channel_id = client.get_current_channel_id();
                 tracing::info!(
                     "Disconnecting idle local client {:?} (last ping: {}, timeout: {}s)",
                     sid,
@@ -1719,6 +1733,12 @@ impl Server {
                     timeout_secs,
                 );
                 self.clients.remove_client_in_server(&server_id, sid).await;
+                crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+                    self,
+                    &server_id,
+                    old_channel_id,
+                )
+                .await;
             }
         }
     }
@@ -1891,6 +1911,7 @@ impl Server {
         // Subscriptions start as None — they're activated after auth.
         let mut client_log_rx: Option<ClientLogReceiver> = None;
         let mut channel_log_rx: Option<ChannelLogReceiver> = None;
+        let mut channel_tree_shadow = ChannelTreeShadow::default();
         let mut session_channel_shadow: SessionChannelShadow = HashMap::new();
         let mut user_visibility = UserVisibilityState::default();
 
@@ -1921,6 +1942,7 @@ impl Server {
                             client.get_session_id(),
                             &mut client_log_rx,
                             &mut channel_log_rx,
+                            &mut channel_tree_shadow,
                             &mut session_channel_shadow,
                             &mut user_visibility,
                             result,
@@ -1941,6 +1963,7 @@ impl Server {
                                         client.get_session_id(),
                                         &mut client_log_rx,
                                         &mut channel_log_rx,
+                                        &mut channel_tree_shadow,
                                         &mut session_channel_shadow,
                                         &mut user_visibility,
                                         result,
@@ -1981,8 +2004,12 @@ impl Server {
                     continue;
                 }
                                 replay_channel_log_gap(
-                                    self, &client, &self.channels, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, op.version,
+                                    self, &client, &self.channels, &mut channel_tree_shadow, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, op.version,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
+                                let last_after_replay = client.get_last_channel_version().await;
+                                if op.version <= last_after_replay {
+                                    continue;
+                                }
 
                                 // Use unified message conversion function
                                 let messages = crate::channel_handler::convert_channel_operation_to_messages_with_shadow(
@@ -2002,6 +2029,7 @@ impl Server {
                                         &msg,
                                     ).await;
                                     for msg in projected {
+                                        crate::channel_handler::sync_channel_tree_shadow(&mut channel_tree_shadow, &msg);
                                         client.write_proto_message(&msg).await
                                             .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                     }
@@ -2021,6 +2049,7 @@ impl Server {
                                         msg,
                                     ).await;
                                     for msg in projected {
+                                        crate::channel_handler::sync_channel_tree_shadow(&mut channel_tree_shadow, &msg);
                                         client.write_proto_message(&msg).await
                                             .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                     }
@@ -2030,7 +2059,7 @@ impl Server {
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                                 let last = client.get_last_channel_version().await;
                                 replay_channel_log_gap(
-                                    self, &client, &self.channels, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, u64::MAX,
+                                    self, &client, &self.channels, &mut channel_tree_shadow, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, u64::MAX,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -2112,7 +2141,7 @@ impl Server {
                                     let last_ch = client.get_last_channel_version().await;
                                     if last_ch < dep {
                                         replay_channel_log_gap(
-                                            self, &client, &self.channels, &mut session_channel_shadow, &mut user_visibility, client_session_id, last_ch, dep + 1,
+                                            self, &client, &self.channels, &mut channel_tree_shadow, &mut session_channel_shadow, &mut user_visibility, client_session_id, last_ch, dep + 1,
                                         ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
                                     }
                                 }
@@ -2204,9 +2233,17 @@ impl Server {
 
         // Single cleanup point: remove the client on any error.
         if result.is_err() {
+            let server_id = client.server_id();
+            let old_channel_id = client.get_current_channel_id();
             self.clients
-                .remove_client_in_server(&client.server_id(), client.get_session_id())
+                .remove_client_in_server(&server_id, client.get_session_id())
                 .await;
+            crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+                self,
+                &server_id,
+                old_channel_id,
+            )
+            .await;
         }
         result
     }
@@ -2309,6 +2346,13 @@ impl Server {
                         new_config.hide_users_without_traverse
                     );
                 }
+                if current.debug.debug_acl_enter() != new_config.debug.debug_acl_enter() {
+                    tracing::info!(
+                        "config reload: debug.debug_acl_enter {} -> {}",
+                        current.debug.debug_acl_enter(),
+                        new_config.debug.debug_acl_enter()
+                    );
+                }
                 if current.server_entrypoints != new_config.server_entrypoints {
                     tracing::info!("config reload: server_entrypoints changed");
                 }
@@ -2395,6 +2439,10 @@ impl Server {
 
     pub fn get_hide_users_without_traverse(&self) -> bool {
         self.read_config().hide_users_without_traverse
+    }
+
+    pub fn get_debug_acl_enter(&self) -> bool {
+        self.read_config().debug.debug_acl_enter()
     }
 
     pub fn get_max_bandwidth(&self) -> u32 {

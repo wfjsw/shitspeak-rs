@@ -19,22 +19,25 @@ pub(crate) async fn compute_permissions_for_client(
 
     let session = u32::from(client.get_session_id());
     let is_superuser = client.is_superuser();
+    let debug_acl_enter = server.get_debug_acl_enter();
 
     let channels = server.get_channels();
     let server_id = client.server_id();
     let client_acl_generation = client.get_acl_generation();
     let channel_acl_generation = channels.channel_acl_generation();
     let cache_session = u64::from(session);
+    let use_acl_cache = !is_superuser;
 
-    if let Some(permissions) = channels
-        .get_cached_permissions_in_server(
-            &server_id,
-            cache_session,
-            channel_id,
-            channel_acl_generation,
-            client_acl_generation,
-        )
-        .await
+    if use_acl_cache
+        && let Some(permissions) = channels
+            .get_cached_permissions_in_server(
+                &server_id,
+                cache_session,
+                channel_id,
+                channel_acl_generation,
+                client_acl_generation,
+            )
+            .await
     {
         tracing::trace!(
             session,
@@ -88,13 +91,20 @@ pub(crate) async fn compute_permissions_for_client(
     if is_superuser {
         let allow_speak = permissions.contains(ACLPermissions::Speak);
         let allow_whisper = permissions.contains(ACLPermissions::Whisper);
+        let allow_enter = permissions.contains(ACLPermissions::Enter);
         let mut elevated: enumflags2::BitFlags<ACLPermissions> = enumflags2::BitFlags::all();
         elevated.remove(ACLPermissions::Speak | ACLPermissions::Whisper);
+        if !debug_acl_enter {
+            elevated.remove(ACLPermissions::Enter);
+        }
         if allow_speak {
             elevated.insert(ACLPermissions::Speak);
         }
         if allow_whisper {
             elevated.insert(ACLPermissions::Whisper);
+        }
+        if !debug_acl_enter && allow_enter {
+            elevated.insert(ACLPermissions::Enter);
         }
         if channel_id != 0 {
             elevated.remove(
@@ -113,11 +123,13 @@ pub(crate) async fn compute_permissions_for_client(
         channel_id,
         user_id,
         is_superuser,
+        debug_acl_enter,
         permissions = ?permissions,
         "Computed ACL permissions"
     );
 
-    if channels.channel_acl_generation() == channel_acl_generation
+    if use_acl_cache
+        && channels.channel_acl_generation() == channel_acl_generation
         && client.get_acl_generation() == client_acl_generation
     {
         channels

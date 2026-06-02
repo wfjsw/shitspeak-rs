@@ -10,6 +10,7 @@ mod ping;
 mod plugin_data_transmission;
 mod query_users;
 mod request_blob;
+pub(crate) mod temp_channel;
 mod text_message;
 mod udp_tunnel;
 mod user_list;

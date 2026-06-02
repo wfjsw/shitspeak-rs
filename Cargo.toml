@@ -106,6 +106,10 @@ name = "voice_e2e"
 harness = false
 
 [[bench]]
+name = "voice_microbatch"
+harness = false
+
+[[bench]]
 name = "s2s_compression"
 harness = false
 

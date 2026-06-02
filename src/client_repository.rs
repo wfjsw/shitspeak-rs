@@ -1083,6 +1083,21 @@ impl ClientRepository {
             .collect()
     }
 
+    /// Return whether any materialized client, local or remote, is currently
+    /// in `channel_id`. This intentionally does not use the local voice-routing
+    /// channel index, because maintenance tasks such as temporary-channel
+    /// reaping must account for cross-node occupants too.
+    pub async fn has_client_in_channel(&self, channel_id: u32) -> bool {
+        self.has_client_in_channel_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await
+    }
+
+    pub async fn has_client_in_channel_in_server(&self, server_id: &str, channel_id: u32) -> bool {
+        self.register.read().await.all_clients().any(|client| {
+            client.server_id() == server_id && client.get_current_channel_id() == channel_id
+        })
+    }
+
     /// Return **local** clients currently in any of the given `channel_ids`
     /// in a single lock acquisition.
     pub async fn get_local_clients_in_channels(
