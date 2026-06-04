@@ -192,6 +192,61 @@ impl CryptState {
         Ok(())
     }
 
+    /// Encrypt a short ordered run of packets for the same recipient.
+    ///
+    /// This is intended for micro-batch experiments: the caller supplies each
+    /// packet's destination, plaintext, and precomputed plaintext checksum,
+    /// and this method advances the recipient IV exactly once per packet before
+    /// handing the sequence to the crypto mode. Packet order is preserved.
+    pub fn encrypt_sequence_with_precomputed_checksums(
+        &mut self,
+        dests: &mut [&mut [u8]],
+        datas: &[&[u8]],
+        plaintext_checksums: &[[u8; 16]],
+    ) -> Result<(), CryptError> {
+        if dests.len() != datas.len() || datas.len() != plaintext_checksums.len() {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+        if self.mode.nonce_size() != 16 || self.encrypt_iv.len() != 16 {
+            return Err(CryptError::InvalidNonceSize);
+        }
+
+        let mode_overhead = self.mode.overhead();
+        let wire_overhead = self.overhead();
+        let mut nonces = Vec::with_capacity(datas.len());
+
+        for (dest, data) in dests.iter_mut().zip(datas.iter()) {
+            for byte in self.encrypt_iv.iter_mut() {
+                *byte = byte.wrapping_add(1);
+                if *byte != 0 {
+                    break;
+                }
+            }
+
+            if dest.len() < data.len() + wire_overhead {
+                return Err(CryptError::DestinationBufferTooSmall);
+            }
+            dest[0] = self.encrypt_iv[0];
+
+            let mut nonce = [0u8; 16];
+            nonce.copy_from_slice(&self.encrypt_iv);
+            nonces.push(nonce);
+        }
+
+        let mut mode_dests = dests
+            .iter_mut()
+            .zip(datas.iter())
+            .map(|(dest, data)| &mut dest[1..data.len() + 1 + mode_overhead])
+            .collect::<Vec<_>>();
+
+        self.mode.encrypt_sequence_with_plaintext_checksums(
+            &mut mode_dests,
+            datas,
+            &nonces,
+            plaintext_checksums,
+        )
+    }
+
     pub fn decrypt(&mut self, dest: &mut BytesMut, data: &[u8]) -> Result<(), CryptError> {
         if data.len() < self.overhead() {
             return Err(CryptError::DataTooShort);
@@ -322,6 +377,73 @@ impl CryptState {
             udp_ping_var: None,
             tcp_ping_avg: None,
             tcp_ping_var: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: [u8; 16] = [0x42; 16];
+    const IV_E: [u8; 16] = [0x01; 16];
+    const IV_D: [u8; 16] = [0x02; 16];
+
+    fn sender() -> CryptState {
+        CryptState::from_key("OCB2-AES128", &KEY, &IV_E, &IV_D).unwrap()
+    }
+
+    fn receiver() -> CryptState {
+        CryptState::from_key("OCB2-AES128", &KEY, &IV_D, &IV_E).unwrap()
+    }
+
+    #[test]
+    fn sequence_encrypt_matches_per_packet_encrypt() {
+        let datas = [1usize, 15, 16, 31, 170]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| vec![0xA0u8.wrapping_add(i as u8); len])
+            .collect::<Vec<_>>();
+        let checksums = datas
+            .iter()
+            .map(|data| CryptState::compute_plaintext_checksum(data))
+            .collect::<Vec<_>>();
+
+        let mut per_packet = sender();
+        let expected = datas
+            .iter()
+            .zip(checksums.iter())
+            .map(|(data, checksum)| {
+                let mut out = vec![0u8; data.len() + per_packet.overhead()];
+                per_packet
+                    .encrypt_with_precomputed_checksum(&mut out, data, checksum)
+                    .unwrap();
+                out
+            })
+            .collect::<Vec<_>>();
+
+        let mut sequence = sender();
+        let mut actual = datas
+            .iter()
+            .map(|data| vec![0u8; data.len() + sequence.overhead()])
+            .collect::<Vec<_>>();
+        let mut dests = actual
+            .iter_mut()
+            .map(|out| out.as_mut_slice())
+            .collect::<Vec<_>>();
+        let data_refs = datas.iter().map(|data| data.as_slice()).collect::<Vec<_>>();
+
+        sequence
+            .encrypt_sequence_with_precomputed_checksums(&mut dests, &data_refs, &checksums)
+            .unwrap();
+
+        assert_eq!(actual, expected);
+
+        let mut decrypt = receiver();
+        for (encrypted, plain) in actual.iter().zip(datas.iter()) {
+            let mut decrypted = BytesMut::new();
+            decrypt.decrypt(&mut decrypted, encrypted).unwrap();
+            assert_eq!(decrypted.as_ref(), plain.as_slice());
         }
     }
 }

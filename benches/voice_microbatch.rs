@@ -22,10 +22,8 @@ use std::{hint::black_box, net::SocketAddr};
 
 use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_rs::client::crypt::CryptState;
-use shitspeak_rs::messages::encoder::{AudioContext, AudioTarget};
-use shitspeak_rs::voice::codec::{
-    Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat,
-};
+use shitspeak_rs::messages::encoder::AudioContext;
+use shitspeak_rs::voice::codec::{Audio, IncomingUdpPacket, PacketFormat};
 use shitspeak_rs::voice::udp_batch::DatagramBatch;
 
 const KEY: [u8; 16] = [0x42; 16];
@@ -108,11 +106,7 @@ fn make_workload(batch_frames: usize, fanout: usize) -> Workload {
 fn decode_inbound_audio(receiver: &mut CryptState, packet: &[u8]) -> Audio {
     let mut decrypted = BytesMut::with_capacity(packet.len().saturating_sub(receiver.overhead()));
     receiver.decrypt(&mut decrypted, packet).unwrap();
-    match IncomingUdpPacket::decode(
-        &decrypted,
-        Some(ClientSessionIdentifier::from(12345)),
-    )
-    .unwrap()
+    match IncomingUdpPacket::decode(&decrypted, Some(ClientSessionIdentifier::from(12345))).unwrap()
     {
         IncomingUdpPacket::Audio(audio) => audio,
         IncomingUdpPacket::Ping(_) => panic!("benchmark input unexpectedly decoded as ping"),
@@ -227,6 +221,88 @@ fn process_microbatch_recipient_major_rayon(mut workload: Workload, addr: Socket
     packets
 }
 
+fn encrypt_sequence_loop(state: &mut CryptState, frames: &[EncodedFrame]) -> Vec<Bytes> {
+    frames
+        .iter()
+        .map(|frame| {
+            let mut buf = vec![0u8; frame.bytes.len() + state.overhead()];
+            state
+                .encrypt_with_precomputed_checksum(&mut buf, &frame.bytes, &frame.checksum)
+                .unwrap();
+            Bytes::from(buf)
+        })
+        .collect()
+}
+
+fn encrypt_sequence_batch(state: &mut CryptState, frames: &[EncodedFrame]) -> Vec<Bytes> {
+    let mut bufs = frames
+        .iter()
+        .map(|frame| vec![0u8; frame.bytes.len() + state.overhead()])
+        .collect::<Vec<_>>();
+    let mut dests = bufs
+        .iter_mut()
+        .map(|buf| buf.as_mut_slice())
+        .collect::<Vec<_>>();
+    let datas = frames
+        .iter()
+        .map(|frame| frame.bytes.as_ref())
+        .collect::<Vec<_>>();
+    let checksums = frames
+        .iter()
+        .map(|frame| frame.checksum)
+        .collect::<Vec<_>>();
+
+    state
+        .encrypt_sequence_with_precomputed_checksums(&mut dests, &datas, &checksums)
+        .unwrap();
+
+    bufs.into_iter().map(Bytes::from).collect()
+}
+
+fn process_microbatch_crypto_loop_seq(mut workload: Workload) -> usize {
+    let audios = decode_batch(&mut workload.inbound_receiver, &workload.encrypted_inbound);
+    let frames = encode_batch(&audios);
+    let mut packets = 0;
+
+    for state in &mut workload.recipient_states {
+        let out = encrypt_sequence_loop(state, &frames);
+        packets += out.len();
+        black_box(out);
+    }
+
+    packets
+}
+
+fn process_microbatch_crypto_batch_seq(mut workload: Workload) -> usize {
+    let audios = decode_batch(&mut workload.inbound_receiver, &workload.encrypted_inbound);
+    let frames = encode_batch(&audios);
+    let mut packets = 0;
+
+    for state in &mut workload.recipient_states {
+        let out = encrypt_sequence_batch(state, &frames);
+        packets += out.len();
+        black_box(out);
+    }
+
+    packets
+}
+
+fn process_microbatch_crypto_batch_rayon(mut workload: Workload) -> usize {
+    let audios = decode_batch(&mut workload.inbound_receiver, &workload.encrypted_inbound);
+    let frames = encode_batch(&audios);
+    let packets = frames.len() * workload.recipient_states.len();
+
+    let out = workload
+        .recipient_states
+        .into_par_iter()
+        .with_min_len(RAYON_BATCH_MIN_LEN)
+        .map(|mut state| encrypt_sequence_batch(&mut state, &frames))
+        .collect::<Vec<_>>();
+
+    black_box(out);
+    packets
+}
+
 fn batch_sizes() -> [usize; 4] {
     [1, 2, 4, 8]
 }
@@ -306,6 +382,48 @@ fn bench_voice_microbatch(c: &mut Criterion) {
                         || make_workload(batch_frames, fanout),
                         |workload| {
                             black_box(process_microbatch_recipient_major_rayon(workload, addr));
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("microbatch_crypto_loop_seq", &label),
+                &(fanout, batch_frames),
+                |b, &(fanout, batch_frames)| {
+                    b.iter_batched(
+                        || make_workload(batch_frames, fanout),
+                        |workload| {
+                            black_box(process_microbatch_crypto_loop_seq(workload));
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("microbatch_crypto_batch_seq", &label),
+                &(fanout, batch_frames),
+                |b, &(fanout, batch_frames)| {
+                    b.iter_batched(
+                        || make_workload(batch_frames, fanout),
+                        |workload| {
+                            black_box(process_microbatch_crypto_batch_seq(workload));
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("microbatch_crypto_batch_rayon", &label),
+                &(fanout, batch_frames),
+                |b, &(fanout, batch_frames)| {
+                    b.iter_batched(
+                        || make_workload(batch_frames, fanout),
+                        |workload| {
+                            black_box(process_microbatch_crypto_batch_rayon(workload));
                         },
                         BatchSize::SmallInput,
                     );

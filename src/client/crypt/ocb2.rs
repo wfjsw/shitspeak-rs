@@ -10,6 +10,14 @@ const BLOCK_SIZE: usize = 16;
 const MAX_PLAINTEXT_BYTES: usize = 1024;
 const MAX_BLOCKS: usize = MAX_PLAINTEXT_BYTES / BLOCK_SIZE; // 64
 
+struct BatchPacketMeta {
+    cleartext_len: usize,
+    last_pos: usize,
+    remaining: usize,
+    n_main: usize,
+    bulk_block_offset: usize,
+}
+
 fn stage_full_blocks<'a>(
     dest_ciphertext: &'a mut [u8],
     data: &[u8],
@@ -211,6 +219,150 @@ impl Ocb2 {
 
         Ok(())
     }
+
+    /// Experimental short-sequence encrypt used by the voice micro-batch
+    /// benchmark. It keeps OCB2 semantics identical to
+    /// `encrypt_with_plaintext_checksum`, but batches the independent AES
+    /// stages across packets in the sequence:
+    ///
+    /// - all `E(nonce)` blocks;
+    /// - all full-block ciphertext ECB work;
+    /// - all partial-block pads;
+    /// - all final tags.
+    ///
+    /// This models the crypto-side change that micro-buffering could unlock:
+    /// a recipient's consecutive frames are still encrypted in order, but the
+    /// AES backend sees wider independent work.
+    pub fn encrypt_sequence_with_plaintext_checksums(
+        &self,
+        dests: &mut [&mut [u8]],
+        datas: &[&[u8]],
+        nonces: &[[u8; BLOCK_SIZE]],
+        plaintext_checksums: &[[u8; BLOCK_SIZE]],
+    ) -> Result<(), CryptError> {
+        let count = datas.len();
+        if dests.len() != count || nonces.len() != count || plaintext_checksums.len() != count {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
+        let tag_size = self.overhead();
+        let mut metas = Vec::with_capacity(count);
+        let mut nonce_blocks = Vec::with_capacity(count * BLOCK_SIZE);
+        for i in 0..count {
+            let cleartext_len = datas[i].len();
+            if cleartext_len > MAX_PLAINTEXT_BYTES {
+                return Err(CryptError::DestinationBufferTooSmall);
+            }
+            if dests[i].len() < cleartext_len + tag_size {
+                return Err(CryptError::DestinationBufferTooSmall);
+            }
+
+            let last_pos = cleartext_len.saturating_sub(1) / BLOCK_SIZE * BLOCK_SIZE;
+            let remaining = cleartext_len - last_pos;
+            let n_main = last_pos / BLOCK_SIZE;
+            metas.push(BatchPacketMeta {
+                cleartext_len,
+                last_pos,
+                remaining,
+                n_main,
+                bulk_block_offset: 0,
+            });
+            nonce_blocks.extend_from_slice(&nonces[i]);
+        }
+
+        self.aes.encrypt_blocks(&mut nonce_blocks)?;
+
+        let mut delta_chains = Vec::with_capacity(count);
+        let mut next_bulk_block = 0;
+        for i in 0..count {
+            let mut chain = [[0u8; BLOCK_SIZE]; MAX_BLOCKS + 2];
+            chain[0].copy_from_slice(&nonce_blocks[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE]);
+            self.gf128.fill_chain(&mut chain, metas[i].n_main + 1);
+            metas[i].bulk_block_offset = next_bulk_block;
+            next_bulk_block += metas[i].n_main;
+            delta_chains.push(chain);
+        }
+
+        let mut bulk = vec![0u8; next_bulk_block * BLOCK_SIZE];
+        for i in 0..count {
+            let meta = &metas[i];
+            if meta.n_main == 0 {
+                continue;
+            }
+            let start = meta.bulk_block_offset * BLOCK_SIZE;
+            let end = start + meta.n_main * BLOCK_SIZE;
+            stage_full_blocks(
+                &mut bulk[start..end],
+                datas[i],
+                &delta_chains[i],
+                meta.n_main,
+            );
+        }
+
+        if !bulk.is_empty() {
+            self.aes.encrypt_blocks(&mut bulk)?;
+        }
+
+        for i in 0..count {
+            let meta = &metas[i];
+            let dest_ciphertext = &mut dests[i][tag_size..tag_size + meta.cleartext_len];
+            let bulk_start = meta.bulk_block_offset * BLOCK_SIZE;
+            for block_i in 0..meta.n_main {
+                let d = &delta_chains[i][block_i + 1];
+                let src = bulk_start + block_i * BLOCK_SIZE;
+                let dst = block_i * BLOCK_SIZE;
+                for j in 0..BLOCK_SIZE {
+                    dest_ciphertext[dst + j] = bulk[src + j] ^ d[j];
+                }
+            }
+        }
+
+        let mut pads = vec![0u8; count * BLOCK_SIZE];
+        for i in 0..count {
+            let meta = &metas[i];
+            let final_delta = delta_chains[i][meta.n_main + 1];
+            let pad = &mut pads[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+            let num_bits = (meta.remaining * 8) as u16;
+            pad[BLOCK_SIZE - 2] = ((num_bits >> 8) & 0xff) as u8;
+            pad[BLOCK_SIZE - 1] = (num_bits & 0xff) as u8;
+            for j in 0..BLOCK_SIZE {
+                pad[j] ^= final_delta[j];
+            }
+        }
+        self.aes.encrypt_blocks(&mut pads)?;
+
+        let mut tags = vec![0u8; count * BLOCK_SIZE];
+        for i in 0..count {
+            let meta = &metas[i];
+            let pad = &pads[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+            let mut checksum = plaintext_checksums[i];
+            for j in meta.remaining..BLOCK_SIZE {
+                checksum[j] ^= pad[j];
+            }
+
+            let dest_ciphertext = &mut dests[i][tag_size..tag_size + meta.cleartext_len];
+            for j in 0..meta.remaining {
+                dest_ciphertext[meta.last_pos + j] = pad[j] ^ datas[i][meta.last_pos + j];
+            }
+
+            let mut tag_buf = delta_chains[i][meta.n_main + 1];
+            self.gf128.triple(&mut tag_buf);
+            for j in 0..BLOCK_SIZE {
+                tag_buf[j] ^= checksum[j];
+            }
+            tags[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE].copy_from_slice(&tag_buf);
+        }
+        self.aes.encrypt_blocks(&mut tags)?;
+
+        for i in 0..count {
+            dests[i][..tag_size].copy_from_slice(&tags[i * BLOCK_SIZE..i * BLOCK_SIZE + tag_size]);
+        }
+
+        Ok(())
+    }
 }
 
 impl CryptoMode for Ocb2 {
@@ -238,6 +390,22 @@ impl CryptoMode for Ocb2 {
         plaintext_checksum: &[u8; BLOCK_SIZE],
     ) -> Result<(), CryptError> {
         Ocb2::encrypt_with_plaintext_checksum(self, dest, data, nonce, plaintext_checksum)
+    }
+
+    fn encrypt_sequence_with_plaintext_checksums(
+        &self,
+        dests: &mut [&mut [u8]],
+        datas: &[&[u8]],
+        nonces: &[[u8; BLOCK_SIZE]],
+        plaintext_checksums: &[[u8; BLOCK_SIZE]],
+    ) -> Result<(), CryptError> {
+        Ocb2::encrypt_sequence_with_plaintext_checksums(
+            self,
+            dests,
+            datas,
+            nonces,
+            plaintext_checksums,
+        )
     }
 
     fn encrypt(&self, dest: &mut [u8], data: &[u8], nonce: &[u8]) -> Result<(), CryptError> {
