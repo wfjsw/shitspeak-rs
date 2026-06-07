@@ -11,7 +11,6 @@ pub(crate) mod handlers;
 pub mod options;
 pub mod session_states;
 pub mod state_log;
-pub mod udp_state;
 pub mod user_info;
 pub mod user_version;
 pub(crate) mod visibility;

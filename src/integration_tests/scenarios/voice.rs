@@ -12,6 +12,8 @@ use bytes::Bytes;
 use crate::channels::Channel;
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::messages::encoder::VoiceTarget;
+use crate::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{AudioPayload, PacketFormat};
 
@@ -24,6 +26,54 @@ fn opus_frame(payload: &AudioPayload) -> &[u8] {
         AudioPayload::Opus(p) => &p.frame,
         _ => panic!("expected Opus payload, got {payload:?}"),
     }
+}
+
+fn voice_target(slot: u32, targets: Vec<VoiceTargetEntry>) -> VoiceTarget {
+    VoiceTarget {
+        id: Some(slot),
+        targets,
+    }
+}
+
+fn voice_target_user(session: u32) -> VoiceTargetEntry {
+    VoiceTargetEntry {
+        session: vec![session],
+        channel_id: None,
+        group: None,
+        links: Some(false),
+        children: Some(false),
+    }
+}
+
+fn voice_target_channel(
+    channel_id: u32,
+    children: bool,
+    links: bool,
+    group: Option<&str>,
+) -> VoiceTargetEntry {
+    VoiceTargetEntry {
+        session: Vec::new(),
+        channel_id: Some(channel_id),
+        group: group.map(str::to_owned),
+        links: Some(links),
+        children: Some(children),
+    }
+}
+
+async fn expect_voice_from(recipient: &TestClient, sender: &TestClient, reason: &str) {
+    let audio = recipient
+        .recv_voice_tcp(VOICE_DEADLINE)
+        .await
+        .expect(reason);
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(sender.server_session));
+}
+
+async fn expect_no_voice(recipient: &TestClient, reason: &str) {
+    assert!(
+        recipient.recv_voice_tcp(NEGATIVE_WINDOW).await.is_none(),
+        "{reason}"
+    );
 }
 
 // ── TCP-tunneled tests ──────────────────────────────────────────────────────
@@ -221,6 +271,308 @@ async fn voice_tcp_linked_channel_routes() {
     );
     assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
     assert_eq!(audio.sender_session, Some(alice.server_session));
+}
+
+/// Checks direct-user voice targets.
+/// Expected: only the targeted session receives the packet.
+#[tokio::test]
+async fn voice_target_to_user_whispers_only_to_that_session() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(90, "WhisperTarget".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(90).await;
+    carol.move_to_channel(90).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    alice
+        .set_voice_target(voice_target(7, vec![voice_target_user(bob.session_id)]))
+        .await;
+    alice
+        .send_voice_tcp(7, 31, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(&bob, &alice, "Bob should receive direct voice target audio").await;
+    expect_no_voice(
+        &carol,
+        "Carol should not receive audio targeted only at Bob's session",
+    )
+    .await;
+}
+
+/// Checks channel voice targets without child or link expansion.
+/// Expected: users in the target channel receive shout audio; users in child
+/// channels do not.
+#[tokio::test]
+async fn voice_target_to_channel_shouts_only_to_that_channel() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(100, "TargetChannel".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(101, "TargetChild".to_owned(), 0, 0, Some(100)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(100).await;
+    carol.move_to_channel(101).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(100, false, false, None)],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 32, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(&bob, &alice, "Bob should receive channel shout audio").await;
+    expect_no_voice(
+        &carol,
+        "Carol in a child channel should not receive a non-recursive channel target",
+    )
+    .await;
+}
+
+/// Checks child-channel expansion for channel voice targets.
+/// Expected: users in descendant channels receive shout audio when
+/// `children` is enabled.
+#[tokio::test]
+async fn voice_target_to_children_shouts_to_descendants() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(110, "Parent".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(111, "Child".to_owned(), 0, 0, Some(110)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(112, "Elsewhere".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(111).await;
+    carol.move_to_channel(112).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(110, true, false, None)],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 33, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob in a child channel should receive recursive channel target audio",
+    )
+    .await;
+    expect_no_voice(
+        &carol,
+        "Carol in an unrelated channel should not receive recursive channel target audio",
+    )
+    .await;
+}
+
+/// Checks linked-channel expansion for channel voice targets.
+/// Expected: users in linked channels receive shout audio when `links` is
+/// enabled.
+#[tokio::test]
+async fn voice_target_to_linked_channels_shouts_across_links() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(120, "LinkSource".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(121, "Linked".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(122, "Unlinked".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans.add_link(120, 121).await.unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(121).await;
+    carol.move_to_channel(122).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(120, false, true, None)],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 34, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob in a linked channel should receive linked voice target audio",
+    )
+    .await;
+    expect_no_voice(
+        &carol,
+        "Carol in an unlinked channel should not receive linked voice target audio",
+    )
+    .await;
+}
+
+/// Checks group filtering for channel voice targets.
+/// Expected: only recipients whose authenticated groups match the target's
+/// `group` field receive shout audio.
+#[tokio::test]
+async fn voice_target_to_specific_group_filters_recipients() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["casters".into()]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(130, "Grouped".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(130).await;
+    carol.move_to_channel(130).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(130, false, false, Some("casters"))],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 35, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive group-filtered voice target audio",
+    )
+    .await;
+    expect_no_voice(
+        &carol,
+        "Carol should not receive voice target audio for a group she is not in",
+    )
+    .await;
 }
 
 // ── Real UDP / OCB2 tests ──────────────────────────────────────────────────

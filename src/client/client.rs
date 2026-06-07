@@ -15,9 +15,7 @@ use rustls::pki_types::CertificateDer;
 use tokio::{
     io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
     net::TcpStream,
-    sync::{
-        Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock, RwLockWriteGuard, mpsc, watch,
-    },
+    sync::{Mutex as AsyncMutex, RwLock, RwLockWriteGuard, mpsc, watch},
 };
 use tokio_rustls::server::TlsStream;
 
@@ -26,7 +24,7 @@ use crate::{
         client_global_state::ClientGlobalState, client_local_state::ClientLocalState,
         client_session_identifier::ClientSessionIdentifier, client_stats::ClientStats,
         crypt::CryptState, global_state_guard::GlobalStateWriteGuard, options::ClientOptions,
-        udp_state::UdpState, user_info::UserInfoExtended,
+        user_info::UserInfoExtended, voice_target::VoiceTarget,
     },
     client_repository::ClientRepository,
     errors::{ReadProtoMessageError, WriteProtoMessageError},
@@ -96,7 +94,6 @@ pub struct Client {
     login_time: DateTime<Utc>,
     last_active: ParkingMutex<DateTime<Utc>>,
     last_ping: ParkingMutex<DateTime<Utc>>,
-    udp_state: Option<AsyncMutex<UdpState>>,
     stats: RwLock<ClientStats>,
 
     certificate_hash: Option<Bytes>,
@@ -108,6 +105,7 @@ pub struct Client {
     local_state: ParkingRwLock<Option<ClientLocalState>>,
     global_state: ParkingRwLock<ClientGlobalState>,
     crypt_state: ParkingMutex<Option<CryptState>>,
+    voice_targets: ParkingMutex<HashMap<u32, VoiceTarget>>,
     voice_routing_tx: mpsc::Sender<VoiceRoutingPayload>,
     voice_routing_rx: ParkingMutex<Option<mpsc::Receiver<VoiceRoutingPayload>>>,
     /// Per-user outgoing TCP voice tunnel queue.  The routing task pushes raw
@@ -266,7 +264,6 @@ impl Client {
             login_time: now,
             last_active: ParkingMutex::new(now),
             last_ping: ParkingMutex::new(now),
-            udp_state: None,
             stats: RwLock::new(ClientStats::default()),
             certificate_hash,
             certificate_chain,
@@ -275,6 +272,7 @@ impl Client {
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             crypt_state: ParkingMutex::new(None),
+            voice_targets: ParkingMutex::new(HashMap::new()),
             voice_routing_tx,
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx,
@@ -419,7 +417,6 @@ impl Client {
             login_time: now,
             last_active: ParkingMutex::new(now),
             last_ping: ParkingMutex::new(now),
-            udp_state: None,
             stats: RwLock::new(ClientStats::default()),
             certificate_hash: None,
             certificate_chain: Vec::new(),
@@ -428,6 +425,7 @@ impl Client {
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             crypt_state: ParkingMutex::new(None),
+            voice_targets: ParkingMutex::new(HashMap::new()),
             voice_routing_tx,
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx,
@@ -496,7 +494,6 @@ impl Client {
             login_time,
             last_active: ParkingMutex::new(login_time),
             last_ping: ParkingMutex::new(login_time),
-            udp_state: None,
             stats: RwLock::new(ClientStats::default()),
             certificate_hash: cert_hash,
             certificate_chain: Vec::new(),
@@ -505,6 +502,7 @@ impl Client {
             local_state: ParkingRwLock::new(None),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             crypt_state: ParkingMutex::new(None),
+            voice_targets: ParkingMutex::new(HashMap::new()),
             voice_routing_tx,
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx,
@@ -851,18 +849,19 @@ impl Client {
         self.crypt_state.lock()
     }
 
-    pub async fn udp_state(&self) -> AsyncMutexGuard<'_, UdpState> {
-        match &self.udp_state {
-            Some(m) => m.lock().await,
-            None => panic!("UDP state not initialized"),
-        }
-    }
-
     pub fn create_crypt_state(&self, mode: &str) -> Result<(), crate::client::crypt::CryptError> {
         let mut state = self.crypt_state.lock();
         let rng = aws_lc_rs::rand::SystemRandom::new();
         *state = Some(CryptState::generate(mode, &rng)?);
         Ok(())
+    }
+
+    pub fn set_voice_target(&self, id: u32, target: VoiceTarget) {
+        self.voice_targets.lock().insert(id, target);
+    }
+
+    pub fn voice_target(&self, id: u32) -> Option<VoiceTarget> {
+        self.voice_targets.lock().get(&id).cloned()
     }
 
     pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) {

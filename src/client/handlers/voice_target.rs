@@ -61,16 +61,14 @@ pub async fn handle_voice_target(
         }
     }
 
-    let mut udp_state = sender.udp_state().await;
-    let target = udp_state.voice_target_mut(target_id);
-    target.clear();
-
+    let mut target = crate::client::voice_target::VoiceTarget::new();
     for session in valid_sessions {
         target.add_session(session);
     }
     for channel in valid_channels {
         target.add_channel(channel);
     }
+    sender.set_voice_target(target_id, target);
 
     Ok(())
 }

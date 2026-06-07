@@ -36,7 +36,6 @@ pub mod types;
 pub mod user_channel_cache;
 pub mod utils;
 pub mod voice;
-pub mod voice_crypto;
 pub mod web;
 
 #[cfg(test)]

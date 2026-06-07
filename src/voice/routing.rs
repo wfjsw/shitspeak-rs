@@ -506,8 +506,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
             return;
         }
         AudioTarget::VoiceTarget(slot) => {
-            let udp_state = sender.udp_state().await;
-            let Some(vt) = udp_state.voice_target(slot).cloned() else {
+            let Some(vt) = sender.voice_target(slot) else {
                 return;
             };
             if vt.is_empty() {

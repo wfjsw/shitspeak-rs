@@ -37,7 +37,6 @@ mod types;
 mod user_channel_cache;
 mod utils;
 mod voice;
-mod voice_crypto;
 mod web;
 
 mod mumble_proto {
