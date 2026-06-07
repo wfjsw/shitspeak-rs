@@ -262,7 +262,6 @@ fn mint_pki() -> BenchPki {
 
 fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Config {
     Config {
-        node_id: 1,
         listen: "127.0.0.1:0".into(),
         server_entrypoints: Vec::new(),
         register_name: "voice-e2e-bench".into(),

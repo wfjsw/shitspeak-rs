@@ -194,6 +194,7 @@ fn frame_for_payload(payload: Bytes) -> transport_pb::Frame {
         payload,
         payload_encoding: transport_pb::PayloadEncoding::Identity as i32,
         uncompressed_payload_len: 0,
+        payload_dictionary_id: 0,
     }
 }
 

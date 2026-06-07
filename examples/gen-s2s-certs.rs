@@ -9,7 +9,6 @@
 use std::fs;
 use std::path::Path;
 
-const DEFAULT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 55555, 1, 1];
 const MAX_NODE_ID: u16 = 0x0fff;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -91,7 +90,7 @@ fn mint_node_cert(
     let mut params = rcgen::CertificateParams::new(vec![format!("s2s-node-{node_id}.local")])?;
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, format!("s2s-node-{node_id}"));
+        .push(rcgen::DnType::CommonName, node_id.to_string());
     params.key_usages = vec![
         rcgen::KeyUsagePurpose::DigitalSignature,
         rcgen::KeyUsagePurpose::KeyEncipherment,
@@ -100,20 +99,6 @@ fn mint_node_cert(
         rcgen::ExtendedKeyUsagePurpose::ServerAuth,
         rcgen::ExtendedKeyUsagePurpose::ClientAuth,
     ];
-
-    // Node identity extension, DER INTEGER encoded for S2S parser compatibility.
-    let der_value = if node_id <= 0x7f {
-        vec![0x02, 0x01, node_id as u8]
-    } else {
-        let [high, low] = node_id.to_be_bytes();
-        vec![0x02, 0x02, high, low]
-    };
-    params
-        .custom_extensions
-        .push(rcgen::CustomExtension::from_oid_content(
-            DEFAULT_OID,
-            der_value,
-        ));
 
     let node_key = rcgen::KeyPair::generate()?;
     let node_cert = params.signed_by(&node_key, &ca_cert, &ca_key)?;

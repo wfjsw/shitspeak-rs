@@ -82,7 +82,10 @@ impl Endpoint for TcpEndpoint {
             if peer_node != peer.node_id() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("peer cn {peer_node} != expected {}", peer.node_id()),
+                    format!(
+                        "peer certificate node id {peer_node} != expected {}",
+                        peer.node_id()
+                    ),
                 ));
             }
             install_stream_session(

@@ -2,7 +2,7 @@
 //!  * trust root (CA bundle) shared by every peer
 //!  * own X.509 certificate chain
 //!  * own private key
-//!  * the local `NodeIdentifier` parsed out of the cert's Subject CN.
+//!  * the local `NodeIdentifier` parsed out of the cert's numeric Subject CN.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -40,7 +40,7 @@ impl NodeIdentity {
         let roots = load_roots(ca_path)?;
         let chain = load_certs(cert_path)?;
         let key = load_private_key(key_path)?;
-        let node_id = parse_cn_node_id(&chain[0], cert_path)?;
+        let node_id = node_id_from_cert(&chain[0], cert_path)?;
 
         Ok(Self {
             node_id,
@@ -65,6 +65,11 @@ impl NodeIdentity {
     pub fn key(&self) -> &PrivateKeyDer<'static> {
         &self.key
     }
+}
+
+pub fn node_id_from_cert_file(path: &Path) -> Result<NodeIdentifier, ConfigError> {
+    let chain = load_certs(path)?;
+    node_id_from_cert(&chain[0], path)
 }
 
 fn load_roots(path: &Path) -> Result<RootCertStore, ConfigError> {
@@ -135,7 +140,7 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ConfigError> 
 
 /// Extracts the Subject Common Name from a DER-encoded cert and parses it as a
 /// decimal `u16` `NodeIdentifier`.
-pub fn parse_cn_node_id(
+pub fn node_id_from_cert(
     cert_der: &CertificateDer<'_>,
     cert_path_for_diag: &Path,
 ) -> Result<NodeIdentifier, ConfigError> {
@@ -164,20 +169,7 @@ pub fn parse_peer_cn(chain: &[CertificateDer<'_>]) -> Result<NodeIdentifier, Con
     let first = chain.first().ok_or(ConfigError::CertEmpty {
         path: "<peer-chain>".to_string(),
     })?;
-    let (_, parsed) =
-        X509Certificate::from_der(first.as_ref()).map_err(|e| ConfigError::X509(format!("{e}")))?;
-    let cn = parsed
-        .subject()
-        .iter_common_name()
-        .next()
-        .and_then(|attr| attr.as_str().ok())
-        .ok_or_else(|| ConfigError::CnMissing {
-            path: "<peer-chain>".to_string(),
-        })?
-        .trim()
-        .to_owned();
-    cn.parse::<NodeIdentifier>()
-        .map_err(|_| ConfigError::CnNotNumeric { cn })
+    node_id_from_cert(first, Path::new("<peer-chain>"))
 }
 
 #[cfg(test)]

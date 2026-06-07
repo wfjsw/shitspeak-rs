@@ -255,6 +255,9 @@ impl ClientRepository {
         }
         let mut pointers = self.allocation_pointers.lock();
         let allocation_pointer = pointers.entry(server_id.to_owned()).or_insert(0);
+        if self.local_node_id == 0 && *allocation_pointer == 0 {
+            *allocation_pointer = 1;
+        }
         let id = *allocation_pointer;
 
         if id > MAX_LOCAL_SESSION_ID {
@@ -1943,6 +1946,20 @@ mod tests {
             Message::TextMessage(text) => assert_eq!(text.message, "hello"),
             other => panic!("expected TextMessage, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn node_zero_allocation_skips_session_zero() {
+        let repo = ClientRepository::new(0, 128);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 34567);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+
+        let client = repo.allocate_web_client(peer.ip(), peer, local, tx).await;
+
+        assert_eq!(client.get_node_id(), 0);
+        assert_eq!(client.get_session_id().get_local_session_id(), 1);
+        assert_ne!(u32::from(client.get_session_id()), 0);
     }
 
     #[tokio::test]

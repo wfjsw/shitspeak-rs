@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 
 use serde::Deserialize;
 use shitspeak_rs::config::S2sConfig;
+use shitspeak_rs::logging;
 use shitspeak_rs::s2s::overlay::OverlayNetwork;
 use shitspeak_rs::s2s::status;
 use shitspeak_rs::s2s::transport::ConnectionManager;
@@ -24,13 +25,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(env_filter)
-        .with_line_number(true)
-        .init();
+    logging::init("s2s-forwarder")?;
 
     run().await
 }

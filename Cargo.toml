@@ -32,7 +32,7 @@ tokio-rustls = "0.26.4"
 tracing = "0.1"
 wasmtime = "45.0.0"
 tracing-appender = { version = "0.2.4", features = ["parking_lot"] }
-tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde", "env-filter"] }
+tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde", "env-filter", "registry"] }
 x509-parser = "0.18.1"
 zstd = "0.13.3"
 

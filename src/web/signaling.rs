@@ -2646,7 +2646,6 @@ mod tests {
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
 
         let config = crate::config::Config {
-            node_id: 1,
             listen: "127.0.0.1:0".into(),
             server_entrypoints: Vec::new(),
             register_name: "test".into(),

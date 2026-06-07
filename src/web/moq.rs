@@ -1888,7 +1888,6 @@ mod tests {
 
     fn test_config(cert_path: PathBuf, key_path: PathBuf) -> Config {
         Config {
-            node_id: 1,
             listen: "127.0.0.1:0".to_string(),
             server_entrypoints: Vec::new(),
             register_name: "test".to_string(),

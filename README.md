@@ -75,21 +75,30 @@ $env:RUST_LOG = "debug"
 cargo run
 ```
 
+To ship logs directly to Grafana Loki, enable `[logging.loki]` in `config.toml`
+or set equivalent `SHITSPEAK_LOGGING_LOKI_*` environment variables:
+
+```toml
+[logging.loki]
+enabled = true
+url = "http://localhost:3100"
+labels = { environment = "dev" }
+```
+
 ## Configuration
 
 The server loads `config.toml` from the working directory. Values can also be overridden with environment variables using the `SHITSPEAK_` prefix and underscores for nested keys.
 
 Important local settings include:
 
-1. `node_id` identifies this server within the session id space.
-2. `listen` is the Mumble client TCP and UDP listener address.
-3. `cert_path` and `key_path` point to the TLS identity used for client connections.
-4. `max_users`, `max_bandwidth`, and message length settings control client limits.
-5. `udp_voice_enabled` and `udp_ping_enabled` control UDP behavior.
-6. `blob_storage_dir` controls where persistent channel, client, and blob data is stored.
-7. `authenticator_wasm_path` enables a custom WASM authentication module.
-8. `s2s` sections configure clustered server operation.
-9. `web` sections configure the browser gateway.
+1. `listen` is the Mumble client TCP and UDP listener address.
+2. `cert_path` and `key_path` point to the TLS identity used for client connections.
+3. `max_users`, `max_bandwidth`, and message length settings control client limits.
+4. `udp_voice_enabled` and `udp_ping_enabled` control UDP behavior.
+5. `blob_storage_dir` controls where persistent channel, client, and blob data is stored.
+6. `authenticator_wasm_path` enables a custom WASM authentication module.
+7. `s2s` sections configure clustered server operation.
+8. `web` sections configure the browser gateway.
 
 Selected settings are hot reloaded when `config.toml` changes. Listener addresses, node identity, TLS identity, storage paths, and other startup resources require a restart.
 
@@ -135,7 +144,7 @@ The main tunables are:
 
 The server to server subsystem supports multi node operation with transport metrics, overlay routing, state replication, and content addressed channel blob transfer. Configuration is split across `[s2s]`, `[s2s.transport]`, `[s2s.overlay]`, and `[s2s.replications]`.
 
-A clustered deployment must provide unique node ids, S2S certificates, listener addresses, advertised addresses, seed peers, and a persistence directory for cluster state. When `s2s.persistence_dir` is set, the transport also caches the latest learned adaptive compression dictionary under that directory and renegotiates it with peers after restart. The included Docker Compose demo shows one concrete 16 node layout.
+A clustered deployment must provide unique S2S certificates whose leaf certificate Common Name is the numeric node id, plus listener addresses, advertised addresses, seed peers, and a persistence directory for cluster state. When S2S is disabled or no S2S certificate is configured, the local node id defaults to `0`. When `s2s.persistence_dir` is set, the transport also caches the latest learned adaptive compression dictionary under that directory and renegotiates it with peers after restart. The included Docker Compose demo shows one concrete 16 node layout.
 
 Generate S2S test certificates with:
 
@@ -176,7 +185,7 @@ The VS Code workspace includes tasks for certificate generation, `cargo check`, 
 
 ## Deployment
 
-The `examples/docker-compose-16node` directory contains a committed 16 node Docker Compose demo. It builds a local cluster layout with one server per node, unique node ids, per node S2S certificates, shared client TLS material, generated config, and deterministic host port assignments.
+The `examples/docker-compose-16node` directory contains a committed 16 node Docker Compose demo. It builds a local cluster layout with one server per node, per node S2S certificates with numeric Common Names, shared client TLS material, generated config, and deterministic host port assignments.
 
 Build the Linux musl binary from the repository root first:
 

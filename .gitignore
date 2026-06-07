@@ -16,6 +16,6 @@ cert.pfx
 log/
 data/
 .claude/settings.local.json
-deploy/
+deploy/*
 examples/docker-compose-16node/.transport-survey
 codex-target/

@@ -342,7 +342,6 @@ mod tests {
 
     fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         Config {
-            node_id: 1,
             listen: "127.0.0.1:0".to_owned(),
             server_entrypoints: entrypoints,
             register_name: "test".to_owned(),
@@ -842,7 +841,7 @@ impl Server {
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
         // ── Channel repository & blob stores ─────────────────────────────
-        let node_id = config.node_id;
+        let node_id = config.local_node_id().map_err(std::io::Error::other)?;
         let client_log_max_entries = config.client_log_max_entries;
         let channel_repo_tuning = ChannelRepoTuning::from(&config);
         let (channels, channel_blobs, session_blobs, user_channel_cache, bans) = match &config

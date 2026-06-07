@@ -187,7 +187,7 @@ pub fn message_conversion(input: TokenStream) -> TokenStream {
                 }
             }
         }
-        
+
         #(#from_impls)*
     };
 

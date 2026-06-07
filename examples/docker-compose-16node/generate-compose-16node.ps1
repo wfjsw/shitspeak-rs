@@ -291,7 +291,6 @@ function New-NodeConfig {
     $seedBlock = ($seedLines -join "`n")
 
     return @"
-node_id = $NodeId
 listen = "[::]:64738"
 register_name = "ShitSpeak Compose node $NodeId"
 register_hostname = "$HostName"

@@ -27,6 +27,7 @@ mod context_action;
 mod errors;
 mod geoip;
 mod localization;
+mod logging;
 mod messages;
 mod protocol_version;
 mod proxy_protocol;
@@ -76,14 +77,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(env_filter)
-        .with_line_number(true)
-        .init();
+    logging::init("shitspeak-rs")?;
 
     // Probe the AES + GF(2^128) backends once at launch (each logs its
     // choice via `tracing::info!`).

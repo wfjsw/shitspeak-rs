@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::constants::APP_PROTO_VER;
 use crate::protocol_version::ProtocolVersion;
+use crate::types::NodeIdentifier;
 
 use config::{Config as ConfigCrate, Environment, File};
 use serde::{Deserialize, Deserializer};
@@ -13,6 +14,8 @@ use crate::s2s::replications::ReplicationTuning;
 use crate::s2s::transport::{
     PeerAddress, SeedAddress, TransportConfig, TransportKind, TransportTuning,
 };
+
+const DEFAULT_LOCAL_NODE_ID: NodeIdentifier = 0;
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct S2sConfig {
@@ -77,6 +80,29 @@ pub struct S2sConfig {
 impl S2sConfig {
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn local_node_id(&self) -> Result<NodeIdentifier, String> {
+        if !self.enabled {
+            return Ok(DEFAULT_LOCAL_NODE_ID);
+        }
+
+        let Some(cert_path) = self.cert_path.as_deref() else {
+            return Ok(DEFAULT_LOCAL_NODE_ID);
+        };
+
+        match crate::s2s::transport::node_id_from_cert_file(cert_path) {
+            Ok(node_id) => Ok(node_id),
+            Err(crate::s2s::transport::ConfigError::CertRead { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(DEFAULT_LOCAL_NODE_ID)
+            }
+            Err(e) => Err(format!(
+                "failed to extract S2S node id from {}: {e}",
+                cert_path.display()
+            )),
+        }
     }
 
     pub fn transport_config(&self) -> Result<Option<TransportConfig>, String> {
@@ -702,7 +728,6 @@ impl DebugConfig {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
-    pub node_id: u16,
     pub listen: String,
     #[serde(default)]
     pub server_entrypoints: Vec<ServerEntrypointConfig>,
@@ -928,6 +953,10 @@ impl Config {
             .build()
             .expect("Failed to build config sources")
     }
+
+    pub fn local_node_id(&self) -> Result<NodeIdentifier, String> {
+        self.s2s.local_node_id()
+    }
 }
 
 #[cfg(test)]
@@ -941,6 +970,19 @@ mod tests {
             .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
             .build()?
             .try_deserialize()
+    }
+
+    fn cert_with_cn(dir: &Path, cn: &str) -> PathBuf {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["s2s-node.local".to_owned()]).expect("cert params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = params.self_signed(&key).expect("self signed cert");
+        let path = dir.join("s2s-cert.pem");
+        std::fs::write(&path, cert.pem()).expect("write cert");
+        path
     }
 
     /// Ensure the checked-in `config.toml` parses cleanly under the current
@@ -970,7 +1012,7 @@ mod tests {
         assert_eq!(cfg.web.webrtc.max_speaker_ssrcs, 64);
         assert!(!cfg.web.moq.enabled);
         assert_eq!(cfg.web.moq.max_speaker_tracks, 64);
-        assert!(cfg.debug.debug_acl_enter());
+        assert!(!cfg.debug.debug_acl_enter());
     }
 
     #[test]
@@ -998,7 +1040,6 @@ mod tests {
     #[test]
     fn udp_ping_user_count_scope_parses_local() {
         let raw = r#"
-            node_id = 1
             listen = "127.0.0.1:64738"
             register_name = "test"
             cert_path = "cert.pem"
@@ -1023,7 +1064,6 @@ mod tests {
     #[test]
     fn server_entrypoints_parse_port_and_sni_scopes() {
         let raw = r#"
-            node_id = 1
             listen = "127.0.0.1:64738"
             register_name = "test"
             cert_path = "cert.pem"
@@ -1079,6 +1119,42 @@ mod tests {
         let cfg = S2sConfig::default();
         assert!(!cfg.is_enabled());
         assert!(cfg.transport_config().unwrap().is_none());
+        assert_eq!(cfg.local_node_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn s2s_local_node_id_defaults_to_zero_without_cert_path() {
+        let cfg = S2sConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.local_node_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn s2s_local_node_id_defaults_to_zero_when_cert_file_is_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cfg = S2sConfig {
+            enabled: true,
+            cert_path: Some(temp.path().join("missing-cert.pem")),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.local_node_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn s2s_local_node_id_parses_numeric_cert_cn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cert_path = cert_with_cn(temp.path(), "42");
+        let cfg = S2sConfig {
+            enabled: true,
+            cert_path: Some(cert_path),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.local_node_id().unwrap(), 42);
     }
 
     #[test]

@@ -1,6 +1,5 @@
 # ShitSpeak server configuration for local testing
 
-node_id = 1
 listen = "0.0.0.0:64738"
 register_name = "ShitSpeak Test"
 
@@ -223,3 +222,18 @@ public_url = "https://localhost:64740/web/moq"
 # key_path = "key.pem"
 max_speaker_tracks = 64
 audio_bitrate = 64000
+
+# Optional Grafana Loki log shipping. `url` may be either the Loki base URL
+# or the full `/loki/api/v1/push` endpoint. These settings are read at startup.
+[logging.loki]
+enabled = false
+# url = "http://localhost:3100"
+# tenant_id = "tenant"
+# username = "grafana-cloud-user-or-org-id"
+# password = "grafana-cloud-token"
+# bearer_token = "token"
+batch_size = 128
+flush_interval_ms = 1000
+queue_capacity = 4096
+request_timeout_ms = 5000
+labels = { environment = "local" }

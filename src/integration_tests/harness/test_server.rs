@@ -152,7 +152,7 @@ pub async fn spawn_s2s_test_server_with_config(
 async fn spawn_test_server_with_pki(
     opts: TestServerOpts,
     pki: Arc<Pki>,
-    node_id: u16,
+    _node_id: u16,
     cert_index: usize,
     s2s: S2sConfig,
     s2s_persistence_dir: Option<TempDir>,
@@ -160,7 +160,6 @@ async fn spawn_test_server_with_pki(
     let (cert_path, key_path) = pki.nodes[cert_index].clone();
 
     let config = Config {
-        node_id,
         listen: "127.0.0.1:0".into(),
         server_entrypoints: Vec::new(),
         register_name: "test".into(),

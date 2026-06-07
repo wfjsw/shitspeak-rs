@@ -1,6 +1,6 @@
 # Docker Compose 16-node demo
 
-This folder generates and runs a local Docker Compose network shaped like the UTD 16-node deployment bundle. Every node runs the same server image, has a unique `node_id`, gets its own S2S ECDSA certificate/key pair, and seeds to the next two nodes in the ring.
+This folder generates and runs a local Docker Compose network shaped like the UTD 16-node deployment bundle. Every node runs the same server image, gets its own S2S ECDSA certificate/key pair with a numeric Common Name node id, and seeds to the next two nodes in the ring.
 
 The demo uses the already-built Linux musl binary so Docker does not need to rebuild the Rust dependency graph.
 
