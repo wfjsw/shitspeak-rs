@@ -217,6 +217,7 @@ struct AuthenticateResponse {
     groups: Vec<String>,
     virtual_server_id: Option<String>,
     language: String,
+    max_bandwidth: Option<u32>,
     texture_url: Option<String>,
     comment_url: Option<String>,
 }
@@ -231,6 +232,7 @@ impl AuthenticateResponse {
             groups,
             virtual_server_id: None,
             language: "en".to_owned(),
+            max_bandwidth: None,
             texture_url: None,
             comment_url: None,
         }
@@ -245,6 +247,7 @@ impl AuthenticateResponse {
             groups: Vec::new(),
             virtual_server_id: None,
             language: "en".to_owned(),
+            max_bandwidth: None,
             texture_url: None,
             comment_url: None,
         }

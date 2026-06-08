@@ -25,6 +25,7 @@ pub mod constants;
 pub mod context_action;
 pub mod errors;
 pub mod geoip;
+pub mod http_client;
 pub mod localization;
 pub mod logging;
 pub mod messages;

@@ -4591,6 +4591,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "wasmtime",
+ "webpki-roots",
  "webrtc",
  "windows-sys 0.61.2",
  "x509-parser 0.18.1",
@@ -5971,6 +5972,15 @@ name = "webpki-root-certs"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
 ]

@@ -7,6 +7,8 @@ use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::timeout;
 use tracing::debug;
 
+use crate::http_client;
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const STUN_HEADER_LEN: usize = 20;
 const STUN_MAX_RESPONSE_LEN: usize = 1500;
@@ -276,7 +278,7 @@ fn stun_padding(attr_len: usize) -> usize {
 }
 
 async fn discover_public_ips_via_https() -> Vec<IpAddr> {
-    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+    let client = match http_client::build_with_webpki_fallback(PROBE_TIMEOUT, "public IP probe") {
         Ok(client) => client,
         Err(e) => {
             debug!(error=%e, "failed to build public IP probe HTTP client");

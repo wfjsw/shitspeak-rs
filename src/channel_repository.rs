@@ -60,6 +60,21 @@ pub struct ChannelRepoTuning {
     pub wal_compaction_expire_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRootConfig {
+    name: String,
+}
+
+impl ChannelRootConfig {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 impl From<&Config> for ChannelRepoTuning {
     fn from(cfg: &Config) -> Self {
         Self {
@@ -68,6 +83,12 @@ impl From<&Config> for ChannelRepoTuning {
             snapshot_every_secs: cfg.channel_snapshot_every_secs.max(1),
             wal_compaction_expire_count: cfg.channel_wal_compaction_expire_count,
         }
+    }
+}
+
+impl From<&Config> for ChannelRootConfig {
+    fn from(cfg: &Config) -> Self {
+        Self::new(cfg.root_channel_name.clone())
     }
 }
 
@@ -88,6 +109,18 @@ pub struct ChannelOperation {
 }
 
 impl ChannelOperation {
+    pub fn is_root_name_config_update(&self) -> bool {
+        matches!(
+            &self.op,
+            ChannelOp::UpdateChannel { id: 0, patch }
+                if patch.name.is_some()
+                    && patch.position.is_none()
+                    && patch.max_users.is_none()
+                    && patch.description_hash.is_none()
+                    && patch.parent_id.is_none()
+        )
+    }
+
     /// Convert this log entry into the protobuf `Message` that should be
     /// sent to a subscriber.  Only changed/delta fields are populated;
     /// Mumble clients merge deltas with their existing state.
@@ -239,7 +272,23 @@ struct SnapshotChannel {
     #[serde(default = "default_server_id")]
     server_id: String,
     #[serde(flatten)]
-    channel: Channel,
+    channel: ChannelSnapshotState,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ChannelSnapshotState {
+    id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    position: i32,
+    max_users: u32,
+    parent_id: Option<u32>,
+    inherit_acl: bool,
+    links: HashSet<u32>,
+    description_hash: Option<String>,
+    acls: Vec<ACL>,
+    #[serde(default)]
+    pending_delete: Option<PendingDeleteState>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -345,6 +394,7 @@ fn channel_op_affects_link_topology(op: &ChannelOp) -> bool {
 
 pub struct ChannelRepository {
     node_id: u16,
+    root_config: ParkingRwLock<ChannelRootConfig>,
     channels: ParkingRwLock<HashMap<String, HashMap<u32, Channel>>>,
     /// Derived transitive link groups, rebuilt from direct channel links.
     link_topologies: ParkingRwLock<HashMap<String, LinkTopology>>,
@@ -382,19 +432,22 @@ impl ChannelRepository {
     // ── Construction ──────────────────────────────────────────────────────
 
     /// Create an in-memory repository (no persistence).
-    pub fn new_in_memory(node_id: u16, tuning: ChannelRepoTuning) -> Arc<Self> {
+    pub fn new_in_memory(
+        node_id: u16,
+        root_config: ChannelRootConfig,
+        tuning: ChannelRepoTuning,
+    ) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
         let mut channels = HashMap::new();
-        // Ensure root channel exists
-        let root = Channel::new(0, "Root", 0, 0, None);
         channels
             .entry(DEFAULT_SERVER_ID.to_owned())
             .or_insert_with(HashMap::new)
-            .insert(0, root);
+            .insert(0, root_channel(&root_config));
         let mut versions = HashMap::new();
         versions.insert(DEFAULT_SERVER_ID.to_owned(), 0);
         Arc::new(Self {
             node_id,
+            root_config: ParkingRwLock::new(root_config),
             channels: ParkingRwLock::new(channels),
             link_topologies: ParkingRwLock::new(HashMap::new()),
             versions: ParkingRwLock::new(versions),
@@ -425,6 +478,7 @@ impl ChannelRepository {
     pub async fn open(
         node_id: u16,
         storage_dir: &Path,
+        root_config: ChannelRootConfig,
         tuning: ChannelRepoTuning,
     ) -> Result<Arc<Self>, ChannelRepoError> {
         tokio::fs::create_dir_all(storage_dir).await?;
@@ -444,9 +498,10 @@ impl ChannelRepository {
                     })?;
                     let mut map: HashMap<String, HashMap<u32, Channel>> = HashMap::new();
                     for scoped in snap.channels {
+                        let channel = scoped.channel.into_channel(&root_config);
                         map.entry(scoped.server_id)
                             .or_default()
-                            .insert(scoped.channel.id, scoped.channel);
+                            .insert(channel.id, channel);
                     }
                     let mut versions = snap.versions;
                     if versions.is_empty() {
@@ -502,8 +557,8 @@ impl ChannelRepository {
                 continue; // already reflected in snapshot
             }
             let scoped_channels = channels.entry(op.server_id.clone()).or_default();
-            ensure_root_channel(scoped_channels);
-            apply_op_to_map(scoped_channels, &op.op, op.node_id);
+            ensure_root_channel(scoped_channels, &root_config);
+            apply_op_to_map(scoped_channels, &op.op, op.node_id, &root_config);
             versions
                 .entry(op.server_id.clone())
                 .and_modify(|version| *version = (*version).max(op.version))
@@ -522,7 +577,7 @@ impl ChannelRepository {
             channels.insert(DEFAULT_SERVER_ID.to_owned(), HashMap::new());
         }
         for scoped_channels in channels.values_mut() {
-            ensure_root_channel(scoped_channels);
+            ensure_root_channel(scoped_channels, &root_config);
         }
         versions.entry(DEFAULT_SERVER_ID.to_owned()).or_insert(0);
         let link_topologies = rebuild_all_link_topologies(&mut channels);
@@ -531,6 +586,7 @@ impl ChannelRepository {
 
         Ok(Arc::new(Self {
             node_id,
+            root_config: ParkingRwLock::new(root_config),
             channels: ParkingRwLock::new(channels),
             link_topologies: ParkingRwLock::new(link_topologies),
             versions: ParkingRwLock::new(versions),
@@ -591,6 +647,57 @@ impl ChannelRepository {
         self.node_id
     }
 
+    pub fn root_channel_name(&self) -> String {
+        self.root_config.read().name().to_owned()
+    }
+
+    pub async fn update_root_channel_config(&self, root_config: ChannelRootConfig) {
+        let mut changed_servers = Vec::new();
+        {
+            let mut current = self.root_config.write();
+            if *current == root_config {
+                return;
+            }
+            *current = root_config.clone();
+        }
+        {
+            let mut all_channels = self.channels.write();
+            if all_channels.is_empty() {
+                all_channels.insert(DEFAULT_SERVER_ID.to_owned(), HashMap::new());
+            }
+            for (server_id, channels) in all_channels.iter_mut() {
+                ensure_root_channel(channels, &root_config);
+                if let Some(root) = channels.get_mut(&0) {
+                    root.name = root_config.name().to_owned();
+                }
+                changed_servers.push(server_id.clone());
+            }
+        }
+
+        let version_by_server = self.versions.read().clone();
+        let now = chrono::Utc::now().timestamp();
+        for server_id in changed_servers {
+            let version = version_by_server.get(&server_id).copied().unwrap_or(0);
+            let _ = self.tx.send(Arc::new(ChannelOperation {
+                server_id,
+                version,
+                node_id: self.node_id,
+                timestamp: now,
+                emits_client_message: true,
+                op: ChannelOp::UpdateChannel {
+                    id: 0,
+                    patch: ChannelPatch {
+                        name: Some(root_config.name().to_owned()),
+                        position: None,
+                        max_users: None,
+                        description_hash: None,
+                        parent_id: None,
+                    },
+                },
+            }));
+        }
+    }
+
     // ── Read API ──────────────────────────────────────────────────────────
 
     pub async fn get_channel(&self, id: u32) -> Option<Channel> {
@@ -603,7 +710,7 @@ impl ChannelRepository {
             .get(server_id)
             .and_then(|channels| channels.get(&id))
             .cloned()
-            .or_else(|| (id == 0).then(root_channel))
+            .or_else(|| (id == 0).then(|| self.root_channel()))
     }
 
     /// Return the effective linked-channel group for `channel_id`.
@@ -858,11 +965,11 @@ impl ChannelRepository {
             Some(channels) => {
                 let mut channels: Vec<Channel> = channels.values().cloned().collect();
                 if !channels.iter().any(|channel| channel.id == 0) {
-                    channels.push(root_channel());
+                    channels.push(self.root_channel());
                 }
                 channels
             }
-            None => vec![root_channel()],
+            None => vec![self.root_channel()],
         }
     }
 
@@ -877,11 +984,11 @@ impl ChannelRepository {
             Some(channels) => {
                 let mut channels: Vec<Channel> = channels.values().cloned().collect();
                 if !channels.iter().any(|channel| channel.id == 0) {
-                    channels.push(root_channel());
+                    channels.push(self.root_channel());
                 }
                 channels
             }
-            None => vec![root_channel()],
+            None => vec![self.root_channel()],
         };
         (channels, version, rx)
     }
@@ -982,7 +1089,7 @@ impl ChannelRepository {
         let channels = self.channels.read();
         let Some(channels) = channels.get(server_id) else {
             return if channel_id == 0 {
-                (Some(root_channel()), Vec::new())
+                (Some(self.root_channel()), Vec::new())
             } else {
                 (None, Vec::new())
             };
@@ -990,14 +1097,14 @@ impl ChannelRepository {
         let channel = channels
             .get(&channel_id)
             .cloned()
-            .or_else(|| (channel_id == 0).then(root_channel));
+            .or_else(|| (channel_id == 0).then(|| self.root_channel()));
         let mut ancestors = Vec::new();
         let mut current_id = channel_id;
         loop {
             let Some(ch) = channels
                 .get(&current_id)
                 .cloned()
-                .or_else(|| (current_id == 0).then(root_channel))
+                .or_else(|| (current_id == 0).then(|| self.root_channel()))
             else {
                 break;
             };
@@ -1005,7 +1112,7 @@ impl ChannelRepository {
             let Some(parent) = channels
                 .get(&pid)
                 .cloned()
-                .or_else(|| (pid == 0).then(root_channel))
+                .or_else(|| (pid == 0).then(|| self.root_channel()))
             else {
                 break;
             };
@@ -1076,7 +1183,8 @@ impl ChannelRepository {
         let op = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
 
             // Validate parent exists
             if let Some(pid) = channel.parent_id {
@@ -1131,9 +1239,11 @@ impl ChannelRepository {
         patch: ChannelPatch,
     ) -> Result<Channel, ChannelRepoError> {
         let parent_changed = patch.parent_id.is_some();
+        let patch = self.normalize_patch_for_channel(id, patch);
         let mut all_channels = self.channels.write();
         let channels = all_channels.entry(server_id.to_owned()).or_default();
-        ensure_root_channel(channels);
+        let root_config = self.root_config.read().clone();
+        ensure_root_channel(channels, &root_config);
 
         if !channels.contains_key(&id) {
             return Err(ChannelRepoError::NotFound(id));
@@ -1203,11 +1313,13 @@ impl ChannelRepository {
         links_remove: Vec<u32>,
     ) -> Result<Channel, ChannelRepoError> {
         let parent_changed = patch.parent_id.is_some();
+        let patch = self.normalize_patch_for_channel(id, patch);
         let links_changed = !links_add.is_empty() || !links_remove.is_empty();
         let updated = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
 
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
@@ -1331,7 +1443,8 @@ impl ChannelRepository {
         let to_delete = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
             }
@@ -1376,7 +1489,8 @@ impl ChannelRepository {
         let deleted = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
             let Some(channel) = channels.get(&id) else {
                 return Err(ChannelRepoError::NotFound(id));
             };
@@ -1426,7 +1540,8 @@ impl ChannelRepository {
         {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
             let to_cancel = collect_subtree(&channels, id);
             for cancel_id in &to_cancel {
                 if let Some(ch) = channels.get_mut(cancel_id) {
@@ -1461,7 +1576,8 @@ impl ChannelRepository {
         {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
             if !channels.contains_key(&a) {
                 return Err(ChannelRepoError::NotFound(a));
             }
@@ -1492,7 +1608,8 @@ impl ChannelRepository {
         {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
             if let Some(ch) = channels.get_mut(&a) {
                 ch.links.remove(&b);
             }
@@ -1528,7 +1645,8 @@ impl ChannelRepository {
         {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
             let ch = channels
                 .get_mut(&channel_id)
                 .ok_or(ChannelRepoError::NotFound(channel_id))?;
@@ -1655,7 +1773,7 @@ impl ChannelRepository {
                     .cloned()
                     .map(|channel| SnapshotChannel {
                         server_id: server_id.clone(),
-                        channel,
+                        channel: ChannelSnapshotState::from_channel(&channel),
                     })
                     .collect::<Vec<_>>()
             })
@@ -1795,17 +1913,19 @@ impl ChannelRepository {
         let (new_version, acl_changed) = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(op.server_id.clone()).or_default();
-            ensure_root_channel(channels);
-            let mut acl_changed = channel_op_affects_acl_generation(&op.op);
-            if let ChannelOp::DeleteChannel { id, nonce } = &op.op {
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
+            let normalized_op = normalize_op_for_root(&op.op, &root_config);
+            let mut acl_changed = channel_op_affects_acl_generation(&normalized_op);
+            if let ChannelOp::DeleteChannel { id, nonce } = &normalized_op {
                 let can_delete = channels
                     .get(id)
                     .and_then(|ch| ch.pending_delete.as_ref())
                     .is_some_and(|pending| pending.nonce == *nonce);
                 acl_changed = can_delete;
             }
-            apply_op_to_map(channels, &op.op, op.node_id);
-            if channel_op_affects_link_topology(&op.op) {
+            apply_op_to_map(channels, &normalized_op, op.node_id, &root_config);
+            if channel_op_affects_link_topology(&normalized_op) {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, &op.server_id, channels);
             }
@@ -1852,7 +1972,9 @@ impl ChannelRepository {
         let pending_delete_move = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.clone()).or_default();
-            ensure_root_channel(channels);
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
+            op.op = normalize_op_for_root(&op.op, &root_config);
             let pending_delete_move = match &op.op {
                 ChannelOp::MarkPendingDelete { id, nonce } => channels
                     .get(id)
@@ -1868,7 +1990,7 @@ impl ChannelRepository {
                 }
                 _ => None,
             };
-            apply_op_to_map(channels, &op.op, op.node_id);
+            apply_op_to_map(channels, &op.op, op.node_id, &root_config);
             if channel_op_affects_link_topology(&op.op) {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, &server_id, channels);
@@ -1934,12 +2056,16 @@ impl ChannelRepository {
             {
                 let mut all_channels = self.channels.write();
                 let channels = all_channels.entry(server_id.to_owned()).or_default();
+                let root_config = self.root_config.read().clone();
                 let old_ids: HashSet<u32> = channels.keys().copied().collect();
                 channels.clear();
-                for channel in channels_snapshot {
+                for mut channel in channels_snapshot {
+                    if channel.id == 0 {
+                        channel.name = root_config.name().to_owned();
+                    }
                     channels.insert(channel.id, channel);
                 }
-                ensure_root_channel(channels);
+                ensure_root_channel(channels, &root_config);
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, server_id, channels);
                 ids.extend(channels.keys().copied());
@@ -2016,13 +2142,14 @@ impl ChannelRepository {
     }
 
     fn make_op_in_server(&self, server_id: &str, op: ChannelOp) -> ChannelOperation {
+        let root_config = self.root_config.read().clone();
         ChannelOperation {
             server_id: server_id.to_owned(),
             version: 0, // assigned by commit()
             node_id: self.node_id,
             timestamp: chrono::Utc::now().timestamp(),
             emits_client_message: true,
-            op,
+            op: normalize_op_for_root(&op, &root_config),
         }
     }
 
@@ -2039,7 +2166,9 @@ impl ChannelRepository {
         let Some(channels) = channels.get(server_id) else {
             return Ok(());
         };
-        match op {
+        let root_config = self.root_config.read().clone();
+        let op = normalize_op_for_root(op, &root_config);
+        match &op {
             ChannelOp::CreateChannel { channel } => {
                 if let Some(pid) = channel.parent_id {
                     if !channels.contains_key(&pid) && pid != 0 {
@@ -2075,7 +2204,7 @@ impl ChannelRepository {
                         return Err(ChannelRepoError::NameConflict(new_name.clone()));
                     }
                 }
-                if let ChannelOp::EditChannel { links_add, .. } = op {
+                if let ChannelOp::EditChannel { links_add, .. } = &op {
                     for &link_add in links_add {
                         if link_add != *id && !channels.contains_key(&link_add) {
                             return Err(ChannelRepoError::NotFound(link_add));
@@ -2128,8 +2257,10 @@ impl ChannelRepository {
 
     async fn commit_assigned_operation(
         &self,
-        op: ChannelOperation,
+        mut op: ChannelOperation,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
+        let root_config = self.root_config.read().clone();
+        op.op = normalize_op_for_root(&op.op, &root_config);
         let op = {
             let mut log = self.log.write();
             self.versions
@@ -2188,6 +2319,8 @@ impl ChannelRepository {
     }
 
     async fn commit(&self, mut op: ChannelOperation) -> Result<(), ChannelRepoError> {
+        let root_config = self.root_config.read().clone();
+        op.op = normalize_op_for_root(&op.op, &root_config);
         let version = {
             let mut versions = self.versions.write();
             let version = versions.entry(op.server_id.clone()).or_insert(0);
@@ -2206,6 +2339,18 @@ impl ChannelRepository {
     async fn invalidate_acl_cache_for_op(&self, op: &ChannelOp) {
         if channel_op_affects_acl_generation(op) {
             self.acl_cache.clear_sync();
+        }
+    }
+
+    fn root_channel(&self) -> Channel {
+        root_channel(&self.root_config.read())
+    }
+
+    fn normalize_patch_for_channel(&self, id: u32, patch: ChannelPatch) -> ChannelPatch {
+        if id == 0 {
+            normalize_root_patch(patch)
+        } else {
+            patch
         }
     }
 }
@@ -2241,8 +2386,14 @@ fn next_available_channel_id(channels: &HashMap<u32, Channel>, temporary: bool) 
 }
 
 /// Apply a `ChannelOp` to the in-memory channel map.
-fn apply_op_to_map(channels: &mut HashMap<u32, Channel>, op: &ChannelOp, origin_node: u16) {
-    match op {
+fn apply_op_to_map(
+    channels: &mut HashMap<u32, Channel>,
+    op: &ChannelOp,
+    origin_node: u16,
+    root_config: &ChannelRootConfig,
+) {
+    let op = normalize_op_for_root(op, root_config);
+    match &op {
         ChannelOp::CreateChannel { channel } => {
             channels.insert(channel.id, channel.clone());
         }
@@ -2351,9 +2502,13 @@ fn apply_op_to_map(channels: &mut HashMap<u32, Channel>, op: &ChannelOp, origin_
         } => {
             channels.clear();
             for channel in snapshot {
-                channels.insert(channel.id, channel.clone());
+                let mut channel = channel.clone();
+                if channel.id == 0 {
+                    channel.name = root_config.name().to_owned();
+                }
+                channels.insert(channel.id, channel);
             }
-            ensure_root_channel(channels);
+            ensure_root_channel(channels, root_config);
         }
     }
 }
@@ -2439,12 +2594,103 @@ fn ordered_link_edge(a: u32, b: u32) -> (u32, u32) {
     if a < b { (a, b) } else { (b, a) }
 }
 
-fn ensure_root_channel(channels: &mut HashMap<u32, Channel>) {
-    channels.entry(0).or_insert_with(root_channel);
+fn ensure_root_channel(channels: &mut HashMap<u32, Channel>, root_config: &ChannelRootConfig) {
+    channels
+        .entry(0)
+        .or_insert_with(|| root_channel(root_config));
+    if let Some(root) = channels.get_mut(&0) {
+        root.name = root_config.name().to_owned();
+        root.parent_id = None;
+    }
 }
 
-fn root_channel() -> Channel {
-    Channel::new(0, "Root", 0, 0, None)
+fn root_channel(root_config: &ChannelRootConfig) -> Channel {
+    Channel::new(0, root_config.name().to_owned(), 0, 0, None)
+}
+
+fn normalize_root_patch(mut patch: ChannelPatch) -> ChannelPatch {
+    if patch.name.is_some() {
+        patch.name = None;
+    }
+    patch.parent_id = None;
+    patch
+}
+
+fn normalize_op_for_root(op: &ChannelOp, root_config: &ChannelRootConfig) -> ChannelOp {
+    match op {
+        ChannelOp::CreateChannel { channel } if channel.id == 0 => {
+            let mut channel = channel.clone();
+            channel.name = root_config.name().to_owned();
+            channel.parent_id = None;
+            ChannelOp::CreateChannel { channel }
+        }
+        ChannelOp::EditChannel {
+            id,
+            patch,
+            links_add,
+            links_remove,
+        } if *id == 0 => ChannelOp::EditChannel {
+            id: *id,
+            patch: normalize_root_patch(patch.clone()),
+            links_add: links_add.clone(),
+            links_remove: links_remove.clone(),
+        },
+        ChannelOp::UpdateChannel { id, patch } if *id == 0 => ChannelOp::UpdateChannel {
+            id: *id,
+            patch: normalize_root_patch(patch.clone()),
+        },
+        ChannelOp::InstallSnapshot { channels, removed } => ChannelOp::InstallSnapshot {
+            channels: channels
+                .iter()
+                .cloned()
+                .map(|mut channel| {
+                    if channel.id == 0 {
+                        channel.name = root_config.name().to_owned();
+                        channel.parent_id = None;
+                    }
+                    channel
+                })
+                .collect(),
+            removed: removed.clone(),
+        },
+        _ => op.clone(),
+    }
+}
+
+impl ChannelSnapshotState {
+    fn from_channel(channel: &Channel) -> Self {
+        Self {
+            id: channel.id,
+            name: (channel.id != 0).then(|| channel.name.clone()),
+            position: channel.position,
+            max_users: channel.max_users,
+            parent_id: channel.parent_id,
+            inherit_acl: channel.inherit_acl,
+            links: channel.links.clone(),
+            description_hash: channel.description_hash.clone(),
+            acls: channel.acls.clone(),
+            pending_delete: channel.pending_delete.clone(),
+        }
+    }
+
+    fn into_channel(self, root_config: &ChannelRootConfig) -> Channel {
+        Channel {
+            id: self.id,
+            name: if self.id == 0 {
+                root_config.name().to_owned()
+            } else {
+                self.name.unwrap_or_else(|| "Unnamed".to_owned())
+            },
+            position: self.position,
+            max_users: self.max_users,
+            parent_id: if self.id == 0 { None } else { self.parent_id },
+            inherit_acl: self.inherit_acl,
+            links: self.links,
+            description_hash: self.description_hash,
+            acls: self.acls,
+            pending_delete: self.pending_delete,
+        }
+    }
 }
 
 fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
@@ -2506,6 +2752,14 @@ mod tests {
         }
     }
 
+    fn root_config() -> ChannelRootConfig {
+        ChannelRootConfig::new("Root")
+    }
+
+    fn repo() -> Arc<ChannelRepository> {
+        ChannelRepository::new_in_memory(1, root_config(), tuning())
+    }
+
     fn effective_group(repo: &ChannelRepository, channel_id: u32) -> Vec<u32> {
         repo.effective_link_group_in_server(DEFAULT_SERVER_ID, channel_id)
             .map(|group| group.as_ref().to_vec())
@@ -2514,7 +2768,7 @@ mod tests {
 
     #[tokio::test]
     async fn linked_channels_form_effective_transitive_groups() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
         for id in 1..=3 {
             repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
                 .await
@@ -2534,7 +2788,7 @@ mod tests {
 
     #[tokio::test]
     async fn removing_link_splits_effective_group_only_when_connectivity_breaks() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
         for id in 1..=3 {
             repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
                 .await
@@ -2558,7 +2812,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_channel_removes_it_from_link_topology() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
         for id in 1..=3 {
             repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
                 .await
@@ -2581,7 +2835,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
 
         {
-            let repo = ChannelRepository::open(1, temp.path(), tuning())
+            let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
                 .await
                 .unwrap();
             for id in 1..=3 {
@@ -2594,7 +2848,7 @@ mod tests {
             repo.save_snapshot().await.unwrap();
         }
 
-        let repo = ChannelRepository::open(1, temp.path(), tuning())
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
             .await
             .unwrap();
 
@@ -2603,8 +2857,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_channel_name_is_loaded_from_config_not_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+
+        {
+            let repo = ChannelRepository::open(
+                1,
+                temp.path(),
+                ChannelRootConfig::new("Configured Root"),
+                tuning(),
+            )
+            .await
+            .unwrap();
+            repo.set_acls(0, false, Vec::new()).await.unwrap();
+            repo.save_snapshot().await.unwrap();
+
+            let raw = std::fs::read_to_string(temp.path().join("channels.snapshot.json")).unwrap();
+            let snapshot: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let root = snapshot["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|channel| channel["id"] == 0)
+                .expect("root channel is snapshotted");
+            assert!(
+                root.get("name").is_none(),
+                "root channel name must not be serialized into the channel snapshot"
+            );
+        }
+
+        let repo = ChannelRepository::open(
+            1,
+            temp.path(),
+            ChannelRootConfig::new("Renamed By Config"),
+            tuning(),
+        )
+        .await
+        .unwrap();
+        let root = repo.get_channel(0).await.unwrap();
+        assert_eq!(root.name, "Renamed By Config");
+        assert!(
+            !root.inherit_acl,
+            "non-name root channel state should still be loaded from the snapshot/WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_channel_name_patches_are_normalized_to_config() {
+        let repo = ChannelRepository::new_in_memory(
+            1,
+            ChannelRootConfig::new("Configured Root"),
+            tuning(),
+        );
+
+        let updated = repo
+            .update_channel(
+                0,
+                ChannelPatch {
+                    name: Some("Ignored Patch".to_owned()),
+                    position: Some(7),
+                    max_users: None,
+                    description_hash: None,
+                    parent_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.name, "Configured Root");
+        assert_eq!(updated.position, 7);
+        assert_eq!(repo.get_channel(0).await.unwrap().name, "Configured Root");
+    }
+
+    #[tokio::test]
     async fn stale_nonce_delete_is_semantic_no_op() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
         repo.create_channel(Channel::new(7, "doomed", 0, 0, Some(0)))
             .await
             .unwrap();
@@ -2621,7 +2948,7 @@ mod tests {
 
     #[tokio::test]
     async fn matching_nonce_delete_removes_subtree_and_emits_remove() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
         repo.create_channel(Channel::new(7, "parent", 0, 0, Some(0)))
             .await
             .unwrap();
@@ -2645,7 +2972,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_channel_ids_are_isolated_by_server_id() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
 
         repo.create_channel_in_server("alpha", Channel::new(7, "alpha", 0, 0, Some(0)))
             .await
@@ -2668,7 +2995,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_allocated_channel_id_does_not_overwrite_existing_channel() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
         let stale_id = repo.next_channel_id(true).await;
 
         repo.create_channel(Channel::new(stale_id, "first", 0, 0, Some(0)))
@@ -2694,7 +3021,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribed_snapshot_receives_followup_channel_operations() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
         let (channels, version, mut rx) =
             repo.snapshot_with_version_and_subscription_in_server("alpha");
 
@@ -2714,7 +3041,7 @@ mod tests {
 
     #[tokio::test]
     async fn s2s_snapshot_install_repairs_clients_in_removed_channels() {
-        let repo = ChannelRepository::new_in_memory(1, tuning());
+        let repo = repo();
         let client_repo = Arc::new(crate::client_repository::ClientRepository::new(1, 128));
         repo.set_client_repo(client_repo.clone()).await;
 

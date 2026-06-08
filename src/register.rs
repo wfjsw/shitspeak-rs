@@ -8,10 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Client;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::http_client;
 use crate::server::Server;
 use crate::types::DEFAULT_SERVER_ID;
 
@@ -180,10 +180,16 @@ pub fn spawn_register_task(
             }
         }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to build HTTP client for registration");
+        let client = match http_client::build_with_webpki_fallback(
+            Duration::from_secs(30),
+            "public server registration",
+        ) {
+            Ok(client) => client,
+            Err(e) => {
+                warn!("Registration task disabled: failed to build HTTP client: {e}");
+                return;
+            }
+        };
 
         loop {
             // Re-read config in case it was hot-reloaded

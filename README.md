@@ -94,13 +94,14 @@ Important local settings include:
 1. `listen` is the Mumble client TCP and UDP listener address.
 2. `cert_path` and `key_path` point to the TLS identity used for client connections.
 3. `max_users`, `max_bandwidth`, and message length settings control client limits.
-4. `udp_voice_enabled` and `udp_ping_enabled` control UDP behavior.
-5. `blob_storage_dir` controls where persistent channel, client, and blob data is stored.
-6. `authenticator_wasm_path` enables a custom WASM authentication module.
-7. `s2s` sections configure clustered server operation.
-8. `web` sections configure the browser gateway.
+4. `root_channel_name` sets the display name for channel `0`.
+5. `udp_voice_enabled` and `udp_ping_enabled` control UDP behavior.
+6. `blob_storage_dir` controls where persistent channel, client, and blob data is stored.
+7. `authenticator_wasm_path` enables a custom WASM authentication module.
+8. `s2s` sections configure clustered server operation.
+9. `web` sections configure the browser gateway.
 
-Selected settings are hot reloaded when `config.toml` changes. Listener addresses, node identity, TLS identity, storage paths, and other startup resources require a restart.
+Selected settings are hot reloaded when `config.toml` changes. The C2S TLS identity from `cert_path` and `key_path` is also hot reloaded for new client handshakes when either file changes. Existing TLS sessions continue using the identity they negotiated. Listener addresses, node identity, storage paths, and other startup resources require a restart.
 
 ## Authentication
 

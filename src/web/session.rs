@@ -184,6 +184,7 @@ pub async fn configure_authenticated_client(
     let channel_cache_key =
         crate::user_channel_cache::user_channel_cache_key(result.user_id, cache_username);
     client.set_language(result.language);
+    client.set_max_bandwidth(result.max_bandwidth);
     client.set_protocol_version(Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)));
     {
         let mut gs = client.write_global_state(server.get_clients());
@@ -532,7 +533,7 @@ pub async fn initial_server_events(
         &mut events,
         ServerSync {
             session: Some(u32::from(session_id)),
-            max_bandwidth: Some(server.get_max_bandwidth()),
+            max_bandwidth: Some(client.max_bandwidth(server.get_max_bandwidth())),
             welcome_text: server.get_welcome_text(),
             permissions: Some(root_permissions),
         }

@@ -968,6 +968,20 @@ impl Client {
         }
     }
 
+    pub fn max_bandwidth(&self, fallback: u32) -> u32 {
+        self.local_state
+            .read()
+            .as_ref()
+            .and_then(|state| state.max_bandwidth())
+            .unwrap_or(fallback)
+    }
+
+    pub fn set_max_bandwidth(&self, max_bandwidth: Option<u32>) {
+        if let Some(ref mut state) = *self.local_state.write() {
+            state.set_max_bandwidth(max_bandwidth);
+        }
+    }
+
     /// Record the negotiated client protocol version. Called once during
     /// the `Version` handshake; subsequent calls are no-ops (the field
     /// is set-once-after-auth). `None` defaults to `1.2.0` to match the

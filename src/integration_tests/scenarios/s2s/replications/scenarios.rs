@@ -11,7 +11,7 @@ use tokio::time::timeout;
 
 use super::harness::ReplCluster;
 use crate::channel_repository::{
-    ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository,
+    ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
 };
 use crate::channels::Channel;
 use crate::s2s::replications::proto::{
@@ -441,7 +441,13 @@ async fn strict_channel_repository_split_heal_elects_one_complete_history() {
     let cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3, 4], cfg).await;
     let repos: Vec<Arc<ChannelRepository>> = [1u16, 2, 3, 4]
         .into_iter()
-        .map(|node_id| ChannelRepository::new_in_memory(node_id, channel_tuning()))
+        .map(|node_id| {
+            ChannelRepository::new_in_memory(
+                node_id,
+                ChannelRootConfig::new("Root"),
+                channel_tuning(),
+            )
+        })
         .collect();
     let mut handles = Vec::new();
     for (i, repo) in repos.iter().enumerate() {

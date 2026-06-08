@@ -20,6 +20,10 @@ use bytes::Bytes;
 use tokio::fs;
 use tokio::io::AsyncWriteExt as _;
 
+use crate::http_client;
+
+const SESSION_BLOB_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 /// Compute the lowercase SHA-1 hex of `data`.
@@ -173,9 +177,12 @@ impl SessionBlobStore {
     pub async fn open(dir: &Path) -> io::Result<Self> {
         let root = dir.join("session_blobs");
         fs::create_dir_all(&root).await?;
+        let http_client =
+            http_client::build_with_webpki_fallback(SESSION_BLOB_HTTP_TIMEOUT, "session blob store")
+                .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(Self {
             root,
-            http_client: reqwest::Client::new(),
+            http_client,
         })
     }
 

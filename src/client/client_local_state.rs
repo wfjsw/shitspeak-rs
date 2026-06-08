@@ -9,6 +9,7 @@ pub struct ClientLocalState {
     authenticated: bool,
     supports_opus: bool,
     language: Language,
+    max_bandwidth: Option<u32>,
 
     last_active_timestamp: Option<std::time::Instant>,
 
@@ -24,6 +25,7 @@ impl ClientLocalState {
             authenticated: false,
             supports_opus: false,
             language: Language::default(),
+            max_bandwidth: None,
 
             last_active_timestamp: None,
 
@@ -55,6 +57,14 @@ impl ClientLocalState {
 
     pub fn set_language(&mut self, language: Language) {
         self.language = language;
+    }
+
+    pub fn max_bandwidth(&self) -> Option<u32> {
+        self.max_bandwidth
+    }
+
+    pub fn set_max_bandwidth(&mut self, max_bandwidth: Option<u32>) {
+        self.max_bandwidth = max_bandwidth;
     }
 
     pub fn get_release(&self) -> Option<&str> {

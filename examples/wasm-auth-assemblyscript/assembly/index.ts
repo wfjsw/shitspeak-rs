@@ -56,6 +56,8 @@ class AuthenticateResponse {
   virtual_server_id: string | null = null;
   language: string = "en";
   @omitnull()
+  max_bandwidth: JSON.Box<i32> | null = null;
+  @omitnull()
   texture_url: string | null = null;
   @omitnull()
   comment_url: string | null = null;

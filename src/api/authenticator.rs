@@ -23,6 +23,9 @@ pub struct AuthenticateResult {
     pub virtual_server_id: Option<String>,
     /// Preferred language for server-generated messages sent to this client.
     pub language: Language,
+    /// Optional per-client maximum bandwidth advertised to the authenticated
+    /// client. `None` uses the server-wide `max_bandwidth` config value.
+    pub max_bandwidth: Option<u32>,
     /// Optional URL for the user's texture/avatar blob.
     /// When present the server fetches this URL, SHA-1s the content,
     /// and stores it in `SessionBlobStore`.
@@ -80,6 +83,7 @@ pub trait Authenticator: Send + Sync + 'static {
             groups: claims.groups.clone(),
             virtual_server_id: None,
             language: Language::default(),
+            max_bandwidth: None,
             texture_url: None,
             comment_url: None,
         })

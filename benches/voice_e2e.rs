@@ -194,6 +194,7 @@ impl Authenticator for AuthenticatorAdapter {
             groups: user.groups,
             virtual_server_id: None,
             language: shitspeak_rs::localization::Language::default(),
+            max_bandwidth: None,
             texture_url: None,
             comment_url: None,
         })

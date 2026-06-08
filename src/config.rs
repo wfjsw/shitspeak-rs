@@ -779,6 +779,8 @@ pub struct Config {
     pub max_text_message_length: u32,
     #[serde(default = "default_max_image_message_length")]
     pub max_image_message_length: u32,
+    #[serde(default = "default_root_channel_name")]
+    pub root_channel_name: String,
     #[serde(default)]
     pub default_channel: u32,
     #[serde(default)]
@@ -881,6 +883,9 @@ fn default_max_text_message_length() -> u32 {
 }
 fn default_max_image_message_length() -> u32 {
     131_072
+}
+fn default_root_channel_name() -> String {
+    "Root".to_string()
 }
 fn default_udp_channel_size() -> usize {
     2048
@@ -1013,6 +1018,55 @@ mod tests {
         assert!(!cfg.web.moq.enabled);
         assert_eq!(cfg.web.moq.max_speaker_tracks, 64);
         assert!(!cfg.debug.debug_acl_enter());
+        assert_eq!(cfg.root_channel_name, "Root");
+    }
+
+    #[test]
+    fn root_channel_name_defaults_and_parses() {
+        let default_cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    listen = "127.0.0.1:64738"
+                    register_name = "test"
+                    cert_path = "cert.pem"
+                    key_path = "key.pem"
+                    send_version = true
+                    send_build_info = true
+                    send_os_info = true
+                    allowed_proxies = []
+                    min_client_version = 0
+                    max_users = 100
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert_eq!(default_cfg.root_channel_name, "Root");
+
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    listen = "127.0.0.1:64738"
+                    register_name = "test"
+                    cert_path = "cert.pem"
+                    key_path = "key.pem"
+                    send_version = true
+                    send_build_info = true
+                    send_os_info = true
+                    allowed_proxies = []
+                    min_client_version = 0
+                    max_users = 100
+                    root_channel_name = "Lobby"
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert_eq!(cfg.root_channel_name, "Lobby");
     }
 
     #[test]

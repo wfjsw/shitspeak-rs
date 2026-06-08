@@ -1823,6 +1823,7 @@ mod tests {
                 groups: vec!["web".to_string()],
                 virtual_server_id: None,
                 language: Language::default(),
+                max_bandwidth: None,
                 texture_url: None,
                 comment_url: None,
             })
@@ -1910,6 +1911,7 @@ mod tests {
             allow_html: true,
             max_text_message_length: 5_000,
             max_image_message_length: 131_072,
+            root_channel_name: "Root".to_string(),
             default_channel: 0,
             cert_required: false,
             blob_storage_dir: None,

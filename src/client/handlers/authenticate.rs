@@ -248,6 +248,7 @@ pub async fn handle_authenticate(
     // ── Store identity on client (single transaction) ─────────────────────
     {
         sender.set_language(result.language);
+        sender.set_max_bandwidth(result.max_bandwidth);
         let mut gs = sender.write_global_state(repo);
         gs.set_user_id(result.user_id);
         gs.set_display_name(result.display_name);
@@ -447,7 +448,7 @@ pub async fn handle_authenticate(
         push_burst(Message::ServerSync(
             ServerSync {
                 session: Some(u32::from(session_id)),
-                max_bandwidth: Some(server.get_max_bandwidth()),
+                max_bandwidth: Some(sender.max_bandwidth(server.get_max_bandwidth())),
                 welcome_text: server.get_welcome_text(),
                 permissions: Some(root_perm),
             }

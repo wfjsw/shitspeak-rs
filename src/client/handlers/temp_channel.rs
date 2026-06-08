@@ -177,7 +177,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        channel_repository::{ChannelRepoTuning, ChannelRepository},
+        channel_repository::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig},
         channels::Channel,
         client_repository::ClientRepository,
         types::DEFAULT_SERVER_ID,
@@ -192,6 +192,10 @@ mod tests {
             snapshot_every_secs: 60,
             wal_compaction_expire_count: 100,
         }
+    }
+
+    fn channel_repository() -> Arc<ChannelRepository> {
+        ChannelRepository::new_in_memory(1, ChannelRootConfig::new("Root"), tuning())
     }
 
     fn peer() -> SocketAddr {
@@ -210,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn temp_channel_is_detected_as_temporary() {
-        let channels = ChannelRepository::new_in_memory(1, tuning());
+        let channels = channel_repository();
         let temp_id = channels
             .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
             .await;
@@ -235,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_temp_channel_is_not_detected_as_temporary() {
-        let channels = ChannelRepository::new_in_memory(1, tuning());
+        let channels = channel_repository();
         // Root channel (id=0) is always non-temporary.
         let root = channels
             .get_channel_in_server(DEFAULT_SERVER_ID, 0)
@@ -256,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn creator_in_temp_channel_is_visible_in_occupancy_index() {
-        let channels = ChannelRepository::new_in_memory(1, tuning());
+        let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
         channels.set_client_repo(clients.clone()).await;
 
@@ -302,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_deletes_empty_temporary_channel() {
-        let channels = ChannelRepository::new_in_memory(1, tuning());
+        let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
 
         let temp_id = channels
@@ -338,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_does_not_delete_occupied_temporary_channel() {
-        let channels = ChannelRepository::new_in_memory(1, tuning());
+        let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
         channels.set_client_repo(clients.clone()).await;
 
@@ -377,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_does_not_delete_non_temporary_channel() {
-        let channels = ChannelRepository::new_in_memory(1, tuning());
+        let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
 
         channels
@@ -399,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_fires_after_last_user_moves_out() {
-        let channels = ChannelRepository::new_in_memory(1, tuning());
+        let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
         channels.set_client_repo(clients.clone()).await;
 
@@ -452,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_fires_after_last_user_disconnects() {
-        let channels = ChannelRepository::new_in_memory(1, tuning());
+        let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
         channels.set_client_repo(clients.clone()).await;
 

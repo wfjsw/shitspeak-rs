@@ -21,6 +21,7 @@ struct ScriptedUser {
     groups: Vec<String>,
     language: Language,
     virtual_server_id: Option<String>,
+    max_bandwidth: Option<u32>,
 }
 
 #[derive(Default)]
@@ -45,6 +46,25 @@ impl TestAuthenticator {
         self.register_user_with_language(name, password, user_id, groups, Language::default());
     }
 
+    pub fn register_user_with_max_bandwidth(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+        max_bandwidth: Option<u32>,
+    ) {
+        self.register_user_with_options(
+            name,
+            password,
+            user_id,
+            groups,
+            Language::default(),
+            None,
+            max_bandwidth,
+        );
+    }
+
     pub fn register_user_with_language(
         &self,
         name: &str,
@@ -65,6 +85,27 @@ impl TestAuthenticator {
         language: Language,
         virtual_server_id: Option<&str>,
     ) {
+        self.register_user_with_options(
+            name,
+            password,
+            user_id,
+            groups,
+            language,
+            virtual_server_id,
+            None,
+        );
+    }
+
+    fn register_user_with_options(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+        language: Language,
+        virtual_server_id: Option<&str>,
+        max_bandwidth: Option<u32>,
+    ) {
         self.users.lock().unwrap().insert(
             name.to_owned(),
             ScriptedUser {
@@ -73,6 +114,7 @@ impl TestAuthenticator {
                 groups,
                 language,
                 virtual_server_id: virtual_server_id.map(str::to_owned),
+                max_bandwidth,
             },
         );
     }
@@ -108,6 +150,7 @@ impl Authenticator for AuthenticatorAdapter {
             groups: entry.groups,
             virtual_server_id: entry.virtual_server_id,
             language: entry.language,
+            max_bandwidth: entry.max_bandwidth,
             texture_url: None,
             comment_url: None,
         })

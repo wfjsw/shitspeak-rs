@@ -26,6 +26,7 @@ mod constants;
 mod context_action;
 mod errors;
 mod geoip;
+mod http_client;
 mod localization;
 mod logging;
 mod messages;
@@ -85,8 +86,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     crate::client::crypt::probe_gf128_backend();
 
     let config = Config::load();
-    let authenticator =
-        ReloadableAuthenticator::from_wasm_path(config.authenticator_wasm_path.as_deref())?;
+    let authenticator = ReloadableAuthenticator::from_wasm_path(
+        config.authenticator_wasm_path.as_deref(),
+        config.blob_storage_dir.as_deref(),
+    )?;
     let server = Server::new_with_reloadable_authenticator(config, authenticator).await?;
 
     // Spawn the hot config reload watcher.

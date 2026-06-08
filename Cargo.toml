@@ -31,6 +31,7 @@ tokio = { version = "1.45.0", features = ["full"] }
 tokio-rustls = "0.26.4"
 tracing = "0.1"
 wasmtime = "45.0.0"
+webpki-roots = "1.0.7"
 tracing-appender = { version = "0.2.4", features = ["parking_lot"] }
 tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde", "env-filter", "registry"] }
 x509-parser = "0.18.1"
@@ -43,7 +44,7 @@ async-trait = "0.1.89"
 rusqlite = { version = "0.39", features = ["bundled"] }
 parking_lot = { version = "0.12.5", features = ["arc_lock", "hardware-lock-elision", "owning_ref", "serde"] }
 scc = "3.7.1"
-quinn = "0.11"
+quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
 tokio_kcp = "0.9"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
@@ -88,7 +89,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-rcgen = { version = "0.13", features = ["x509-parser", "pem"] }
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tempfile = "3"
 tracing-test = "0.2"
@@ -118,6 +119,7 @@ incremental = false
 
 [profile.release]
 incremental = false
+lto = true
 
 [profile.test]
 incremental = false

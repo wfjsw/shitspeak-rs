@@ -76,6 +76,7 @@ pub fn spawn_config_watcher(
             "config.toml",
         );
         watch_authenticator_directory(&mut watcher, &mut watched_dirs, &server);
+        watch_c2s_tls_identity_directories(&mut watcher, &mut watched_dirs, &server);
 
         tracing::info!("config watcher: watching {} for changes", parent.display());
 
@@ -121,14 +122,19 @@ pub fn spawn_config_watcher(
                         .authenticator_wasm_path()
                         .as_deref()
                         .is_some_and(|auth_path| same_fileish(changed, auth_path))
+                    || {
+                        let (cert_path, key_path) = server.c2s_tls_identity_paths();
+                        same_fileish(changed, &cert_path) || same_fileish(changed, &key_path)
+                    }
             });
 
             if received && should_reload {
-                tracing::info!("config watcher: auth/config change detected, reloading...");
+                tracing::info!("config watcher: auth/config/TLS change detected, reloading...");
                 if let Err(e) = runtime.block_on(server.reload_config()) {
                     tracing::error!("config watcher: reload failed: {e}");
                 }
                 watch_authenticator_directory(&mut watcher, &mut watched_dirs, &server);
+                watch_c2s_tls_identity_directories(&mut watcher, &mut watched_dirs, &server);
             }
         }
     })
@@ -152,6 +158,30 @@ fn watch_authenticator_directory(
             "WASM authenticator",
         );
     }
+}
+
+fn watch_c2s_tls_identity_directories(
+    watcher: &mut RecommendedWatcher,
+    watched_dirs: &mut HashSet<PathBuf>,
+    server: &Arc<Box<Server>>,
+) {
+    let (cert_path, key_path) = server.c2s_tls_identity_paths();
+    watch_file_parent_directory(watcher, watched_dirs, &cert_path, "C2S TLS certificate");
+    watch_file_parent_directory(watcher, watched_dirs, &key_path, "C2S TLS private key");
+}
+
+fn watch_file_parent_directory(
+    watcher: &mut RecommendedWatcher,
+    watched_dirs: &mut HashSet<PathBuf>,
+    path: &Path,
+    label: &str,
+) {
+    let normalized = normalize_path(path);
+    let dir = normalized
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    watch_directory(watcher, watched_dirs, normalize_path(&dir), label);
 }
 
 fn watch_directory(

@@ -252,4 +252,18 @@ mod tests {
         let id = mint(&dir, "10");
         let (_server, _client) = build_tls_configs(&id).unwrap();
     }
+
+    #[test]
+    fn peer_chain_must_be_signed_by_configured_s2s_ca() {
+        install_default_provider();
+        let trusted_dir = TempDir::new().unwrap();
+        let untrusted_dir = TempDir::new().unwrap();
+        let trusted = mint(&trusted_dir, "10");
+        let untrusted_peer = mint(&untrusted_dir, "11");
+
+        assert!(
+            verify_peer_cert_chain(trusted.roots().clone(), untrusted_peer.chain()).is_err(),
+            "S2S peer certificates must chain to the configured s2s.ca_path only"
+        );
+    }
 }

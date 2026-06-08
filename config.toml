@@ -30,6 +30,7 @@ max_bandwidth = 72000
 allow_html = true
 max_text_message_length = 5000
 max_image_message_length = 131072
+root_channel_name = "Root"
 default_channel = 1
 cert_required = false
 # When enabled, clients only see users in channels they can Traverse.

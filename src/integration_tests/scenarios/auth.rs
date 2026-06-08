@@ -199,6 +199,24 @@ async fn auth_server_sync_reports_evaluated_root_permissions() {
     assert_eq!(bob.initial_permissions, Some(u64::from(expected)));
 }
 
+#[tokio::test]
+async fn auth_max_bandwidth_override_is_reported_in_server_sync() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server.authenticator.register_user_with_max_bandwidth(
+        "alice",
+        None,
+        Some(1),
+        vec![],
+        Some(24_000),
+    );
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+
+    assert_eq!(alice.max_bandwidth, Some(24_000));
+}
+
 /// Checks that a registered user with the wrong password is rejected.
 /// Expected: authentication fails with `Reject::WrongUserPw`, matching
 /// Mumble's reject mapping in `D:\mumble\src\murmur\Messages.cpp::msgAuthenticate`

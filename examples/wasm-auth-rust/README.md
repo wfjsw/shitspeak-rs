@@ -18,3 +18,5 @@ Local demo behavior:
 - `admin` with password `secret` is accepted as user `1` with the `admin` group.
 - `guest` is accepted as a guest user.
 - usernames starting with `fetch:` call the host HTTPS `fetch` import as an example external auth flow.
+
+Responses may include `max_bandwidth` to override the configured bandwidth limit for that authenticated client.

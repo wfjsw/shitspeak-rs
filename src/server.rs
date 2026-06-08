@@ -20,7 +20,9 @@ use tokio_rustls::server::TlsStream;
 use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
-use crate::channel_repository::{ChannelOperation, ChannelRepoTuning, ChannelRepository};
+use crate::channel_repository::{
+    ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
+};
 use crate::client::{
     AsyncMessageHandlerExt, Client, client_session_identifier::ClientSessionIdentifier,
     state_log::ClientStateBroadcastPayload, visibility::UserVisibilityState,
@@ -67,6 +69,29 @@ fn first_socket_addr(address: &str) -> Result<SocketAddr, Box<dyn std::error::Er
         )
         .into()
     })
+}
+
+fn load_c2s_tls_acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+    let certificate = CertificateDer::pem_file_iter(&config.cert_path)
+        .map_err(|e| startup_file_error("cert_path", &config.cert_path, "read TLS certificate", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            startup_file_error("cert_path", &config.cert_path, "parse TLS certificate", e)
+        })?;
+    let private_key = PrivateKeyDer::from_pem_file(&config.key_path)
+        .map_err(|e| startup_file_error("key_path", &config.key_path, "read TLS private key", e))?;
+
+    let client_cert_verifier = Arc::new(ClientCertificateVerifier::new());
+
+    let mut tls_config = rustls::ServerConfig::builder_with_protocol_versions(&[&TLS12, &TLS13])
+        .with_client_cert_verifier(client_cert_verifier)
+        .with_single_cert(certificate, private_key)?;
+    tls_config.alpn_protocols = vec![
+        crate::web::signaling::ALPN_HTTP_1_1.to_vec(),
+        crate::web::signaling::ALPN_MUMBLE.to_vec(),
+    ];
+
+    Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 
 async fn bind_entrypoint_socket_pair(
@@ -310,6 +335,8 @@ mod tests {
         AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     };
     use crate::localization::Language;
+    use rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
 
     struct TestAuthenticator;
 
@@ -334,6 +361,7 @@ mod tests {
                 groups: Vec::new(),
                 virtual_server_id: None,
                 language: Language::default(),
+                max_bandwidth: None,
                 texture_url: None,
                 comment_url: None,
             })
@@ -364,6 +392,7 @@ mod tests {
             allow_html: true,
             max_text_message_length: 5_000,
             max_image_message_length: 131_072,
+            root_channel_name: "Root".to_owned(),
             default_channel: 0,
             cert_required: false,
             blob_storage_dir: None,
@@ -384,6 +413,111 @@ mod tests {
             debug: crate::config::DebugConfig::default(),
             s2s: crate::config::S2sConfig::default(),
             web: crate::config::WebConfig::default(),
+        }
+    }
+
+    fn write_test_cert(dir: &std::path::Path, name: &str) -> (String, String, Vec<u8>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate test cert");
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        let cert_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .next()
+            .expect("test cert PEM contains a certificate")
+            .expect("parse test cert")
+            .to_vec();
+
+        let cert_path = dir.join(format!("{name}-cert.pem"));
+        let key_path = dir.join(format!("{name}-key.pem"));
+        std::fs::write(&cert_path, cert_pem).expect("write test cert");
+        std::fs::write(&key_path, key_pem).expect("write test key");
+
+        (
+            cert_path.display().to_string(),
+            key_path.display().to_string(),
+            cert_der,
+        )
+    }
+
+    async fn connect_tls_leaf_der(server: &Arc<Box<Server>>) -> Vec<u8> {
+        let acceptor = server.tls_acceptor.read().clone();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let accept_task = tokio::spawn(async move { acceptor.accept(server_io).await.map(drop) });
+
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(cfg));
+        let tls = connector
+            .connect(
+                ServerName::try_from("localhost").expect("static server name"),
+                client_io,
+            )
+            .await
+            .expect("client TLS handshake");
+        let leaf = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .expect("server certificate chain")
+            .first()
+            .expect("server leaf certificate")
+            .to_vec();
+        drop(tls);
+        match accept_task.await.expect("accept task joins") {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(err) => panic!("accept TLS: {err}"),
+        }
+        leaf
+    }
+
+    #[derive(Debug)]
+    struct AcceptAnyServerCert;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+                rustls::SignatureScheme::ED25519,
+            ]
         }
     }
 
@@ -549,6 +683,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_c2s_tls_identity_swaps_acceptor_for_new_handshakes() {
+        install_default_provider();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path, first_leaf) = write_test_cert(temp.path(), "first");
+        let mut config = test_config(Vec::new());
+        config.cert_path = cert_path;
+        config.key_path = key_path;
+        let server = Server::new(config.clone(), TestAuthenticator)
+            .await
+            .expect("server");
+
+        assert_eq!(connect_tls_leaf_der(&server).await, first_leaf);
+
+        let (next_cert_path, next_key_path, next_leaf) = write_test_cert(temp.path(), "next");
+        let mut next_config = config;
+        next_config.cert_path = next_cert_path;
+        next_config.key_path = next_key_path;
+
+        server
+            .reload_c2s_tls_identity(&next_config)
+            .expect("reload C2S TLS identity");
+
+        assert_eq!(connect_tls_leaf_der(&server).await, next_leaf);
+    }
+
+    #[tokio::test]
+    async fn reload_c2s_tls_identity_keeps_current_acceptor_on_invalid_identity() {
+        install_default_provider();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path, first_leaf) = write_test_cert(temp.path(), "first");
+        let mut config = test_config(Vec::new());
+        config.cert_path = cert_path;
+        config.key_path = key_path;
+        let server = Server::new(config.clone(), TestAuthenticator)
+            .await
+            .expect("server");
+
+        let (next_cert_path, next_key_path, _next_leaf) = write_test_cert(temp.path(), "next");
+        std::fs::write(&next_key_path, "not a private key").expect("write invalid key");
+        let mut next_config = config;
+        next_config.cert_path = next_cert_path;
+        next_config.key_path = next_key_path;
+
+        assert!(server.reload_c2s_tls_identity(&next_config).is_err());
+        assert_eq!(connect_tls_leaf_der(&server).await, first_leaf);
+    }
+
+    #[tokio::test]
     async fn idle_reaper_only_disconnects_local_clients() {
         install_default_provider();
         let server = Server::new(test_config(Vec::new()), TestAuthenticator)
@@ -614,7 +796,7 @@ pub struct Server {
 
     allowed_proxies: Vec<AnyIpCidr>,
 
-    tls_acceptor: TlsAcceptor,
+    tls_acceptor: ParkingRwLock<TlsAcceptor>,
     entrypoints: Arc<ParkingRwLock<EntrypointBindings>>,
     entrypoint_runtime: Mutex<Option<EntrypointRuntime>>,
     entrypoint_reload_lock: tokio::sync::Mutex<()>,
@@ -813,42 +995,22 @@ impl Server {
             .map(|proxy| AnyIpCidr::from_str(proxy))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let certificate = CertificateDer::pem_file_iter(&config.cert_path)
-            .map_err(|e| {
-                startup_file_error("cert_path", &config.cert_path, "read TLS certificate", e)
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                startup_file_error("cert_path", &config.cert_path, "parse TLS certificate", e)
-            })?;
-        let private_key = PrivateKeyDer::from_pem_file(&config.key_path).map_err(|e| {
-            startup_file_error("key_path", &config.key_path, "read TLS private key", e)
-        })?;
+        let tls_acceptor = load_c2s_tls_acceptor(&config)?;
 
         let entrypoints = bind_entrypoints(&config).await?;
-
-        let client_cert_verifier = Arc::new(ClientCertificateVerifier::new());
-
-        let mut tls_config =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&TLS12, &TLS13])
-                .with_client_cert_verifier(client_cert_verifier)
-                .with_single_cert(certificate, private_key)?;
-        tls_config.alpn_protocols = vec![
-            crate::web::signaling::ALPN_HTTP_1_1.to_vec(),
-            crate::web::signaling::ALPN_MUMBLE.to_vec(),
-        ];
-
-        let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
         // ── Channel repository & blob stores ─────────────────────────────
         let node_id = config.local_node_id().map_err(std::io::Error::other)?;
         let client_log_max_entries = config.client_log_max_entries;
         let channel_repo_tuning = ChannelRepoTuning::from(&config);
+        let channel_root_config = ChannelRootConfig::from(&config);
         let (channels, channel_blobs, session_blobs, user_channel_cache, bans) = match &config
             .blob_storage_dir
         {
             Some(dir) => {
-                let ch_repo = ChannelRepository::open(node_id, dir, channel_repo_tuning).await?;
+                let ch_repo =
+                    ChannelRepository::open(node_id, dir, channel_root_config, channel_repo_tuning)
+                        .await?;
                 let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
                 let user_channel_cache = UserChannelCache::open(dir).await?;
@@ -859,7 +1021,11 @@ impl Server {
                 // In-memory mode: use a temp dir for blob stores so the
                 // code paths are uniform; blobs won't survive restarts.
                 let tmp = std::env::temp_dir().join("shitspeak-blobs");
-                let ch_repo = ChannelRepository::new_in_memory(node_id, channel_repo_tuning);
+                let ch_repo = ChannelRepository::new_in_memory(
+                    node_id,
+                    channel_root_config,
+                    channel_repo_tuning,
+                );
                 let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
                 let user_channel_cache = UserChannelCache::new_in_memory();
@@ -877,7 +1043,7 @@ impl Server {
         let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
             allowed_proxies,
-            tls_acceptor,
+            tls_acceptor: ParkingRwLock::new(tls_acceptor),
             entrypoints: Arc::new(ParkingRwLock::new(entrypoints)),
             entrypoint_runtime: Mutex::new(None),
             entrypoint_reload_lock: tokio::sync::Mutex::new(()),
@@ -941,6 +1107,27 @@ impl Server {
 
     pub fn authenticator_wasm_path(&self) -> Option<PathBuf> {
         self.read_config().authenticator_wasm_path.clone()
+    }
+
+    pub fn c2s_tls_identity_paths(&self) -> (PathBuf, PathBuf) {
+        let config = self.read_config();
+        (
+            PathBuf::from(&config.cert_path),
+            PathBuf::from(&config.key_path),
+        )
+    }
+
+    fn replace_c2s_tls_acceptor(&self, tls_acceptor: TlsAcceptor) {
+        *self.tls_acceptor.write() = tls_acceptor;
+    }
+
+    fn reload_c2s_tls_identity(
+        &self,
+        new_config: &Config,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tls_acceptor = load_c2s_tls_acceptor(new_config)?;
+        self.replace_c2s_tls_acceptor(tls_acceptor);
+        Ok(())
     }
 
     fn authenticator_arc(&self) -> Arc<dyn Authenticator> {
@@ -1813,7 +2000,7 @@ impl Server {
         };
 
         let local_addr = tcp_stream.local_addr()?;
-        let tls_acceptor = self.tls_acceptor.clone();
+        let tls_acceptor = self.tls_acceptor.read().clone();
         let tls_stream = tls_acceptor.accept(tcp_stream).await?;
         let server_id = self.resolve_tls_server_id(&provisional_server_id, local_addr, &tls_stream);
         match tls_stream.get_ref().1.alpn_protocol() {
@@ -1999,14 +2186,16 @@ impl Server {
                     continue;
                 }
                 let last = client.get_last_channel_version().await;
-                if op.version <= last {
+                if op.version <= last && !op.is_root_name_config_update() {
                     continue;
                 }
+                if op.version > last {
                                 replay_channel_log_gap(
                                     self, &client, &self.channels, &mut channel_tree_shadow, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, op.version,
                                 ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
+                }
                                 let last_after_replay = client.get_last_channel_version().await;
-                                if op.version <= last_after_replay {
+                                if op.version <= last_after_replay && !op.is_root_name_config_update() {
                                     continue;
                                 }
 
@@ -2053,7 +2242,9 @@ impl Server {
                                             .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                     }
                                 }
-                                client.set_last_channel_version(op.version).await;
+                                if op.version > last_after_replay {
+                                    client.set_last_channel_version(op.version).await;
+                                }
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                                 let last = client.get_last_channel_version().await;
@@ -2254,9 +2445,11 @@ impl Server {
     pub async fn reload_config(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
         match Config::reload() {
             Ok(Some(new_config)) => {
-                let prepared_authenticator = self
-                    .authenticator
-                    .prepare_wasm_reload(new_config.authenticator_wasm_path.as_deref())?;
+                let next_tls_acceptor = load_c2s_tls_acceptor(&new_config)?;
+                let prepared_authenticator = self.authenticator.prepare_wasm_reload(
+                    new_config.authenticator_wasm_path.as_deref(),
+                    new_config.blob_storage_dir.as_deref(),
+                )?;
                 let authenticator_reloaded = prepared_authenticator.is_some();
 
                 self.apply_entrypoint_config(&new_config).await?;
@@ -2265,6 +2458,16 @@ impl Server {
                 // Log notable changes
                 if current.welcome_text != new_config.welcome_text {
                     tracing::info!("config reload: welcome_text changed");
+                }
+                if current.root_channel_name != new_config.root_channel_name {
+                    tracing::info!(
+                        "config reload: root_channel_name {:?} -> {:?}",
+                        current.root_channel_name,
+                        new_config.root_channel_name
+                    );
+                    self.channels
+                        .update_root_channel_config(ChannelRootConfig::from(&new_config))
+                        .await;
                 }
                 if current.max_bandwidth != new_config.max_bandwidth {
                     tracing::info!(
@@ -2286,6 +2489,17 @@ impl Server {
                         "config reload: authenticator_wasm_path {:?} -> {:?}",
                         current.authenticator_wasm_path,
                         new_config.authenticator_wasm_path
+                    );
+                }
+                if current.cert_path != new_config.cert_path
+                    || current.key_path != new_config.key_path
+                {
+                    tracing::info!(
+                        "config reload: C2S TLS identity paths {:?}/{:?} -> {:?}/{:?}",
+                        current.cert_path,
+                        current.key_path,
+                        new_config.cert_path,
+                        new_config.key_path
                     );
                 }
                 if current.s2s.overlay.route_transit_messages
@@ -2355,6 +2569,8 @@ impl Server {
                 if current.server_entrypoints != new_config.server_entrypoints {
                     tracing::info!("config reload: server_entrypoints changed");
                 }
+                self.replace_c2s_tls_acceptor(next_tls_acceptor);
+                tracing::info!("config reload: C2S TLS identity refreshed");
                 *current = new_config;
                 drop(current);
                 self.authenticator

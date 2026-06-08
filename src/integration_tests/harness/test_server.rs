@@ -182,6 +182,7 @@ async fn spawn_test_server_with_pki(
         allow_html: true,
         max_text_message_length: 5_000,
         max_image_message_length: 131_072,
+        root_channel_name: "Root".into(),
         default_channel: opts.default_channel,
         cert_required: opts.cert_required,
         blob_storage_dir: None,

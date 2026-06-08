@@ -20,4 +20,6 @@ Local demo behavior:
 - `guest` is accepted as a guest user.
 - usernames starting with `fetch:` call the host HTTPS `fetch` import as an example external auth flow.
 
+Responses may include `max_bandwidth` to override the configured bandwidth limit for that authenticated client.
+
 The example uses a tiny hand-rolled JSON reader to keep the AssemblyScript sample dependency-free. Use a real JSON library for production policy code.

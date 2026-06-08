@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io::{self, Write as _};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -10,9 +13,13 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::runtime::Handle;
-use wasmtime::{Caller, Engine as WasmEngine, Extern, Instance, Linker, Memory, Module, Store};
+use wasmtime::{
+    Caller, Config as WasmConfig, Engine as WasmEngine, Extern, Instance, Linker, Memory, Module,
+    Store,
+};
 
+use crate::blob_store::sha1_hex;
+use crate::http_client;
 use crate::localization::Language;
 use crate::protocol_version::ProtocolVersion;
 
@@ -23,7 +30,14 @@ use super::{
 
 const MAX_WASM_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_WASM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WASM_AUTH_CACHE_KEY_BYTES: usize = 1024;
+const MAX_WASM_AUTH_CACHE_VALUE_BYTES: usize = 64 * 1024;
+const MAX_WASM_AUTH_CACHE_ENTRIES: usize = 1024;
+const MAX_WASM_AUTH_STATE_KEY_BYTES: usize = 1024;
+const MAX_WASM_AUTH_STATE_VALUE_BYTES: usize = MAX_WASM_RESPONSE_BYTES;
+const WASM_AUTH_STATE_SUBDIR: &str = "wasm_authenticator";
 const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+static WASM_AUTH_STATE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum WasmAuthenticatorError {
@@ -42,6 +56,8 @@ pub enum WasmAuthenticatorError {
     Memory(String),
     #[error("WASM authenticator returned invalid payload: {0}")]
     InvalidPayload(String),
+    #[error("failed to build WASM authenticator HTTP client: {source}")]
+    HttpClient { source: reqwest::Error },
     #[error("WASM authenticator JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -67,6 +83,7 @@ impl Authenticator for DemoAuthenticator {
             groups,
             virtual_server_id: None,
             language: Language::default(),
+            max_bandwidth: None,
             texture_url: None,
             comment_url: None,
         })
@@ -87,9 +104,12 @@ impl ReloadableAuthenticator {
         }
     }
 
-    pub fn from_wasm_path(path: Option<&Path>) -> Result<Self, WasmAuthenticatorError> {
+    pub fn from_wasm_path(
+        path: Option<&Path>,
+        storage_dir: Option<&Path>,
+    ) -> Result<Self, WasmAuthenticatorError> {
         Ok(Self {
-            inner: RwLock::new(load_authenticator_from_wasm_path(path)?),
+            inner: RwLock::new(load_authenticator_from_wasm_path(path, storage_dir)?),
             reloads_from_wasm_config: true,
         })
     }
@@ -97,11 +117,12 @@ impl ReloadableAuthenticator {
     pub fn prepare_wasm_reload(
         &self,
         path: Option<&Path>,
+        storage_dir: Option<&Path>,
     ) -> Result<Option<Arc<dyn Authenticator>>, WasmAuthenticatorError> {
         if !self.reloads_from_wasm_config {
             return Ok(None);
         }
-        load_authenticator_from_wasm_path(path).map(Some)
+        load_authenticator_from_wasm_path(path, storage_dir).map(Some)
     }
 
     pub fn apply_prepared_reload(&self, next: Option<Arc<dyn Authenticator>>) {
@@ -176,9 +197,10 @@ impl Authenticator for ReloadableAuthenticator {
 
 fn load_authenticator_from_wasm_path(
     path: Option<&Path>,
+    storage_dir: Option<&Path>,
 ) -> Result<Arc<dyn Authenticator>, WasmAuthenticatorError> {
     match path.filter(|path| !path.as_os_str().is_empty()) {
-        Some(path) => Ok(Arc::new(WasmAuthenticator::from_file(path)?)),
+        Some(path) => Ok(Arc::new(WasmAuthenticator::from_file(path, storage_dir)?)),
         None => Ok(Arc::new(DemoAuthenticator)),
     }
 }
@@ -186,16 +208,27 @@ fn load_authenticator_from_wasm_path(
 pub struct WasmAuthenticator {
     module: Arc<CompiledWasmAuthenticator>,
     http_client: reqwest::Client,
+    cache: Arc<WasmAuthCache>,
+    state: Arc<WasmAuthState>,
     source_path: PathBuf,
 }
 
 impl WasmAuthenticator {
-    pub fn from_file(path: &Path) -> Result<Self, WasmAuthenticatorError> {
+    pub fn from_file(
+        path: &Path,
+        storage_dir: Option<&Path>,
+    ) -> Result<Self, WasmAuthenticatorError> {
         let bytes = std::fs::read(path).map_err(|source| WasmAuthenticatorError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        let engine = WasmEngine::default();
+        let mut config = WasmConfig::new();
+        config.async_support(true);
+        let engine =
+            WasmEngine::new(&config).map_err(|source| WasmAuthenticatorError::Compile {
+                path: path.to_path_buf(),
+                error: source.to_string(),
+            })?;
         let module =
             Module::new(&engine, &bytes).map_err(|source| WasmAuthenticatorError::Compile {
                 path: path.to_path_buf(),
@@ -203,9 +236,14 @@ impl WasmAuthenticator {
             })?;
 
         tracing::info!(path = %path.display(), "loaded WASM authenticator");
+        let http_client =
+            http_client::build_with_webpki_fallback(MAX_FETCH_TIMEOUT, "WASM authenticator fetch")
+                .map_err(|source| WasmAuthenticatorError::HttpClient { source })?;
         Ok(Self {
             module: Arc::new(CompiledWasmAuthenticator { engine, module }),
-            http_client: reqwest::Client::new(),
+            http_client,
+            cache: Arc::new(WasmAuthCache::default()),
+            state: Arc::new(WasmAuthState::new(storage_dir)),
             source_path: path.to_path_buf(),
         })
     }
@@ -253,19 +291,12 @@ impl WasmAuthenticator {
         let request_json = serde_json::to_vec(&request)?;
         let module = Arc::clone(&self.module);
         let http_client = self.http_client.clone();
-        let runtime = Handle::current();
-        let source_path = self.source_path.clone();
+        let cache = Arc::clone(&self.cache);
+        let state = Arc::clone(&self.state);
 
-        tokio::task::spawn_blocking(move || {
-            module.invoke_json_export(export_name, &request_json, http_client, runtime)
-        })
-        .await
-        .map_err(|error| {
-            WasmAuthenticatorError::Execution(format!(
-                "WASM authenticator `{}` task failed: {error}",
-                source_path.display()
-            ))
-        })?
+        module
+            .invoke_json_export(export_name, &request_json, http_client, cache, state)
+            .await
     }
 }
 
@@ -317,6 +348,7 @@ impl Authenticator for WasmAuthenticator {
                 groups: claims.groups.clone(),
                 virtual_server_id: None,
                 language: Language::default(),
+                max_bandwidth: None,
                 texture_url: None,
                 comment_url: None,
             }),
@@ -356,12 +388,13 @@ struct CompiledWasmAuthenticator {
 }
 
 impl CompiledWasmAuthenticator {
-    fn invoke_json_export(
+    async fn invoke_json_export(
         &self,
         export_name: &'static str,
         request_json: &[u8],
         http_client: reqwest::Client,
-        runtime: Handle,
+        cache: Arc<WasmAuthCache>,
+        state: Arc<WasmAuthState>,
     ) -> Result<Option<Vec<u8>>, WasmAuthenticatorError> {
         if request_json.len() > MAX_WASM_REQUEST_BYTES {
             return Err(WasmAuthenticatorError::InvalidPayload(format!(
@@ -373,12 +406,14 @@ impl CompiledWasmAuthenticator {
             &self.engine,
             HostState {
                 http_client,
-                runtime,
+                cache,
+                state,
             },
         );
         let linker = build_linker(&self.engine)?;
         let instance = linker
-            .instantiate(&mut store, &self.module)
+            .instantiate_async(&mut store, &self.module)
+            .await
             .map_err(wasm_execution_error)?;
         let Some(func) = instance.get_func(&mut store, export_name) else {
             return Ok(None);
@@ -396,7 +431,8 @@ impl CompiledWasmAuthenticator {
 
         let request_len = checked_i32_len(request_json.len())?;
         let request_ptr = alloc
-            .call(&mut store, request_len)
+            .call_async(&mut store, request_len)
+            .await
             .map_err(wasm_execution_error)?;
         if request_ptr < 0 {
             return Err(WasmAuthenticatorError::InvalidPayload(
@@ -408,7 +444,8 @@ impl CompiledWasmAuthenticator {
             .map_err(|error| WasmAuthenticatorError::Memory(error.to_string()))?;
 
         let packed = func
-            .call(&mut store, (request_ptr, request_len))
+            .call_async(&mut store, (request_ptr, request_len))
+            .await
             .map_err(wasm_execution_error)?;
         let (response_ptr, response_len) = unpack_ptr_len(packed)?;
         if response_len as usize > MAX_WASM_RESPONSE_BYTES {
@@ -423,9 +460,13 @@ impl CompiledWasmAuthenticator {
 
         if let Some(dealloc) = dealloc {
             if request_ptr as u32 != response_ptr || request_len as u32 != response_len {
-                let _ = dealloc.call(&mut store, (request_ptr, request_len));
+                let _ = dealloc
+                    .call_async(&mut store, (request_ptr, request_len))
+                    .await;
             }
-            let _ = dealloc.call(&mut store, (response_ptr as i32, response_len as i32));
+            let _ = dealloc
+                .call_async(&mut store, (response_ptr as i32, response_len as i32))
+                .await;
         }
 
         Ok(Some(response))
@@ -435,16 +476,68 @@ impl CompiledWasmAuthenticator {
 fn build_linker(engine: &WasmEngine) -> Result<Linker<HostState>, WasmAuthenticatorError> {
     let mut linker = Linker::new(engine);
     linker
-        .func_wrap("env", "fetch", host_fetch)
+        .func_wrap_async("env", "fetch", |caller, params| {
+            Box::new(host_fetch(caller, params))
+        })
         .map_err(wasm_execution_error)?;
     linker
-        .func_wrap("shitspeak", "fetch", host_fetch)
+        .func_wrap_async("shitspeak", "fetch", |caller, params| {
+            Box::new(host_fetch(caller, params))
+        })
         .map_err(wasm_execution_error)?;
     linker
         .func_wrap("env", "log", host_log)
         .map_err(wasm_execution_error)?;
     linker
         .func_wrap("shitspeak", "log", host_log)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "cache_get", host_cache_get)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "cache_get", host_cache_get)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "cache_put", host_cache_put)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "cache_put", host_cache_put)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "cache_delete", host_cache_delete)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "cache_delete", host_cache_delete)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "cache_clear", host_cache_clear)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "cache_clear", host_cache_clear)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "state_get", host_state_get)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "state_get", host_state_get)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "state_put", host_state_put)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "state_put", host_state_put)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "state_delete", host_state_delete)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "state_delete", host_state_delete)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "state_clear", host_state_clear)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "state_clear", host_state_clear)
         .map_err(wasm_execution_error)?;
     Ok(linker)
 }
@@ -461,16 +554,13 @@ fn optional_dealloc(
         .map_err(wasm_execution_error)
 }
 
-fn host_fetch(
+async fn host_fetch(
     mut caller: Caller<'_, HostState>,
-    request_ptr: i32,
-    request_len: i32,
-    response_ptr: i32,
-    response_capacity: i32,
+    (request_ptr, request_len, response_ptr, response_capacity): (i32, i32, i32, i32),
 ) -> i32 {
     let response = match read_guest_bytes(&mut caller, request_ptr, request_len) {
         Ok(bytes) => match serde_json::from_slice::<FetchRequest>(&bytes) {
-            Ok(request) => execute_fetch(caller.data(), request),
+            Ok(request) => execute_fetch(caller.data(), request).await,
             Err(error) => FetchResponse::error(format!("invalid fetch request JSON: {error}")),
         },
         Err(error) => FetchResponse::error(error),
@@ -503,6 +593,198 @@ fn host_log(mut caller: Caller<'_, HostState>, level: i32, ptr: i32, len: i32) {
         5 => tracing::trace!(target: "wasm_auth", "{message}"),
         _ => tracing::info!(target: "wasm_auth", "{message}"),
     }
+}
+
+fn host_cache_get(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    response_ptr: i32,
+    response_capacity: i32,
+) -> i32 {
+    let key = match read_cache_key(&mut caller, key_ptr, key_len) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth cache get");
+            return -1;
+        }
+    };
+    let Some(value) = caller.data().cache.get(&key) else {
+        return 0;
+    };
+    write_guest_bytes(&mut caller, response_ptr, response_capacity, &value)
+}
+
+fn host_cache_put(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    value_ptr: i32,
+    value_len: i32,
+) -> i32 {
+    let key = match read_cache_key(&mut caller, key_ptr, key_len) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth cache put key");
+            return -1;
+        }
+    };
+    if value_len <= 0 || value_len as usize > MAX_WASM_AUTH_CACHE_VALUE_BYTES {
+        tracing::warn!(
+            target: "wasm_auth",
+            value_len,
+            "invalid WASM auth cache put value length"
+        );
+        return -1;
+    }
+    let value = match read_guest_bytes(&mut caller, value_ptr, value_len) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth cache put value");
+            return -1;
+        }
+    };
+    caller.data().cache.put(key, value);
+    1
+}
+
+fn host_cache_delete(mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32) -> i32 {
+    let key = match read_cache_key(&mut caller, key_ptr, key_len) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth cache delete");
+            return -1;
+        }
+    };
+    if caller.data().cache.delete(&key) {
+        1
+    } else {
+        0
+    }
+}
+
+fn host_cache_clear(caller: Caller<'_, HostState>) -> i32 {
+    caller.data().cache.clear();
+    1
+}
+
+fn host_state_get(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    response_ptr: i32,
+    response_capacity: i32,
+) -> i32 {
+    let key = match read_state_key(&mut caller, key_ptr, key_len) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth state get");
+            return -1;
+        }
+    };
+    let value = match caller.data().state.get(&key) {
+        Ok(Some(value)) => value,
+        Ok(None) => return 0,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error = %error, "WASM auth state get failed");
+            return -1;
+        }
+    };
+    write_guest_bytes(&mut caller, response_ptr, response_capacity, &value)
+}
+
+fn host_state_put(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    value_ptr: i32,
+    value_len: i32,
+) -> i32 {
+    let key = match read_state_key(&mut caller, key_ptr, key_len) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth state put key");
+            return -1;
+        }
+    };
+    if value_len <= 0 || value_len as usize > MAX_WASM_AUTH_STATE_VALUE_BYTES {
+        tracing::warn!(
+            target: "wasm_auth",
+            value_len,
+            "invalid WASM auth state put value length"
+        );
+        return -1;
+    }
+    let value = match read_guest_bytes(&mut caller, value_ptr, value_len) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth state put value");
+            return -1;
+        }
+    };
+    match caller.data().state.put(&key, &value) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error = %error, "WASM auth state put failed");
+            -1
+        }
+    }
+}
+
+fn host_state_delete(mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32) -> i32 {
+    let key = match read_state_key(&mut caller, key_ptr, key_len) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth state delete");
+            return -1;
+        }
+    };
+    match caller.data().state.delete(&key) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error = %error, "WASM auth state delete failed");
+            -1
+        }
+    }
+}
+
+fn host_state_clear(caller: Caller<'_, HostState>) -> i32 {
+    match caller.data().state.clear() {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error = %error, "WASM auth state clear failed");
+            -1
+        }
+    }
+}
+
+fn read_cache_key(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+) -> Result<Vec<u8>, String> {
+    if len < 0 || len as usize > MAX_WASM_AUTH_CACHE_KEY_BYTES {
+        return Err(format!(
+            "cache key length must be between 0 and {MAX_WASM_AUTH_CACHE_KEY_BYTES} bytes"
+        ));
+    }
+    read_guest_bytes(caller, ptr, len)
+}
+
+fn read_state_key(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+) -> Result<Vec<u8>, String> {
+    if len <= 0 || len as usize > MAX_WASM_AUTH_STATE_KEY_BYTES {
+        return Err(format!(
+            "state key length must be between 1 and {MAX_WASM_AUTH_STATE_KEY_BYTES} bytes"
+        ));
+    }
+    read_guest_bytes(caller, ptr, len)
 }
 
 fn read_guest_bytes(
@@ -558,7 +840,7 @@ fn guest_memory(caller: &mut Caller<'_, HostState>) -> Result<Memory, String> {
         .ok_or_else(|| "guest does not export memory".to_owned())
 }
 
-fn execute_fetch(state: &HostState, request: FetchRequest) -> FetchResponse {
+async fn execute_fetch(state: &HostState, request: FetchRequest) -> FetchResponse {
     let url = match Url::parse(&request.url) {
         Ok(url) => url,
         Err(error) => return FetchResponse::error(format!("invalid URL: {error}")),
@@ -583,34 +865,32 @@ fn execute_fetch(state: &HostState, request: FetchRequest) -> FetchResponse {
         builder = builder.body(body.into_bytes());
     }
 
-    state.runtime.block_on(async move {
-        match builder.send().await {
-            Ok(response) => {
-                let status = response.status();
-                let status_code = status.as_u16();
-                let status_text = status.canonical_reason().unwrap_or("").to_owned();
-                let ok = status.is_success();
-                let mut headers = HashMap::new();
-                for (name, value) in response.headers() {
-                    if let Ok(value) = value.to_str() {
-                        headers.insert(name.as_str().to_owned(), value.to_owned());
-                    }
-                }
-                match response.bytes().await {
-                    Ok(body) => FetchResponse {
-                        ok,
-                        status: status_code,
-                        status_text,
-                        headers,
-                        body: Some(String::from_utf8_lossy(&body).into_owned()),
-                        error: None,
-                    },
-                    Err(error) => FetchResponse::error(format!("failed to read response: {error}")),
+    match builder.send().await {
+        Ok(response) => {
+            let status = response.status();
+            let status_code = status.as_u16();
+            let status_text = status.canonical_reason().unwrap_or("").to_owned();
+            let ok = status.is_success();
+            let mut headers = HashMap::new();
+            for (name, value) in response.headers() {
+                if let Ok(value) = value.to_str() {
+                    headers.insert(name.as_str().to_owned(), value.to_owned());
                 }
             }
-            Err(error) => FetchResponse::error(error.to_string()),
+            match response.bytes().await {
+                Ok(body) => FetchResponse {
+                    ok,
+                    status: status_code,
+                    status_text,
+                    headers,
+                    body: Some(String::from_utf8_lossy(&body).into_owned()),
+                    error: None,
+                },
+                Err(error) => FetchResponse::error(format!("failed to read response: {error}")),
+            }
         }
-    })
+        Err(error) => FetchResponse::error(error.to_string()),
+    }
 }
 
 fn checked_i32_len(len: usize) -> Result<i32, WasmAuthenticatorError> {
@@ -634,7 +914,155 @@ fn wasm_execution_error(error: impl std::fmt::Display) -> WasmAuthenticatorError
 
 struct HostState {
     http_client: reqwest::Client,
-    runtime: Handle,
+    cache: Arc<WasmAuthCache>,
+    state: Arc<WasmAuthState>,
+}
+
+#[derive(Default)]
+struct WasmAuthCache {
+    inner: RwLock<WasmAuthCacheInner>,
+}
+
+impl WasmAuthCache {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .read()
+            .expect("WASM auth cache RwLock poisoned")
+            .entries
+            .get(key)
+            .cloned()
+    }
+
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) {
+        let mut inner = self.inner.write().expect("WASM auth cache RwLock poisoned");
+        if inner.entries.contains_key(&key) {
+            inner.entries.insert(key, value);
+            return;
+        }
+        while inner.entries.len() >= MAX_WASM_AUTH_CACHE_ENTRIES {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            inner.entries.remove(&oldest);
+        }
+        inner.order.push_back(key.clone());
+        inner.entries.insert(key, value);
+    }
+
+    fn delete(&self, key: &[u8]) -> bool {
+        let mut inner = self.inner.write().expect("WASM auth cache RwLock poisoned");
+        let removed = inner.entries.remove(key).is_some();
+        if removed {
+            inner.order.retain(|candidate| candidate.as_slice() != key);
+        }
+        removed
+    }
+
+    fn clear(&self) {
+        let mut inner = self.inner.write().expect("WASM auth cache RwLock poisoned");
+        inner.entries.clear();
+        inner.order.clear();
+    }
+}
+
+#[derive(Default)]
+struct WasmAuthCacheInner {
+    entries: HashMap<Vec<u8>, Vec<u8>>,
+    order: VecDeque<Vec<u8>>,
+}
+
+struct WasmAuthState {
+    root: Option<PathBuf>,
+}
+
+impl WasmAuthState {
+    fn new(storage_dir: Option<&Path>) -> Self {
+        Self {
+            root: storage_dir.map(|dir| dir.join(WASM_AUTH_STATE_SUBDIR)),
+        }
+    }
+
+    fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let Some(path) = self.path_for_key(key) else {
+            return Ok(None);
+        };
+        match fs::read(&path) {
+            Ok(value) if value.len() <= MAX_WASM_AUTH_STATE_VALUE_BYTES => Ok(Some(value)),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persistent state value exceeds host limit",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> io::Result<bool> {
+        let Some(path) = self.path_for_key(key) else {
+            return Ok(false);
+        };
+        let Some(parent) = path.parent() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "persistent state path has no parent",
+            ));
+        };
+        fs::create_dir_all(parent)?;
+        let tmp_seq = WASM_AUTH_STATE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-{tmp_seq}"));
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            file.write_all(value)?;
+            file.sync_data()?;
+        }
+        replace_file(&tmp, &path)?;
+        Ok(true)
+    }
+
+    fn delete(&self, key: &[u8]) -> io::Result<bool> {
+        let Some(path) = self.path_for_key(key) else {
+            return Ok(false);
+        };
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn clear(&self) -> io::Result<bool> {
+        let Some(root) = self.root.as_ref() else {
+            return Ok(false);
+        };
+        match fs::remove_dir_all(root) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn path_for_key(&self, key: &[u8]) -> Option<PathBuf> {
+        let root = self.root.as_ref()?;
+        let key = sha1_hex(key);
+        let (prefix, suffix) = key.split_at(2);
+        Some(root.join(prefix).join(suffix))
+    }
+}
+
+fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        match fs::remove_file(dst) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::rename(src, dst)
 }
 
 #[derive(Serialize)]
@@ -720,6 +1148,8 @@ struct WasmAuthenticateResponse {
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
+    max_bandwidth: Option<u32>,
+    #[serde(default)]
     texture_url: Option<String>,
     #[serde(default)]
     comment_url: Option<String>,
@@ -746,6 +1176,7 @@ impl WasmAuthenticateResponse {
                 .as_deref()
                 .map(Language::from_code)
                 .unwrap_or_default(),
+            max_bandwidth: self.max_bandwidth,
             texture_url: self.texture_url,
             comment_url: self.comment_url,
         })

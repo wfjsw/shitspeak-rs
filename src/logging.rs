@@ -13,6 +13,8 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::http_client;
+
 const DEFAULT_LOKI_BATCH_SIZE: usize = 128;
 const DEFAULT_LOKI_FLUSH_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_LOKI_QUEUE_CAPACITY: usize = 4_096;
@@ -173,9 +175,7 @@ impl LokiLayer {
         let flush_interval = config.flush_interval();
         let request_timeout = config.request_timeout();
         let labels = base_labels(service_name, &config.labels);
-        let client = reqwest::Client::builder()
-            .timeout(request_timeout)
-            .build()?;
+        let client = http_client::build_with_webpki_fallback(request_timeout, "loki logging")?;
         let (tx, rx) = mpsc::channel(queue_capacity);
 
         tokio::spawn(run_loki_sender(
