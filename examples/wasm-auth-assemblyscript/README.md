@@ -16,9 +16,11 @@ authenticator_wasm_path = "examples/wasm-auth-assemblyscript/build/auth.wasm"
 
 Local demo behavior:
 
-- `admin` with password `secret` is accepted as user `1` with the `admin` group.
+- `admin` with password `secret` is accepted as user `1` with the `admin` group and superuser privileges.
 - `guest` is accepted as a guest user.
 - usernames starting with `fetch:` call the host HTTPS `fetch` import as an example external auth flow.
+
+The host runs authenticator calls on Wasmtime's async engine. AssemblyScript still imports `fetch` as a normal core-WASM function; the host may suspend and resume the Wasmtime invocation while the HTTPS request is in flight.
 
 Responses may include `max_bandwidth` to override the configured bandwidth limit for that authenticated client.
 

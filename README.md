@@ -82,6 +82,7 @@ or set equivalent `SHITSPEAK_LOGGING_LOKI_*` environment variables:
 [logging.loki]
 enabled = true
 url = "http://localhost:3100"
+level = "debug"
 labels = { environment = "dev" }
 ```
 

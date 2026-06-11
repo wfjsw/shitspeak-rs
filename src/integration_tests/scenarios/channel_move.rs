@@ -17,7 +17,7 @@ async fn self_move_broadcasts_to_peer() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
@@ -60,7 +60,7 @@ async fn moderator_move_other() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);

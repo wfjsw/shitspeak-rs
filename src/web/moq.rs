@@ -585,69 +585,7 @@ impl MoqSessionRuntime {
         command: ClientCommand,
     ) -> Result<Vec<ServerEvent>, String> {
         match command {
-            ClientCommand::Authenticate { auth } => {
-                if self.client.is_some() {
-                    return Ok(vec![ServerEvent::AuthenticationRejected {
-                        reason: "already authenticated".to_string(),
-                    }]);
-                }
-                let cache_username = match &auth {
-                    crate::web::protocol::AuthRequest::Password { username, .. } => {
-                        Some(username.clone())
-                    }
-                    crate::web::protocol::AuthRequest::Sso { .. } => None,
-                };
-                let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(256);
-                let result = self
-                    .context
-                    .authenticate(0, auth)
-                    .await
-                    .map_err(authentication_rejection_reason)?;
-                let Some((server, client, session, display_name)) = self
-                    .context
-                    .allocate_authenticated_client(
-                        result,
-                        outbound_tx,
-                        WebSessionTransport::Moq,
-                        cache_username.as_deref(),
-                    )
-                    .await
-                else {
-                    return Err("MoQ authentication is not wired to this server".to_string());
-                };
-
-                self.outbound_rx = Some(outbound_rx);
-                self.voice_rx = client.take_voice_tcp_rx();
-                self.client = Some(Arc::clone(&client));
-                let mut events = vec![ServerEvent::Authenticated {
-                    session,
-                    display_name,
-                }];
-                events.extend(
-                    initial_server_events(
-                        &server,
-                        &client,
-                        &mut self.channel_shadow,
-                        &mut self.user_visibility,
-                    )
-                    .await,
-                );
-                client
-                    .set_last_channel_version(
-                        server
-                            .get_channels()
-                            .current_version_in_server(&client.server_id()),
-                    )
-                    .await;
-                let (_, versions) = server
-                    .get_clients()
-                    .snapshot_with_versions_in_server(&client.server_id())
-                    .await;
-                client.update_last_client_versions(&versions).await;
-                self.client_log_rx = Some(server.get_clients().subscribe());
-                self.channel_log_rx = Some(server.get_channels().subscribe());
-                Ok(events)
-            }
+            ClientCommand::Authenticate { auth } => self.authenticate_client(auth).await,
             ClientCommand::VoiceControl { ptt, target, epoch } => {
                 self.update_voice_control(ptt, target, epoch).await;
                 Ok(vec![ServerEvent::VoiceControlAck { epoch }])
@@ -665,6 +603,73 @@ impl MoqSessionRuntime {
                 }
             }
         }
+    }
+
+    async fn authenticate_client(
+        &mut self,
+        auth: crate::web::protocol::AuthRequest,
+    ) -> Result<Vec<ServerEvent>, String> {
+        if self.client.is_some() {
+            return Ok(vec![ServerEvent::AuthenticationRejected {
+                reason: "already authenticated".to_string(),
+            }]);
+        }
+
+        let cache_username = match &auth {
+            crate::web::protocol::AuthRequest::Password { username, .. } => Some(username.clone()),
+            crate::web::protocol::AuthRequest::Sso { .. } => None,
+        };
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(256);
+        let result = self
+            .context
+            .authenticate(0, auth)
+            .await
+            .map_err(authentication_rejection_reason)?;
+        let Some((server, client, session, display_name)) = self
+            .context
+            .allocate_authenticated_client(
+                result,
+                outbound_tx,
+                WebSessionTransport::Moq,
+                cache_username.as_deref(),
+            )
+            .await
+        else {
+            return Err("MoQ authentication is not wired to this server".to_string());
+        };
+
+        self.outbound_rx = Some(outbound_rx);
+        self.voice_rx = client.take_voice_tcp_rx();
+        self.client = Some(Arc::clone(&client));
+
+        let mut events = vec![ServerEvent::Authenticated {
+            session,
+            display_name,
+        }];
+        events.extend(
+            initial_server_events(
+                &server,
+                &client,
+                &mut self.channel_shadow,
+                &mut self.user_visibility,
+            )
+            .await,
+        );
+        client
+            .set_last_channel_version(
+                server
+                    .get_channels()
+                    .current_version_in_server(&client.server_id()),
+            )
+            .await;
+        let (_, versions) = server
+            .get_clients()
+            .snapshot_with_versions_in_server(&client.server_id())
+            .await;
+        client.update_last_client_versions(&versions).await;
+        self.client_log_rx = Some(server.get_clients().subscribe());
+        self.channel_log_rx = Some(server.get_channels().subscribe());
+        Ok(events)
     }
 
     pub async fn disconnect_client(&mut self) {
@@ -1821,6 +1826,7 @@ mod tests {
                 user_id: Some(7),
                 display_name: Some("Alice".to_string()),
                 groups: vec!["web".to_string()],
+                is_superuser: false,
                 virtual_server_id: None,
                 language: Language::default(),
                 max_bandwidth: None,

@@ -16,6 +16,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+use tracing::Instrument;
 
 use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
@@ -31,7 +32,7 @@ use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError};
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
-use crate::proxy_protocol::get_proxy_protocol_real_ip;
+use crate::proxy_protocol::get_proxy_protocol_client_address;
 use crate::user_channel_cache::UserChannelCache;
 use crate::{
     client_repository::ClientRepository,
@@ -45,6 +46,9 @@ use crate::{
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
 type UdpPacket = (Bytes, std::net::SocketAddr, std::net::SocketAddr);
+#[cfg(feature = "web")]
+const ALPN_HTTP_1_1: &[u8] = b"http/1.1";
+const ALPN_MUMBLE: &[u8] = b"mumble";
 const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 128;
 const DYNAMIC_ENTRYPOINT_MIN_PORT: u16 = 49152;
 const DYNAMIC_ENTRYPOINT_MAX_PORT: u16 = 65535;
@@ -86,10 +90,11 @@ fn load_c2s_tls_acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::er
     let mut tls_config = rustls::ServerConfig::builder_with_protocol_versions(&[&TLS12, &TLS13])
         .with_client_cert_verifier(client_cert_verifier)
         .with_single_cert(certificate, private_key)?;
-    tls_config.alpn_protocols = vec![
-        crate::web::signaling::ALPN_HTTP_1_1.to_vec(),
-        crate::web::signaling::ALPN_MUMBLE.to_vec(),
-    ];
+    #[cfg(feature = "web")]
+    {
+        tls_config.alpn_protocols.push(ALPN_HTTP_1_1.to_vec());
+    }
+    tls_config.alpn_protocols.push(ALPN_MUMBLE.to_vec());
 
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
@@ -359,6 +364,7 @@ mod tests {
                 user_id: None,
                 display_name: Some(username.to_owned()),
                 groups: Vec::new(),
+                is_superuser: false,
                 virtual_server_id: None,
                 language: Language::default(),
                 max_bandwidth: None,
@@ -1186,30 +1192,35 @@ impl Server {
             pending_delete_timeout_ms,
             internal_rx.clone(),
         );
-        let startup_config = self.read_config().clone();
-        let web_config = startup_config.web.clone();
-        let web_signaling = match web_config.clone() {
-            web if web.enabled && web.listen.is_some() => Some(
-                crate::web::signaling::SignalingServer::new(web)
+        let mut web_tasks = JoinSet::<()>::new();
+        #[cfg(feature = "web")]
+        {
+            let startup_config = self.read_config().clone();
+            let web_config = startup_config.web.clone();
+            if web_config.enabled && web_config.listen.is_some() {
+                let handle = crate::web::signaling::SignalingServer::new(web_config.clone())
                     .with_authenticator(self.authenticator_arc())
                     .with_server(Arc::clone(self))
-                    .spawn(internal_rx.clone())?,
-            ),
-            _ => None,
-        };
-        let web_moq = match web_config {
-            web if web.enabled && web.moq.enabled && web.moq.listen.is_some() => Some(
-                crate::web::moq::MoqServer::new(web)
+                    .spawn(internal_rx.clone())?;
+                web_tasks.spawn(async move {
+                    let _ = handle.await;
+                });
+            }
+            #[cfg(feature = "moq")]
+            if web_config.enabled && web_config.moq.enabled && web_config.moq.listen.is_some() {
+                let handle = crate::web::moq::MoqServer::new(web_config)
                     .with_tls_fallback(
                         startup_config.cert_path.clone(),
                         startup_config.key_path.clone(),
                     )
                     .with_authenticator(self.authenticator_arc())
                     .with_server(Arc::clone(self))
-                    .spawn(internal_rx.clone())?,
-            ),
-            _ => None,
-        };
+                    .spawn(internal_rx.clone())?;
+                web_tasks.spawn(async move {
+                    let _ = handle.await;
+                });
+            }
+        }
         let s2s_task = Arc::clone(&self.s2s_manager)
             .spawn_runtime_task(Arc::downgrade(self), internal_rx.clone());
 
@@ -1225,18 +1236,7 @@ impl Server {
             result = &mut udp_process => { let _ = result; }
             result = &mut idle_reaper => { let _ = result; }
             result = &mut pending_delete_watchdog => { let _ = result; }
-            result = async {
-                match web_signaling {
-                    Some(handle) => handle.await.ok(),
-                    None => std::future::pending::<Option<()>>().await,
-                }
-            } => { let _ = result; }
-            result = async {
-                match web_moq {
-                    Some(handle) => handle.await.ok(),
-                    None => std::future::pending::<Option<()>>().await,
-                }
-            } => { let _ = result; }
+            result = web_tasks.join_next(), if !web_tasks.is_empty() => { let _ = result; }
             _ = shutdown_rx.changed() => {
                 tracing::info!("Shutdown signal received.");
             }
@@ -1248,6 +1248,7 @@ impl Server {
         let _ = udp_process.await;
         let _ = idle_reaper.await;
         let _ = pending_delete_watchdog.await;
+        while web_tasks.join_next().await.is_some() {}
         s2s_task.join().await;
         let _ = register_task.await;
 
@@ -1671,16 +1672,9 @@ impl Server {
                 let provisional_server_id =
                     conn_server.provisional_server_id_for_port(local_addr.port());
                 tokio::spawn(async move {
-                    if let Err(e) = conn_server
+                    let _ = conn_server
                         .handle_incoming_connection(tcp_stream, remote_addr, provisional_server_id)
-                        .await
-                    {
-                        if e.is_clean_disconnect() {
-                            tracing::trace!("Connection closed without TLS close_notify: {}", e);
-                        } else {
-                            tracing::warn!("Error handling connection: {}", e);
-                        }
-                    }
+                        .await;
                 });
             }
             tracing::info!("TCP accept stopped for {}", local_addr);
@@ -1986,35 +1980,37 @@ impl Server {
         remote_addr: std::net::SocketAddr,
         provisional_server_id: String,
     ) -> Result<(), HandleIncomingConnectionError> {
-        let real_ip = if self
+        let client_addr = if self
             .allowed_proxies
             .iter()
             .any(|proxy| proxy.contains(&remote_addr.ip()))
         {
-            match get_proxy_protocol_real_ip(&tcp_stream).await? {
-                Some(ip) => ip,
-                None => remote_addr.ip(),
+            match get_proxy_protocol_client_address(&tcp_stream).await? {
+                Some(addr) => SocketAddr::new(addr.ip(), addr.port()),
+                None => remote_addr,
             }
         } else {
-            remote_addr.ip()
+            remote_addr
         };
+        let real_ip = client_addr.ip();
 
         let local_addr = tcp_stream.local_addr()?;
         let tls_acceptor = self.tls_acceptor.read().clone();
         let tls_stream = tls_acceptor.accept(tcp_stream).await?;
         let server_id = self.resolve_tls_server_id(&provisional_server_id, local_addr, &tls_stream);
         match tls_stream.get_ref().1.alpn_protocol() {
-            Some(crate::web::signaling::ALPN_HTTP_1_1) => {
+            #[cfg(feature = "web")]
+            Some(ALPN_HTTP_1_1) => {
                 let web = self.read_config().web.clone();
                 crate::web::signaling::SignalingServer::new(web)
                     .with_authenticator(self.authenticator_arc())
                     .with_server(Arc::clone(self))
                     .with_provisional_server_id(server_id)
-                    .handle_stream_with_peer(tls_stream, real_ip, remote_addr, local_addr)
+                    .handle_stream_with_peer(tls_stream, real_ip, client_addr, local_addr)
                     .await?;
                 return Ok(());
             }
-            Some(crate::web::signaling::ALPN_MUMBLE) | None => {}
+            Some(ALPN_MUMBLE) | None => {}
             Some(other) => {
                 tracing::warn!(
                     protocol = %String::from_utf8_lossy(other),
@@ -2027,7 +2023,7 @@ impl Server {
         self.handle_native_mumble_tls_connection(
             tls_stream,
             real_ip,
-            remote_addr,
+            client_addr,
             local_addr,
             server_id,
         )
@@ -2093,6 +2089,7 @@ impl Server {
             .await;
 
         let client_session_id = client.get_session_id();
+        let client_span = client.tracing_span();
 
         // Subscriptions start as None — they're activated after auth.
         let mut client_log_rx: Option<ClientLogReceiver> = None;
@@ -2111,7 +2108,7 @@ impl Server {
                     // ── Local disconnect request ─────────────────────────────
                     _ = client.disconnected() => {
                         tracing::debug!(
-                            session = u32::from(client_session_id),
+                            session = u32::from(client.get_session_id()),
                             "closing connection after local disconnect request"
                         );
                         return Ok(());
@@ -2166,9 +2163,9 @@ impl Server {
                             }
                             Err(crate::errors::ReadProtoMessageError::UnknownMessageType(err)) => {
                                 tracing::warn!(
-                                    "Client {:?} sent unknown message type {} — ignoring",
-                                    client_session_id,
-                                    err.message_type,
+                                    session = u32::from(client.get_session_id()),
+                                    message_type = err.message_type,
+                                    "client sent unknown message type; ignoring",
                                 );
                                 // Gracefully ignore unknown message types
                             }
@@ -2419,21 +2416,36 @@ impl Server {
                     }
                 }
             }
-        }.await;
+        }
+        .instrument(client_span.clone())
+        .await;
 
         // Single cleanup point: remove the client on any error.
         if result.is_err() {
-            let server_id = client.server_id();
-            let old_channel_id = client.get_current_channel_id();
-            self.clients
-                .remove_client_in_server(&server_id, client.get_session_id())
+            async {
+                let server_id = client.server_id();
+                let old_channel_id = client.get_current_channel_id();
+                self.clients
+                    .remove_client_in_server(&server_id, client.get_session_id())
+                    .await;
+                crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+                    self,
+                    &server_id,
+                    old_channel_id,
+                )
                 .await;
-            crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
-                self,
-                &server_id,
-                old_channel_id,
-            )
+            }
+            .instrument(client_span.clone())
             .await;
+        }
+        if let Err(error) = &result {
+            client.in_tracing_scope(|| {
+                if error.is_clean_disconnect() {
+                    tracing::trace!("connection closed without TLS close_notify: {}", error);
+                } else {
+                    tracing::warn!("error handling connection: {}", error);
+                }
+            });
         }
         result
     }

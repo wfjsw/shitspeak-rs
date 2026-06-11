@@ -18,7 +18,7 @@ async fn self_mute_broadcasts() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
@@ -156,7 +156,7 @@ async fn client_suppress_update_is_denied() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await

@@ -68,194 +68,203 @@ impl AsyncMessageHandlerExt for Arc<Box<crate::client::Client>> {
         server: &Arc<Box<Server>>,
         message: Message,
     ) -> Result<(), MessageHandlerError> {
-        let session = u32::from(self.get_session_id());
-        let result = match message {
-            Message::Version(version) => {
-                tracing::debug!(session, "handling Version");
-                handle_version(server, self, version.into()).await
-            }
-            Message::UDPTunnel(data) => {
-                tracing::trace!(session, len = data.len(), "handling UDPTunnel");
-                handle_udp_tunnel(server, self, data).await
-            }
-            Message::Authenticate(authenticate) => {
-                tracing::debug!(session, "handling Authenticate");
-                handle_authenticate(server, self, authenticate.into()).await
-            }
-            Message::Ping(ping) => {
-                tracing::trace!(session, "handling Ping");
-                handle_ping(
-                    server,
-                    self,
-                    ping.try_into().map_err(MessageProtocolError::from)?,
-                )
-                .await
-            }
-            Message::Reject(_) => {
-                tracing::debug!(session, "rejecting incoming Reject");
-                Err(MessageTypeNotForIncoming::new(message).into())
-            }
-            Message::ServerSync(_) => {
-                tracing::debug!(session, "rejecting incoming ServerSync");
-                Err(MessageTypeNotForIncoming::new(message).into())
-            }
-            Message::ChannelRemove(channel_remove) => {
-                tracing::debug!(
-                    session,
-                    channel_id = channel_remove.channel_id,
-                    "handling ChannelRemove"
-                );
-                handle_channel_remove(server, self, channel_remove.into()).await
-            }
-            Message::ChannelState(channel_state) => {
-                tracing::debug!(
-                    session,
-                    channel_id = channel_state.channel_id,
-                    "handling ChannelState"
-                );
-                handle_channel_state(server, self, channel_state.into()).await
-            }
-            Message::UserRemove(user_remove) => {
-                tracing::debug!(session, target = user_remove.session, "handling UserRemove");
-                handle_user_remove(server, self, user_remove.into()).await
-            }
-            Message::UserState(user_state) => {
-                tracing::debug!(session, target = user_state.session, "handling UserState");
-                handle_user_state(
-                    server,
-                    self,
-                    user_state.try_into().map_err(MessageProtocolError::from)?,
-                )
-                .await
-            }
-            Message::BanList(ban_list) => {
-                tracing::debug!(session, query = ban_list.query, "handling BanList");
-                handle_ban_list(server, self, ban_list.into()).await
-            }
-            Message::TextMessage(text_message) => {
-                tracing::debug!(session, channels = ?text_message.channel_id, trees = ?text_message.tree_id, "handling TextMessage");
-                handle_text_message(server, self, text_message.into()).await
-            }
-            Message::PermissionDenied(_) => {
-                tracing::debug!(session, "rejecting incoming PermissionDenied");
-                Err(MessageTypeNotForIncoming::new(message).into())
-            }
-            Message::ACL(acl) => {
-                tracing::debug!(
-                    session,
-                    channel_id = acl.channel_id,
-                    query = acl.query,
-                    "handling ACL"
-                );
-                handle_acl(server, self, acl.into()).await
-            }
-            Message::QueryUsers(query_users) => {
-                tracing::debug!(session, ids = ?query_users.ids, names = ?query_users.names, "handling QueryUsers");
-                handle_query_users(server, self, query_users.into()).await
-            }
-            Message::CryptSetup(crypt_setup) => {
-                tracing::debug!(session, "handling CryptSetup");
-                handle_crypt_setup(server, self, crypt_setup.into()).await
-            }
-            Message::ContextActionModify(_) => {
-                tracing::debug!(session, "rejecting incoming ContextActionModify");
-                Err(MessageTypeNotForIncoming::new(message).into())
-            }
-            Message::ContextAction(context_action) => {
-                tracing::debug!(session, action = %context_action.action, "handling ContextAction");
-                handle_context_action(server, self, context_action.into()).await
-            }
-            Message::UserList(user_list) => {
-                tracing::debug!(
-                    session,
-                    num_users = user_list.users.len(),
-                    "handling UserList"
-                );
-                handle_user_list(server, self, user_list.into()).await
-            }
-            Message::VoiceTarget(voice_target) => {
-                tracing::debug!(session, target_id = voice_target.id, "handling VoiceTarget");
-                handle_voice_target(server, self, voice_target.into()).await
-            }
-            Message::PermissionQuery(permission_query) => {
-                tracing::debug!(
-                    session,
-                    channel_id = permission_query.channel_id,
-                    "handling PermissionQuery"
-                );
-                handle_permission_query(server, self, permission_query.into()).await
-            }
-            Message::CodecVersion(_) => {
-                tracing::debug!(session, "rejecting incoming CodecVersion");
-                Err(MessageTypeNotForIncoming::new(message).into())
-            }
-            Message::UserStats(user_stats) => {
-                tracing::debug!(session, target = user_stats.session, "handling UserStats");
-                handle_user_stats(server, self, user_stats.into()).await
-            }
-            Message::RequestBlob(request_blob) => {
-                tracing::debug!(
-                    session,
-                    textures = request_blob.session_texture.len(),
-                    comments = request_blob.session_comment.len(),
-                    "handling RequestBlob"
-                );
-                handle_request_blob(server, self, request_blob.into()).await
-            }
-            Message::ServerConfig(_) => {
-                tracing::debug!(session, "rejecting incoming ServerConfig");
-                Err(MessageTypeNotForIncoming::new(message).into())
-            }
-            Message::SuggestConfig(_) => {
-                tracing::debug!(session, "rejecting incoming SuggestConfig");
-                Err(MessageTypeNotForIncoming::new(message).into())
-            }
-            Message::PluginDataTransmission(plugin_data) => {
-                tracing::debug!(
-                    session,
-                    receivers = plugin_data.receiver_sessions.len(),
-                    "handling PluginDataTransmission"
-                );
-                handle_plugin_data_transmission(server, self, plugin_data.into()).await
-            }
-        };
+        self.in_tracing_span(handle_message_inner(self, server, message))
+            .await
+    }
+}
 
-        // Triage the result: auth rejections and permission denials are sent
-        // back to the client immediately; all other errors propagate.
-        match result {
-            Err(MessageHandlerError::ProtocolViolation(reason)) => {
-                use crate::messages::WriteMessageExt;
-                tracing::warn!(session, reason = %reason, "Protocol violation");
-                let reject = crate::errors::AuthRejection::new_with_language(
-                    crate::messages::encoder::RejectType::None,
-                    self.language(),
-                );
-                let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
-                let msg = crate::messages::Message::Reject(reject_msg.into());
-                self.write_proto_message(&msg).await?;
-                Err(MessageHandlerError::AuthRejection(reject))
-            }
-            Err(MessageHandlerError::AuthRejection(reject)) => {
-                use crate::messages::WriteMessageExt;
-                let reject_msg: crate::messages::encoder::Reject =
-                    reject.clone().localized(self.language()).into();
-                let msg = crate::messages::Message::Reject(reject_msg.into());
-                self.write_proto_message(&msg).await?;
-                Err(MessageHandlerError::AuthRejection(reject))
-            }
-            Err(MessageHandlerError::PermissionDenied(mut deny)) => {
-                use crate::messages::WriteMessageExt;
-                if deny.reason.is_none() {
-                    deny.reason = Some(crate::localization::permission_denied_reason(
-                        self.language(),
-                        deny.r#type,
-                    ));
-                }
-                let msg: crate::messages::Message = deny.into();
-                self.write_proto_message(&msg).await?;
-                Ok(())
-            }
-            other => other,
+async fn handle_message_inner(
+    client: &Arc<Box<crate::client::Client>>,
+    server: &Arc<Box<Server>>,
+    message: Message,
+) -> Result<(), MessageHandlerError> {
+    let session = u32::from(client.get_session_id());
+    let result = match message {
+        Message::Version(version) => {
+            tracing::debug!(session, "handling Version");
+            handle_version(server, client, version.into()).await
         }
+        Message::UDPTunnel(data) => {
+            tracing::trace!(session, len = data.len(), "handling UDPTunnel");
+            handle_udp_tunnel(server, client, data).await
+        }
+        Message::Authenticate(authenticate) => {
+            tracing::debug!(session, "handling Authenticate");
+            handle_authenticate(server, client, authenticate.into()).await
+        }
+        Message::Ping(ping) => {
+            tracing::trace!(session, "handling Ping");
+            handle_ping(
+                server,
+                client,
+                ping.try_into().map_err(MessageProtocolError::from)?,
+            )
+            .await
+        }
+        Message::Reject(_) => {
+            tracing::debug!(session, "rejecting incoming Reject");
+            Err(MessageTypeNotForIncoming::new(message).into())
+        }
+        Message::ServerSync(_) => {
+            tracing::debug!(session, "rejecting incoming ServerSync");
+            Err(MessageTypeNotForIncoming::new(message).into())
+        }
+        Message::ChannelRemove(channel_remove) => {
+            tracing::debug!(
+                session,
+                channel_id = channel_remove.channel_id,
+                "handling ChannelRemove"
+            );
+            handle_channel_remove(server, client, channel_remove.into()).await
+        }
+        Message::ChannelState(channel_state) => {
+            tracing::debug!(
+                session,
+                channel_id = channel_state.channel_id,
+                "handling ChannelState"
+            );
+            handle_channel_state(server, client, channel_state.into()).await
+        }
+        Message::UserRemove(user_remove) => {
+            tracing::debug!(session, target = user_remove.session, "handling UserRemove");
+            handle_user_remove(server, client, user_remove.into()).await
+        }
+        Message::UserState(user_state) => {
+            tracing::debug!(session, target = user_state.session, "handling UserState");
+            handle_user_state(
+                server,
+                client,
+                user_state.try_into().map_err(MessageProtocolError::from)?,
+            )
+            .await
+        }
+        Message::BanList(ban_list) => {
+            tracing::debug!(session, query = ban_list.query, "handling BanList");
+            handle_ban_list(server, client, ban_list.into()).await
+        }
+        Message::TextMessage(text_message) => {
+            tracing::debug!(session, channels = ?text_message.channel_id, trees = ?text_message.tree_id, "handling TextMessage");
+            handle_text_message(server, client, text_message.into()).await
+        }
+        Message::PermissionDenied(_) => {
+            tracing::debug!(session, "rejecting incoming PermissionDenied");
+            Err(MessageTypeNotForIncoming::new(message).into())
+        }
+        Message::ACL(acl) => {
+            tracing::debug!(
+                session,
+                channel_id = acl.channel_id,
+                query = acl.query,
+                "handling ACL"
+            );
+            handle_acl(server, client, acl.into()).await
+        }
+        Message::QueryUsers(query_users) => {
+            tracing::debug!(session, ids = ?query_users.ids, names = ?query_users.names, "handling QueryUsers");
+            handle_query_users(server, client, query_users.into()).await
+        }
+        Message::CryptSetup(crypt_setup) => {
+            tracing::debug!(session, "handling CryptSetup");
+            handle_crypt_setup(server, client, crypt_setup.into()).await
+        }
+        Message::ContextActionModify(_) => {
+            tracing::debug!(session, "rejecting incoming ContextActionModify");
+            Err(MessageTypeNotForIncoming::new(message).into())
+        }
+        Message::ContextAction(context_action) => {
+            tracing::debug!(session, action = %context_action.action, "handling ContextAction");
+            handle_context_action(server, client, context_action.into()).await
+        }
+        Message::UserList(user_list) => {
+            tracing::debug!(
+                session,
+                num_users = user_list.users.len(),
+                "handling UserList"
+            );
+            handle_user_list(server, client, user_list.into()).await
+        }
+        Message::VoiceTarget(voice_target) => {
+            tracing::debug!(session, target_id = voice_target.id, "handling VoiceTarget");
+            handle_voice_target(server, client, voice_target.into()).await
+        }
+        Message::PermissionQuery(permission_query) => {
+            tracing::debug!(
+                session,
+                channel_id = permission_query.channel_id,
+                "handling PermissionQuery"
+            );
+            handle_permission_query(server, client, permission_query.into()).await
+        }
+        Message::CodecVersion(_) => {
+            tracing::debug!(session, "rejecting incoming CodecVersion");
+            Err(MessageTypeNotForIncoming::new(message).into())
+        }
+        Message::UserStats(user_stats) => {
+            tracing::debug!(session, target = user_stats.session, "handling UserStats");
+            handle_user_stats(server, client, user_stats.into()).await
+        }
+        Message::RequestBlob(request_blob) => {
+            tracing::debug!(
+                session,
+                textures = request_blob.session_texture.len(),
+                comments = request_blob.session_comment.len(),
+                "handling RequestBlob"
+            );
+            handle_request_blob(server, client, request_blob.into()).await
+        }
+        Message::ServerConfig(_) => {
+            tracing::debug!(session, "rejecting incoming ServerConfig");
+            Err(MessageTypeNotForIncoming::new(message).into())
+        }
+        Message::SuggestConfig(_) => {
+            tracing::debug!(session, "rejecting incoming SuggestConfig");
+            Err(MessageTypeNotForIncoming::new(message).into())
+        }
+        Message::PluginDataTransmission(plugin_data) => {
+            tracing::debug!(
+                session,
+                receivers = plugin_data.receiver_sessions.len(),
+                "handling PluginDataTransmission"
+            );
+            handle_plugin_data_transmission(server, client, plugin_data.into()).await
+        }
+    };
+
+    // Triage the result: auth rejections and permission denials are sent
+    // back to the client immediately; all other errors propagate.
+    match result {
+        Err(MessageHandlerError::ProtocolViolation(reason)) => {
+            use crate::messages::WriteMessageExt;
+            tracing::warn!(session, reason = %reason, "Protocol violation");
+            let reject = crate::errors::AuthRejection::new_with_language(
+                crate::messages::encoder::RejectType::None,
+                client.language(),
+            );
+            let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
+            let msg = crate::messages::Message::Reject(reject_msg.into());
+            client.write_proto_message(&msg).await?;
+            Err(MessageHandlerError::AuthRejection(reject))
+        }
+        Err(MessageHandlerError::AuthRejection(reject)) => {
+            use crate::messages::WriteMessageExt;
+            let reject_msg: crate::messages::encoder::Reject =
+                reject.clone().localized(client.language()).into();
+            let msg = crate::messages::Message::Reject(reject_msg.into());
+            client.write_proto_message(&msg).await?;
+            Err(MessageHandlerError::AuthRejection(reject))
+        }
+        Err(MessageHandlerError::PermissionDenied(mut deny)) => {
+            use crate::messages::WriteMessageExt;
+            if deny.reason.is_none() {
+                deny.reason = Some(crate::localization::permission_denied_reason(
+                    client.language(),
+                    deny.r#type,
+                ));
+            }
+            let msg: crate::messages::Message = deny.into();
+            client.write_proto_message(&msg).await?;
+            Ok(())
+        }
+        other => other,
     }
 }

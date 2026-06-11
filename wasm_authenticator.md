@@ -87,6 +87,8 @@ The request is JSON:
 
 The response buffer receives JSON containing `ok`, `status`, `status_text`, `headers`, `body`, and `error`. The return value is the response byte length. If the supplied response buffer is too small, the return value is the negative required length. Only `https://` URLs are allowed.
 
+Although the guest imports this as a normal core-WASM function, the host implementation is async. A call to `fetch` may yield the Wasmtime invocation while the HTTP request is in flight, then resume the guest with the same return-value contract.
+
 ## Host Cache And State Imports
 
 The host also provides these imports under both `env` and `shitspeak`:

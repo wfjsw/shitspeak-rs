@@ -101,7 +101,7 @@ async fn create_permanent_channel_propagates() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
@@ -183,7 +183,7 @@ async fn creating_temp_channel_moves_creator_into_it() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -247,7 +247,7 @@ async fn temp_channels_cannot_be_parents_for_create_or_reparent() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -279,7 +279,7 @@ async fn temp_channel_is_removed_after_last_user_moves_out() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -316,7 +316,7 @@ async fn temp_channel_is_removed_after_last_user_disconnects() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
@@ -359,10 +359,10 @@ async fn simultaneous_temporary_channels_get_distinct_ids() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
-        .register_user("bob", None, Some(2), vec!["admin".into()]);
+        .register_superuser("bob", None, Some(2), vec!["admin".into()]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -411,7 +411,7 @@ async fn temp_channel_log_gap_snapshot_removes_stale_channel_without_disconnect(
     .await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -508,7 +508,7 @@ async fn temp_channel_lagged_replay_when_already_current_is_recoverable() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -577,7 +577,7 @@ async fn update_channel_name_propagates() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
@@ -620,7 +620,7 @@ async fn remove_channel_migrates_users_to_parent() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);

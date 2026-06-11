@@ -26,7 +26,7 @@ async fn acl_denies_enter_for_non_admin() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
@@ -106,7 +106,7 @@ async fn superuser_respects_enter_when_debug_acl_enter_disabled() {
     .await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let chans = server.server.get_channels();
     chans
@@ -174,7 +174,7 @@ async fn superuser_ignores_enter_by_default() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let chans = server.server.get_channels();
     chans
@@ -228,7 +228,7 @@ async fn acl_query_returns_chain() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let chans = server.server.get_channels();
     chans
@@ -272,7 +272,7 @@ async fn acl_query_returns_inherited_entries_before_local_entries() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let chans = server.server.get_channels();
     chans
@@ -751,7 +751,7 @@ async fn traverse_visibility_reconciles_acl_changes() {
         .register_user("bob", None, Some(2), vec![]);
     server
         .authenticator
-        .register_user("carol", None, Some(3), vec!["admin".into()]);
+        .register_superuser("carol", None, Some(3), vec!["admin".into()]);
 
     let chans = server.server.get_channels();
     chans
@@ -1465,7 +1465,7 @@ async fn superuser_speak_and_whisper_follow_acl_evaluation() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -1628,17 +1628,17 @@ async fn acl_cache_group_and_user_id_changes_update_permissions() {
     let after_group = cached_permissions(&server, &bob, 58).await;
     assert!(!after_group.contains(ACLPermissions::Enter));
 
-    let admin_before = cached_permissions(&server, &bob, 0).await;
-    assert!(!admin_before.contains(ACLPermissions::Ban));
+    let superuser_before = cached_permissions(&server, &bob, 0).await;
+    assert!(!superuser_before.contains(ACLPermissions::Ban));
     {
         let mut gs = client.write_global_state_direct();
-        gs.set_groups(["admin".to_owned()].into_iter().collect());
+        gs.set_superuser(true);
     }
-    let admin_after = cached_permissions(&server, &bob, 0).await;
-    assert!(admin_after.contains(ACLPermissions::Ban));
+    let superuser_after = cached_permissions(&server, &bob, 0).await;
+    assert!(superuser_after.contains(ACLPermissions::Ban));
     {
         let mut gs = client.write_global_state_direct();
-        gs.set_groups(std::collections::HashSet::new());
+        gs.set_superuser(false);
     }
 
     chans

@@ -17,7 +17,7 @@ async fn tree_burst_includes_all_channels() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
@@ -79,7 +79,7 @@ async fn tree_create_propagates_to_peer() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
@@ -121,7 +121,7 @@ async fn tree_remove_propagates_to_peer() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);

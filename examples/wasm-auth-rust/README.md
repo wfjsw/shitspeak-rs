@@ -15,8 +15,10 @@ authenticator_wasm_path = "examples/wasm-auth-rust/target/wasm32-unknown-unknown
 
 Local demo behavior:
 
-- `admin` with password `secret` is accepted as user `1` with the `admin` group.
+- `admin` with password `secret` is accepted as user `1` with the `admin` group and superuser privileges.
 - `guest` is accepted as a guest user.
 - usernames starting with `fetch:` call the host HTTPS `fetch` import as an example external auth flow.
+
+The host runs authenticator calls on Wasmtime's async engine. The Rust export functions keep the required pointer/length ABI, while the example policy and fetch helpers are async internally.
 
 Responses may include `max_bandwidth` to override the configured bandwidth limit for that authenticated client.

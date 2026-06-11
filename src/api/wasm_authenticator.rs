@@ -81,6 +81,7 @@ impl Authenticator for DemoAuthenticator {
             user_id: None,
             display_name: Some(username.to_owned()),
             groups,
+            is_superuser: username == "admin",
             virtual_server_id: None,
             language: Language::default(),
             max_bandwidth: None,
@@ -346,6 +347,7 @@ impl Authenticator for WasmAuthenticator {
                     .clone()
                     .or_else(|| Some(claims.username.clone())),
                 groups: claims.groups.clone(),
+                is_superuser: false,
                 virtual_server_id: None,
                 language: Language::default(),
                 max_bandwidth: None,
@@ -1144,6 +1146,8 @@ struct WasmAuthenticateResponse {
     #[serde(default)]
     groups: Vec<String>,
     #[serde(default)]
+    is_superuser: bool,
+    #[serde(default)]
     virtual_server_id: Option<String>,
     #[serde(default)]
     language: Option<String>,
@@ -1170,6 +1174,7 @@ impl WasmAuthenticateResponse {
             user_id: self.user_id,
             display_name: self.display_name,
             groups: self.groups,
+            is_superuser: self.is_superuser,
             virtual_server_id: self.virtual_server_id,
             language: self
                 .language

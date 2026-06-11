@@ -32,6 +32,7 @@ pub struct ClientGlobalState {
     // ── User identity ─────────────────────────────────────────────────────
     user_id: Option<u32>,
     groups: HashSet<String>,
+    is_superuser: bool,
     tokens: HashSet<String>,
     display_name: Option<String>,
     acl_generation: u64,
@@ -64,6 +65,7 @@ impl ClientGlobalState {
 
             user_id: None,
             groups: HashSet::new(),
+            is_superuser: false,
             tokens: HashSet::new(),
             display_name: None,
             acl_generation: 0,
@@ -370,6 +372,21 @@ impl ClientGlobalState {
 
     pub fn has_group(&self, group: &str) -> bool {
         self.groups.contains(&group.to_string())
+    }
+
+    pub fn is_superuser(&self) -> bool {
+        self.is_superuser
+    }
+
+    pub fn set_superuser(&mut self, value: bool) {
+        if self.is_superuser == value {
+            return;
+        }
+        self.is_superuser = value;
+        self.bump_acl_generation();
+        if self.delta_recording {
+            self.pending_delta.is_superuser = Some(value);
+        }
     }
 
     pub fn add_group(&mut self, group: String) {

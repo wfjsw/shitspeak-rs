@@ -93,6 +93,7 @@ pub struct ClientGlobalStateDelta {
     // User identity
     pub user_id: Option<Option<u32>>,
     pub groups: Option<HashSet<String>>,
+    pub is_superuser: Option<bool>,
     pub tokens: Option<HashSet<String>>,
     pub display_name: Option<Option<String>>,
 }
@@ -120,6 +121,7 @@ impl ClientGlobalStateDelta {
             comment_hash: Some(state.get_comment_hash().map(ToOwned::to_owned)),
             user_id: Some(state.get_user_id()),
             groups: Some(state.get_groups().clone()),
+            is_superuser: Some(state.is_superuser()),
             tokens: Some(state.get_tokens().clone()),
             display_name: Some(state.get_display_name_opt().map(ToOwned::to_owned)),
         }
@@ -145,6 +147,7 @@ impl ClientGlobalStateDelta {
             || self.comment_hash.is_some()
             || self.user_id.is_some()
             || self.groups.is_some()
+            || self.is_superuser.is_some()
             || self.tokens.is_some()
             || self.display_name.is_some())
     }

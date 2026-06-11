@@ -18,6 +18,7 @@ pub struct AuthenticateResult {
     pub user_id: Option<u32>,
     pub display_name: Option<String>,
     pub groups: Vec<String>,
+    pub is_superuser: bool,
     /// Optional server-id scope selected by the authenticator.  Configured
     /// virtual-server entrypoints do not constrain this value.
     pub virtual_server_id: Option<String>,
@@ -81,6 +82,7 @@ pub trait Authenticator: Send + Sync + 'static {
                 .clone()
                 .or_else(|| Some(claims.username.clone())),
             groups: claims.groups.clone(),
+            is_superuser: false,
             virtual_server_id: None,
             language: Language::default(),
             max_bandwidth: None,

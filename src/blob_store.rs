@@ -177,13 +177,12 @@ impl SessionBlobStore {
     pub async fn open(dir: &Path) -> io::Result<Self> {
         let root = dir.join("session_blobs");
         fs::create_dir_all(&root).await?;
-        let http_client =
-            http_client::build_with_webpki_fallback(SESSION_BLOB_HTTP_TIMEOUT, "session blob store")
-                .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok(Self {
-            root,
-            http_client,
-        })
+        let http_client = http_client::build_with_webpki_fallback(
+            SESSION_BLOB_HTTP_TIMEOUT,
+            "session blob store",
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(Self { root, http_client })
     }
 
     /// Store `data` and return its SHA-1 key. No-op if the blob already exists.

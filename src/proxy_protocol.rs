@@ -5,18 +5,58 @@ use tokio::io::ReadBuf;
 
 use crate::errors::ProxyProtocolHeaderTooLargeError;
 
+#[derive(Clone, Copy, Debug)]
+pub struct ProxiedClientAddress {
+    ip: std::net::IpAddr,
+    port: u16,
+}
+
+impl ProxiedClientAddress {
+    pub fn ip(&self) -> std::net::IpAddr {
+        self.ip
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
 pub fn convert_v1_addresses_to_ipaddr(addresses: ppp::v1::Addresses) -> Option<std::net::IpAddr> {
+    convert_v1_addresses_to_client_address(addresses).map(|addr| addr.ip())
+}
+
+pub fn convert_v1_addresses_to_client_address(
+    addresses: ppp::v1::Addresses,
+) -> Option<ProxiedClientAddress> {
     match addresses {
-        ppp::v1::Addresses::Tcp4(addr) => Some(std::net::IpAddr::V4(addr.source_address)),
-        ppp::v1::Addresses::Tcp6(addr) => Some(std::net::IpAddr::V6(addr.source_address)),
+        ppp::v1::Addresses::Tcp4(addr) => Some(ProxiedClientAddress {
+            ip: std::net::IpAddr::V4(addr.source_address),
+            port: addr.source_port,
+        }),
+        ppp::v1::Addresses::Tcp6(addr) => Some(ProxiedClientAddress {
+            ip: std::net::IpAddr::V6(addr.source_address),
+            port: addr.source_port,
+        }),
         _ => None,
     }
 }
 
 pub fn convert_v2_addresses_to_ipaddr(addresses: ppp::v2::Addresses) -> Option<std::net::IpAddr> {
+    convert_v2_addresses_to_client_address(addresses).map(|addr| addr.ip())
+}
+
+pub fn convert_v2_addresses_to_client_address(
+    addresses: ppp::v2::Addresses,
+) -> Option<ProxiedClientAddress> {
     match addresses {
-        ppp::v2::Addresses::IPv4(addr) => Some(std::net::IpAddr::V4(addr.source_address)),
-        ppp::v2::Addresses::IPv6(addr) => Some(std::net::IpAddr::V6(addr.source_address)),
+        ppp::v2::Addresses::IPv4(addr) => Some(ProxiedClientAddress {
+            ip: std::net::IpAddr::V4(addr.source_address),
+            port: addr.source_port,
+        }),
+        ppp::v2::Addresses::IPv6(addr) => Some(ProxiedClientAddress {
+            ip: std::net::IpAddr::V6(addr.source_address),
+            port: addr.source_port,
+        }),
         _ => None,
     }
 }
@@ -53,6 +93,14 @@ impl std::error::Error for GetProxyProtocolRealIpError {}
 pub async fn get_proxy_protocol_real_ip(
     tcp_stream: &tokio::net::TcpStream,
 ) -> Result<Option<std::net::IpAddr>, GetProxyProtocolRealIpError> {
+    Ok(get_proxy_protocol_client_address(tcp_stream)
+        .await?
+        .map(|addr| addr.ip()))
+}
+
+pub async fn get_proxy_protocol_client_address(
+    tcp_stream: &tokio::net::TcpStream,
+) -> Result<Option<ProxiedClientAddress>, GetProxyProtocolRealIpError> {
     let mut buffer = Vec::with_capacity(1600);
     let header = {
         let mut read = 0;
@@ -79,8 +127,12 @@ pub async fn get_proxy_protocol_real_ip(
     };
 
     match header {
-        HeaderResult::V2(Ok(header)) => Ok(convert_v2_addresses_to_ipaddr(header.addresses)),
-        HeaderResult::V1(Ok(header)) => Ok(convert_v1_addresses_to_ipaddr(header.addresses)),
+        HeaderResult::V2(Ok(header)) => {
+            Ok(convert_v2_addresses_to_client_address(header.addresses))
+        }
+        HeaderResult::V1(Ok(header)) => {
+            Ok(convert_v1_addresses_to_client_address(header.addresses))
+        }
         _ => Ok(None),
     }
 }

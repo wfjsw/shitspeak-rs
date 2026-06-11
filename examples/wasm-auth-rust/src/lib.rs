@@ -1,7 +1,9 @@
 use std::alloc::{alloc as raw_alloc, dealloc as raw_dealloc, Layout};
 use std::collections::HashMap;
+use std::future::Future;
 use std::ptr;
 use std::slice;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +41,13 @@ pub extern "C" fn dealloc(ptr: i32, len: i32) {
 
 #[no_mangle]
 pub extern "C" fn authenticate(ptr: i32, len: i32) -> u64 {
+    poll_wasm_future(authenticate_async(ptr, len)).unwrap_or_else(|| {
+        log(2, "authenticator future yielded unexpectedly");
+        write_json(&AuthenticateResponse::reject("retry_later"))
+    })
+}
+
+async fn authenticate_async(ptr: i32, len: i32) -> u64 {
     let request = match read_json::<AuthenticateRequest>(ptr, len) {
         Ok(request) => request,
         Err(error) => {
@@ -53,6 +62,7 @@ pub extern "C" fn authenticate(ptr: i32, len: i32) -> u64 {
                 Some(1),
                 "Admin",
                 vec!["admin".to_owned()],
+                true,
             ))
         } else {
             write_json(&AuthenticateResponse::reject("wrong_password"))
@@ -60,14 +70,18 @@ pub extern "C" fn authenticate(ptr: i32, len: i32) -> u64 {
     }
 
     if request.username == "guest" {
-        return write_json(&AuthenticateResponse::accept(None, "guest", Vec::new()));
+        return write_json(&AuthenticateResponse::accept(
+            None,
+            "guest",
+            Vec::new(),
+            false,
+        ));
     }
 
     if let Some(remote_username) = request.username.strip_prefix("fetch:") {
-        return write_json(&authenticate_with_fetch(
-            remote_username,
-            request.password.as_deref(),
-        ));
+        return write_json(
+            &authenticate_with_fetch(remote_username, request.password.as_deref()).await,
+        );
     }
 
     write_json(&AuthenticateResponse::reject("no_such_user"))
@@ -75,6 +89,13 @@ pub extern "C" fn authenticate(ptr: i32, len: i32) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn language(ptr: i32, len: i32) -> u64 {
+    poll_wasm_future(language_async(ptr, len)).unwrap_or_else(|| {
+        log(2, "language future yielded unexpectedly");
+        write_json(&LanguageResponse { language: "en" })
+    })
+}
+
+async fn language_async(ptr: i32, len: i32) -> u64 {
     let language = read_json::<LanguageRequest>(ptr, len)
         .ok()
         .and_then(|request| request.username)
@@ -84,7 +105,7 @@ pub extern "C" fn language(ptr: i32, len: i32) -> u64 {
     write_json(&LanguageResponse { language })
 }
 
-fn authenticate_with_fetch(username: &str, password: Option<&str>) -> AuthenticateResponse {
+async fn authenticate_with_fetch(username: &str, password: Option<&str>) -> AuthenticateResponse {
     let request_body = serde_json::json!({
         "username": username,
         "password": password,
@@ -100,7 +121,7 @@ fn authenticate_with_fetch(username: &str, password: Option<&str>) -> Authentica
         timeout_ms: 5_000,
     };
 
-    let response = match fetch_json(fetch_request) {
+    let response = match fetch_json(fetch_request).await {
         Ok(response) => response,
         Err(error) => {
             log(2, &format!("fetch auth failed: {error}"));
@@ -119,7 +140,7 @@ fn authenticate_with_fetch(username: &str, password: Option<&str>) -> Authentica
         .unwrap_or_else(|_| AuthenticateResponse::reject("retry_later"))
 }
 
-fn fetch_json(request: FetchRequest) -> Result<FetchResponse, String> {
+async fn fetch_json(request: FetchRequest) -> Result<FetchResponse, String> {
     let request_json = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let mut response = vec![0u8; 64 * 1024];
     let mut written = unsafe {
@@ -191,6 +212,35 @@ fn layout_for(len: i32) -> Option<Layout> {
     Layout::from_size_align((len as usize).max(1), 1).ok()
 }
 
+fn poll_wasm_future<F>(future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(output) => Some(output),
+        Poll::Pending => None,
+    }
+}
+
+fn noop_waker() -> Waker {
+    unsafe { Waker::from_raw(noop_raw_waker()) }
+}
+
+fn noop_raw_waker() -> RawWaker {
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        noop_raw_waker()
+    }
+    unsafe fn wake(_: *const ()) {}
+    unsafe fn wake_by_ref(_: *const ()) {}
+    unsafe fn drop(_: *const ()) {}
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    RawWaker::new(ptr::null(), &VTABLE)
+}
+
 #[derive(Deserialize)]
 struct AuthenticateRequest {
     username: String,
@@ -215,6 +265,7 @@ struct AuthenticateResponse {
     user_id: Option<u32>,
     display_name: Option<String>,
     groups: Vec<String>,
+    is_superuser: bool,
     virtual_server_id: Option<String>,
     language: String,
     max_bandwidth: Option<u32>,
@@ -223,13 +274,19 @@ struct AuthenticateResponse {
 }
 
 impl AuthenticateResponse {
-    fn accept(user_id: Option<u32>, display_name: &str, groups: Vec<String>) -> Self {
+    fn accept(
+        user_id: Option<u32>,
+        display_name: &str,
+        groups: Vec<String>,
+        is_superuser: bool,
+    ) -> Self {
         Self {
             accepted: true,
             rejection: None,
             user_id,
             display_name: Some(display_name.to_owned()),
             groups,
+            is_superuser,
             virtual_server_id: None,
             language: "en".to_owned(),
             max_bandwidth: None,
@@ -245,6 +302,7 @@ impl AuthenticateResponse {
             user_id: None,
             display_name: None,
             groups: Vec::new(),
+            is_superuser: false,
             virtual_server_id: None,
             language: "en".to_owned(),
             max_bandwidth: None,

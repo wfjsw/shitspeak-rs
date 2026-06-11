@@ -19,6 +19,7 @@ struct ScriptedUser {
     password: Option<String>,
     user_id: Option<u32>,
     groups: Vec<String>,
+    is_superuser: bool,
     language: Language,
     virtual_server_id: Option<String>,
     max_bandwidth: Option<u32>,
@@ -46,6 +47,25 @@ impl TestAuthenticator {
         self.register_user_with_language(name, password, user_id, groups, Language::default());
     }
 
+    pub fn register_superuser(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+    ) {
+        self.register_user_with_options(
+            name,
+            password,
+            user_id,
+            groups,
+            true,
+            Language::default(),
+            None,
+            None,
+        );
+    }
+
     pub fn register_user_with_max_bandwidth(
         &self,
         name: &str,
@@ -59,6 +79,7 @@ impl TestAuthenticator {
             password,
             user_id,
             groups,
+            false,
             Language::default(),
             None,
             max_bandwidth,
@@ -90,6 +111,7 @@ impl TestAuthenticator {
             password,
             user_id,
             groups,
+            false,
             language,
             virtual_server_id,
             None,
@@ -102,6 +124,7 @@ impl TestAuthenticator {
         password: Option<&str>,
         user_id: Option<u32>,
         groups: Vec<String>,
+        is_superuser: bool,
         language: Language,
         virtual_server_id: Option<&str>,
         max_bandwidth: Option<u32>,
@@ -112,6 +135,7 @@ impl TestAuthenticator {
                 password: password.map(str::to_owned),
                 user_id,
                 groups,
+                is_superuser,
                 language,
                 virtual_server_id: virtual_server_id.map(str::to_owned),
                 max_bandwidth,
@@ -148,6 +172,7 @@ impl Authenticator for AuthenticatorAdapter {
             user_id: entry.user_id,
             display_name: Some(username.to_owned()),
             groups: entry.groups,
+            is_superuser: entry.is_superuser,
             virtual_server_id: entry.virtual_server_id,
             language: entry.language,
             max_bandwidth: entry.max_bandwidth,

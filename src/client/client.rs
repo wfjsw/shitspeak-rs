@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
@@ -59,6 +60,19 @@ pub(crate) fn random_client_instance_id() -> ClientInstanceId {
     }
 }
 
+fn client_tracing_span(
+    session_id: ClientSessionIdentifier,
+    real_ip_address: IpAddr,
+    tcp_address: SocketAddr,
+) -> tracing::Span {
+    tracing::info_span!(
+        "client",
+        client_ip = %real_ip_address,
+        client_port = tcp_address.port(),
+        session = u32::from(session_id),
+    )
+}
+
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +98,7 @@ pub struct Client {
     /// bind/unbind paths write it only on rare events.
     udp_address: ParkingRwLock<Option<SocketAddr>>,
     local_address: SocketAddr,
+    tracing_span: tracing::Span,
 
     transport: ClientTransport,
     disconnect_tx: watch::Sender<bool>,
@@ -254,6 +269,7 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
+            tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
             transport: ClientTransport::NativeTls {
                 rx: AsyncMutex::new(connection_rx),
                 tx: AsyncMutex::new(connection_tx),
@@ -410,6 +426,7 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(None),
             local_address,
+            tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
             transport: ClientTransport::WebGateway { kind, outbound_tx },
             disconnect_tx,
             disconnect_rx,
@@ -487,6 +504,7 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
+            tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
             transport: ClientTransport::Remote,
             disconnect_tx,
             disconnect_rx,
@@ -629,6 +647,7 @@ impl Client {
     pub fn set_scoped_identity(&self, server_id: String, session_id: ClientSessionIdentifier) {
         *self.server_id.write() = server_id;
         *self.session_id.write() = session_id;
+        self.record_tracing_span_session();
     }
 
     pub fn get_node_id(&self) -> u16 {
@@ -708,6 +727,28 @@ impl Client {
         self.real_ip_address
     }
 
+    pub(crate) fn tracing_span(&self) -> tracing::Span {
+        self.tracing_span.clone()
+    }
+
+    pub(crate) async fn in_tracing_span<F, T>(&self, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        use tracing::Instrument as _;
+
+        future.instrument(self.tracing_span()).await
+    }
+
+    pub(crate) fn in_tracing_scope<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.tracing_span.in_scope(f)
+    }
+
+    fn record_tracing_span_session(&self) {
+        self.tracing_span
+            .record("session", u32::from(self.get_session_id()));
+    }
+
     pub fn get_login_time(&self) -> DateTime<Utc> {
         self.login_time
     }
@@ -735,6 +776,10 @@ impl Client {
     }
 
     pub async fn read_proto_message(&self) -> Result<Message, ReadProtoMessageError> {
+        self.in_tracing_span(self.read_proto_message_inner()).await
+    }
+
+    async fn read_proto_message_inner(&self) -> Result<Message, ReadProtoMessageError> {
         let ClientTransport::NativeTls { rx, .. } = &self.transport else {
             return Err(transport_not_readable_error().into());
         };
@@ -749,6 +794,14 @@ impl Client {
     }
 
     pub async fn write_proto_message(
+        &self,
+        message: &Message,
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.write_proto_message_inner(message))
+            .await
+    }
+
+    async fn write_proto_message_inner(
         &self,
         message: &Message,
     ) -> Result<(), WriteProtoMessageError> {
@@ -771,6 +824,14 @@ impl Client {
     }
 
     pub async fn write_proto_message_batch(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.write_proto_message_batch_inner(messages))
+            .await
+    }
+
+    async fn write_proto_message_batch_inner(
         &self,
         messages: &[Message],
     ) -> Result<(), WriteProtoMessageError> {
@@ -940,10 +1001,8 @@ impl Client {
 
     /// Returns `true` if this client has superuser privileges.
     ///
-    /// A client is a superuser if they are authenticated and belong to the
-    /// `admin` group.
     pub fn is_superuser(&self) -> bool {
-        self.has_group("admin")
+        self.global_state.read().is_superuser()
     }
 
     pub fn set_authenticated(&self, value: bool) {

@@ -1,3 +1,4 @@
+#[cfg(feature = "moq")]
 pub mod moq;
 pub mod peer;
 pub mod protocol;

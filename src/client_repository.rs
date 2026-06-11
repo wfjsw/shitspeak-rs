@@ -965,7 +965,7 @@ impl ClientRepository {
                 continue;
             }
             if let Err(e) = client.write_proto_message(message).await {
-                tracing::warn!("broadcast_all write error: {e}");
+                client.in_tracing_scope(|| tracing::warn!("broadcast_all write error: {e}"));
             }
         }
     }
@@ -993,7 +993,7 @@ impl ClientRepository {
                 continue;
             }
             if let Err(e) = client.write_proto_message(message).await {
-                tracing::warn!("broadcast_except write error: {e}");
+                client.in_tracing_scope(|| tracing::warn!("broadcast_except write error: {e}"));
             }
         }
     }
@@ -1022,7 +1022,8 @@ impl ClientRepository {
                 continue;
             }
             if let Err(e) = client.write_proto_message_batch(messages).await {
-                tracing::warn!("broadcast_batch_except write error: {e}");
+                client
+                    .in_tracing_scope(|| tracing::warn!("broadcast_batch_except write error: {e}"));
             }
         }
     }
@@ -1456,7 +1457,7 @@ impl ClientRepository {
         match client {
             Some(c) => {
                 if let Err(e) = c.write_proto_message(message).await {
-                    tracing::warn!("send_to {id:?} write error: {e}");
+                    c.in_tracing_scope(|| tracing::warn!("send_to {id:?} write error: {e}"));
                     false
                 } else {
                     true
@@ -2593,6 +2594,9 @@ pub(crate) fn apply_delta_to_global_state(
     }
     if let Some(ref v) = delta.groups {
         gs.set_groups(v.clone());
+    }
+    if let Some(v) = delta.is_superuser {
+        gs.set_superuser(v);
     }
     if let Some(ref v) = delta.tokens {
         gs.set_tokens(v.clone());

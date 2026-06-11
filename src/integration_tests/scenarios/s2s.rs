@@ -222,7 +222,7 @@ async fn add_s2s_peer_address(server: &TestServer, node_id: u16, port: u16) {
 
 fn register_pair_users(a: &TestServer, b: &TestServer) {
     a.authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     b.authenticator.register_user("bob", None, Some(2), vec![]);
 }
 
@@ -1256,7 +1256,7 @@ async fn s2s_client_replication_catches_up_when_second_node_starts_later() {
     )
     .await;
     a.authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     let alice = TestClient::connect_and_authenticate(&a, "alice", None)
         .await
         .expect("alice");
@@ -1319,7 +1319,7 @@ async fn s2s_client_replication_catches_up_preexisting_clients_when_node_joins_o
     wait_for_s2s_cluster(&[(&a, 1), (&c, 3)]).await;
 
     a.authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     let alice = TestClient::connect_and_authenticate(&a, "alice", None)
         .await
         .expect("alice");
@@ -1387,7 +1387,7 @@ async fn s2s_client_replication_catches_up_with_demo_transport_mix() {
     )
     .await;
     a.authenticator
-        .register_user("alice", None, Some(1), vec!["admin".into()]);
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
     let alice = TestClient::connect_and_authenticate(&a, "alice", None)
         .await
         .expect("alice");

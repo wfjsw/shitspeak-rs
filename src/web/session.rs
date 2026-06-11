@@ -181,6 +181,22 @@ pub async fn configure_authenticated_client(
     result: AuthenticateResult,
     cache_username: Option<&str>,
 ) {
+    client
+        .in_tracing_span(configure_authenticated_client_inner(
+            server,
+            client,
+            result,
+            cache_username,
+        ))
+        .await
+}
+
+async fn configure_authenticated_client_inner(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    result: AuthenticateResult,
+    cache_username: Option<&str>,
+) {
     let channel_cache_key =
         crate::user_channel_cache::user_channel_cache_key(result.user_id, cache_username);
     client.set_language(result.language);
@@ -190,6 +206,7 @@ pub async fn configure_authenticated_client(
         let mut gs = client.write_global_state(server.get_clients());
         gs.set_user_id(result.user_id);
         gs.set_display_name(result.display_name);
+        gs.set_superuser(result.is_superuser);
         gs.set_groups(result.groups.into_iter().collect());
     }
     if let Some(username) = cache_username {

@@ -15,7 +15,6 @@ use crate::api::{
 use crate::channel_handler::SessionChannelShadow;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::ClientStateOperation;
-use crate::client::user_info::Credential;
 use crate::client::visibility::UserVisibilityState;
 use crate::client::{AsyncMessageHandlerExt, Client};
 use crate::config::{WebAuthMode, WebConfig};
@@ -1171,11 +1170,13 @@ async fn handle_signaling_client_command(
     match client.handle_message(server, message).await {
         Ok(()) => Ok(()),
         Err(error) => {
-            tracing::warn!(
-                session = session.session_id,
-                error = %error,
-                "web control command failed"
-            );
+            client.in_tracing_scope(|| {
+                tracing::warn!(
+                    session = session.session_id,
+                    error = %error,
+                    "web control command failed"
+                );
+            });
             send_websocket_error(stream, &format!("control command failed: {error}")).await
         }
     }
@@ -1233,8 +1234,6 @@ async fn handle_successful_password_auth(
     cache_username: Option<&str>,
 ) -> io::Result<()> {
     let display_name = result.display_name.clone();
-    let channel_cache_key =
-        crate::user_channel_cache::user_channel_cache_key(result.user_id, cache_username);
     let mut initial_state_client = None;
     if let Some(server) = context.server.as_ref() {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<Message>(256);
@@ -1253,75 +1252,13 @@ async fn handle_successful_password_auth(
             .await;
         session.session_id = u32::from(client.get_session_id());
         session.outbound_rx = Some(outbound_rx);
-
-        client.set_language(result.language);
-        client.set_max_bandwidth(result.max_bandwidth);
-        client.set_protocol_version(Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)));
-        {
-            let mut gs = client.write_global_state(server.get_clients());
-            gs.set_user_id(result.user_id);
-            gs.set_display_name(result.display_name);
-            gs.set_groups(result.groups.into_iter().collect());
-        }
-        if let Some(username) = cache_username {
-            let mut ext = client.user_info_extended().await;
-            ext.set_credential(Credential::new(username.to_owned(), None));
-        }
-
-        let server_id = client.server_id();
-        let restored_channels = crate::user_channel_cache::resolve_login_channels(
+        crate::web::session::configure_authenticated_client(
             server,
             &client,
-            channel_cache_key.as_deref(),
+            result,
+            cache_username,
         )
         .await;
-        let target_ch = restored_channels.current_channel_id;
-        client.set_current_channel_id(
-            target_ch,
-            server.get_clients(),
-            server.get_channels().current_version_in_server(&server_id),
-        );
-        if !restored_channels.listening_channel_ids.is_empty() {
-            let mut gs = client.write_global_state(server.get_clients());
-            for channel_id in &restored_channels.listening_channel_ids {
-                gs.listen_channel(*channel_id);
-            }
-        }
-        if let Some(cache_key) = channel_cache_key.as_deref() {
-            if let Err(error) = server
-                .get_user_channel_cache()
-                .remember_last_channel(cache_key, target_ch)
-                .await
-            {
-                tracing::warn!(
-                    error = %error,
-                    cache_key,
-                    "failed to stage user last channel cache"
-                );
-            }
-            if !restored_channels.listening_channel_ids.is_empty() {
-                if let Err(error) = server
-                    .get_user_channel_cache()
-                    .remember_listening_channels(
-                        cache_key,
-                        restored_channels.listening_channel_ids.iter().copied(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        cache_key,
-                        "failed to stage user listening channel cache"
-                    );
-                }
-            }
-        }
-        client.set_authenticated(true);
-        server
-            .get_clients()
-            .publish_client_in_server(&server_id, client.get_session_id())
-            .await;
-        crate::voice::spawn_voice_routing_task(Arc::clone(server), Arc::clone(&client));
         initial_state_client = Some((Arc::clone(server), Arc::clone(&client)));
         session.client = Some(client);
     }
@@ -2623,6 +2560,7 @@ mod tests {
                 user_id: Some(7),
                 display_name: Some("Alice".to_string()),
                 groups: vec!["web".to_string()],
+                is_superuser: false,
                 virtual_server_id: None,
                 language: Language::default(),
                 max_bandwidth: None,

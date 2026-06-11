@@ -52,6 +52,7 @@ class AuthenticateResponse {
   @omitnull()
   display_name: string | null = null;
   groups: string[] = [];
+  is_superuser: bool = false;
   @omitnull()
   virtual_server_id: string | null = null;
   language: string = "en";
@@ -99,6 +100,7 @@ export function authenticate(ptr: i32, len: i32): u64 {
       resp.user_id = new JSON.Box<i32>(1);
       resp.display_name = "Admin";
       resp.groups = ["admin"];
+      resp.is_superuser = true;
       return writeResponse(resp);
     }
     return writeResponse(mkReject("wrong_password"));

@@ -39,6 +39,7 @@ mod types;
 mod user_channel_cache;
 mod utils;
 mod voice;
+#[cfg(feature = "web")]
 mod web;
 
 mod mumble_proto {
@@ -69,6 +70,7 @@ mod s2s_application_proto {
 async fn main() {
     if let Err(e) = run().await {
         eprintln!("error: {e}");
+        logging::flush();
         std::process::exit(1);
     }
 }
@@ -78,7 +80,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    logging::init("shitspeak-rs")?;
+    let logging_guard = logging::init("shitspeak-rs")?;
 
     // Probe the AES + GF(2^128) backends once at launch (each logs its
     // choice via `tracing::info!`).
@@ -127,6 +129,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => tracing::warn!("Received Ctrl-C again, forcing shutdown."),
                 Err(e) => tracing::error!("Failed to listen for additional Ctrl-C: {e}"),
             }
+            logging_guard.flush();
             std::process::exit(130);
         }
     }

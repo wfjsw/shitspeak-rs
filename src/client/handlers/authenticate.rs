@@ -252,6 +252,7 @@ pub async fn handle_authenticate(
         let mut gs = sender.write_global_state(repo);
         gs.set_user_id(result.user_id);
         gs.set_display_name(result.display_name);
+        gs.set_superuser(result.is_superuser);
         gs.set_groups(result.groups.into_iter().collect());
         gs.set_texture_blob(texture_url, texture_hash);
         gs.set_comment_blob(comment_url, comment_hash);

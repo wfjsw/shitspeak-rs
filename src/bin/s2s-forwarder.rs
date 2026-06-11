@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    logging::init("s2s-forwarder")?;
+    let _logging_guard = logging::init("s2s-forwarder")?;
 
     run().await
 }

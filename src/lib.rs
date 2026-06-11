@@ -38,6 +38,7 @@ pub mod types;
 pub mod user_channel_cache;
 pub mod utils;
 pub mod voice;
+#[cfg(feature = "web")]
 pub mod web;
 
 #[cfg(test)]

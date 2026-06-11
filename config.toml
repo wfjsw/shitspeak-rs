@@ -235,6 +235,7 @@ enabled = false
 # bearer_token = "token"
 batch_size = 128
 flush_interval_ms = 1000
+level = "debug"
 queue_capacity = 4096
 request_timeout_ms = 5000
 labels = { environment = "local" }

@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use tracing::Instrument;
 
 use super::codec::{self, Audio, PacketFormat};
 use super::routing_queue::VoiceRoutingPayload;
@@ -841,25 +842,31 @@ pub(crate) async fn flush_voice_batch(
 /// it does not prevent the client from being dropped — when all strong `Arc`s
 /// are gone the weak upgrade fails, the loop exits, and the task cleans up.
 pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client>>) {
+    let span = sender.tracing_span();
     let mut rx = match sender.take_voice_routing_rx() {
         Some(rx) => rx,
         None => {
-            tracing::warn!(
-                session = u32::from(sender.get_session_id()),
-                "voice routing task already spawned"
-            );
+            span.in_scope(|| {
+                tracing::warn!(
+                    session = u32::from(sender.get_session_id()),
+                    "voice routing task already spawned"
+                );
+            });
             return;
         }
     };
     let weak_sender = Arc::downgrade(&sender);
-    tokio::spawn(async move {
-        while let Some(payload) = rx.recv().await {
-            let Some(sender) = weak_sender.upgrade() else {
-                break;
-            };
-            route_voice(&server, &sender, &payload.decoded_audio).await;
+    tokio::spawn(
+        async move {
+            while let Some(payload) = rx.recv().await {
+                let Some(sender) = weak_sender.upgrade() else {
+                    break;
+                };
+                route_voice(&server, &sender, &payload.decoded_audio).await;
+            }
         }
-    });
+        .instrument(span),
+    );
 }
 
 /// Spawn a per-user voice TCP send task.
@@ -873,33 +880,39 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
 /// Holds a `Weak` reference to the client so the task does not prevent
 /// client drop; on a failed upgrade or a write error, the task exits.
 pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
+    let span = client.tracing_span();
     let mut rx = match client.take_voice_tcp_rx() {
         Some(rx) => rx,
         None => {
-            tracing::warn!(
-                session = u32::from(client.get_session_id()),
-                "voice TCP send task already spawned"
-            );
+            span.in_scope(|| {
+                tracing::warn!(
+                    session = u32::from(client.get_session_id()),
+                    "voice TCP send task already spawned"
+                );
+            });
             return;
         }
     };
     let weak_client = Arc::downgrade(&client);
-    tokio::spawn(async move {
-        while let Some(raw) = rx.recv().await {
-            let Some(client) = weak_client.upgrade() else {
-                break;
-            };
-            let message = crate::messages::Message::UDPTunnel(raw);
-            if let Err(e) = client.write_proto_message(&message).await {
-                tracing::trace!(
-                    session = u32::from(client.get_session_id()),
-                    error = %e,
-                    "voice TCP send failed, terminating send task"
-                );
-                break;
+    tokio::spawn(
+        async move {
+            while let Some(raw) = rx.recv().await {
+                let Some(client) = weak_client.upgrade() else {
+                    break;
+                };
+                let message = crate::messages::Message::UDPTunnel(raw);
+                if let Err(e) = client.write_proto_message(&message).await {
+                    tracing::trace!(
+                        session = u32::from(client.get_session_id()),
+                        error = %e,
+                        "voice TCP send failed, terminating send task"
+                    );
+                    break;
+                }
             }
         }
-    });
+        .instrument(span),
+    );
 }
 
 /// Collect all channel IDs in the subtree rooted at `root_id`.
