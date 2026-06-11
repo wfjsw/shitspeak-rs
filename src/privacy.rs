@@ -47,12 +47,13 @@ fn apply_reversible_certificate_hash_permutation(
     certificate_hash_hex: &str,
     reverse: bool,
 ) -> Option<String> {
-    use aes::cipher::KeyInit;
-
     let certificate_hash = hex::decode(certificate_hash_hex).ok()?;
     let mut state: [u8; CERTIFICATE_HASH_BYTES] = certificate_hash.as_slice().try_into().ok()?;
     let key = derive_certificate_hash_aes_key(secret);
-    let cipher = aes::Aes256::new_from_slice(&key).expect("AES-256 key length is fixed");
+    let unbound_key = aws_lc_rs::cipher::UnboundCipherKey::new(&aws_lc_rs::cipher::AES_256, &key)
+        .expect("AES-256 key length is fixed");
+    let cipher =
+        aws_lc_rs::cipher::EncryptingKey::ecb(unbound_key).expect("AES-256 ECB key is valid");
 
     let round_iter: Box<dyn Iterator<Item = u8>> = if reverse {
         Box::new((0..CERTIFICATE_HASH_FEISTEL_ROUNDS).rev())
@@ -93,18 +94,18 @@ fn derive_certificate_hash_aes_key(secret: &str) -> [u8; 32] {
 }
 
 fn certificate_hash_aes_round_output(
-    cipher: &aes::Aes256,
+    cipher: &aws_lc_rs::cipher::EncryptingKey,
     round: u8,
     half: &[u8; CERTIFICATE_HASH_FEISTEL_HALF_BYTES],
 ) -> [u8; CERTIFICATE_HASH_FEISTEL_HALF_BYTES] {
-    use aes::cipher::BlockEncrypt;
-
-    let mut block = aes::Block::default();
+    let mut block = [0u8; 16];
     block[..CERTIFICATE_HASH_AES_ROUND_CONTEXT.len()]
         .copy_from_slice(CERTIFICATE_HASH_AES_ROUND_CONTEXT);
     block[CERTIFICATE_HASH_AES_ROUND_CONTEXT.len()] = round;
     block[CERTIFICATE_HASH_AES_ROUND_CONTEXT.len() + 1..].copy_from_slice(half);
-    cipher.encrypt_block(&mut block);
+    cipher
+        .encrypt(&mut block)
+        .expect("AES-256 ECB encrypts one complete block");
 
     let mut out = [0u8; CERTIFICATE_HASH_FEISTEL_HALF_BYTES];
     out.copy_from_slice(&block[..CERTIFICATE_HASH_FEISTEL_HALF_BYTES]);

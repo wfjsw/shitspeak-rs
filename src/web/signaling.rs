@@ -6,7 +6,6 @@ use std::sync::Arc;
 use base64::Engine;
 use bytes::Bytes;
 use serde::Deserialize;
-use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::api::{
@@ -361,10 +360,11 @@ fn websocket_upgrade_key<'a>(request: &HttpRequest<'a>) -> Option<&'a str> {
 }
 
 fn websocket_accept_key(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(WEBSOCKET_ACCEPT_GUID.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+    let mut input = Vec::with_capacity(key.len() + WEBSOCKET_ACCEPT_GUID.len());
+    input.extend_from_slice(key.as_bytes());
+    input.extend_from_slice(WEBSOCKET_ACCEPT_GUID.as_bytes());
+    let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY, &input);
+    base64::engine::general_purpose::STANDARD.encode(hash.as_ref())
 }
 
 #[derive(Debug, Deserialize)]

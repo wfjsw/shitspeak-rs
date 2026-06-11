@@ -4,62 +4,60 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aes = "0.8.4"
-aws-lc-rs = "1.15.2"
-base64 = "0.22.1"
-bytes = { version = "1.11.0", features = ["serde"] }
-chrono = { version = "0.4.41", features = ["serde"] }
-cidr = "0.3.2"
-config = "0.15.19"
+aws-lc-rs = "1"
+base64 = "0"
+bytes = { version = "1", features = ["serde"] }
+chrono = { version = "0", features = ["serde"] }
+cidr = "0"
+config = "0"
 notify = "8"
-enumflags2 = { version = "0.7.12", features = ["serde"] }
-hex = "0.4.3"
-libc = "0.2"
-maxminddb = { version = "0.28.1", features = ["mmap", "simdutf8"] }
-num_enum = "0.7.5"
-paste = "1.0.15"
-ppp = "2.3.0"
-prost = "0.14.3"
-prost-types = "0.14.3"
-rustls = "0.23.35"
-serde = { version = "1.0.228", features = ["derive"] }
+enumflags2 = { version = "0", features = ["serde"] }
+hex = "0"
+libc = "0"
+maxminddb = { version = "0", features = ["mmap", "simdutf8"] }
+num_enum = "0"
+paste = "1"
+ppp = "2"
+prost = "0"
+prost-types = "0"
+rustls = "0"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.13.3", default-features = false, features = ["charset", "http2", "rustls", "stream"] }
-sha1 = "0.11.0"
-socket2 = { version = "0.6", features = ["all"] }
-thiserror = "2.0.17"
-tokio = { version = "1.45.0", features = ["full"] }
-tokio-rustls = "0.26.4"
+reqwest = { version = "0", default-features = false, features = ["charset", "http2", "rustls", "stream"] }
+socket2 = { version = "0", features = ["all"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0"
 tracing = "0.1"
-wasmtime = { version = "45.0.0", default-features = false, features = ["async", "cranelift", "parallel-compilation", "runtime"] }
-webpki-roots = "1.0.7"
-tracing-appender = { version = "0.2.4", features = ["parking_lot"] }
-tracing-subscriber = { version = "0.3.22", features = ["parking_lot", "serde", "env-filter", "registry"] }
-x509-parser = "0.18.1"
-zstd = "0.13.3"
+wasmtime = { version = "45", default-features = false, features = ["async", "cranelift", "parallel-compilation", "runtime"] }
+webpki-roots = "1"
+tracing-appender = { version = "0", features = ["parking_lot"] }
+tracing-subscriber = { version = "0", features = ["parking_lot", "serde", "env-filter", "registry"] }
+x509-parser = "0"
+zstd = "0"
 
 # local proc-macro to derive message helpers
 message_macro = { path = "src/messages/macros" }
-os_info = "3.14.0"
-async-trait = "0.1.89"
-rusqlite = { version = "0.39", features = ["bundled"] }
-parking_lot = { version = "0.12.5", features = ["arc_lock", "hardware-lock-elision", "owning_ref", "serde"] }
-scc = "3.7.1"
-quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
-tokio_kcp = "0.9"
+os_info = "3"
+async-trait = "0"
+rusqlite = { version = "0", features = ["bundled"] }
+parking_lot = { version = "0", features = ["arc_lock", "hardware-lock-elision", "owning_ref", "serde"] }
+scc = "3"
+quinn = { version = "0", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
+tokio_kcp = "0"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
-rand = "0.10.1"
+rand = "0.10"
 arc-swap = "1"
 rmp-serde = "1"
 rayon = "1"
-webrtc = { version = "0.17.1", optional = true }
-moq-lite = { version = "0.16.3", optional = true }
-moq-native = { version = "0.14.1", default-features = false, features = ["quinn", "aws-lc-rs"], optional = true }
-hang = { version = "0.16.0", optional = true }
+webrtc = { version = "0.17", optional = true }
+moq-lite = { version = "0.16", optional = true }
+moq-native = { version = "0.14", default-features = false, features = ["quinn", "aws-lc-rs"], optional = true }
+hang = { version = "0.16", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
