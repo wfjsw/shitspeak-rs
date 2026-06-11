@@ -125,6 +125,7 @@ pub(crate) async fn build_visible_user_state(
         state.listening_channel_add = sorted_channels(&listener_channels);
         state.listening_channel_remove.clear();
     }
+    protect_user_state_hash_for_viewer(server, viewer, &mut state);
     state
 }
 
@@ -163,21 +164,34 @@ pub(crate) async fn project_message(
     visibility: &mut UserVisibilityState,
     message: &Message,
 ) -> Vec<Message> {
-    if !server.get_hide_users_without_traverse() {
-        return vec![message.clone()];
-    }
-
     match message {
         Message::UserState(user_state) => {
             let Ok(user_state) = UserState::try_from(user_state.clone()) else {
-                return Vec::new();
+                return if server.get_hide_users_without_traverse() {
+                    Vec::new()
+                } else {
+                    vec![message.clone()]
+                };
             };
             let Some(session) = user_state.session else {
-                return Vec::new();
+                return if server.get_hide_users_without_traverse() {
+                    Vec::new()
+                } else {
+                    vec![message.clone()]
+                };
             };
-            project_user_state(server, viewer, visibility, &user_state, session).await
+            if server.get_hide_users_without_traverse() {
+                project_user_state(server, viewer, visibility, &user_state, session).await
+            } else {
+                let mut projected = user_state;
+                protect_user_state_hash_for_viewer(server, viewer, &mut projected);
+                vec![projected.into()]
+            }
         }
         Message::UserRemove(user_remove) => {
+            if !server.get_hide_users_without_traverse() {
+                return vec![message.clone()];
+            }
             let session = ClientSessionIdentifier::from(user_remove.session);
             if !visibility.remove(session) {
                 return Vec::new();
@@ -336,6 +350,7 @@ async fn project_user_state(
         let mut state = target.build_user_state_for_broadcast();
         state.listening_channel_add = sorted_channels(&new_listeners);
         state.listening_channel_remove.clear();
+        protect_user_state_hash_for_viewer(server, viewer, &mut state);
         return vec![state.into()];
     }
 
@@ -345,6 +360,7 @@ async fn project_user_state(
     projected.actor = visible_actor(server, viewer, raw.actor).await;
     projected.listening_channel_add = sorted_difference(&new_listeners, &old.listener_channels);
     projected.listening_channel_remove = sorted_difference(&old.listener_channels, &new_listeners);
+    protect_user_state_hash_for_viewer(server, viewer, &mut projected);
 
     if user_state_delta_empty(&projected) {
         Vec::new()
@@ -380,6 +396,7 @@ async fn reconcile_target(
             let mut state = target.build_user_state_for_broadcast();
             state.listening_channel_add = sorted_channels(&new_listeners);
             state.listening_channel_remove.clear();
+            protect_user_state_hash_for_viewer(server, viewer, &mut state);
             vec![state.into()]
         }
         Some(old) => {
@@ -394,6 +411,7 @@ async fn reconcile_target(
                     sorted_difference(&new_listeners, &old.listener_channels);
                 state.listening_channel_remove =
                     sorted_difference(&old.listener_channels, &new_listeners);
+                protect_user_state_hash_for_viewer(server, viewer, &mut state);
                 vec![state.into()]
             } else {
                 let adds = sorted_difference(&new_listeners, &old.listener_channels);
@@ -430,6 +448,23 @@ async fn visible_actor(
     can_view_user(server, viewer, &target)
         .await
         .then_some(actor)
+}
+
+fn protect_user_state_hash_for_viewer(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    state: &mut UserState,
+) {
+    let Some((protection, secret)) = server.get_certificate_hash_privacy() else {
+        return;
+    };
+    crate::privacy::protect_user_state_certificate_hash(
+        state,
+        viewer.is_superuser(),
+        viewer.get_session_id(),
+        protection,
+        Some(secret.as_str()),
+    );
 }
 
 fn hidden_user_remove(session: ClientSessionIdentifier) -> Message {

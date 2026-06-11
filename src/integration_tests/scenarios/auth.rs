@@ -41,6 +41,156 @@ async fn auth_two_clients_succeeds() {
     assert_eq!(bob.welcome_text.as_deref(), Some("test-welcome"));
 }
 
+#[tokio::test]
+async fn authenticator_receives_tls_ja4_and_proxy_protocol_flag() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let _alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+
+    let auxiliary = server.authenticator.authenticated_auxiliary_data();
+    let auxiliary = auxiliary.last().expect("authenticator should record auth data");
+    let tls_ja4 = auxiliary
+        .tls_ja4()
+        .expect("native TLS connection should have a JA4 fingerprint");
+    assert!(tls_ja4.starts_with("t13x"), "SNI-redacted TLS 1.3 JA4: {tls_ja4}");
+    assert!(
+        !auxiliary.uses_proxy_protocol(),
+        "direct test connection should not use PROXY protocol"
+    );
+}
+
+#[tokio::test]
+async fn certificate_hash_privacy_remaps_other_users_only() {
+    let privacy = crate::config::PrivacyConfig::new(
+        true,
+        Some("test-shared-certificate-hash-secret".to_owned()),
+    );
+    let server = spawn_test_server(TestServerOpts {
+        privacy,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth");
+
+    let bob_self_hash = hex::encode(bob.cert_sha1());
+    let bob_self_state = bob
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob.session_id))
+        .expect("bob should receive his own UserState");
+    assert_eq!(bob_self_state.hash.as_deref(), Some(bob_self_hash.as_str()));
+
+    let alice_bob_state = alice
+        .recv_until(
+            |message| matches!(message, Message::UserState(state) if state.session == Some(bob.session_id)),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .or_else(|| {
+            alice
+                .initial_user_states
+                .iter()
+                .find(|state| state.session == Some(bob.session_id))
+                .cloned()
+                .map(Message::UserState)
+        })
+        .expect("alice should see bob");
+    let Message::UserState(alice_bob_state) = alice_bob_state else {
+        panic!("expected Bob UserState");
+    };
+    let expected = crate::privacy::remapped_certificate_hash_hex(
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+    )
+    .expect("valid test hash");
+    assert_eq!(alice_bob_state.hash.as_deref(), Some(expected.as_str()));
+    assert_ne!(
+        alice_bob_state.hash.as_deref(),
+        Some(bob_self_hash.as_str())
+    );
+}
+
+#[tokio::test]
+async fn certificate_hash_privacy_reversible_remaps_other_users_only() {
+    let privacy = crate::config::PrivacyConfig::with_certificate_hash_protection(
+        crate::config::CertificateHashProtection::Reversible,
+        Some("test-shared-certificate-hash-secret".to_owned()),
+    );
+    let server = spawn_test_server(TestServerOpts {
+        privacy,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth");
+
+    let bob_self_hash = hex::encode(bob.cert_sha1());
+    let bob_self_state = bob
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob.session_id))
+        .expect("bob should receive his own UserState");
+    assert_eq!(bob_self_state.hash.as_deref(), Some(bob_self_hash.as_str()));
+
+    let alice_bob_state = alice
+        .recv_until(
+            |message| matches!(message, Message::UserState(state) if state.session == Some(bob.session_id)),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .or_else(|| {
+            alice
+                .initial_user_states
+                .iter()
+                .find(|state| state.session == Some(bob.session_id))
+                .cloned()
+                .map(Message::UserState)
+        })
+        .expect("alice should see bob");
+    let Message::UserState(alice_bob_state) = alice_bob_state else {
+        panic!("expected Bob UserState");
+    };
+    let expected = crate::privacy::protected_certificate_hash_hex(
+        crate::config::CertificateHashProtection::Reversible,
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+    )
+    .expect("valid test hash");
+    assert_eq!(alice_bob_state.hash.as_deref(), Some(expected.as_str()));
+    assert_ne!(
+        alice_bob_state.hash.as_deref(),
+        Some(bob_self_hash.as_str())
+    );
+}
+
 /// Checks that two users authenticating at the same time converge on each
 /// other's presence even if one user's auth burst races the other's publish.
 #[tokio::test]

@@ -39,6 +39,8 @@ pub struct AuthenticateAuxiliaryData {
     pub certificate_hash: Option<Bytes>,
     pub session_id: u32,
     pub ip_address: IpAddr,
+    pub tls_ja4: Option<String>,
+    pub uses_proxy_protocol: bool,
     pub version: Option<ProtocolVersion>,
     pub client_name: Option<String>,
     pub os_name: Option<String>,

@@ -39,7 +39,16 @@ pub async fn handle_authenticate(
             session = u32::from(session),
             "Authenticate: token update for already-authenticated client"
         );
+        let token_count = msg.tokens.len();
         sender.set_tokens(msg.tokens.into_iter().collect(), repo);
+        tracing::info!(
+            server_id = %sender.server_id(),
+            session = u32::from(sender.get_session_id()),
+            user_id = ?sender.get_user_id(),
+            display_name = ?sender.display_name_opt(),
+            token_count,
+            "client re-authenticated"
+        );
         return Ok(());
     }
 
@@ -68,6 +77,8 @@ pub async fn handle_authenticate(
         certificate_hash,
         session_id: session_id.into(),
         ip_address,
+        tls_ja4: sender.tls_ja4().map(ToOwned::to_owned),
+        uses_proxy_protocol: sender.uses_proxy_protocol(),
         version,
         client_name,
         os_name,
@@ -490,6 +501,14 @@ pub async fn handle_authenticate(
 
     // ── Mark as authenticated ─────────────────────────────────────────────
     sender.set_authenticated(true);
+    tracing::info!(
+        server_id = %sender.server_id(),
+        session = u32::from(session_id),
+        user_id = ?sender.get_user_id(),
+        display_name = ?sender.display_name_opt(),
+        transport = ?sender.transport_kind(),
+        "client authenticated"
+    );
 
     // ── Spawn per-user voice routing task ─────────────────────────────────
     crate::voice::spawn_voice_routing_task(Arc::clone(server), Arc::clone(sender));

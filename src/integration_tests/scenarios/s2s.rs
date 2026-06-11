@@ -329,6 +329,53 @@ async fn s2s_cross_node_user_stats_rpc() {
     assert!(msg.is_some(), "Alice should receive Bob's cross-node stats");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_cross_node_user_stats_omits_sensitive_fields_for_non_superuser() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    a.authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    b.authenticator.register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    alice
+        .send(
+            UserStats {
+                session: Some(bob.session_id),
+                stats_only: Some(false),
+                ..UserStats::default()
+            }
+            .into(),
+        )
+        .await;
+
+    let msg = alice
+        .recv_until(
+            |m| matches!(m, Message::UserStats(us) if us.session == Some(bob.session_id)),
+            CLIENT_DEADLINE,
+        )
+        .await;
+
+    let Some(Message::UserStats(stats)) = msg else {
+        panic!("Alice should receive Bob's cross-node stats");
+    };
+    assert!(stats.certificates.is_empty());
+    assert_eq!(stats.address, None);
+    let version = stats.version.as_ref().expect("version should be present");
+    assert!(version.version_v1.is_some() || version.version_v2.is_some());
+    assert_eq!(version.release, None);
+    assert_eq!(version.os, None);
+    assert_eq!(version.os_version, None);
+    assert_eq!(stats.strong_certificate, Some(true));
+}
+
 /// Checks cross-node plugin data routing to explicitly targeted receiver sessions.
 /// Expected: Bob receives Alice's `PluginDataTransmission` with the sender
 /// stamped by server A and the payload preserved over S2S.

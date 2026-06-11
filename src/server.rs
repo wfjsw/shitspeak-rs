@@ -32,12 +32,12 @@ use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError};
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
-use crate::proxy_protocol::get_proxy_protocol_client_address;
+use crate::proxy_protocol::consume_proxy_protocol_connection_info;
 use crate::user_channel_cache::UserChannelCache;
 use crate::{
     client_repository::ClientRepository,
     codec_info::CodecInfo,
-    config::{Config, ServerEntrypointConfig, UdpPingUserCountScope},
+    config::{CertificateHashProtection, Config, ServerEntrypointConfig, UdpPingUserCountScope},
     constants::MTU,
     s2s::S2SManager,
     types::{DEFAULT_SERVER_ID, NodeIdentifier, default_server_id},
@@ -97,6 +97,24 @@ fn load_c2s_tls_acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::er
     tls_config.alpn_protocols.push(ALPN_MUMBLE.to_vec());
 
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
+}
+
+fn validate_privacy_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.privacy.protect_certificate_hashes()
+        && config
+            .privacy
+            .certificate_hash_secret()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .is_none()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "privacy.protect_certificate_hashes requires privacy.certificate_hash_secret when set to true, \"irreversible\", or \"reversible\"",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 async fn bind_entrypoint_socket_pair(
@@ -416,9 +434,10 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
-            debug: crate::config::DebugConfig::default(),
+            acl: crate::config::AclConfig::default(),
             s2s: crate::config::S2sConfig::default(),
             web: crate::config::WebConfig::default(),
+            privacy: crate::config::PrivacyConfig::default(),
         }
     }
 
@@ -924,11 +943,11 @@ async fn activate_client_subscriptions(
     let last_seen = client.get_last_client_versions().await;
     let (missed, new_versions) = server
         .clients
-        .replay_since_in_server(&server_id, &last_seen)
+        .replay_since_in_server_for_client(&server_id, &last_seen, client_session_id)
         .await
         .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
     for msg in &missed {
-        let messages = crate::client::visibility::project_message_with_shadow(
+        write_projected_client_log_message_with_acl_refresh(
             server,
             client,
             user_visibility,
@@ -936,13 +955,7 @@ async fn activate_client_subscriptions(
             &server_id,
             msg,
         )
-        .await;
-        for msg in messages {
-            client
-                .write_proto_message(&msg)
-                .await
-                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-        }
+        .await?;
     }
     client.update_last_client_versions(&new_versions).await;
 
@@ -977,6 +990,63 @@ async fn finish_handler_result(
     .await
 }
 
+fn is_acl_cache_flush_message(message: &Message) -> bool {
+    matches!(message, Message::PermissionQuery(pq) if pq.flush == Some(true))
+}
+
+async fn write_projected_client_log_message_with_acl_refresh(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: &Message,
+) -> Result<(), HandleIncomingConnectionError> {
+    for msg in crate::client::visibility::project_message_with_shadow(
+        server,
+        client,
+        user_visibility,
+        session_channel_shadow,
+        server_id,
+        message,
+    )
+    .await
+    {
+        client
+            .write_proto_message(&msg)
+            .await
+            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+    }
+
+    if is_acl_cache_flush_message(message) {
+        for refresh in crate::channel_handler::build_channel_permission_info_refresh_messages(
+            server,
+            client,
+            server.get_channels(),
+        )
+        .await
+        {
+            for msg in crate::client::visibility::project_message_with_shadow(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                server_id,
+                &refresh,
+            )
+            .await
+            {
+                client
+                    .write_proto_message(&msg)
+                    .await
+                    .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl Server {
     pub async fn new<A: Authenticator>(
         config: Config,
@@ -1000,6 +1070,7 @@ impl Server {
             .iter()
             .map(|proxy| AnyIpCidr::from_str(proxy))
             .collect::<Result<Vec<_>, _>>()?;
+        validate_privacy_config(&config)?;
 
         let tls_acceptor = load_c2s_tls_acceptor(&config)?;
 
@@ -1976,25 +2047,28 @@ impl Server {
 
     pub async fn handle_incoming_connection(
         self: &Arc<Box<Self>>,
-        tcp_stream: tokio::net::TcpStream,
+        mut tcp_stream: tokio::net::TcpStream,
         remote_addr: std::net::SocketAddr,
         provisional_server_id: String,
     ) -> Result<(), HandleIncomingConnectionError> {
-        let client_addr = if self
+        let proxy_connection = if self
             .allowed_proxies
             .iter()
             .any(|proxy| proxy.contains(&remote_addr.ip()))
         {
-            match get_proxy_protocol_client_address(&tcp_stream).await? {
-                Some(addr) => SocketAddr::new(addr.ip(), addr.port()),
-                None => remote_addr,
-            }
+            consume_proxy_protocol_connection_info(&mut tcp_stream).await?
         } else {
-            remote_addr
+            None
         };
+        let uses_proxy_protocol = proxy_connection.is_some();
+        let client_addr = proxy_connection
+            .and_then(|info| info.client_address())
+            .map(|addr| SocketAddr::new(addr.ip(), addr.port()))
+            .unwrap_or(remote_addr);
         let real_ip = client_addr.ip();
 
         let local_addr = tcp_stream.local_addr()?;
+        let tls_ja4 = crate::tls_fingerprint::peek_tls_ja4(&tcp_stream).await?;
         let tls_acceptor = self.tls_acceptor.read().clone();
         let tls_stream = tls_acceptor.accept(tcp_stream).await?;
         let server_id = self.resolve_tls_server_id(&provisional_server_id, local_addr, &tls_stream);
@@ -2006,7 +2080,14 @@ impl Server {
                     .with_authenticator(self.authenticator_arc())
                     .with_server(Arc::clone(self))
                     .with_provisional_server_id(server_id)
-                    .handle_stream_with_peer(tls_stream, real_ip, client_addr, local_addr)
+                    .handle_stream_with_peer(
+                        tls_stream,
+                        real_ip,
+                        client_addr,
+                        local_addr,
+                        tls_ja4,
+                        uses_proxy_protocol,
+                    )
                     .await?;
                 return Ok(());
             }
@@ -2026,6 +2107,8 @@ impl Server {
             client_addr,
             local_addr,
             server_id,
+            tls_ja4,
+            uses_proxy_protocol,
         )
         .await
     }
@@ -2063,6 +2146,8 @@ impl Server {
         remote_addr: std::net::SocketAddr,
         local_addr: std::net::SocketAddr,
         server_id: String,
+        tls_ja4: Option<String>,
+        uses_proxy_protocol: bool,
     ) -> Result<(), HandleIncomingConnectionError> {
         // Send server version (these are startup-only, read once)
         let version = {
@@ -2085,6 +2170,8 @@ impl Server {
                 None,
                 local_addr,
                 tls_stream,
+                tls_ja4,
+                uses_proxy_protocol,
             )
             .await;
 
@@ -2284,21 +2371,18 @@ impl Server {
                                 }
                                 if entry.version > last_for_node + 1 {
                                     let server_id = client.server_id();
-                                    let (missed, new_versions) = self.clients.replay_since_in_server(&server_id, &last_seen).await
+                                    let (missed, new_versions) = self.clients.replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id()).await
                                         .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
                                     for msg in &missed {
-                                        let projected = crate::client::visibility::project_message_with_shadow(
+                                        write_projected_client_log_message_with_acl_refresh(
                                             self,
                                             &client,
                                             &mut user_visibility,
                                             &mut session_channel_shadow,
                                             &server_id,
                                             msg,
-                                        ).await;
-                                        for msg in projected {
-                                            client.write_proto_message(&msg).await
-                                                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                        }
+                                        )
+                                        .await?;
                                     }
                                     let reconcile = crate::client::visibility::reconcile_all(
                                         self,
@@ -2333,19 +2417,19 @@ impl Server {
                                     }
                                 }
 
-                                if let Some(msg) = entry.to_message(&self.clients).await {
-                                    let projected = crate::client::visibility::project_message_with_shadow(
+                                for msg in entry
+                                    .messages_for_client(&self.clients, client.get_session_id())
+                                    .await
+                                {
+                                    write_projected_client_log_message_with_acl_refresh(
                                         self,
                                         &client,
                                         &mut user_visibility,
                                         &mut session_channel_shadow,
                                         &client.server_id(),
                                         &msg,
-                                    ).await;
-                                    for msg in projected {
-                                        client.write_proto_message(&msg).await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    }
+                                    )
+                                    .await?;
                                 }
                                 let reconcile = crate::client::visibility::reconcile_all(
                                     self,
@@ -2371,21 +2455,18 @@ impl Server {
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                                 let last_seen = client.get_last_client_versions().await;
                                 let server_id = client.server_id();
-                                let (missed, new_versions) = self.clients.replay_since_in_server(&server_id, &last_seen).await
+                                let (missed, new_versions) = self.clients.replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id()).await
                                     .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
                                 for msg in &missed {
-                                    let projected = crate::client::visibility::project_message_with_shadow(
+                                    write_projected_client_log_message_with_acl_refresh(
                                         self,
                                         &client,
                                         &mut user_visibility,
                                         &mut session_channel_shadow,
                                         &server_id,
                                         msg,
-                                    ).await;
-                                    for msg in projected {
-                                        client.write_proto_message(&msg).await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    }
+                                    )
+                                    .await?;
                                 }
                                 let reconcile = crate::client::visibility::reconcile_all(
                                     self,
@@ -2457,6 +2538,7 @@ impl Server {
     pub async fn reload_config(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
         match Config::reload() {
             Ok(Some(new_config)) => {
+                validate_privacy_config(&new_config)?;
                 let next_tls_acceptor = load_c2s_tls_acceptor(&new_config)?;
                 let prepared_authenticator = self.authenticator.prepare_wasm_reload(
                     new_config.authenticator_wasm_path.as_deref(),
@@ -2466,6 +2548,7 @@ impl Server {
 
                 self.apply_entrypoint_config(&new_config).await?;
 
+                let mut invalidate_acl_cache = false;
                 let mut current = self.config.write().expect("Config RwLock poisoned");
                 // Log notable changes
                 if current.welcome_text != new_config.welcome_text {
@@ -2571,11 +2654,55 @@ impl Server {
                         new_config.hide_users_without_traverse
                     );
                 }
-                if current.debug.debug_acl_enter() != new_config.debug.debug_acl_enter() {
+                if current.acl.debug_acl_enter() != new_config.acl.debug_acl_enter() {
                     tracing::info!(
-                        "config reload: debug.debug_acl_enter {} -> {}",
-                        current.debug.debug_acl_enter(),
-                        new_config.debug.debug_acl_enter()
+                        "config reload: acl.debug_acl_enter {} -> {}",
+                        current.acl.debug_acl_enter(),
+                        new_config.acl.debug_acl_enter()
+                    );
+                }
+                if current.acl.explicit_enter_deny_overrides_write()
+                    != new_config.acl.explicit_enter_deny_overrides_write()
+                {
+                    tracing::info!(
+                        "config reload: acl.explicit_enter_deny_overrides_write {} -> {}",
+                        current.acl.explicit_enter_deny_overrides_write(),
+                        new_config.acl.explicit_enter_deny_overrides_write()
+                    );
+                    invalidate_acl_cache = true;
+                }
+                if current.acl.preserve_write_acl_on_edit()
+                    != new_config.acl.preserve_write_acl_on_edit()
+                {
+                    tracing::info!(
+                        "config reload: acl.preserve_write_acl_on_edit {} -> {}",
+                        current.acl.preserve_write_acl_on_edit(),
+                        new_config.acl.preserve_write_acl_on_edit()
+                    );
+                }
+                if current.acl.grant_temp_channel_creator_acl()
+                    != new_config.acl.grant_temp_channel_creator_acl()
+                {
+                    tracing::info!(
+                        "config reload: acl.grant_temp_channel_creator_acl {} -> {}",
+                        current.acl.grant_temp_channel_creator_acl(),
+                        new_config.acl.grant_temp_channel_creator_acl()
+                    );
+                }
+                if current.privacy.certificate_hash_protection()
+                    != new_config.privacy.certificate_hash_protection()
+                {
+                    tracing::info!(
+                        "config reload: privacy.protect_certificate_hashes {} -> {}",
+                        current.privacy.certificate_hash_protection(),
+                        new_config.privacy.certificate_hash_protection()
+                    );
+                }
+                if current.privacy.certificate_hash_secret().is_some()
+                    != new_config.privacy.certificate_hash_secret().is_some()
+                {
+                    tracing::info!(
+                        "config reload: privacy.certificate_hash_secret presence changed"
                     );
                 }
                 if current.server_entrypoints != new_config.server_entrypoints {
@@ -2585,6 +2712,9 @@ impl Server {
                 tracing::info!("config reload: C2S TLS identity refreshed");
                 *current = new_config;
                 drop(current);
+                if invalidate_acl_cache {
+                    self.channels.invalidate_acl_cache_for_channel(0).await;
+                }
                 self.authenticator
                     .apply_prepared_reload(prepared_authenticator);
                 if authenticator_reloaded {
@@ -2669,7 +2799,34 @@ impl Server {
     }
 
     pub fn get_debug_acl_enter(&self) -> bool {
-        self.read_config().debug.debug_acl_enter()
+        self.read_config().acl.debug_acl_enter()
+    }
+
+    pub fn get_explicit_enter_deny_overrides_write(&self) -> bool {
+        self.read_config().acl.explicit_enter_deny_overrides_write()
+    }
+
+    pub fn get_preserve_write_acl_on_edit(&self) -> bool {
+        self.read_config().acl.preserve_write_acl_on_edit()
+    }
+
+    pub fn get_grant_temp_channel_creator_acl(&self) -> bool {
+        self.read_config().acl.grant_temp_channel_creator_acl()
+    }
+
+    pub fn get_certificate_hash_privacy(&self) -> Option<(CertificateHashProtection, String)> {
+        let config = self.read_config();
+        let protection = config.privacy.certificate_hash_protection();
+        if !protection.is_enabled() {
+            return None;
+        }
+        let secret = config
+            .privacy
+            .certificate_hash_secret()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(ToOwned::to_owned)?;
+        Some((protection, secret))
     }
 
     pub fn get_max_bandwidth(&self) -> u32 {
@@ -2805,10 +2962,7 @@ impl Server {
     }
 }
 
-use crate::channel_handler::{
-    apply_permission_info_to_channel_state, convert_channel_operation_to_messages,
-    replay_channel_log_gap,
-};
+use crate::channel_handler::replay_channel_log_gap;
 use crate::utils::recv_optional;
 
 // ─── Log gap replay helpers ─────────────────────────────────────────────────

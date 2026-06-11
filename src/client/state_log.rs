@@ -151,6 +151,13 @@ impl ClientGlobalStateDelta {
             || self.tokens.is_some()
             || self.display_name.is_some())
     }
+
+    pub fn affects_acl_generation(&self) -> bool {
+        self.user_id.is_some()
+            || self.groups.is_some()
+            || self.is_superuser.is_some()
+            || self.tokens.is_some()
+    }
 }
 
 // ─── ClientStateOperation ────────────────────────────────────────────────────
@@ -314,6 +321,47 @@ pub struct ClientStateBroadcastPayload {
 }
 
 impl ClientStateLogEntry {
+    async fn acl_cache_flush_message_for(
+        &self,
+        repo: &ClientRepository,
+        viewer_session_id: ClientSessionIdentifier,
+    ) -> Option<crate::messages::Message> {
+        match &self.op {
+            ClientStateOperation::UpdateGlobalState {
+                server_id,
+                session_id,
+                client_instance_id,
+                delta,
+                ..
+            } if *session_id == viewer_session_id && delta.affects_acl_generation() => {
+                let client = repo.get_client_in_server(server_id, *session_id).await?;
+                if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
+                    return None;
+                }
+                Some(crate::messages::encoder::PermissionQuery::flush_cache().into())
+            }
+            _ => None,
+        }
+    }
+
+    pub async fn messages_for_client(
+        &self,
+        repo: &ClientRepository,
+        viewer_session_id: ClientSessionIdentifier,
+    ) -> Vec<crate::messages::Message> {
+        let mut messages = Vec::new();
+        if let Some(message) = self
+            .acl_cache_flush_message_for(repo, viewer_session_id)
+            .await
+        {
+            messages.push(message);
+        }
+        if let Some(message) = self.to_message(repo).await {
+            messages.push(message);
+        }
+        messages
+    }
+
     /// Convert this log entry into the protobuf `Message` that should be
     /// sent to a subscriber.
     ///

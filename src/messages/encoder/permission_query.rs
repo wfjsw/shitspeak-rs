@@ -7,6 +7,16 @@ pub struct PermissionQuery {
     pub flush: Option<bool>,
 }
 
+impl PermissionQuery {
+    pub fn flush_cache() -> Self {
+        Self {
+            channel_id: None,
+            permissions: None,
+            flush: Some(true),
+        }
+    }
+}
+
 impl From<crate::mumble_proto::PermissionQuery> for PermissionQuery {
     fn from(proto: crate::mumble_proto::PermissionQuery) -> Self {
         Self {

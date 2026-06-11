@@ -4,6 +4,14 @@ ShitSpeak RS is a Rust implementation of a Mumble compatible voice server. It pr
 
 The Cargo package name is `shitspeak-rs`.
 
+Certificate-hash privacy is configured with `[privacy].protect_certificate_hashes`.
+Use `false` to disable it, `true` or `"irreversible"` for a stable one-way
+remap, and `"reversible"` for an AES-based stable remap that can be restored
+with the shared secret. Only other users' `UserState.hash` values are remapped
+for non-superuser clients; the viewer's own hash is sent unchanged. Configure
+the same `[privacy].certificate_hash_secret` on every cluster node, or use
+`SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET`.
+
 ## Project Status
 
 This project is under active development. The checked in `config.toml` is suitable for local testing and should be reviewed before public deployment. Some web gateway and MoQ settings are present but disabled by default.
@@ -82,9 +90,15 @@ or set equivalent `SHITSPEAK_LOGGING_LOKI_*` environment variables:
 [logging.loki]
 enabled = true
 url = "http://localhost:3100"
-level = "debug"
+filter = "shitspeak_rs=debug"
 labels = { environment = "dev" }
 ```
+
+If `filter` is omitted, Loki shipping defaults to `shitspeak_rs=<level>`, so
+dependency logs are not sent unless you widen the directive explicitly. Failed
+pushes are retried from a bounded in-memory cache; tune
+`retry_cache_capacity`, `retry_initial_interval_ms`, and
+`retry_max_interval_ms` for larger deployments.
 
 ## Configuration
 
@@ -101,6 +115,9 @@ Important local settings include:
 7. `authenticator_wasm_path` enables a custom WASM authentication module.
 8. `s2s` sections configure clustered server operation.
 9. `web` sections configure the browser gateway.
+10. `[acl].explicit_enter_deny_overrides_write` lets an explicit `Enter` deny override `Write`'s implied `Enter` permission.
+11. `[acl].preserve_write_acl_on_edit` controls whether registered non-superuser ACL editors keep a personal `Write` fallback.
+12. `[privacy].protect_certificate_hashes` accepts `false`, `true`, `"irreversible"`, or `"reversible"` for other users' `UserState.hash` values in non-superuser views. Configure the same `[privacy].certificate_hash_secret` on every cluster node, or use `SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET`.
 
 Selected settings are hot reloaded when `config.toml` changes. The C2S TLS identity from `cert_path` and `key_path` is also hot reloaded for new client handshakes when either file changes. Existing TLS sessions continue using the identity they negotiated. Listener addresses, node identity, storage paths, and other startup resources require a restart.
 

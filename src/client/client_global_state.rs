@@ -90,14 +90,15 @@ impl ClientGlobalState {
         self.pending_delta = ClientGlobalStateDelta::default();
     }
 
-    pub fn set_current_channel_id(&mut self, channel_id: u32) {
+    pub fn set_current_channel_id(&mut self, channel_id: u32) -> bool {
         if self.current_channel_id == channel_id {
-            return;
+            return false;
         }
         self.current_channel_id = channel_id;
         if self.delta_recording {
             self.pending_delta.current_channel_id = Some(channel_id);
         }
+        true
     }
 
     pub fn get_current_channel_id(&self) -> u32 {

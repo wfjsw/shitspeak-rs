@@ -243,6 +243,252 @@ async fn creating_temp_channel_moves_creator_into_it() {
 }
 
 #[tokio::test]
+async fn temp_channel_creation_grants_only_missing_creator_permissions() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![
+                ACL {
+                    user_id: None,
+                    group: Some("all".to_owned()),
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: enumflags2::BitFlags::empty(),
+                    deny: ACLPermissions::Enter | ACLPermissions::Speak,
+                },
+                ACL {
+                    user_id: Some(1),
+                    group: None,
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: ACLPermissions::TempChannel | ACLPermissions::Enter,
+                    deny: enumflags2::BitFlags::empty(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    let temp_channel_id = create_channel_and_wait(&alice, 0, "AclTemp", true).await;
+    wait_for_user_in_channel(&alice, alice.session_id, temp_channel_id).await;
+
+    let channel = server
+        .server
+        .get_channels()
+        .get_channel_in_server(DEFAULT_SERVER_ID, temp_channel_id)
+        .await
+        .expect("temporary channel should exist");
+    let creator_acl = channel
+        .acls
+        .iter()
+        .find(|acl| acl.user_id == Some(1))
+        .expect("temp channel should add a creator ACL for missing permissions");
+
+    assert_eq!(
+        creator_acl.allow,
+        ACLPermissions::Write | ACLPermissions::Speak,
+        "Enter is inherited, so only missing Write and Speak should be granted locally"
+    );
+    assert!(creator_acl.deny.is_empty());
+    assert!(creator_acl.apply_here);
+    assert!(!creator_acl.apply_subs);
+}
+
+#[tokio::test]
+async fn temp_channel_creation_does_not_duplicate_inherited_creator_permissions() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![
+                ACL {
+                    user_id: None,
+                    group: Some("all".to_owned()),
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: enumflags2::BitFlags::empty(),
+                    deny: ACLPermissions::Enter | ACLPermissions::Speak,
+                },
+                ACL {
+                    user_id: Some(1),
+                    group: None,
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: ACLPermissions::TempChannel
+                        | ACLPermissions::Write
+                        | ACLPermissions::Enter
+                        | ACLPermissions::Speak,
+                    deny: enumflags2::BitFlags::empty(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    let temp_channel_id = create_channel_and_wait(&alice, 0, "InheritedAclTemp", true).await;
+    wait_for_user_in_channel(&alice, alice.session_id, temp_channel_id).await;
+
+    let channel = server
+        .server
+        .get_channels()
+        .get_channel_in_server(DEFAULT_SERVER_ID, temp_channel_id)
+        .await
+        .expect("temporary channel should exist");
+
+    assert!(
+        channel.acls.iter().all(|acl| acl.user_id != Some(1)),
+        "creator permissions already inherited by the temporary channel should not be duplicated"
+    );
+}
+
+#[tokio::test]
+async fn temp_channel_creator_acl_grant_can_be_disabled() {
+    let server = spawn_test_server(TestServerOpts {
+        grant_temp_channel_creator_acl: false,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![
+                ACL {
+                    user_id: None,
+                    group: Some("all".to_owned()),
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: enumflags2::BitFlags::empty(),
+                    deny: ACLPermissions::Enter | ACLPermissions::Speak,
+                },
+                ACL {
+                    user_id: Some(1),
+                    group: None,
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: ACLPermissions::TempChannel.into(),
+                    deny: enumflags2::BitFlags::empty(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    let temp_channel_id = create_channel_and_wait(&alice, 0, "NoCreatorAclTemp", true).await;
+    wait_for_user_in_channel(&alice, alice.session_id, temp_channel_id).await;
+
+    let channel = server
+        .server
+        .get_channels()
+        .get_channel_in_server(DEFAULT_SERVER_ID, temp_channel_id)
+        .await
+        .expect("temporary channel should exist");
+
+    assert!(
+        channel.acls.is_empty(),
+        "disabled grant_temp_channel_creator_acl should leave the temp channel without creator ACLs"
+    );
+}
+
+#[tokio::test]
+async fn temp_channel_creation_grants_certificate_hash_acl_without_user_id() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, None, vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let expected_group = format!("${}", hex::encode(alice.cert_sha1()));
+
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![
+                ACL {
+                    user_id: None,
+                    group: Some("all".to_owned()),
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: enumflags2::BitFlags::empty(),
+                    deny: ACLPermissions::Enter | ACLPermissions::Speak,
+                },
+                ACL {
+                    user_id: None,
+                    group: Some(expected_group.clone()),
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: ACLPermissions::TempChannel.into(),
+                    deny: enumflags2::BitFlags::empty(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let temp_channel_id = create_channel_and_wait(&alice, 0, "CertAclTemp", true).await;
+    wait_for_user_in_channel(&alice, alice.session_id, temp_channel_id).await;
+
+    let channel = server
+        .server
+        .get_channels()
+        .get_channel_in_server(DEFAULT_SERVER_ID, temp_channel_id)
+        .await
+        .expect("temporary channel should exist");
+    let creator_acl = channel
+        .acls
+        .iter()
+        .find(|acl| acl.group.as_deref() == Some(expected_group.as_str()))
+        .expect("temp channel should add a certificate-hash ACL for anonymous creators");
+
+    assert_eq!(
+        creator_acl.allow,
+        ACLPermissions::Write | ACLPermissions::Enter | ACLPermissions::Speak
+    );
+    assert!(creator_acl.deny.is_empty());
+    assert_eq!(creator_acl.user_id, None);
+    assert!(creator_acl.apply_here);
+    assert!(!creator_acl.apply_subs);
+}
+
+#[tokio::test]
 async fn temp_channels_cannot_be_parents_for_create_or_reparent() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

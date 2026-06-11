@@ -37,6 +37,8 @@ authenticate_external(ptr: i32, len: i32) -> i64
     "certificate_hash_base64": null,
     "session_id": 1,
     "ip_address": "127.0.0.1",
+    "tls_ja4": "t13x0306h2_8daaf6152771_02713d6af862",
+    "uses_proxy_protocol": false,
     "version": { "major": 1, "minor": 5, "patch": 0 },
     "client_name": "Mumble",
     "os_name": "Windows",

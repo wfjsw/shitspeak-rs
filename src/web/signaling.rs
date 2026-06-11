@@ -101,7 +101,7 @@ impl SignalingServer {
                 let server = Arc::clone(&server);
                 tokio::spawn(async move {
                     if let Err(e) = server
-                        .handle_stream_with_peer(stream, peer.ip(), peer, listen)
+                        .handle_stream_with_peer(stream, peer.ip(), peer, listen, None, false)
                         .await
                     {
                         tracing::trace!(%peer, error = %e, "web signaling connection failed");
@@ -116,7 +116,7 @@ impl SignalingServer {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        self.handle_stream_with_peer(stream, peer.ip(), peer, peer)
+        self.handle_stream_with_peer(stream, peer.ip(), peer, peer, None, false)
             .await
     }
 
@@ -126,6 +126,8 @@ impl SignalingServer {
         real_ip: IpAddr,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
+        tls_ja4: Option<String>,
+        uses_proxy_protocol: bool,
     ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -219,6 +221,8 @@ impl SignalingServer {
                         real_ip,
                         peer_addr,
                         local_addr,
+                        tls_ja4.clone(),
+                        uses_proxy_protocol,
                     );
                     run_signaling_websocket(stream, websocket_initial_bytes, context).await?;
                 } else {
@@ -406,6 +410,8 @@ struct SignalingContext {
     real_ip: IpAddr,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
+    tls_ja4: Option<String>,
+    uses_proxy_protocol: bool,
 }
 
 impl SignalingContext {
@@ -417,6 +423,8 @@ impl SignalingContext {
         real_ip: IpAddr,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
+        tls_ja4: Option<String>,
+        uses_proxy_protocol: bool,
     ) -> Self {
         Self {
             config,
@@ -427,6 +435,8 @@ impl SignalingContext {
             real_ip,
             peer_addr,
             local_addr,
+            tls_ja4,
+            uses_proxy_protocol,
         }
     }
 
@@ -436,6 +446,8 @@ impl SignalingContext {
             certificate_hash: None,
             session_id,
             ip_address: self.real_ip,
+            tls_ja4: self.tls_ja4.clone(),
+            uses_proxy_protocol: self.uses_proxy_protocol,
             version: None,
             client_name: Some("shitspeak-web".to_string()),
             os_name: Some("browser".to_string()),
@@ -1594,8 +1606,11 @@ async fn send_web_client_log_update(
         return Ok(());
     }
 
-    if let Some(message) = entry.to_message(server.get_clients()).await {
-        send_web_outbound_message_with_synthetic(
+    for message in entry
+        .messages_for_client(server.get_clients(), client.get_session_id())
+        .await
+    {
+        send_web_client_log_message_with_acl_refresh(
             stream,
             &server,
             &client,
@@ -1648,7 +1663,7 @@ async fn send_web_client_log_gap(
     let server_id = client.server_id();
     let (missed, versions) = match server
         .get_clients()
-        .replay_since_in_server(&server_id, &last_seen)
+        .replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id())
         .await
     {
         Ok(replay) => replay,
@@ -1658,7 +1673,7 @@ async fn send_web_client_log_gap(
         }
     };
     for message in missed {
-        send_web_outbound_message_with_synthetic(
+        send_web_client_log_message_with_acl_refresh(
             stream,
             &server,
             &client,
@@ -1688,6 +1703,57 @@ async fn send_web_client_log_gap(
         }
     }
     client.update_last_client_versions(&versions).await;
+    Ok(())
+}
+
+fn is_acl_cache_flush_message(message: &Message) -> bool {
+    matches!(message, Message::PermissionQuery(pq) if pq.flush == Some(true))
+}
+
+async fn send_web_client_log_message_with_acl_refresh(
+    stream: &mut (impl AsyncWrite + Unpin),
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    peer: Option<&WebRtcPeer>,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    message: &Message,
+) -> io::Result<()> {
+    send_web_outbound_message_with_synthetic(
+        stream,
+        server,
+        client,
+        peer,
+        channel_shadow,
+        user_visibility,
+        server_id,
+        message,
+    )
+    .await?;
+
+    if is_acl_cache_flush_message(message) {
+        for refresh in crate::channel_handler::build_channel_permission_info_refresh_messages(
+            server,
+            client,
+            server.get_channels(),
+        )
+        .await
+        {
+            send_web_outbound_message_with_synthetic(
+                stream,
+                server,
+                client,
+                peer,
+                channel_shadow,
+                user_visibility,
+                server_id,
+                &refresh,
+            )
+            .await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -2626,7 +2692,8 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
-            debug: crate::config::DebugConfig::default(),
+            acl: crate::config::AclConfig::default(),
+            privacy: crate::config::PrivacyConfig::default(),
             s2s: crate::config::S2sConfig::default(),
             web: WebConfig::default(),
         };

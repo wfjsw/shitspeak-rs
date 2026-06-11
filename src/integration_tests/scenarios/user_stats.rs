@@ -7,7 +7,7 @@ use crate::messages::Message;
 use crate::messages::encoder::UserStats;
 
 #[tokio::test]
-async fn user_stats_includes_certificate_chain() {
+async fn user_stats_omits_sensitive_fields_for_non_superuser() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
@@ -39,8 +39,56 @@ async fn user_stats_includes_certificate_chain() {
         panic!("Alice should receive her UserStats response");
     };
 
+    assert!(stats.certificates.is_empty());
+    assert_eq!(stats.address, None);
+    let version = stats.version.as_ref().expect("version should be present");
+    assert!(version.version_v1.is_some() || version.version_v2.is_some());
+    assert_eq!(version.release, None);
+    assert_eq!(version.os, None);
+    assert_eq!(version.os_version, None);
+    assert_eq!(stats.strong_certificate, Some(true));
+}
+
+#[tokio::test]
+async fn user_stats_includes_sensitive_fields_for_superuser() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    alice
+        .send(
+            UserStats {
+                session: Some(alice.session_id),
+                stats_only: Some(false),
+                ..UserStats::default()
+            }
+            .into(),
+        )
+        .await;
+
+    let msg = alice
+        .recv_until(
+            |m| matches!(m, Message::UserStats(us) if us.session == Some(alice.session_id)),
+            Duration::from_secs(2),
+        )
+        .await;
+
+    let Some(Message::UserStats(stats)) = msg else {
+        panic!("Alice should receive her UserStats response");
+    };
+
     assert_eq!(stats.certificates.len(), 1);
     assert_eq!(stats.certificates[0].as_ref(), alice.cert_der.as_slice());
+    assert!(stats.address.is_some());
+    let version = stats.version.as_ref().expect("version should be present");
+    assert_eq!(version.release.as_deref(), Some("test-client"));
+    assert_eq!(version.os.as_deref(), Some("test"));
+    assert_eq!(version.os_version.as_deref(), Some("test"));
     assert_eq!(stats.strong_certificate, Some(true));
 }
 

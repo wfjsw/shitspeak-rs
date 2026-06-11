@@ -30,6 +30,8 @@ pub struct WebSessionContext {
     real_ip: IpAddr,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
+    tls_ja4: Option<String>,
+    uses_proxy_protocol: bool,
 }
 
 impl WebSessionContext {
@@ -41,6 +43,8 @@ impl WebSessionContext {
         real_ip: IpAddr,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
+        tls_ja4: Option<String>,
+        uses_proxy_protocol: bool,
     ) -> Self {
         Self {
             config,
@@ -51,6 +55,8 @@ impl WebSessionContext {
             real_ip,
             peer_addr,
             local_addr,
+            tls_ja4,
+            uses_proxy_protocol,
         }
     }
 
@@ -79,6 +85,8 @@ impl WebSessionContext {
             certificate_hash: None,
             session_id,
             ip_address: self.real_ip,
+            tls_ja4: self.tls_ja4.clone(),
+            uses_proxy_protocol: self.uses_proxy_protocol,
             version: None,
             client_name: Some("shitspeak-web".to_string()),
             os_name: Some("browser".to_string()),
@@ -267,6 +275,15 @@ async fn configure_authenticated_client_inner(
         .get_clients()
         .publish_client_in_server(&server_id, client.get_session_id())
         .await;
+    tracing::info!(
+        server_id = %server_id,
+        session = u32::from(client.get_session_id()),
+        user_id = ?client.get_user_id(),
+        display_name = ?client.display_name_opt(),
+        cache_username,
+        transport = ?client.transport_kind(),
+        "client authenticated"
+    );
     crate::voice::spawn_voice_routing_task(Arc::clone(server), Arc::clone(client));
 }
 

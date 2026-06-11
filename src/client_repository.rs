@@ -390,6 +390,8 @@ impl ClientRepository {
             udp_address,
             local_address,
             connection,
+            None,
+            false,
         )
         .await
     }
@@ -402,6 +404,8 @@ impl ClientRepository {
         udp_address: Option<SocketAddr>,
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
+        tls_ja4: Option<String>,
+        uses_proxy_protocol: bool,
     ) -> Arc<Box<Client>> {
         let server_id = server_id.into();
         let mut register = self.register.write().await;
@@ -420,6 +424,8 @@ impl ClientRepository {
             udp_address,
             local_address,
             connection,
+            tls_ja4,
+            uses_proxy_protocol,
             client_instance_id,
         );
 
@@ -447,6 +453,18 @@ impl ClientRepository {
 
         // NOTE: AddClient log entry is deferred until the client
         // authenticates.  See `publish_client()`.
+
+        tracing::info!(
+            server_id = %client.server_id(),
+            session = u32::from(client.get_session_id()),
+            client_instance_id = client.client_instance_id(),
+            transport = ?client.transport_kind(),
+            real_ip = %client.get_real_ip_address(),
+            tcp_addr = %client.get_tcp_address(),
+            udp_addr = ?client.get_udp_address(),
+            local_addr = %client.get_local_address(),
+            "client connected"
+        );
 
         client
     }
@@ -506,6 +524,17 @@ impl ClientRepository {
             .or_default()
             .insert(scoped_id);
 
+        tracing::info!(
+            server_id = %client.server_id(),
+            session = u32::from(client.get_session_id()),
+            client_instance_id = client.client_instance_id(),
+            transport = ?client.transport_kind(),
+            real_ip = %client.get_real_ip_address(),
+            tcp_addr = %client.get_tcp_address(),
+            local_addr = %client.get_local_address(),
+            "client connected"
+        );
+
         client
     }
 
@@ -546,6 +575,17 @@ impl ClientRepository {
             .entry(tcp_address.ip())
             .or_default()
             .insert(scoped_id);
+
+        tracing::info!(
+            server_id = %client.server_id(),
+            session = u32::from(client.get_session_id()),
+            client_instance_id = client.client_instance_id(),
+            transport = ?client.transport_kind(),
+            real_ip = %client.get_real_ip_address(),
+            tcp_addr = %client.get_tcp_address(),
+            local_addr = %client.get_local_address(),
+            "client connected"
+        );
 
         client
     }
@@ -724,6 +764,17 @@ impl ClientRepository {
             )
             .await;
         }
+
+        tracing::info!(
+            server_id,
+            session = u32::from(id),
+            client_instance_id = client.client_instance_id(),
+            transport = ?client.transport_kind(),
+            user_id = ?client.get_user_id(),
+            display_name = ?client.display_name_opt(),
+            channel_id = client.get_current_channel_id(),
+            "client disconnected"
+        );
 
         Some(client)
     }
@@ -1352,11 +1403,21 @@ impl ClientRepository {
             .await
     }
 
+    pub async fn replay_since_in_server_for_client(
+        &self,
+        server_id: &str,
+        last_seen: &HashMap<u16, u64>,
+        viewer_session_id: ClientSessionIdentifier,
+    ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
+        self.replay_since_in_server_filtered(server_id, last_seen, Some(viewer_session_id))
+            .await
+    }
+
     async fn replay_since_in_server_filtered(
         &self,
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
-        _skip_lifecycle_for: Option<ClientSessionIdentifier>,
+        viewer_session_id: Option<ClientSessionIdentifier>,
     ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
         let register = self.register.read().await;
 
@@ -1423,7 +1484,9 @@ impl ClientRepository {
         // Convert to messages
         let mut messages = Vec::with_capacity(entries.len());
         for entry in entries {
-            if let Some(msg) = entry.to_message(self).await {
+            if let Some(viewer_session_id) = viewer_session_id {
+                messages.extend(entry.messages_for_client(self, viewer_session_id).await);
+            } else if let Some(msg) = entry.to_message(self).await {
                 messages.push(msg);
             }
             let cur = new_versions.entry(entry.node_id).or_insert(0);

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -25,10 +25,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::http_client;
 
 const DEFAULT_LOKI_BATCH_SIZE: usize = 128;
+const DEFAULT_LOKI_FILTER_TARGET: &str = "shitspeak_rs";
 const DEFAULT_LOKI_FLUSH_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_LOKI_LEVEL: &str = "debug";
 const DEFAULT_LOKI_QUEUE_CAPACITY: usize = 4_096;
 const DEFAULT_LOKI_REQUEST_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_LOKI_RETRY_INITIAL_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_LOKI_RETRY_MAX_INTERVAL_MS: u64 = 30_000;
 const LOKI_PUSH_PATH: &str = "/loki/api/v1/push";
 
 static LOKI_FLUSH_HANDLE: OnceLock<Mutex<Option<LokiFlushHandle>>> = OnceLock::new();
@@ -66,12 +69,20 @@ struct LokiConfig {
     batch_size: usize,
     #[serde(default = "default_loki_flush_interval_ms")]
     flush_interval_ms: u64,
+    #[serde(default)]
+    filter: Option<String>,
     #[serde(default = "default_loki_level")]
     level: String,
     #[serde(default = "default_loki_queue_capacity")]
     queue_capacity: usize,
     #[serde(default = "default_loki_request_timeout_ms")]
     request_timeout_ms: u64,
+    #[serde(default)]
+    retry_cache_capacity: Option<usize>,
+    #[serde(default = "default_loki_retry_initial_interval_ms")]
+    retry_initial_interval_ms: u64,
+    #[serde(default = "default_loki_retry_max_interval_ms")]
+    retry_max_interval_ms: u64,
 }
 
 impl Default for LokiConfig {
@@ -86,9 +97,13 @@ impl Default for LokiConfig {
             labels: HashMap::new(),
             batch_size: DEFAULT_LOKI_BATCH_SIZE,
             flush_interval_ms: DEFAULT_LOKI_FLUSH_INTERVAL_MS,
+            filter: None,
             level: default_loki_level(),
             queue_capacity: DEFAULT_LOKI_QUEUE_CAPACITY,
             request_timeout_ms: DEFAULT_LOKI_REQUEST_TIMEOUT_MS,
+            retry_cache_capacity: None,
+            retry_initial_interval_ms: DEFAULT_LOKI_RETRY_INITIAL_INTERVAL_MS,
+            retry_max_interval_ms: DEFAULT_LOKI_RETRY_MAX_INTERVAL_MS,
         }
     }
 }
@@ -126,15 +141,54 @@ impl LokiConfig {
         Duration::from_millis(self.request_timeout_ms.max(1))
     }
 
-    fn level_filter(&self) -> Result<LevelFilter, Box<dyn Error>> {
+    fn retry_cache_capacity(&self) -> usize {
+        self.retry_cache_capacity
+            .unwrap_or_else(|| self.queue_capacity())
+            .max(1)
+    }
+
+    fn retry_initial_interval(&self) -> Duration {
+        Duration::from_millis(self.retry_initial_interval_ms.max(1))
+    }
+
+    fn retry_max_interval(&self) -> Duration {
+        let initial = self.retry_initial_interval();
+        Duration::from_millis(self.retry_max_interval_ms.max(1)).max(initial)
+    }
+
+    fn normalized_level(&self) -> Result<String, Box<dyn Error>> {
         let level = self.level.trim();
         let level = if level.is_empty() {
             DEFAULT_LOKI_LEVEL
         } else {
             level
         };
-        LevelFilter::from_str(&level.to_ascii_lowercase())
-            .map_err(|error| format!("invalid logging.loki.level {level:?}: {error}").into())
+        let level = level.to_ascii_lowercase();
+        LevelFilter::from_str(&level)
+            .map_err(|error| format!("invalid logging.loki.level {level:?}: {error}"))?;
+        Ok(level)
+    }
+
+    fn filter_directive(&self) -> Result<String, Box<dyn Error>> {
+        if let Some(filter) = self
+            .filter
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(filter.to_string());
+        }
+
+        Ok(format!(
+            "{DEFAULT_LOKI_FILTER_TARGET}={}",
+            self.normalized_level()?
+        ))
+    }
+
+    fn event_filter(&self) -> Result<tracing_subscriber::EnvFilter, Box<dyn Error>> {
+        let filter = self.filter_directive()?;
+        tracing_subscriber::EnvFilter::try_new(&filter)
+            .map_err(|error| format!("invalid logging.loki.filter {filter:?}: {error}").into())
     }
 }
 
@@ -168,17 +222,18 @@ pub fn init(service_name: &'static str) -> Result<LoggingGuard, Box<dyn Error>> 
     let config = load_logging_config()?;
 
     if config.loki.enabled() {
-        let loki_filter = config.loki.level_filter()?;
+        let loki_metadata_filter = config.loki.event_filter()?;
+        let loki_event_filter = config.loki.event_filter()?;
         let (loki_formatter, flush_handle) = LokiEventFormatter::spawn(config.loki, service_name)?;
         let loki_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
+            .with_ansi(true)
             .with_writer(NoopMakeWriter)
             .fmt_fields(LokiFields::default())
             .event_format(loki_formatter);
         tracing_subscriber::registry()
             .with(fmt_layer.with_filter(cli_filter))
-            .with(LokiMetadataLayer::default().with_filter(loki_filter))
-            .with(loki_layer.with_filter(loki_filter))
+            .with(LokiMetadataLayer::default().with_filter(loki_metadata_filter))
+            .with(loki_layer.with_filter(loki_event_filter))
             .init();
         set_global_loki_flush_handle(flush_handle.clone());
         install_panic_hook();
@@ -228,6 +283,14 @@ fn default_loki_request_timeout_ms() -> u64 {
     DEFAULT_LOKI_REQUEST_TIMEOUT_MS
 }
 
+fn default_loki_retry_initial_interval_ms() -> u64 {
+    DEFAULT_LOKI_RETRY_INITIAL_INTERVAL_MS
+}
+
+fn default_loki_retry_max_interval_ms() -> u64 {
+    DEFAULT_LOKI_RETRY_MAX_INTERVAL_MS
+}
+
 #[derive(Clone)]
 struct LokiFlushHandle {
     command_tx: mpsc::UnboundedSender<LokiCommand>,
@@ -268,7 +331,8 @@ impl LokiCommand {
 
 struct LokiEventFormatter {
     tx: mpsc::Sender<LokiEntry>,
-    line_formatter: tracing_subscriber::fmt::format::Format,
+    line_formatter:
+        tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, ()>,
 }
 
 impl LokiEventFormatter {
@@ -283,6 +347,9 @@ impl LokiEventFormatter {
         let batch_size = config.batch_size();
         let flush_interval = config.flush_interval();
         let request_timeout = config.request_timeout();
+        let retry_cache_capacity = config.retry_cache_capacity();
+        let retry_initial_interval = config.retry_initial_interval();
+        let retry_max_interval = config.retry_max_interval();
         let labels = base_labels(service_name, &config.labels);
         let client = http_client::build_with_webpki_fallback(request_timeout, "loki logging")?;
         let (tx, rx) = mpsc::channel(queue_capacity);
@@ -301,13 +368,19 @@ impl LokiEventFormatter {
                 labels,
                 batch_size,
                 flush_interval,
+                retry_cache_capacity,
+                retry_initial_interval,
+                retry_max_interval,
             },
         ));
 
         Ok((
             Self {
                 tx,
-                line_formatter: tracing_subscriber::fmt::format().with_line_number(true),
+                line_formatter: tracing_subscriber::fmt::format()
+                    .with_line_number(true)
+                    .without_time()
+                    .with_ansi(true),
             },
             LokiFlushHandle {
                 command_tx,
@@ -506,15 +579,25 @@ impl Visit for EventVisitor {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.insert(field, serde_json::Value::String(format!("{value:?}")));
+        self.insert(
+            field,
+            serde_json::Value::String(metadata_debug_to_string(value)),
+        );
     }
 }
 
+#[derive(Clone)]
 struct LokiEntry {
     timestamp_ns: String,
     level: String,
     line: String,
     metadata: BTreeMap<String, String>,
+}
+
+struct LokiBatch {
+    entries: Vec<LokiEntry>,
+    next_retry_at: tokio::time::Instant,
+    retry_delay: Duration,
 }
 
 struct LokiSender {
@@ -527,6 +610,9 @@ struct LokiSender {
     labels: BTreeMap<String, String>,
     batch_size: usize,
     flush_interval: Duration,
+    retry_cache_capacity: usize,
+    retry_initial_interval: Duration,
+    retry_max_interval: Duration,
 }
 
 async fn run_loki_sender(
@@ -535,6 +621,7 @@ async fn run_loki_sender(
     sender: LokiSender,
 ) {
     let mut pending = Vec::with_capacity(sender.batch_size);
+    let mut retry_cache = VecDeque::new();
     let mut interval = tokio::time::interval(sender.flush_interval);
     let mut command_rx_closed = false;
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -546,11 +633,11 @@ async fn run_loki_sender(
                     Some(entry) => {
                         pending.push(entry);
                         if pending.len() >= sender.batch_size {
-                            flush_loki_batch(&sender, &mut pending).await;
+                            flush_loki_batch(&sender, &mut pending, &mut retry_cache).await;
                         }
                     }
                     None => {
-                        flush_loki_batch(&sender, &mut pending).await;
+                        flush_loki_batch(&sender, &mut pending, &mut retry_cache).await;
                         break;
                     }
                 }
@@ -558,13 +645,15 @@ async fn run_loki_sender(
             command = command_rx.recv(), if !command_rx_closed => {
                 match command {
                     Some(LokiCommand::Flush(ack)) => {
-                        drain_loki_entries(&mut rx, &sender, &mut pending).await;
-                        flush_loki_batch(&sender, &mut pending).await;
+                        drain_loki_entries(&mut rx, &sender, &mut pending, &mut retry_cache).await;
+                        flush_loki_retry_cache(&sender, &mut retry_cache, true).await;
+                        flush_loki_batch(&sender, &mut pending, &mut retry_cache).await;
                         let _ = ack.send(());
                     }
                     Some(LokiCommand::Shutdown(ack)) => {
-                        drain_loki_entries(&mut rx, &sender, &mut pending).await;
-                        flush_loki_batch(&sender, &mut pending).await;
+                        drain_loki_entries(&mut rx, &sender, &mut pending, &mut retry_cache).await;
+                        flush_loki_retry_cache(&sender, &mut retry_cache, true).await;
+                        flush_loki_batch(&sender, &mut pending, &mut retry_cache).await;
                         let _ = ack.send(());
                         break;
                     }
@@ -574,7 +663,8 @@ async fn run_loki_sender(
                 }
             }
             _ = interval.tick() => {
-                flush_loki_batch(&sender, &mut pending).await;
+                flush_loki_retry_cache(&sender, &mut retry_cache, false).await;
+                flush_loki_batch(&sender, &mut pending, &mut retry_cache).await;
             }
         }
     }
@@ -584,26 +674,134 @@ async fn drain_loki_entries(
     rx: &mut mpsc::Receiver<LokiEntry>,
     sender: &LokiSender,
     pending: &mut Vec<LokiEntry>,
+    retry_cache: &mut VecDeque<LokiBatch>,
 ) {
     while let Ok(entry) = rx.try_recv() {
         pending.push(entry);
         if pending.len() >= sender.batch_size {
-            flush_loki_batch(sender, pending).await;
+            flush_loki_batch(sender, pending, retry_cache).await;
         }
     }
 }
 
-async fn flush_loki_batch(sender: &LokiSender, pending: &mut Vec<LokiEntry>) {
+async fn flush_loki_batch(
+    sender: &LokiSender,
+    pending: &mut Vec<LokiEntry>,
+    retry_cache: &mut VecDeque<LokiBatch>,
+) {
     if pending.is_empty() {
         return;
     }
 
-    let payload = build_push_request(&sender.labels, pending.drain(..));
+    let entries = std::mem::take(pending);
+    match send_loki_entries(sender, &entries).await {
+        LokiPushResult::Delivered => {}
+        LokiPushResult::Retryable(error) => {
+            eprintln!("loki logging: push failed; caching batch for retry: {error}");
+            cache_loki_retry_batch(sender, retry_cache, entries, sender.retry_initial_interval);
+        }
+        LokiPushResult::Permanent(error) => {
+            eprintln!("loki logging: dropping log batch: {error}");
+        }
+    }
+}
+
+async fn flush_loki_retry_cache(
+    sender: &LokiSender,
+    retry_cache: &mut VecDeque<LokiBatch>,
+    force: bool,
+) {
+    if retry_cache.is_empty() {
+        return;
+    }
+
+    let now = tokio::time::Instant::now();
+    let mut deferred = VecDeque::with_capacity(retry_cache.len());
+    while let Some(mut batch) = retry_cache.pop_front() {
+        if !force && batch.next_retry_at > now {
+            deferred.push_back(batch);
+            continue;
+        }
+
+        match send_loki_entries(sender, &batch.entries).await {
+            LokiPushResult::Delivered => {}
+            LokiPushResult::Retryable(error) => {
+                let next_delay = batch
+                    .retry_delay
+                    .saturating_mul(2)
+                    .min(sender.retry_max_interval);
+                eprintln!("loki logging: retry failed; keeping batch cached: {error}");
+                batch.retry_delay = next_delay;
+                batch.next_retry_at = tokio::time::Instant::now() + next_delay;
+                deferred.push_back(batch);
+            }
+            LokiPushResult::Permanent(error) => {
+                eprintln!("loki logging: dropping cached log batch: {error}");
+            }
+        }
+    }
+
+    *retry_cache = deferred;
+    trim_loki_retry_cache(sender, retry_cache);
+}
+
+fn cache_loki_retry_batch(
+    sender: &LokiSender,
+    retry_cache: &mut VecDeque<LokiBatch>,
+    entries: Vec<LokiEntry>,
+    retry_delay: Duration,
+) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let retry_delay = retry_delay.min(sender.retry_max_interval);
+    retry_cache.push_back(LokiBatch {
+        entries,
+        next_retry_at: tokio::time::Instant::now() + retry_delay,
+        retry_delay,
+    });
+    trim_loki_retry_cache(sender, retry_cache);
+}
+
+fn trim_loki_retry_cache(sender: &LokiSender, retry_cache: &mut VecDeque<LokiBatch>) {
+    let mut cached_entries = retry_cache
+        .iter()
+        .map(|batch| batch.entries.len())
+        .sum::<usize>();
+    while cached_entries > sender.retry_cache_capacity {
+        let Some(mut batch) = retry_cache.pop_front() else {
+            break;
+        };
+        if cached_entries.saturating_sub(batch.entries.len()) >= sender.retry_cache_capacity {
+            cached_entries = cached_entries.saturating_sub(batch.entries.len());
+            eprintln!(
+                "loki logging: dropping {} cached entries after retry cache overflow",
+                batch.entries.len()
+            );
+            continue;
+        }
+
+        let overflow = cached_entries - sender.retry_cache_capacity;
+        batch.entries.drain(..overflow);
+        cached_entries -= overflow;
+        eprintln!("loki logging: dropping {overflow} cached entries after retry cache overflow");
+        retry_cache.push_front(batch);
+    }
+}
+
+enum LokiPushResult {
+    Delivered,
+    Retryable(String),
+    Permanent(String),
+}
+
+async fn send_loki_entries(sender: &LokiSender, entries: &[LokiEntry]) -> LokiPushResult {
+    let payload = build_push_request(&sender.labels, entries.iter().cloned());
     let body = match serde_json::to_vec(&payload) {
         Ok(body) => body,
         Err(error) => {
-            eprintln!("loki logging: failed to encode log batch: {error}");
-            return;
+            return LokiPushResult::Permanent(format!("failed to encode log batch: {error}"));
         }
     };
 
@@ -635,15 +833,18 @@ async fn flush_loki_batch(sender: &LokiSender, pending: &mut Vec<LokiEntry>) {
     }
 
     match request.send().await {
-        Ok(response) if response.status().is_success() => {}
+        Ok(response) if response.status().is_success() => LokiPushResult::Delivered,
         Ok(response) => {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eprintln!("loki logging: push failed with HTTP {status}: {text}");
+            let message = format!("HTTP {status}: {text}");
+            if status.is_server_error() || status.as_u16() == 429 {
+                LokiPushResult::Retryable(message)
+            } else {
+                LokiPushResult::Permanent(format!("push failed with {message}"))
+            }
         }
-        Err(error) => {
-            eprintln!("loki logging: push failed: {error}");
-        }
+        Err(error) => LokiPushResult::Retryable(error.to_string()),
     }
 }
 
@@ -763,11 +964,117 @@ fn sanitize_loki_metadata_key(value: &str) -> String {
 }
 
 fn metadata_value_to_string(value: serde_json::Value) -> String {
+    strip_ansi_escape_codes(&metadata_value_to_display_string(value))
+}
+
+fn metadata_value_to_display_string(value: serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value,
         serde_json::Value::Null => "null".to_string(),
-        value => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Array(values) => {
+            let values = values
+                .into_iter()
+                .map(metadata_value_to_display_string)
+                .collect::<Vec<_>>();
+            format!("[{}]", values.join(", "))
+        }
+        serde_json::Value::Object(values) => {
+            let values = values
+                .into_iter()
+                .map(|(key, value)| format!("{key}: {}", metadata_value_to_display_string(value)))
+                .collect::<Vec<_>>();
+            format!("{{{}}}", values.join(", "))
+        }
     }
+}
+
+fn metadata_debug_to_string(value: &dyn fmt::Debug) -> String {
+    strip_ansi_escape_codes(&unquote_debug_string_literals(&format!("{value:?}")))
+}
+
+fn unquote_debug_string_literals(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    let mut in_string = false;
+
+    while let Some(ch) = chars.next() {
+        match (in_string, ch) {
+            (false, '"') => in_string = true,
+            (true, '"') => in_string = false,
+            (true, '\\') => append_debug_escape(&mut out, &mut chars),
+            _ => out.push(ch),
+        }
+    }
+
+    out
+}
+
+fn append_debug_escape(out: &mut String, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let Some(ch) = chars.next() else {
+        return;
+    };
+
+    match ch {
+        '"' => out.push('\''),
+        '\\' => out.push('\\'),
+        'n' | 'r' | 't' => out.push(' '),
+        '0' => out.push('0'),
+        'u' if chars.next_if_eq(&'{').is_some() => {
+            let mut scalar = String::new();
+            for ch in chars.by_ref() {
+                if ch == '}' {
+                    break;
+                }
+                scalar.push(ch);
+            }
+            if let Ok(value) = u32::from_str_radix(&scalar, 16)
+                && let Some(ch) = char::from_u32(value)
+                && !ch.is_control()
+            {
+                out.push(ch);
+            }
+        }
+        other => out.push(other),
+    }
+}
+
+fn strip_ansi_escape_codes(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ('@'..='~').contains(&ch) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(ch) = chars.next() {
+                    if ch == '\u{7}' {
+                        break;
+                    }
+                    if ch == '\u{1b}' && chars.next_if_eq(&'\\').is_some() {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
 }
 
 fn trim_trailing_newline(line: &mut String) {
@@ -968,11 +1275,76 @@ mod tests {
     }
 
     #[test]
-    fn loki_config_default_level_is_debug() {
+    fn loki_config_default_filter_only_captures_shitspeak_rs() {
         let cfg = LokiConfig::default();
 
         assert_eq!(cfg.level, "debug");
-        assert_eq!(cfg.level_filter().unwrap(), LevelFilter::DEBUG);
+        assert_eq!(
+            cfg.filter_directive().unwrap(),
+            "shitspeak_rs=debug".to_string()
+        );
+        cfg.event_filter().expect("default filter parses");
+    }
+
+    #[test]
+    fn loki_config_filter_overrides_level_fallback() {
+        let cfg = LokiConfig {
+            filter: Some("shitspeak_rs=info,tower_http=warn".to_string()),
+            level: "trace".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cfg.filter_directive().unwrap(),
+            "shitspeak_rs=info,tower_http=warn"
+        );
+        cfg.event_filter().expect("explicit filter parses");
+    }
+
+    #[test]
+    fn loki_retry_defaults_are_bounded_and_valid() {
+        let cfg = LokiConfig::default();
+
+        assert_eq!(cfg.retry_cache_capacity(), cfg.queue_capacity());
+        assert_eq!(
+            cfg.retry_initial_interval(),
+            Duration::from_millis(DEFAULT_LOKI_RETRY_INITIAL_INTERVAL_MS)
+        );
+        assert_eq!(
+            cfg.retry_max_interval(),
+            Duration::from_millis(DEFAULT_LOKI_RETRY_MAX_INTERVAL_MS)
+        );
+    }
+
+    #[test]
+    fn loki_retry_cache_trims_oldest_entries() {
+        let sender = test_loki_sender(3);
+        let mut cache = VecDeque::new();
+
+        cache_loki_retry_batch(
+            &sender,
+            &mut cache,
+            vec![
+                test_loki_entry("1"),
+                test_loki_entry("2"),
+                test_loki_entry("3"),
+            ],
+            Duration::from_millis(1),
+        );
+        cache_loki_retry_batch(
+            &sender,
+            &mut cache,
+            vec![test_loki_entry("4"), test_loki_entry("5")],
+            Duration::from_millis(1),
+        );
+
+        let retained = cache
+            .iter()
+            .flat_map(|batch| batch.entries.iter())
+            .map(|entry| entry.timestamp_ns.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(retained, vec!["3", "4", "5"]);
     }
 
     #[test]
@@ -1004,6 +1376,47 @@ mod tests {
     }
 
     #[test]
+    fn loki_structured_metadata_formats_containers_without_json_string_escapes() {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "spans".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("client".to_string())]),
+        );
+
+        let metadata = structured_metadata(fields);
+
+        assert_eq!(metadata.get("spans").map(String::as_str), Some("[client]"));
+    }
+
+    #[test]
+    fn loki_debug_metadata_unquotes_debug_string_literals() {
+        let formatted = metadata_debug_to_string(&format_args!(
+            "SeedAddress {{ addr: {:?}, transport: Tcp }}",
+            "hk.mumble.winterco.org:64739"
+        ));
+
+        assert_eq!(
+            formatted,
+            "SeedAddress { addr: hk.mumble.winterco.org:64739, transport: Tcp }"
+        );
+        assert!(!formatted.contains("\\\""));
+        assert!(!formatted.contains('"'));
+    }
+
+    #[test]
+    fn loki_metadata_strips_ansi_escape_codes() {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "client".to_string(),
+            serde_json::Value::String("\u{1b}[32mgreen\u{1b}[0m".to_string()),
+        );
+
+        let metadata = structured_metadata(fields);
+
+        assert_eq!(metadata.get("client").map(String::as_str), Some("green"));
+    }
+
+    #[test]
     fn invalid_label_names_are_ignored() {
         let mut configured = HashMap::new();
         configured.insert("valid_label".to_string(), "yes".to_string());
@@ -1013,5 +1426,31 @@ mod tests {
 
         assert_eq!(labels.get("valid_label").map(String::as_str), Some("yes"));
         assert!(!labels.contains_key("not-valid"));
+    }
+
+    fn test_loki_sender(retry_cache_capacity: usize) -> LokiSender {
+        LokiSender {
+            client: reqwest::Client::new(),
+            push_url: "http://127.0.0.1:3100/loki/api/v1/push".to_string(),
+            tenant_id: None,
+            username: None,
+            password: None,
+            bearer_token: None,
+            labels: BTreeMap::new(),
+            batch_size: 128,
+            flush_interval: Duration::from_millis(1000),
+            retry_cache_capacity,
+            retry_initial_interval: Duration::from_millis(1),
+            retry_max_interval: Duration::from_millis(10),
+        }
+    }
+
+    fn test_loki_entry(timestamp_ns: &str) -> LokiEntry {
+        LokiEntry {
+            timestamp_ns: timestamp_ns.to_string(),
+            level: "INFO".to_string(),
+            line: "line".to_string(),
+            metadata: BTreeMap::new(),
+        }
     }
 }

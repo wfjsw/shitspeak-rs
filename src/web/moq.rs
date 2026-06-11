@@ -542,6 +542,8 @@ impl MoqServer {
             fallback.ip(),
             fallback,
             self.config.moq.listen.unwrap_or(fallback),
+            None,
+            false,
         )
     }
 }
@@ -1029,9 +1031,12 @@ impl MoqSessionRuntime {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
-        if let Some(message) = entry.to_message(server.get_clients()).await {
+        for message in entry
+            .messages_for_client(server.get_clients(), client.get_session_id())
+            .await
+        {
             events.extend(
-                message_with_synthetic_events(
+                client_log_message_events_with_acl_refresh(
                     &server,
                     &client,
                     &mut self.channel_shadow,
@@ -1076,13 +1081,13 @@ impl MoqSessionRuntime {
         let server_id = client.server_id();
         let (missed, versions) = server
             .get_clients()
-            .replay_since_in_server(&server_id, &last_seen)
+            .replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id())
             .await
             .map_err(|()| "MoQ client update gap is unrecoverable".to_string())?;
         let mut events = Vec::new();
         for message in missed {
             events.extend(
-                message_with_synthetic_events(
+                client_log_message_events_with_acl_refresh(
                     &server,
                     &client,
                     &mut self.channel_shadow,
@@ -1325,6 +1330,55 @@ async fn message_with_synthetic_events(
     .into_iter()
     .filter_map(server_event_from_message)
     .collect()
+}
+
+#[cfg(feature = "moq")]
+fn is_acl_cache_flush_message(message: &Message) -> bool {
+    matches!(message, Message::PermissionQuery(pq) if pq.flush == Some(true))
+}
+
+#[cfg(feature = "moq")]
+async fn client_log_message_events_with_acl_refresh(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    message: &Message,
+) -> Vec<ServerEvent> {
+    let mut events = message_with_synthetic_events(
+        server,
+        client,
+        channel_shadow,
+        user_visibility,
+        server_id,
+        message,
+    )
+    .await;
+
+    if is_acl_cache_flush_message(message) {
+        for refresh in crate::channel_handler::build_channel_permission_info_refresh_messages(
+            server,
+            client,
+            server.get_channels(),
+        )
+        .await
+        {
+            events.extend(
+                message_with_synthetic_events(
+                    server,
+                    client,
+                    channel_shadow,
+                    user_visibility,
+                    server_id,
+                    &refresh,
+                )
+                .await,
+            );
+        }
+    }
+
+    events
 }
 
 #[cfg(feature = "moq")]
@@ -1854,6 +1908,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64740),
+            None,
+            false,
         );
         context
     }
@@ -1873,6 +1929,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64740),
+            None,
+            false,
         )
     }
 
@@ -1935,7 +1993,8 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
-            debug: crate::config::DebugConfig::default(),
+            acl: crate::config::AclConfig::default(),
+            privacy: crate::config::PrivacyConfig::default(),
             s2s: crate::config::S2sConfig::default(),
             web: WebConfig::default(),
         }

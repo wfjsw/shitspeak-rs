@@ -6,7 +6,10 @@ use crate::{
     client::{Client, client_global_state::ClientGlobalState},
     errors::MessageHandlerError,
     localization::channel_does_not_exist,
-    messages::encoder::{DenyType, PermissionDenied, UserState},
+    messages::{
+        Message, WriteMessageExt,
+        encoder::{DenyType, PermissionDenied, PermissionQuery, UserState},
+    },
     server::Server,
 };
 
@@ -43,6 +46,41 @@ fn handle_pre_auth_user_state(
     let repo = server.get_clients();
     let mut gs = sender.write_global_state_as(repo, Some(sender.get_session_id()), None);
     apply_self_mute_deaf(&mut gs, msg.self_mute, msg.self_deaf);
+}
+
+pub(crate) async fn send_enter_permission_queries(
+    server: &Arc<Box<Server>>,
+    target: &Arc<Box<Client>>,
+    channel_id: u32,
+) -> Result<(), MessageHandlerError> {
+    let server_id = target.server_id();
+    let parent_id = server
+        .get_channels()
+        .get_channel_in_server(&server_id, channel_id)
+        .await
+        .and_then(|channel| channel.parent_id);
+
+    let mut channel_ids = vec![channel_id];
+    if let Some(parent_id) = parent_id {
+        channel_ids.push(parent_id);
+    }
+
+    let mut messages = Vec::with_capacity(channel_ids.len());
+    for channel_id in channel_ids {
+        let permissions =
+            crate::client::acl::compute_permissions_for_client(server, target, channel_id).await;
+        messages.push(Message::PermissionQuery(
+            PermissionQuery {
+                channel_id: Some(channel_id),
+                permissions: Some(permissions.bits()),
+                flush: Some(false),
+            }
+            .into(),
+        ));
+    }
+
+    target.write_proto_message_batch(&messages).await?;
+    Ok(())
 }
 
 pub async fn handle_user_state(
@@ -524,6 +562,7 @@ pub async fn handle_user_state(
     } else {
         None
     };
+    let mut entered_channel_id = None;
     let mut cache_last_channel_id = None;
     let mut cache_listening_channel_ids = None;
     {
@@ -584,7 +623,19 @@ pub async fn handle_user_state(
 
         // ── Channel move ──────────────────────────────────────────────────────
         if let Some(new_channel_id) = requested_channel_change {
-            gs.set_current_channel_id(new_channel_id);
+            if gs.set_current_channel_id(new_channel_id) {
+                entered_channel_id = Some(new_channel_id);
+                tracing::info!(
+                    server_id = %server_id,
+                    session = u32::from(target_id),
+                    actor = u32::from(sender_id),
+                    user_id = ?gs.get_user_id(),
+                    display_name = ?gs.get_display_name_opt(),
+                    previous_channel_id = target_current_channel_id,
+                    channel_id = new_channel_id,
+                    "client entered channel"
+                );
+            }
             cache_last_channel_id = Some(new_channel_id);
 
             if let Some(dst_perms) = target_destination_perms {
@@ -671,6 +722,10 @@ pub async fn handle_user_state(
             target_current_channel_id,
         )
         .await;
+    }
+
+    if let Some(channel_id) = entered_channel_id {
+        send_enter_permission_queries(server, &target, channel_id).await?;
     }
 
     Ok(())

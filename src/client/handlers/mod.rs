@@ -41,6 +41,7 @@ use udp_tunnel::handle_udp_tunnel;
 use user_list::handle_user_list;
 use user_remove::handle_user_remove;
 use user_state::handle_user_state;
+pub(crate) use user_state::send_enter_permission_queries;
 use user_stats::handle_user_stats;
 use version::handle_version;
 use voice_target::handle_voice_target;
@@ -261,6 +262,16 @@ async fn handle_message_inner(
                     deny.r#type,
                 ));
             }
+            tracing::warn!(
+                session,
+                denied_session = deny.session,
+                deny_type = ?deny.r#type,
+                channel_id = ?deny.channel_id,
+                permission = ?deny.permission,
+                name = ?deny.name,
+                reason = ?deny.reason,
+                "Permission denied"
+            );
             let msg: crate::messages::Message = deny.into();
             client.write_proto_message(&msg).await?;
             Ok(())

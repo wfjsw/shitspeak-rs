@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes = "0.8.4"
 aws-lc-rs = "1.15.2"
 base64 = "0.22.1"
 bytes = { version = "1.11.0", features = ["serde"] }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    acl::ACLPermissions,
+    acl::{ACL, ACLPermissions},
     channel_repository::ChannelOp,
     channels::{Channel, ChannelPatch},
     client::Client,
@@ -72,9 +72,9 @@ pub async fn handle_channel_state(
             } else {
                 ACLPermissions::MakeChannel
             };
-            let parent_perms =
+            let creator_parent_perms =
                 crate::client::acl::compute_permissions_for_client(server, sender, parent_id).await;
-            if !parent_perms.contains(required_permission) {
+            if !creator_parent_perms.contains(required_permission) {
                 return Err(MessageHandlerError::PermissionDenied(
                     PermissionDenied::for_permission(
                         u32::from(session),
@@ -112,6 +112,9 @@ pub async fn handle_channel_state(
                 Some(parent_id),
             );
             new_ch.description_hash = description_hash;
+            if is_temp && server.get_grant_temp_channel_creator_acl() {
+                add_missing_creator_temp_channel_acls(server, sender, parent_id, &mut new_ch).await;
+            }
 
             let op = ChannelOp::CreateChannel {
                 channel: new_ch.clone(),
@@ -341,6 +344,83 @@ pub async fn handle_channel_state(
     }
 
     Ok(())
+}
+
+async fn add_missing_creator_temp_channel_acls(
+    server: &Arc<Box<Server>>,
+    sender: &Arc<Box<Client>>,
+    parent_id: u32,
+    channel: &mut Channel,
+) {
+    let (user_id, group) = match sender.get_user_id() {
+        Some(user_id) => (Some(user_id as i32), None),
+        None => match sender.get_certificate_hash() {
+            Some(hash) => (None, Some(format!("${}", hex::encode(hash)))),
+            None => return,
+        },
+    };
+
+    let required = ACLPermissions::Write | ACLPermissions::Enter | ACLPermissions::Speak;
+    let inherited = inherited_creator_permissions(server, sender, parent_id, channel).await;
+    let missing = required & !inherited;
+    if missing.is_empty() {
+        return;
+    }
+
+    channel.acls.push(ACL {
+        user_id,
+        group,
+        apply_here: true,
+        apply_subs: false,
+        allow: missing,
+        deny: enumflags2::BitFlags::empty(),
+    });
+}
+
+async fn inherited_creator_permissions(
+    server: &Arc<Box<Server>>,
+    sender: &Arc<Box<Client>>,
+    parent_id: u32,
+    channel: &Channel,
+) -> enumflags2::BitFlags<ACLPermissions> {
+    let channels = server.get_channels();
+    let mut ancestors = Vec::new();
+    if let Some(parent) = channels
+        .get_channel_in_server(&sender.server_id(), parent_id)
+        .await
+    {
+        ancestors.push(parent);
+    }
+    ancestors.extend(
+        channels
+            .get_ancestors_in_server(&sender.server_id(), parent_id)
+            .await,
+    );
+
+    let user_id = sender.get_user_id();
+    let groups: Vec<String> = sender.get_groups_clone().into_iter().collect();
+    let group_refs: Vec<&str> = groups.iter().map(String::as_str).collect();
+    let tokens: Vec<String> = sender.get_tokens_clone().into_iter().collect();
+    let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let membership = crate::client::group::ClientMembershipQuery {
+        groups: &group_refs,
+        authenticated: user_id.is_some(),
+        access_tokens: &token_refs,
+        cert_hash: sender.get_certificate_hash(),
+        has_verified_cert_chain: sender.is_verified(),
+        ip_address: Some(sender.get_real_ip_address()),
+        asn: None,
+        country_code: None,
+    };
+
+    crate::acl::evaluate_permission_with_behavior(
+        channel,
+        &ancestors,
+        user_id,
+        &membership,
+        channel.id,
+        server.get_explicit_enter_deny_overrides_write(),
+    )
 }
 
 async fn description_blob_patch(

@@ -310,6 +310,7 @@ struct Snapshot {
 struct CachedAclPermissions {
     channel_acl_generation: u64,
     client_acl_generation: u64,
+    explicit_enter_deny_overrides_write: bool,
     permissions: BitFlags<ACLPermissions>,
 }
 
@@ -1682,6 +1683,7 @@ impl ChannelRepository {
             channel_id,
             channel_acl_generation,
             client_acl_generation,
+            false,
         )
         .await
     }
@@ -1693,13 +1695,16 @@ impl ChannelRepository {
         channel_id: u32,
         channel_acl_generation: u64,
         client_acl_generation: u64,
+        explicit_enter_deny_overrides_write: bool,
     ) -> Option<BitFlags<ACLPermissions>> {
         self.acl_cache
             .get_sync(&(server_id.to_owned(), session_id, channel_id))
             .and_then(|entry| {
-                (entry.channel_acl_generation == channel_acl_generation
-                    && entry.client_acl_generation == client_acl_generation)
-                    .then_some(entry.permissions)
+                let cache_key_matches = entry.channel_acl_generation == channel_acl_generation
+                    && entry.client_acl_generation == client_acl_generation
+                    && entry.explicit_enter_deny_overrides_write
+                        == explicit_enter_deny_overrides_write;
+                cache_key_matches.then_some(entry.permissions)
             })
     }
 
@@ -1717,6 +1722,7 @@ impl ChannelRepository {
             channel_id,
             channel_acl_generation,
             client_acl_generation,
+            false,
             permissions,
         )
         .await;
@@ -1729,6 +1735,7 @@ impl ChannelRepository {
         channel_id: u32,
         channel_acl_generation: u64,
         client_acl_generation: u64,
+        explicit_enter_deny_overrides_write: bool,
         permissions: BitFlags<ACLPermissions>,
     ) {
         let _ = self.acl_cache.put_sync(
@@ -1736,6 +1743,7 @@ impl ChannelRepository {
             CachedAclPermissions {
                 channel_acl_generation,
                 client_acl_generation,
+                explicit_enter_deny_overrides_write,
                 permissions,
             },
         );
@@ -2693,7 +2701,7 @@ impl ChannelSnapshotState {
     }
 }
 
-fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
+pub(crate) fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
     match op {
         ChannelOp::CreateChannel { .. }
         | ChannelOp::DeleteChannel { .. }

@@ -701,28 +701,211 @@ impl From<S2sTransportKindConfig> for TransportKind {
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct DebugConfig {
+pub struct AclConfig {
     /// When true, superusers ignore channel Enter ACLs. Default preserves the
     /// historical superuser behavior.
     #[serde(default = "default_true")]
     debug_acl_enter: bool,
+    /// When true, a matching explicit Enter deny remains denied even when
+    /// Write would otherwise imply Enter. Default preserves historical Write
+    /// behavior.
+    #[serde(default)]
+    explicit_enter_deny_overrides_write: bool,
+    /// When true, registered non-superuser ACL editors keep a personal
+    /// Write|Traverse fallback if their edit would remove their own Write.
+    #[serde(default = "default_true")]
+    preserve_write_acl_on_edit: bool,
+    /// When true, temporary channel creation adds a creator-specific ACL for
+    /// any missing Write, Enter, and Speak permissions.
+    #[serde(default = "default_true")]
+    grant_temp_channel_creator_acl: bool,
 }
 
-impl Default for DebugConfig {
+impl Default for AclConfig {
     fn default() -> Self {
         Self {
             debug_acl_enter: true,
+            explicit_enter_deny_overrides_write: false,
+            preserve_write_acl_on_edit: true,
+            grant_temp_channel_creator_acl: true,
         }
     }
 }
 
-impl DebugConfig {
+impl AclConfig {
     pub fn new(debug_acl_enter: bool) -> Self {
-        Self { debug_acl_enter }
+        Self {
+            debug_acl_enter,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_explicit_enter_deny_overrides_write(
+        debug_acl_enter: bool,
+        explicit_enter_deny_overrides_write: bool,
+    ) -> Self {
+        Self {
+            debug_acl_enter,
+            explicit_enter_deny_overrides_write,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_acl_behavior(
+        debug_acl_enter: bool,
+        explicit_enter_deny_overrides_write: bool,
+        preserve_write_acl_on_edit: bool,
+        grant_temp_channel_creator_acl: bool,
+    ) -> Self {
+        Self {
+            debug_acl_enter,
+            explicit_enter_deny_overrides_write,
+            preserve_write_acl_on_edit,
+            grant_temp_channel_creator_acl,
+        }
     }
 
     pub fn debug_acl_enter(&self) -> bool {
         self.debug_acl_enter
+    }
+
+    pub fn explicit_enter_deny_overrides_write(&self) -> bool {
+        self.explicit_enter_deny_overrides_write
+    }
+
+    pub fn preserve_write_acl_on_edit(&self) -> bool {
+        self.preserve_write_acl_on_edit
+    }
+
+    pub fn grant_temp_channel_creator_acl(&self) -> bool {
+        self.grant_temp_channel_creator_acl
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CertificateHashProtection {
+    #[default]
+    Disabled,
+    Irreversible,
+    Reversible,
+}
+
+impl CertificateHashProtection {
+    fn from_bool(enabled: bool) -> Self {
+        if enabled {
+            Self::Irreversible
+        } else {
+            Self::Disabled
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "false" | "disabled" | "disable" | "off" | "none" => Some(Self::Disabled),
+            "true" | "irreversible" => Some(Self::Irreversible),
+            "reversible" => Some(Self::Reversible),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CertificateHashProtection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Disabled => "disabled",
+            Self::Irreversible => "irreversible",
+            Self::Reversible => "reversible",
+        };
+        f.write_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for CertificateHashProtection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawProtection {
+            Bool(bool),
+            String(String),
+        }
+
+        match RawProtection::deserialize(deserializer)? {
+            RawProtection::Bool(enabled) => Ok(Self::from_bool(enabled)),
+            RawProtection::String(value) => Self::parse(&value).ok_or_else(|| {
+                serde::de::Error::custom(
+                    "expected false, true, \"irreversible\", or \"reversible\"",
+                )
+            }),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrivacyConfig {
+    /// Controls remapping of other users' UserState.hash values before
+    /// delivery to non-superuser clients. The viewer's own hash remains raw.
+    #[serde(default)]
+    protect_certificate_hashes: CertificateHashProtection,
+    /// Shared cluster secret for certificate-hash remapping. Configure the
+    /// same value on every node when protection is enabled.
+    #[serde(default)]
+    certificate_hash_secret: Option<String>,
+    /// Environment-variable friendly form:
+    /// SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET -> privacy.certificate.hash.secret.
+    #[serde(default)]
+    certificate: PrivacyCertificateConfig,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+struct PrivacyCertificateConfig {
+    #[serde(default)]
+    hash: PrivacyCertificateHashConfig,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+struct PrivacyCertificateHashConfig {
+    #[serde(default)]
+    secret: Option<String>,
+}
+
+impl PrivacyConfig {
+    pub fn new(protect_certificate_hashes: bool, certificate_hash_secret: Option<String>) -> Self {
+        Self::with_certificate_hash_protection(
+            CertificateHashProtection::from_bool(protect_certificate_hashes),
+            certificate_hash_secret,
+        )
+    }
+
+    pub fn with_certificate_hash_protection(
+        protect_certificate_hashes: CertificateHashProtection,
+        certificate_hash_secret: Option<String>,
+    ) -> Self {
+        Self {
+            protect_certificate_hashes,
+            certificate_hash_secret,
+            certificate: PrivacyCertificateConfig::default(),
+        }
+    }
+
+    pub fn protect_certificate_hashes(&self) -> bool {
+        self.protect_certificate_hashes.is_enabled()
+    }
+
+    pub fn certificate_hash_protection(&self) -> CertificateHashProtection {
+        self.protect_certificate_hashes
+    }
+
+    pub fn certificate_hash_secret(&self) -> Option<&str> {
+        self.certificate_hash_secret
+            .as_deref()
+            .or(self.certificate.hash.secret.as_deref())
     }
 }
 
@@ -855,9 +1038,13 @@ pub struct Config {
     #[serde(default)]
     pub hide_users_without_traverse: bool,
 
-    // ── Debug behavior toggles ───────────────────────────────────────────
+    // ── ACL behavior toggles ─────────────────────────────────────────────
     #[serde(default)]
-    pub debug: DebugConfig,
+    pub acl: AclConfig,
+
+    // ── Privacy behavior toggles ───────────────────────────────────────
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 
     // ── S2S cluster bootstrap ───────────────────────────────────────────
     #[serde(default)]
@@ -1017,7 +1204,10 @@ mod tests {
         assert_eq!(cfg.web.webrtc.max_speaker_ssrcs, 64);
         assert!(!cfg.web.moq.enabled);
         assert_eq!(cfg.web.moq.max_speaker_tracks, 64);
-        assert!(!cfg.debug.debug_acl_enter());
+        assert!(!cfg.acl.debug_acl_enter());
+        assert!(cfg.acl.explicit_enter_deny_overrides_write());
+        assert!(!cfg.acl.preserve_write_acl_on_edit());
+        assert!(cfg.acl.grant_temp_channel_creator_acl());
         assert_eq!(cfg.root_channel_name, "Root");
     }
 
@@ -1070,18 +1260,26 @@ mod tests {
     }
 
     #[test]
-    fn debug_acl_enter_defaults_true_and_parses_false() {
-        let default_cfg: DebugConfig = ::config::Config::builder()
+    fn acl_config_defaults_and_parses_behavior_flags() {
+        let default_cfg: AclConfig = ::config::Config::builder()
             .add_source(::config::File::from_str("", ::config::FileFormat::Toml))
             .build()
             .expect("config builder")
             .try_deserialize()
             .expect("config deserialize");
         assert!(default_cfg.debug_acl_enter());
+        assert!(!default_cfg.explicit_enter_deny_overrides_write());
+        assert!(default_cfg.preserve_write_acl_on_edit());
+        assert!(default_cfg.grant_temp_channel_creator_acl());
 
-        let cfg: DebugConfig = ::config::Config::builder()
+        let cfg: AclConfig = ::config::Config::builder()
             .add_source(::config::File::from_str(
-                "debug_acl_enter = false",
+                r#"
+                    debug_acl_enter = false
+                    explicit_enter_deny_overrides_write = true
+                    preserve_write_acl_on_edit = false
+                    grant_temp_channel_creator_acl = false
+                "#,
                 ::config::FileFormat::Toml,
             ))
             .build()
@@ -1089,6 +1287,81 @@ mod tests {
             .try_deserialize()
             .expect("config deserialize");
         assert!(!cfg.debug_acl_enter());
+        assert!(cfg.explicit_enter_deny_overrides_write());
+        assert!(!cfg.preserve_write_acl_on_edit());
+        assert!(!cfg.grant_temp_channel_creator_acl());
+    }
+
+    #[test]
+    fn privacy_config_defaults_and_parses_protection_modes_and_secret_forms() {
+        let default_cfg: PrivacyConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str("", ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert!(!default_cfg.protect_certificate_hashes());
+        assert_eq!(
+            default_cfg.certificate_hash_protection(),
+            CertificateHashProtection::Disabled
+        );
+        assert_eq!(default_cfg.certificate_hash_secret(), None);
+
+        let flat_cfg: PrivacyConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    protect_certificate_hashes = true
+                    certificate_hash_secret = "flat-secret"
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert!(flat_cfg.protect_certificate_hashes());
+        assert_eq!(
+            flat_cfg.certificate_hash_protection(),
+            CertificateHashProtection::Irreversible
+        );
+        assert_eq!(flat_cfg.certificate_hash_secret(), Some("flat-secret"));
+
+        let nested_cfg: PrivacyConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    protect_certificate_hashes = "reversible"
+
+                    [certificate.hash]
+                    secret = "nested-secret"
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert!(nested_cfg.protect_certificate_hashes());
+        assert_eq!(
+            nested_cfg.certificate_hash_protection(),
+            CertificateHashProtection::Reversible
+        );
+        assert_eq!(nested_cfg.certificate_hash_secret(), Some("nested-secret"));
+
+        let irreversible_cfg: PrivacyConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    protect_certificate_hashes = "irreversible"
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        assert_eq!(
+            irreversible_cfg.certificate_hash_protection(),
+            CertificateHashProtection::Irreversible
+        );
     }
 
     #[test]

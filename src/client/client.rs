@@ -98,6 +98,8 @@ pub struct Client {
     /// bind/unbind paths write it only on rare events.
     udp_address: ParkingRwLock<Option<SocketAddr>>,
     local_address: SocketAddr,
+    tls_ja4: Option<String>,
+    uses_proxy_protocol: bool,
     tracing_span: tracing::Span,
 
     transport: ClientTransport,
@@ -199,6 +201,8 @@ impl Client {
             udp_address,
             local_address,
             connection,
+            None,
+            false,
         )
     }
 
@@ -210,6 +214,8 @@ impl Client {
         udp_address: Option<SocketAddr>,
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
+        tls_ja4: Option<String>,
+        uses_proxy_protocol: bool,
     ) -> Box<Self> {
         Self::new_local_in_server_with_instance_id(
             server_id,
@@ -219,6 +225,8 @@ impl Client {
             udp_address,
             local_address,
             connection,
+            tls_ja4,
+            uses_proxy_protocol,
             random_client_instance_id(),
         )
     }
@@ -231,6 +239,8 @@ impl Client {
         udp_address: Option<SocketAddr>,
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
+        tls_ja4: Option<String>,
+        uses_proxy_protocol: bool,
         client_instance_id: ClientInstanceId,
     ) -> Box<Self> {
         let (certificate_hash, certificate_chain, is_verified) = {
@@ -269,6 +279,8 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
+            tls_ja4,
+            uses_proxy_protocol,
             tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
             transport: ClientTransport::NativeTls {
                 rx: AsyncMutex::new(connection_rx),
@@ -426,6 +438,8 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(None),
             local_address,
+            tls_ja4: None,
+            uses_proxy_protocol: false,
             tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
             transport: ClientTransport::WebGateway { kind, outbound_tx },
             disconnect_tx,
@@ -504,6 +518,8 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
+            tls_ja4: None,
+            uses_proxy_protocol: false,
             tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
             transport: ClientTransport::Remote,
             disconnect_tx,
@@ -670,6 +686,13 @@ impl Client {
         self.global_state.read().get_current_channel_id()
     }
 
+    pub fn display_name_opt(&self) -> Option<String> {
+        self.global_state
+            .read()
+            .get_display_name_opt()
+            .map(ToOwned::to_owned)
+    }
+
     pub fn get_listening_channel_ids(&self) -> std::collections::HashSet<u32> {
         self.global_state.read().get_listening_channel_id().clone()
     }
@@ -680,9 +703,20 @@ impl Client {
         repo: &ClientRepository,
         channel_version: u64,
     ) {
+        let previous_channel_id = self.get_current_channel_id();
         let mut gs =
             self.write_global_state_as(repo, Some(self.get_session_id()), Some(channel_version));
-        gs.set_current_channel_id(channel_id);
+        if gs.set_current_channel_id(channel_id) {
+            tracing::info!(
+                server_id = %self.server_id(),
+                session = u32::from(self.get_session_id()),
+                user_id = ?gs.get_user_id(),
+                display_name = ?gs.get_display_name_opt(),
+                previous_channel_id,
+                channel_id,
+                "client entered channel"
+            );
+        }
     }
 
     pub fn get_user_id(&self) -> Option<u32> {
@@ -709,6 +743,14 @@ impl Client {
 
     pub fn get_local_address(&self) -> SocketAddr {
         self.local_address
+    }
+
+    pub fn tls_ja4(&self) -> Option<&str> {
+        self.tls_ja4.as_deref()
+    }
+
+    pub fn uses_proxy_protocol(&self) -> bool {
+        self.uses_proxy_protocol
     }
 
     pub fn get_udp_address(&self) -> Option<SocketAddr> {

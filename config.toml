@@ -33,6 +33,10 @@ max_image_message_length = 131072
 root_channel_name = "Root"
 default_channel = 1
 cert_required = false
+# When enabled, ChannelState messages include per-client permission hints
+# (`is_enter_restricted` and `can_enter`), and ACL/enter changes send
+# PermissionQuery refreshes.
+send_permission_info = false
 # When enabled, clients only see users in channels they can Traverse.
 hide_users_without_traverse = false
 
@@ -57,11 +61,32 @@ channel_snapshot_every_ops = 10
 channel_snapshot_every_secs = 60
 channel_wal_compaction_expire_count = 2000
 
-# Debug behavior toggles
-[debug]
+# ACL behavior toggles
+[acl]
 # Preserve historical superuser behavior by ignoring Enter denies.
 # Set false to make superusers respect Enter ACLs.
 debug_acl_enter = false
+# When true, an explicit Enter deny stays denied even if Write is allowed.
+explicit_enter_deny_overrides_write = true
+# When true, registered non-superuser ACL editors keep a personal Write ACL if
+# their edit would otherwise remove their own Write permission.
+preserve_write_acl_on_edit = false
+# When true, temporary channel creators receive local ACL grants for any missing
+# Write, Enter, and Speak permissions not already inherited by the new channel.
+grant_temp_channel_creator_acl = true
+
+# Privacy behavior toggles
+[privacy]
+# Controls how non-superuser clients see other users' certificate hashes in
+# UserState.hash. Their own certificate hash remains raw.
+# false = disabled; true or "irreversible" = stable one-way remap;
+# "reversible" = stable AES-based remap reversible with the shared secret.
+protect_certificate_hashes = false
+# Required when protect_certificate_hashes is true, "irreversible", or
+# "reversible". In clusters, every node must use the same secret. Prefer
+# SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET, which maps to the nested
+# privacy.certificate.hash.secret override.
+# certificate_hash_secret = "replace-with-a-long-random-cluster-secret"
 
 # S2S (server-to-server)
 # ── L1 transport tunables ─────────────────────────────────────────────
@@ -235,7 +260,15 @@ enabled = false
 # bearer_token = "token"
 batch_size = 128
 flush_interval_ms = 1000
+# EnvFilter directive for logs shipped to Loki. By default, only this crate's
+# modules are shipped (`shitspeak_rs=debug`); widen this explicitly if you also
+# want dependency logs.
+filter = "shitspeak_rs=debug"
+# Legacy fallback used when `filter` is omitted.
 level = "debug"
 queue_capacity = 4096
 request_timeout_ms = 5000
+retry_cache_capacity = 4096
+retry_initial_interval_ms = 1000
+retry_max_interval_ms = 30000
 labels = { environment = "local" }

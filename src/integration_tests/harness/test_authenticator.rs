@@ -28,11 +28,32 @@ struct ScriptedUser {
 #[derive(Default)]
 pub struct TestAuthenticator {
     users: Mutex<HashMap<String, ScriptedUser>>,
+    auxiliary_data: Mutex<Vec<TestAuthenticateAuxiliaryData>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TestAuthenticateAuxiliaryData {
+    tls_ja4: Option<String>,
+    uses_proxy_protocol: bool,
+}
+
+impl TestAuthenticateAuxiliaryData {
+    pub fn tls_ja4(&self) -> Option<&str> {
+        self.tls_ja4.as_deref()
+    }
+
+    pub fn uses_proxy_protocol(&self) -> bool {
+        self.uses_proxy_protocol
+    }
 }
 
 impl TestAuthenticator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn authenticated_auxiliary_data(&self) -> Vec<TestAuthenticateAuxiliaryData> {
+        self.auxiliary_data.lock().unwrap().clone()
     }
 
     /// Register (or overwrite) a user. `password = None` means the user logs in
@@ -154,8 +175,16 @@ impl Authenticator for AuthenticatorAdapter {
         &self,
         username: &str,
         password: Option<&str>,
-        _auxiliary_data: &AuthenticateAuxiliaryData,
+        auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Result<AuthenticateResult, AuthenticationRejection> {
+        self.0
+            .auxiliary_data
+            .lock()
+            .unwrap()
+            .push(TestAuthenticateAuxiliaryData {
+                tls_ja4: auxiliary_data.tls_ja4.clone(),
+                uses_proxy_protocol: auxiliary_data.uses_proxy_protocol,
+            });
         let entry = {
             let users = self.0.users.lock().unwrap();
             users.get(username).cloned()

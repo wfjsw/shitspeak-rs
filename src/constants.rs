@@ -8,7 +8,7 @@ pub const APP_NAME_FROM_ENV: Option<&str> = option_env!("APP_NAME");
 pub const APP_VERSION_FROM_ENV: Option<&str> = option_env!("APP_VERSION");
 pub const APP_PROTO_VER: ProtocolVersion = ProtocolVersion {
     major: 1,
-    minor: 4,
+    minor: 6,
     patch: 0,
 };
 

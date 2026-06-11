@@ -310,6 +310,10 @@ max_text_message_length = 5000
 max_image_message_length = 131072
 default_channel = 1
 cert_required = false
+# When enabled, ChannelState messages include per-client permission hints
+# (`is_enter_restricted` and `can_enter`), and ACL/enter changes send
+# PermissionQuery refreshes.
+send_permission_info = false
 
 udp_voice_enabled = true
 udp_ping_enabled = true

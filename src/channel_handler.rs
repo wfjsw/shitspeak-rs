@@ -10,7 +10,9 @@ use std::{
 };
 
 use crate::{
-    channel_repository::{ChannelOp, ChannelOperation, ChannelRepository},
+    channel_repository::{
+        ChannelOp, ChannelOperation, ChannelRepository, channel_op_affects_acl_generation,
+    },
     client::{Client, client_session_identifier::ClientSessionIdentifier},
     messages::{Message, encoder::ChannelState},
     server::Server,
@@ -33,6 +35,32 @@ pub fn sync_channel_tree_shadow(shadow: &mut ChannelTreeShadow, message: &Messag
     }
 }
 
+pub(crate) async fn permission_info_for_channel(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+) -> (bool, enumflags2::BitFlags<crate::acl::ACLPermissions>) {
+    let server_id = client.server_id();
+    let (_, channel, ancestors) = server
+        .get_channels()
+        .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
+        .await;
+    let is_enter_restricted = channel.as_ref().is_some_and(|channel| {
+        crate::acl::channel_has_effective_restriction(
+            channel,
+            &ancestors,
+            crate::acl::ACLPermissions::Traverse,
+        ) || crate::acl::channel_has_effective_restriction(
+            channel,
+            &ancestors,
+            crate::acl::ACLPermissions::Enter,
+        )
+    });
+    let perms =
+        crate::client::acl::compute_permissions_for_client(server, client, channel_id).await;
+    (is_enter_restricted, perms)
+}
+
 /// Helper to add permission information to a ChannelState message.
 /// Applied when `send_permission_info` is enabled.
 pub async fn apply_permission_info_to_channel_state(
@@ -44,11 +72,19 @@ pub async fn apply_permission_info_to_channel_state(
     if let crate::messages::Message::ChannelState(cs_proto) = cs_proto {
         if let Some(ch_id) = cs_proto.channel_id {
             let server_id = client.server_id();
-            if let Some(ch) = channels.get_channel_in_server(&server_id, ch_id).await {
-                let perms =
-                    crate::client::acl::compute_permissions_for_client(server, client, ch_id).await;
+            if channels
+                .get_channel_in_server(&server_id, ch_id)
+                .await
+                .is_some()
+            {
+                let (is_enter_restricted, perms) =
+                    permission_info_for_channel(server, client, ch_id).await;
                 let encoder_cs: crate::messages::encoder::ChannelState = cs_proto.clone().into();
-                return Some(encoder_cs.with_permission_info(&ch, perms).into());
+                return Some(
+                    encoder_cs
+                        .with_permission_info(is_enter_restricted, perms)
+                        .into(),
+                );
             }
         }
     }
@@ -84,6 +120,10 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
     let server_id = client.server_id();
     if op.server_id != server_id {
         return messages;
+    }
+
+    if channel_op_affects_acl_generation(&op.op) {
+        messages.push(crate::messages::encoder::PermissionQuery::flush_cache().into());
     }
 
     match &op.op {
@@ -174,6 +214,14 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
                 .into();
             messages.push(permission_query);
         }
+    }
+
+    if send_permission_info
+        && channel_op_affects_acl_generation(&op.op)
+        && !matches!(op.op, ChannelOp::InstallSnapshot { .. })
+    {
+        messages
+            .extend(build_channel_permission_info_refresh_messages(server, client, channels).await);
     }
 
     messages
@@ -604,10 +652,40 @@ pub async fn build_channel_state_message(
 
     // Add permission info if configured
     if server.get_send_permission_info() {
-        let perms =
-            crate::client::acl::compute_permissions_for_client(server, client, channel.id).await;
-        cs = cs.with_permission_info(channel, perms);
+        let (is_enter_restricted, perms) =
+            permission_info_for_channel(server, client, channel.id).await;
+        cs = cs.with_permission_info(is_enter_restricted, perms);
     }
 
     cs
+}
+
+/// Build permission-only `ChannelState` deltas for the current channel tree.
+pub async fn build_channel_permission_info_refresh_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+) -> Vec<Message> {
+    if !server.get_send_permission_info() {
+        return Vec::new();
+    }
+
+    let server_id = client.server_id();
+    let mut channels = channels.get_all_in_server(&server_id).await;
+    channels.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
+
+    let mut messages = Vec::with_capacity(channels.len());
+    for channel in channels {
+        let (is_enter_restricted, perms) =
+            permission_info_for_channel(server, client, channel.id).await;
+        messages.push(
+            ChannelState {
+                channel_id: Some(channel.id),
+                ..Default::default()
+            }
+            .with_permission_info(is_enter_restricted, perms)
+            .into(),
+        );
+    }
+    messages
 }

@@ -20,6 +20,7 @@ pub(crate) async fn compute_permissions_for_client(
     let session = u32::from(client.get_session_id());
     let is_superuser = client.is_superuser();
     let debug_acl_enter = server.get_debug_acl_enter();
+    let explicit_enter_deny_overrides_write = server.get_explicit_enter_deny_overrides_write();
 
     let channels = server.get_channels();
     let server_id = client.server_id();
@@ -36,6 +37,7 @@ pub(crate) async fn compute_permissions_for_client(
                 channel_id,
                 channel_acl_generation,
                 client_acl_generation,
+                explicit_enter_deny_overrides_write,
             )
             .await
     {
@@ -82,11 +84,18 @@ pub(crate) async fn compute_permissions_for_client(
         tokens = ?token_refs,
         ancestors = ancestors.len(),
         is_superuser,
+        explicit_enter_deny_overrides_write,
         "Computing ACL permissions"
     );
 
-    let mut permissions =
-        crate::acl::evaluate_permission(&channel, &ancestors, user_id, &membership, channel_id);
+    let mut permissions = crate::acl::evaluate_permission_with_behavior(
+        &channel,
+        &ancestors,
+        user_id,
+        &membership,
+        channel_id,
+        explicit_enter_deny_overrides_write,
+    );
 
     if is_superuser {
         let allow_speak = permissions.contains(ACLPermissions::Speak);
@@ -124,6 +133,7 @@ pub(crate) async fn compute_permissions_for_client(
         user_id,
         is_superuser,
         debug_acl_enter,
+        explicit_enter_deny_overrides_write,
         permissions = ?permissions,
         "Computed ACL permissions"
     );
@@ -139,6 +149,7 @@ pub(crate) async fn compute_permissions_for_client(
                 channel_id,
                 channel_acl_generation,
                 client_acl_generation,
+                explicit_enter_deny_overrides_write,
                 permissions,
             )
             .await;

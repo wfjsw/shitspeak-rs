@@ -148,9 +148,12 @@ pub async fn handle_acl(
 
         let inherit_acl = msg.inherit_acls.unwrap_or(true);
 
-        // Safety fallback: if the requesting client would lose Write (and is registered),
+        // Safety fallback: if a registered non-superuser would lose Write,
         // include a Write|Traverse ACL in the same SetAcls transaction.
-        if sender.is_registered() {
+        if server.get_preserve_write_acl_on_edit()
+            && sender.is_registered()
+            && !sender.is_superuser()
+        {
             let (channel, ancestors) = server
                 .get_channels()
                 .get_channel_with_ancestors_in_server(&server_id, channel_id)

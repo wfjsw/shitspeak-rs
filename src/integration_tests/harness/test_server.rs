@@ -12,7 +12,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, S2sConfig, S2sSeedAddressConfig, UdpPingUserCountScope, WebConfig};
+use crate::config::{
+    Config, PrivacyConfig, S2sConfig, S2sSeedAddressConfig, UdpPingUserCountScope, WebConfig,
+};
 use crate::constants::APP_PROTO_VER;
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
 use crate::protocol_version::ProtocolVersion;
@@ -30,6 +32,10 @@ pub struct TestServerOpts {
     pub send_permission_info: bool,
     pub hide_users_without_traverse: bool,
     pub debug_acl_enter: bool,
+    pub explicit_enter_deny_overrides_write: bool,
+    pub preserve_write_acl_on_edit: bool,
+    pub grant_temp_channel_creator_acl: bool,
+    pub privacy: PrivacyConfig,
     pub server_protocol_version: ProtocolVersion,
     pub channel_log_max_entries: usize,
 }
@@ -46,6 +52,10 @@ impl Default for TestServerOpts {
             send_permission_info: false,
             hide_users_without_traverse: false,
             debug_acl_enter: true,
+            explicit_enter_deny_overrides_write: false,
+            preserve_write_acl_on_edit: true,
+            grant_temp_channel_creator_acl: true,
+            privacy: PrivacyConfig::default(),
             server_protocol_version: APP_PROTO_VER,
             channel_log_max_entries: 10_000,
         }
@@ -200,7 +210,13 @@ async fn spawn_test_server_with_pki(
         required_groups: Vec::new(),
         send_permission_info: opts.send_permission_info,
         hide_users_without_traverse: opts.hide_users_without_traverse,
-        debug: crate::config::DebugConfig::new(opts.debug_acl_enter),
+        acl: crate::config::AclConfig::with_acl_behavior(
+            opts.debug_acl_enter,
+            opts.explicit_enter_deny_overrides_write,
+            opts.preserve_write_acl_on_edit,
+            opts.grant_temp_channel_creator_acl,
+        ),
+        privacy: opts.privacy,
         s2s,
         web: WebConfig::default(),
     };
