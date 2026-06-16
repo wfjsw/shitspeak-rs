@@ -76,7 +76,9 @@ pub async fn peek_tls_ja4(tcp_stream: &TcpStream) -> io::Result<Option<String>> 
 
         match parse_tls_client_hello_records(&buffer[..len]) {
             ClientHelloRecordParse::Complete(handshake) => {
-                return Ok(parse_client_hello(&handshake).map(|hello| ja4_from_client_hello(&hello)));
+                return Ok(
+                    parse_client_hello(&handshake).map(|hello| ja4_from_client_hello(&hello))
+                );
             }
             ClientHelloRecordParse::Invalid => return Ok(None),
             ClientHelloRecordParse::Incomplete if len < capacity => return Ok(None),
@@ -371,20 +373,20 @@ mod tests {
             (
                 TLS_EXTENSION_SERVER_NAME,
                 vec![
-                    0x00, 0x10, 0x00, 0x00, 0x0d, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-                    b'.', b't', b'e', b's', b't',
+                    0x00, 0x10, 0x00, 0x00, 0x0d, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.',
+                    b't', b'e', b's', b't',
                 ],
             ),
-            (
-                TLS_EXTENSION_ALPN,
-                vec![0x00, 0x03, 0x02, b'h', b'2'],
-            ),
+            (TLS_EXTENSION_ALPN, vec![0x00, 0x03, 0x02, b'h', b'2']),
         ]);
 
         let without_sni = parse_client_hello(&without_sni).expect("parse without SNI");
         let with_sni = parse_client_hello(&with_sni).expect("parse with SNI");
 
-        assert_eq!(ja4_from_client_hello(&without_sni), ja4_from_client_hello(&with_sni));
+        assert_eq!(
+            ja4_from_client_hello(&without_sni),
+            ja4_from_client_hello(&with_sni)
+        );
     }
 
     fn test_client_hello(extensions: Vec<(u16, Vec<u8>)>) -> Vec<u8> {

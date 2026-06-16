@@ -113,11 +113,13 @@ Important local settings include:
 5. `udp_voice_enabled` and `udp_ping_enabled` control UDP behavior.
 6. `blob_storage_dir` controls where persistent channel, client, and blob data is stored.
 7. `authenticator_wasm_path` enables a custom WASM authentication module.
-8. `s2s` sections configure clustered server operation.
-9. `web` sections configure the browser gateway.
-10. `[acl].explicit_enter_deny_overrides_write` lets an explicit `Enter` deny override `Write`'s implied `Enter` permission.
-11. `[acl].preserve_write_acl_on_edit` controls whether registered non-superuser ACL editors keep a personal `Write` fallback.
-12. `[privacy].protect_certificate_hashes` accepts `false`, `true`, `"irreversible"`, or `"reversible"` for other users' `UserState.hash` values in non-superuser views. Configure the same `[privacy].certificate_hash_secret` on every cluster node, or use `SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET`.
+8. `authenticator_file_access_dir` optionally grants that WASM module file stream access rooted at listed directories.
+9. `authenticator_working_dir` sets the working directory for relative WASM authenticator file paths.
+10. `s2s` sections configure clustered server operation.
+11. `web` sections configure the browser gateway.
+12. `[acl].explicit_enter_deny_overrides_write` lets an explicit `Enter` deny override `Write`'s implied `Enter` permission.
+13. `[acl].preserve_write_acl_on_edit` controls whether registered non-superuser ACL editors keep a personal `Write` fallback.
+14. `[privacy].protect_certificate_hashes` accepts `false`, `true`, `"irreversible"`, or `"reversible"` for other users' `UserState.hash` values in non-superuser views. Configure the same `[privacy].certificate_hash_secret` on every cluster node, or use `SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET`.
 
 Selected settings are hot reloaded when `config.toml` changes. The C2S TLS identity from `cert_path` and `key_path` is also hot reloaded for new client handshakes when either file changes. Existing TLS sessions continue using the identity they negotiated. Listener addresses, node identity, storage paths, and other startup resources require a restart.
 

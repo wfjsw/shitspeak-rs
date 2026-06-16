@@ -187,6 +187,8 @@ async fn spawn_test_server_with_pki(
         min_client_version: 0,
         max_users: opts.max_users,
         authenticator_wasm_path: None,
+        authenticator_file_access_dir: Vec::new(),
+        authenticator_working_dir: None,
         welcome_text: opts.welcome_text.clone(),
         max_bandwidth: 72_000,
         allow_html: true,

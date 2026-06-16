@@ -53,11 +53,16 @@ async fn authenticator_receives_tls_ja4_and_proxy_protocol_flag() {
         .expect("alice auth");
 
     let auxiliary = server.authenticator.authenticated_auxiliary_data();
-    let auxiliary = auxiliary.last().expect("authenticator should record auth data");
+    let auxiliary = auxiliary
+        .last()
+        .expect("authenticator should record auth data");
     let tls_ja4 = auxiliary
         .tls_ja4()
         .expect("native TLS connection should have a JA4 fingerprint");
-    assert!(tls_ja4.starts_with("t13x"), "SNI-redacted TLS 1.3 JA4: {tls_ja4}");
+    assert!(
+        tls_ja4.starts_with("t13x"),
+        "SNI-redacted TLS 1.3 JA4: {tls_ja4}"
+    );
     assert!(
         !auxiliary.uses_proxy_protocol(),
         "direct test connection should not use PROXY protocol"

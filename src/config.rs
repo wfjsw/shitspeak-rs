@@ -950,6 +950,14 @@ pub struct Config {
     /// on hot reload. `None` falls back to the built-in demo authenticator.
     #[serde(default)]
     pub authenticator_wasm_path: Option<PathBuf>,
+    /// Optional directories that bound WASM authenticator file stream access.
+    /// When empty, file stream imports are unavailable.
+    #[serde(default)]
+    pub authenticator_file_access_dir: Vec<PathBuf>,
+    /// Optional working directory used to resolve relative WASM authenticator
+    /// file stream paths. Access is still bounded by authenticator_file_access_dir.
+    #[serde(default)]
+    pub authenticator_working_dir: Option<PathBuf>,
 
     // ── Mumble standard server config ──────────────────────────────────────
     #[serde(default)]

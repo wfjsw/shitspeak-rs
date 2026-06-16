@@ -280,6 +280,8 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         min_client_version: 0,
         max_users: 128,
         authenticator_wasm_path: None,
+        authenticator_file_access_dir: Vec::new(),
+        authenticator_working_dir: None,
         welcome_text: None,
         max_bandwidth: 72_000,
         allow_html: true,

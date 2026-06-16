@@ -93,6 +93,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let authenticator = ReloadableAuthenticator::from_wasm_path(
         config.authenticator_wasm_path.as_deref(),
         config.blob_storage_dir.as_deref(),
+        &config.authenticator_file_access_dir,
+        config.authenticator_working_dir.as_deref(),
     )?;
     let server = Server::new_with_reloadable_authenticator(config, authenticator).await?;
 

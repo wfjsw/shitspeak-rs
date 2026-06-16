@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write as _};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -13,6 +13,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::time;
 use wasmtime::{
     Caller, Config as WasmConfig, Engine as WasmEngine, Extern, Instance, Linker, Memory, Module,
     Store,
@@ -35,8 +39,16 @@ const MAX_WASM_AUTH_CACHE_VALUE_BYTES: usize = 64 * 1024;
 const MAX_WASM_AUTH_CACHE_ENTRIES: usize = 1024;
 const MAX_WASM_AUTH_STATE_KEY_BYTES: usize = 1024;
 const MAX_WASM_AUTH_STATE_VALUE_BYTES: usize = MAX_WASM_RESPONSE_BYTES;
+const MAX_WASM_AUTH_FILE_PATH_BYTES: usize = 1024;
+const MAX_WASM_AUTH_OPEN_STREAMS: usize = 64;
 const WASM_AUTH_STATE_SUBDIR: &str = "wasm_authenticator";
 const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+const FILE_OPEN_READ: i32 = 0x01;
+const FILE_OPEN_WRITE: i32 = 0x02;
+const FILE_OPEN_CREATE: i32 = 0x04;
+const FILE_OPEN_TRUNCATE: i32 = 0x08;
+const FILE_OPEN_APPEND: i32 = 0x10;
 static WASM_AUTH_STATE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -58,6 +70,8 @@ pub enum WasmAuthenticatorError {
     InvalidPayload(String),
     #[error("failed to build WASM authenticator HTTP client: {source}")]
     HttpClient { source: reqwest::Error },
+    #[error("invalid WASM authenticator file access config: {0}")]
+    FileAccessConfig(String),
     #[error("WASM authenticator JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -108,9 +122,16 @@ impl ReloadableAuthenticator {
     pub fn from_wasm_path(
         path: Option<&Path>,
         storage_dir: Option<&Path>,
+        file_access_dirs: &[PathBuf],
+        working_dir: Option<&Path>,
     ) -> Result<Self, WasmAuthenticatorError> {
         Ok(Self {
-            inner: RwLock::new(load_authenticator_from_wasm_path(path, storage_dir)?),
+            inner: RwLock::new(load_authenticator_from_wasm_path(
+                path,
+                storage_dir,
+                file_access_dirs,
+                working_dir,
+            )?),
             reloads_from_wasm_config: true,
         })
     }
@@ -119,11 +140,14 @@ impl ReloadableAuthenticator {
         &self,
         path: Option<&Path>,
         storage_dir: Option<&Path>,
+        file_access_dirs: &[PathBuf],
+        working_dir: Option<&Path>,
     ) -> Result<Option<Arc<dyn Authenticator>>, WasmAuthenticatorError> {
         if !self.reloads_from_wasm_config {
             return Ok(None);
         }
-        load_authenticator_from_wasm_path(path, storage_dir).map(Some)
+        load_authenticator_from_wasm_path(path, storage_dir, file_access_dirs, working_dir)
+            .map(Some)
     }
 
     pub fn apply_prepared_reload(&self, next: Option<Arc<dyn Authenticator>>) {
@@ -199,9 +223,16 @@ impl Authenticator for ReloadableAuthenticator {
 fn load_authenticator_from_wasm_path(
     path: Option<&Path>,
     storage_dir: Option<&Path>,
+    file_access_dirs: &[PathBuf],
+    working_dir: Option<&Path>,
 ) -> Result<Arc<dyn Authenticator>, WasmAuthenticatorError> {
     match path.filter(|path| !path.as_os_str().is_empty()) {
-        Some(path) => Ok(Arc::new(WasmAuthenticator::from_file(path, storage_dir)?)),
+        Some(path) => Ok(Arc::new(WasmAuthenticator::from_file(
+            path,
+            storage_dir,
+            file_access_dirs,
+            working_dir,
+        )?)),
         None => Ok(Arc::new(DemoAuthenticator)),
     }
 }
@@ -218,6 +249,8 @@ impl WasmAuthenticator {
     pub fn from_file(
         path: &Path,
         storage_dir: Option<&Path>,
+        file_access_dirs: &[PathBuf],
+        working_dir: Option<&Path>,
     ) -> Result<Self, WasmAuthenticatorError> {
         let bytes = std::fs::read(path).map_err(|source| WasmAuthenticatorError::Read {
             path: path.to_path_buf(),
@@ -244,7 +277,11 @@ impl WasmAuthenticator {
             module: Arc::new(CompiledWasmAuthenticator { engine, module }),
             http_client,
             cache: Arc::new(WasmAuthCache::default()),
-            state: Arc::new(WasmAuthState::new(storage_dir)),
+            state: Arc::new(WasmAuthState::new(
+                storage_dir,
+                file_access_dirs,
+                working_dir,
+            )?),
             source_path: path.to_path_buf(),
         })
     }
@@ -410,6 +447,7 @@ impl CompiledWasmAuthenticator {
                 http_client,
                 cache,
                 state,
+                streams: HostStreams::default(),
             },
         );
         let linker = build_linker(&self.engine)?;
@@ -485,6 +523,82 @@ fn build_linker(engine: &WasmEngine) -> Result<Linker<HostState>, WasmAuthentica
     linker
         .func_wrap_async("shitspeak", "fetch", |caller, params| {
             Box::new(host_fetch(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("env", "tcp_open", |caller, params| {
+            Box::new(host_tcp_open(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("shitspeak", "tcp_open", |caller, params| {
+            Box::new(host_tcp_open(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("env", "udp_open", |caller, params| {
+            Box::new(host_udp_open(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("shitspeak", "udp_open", |caller, params| {
+            Box::new(host_udp_open(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("env", "file_open", |caller, params| {
+            Box::new(host_file_open(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("shitspeak", "file_open", |caller, params| {
+            Box::new(host_file_open(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("env", "stream_read", |caller, params| {
+            Box::new(host_stream_read(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("shitspeak", "stream_read", |caller, params| {
+            Box::new(host_stream_read(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("env", "stream_write", |caller, params| {
+            Box::new(host_stream_write(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("shitspeak", "stream_write", |caller, params| {
+            Box::new(host_stream_write(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("env", "stream_seek", |caller, params| {
+            Box::new(host_stream_seek(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("shitspeak", "stream_seek", |caller, params| {
+            Box::new(host_stream_seek(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("env", "stream_close", host_stream_close)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap("shitspeak", "stream_close", host_stream_close)
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("env", "file_delete", |caller, params| {
+            Box::new(host_file_delete(caller, params))
+        })
+        .map_err(wasm_execution_error)?;
+    linker
+        .func_wrap_async("shitspeak", "file_delete", |caller, params| {
+            Box::new(host_file_delete(caller, params))
         })
         .map_err(wasm_execution_error)?;
     linker
@@ -579,6 +693,196 @@ async fn host_fetch(
                 response_capacity,
                 fallback.as_bytes(),
             )
+        }
+    }
+}
+
+async fn host_tcp_open(
+    mut caller: Caller<'_, HostState>,
+    (addr_ptr, addr_len, timeout_ms): (i32, i32, i32),
+) -> i32 {
+    let addr = match read_socket_addr(&mut caller, addr_ptr, addr_len) {
+        Ok(addr) => addr,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth TCP address");
+            return -1;
+        }
+    };
+    let stream = match with_timeout(timeout_ms, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "wasm_auth", %addr, error = %error, "WASM auth TCP open failed");
+            return -1;
+        }
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", %addr, error = %error, "WASM auth TCP open timed out");
+            return -1;
+        }
+    };
+    caller.data_mut().streams.insert(HostStream::Tcp(stream))
+}
+
+async fn host_udp_open(mut caller: Caller<'_, HostState>, (addr_ptr, addr_len): (i32, i32)) -> i32 {
+    let addr = match read_socket_addr(&mut caller, addr_ptr, addr_len) {
+        Ok(addr) => addr,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth UDP address");
+            return -1;
+        }
+    };
+    let bind_addr = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", %addr, error = %error, "WASM auth UDP bind failed");
+            return -1;
+        }
+    };
+    if let Err(error) = socket.connect(addr).await {
+        tracing::warn!(target: "wasm_auth", %addr, error = %error, "WASM auth UDP connect failed");
+        return -1;
+    }
+    caller.data_mut().streams.insert(HostStream::Udp(socket))
+}
+
+async fn host_file_open(
+    mut caller: Caller<'_, HostState>,
+    (path_ptr, path_len, flags): (i32, i32, i32),
+) -> i32 {
+    let path = match read_guest_string(
+        &mut caller,
+        path_ptr,
+        path_len,
+        MAX_WASM_AUTH_FILE_PATH_BYTES,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth file path");
+            return -1;
+        }
+    };
+    let file = match caller.data().state.open_file(&path, flags).await {
+        Ok(Some(file)) => file,
+        Ok(None) => return 0,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", path, error = %error, "WASM auth file open failed");
+            return -1;
+        }
+    };
+    caller.data_mut().streams.insert(HostStream::File(file))
+}
+
+async fn host_stream_read(
+    mut caller: Caller<'_, HostState>,
+    (handle, response_ptr, response_capacity, timeout_ms): (i32, i32, i32, i32),
+) -> i32 {
+    if response_ptr < 0 || response_capacity < 0 {
+        return -1;
+    }
+    let Ok(capacity) = usize::try_from(response_capacity) else {
+        return -1;
+    };
+    if capacity > MAX_WASM_RESPONSE_BYTES {
+        return -1;
+    }
+    let mut buf = vec![0u8; capacity];
+    let result = match caller.data_mut().streams.get_mut(handle) {
+        Some(HostStream::Tcp(stream)) => with_timeout(timeout_ms, stream.read(&mut buf)).await,
+        Some(HostStream::Udp(socket)) => with_timeout(timeout_ms, socket.recv(&mut buf)).await,
+        Some(HostStream::File(file)) => with_timeout(timeout_ms, file.read(&mut buf)).await,
+        None => return -1,
+    };
+    let n = match result {
+        Ok(Ok(n)) => n,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "wasm_auth", handle, error = %error, "WASM auth stream read failed");
+            return -1;
+        }
+        Err(_) => return 0,
+    };
+    write_guest_bytes(&mut caller, response_ptr, response_capacity, &buf[..n])
+}
+
+async fn host_stream_write(
+    mut caller: Caller<'_, HostState>,
+    (handle, request_ptr, request_len, timeout_ms): (i32, i32, i32, i32),
+) -> i32 {
+    let bytes = match read_guest_bytes(&mut caller, request_ptr, request_len) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth stream write buffer");
+            return -1;
+        }
+    };
+    let result = match caller.data_mut().streams.get_mut(handle) {
+        Some(HostStream::Tcp(stream)) => with_timeout(timeout_ms, stream.write(&bytes)).await,
+        Some(HostStream::Udp(socket)) => with_timeout(timeout_ms, socket.send(&bytes)).await,
+        Some(HostStream::File(file)) => with_timeout(timeout_ms, file.write(&bytes)).await,
+        None => return -1,
+    };
+    match result {
+        Ok(Ok(n)) => checked_i32_plain(n),
+        Ok(Err(error)) => {
+            tracing::warn!(target: "wasm_auth", handle, error = %error, "WASM auth stream write failed");
+            -1
+        }
+        Err(_) => -1,
+    }
+}
+
+async fn host_stream_seek(
+    mut caller: Caller<'_, HostState>,
+    (handle, position): (i32, i64),
+) -> i32 {
+    if position < 0 {
+        return -1;
+    }
+    let Some(HostStream::File(file)) = caller.data_mut().streams.get_mut(handle) else {
+        return -1;
+    };
+    match file.seek(io::SeekFrom::Start(position as u64)).await {
+        Ok(_) => 1,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", handle, error = %error, "WASM auth file seek failed");
+            -1
+        }
+    }
+}
+
+fn host_stream_close(mut caller: Caller<'_, HostState>, handle: i32) -> i32 {
+    if caller.data_mut().streams.remove(handle).is_some() {
+        1
+    } else {
+        0
+    }
+}
+
+async fn host_file_delete(
+    mut caller: Caller<'_, HostState>,
+    (path_ptr, path_len): (i32, i32),
+) -> i32 {
+    let path = match read_guest_string(
+        &mut caller,
+        path_ptr,
+        path_len,
+        MAX_WASM_AUTH_FILE_PATH_BYTES,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", error, "invalid WASM auth file delete path");
+            return -1;
+        }
+    };
+    match caller.data().state.file_delete(&path).await {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(error) => {
+            tracing::warn!(target: "wasm_auth", path, error = %error, "WASM auth file delete failed");
+            -1
         }
     }
 }
@@ -789,6 +1093,31 @@ fn read_state_key(
     read_guest_bytes(caller, ptr, len)
 }
 
+fn read_socket_addr(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+) -> Result<SocketAddr, String> {
+    let addr = read_guest_string(caller, ptr, len, MAX_WASM_AUTH_FILE_PATH_BYTES)?;
+    addr.parse::<SocketAddr>()
+        .map_err(|error| format!("socket address must be host:port: {error}"))
+}
+
+fn read_guest_string(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+    max_len: usize,
+) -> Result<String, String> {
+    if len < 0 || len as usize > max_len {
+        return Err(format!(
+            "guest string length must be between 0 and {max_len} bytes"
+        ));
+    }
+    String::from_utf8(read_guest_bytes(caller, ptr, len)?)
+        .map_err(|error| format!("guest string must be UTF-8: {error}"))
+}
+
 fn read_guest_bytes(
     caller: &mut Caller<'_, HostState>,
     ptr: i32,
@@ -900,6 +1229,24 @@ fn checked_i32_len(len: usize) -> Result<i32, WasmAuthenticatorError> {
         .map_err(|_| WasmAuthenticatorError::InvalidPayload("buffer too large".to_owned()))
 }
 
+fn checked_i32_plain(len: usize) -> i32 {
+    i32::try_from(len).unwrap_or(i32::MAX)
+}
+
+async fn with_timeout<T>(
+    timeout_ms: i32,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, time::error::Elapsed> {
+    time::timeout(timeout_duration(timeout_ms), future).await
+}
+
+fn timeout_duration(timeout_ms: i32) -> Duration {
+    if timeout_ms <= 0 {
+        return MAX_SOCKET_TIMEOUT;
+    }
+    Duration::from_millis(timeout_ms as u64).min(MAX_SOCKET_TIMEOUT)
+}
+
 fn unpack_ptr_len(packed: i64) -> Result<(u32, u32), WasmAuthenticatorError> {
     if packed < 0 {
         return Err(WasmAuthenticatorError::InvalidPayload(format!(
@@ -918,6 +1265,54 @@ struct HostState {
     http_client: reqwest::Client,
     cache: Arc<WasmAuthCache>,
     state: Arc<WasmAuthState>,
+    streams: HostStreams,
+}
+
+#[derive(Default)]
+struct HostStreams {
+    next_handle: i32,
+    streams: HashMap<i32, HostStream>,
+}
+
+impl HostStreams {
+    fn insert(&mut self, stream: HostStream) -> i32 {
+        if self.streams.len() >= MAX_WASM_AUTH_OPEN_STREAMS {
+            return -1;
+        }
+        let handle = self.next_available_handle();
+        if handle <= 0 {
+            return -1;
+        }
+        self.streams.insert(handle, stream);
+        handle
+    }
+
+    fn next_available_handle(&mut self) -> i32 {
+        for _ in 0..i32::MAX {
+            self.next_handle = self.next_handle.saturating_add(1);
+            if self.next_handle <= 0 {
+                self.next_handle = 1;
+            }
+            if !self.streams.contains_key(&self.next_handle) {
+                return self.next_handle;
+            }
+        }
+        -1
+    }
+
+    fn get_mut(&mut self, handle: i32) -> Option<&mut HostStream> {
+        self.streams.get_mut(&handle)
+    }
+
+    fn remove(&mut self, handle: i32) -> Option<HostStream> {
+        self.streams.remove(&handle)
+    }
+}
+
+enum HostStream {
+    Tcp(TcpStream),
+    Udp(UdpSocket),
+    File(File),
 }
 
 #[derive(Default)]
@@ -975,13 +1370,37 @@ struct WasmAuthCacheInner {
 
 struct WasmAuthState {
     root: Option<PathBuf>,
+    file_roots: Vec<PathBuf>,
+    working_dir: PathBuf,
 }
 
 impl WasmAuthState {
-    fn new(storage_dir: Option<&Path>) -> Self {
-        Self {
+    fn new(
+        storage_dir: Option<&Path>,
+        file_access_dirs: &[PathBuf],
+        working_dir: Option<&Path>,
+    ) -> Result<Self, WasmAuthenticatorError> {
+        let process_dir = std::env::current_dir().map_err(|error| {
+            WasmAuthenticatorError::FileAccessConfig(format!(
+                "failed to resolve process current directory: {error}"
+            ))
+        })?;
+        let working_dir = working_dir
+            .map(|dir| normalize_host_path(&process_dir, dir))
+            .transpose()
+            .map_err(WasmAuthenticatorError::FileAccessConfig)?
+            .unwrap_or_else(|| process_dir.clone());
+        let file_roots = file_access_dirs
+            .iter()
+            .map(|dir| normalize_host_path(&process_dir, dir))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WasmAuthenticatorError::FileAccessConfig)?;
+
+        Ok(Self {
             root: storage_dir.map(|dir| dir.join(WASM_AUTH_STATE_SUBDIR)),
-        }
+            file_roots,
+            working_dir,
+        })
     }
 
     fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
@@ -1053,6 +1472,108 @@ impl WasmAuthState {
         let (prefix, suffix) = key.split_at(2);
         Some(root.join(prefix).join(suffix))
     }
+
+    async fn open_file(&self, path: &str, flags: i32) -> io::Result<Option<File>> {
+        let Some(path) = self.path_for_file(path)? else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            if flags & FILE_OPEN_CREATE != 0 {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        let mut options = tokio::fs::OpenOptions::new();
+        options
+            .read(flags & FILE_OPEN_READ != 0)
+            .write(flags & FILE_OPEN_WRITE != 0)
+            .create(flags & FILE_OPEN_CREATE != 0)
+            .truncate(flags & FILE_OPEN_TRUNCATE != 0)
+            .append(flags & FILE_OPEN_APPEND != 0);
+        options.open(path).await.map(Some)
+    }
+
+    async fn file_delete(&self, path: &str) -> io::Result<bool> {
+        let Some(path) = self.path_for_file(path)? else {
+            return Ok(false);
+        };
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn path_for_file(&self, path: &str) -> io::Result<Option<PathBuf>> {
+        if self.file_roots.is_empty() {
+            return Ok(None);
+        }
+        if path.as_bytes().len() > MAX_WASM_AUTH_FILE_PATH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file path exceeds host limit",
+            ));
+        }
+        let path = Path::new(path);
+        let resolved = if path.is_absolute() {
+            normalize_guest_path(path)?
+        } else {
+            normalize_guest_path(&self.working_dir.join(path))?
+        };
+        if self
+            .file_roots
+            .iter()
+            .any(|root| resolved.starts_with(root))
+        {
+            Ok(Some(resolved))
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file path is outside authenticator_file_access_dir",
+            ));
+        }
+    }
+}
+
+fn normalize_host_path(base: &Path, path: &Path) -> Result<PathBuf, String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    normalize_path_components(&path, true)
+        .map_err(|error| format!("invalid path `{}`: {error}", path.display()))
+}
+
+fn normalize_guest_path(path: &Path) -> io::Result<PathBuf> {
+    normalize_path_components(path, true)
+}
+
+fn normalize_path_components(path: &Path, allow_parent: bool) -> io::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if allow_parent {
+                    if !normalized.pop() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "file path cannot traverse above root",
+                        ));
+                    }
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "file path cannot contain traversal",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {

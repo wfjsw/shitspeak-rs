@@ -411,6 +411,8 @@ mod tests {
             min_client_version: 0,
             max_users: 100,
             authenticator_wasm_path: None,
+            authenticator_file_access_dir: Vec::new(),
+            authenticator_working_dir: None,
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,
@@ -2543,6 +2545,8 @@ impl Server {
                 let prepared_authenticator = self.authenticator.prepare_wasm_reload(
                     new_config.authenticator_wasm_path.as_deref(),
                     new_config.blob_storage_dir.as_deref(),
+                    &new_config.authenticator_file_access_dir,
+                    new_config.authenticator_working_dir.as_deref(),
                 )?;
                 let authenticator_reloaded = prepared_authenticator.is_some();
 
@@ -2584,6 +2588,21 @@ impl Server {
                         "config reload: authenticator_wasm_path {:?} -> {:?}",
                         current.authenticator_wasm_path,
                         new_config.authenticator_wasm_path
+                    );
+                }
+                if current.authenticator_file_access_dir != new_config.authenticator_file_access_dir
+                {
+                    tracing::info!(
+                        "config reload: authenticator_file_access_dir {:?} -> {:?}",
+                        current.authenticator_file_access_dir,
+                        new_config.authenticator_file_access_dir
+                    );
+                }
+                if current.authenticator_working_dir != new_config.authenticator_working_dir {
+                    tracing::info!(
+                        "config reload: authenticator_working_dir {:?} -> {:?}",
+                        current.authenticator_working_dir,
+                        new_config.authenticator_working_dir
                     );
                 }
                 if current.cert_path != new_config.cert_path

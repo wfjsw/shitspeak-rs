@@ -23,6 +23,12 @@ max_users = 100
 # The configured WASM file is loaded at startup and hot-reloaded when the file
 # or config.toml changes.
 # authenticator_wasm_path = "auth.wasm"
+# Optional root directories for WASM authenticator file stream imports.
+# Omit to disable file access from the authenticator.
+# authenticator_file_access_dir = ["auth-files"]
+# Optional working directory for relative WASM authenticator file paths.
+# Relative paths are still allowed only when they resolve under one of the roots above.
+# authenticator_working_dir = "auth-files"
 
 # Mumble standard
 welcome_text = "Welcome to ShitSpeak test server!"
