@@ -1,11 +1,29 @@
-use std::alloc::{alloc as raw_alloc, dealloc as raw_dealloc, Layout};
-use std::collections::HashMap;
-use std::future::Future;
-use std::ptr;
-use std::slice;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+#![no_std]
+
+extern crate alloc;
+
+use alloc::alloc::{alloc as raw_alloc, dealloc as raw_dealloc, Layout};
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::future::Future;
+use core::panic::PanicInfo;
+use core::ptr;
+use core::slice;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use serde::{Deserialize, Serialize};
+
+#[global_allocator]
+static ALLOCATOR: talc::wasm::WasmDynamicTalc = talc::wasm::new_wasm_dynamic_allocator();
+
+#[panic_handler]
+fn panic(_info: &PanicInfo<'_>) -> ! {
+    loop {}
+}
 
 #[link(wasm_import_module = "shitspeak")]
 extern "C" {
@@ -110,7 +128,7 @@ async fn authenticate_with_fetch(username: &str, password: Option<&str>) -> Auth
         "username": username,
         "password": password,
     });
-    let mut headers = HashMap::new();
+    let mut headers = BTreeMap::new();
     headers.insert("content-type".to_owned(), "application/json".to_owned());
 
     let fetch_request = FetchRequest {
@@ -218,7 +236,7 @@ where
 {
     let waker = noop_waker();
     let mut context = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
+    let mut future = core::pin::pin!(future);
     match future.as_mut().poll(&mut context) {
         Poll::Ready(output) => Some(output),
         Poll::Pending => None,
@@ -316,7 +334,7 @@ impl AuthenticateResponse {
 struct FetchRequest {
     url: String,
     method: String,
-    headers: HashMap<String, String>,
+    headers: BTreeMap<String, String>,
     body: Option<String>,
     timeout_ms: u64,
 }
@@ -329,6 +347,6 @@ struct FetchResponse {
     #[serde(default)]
     status_text: String,
     #[serde(default)]
-    headers: HashMap<String, String>,
+    headers: BTreeMap<String, String>,
     body: Option<String>,
 }
