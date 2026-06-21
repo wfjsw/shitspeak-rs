@@ -5,6 +5,7 @@ pub use self::{
     listener::KcpListener,
     session::KcpStatsHandle,
     stream::KcpStream,
+    udp_io::{KcpUdpIo, SharedUdpIo},
 };
 pub use kcp::KcpStats;
 
@@ -13,4 +14,5 @@ mod listener;
 mod session;
 mod skcp;
 mod stream;
+mod udp_io;
 mod utils;

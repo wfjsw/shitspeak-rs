@@ -6,7 +6,7 @@ pub mod replications;
 pub mod transport;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -28,6 +28,12 @@ use crate::voice::codec::AudioPayload;
 const S2S_DEADLINE: Duration = Duration::from_secs(10);
 const CLIENT_DEADLINE: Duration = Duration::from_secs(4);
 const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+const CONVERGENCE_NODE_COUNT: u16 = 6;
+const CONVERGENCE_USERS_PER_NODE: usize = 800;
+const CONVERGENCE_LIGHT_USERS_PER_NODE: usize = 20;
+const CONVERGENCE_HELLO_INTERVAL_MS: u64 = 200;
+const CONVERGENCE_HELLO_DEAD_INTERVAL_MS: u64 = 800;
+const CONVERGENCE_LSA_MAX_AGE_MS: u64 = 5_000;
 
 async fn spawn_s2s_pair() -> (TestServer, TestServer) {
     let pki = Arc::new(mint_pki(&[1, 2]));
@@ -193,6 +199,72 @@ async fn wait_for_s2s_cluster(nodes: &[(&TestServer, u16)]) {
     assert!(ready, "S2S cluster did not converge in time");
 }
 
+struct ConvergenceCluster {
+    servers: Vec<TestServer>,
+    s2s_ports: Vec<u16>,
+}
+
+impl ConvergenceCluster {
+    async fn connect_full_mesh(&self) {
+        for (idx, server) in self.servers.iter().enumerate() {
+            for (peer_idx, &peer_port) in self.s2s_ports.iter().enumerate() {
+                if idx == peer_idx {
+                    continue;
+                }
+                add_s2s_peer_address(server, (peer_idx + 1) as u16, peer_port).await;
+            }
+        }
+    }
+}
+
+async fn spawn_s2s_convergence_cluster() -> ConvergenceCluster {
+    let node_ids: Vec<u16> = (1..=CONVERGENCE_NODE_COUNT).collect();
+    let pki = Arc::new(mint_pki(&node_ids));
+    let mut ports = Vec::with_capacity(node_ids.len());
+    for _ in &node_ids {
+        ports.push(pick_free_port().await);
+    }
+
+    let mut servers = Vec::with_capacity(node_ids.len());
+    for (idx, &node_id) in node_ids.iter().enumerate() {
+        let mut opts = TestServerOpts::default();
+        opts.max_users = (CONVERGENCE_USERS_PER_NODE
+            + CONVERGENCE_LIGHT_USERS_PER_NODE * (usize::from(CONVERGENCE_NODE_COUNT) - 1)
+            + 8) as u64;
+        let mut s2s = S2sConfig {
+            enabled: true,
+            tcp_listen: vec![loopback(ports[idx])],
+            seed_addresses: Vec::new(),
+            ..S2sConfig::default()
+        };
+        s2s.overlay.hello_interval_ms = CONVERGENCE_HELLO_INTERVAL_MS;
+        s2s.overlay.hello_dead_interval_ms = CONVERGENCE_HELLO_DEAD_INTERVAL_MS;
+        s2s.overlay.lsa_max_age_ms = CONVERGENCE_LSA_MAX_AGE_MS;
+        s2s.overlay.lsa_flood_pacing_interval_ms = 50;
+        s2s.overlay.cost_rerun_min_interval_ms = 50;
+        servers.push(
+            spawn_s2s_test_server_with_config(opts, Arc::clone(&pki), node_id, idx, s2s).await,
+        );
+    }
+    for server in &servers {
+        wait_for_s2s_runtime(server).await;
+    }
+    ConvergenceCluster {
+        servers,
+        s2s_ports: ports,
+    }
+}
+
+async fn wait_for_convergence_cluster(cluster: &ConvergenceCluster) {
+    let refs = cluster
+        .servers
+        .iter()
+        .enumerate()
+        .map(|(idx, server)| (server, (idx + 1) as u16))
+        .collect::<Vec<_>>();
+    wait_for_s2s_cluster(&refs).await;
+}
+
 async fn wait_for_s2s_runtime(server: &TestServer) {
     let ready = wait_until(S2S_DEADLINE, || {
         let mgr = server.server.s2s_manager();
@@ -218,6 +290,172 @@ async fn add_s2s_peer_address(server: &TestServer, node_id: u16, port: u16) {
             PeerAddress::new(loopback(port), TransportKind::Tcp),
         )
         .await;
+}
+
+fn convergence_users_for_node(node_id: u16) -> usize {
+    if std::env::var_os("SHITSPEAK_FULL_CONVERGENCE_LOAD").is_some() || node_id == 6 {
+        CONVERGENCE_USERS_PER_NODE
+    } else {
+        CONVERGENCE_LIGHT_USERS_PER_NODE
+    }
+}
+
+async fn add_synthetic_published_users(server: &TestServer, node_id: u16) -> Vec<u32> {
+    let user_count = convergence_users_for_node(node_id);
+    let mut sessions = Vec::with_capacity(user_count);
+    for idx in 0..user_count {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let octet = ((idx % 250) + 1) as u8;
+        let peer = std::net::SocketAddr::from(([10, node_id as u8, 0, octet], 20_000 + idx as u16));
+        let local = std::net::SocketAddr::from(([127, 0, 0, 1], 30_000 + idx as u16));
+        let client = server
+            .server
+            .get_clients()
+            .allocate_web_client(peer.ip(), peer, local, tx)
+            .await;
+        {
+            let mut gs = client.write_global_state_direct();
+            gs.set_user_id(Some(u32::from(node_id) * 100_000 + idx as u32));
+            gs.set_display_name(Some(format!("node{node_id}-user{idx:03}")));
+            gs.set_current_channel_id(0);
+        }
+        let session = client.get_session_id();
+        server.server.get_clients().publish_client(session).await;
+        sessions.push(u32::from(session));
+    }
+    sessions
+}
+
+async fn wait_for_observer_to_know_users(
+    observer: &TestClient,
+    sessions: &[u32],
+    deadline: Duration,
+) -> bool {
+    let mut remaining = sessions
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    for state in &observer.initial_user_states {
+        if let Some(session) = state.session {
+            remaining.remove(&session);
+        }
+    }
+    let until = Instant::now() + deadline;
+    while !remaining.is_empty() && Instant::now() < until {
+        let Some(message) = observer.recv(Duration::from_millis(250)).await else {
+            continue;
+        };
+        if let Message::UserState(state) = message {
+            if let Some(session) = state.session {
+                remaining.remove(&session);
+            }
+        }
+    }
+    remaining.is_empty()
+}
+
+async fn wait_for_servers_to_track_users(
+    servers: &[TestServer],
+    sessions_by_node: &[Vec<u32>],
+    deadline: Duration,
+) -> bool {
+    wait_until(deadline, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            servers.iter().all(|server| {
+                sessions_by_node.iter().flatten().all(|&session| {
+                    handle
+                        .block_on(
+                            server
+                                .server
+                                .get_clients()
+                                .get_client(ClientSessionIdentifier::from(session)),
+                        )
+                        .is_some()
+                })
+            })
+        })
+    })
+    .await
+}
+
+async fn wait_for_user_removes(
+    observer: &TestClient,
+    sessions: &[u32],
+    deadline: Duration,
+) -> Option<Duration> {
+    let started = Instant::now();
+    let mut remaining = sessions
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    while !remaining.is_empty() && started.elapsed() < deadline {
+        let Some(message) = observer.recv(Duration::from_millis(250)).await else {
+            continue;
+        };
+        if let Message::UserRemove(remove) = message {
+            remaining.remove(&remove.session);
+        }
+    }
+    remaining.is_empty().then(|| started.elapsed())
+}
+
+async fn wait_for_user_state_update(
+    observer: &TestClient,
+    session: u32,
+    deadline: Duration,
+    predicate: impl Fn(&crate::mumble_proto::UserState) -> bool,
+) -> Option<Duration> {
+    let started = Instant::now();
+    while started.elapsed() < deadline {
+        let Some(message) = observer.recv(Duration::from_millis(250)).await else {
+            continue;
+        };
+        if let Message::UserState(state) = message {
+            if state.session == Some(session) && predicate(&state) {
+                return Some(started.elapsed());
+            }
+        }
+    }
+    None
+}
+
+async fn observer_sees_user_churn(
+    observer: &TestClient,
+    sessions: &[u32],
+    watch_for: Duration,
+) -> bool {
+    let watched = sessions
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let started = Instant::now();
+    while started.elapsed() < watch_for {
+        let remaining = watch_for.saturating_sub(started.elapsed());
+        let Some(message) = observer
+            .recv(remaining.min(Duration::from_millis(250)))
+            .await
+        else {
+            continue;
+        };
+        match message {
+            Message::UserState(state) => {
+                if state
+                    .session
+                    .is_some_and(|session| watched.contains(&session))
+                {
+                    return true;
+                }
+            }
+            Message::UserRemove(remove) => {
+                if watched.contains(&remove.session) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn register_pair_users(a: &TestServer, b: &TestServer) {
@@ -1167,6 +1405,161 @@ async fn s2s_client_replication_propagates_add_update_remove() {
     assert!(
         removed,
         "Server B should remove Alice from its remote index"
+    );
+}
+
+/// Checks client-visible stability in a 6-node cluster after one redundant
+/// direct transport edge is severed. Expected: because node 6 is still reachable
+/// through other links, clients on node 1 do not receive unsolicited
+/// `UserState` or `UserRemove` for node 6 users.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn s2s_six_node_800_users_direct_link_severed_no_client_visible_churn() {
+    let _guard = s2s_network_test_guard().await;
+    let cluster = spawn_s2s_convergence_cluster().await;
+    let servers = &cluster.servers;
+    println!("direct-link-sever setup: spawned 6 S2S runtimes");
+
+    for (idx, server) in servers.iter().enumerate() {
+        server
+            .authenticator
+            .register_user("observer", None, Some(900_000 + idx as u32), vec![]);
+    }
+    let mut sessions_by_node = Vec::with_capacity(servers.len());
+    for (idx, server) in servers.iter().enumerate() {
+        sessions_by_node.push(add_synthetic_published_users(server, (idx + 1) as u16).await);
+        println!(
+            "direct-link-sever setup: node {} published {} synthetic users",
+            idx + 1,
+            sessions_by_node[idx].len()
+        );
+    }
+    cluster.connect_full_mesh().await;
+    println!("direct-link-sever setup: full mesh addresses installed");
+    wait_for_convergence_cluster(&cluster).await;
+    println!("direct-link-sever setup: overlay converged");
+    assert!(
+        wait_for_servers_to_track_users(&servers, &sessions_by_node, Duration::from_secs(45)).await,
+        "all servers should materialize all synthetic users before the measured cut"
+    );
+    let observer = TestClient::connect_and_authenticate(&servers[0], "observer", None)
+        .await
+        .expect("observer");
+    println!("direct-link-sever setup: observer connected");
+    assert!(
+        wait_for_observer_to_know_users(&observer, &sessions_by_node[5], Duration::from_secs(45))
+            .await,
+        "observer should receive node 6's initial UserState set before the measured cut"
+    );
+    observer.drain_now().await;
+
+    let node1_transport = servers[0]
+        .server
+        .s2s_manager()
+        .transport()
+        .expect("node 1 transport");
+    let node6_transport = servers[5]
+        .server
+        .s2s_manager()
+        .transport()
+        .expect("node 6 transport");
+    node1_transport.forget_node(6).await;
+    node6_transport.forget_node(1).await;
+
+    assert!(
+        !observer_sees_user_churn(&observer, &sessions_by_node[5], Duration::from_secs(6)).await,
+        "severing only the direct node 1 <-> node 6 link should not emit UserState/UserRemove for node 6 users while alternate routes remain"
+    );
+    assert!(
+        wait_until(Duration::from_secs(6), || {
+            servers[0]
+                .server
+                .s2s_manager()
+                .overlay()
+                .is_some_and(|overlay| {
+                    overlay.alive_members().contains(&6)
+                        && overlay.route_to(6, ServiceLevel::Reliable).is_some()
+                })
+        })
+        .await,
+        "node 1 should still consider node 6 alive and routed through alternate links"
+    );
+
+    println!(
+        "direct-link-sever stability: no UserState/UserRemove for {} node 6 users over 6s; node 6 stayed reachable",
+        sessions_by_node[5].len()
+    )
+}
+
+/// Measures client-visible convergence in a 6-node cluster with 800 published
+/// users per node after one node goes unreachable without a graceful S2S leave.
+/// Expected: a client on a surviving node receives `UserRemove` for every
+/// published user from the failed node after failure detection ages it out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn s2s_six_node_800_users_ungraceful_node_failure_client_visible_convergence() {
+    let _guard = s2s_network_test_guard().await;
+    let mut cluster = spawn_s2s_convergence_cluster().await;
+    let servers = &cluster.servers;
+    println!("node-offline setup: spawned 6 S2S runtimes");
+
+    for (idx, server) in servers.iter().enumerate() {
+        server
+            .authenticator
+            .register_user("observer", None, Some(910_000 + idx as u32), vec![]);
+    }
+    let mut sessions_by_node = Vec::with_capacity(servers.len());
+    for (idx, server) in servers.iter().enumerate() {
+        sessions_by_node.push(add_synthetic_published_users(server, (idx + 1) as u16).await);
+        println!(
+            "node-offline setup: node {} published {} synthetic users",
+            idx + 1,
+            sessions_by_node[idx].len()
+        );
+    }
+    cluster.connect_full_mesh().await;
+    println!("node-offline setup: full mesh addresses installed");
+    wait_for_convergence_cluster(&cluster).await;
+    println!("node-offline setup: overlay converged");
+    assert!(
+        wait_for_servers_to_track_users(&servers, &sessions_by_node, Duration::from_secs(45)).await,
+        "all servers should materialize all synthetic users before the measured outage"
+    );
+    let observer = TestClient::connect_and_authenticate(&servers[0], "observer", None)
+        .await
+        .expect("observer");
+    println!("node-offline setup: observer connected");
+    assert!(
+        wait_for_observer_to_know_users(&observer, &sessions_by_node[5], Duration::from_secs(45))
+            .await,
+        "observer should receive node 6's initial UserState set before the measured outage"
+    );
+    observer.drain_now().await;
+
+    let offline_transport = cluster.servers[5]
+        .server
+        .s2s_manager()
+        .transport()
+        .expect("node 6 transport");
+    let started = Instant::now();
+    offline_transport.shutdown().await;
+
+    let elapsed = wait_for_user_removes(&observer, &sessions_by_node[5], Duration::from_secs(45))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "observer did not receive all {} UserRemove messages from offline node",
+                sessions_by_node[5].len()
+            )
+        });
+
+    println!(
+        "ungraceful-node-failure convergence: observer received {} UserRemove messages in {:?} after node 6 transport shutdown (configured lsa_max_age={}ms)",
+        sessions_by_node[5].len(),
+        elapsed,
+        CONVERGENCE_LSA_MAX_AGE_MS
+    );
+    assert!(
+        started.elapsed() >= elapsed,
+        "elapsed timer should be measured from transport shutdown"
     );
 }
 

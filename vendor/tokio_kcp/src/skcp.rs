@@ -1,7 +1,6 @@
 use std::{
     io::{self, ErrorKind, Write},
     net::SocketAddr,
-    sync::Arc,
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
@@ -9,20 +8,20 @@ use std::{
 use futures_util::future;
 use kcp::{Error as KcpError, Kcp, KcpResult, KcpStats};
 use log::{error, trace};
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::sync::mpsc;
 
-use crate::{utils::now_millis, KcpConfig};
+use crate::{udp_io::SharedUdpIo, utils::now_millis, KcpConfig};
 
 /// Writer for sending packets to the underlying UdpSocket
 struct UdpOutput {
-    socket: Arc<UdpSocket>,
+    socket: SharedUdpIo,
     target_addr: SocketAddr,
     delay_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl UdpOutput {
     /// Create a new Writer for writing packets to UdpSocket
-    pub fn new(socket: Arc<UdpSocket>, target_addr: SocketAddr) -> UdpOutput {
+    pub fn new(socket: SharedUdpIo, target_addr: SocketAddr) -> UdpOutput {
         let (delay_tx, mut delay_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         {
@@ -70,7 +69,7 @@ impl Write for UdpOutput {
 pub struct KcpSocket {
     kcp: Kcp<UdpOutput>,
     last_update: Instant,
-    socket: Arc<UdpSocket>,
+    socket: SharedUdpIo,
     flush_write: bool,
     flush_ack_input: bool,
     sent_first: bool,
@@ -85,7 +84,7 @@ impl KcpSocket {
     pub fn new(
         c: &KcpConfig,
         conv: u32,
-        socket: Arc<UdpSocket>,
+        socket: SharedUdpIo,
         target_addr: SocketAddr,
         stream: bool,
     ) -> KcpResult<KcpSocket> {
@@ -317,7 +316,7 @@ impl KcpSocket {
         }
     }
 
-    pub fn udp_socket(&self) -> &Arc<UdpSocket> {
+    pub fn udp_socket(&self) -> &SharedUdpIo {
         &self.socket
     }
 

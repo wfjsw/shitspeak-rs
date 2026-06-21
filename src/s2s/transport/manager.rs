@@ -23,7 +23,8 @@ use super::SendOptions;
 use super::config::TransportConfig;
 use super::connection::{AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerState};
 use super::endpoint::{
-    EndpointRegistry, kcp::KcpEndpoint, quic::QuicEndpoint, tcp::TcpEndpoint, udp::UdpEndpoint,
+    EndpointRegistry, kcp::KcpEndpoint, mux::UdpMuxSet, quic::QuicEndpoint, tcp::TcpEndpoint,
+    udp::UdpEndpoint,
 };
 use super::error::{ConfigError, SendError, TransportError};
 use super::identity::NodeIdentity;
@@ -938,6 +939,7 @@ fn build_endpoints(
     server_tls: Arc<rustls::ServerConfig>,
     client_tls: Arc<rustls::ClientConfig>,
 ) -> Result<EndpointRegistry, TransportError> {
+    let mux = UdpMuxSet::new(&udp_family_listen_addrs(cfg));
     let has_seed = |kind| {
         cfg.seed_targets()
             .iter()
@@ -956,6 +958,7 @@ fn build_endpoints(
             server_tls.clone(),
             client_tls.clone(),
             cfg.kcp_listen_addrs().iter().copied(),
+            mux.clone(),
         ))
     });
     let quic = if !cfg.quic_listen_addrs().is_empty() || has_seed(TransportKind::Quic) {
@@ -963,6 +966,7 @@ fn build_endpoints(
             server_tls.clone(),
             client_tls.clone(),
             cfg.quic_listen_addrs().iter().copied(),
+            mux.clone(),
         )
         .map_err(|e| {
             let (addr, source) = e.into_parts();
@@ -976,10 +980,34 @@ fn build_endpoints(
         Arc::new(UdpEndpoint::new(
             identity,
             cfg.udp_listen_addrs().iter().copied(),
+            mux,
         ))
     });
 
     Ok(EndpointRegistry::new(tcp, kcp, quic, udp))
+}
+
+fn udp_family_listen_addrs(cfg: &TransportConfig) -> Vec<(TransportKind, SocketAddr)> {
+    let mut addrs = Vec::new();
+    addrs.extend(
+        cfg.kcp_listen_addrs()
+            .iter()
+            .copied()
+            .map(|addr| (TransportKind::Kcp, addr)),
+    );
+    addrs.extend(
+        cfg.quic_listen_addrs()
+            .iter()
+            .copied()
+            .map(|addr| (TransportKind::Quic, addr)),
+    );
+    addrs.extend(
+        cfg.udp_listen_addrs()
+            .iter()
+            .copied()
+            .map(|addr| (TransportKind::Udp, addr)),
+    );
+    addrs
 }
 
 #[cfg(test)]
@@ -1132,6 +1160,36 @@ mod tests {
             vec![
                 PeerAddress::new(socket("127.0.0.1:64740"), TransportKind::Kcp),
                 PeerAddress::new(socket("127.0.0.2:64740"), TransportKind::Kcp),
+            ]
+        );
+    }
+
+    #[test]
+    fn listen_addresses_can_publish_same_udp_socket_for_all_udp_family_transports() {
+        let shared = socket("127.0.0.1:64739");
+        let mut addrs = Vec::new();
+        addrs.extend(advertised_addresses(
+            &[],
+            &[shared],
+            TransportKind::Kcp,
+        ));
+        addrs.extend(advertised_addresses(
+            &[],
+            &[shared],
+            TransportKind::Quic,
+        ));
+        addrs.extend(advertised_addresses(
+            &[],
+            &[shared],
+            TransportKind::Udp,
+        ));
+
+        assert_eq!(
+            addrs,
+            vec![
+                PeerAddress::new(shared, TransportKind::Kcp),
+                PeerAddress::new(shared, TransportKind::Quic),
+                PeerAddress::new(shared, TransportKind::Udp),
             ]
         );
     }

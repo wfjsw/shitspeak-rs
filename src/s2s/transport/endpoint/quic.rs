@@ -10,7 +10,7 @@ use std::sync::Arc;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
     ClientConfig as QuinnClientConfig, Endpoint as QuinnEndpoint, EndpointConfig,
-    ServerConfig as QuinnServerConfig, default_runtime,
+    ServerConfig as QuinnServerConfig, TransportConfig as QuinnTransportConfig, default_runtime,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, warn};
@@ -20,15 +20,22 @@ use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
 use super::super::native_stats;
 use super::super::service_level::TransportKind;
-use super::{Endpoint, install_stream_session, ipv6_only_for_address, socket_addr_supports_remote};
+use super::{
+    Endpoint, install_stream_session, ipv6_only_for_address, socket_addr_supports_remote,
+    mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxSet},
+    remote_udp_addr_is_muxed, seed_udp_addr_is_muxed,
+};
 
 /// QUIC endpoint state. Owns the bound `quinn::Endpoint` and the QUIC
 /// client config used for outbound connections.
 pub(crate) struct QuicEndpoint {
-    accept_handles: Vec<AcceptEndpoint>,
+    listen_addrs: Vec<SocketAddr>,
+    server_cfg: QuinnServerConfig,
+    accept_handles: parking_lot::Mutex<Vec<AcceptEndpoint>>,
     client_v4: Option<QuinnEndpoint>,
     client_v6: Option<QuinnEndpoint>,
     client_cfg: QuinnClientConfig,
+    mux: UdpMuxSet,
 }
 
 struct AcceptEndpoint {
@@ -54,6 +61,7 @@ impl QuicEndpoint {
         server_tls: Arc<rustls::ServerConfig>,
         client_tls: Arc<rustls::ClientConfig>,
         listen_addrs: impl IntoIterator<Item = SocketAddr>,
+        mux: UdpMuxSet,
     ) -> Result<Self, QuicBindError> {
         let listen_addrs = listen_addrs.into_iter().collect::<Vec<_>>();
         let mut server_tls = (*server_tls).clone();
@@ -70,49 +78,44 @@ impl QuicEndpoint {
             .try_into()
             .map_err(|e| quic_config_error(first_listen_addr(&listen_addrs), e))?;
         let server_cfg = QuinnServerConfig::with_crypto(Arc::new(qsc));
-        let mut accept_handles = Vec::with_capacity(listen_addrs.len());
-        for addr in listen_addrs.iter().copied() {
-            let ipv6_only = ipv6_only_for_address(addr, &listen_addrs);
-            let handle =
-                bind_server_endpoint(server_cfg.clone(), addr, ipv6_only).map_err(|e| {
-                    QuicBindError {
-                        addr,
-                        source: io::Error::new(e.kind(), format!("quic bind {addr}: {e}")),
-                    }
-                })?;
-            accept_handles.push(AcceptEndpoint { handle, ipv6_only });
-        }
         let (client_v4, client_v6) = build_client_endpoints().map_err(|source| QuicBindError {
             addr: first_listen_addr(&listen_addrs),
             source,
         })?;
 
         Ok(Self {
-            accept_handles,
+            listen_addrs,
+            server_cfg,
+            accept_handles: parking_lot::Mutex::new(Vec::new()),
             client_v4,
             client_v6,
             client_cfg,
+            mux,
         })
     }
 
-    fn client_handle(&self, addr: SocketAddr) -> io::Result<&QuinnEndpoint> {
-        if addr.is_ipv4() {
-            self.client_v4
-                .as_ref()
-                .or_else(|| self.accept_handle_for_family(addr))
-                .ok_or_else(|| missing_client_socket(addr))
-        } else {
-            self.client_v6
-                .as_ref()
-                .or_else(|| self.accept_handle_for_family(addr))
-                .ok_or_else(|| missing_client_socket(addr))
+    async fn client_handle(
+        &self,
+        addr: SocketAddr,
+        muxed: bool,
+    ) -> io::Result<QuinnEndpoint> {
+        if muxed {
+            return bind_prefixed_client_endpoint(addr).await;
         }
+        let handle = if addr.is_ipv4() {
+            self.client_v4.as_ref().cloned()
+        } else {
+            self.client_v6.as_ref().cloned()
+        };
+        handle
+            .or_else(|| self.accept_handle_for_family(addr))
+            .ok_or_else(|| missing_client_socket(addr))
     }
 
-    fn accept_handle_for_family(&self, addr: SocketAddr) -> Option<&QuinnEndpoint> {
-        self.accept_handles.iter().find_map(|accept| {
+    fn accept_handle_for_family(&self, addr: SocketAddr) -> Option<QuinnEndpoint> {
+        self.accept_handles.lock().iter().find_map(|accept| {
             let local = accept.handle.local_addr().ok()?;
-            socket_addr_supports_remote(local, accept.ipv6_only, addr).then_some(&accept.handle)
+            socket_addr_supports_remote(local, accept.ipv6_only, addr).then_some(accept.handle.clone())
         })
     }
 }
@@ -159,6 +162,19 @@ fn bind_server_endpoint(
     )
 }
 
+fn bind_mux_server_endpoint(
+    server_cfg: QuinnServerConfig,
+    handle: super::mux::UdpMuxHandle,
+) -> io::Result<QuinnEndpoint> {
+    let runtime = default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+    QuinnEndpoint::new_with_abstract_socket(
+        endpoint_config(true)?,
+        Some(server_cfg),
+        Arc::new(handle),
+        runtime,
+    )
+}
+
 fn build_client_endpoints() -> io::Result<(Option<QuinnEndpoint>, Option<QuinnEndpoint>)> {
     let client_v4 = bind_client_endpoint(SocketAddr::from(([0, 0, 0, 0], 0)));
     let client_v6 = bind_client_endpoint(SocketAddr::from(([0u16; 8], 0)));
@@ -184,6 +200,32 @@ fn bind_client_endpoint(addr: SocketAddr) -> io::Result<QuinnEndpoint> {
     QuinnEndpoint::client(addr)
 }
 
+async fn bind_prefixed_client_endpoint(addr: SocketAddr) -> io::Result<QuinnEndpoint> {
+    let socket = PrefixedUdpSocket::bind_ephemeral(addr, TransportKind::Quic).await?;
+    let runtime = default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+    QuinnEndpoint::new_with_abstract_socket(endpoint_config(true)?, None, Arc::new(socket), runtime)
+}
+
+fn endpoint_config(muxed: bool) -> io::Result<EndpointConfig> {
+    let mut cfg = EndpointConfig::default();
+    if muxed {
+        let max_payload = 1472usize.saturating_sub(DISCRIMINATOR_LEN);
+        cfg.max_udp_payload_size(max_payload as u16)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
+    }
+    Ok(cfg)
+}
+
+fn quic_transport_config(muxed: bool) -> Arc<QuinnTransportConfig> {
+    let mut transport = QuinnTransportConfig::default();
+    if muxed {
+        let mtu = 1200u16.saturating_sub(DISCRIMINATOR_LEN as u16);
+        transport.initial_mtu(mtu);
+        transport.min_mtu(mtu);
+    }
+    Arc::new(transport)
+}
+
 fn missing_client_socket(addr: SocketAddr) -> io::Error {
     io::Error::new(
         io::ErrorKind::AddrNotAvailable,
@@ -199,7 +241,33 @@ impl Endpoint for QuicEndpoint {
         inner: Arc<ManagerInner>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            for accept in &self.accept_handles {
+            let mut handles = Vec::with_capacity(self.listen_addrs.len());
+            for addr in self.listen_addrs.iter().copied() {
+                let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
+                let handle = match self
+                    .mux
+                    .take_handle(addr, TransportKind::Quic, inner.shutdown().child_token())
+                    .await?
+                {
+                    Some(mux_handle) => {
+                        let mut server_cfg = self.server_cfg.clone();
+                        server_cfg.transport = quic_transport_config(true);
+                        bind_mux_server_endpoint(server_cfg, mux_handle).map_err(|e| {
+                            io::Error::new(e.kind(), format!("quic mux bind {addr}: {e}"))
+                        })?
+                    }
+                    None => {
+                        let mut server_cfg = self.server_cfg.clone();
+                        server_cfg.transport = quic_transport_config(false);
+                        bind_server_endpoint(server_cfg, addr, ipv6_only).map_err(|e| {
+                            io::Error::new(e.kind(), format!("quic bind {addr}: {e}"))
+                        })?
+                    }
+                };
+                handles.push(AcceptEndpoint { handle, ipv6_only });
+            }
+            *self.accept_handles.lock() = handles;
+            for accept in self.accept_handles.lock().iter() {
                 let handle = accept.handle.clone();
                 debug!(
                     addr=?handle.local_addr().ok(),
@@ -219,8 +287,11 @@ impl Endpoint for QuicEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
+            let muxed =
+                remote_udp_addr_is_muxed(&peer.snapshot_addresses(), addr, TransportKind::Quic);
             let connecting = self
-                .client_handle(addr)?
+                .client_handle(addr, muxed)
+                .await?
                 .connect_with(
                     self.client_cfg.clone(),
                     addr,
@@ -274,8 +345,11 @@ impl Endpoint for QuicEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
         async move {
+            let muxed =
+                seed_udp_addr_is_muxed(&inner.cfg().seed_targets(), addr, TransportKind::Quic);
             let connecting = self
-                .client_handle(addr)?
+                .client_handle(addr, muxed)
+                .await?
                 .connect_with(self.client_cfg.clone(), addr, "s2s-seed.local")
                 .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
             let conn = connecting

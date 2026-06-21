@@ -1788,10 +1788,10 @@ async fn acl_cache_per_user_purge_sends_permission_query_flush_only_to_that_user
 async fn channel_state_initial_sync_includes_permission_info_when_enabled() {
     let server = spawn_test_server(TestServerOpts {
         send_permission_info: true,
-        ..TestServerOpts::default()
+        ..TestServerOpts::defa
     })
     .await;
-    server
+    serverult()
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
 

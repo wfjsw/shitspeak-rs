@@ -20,12 +20,15 @@ use super::super::service_level::TransportKind;
 use super::{
     Endpoint, bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only,
     install_stream_session, ipv6_only_for_address,
+    mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpDialMode, UdpMuxSet},
+    remote_udp_addr_is_muxed, seed_udp_addr_is_muxed,
 };
 
 pub(crate) struct KcpEndpoint {
     server_tls: Arc<rustls::ServerConfig>,
     client_tls: Arc<rustls::ClientConfig>,
     listen_addrs: Vec<SocketAddr>,
+    mux: UdpMuxSet,
 }
 
 impl KcpEndpoint {
@@ -33,11 +36,13 @@ impl KcpEndpoint {
         server_tls: Arc<rustls::ServerConfig>,
         client_tls: Arc<rustls::ClientConfig>,
         listen_addrs: impl IntoIterator<Item = SocketAddr>,
+        mux: UdpMuxSet,
     ) -> Self {
         Self {
             server_tls,
             client_tls,
             listen_addrs: listen_addrs.into_iter().collect(),
+            mux,
         }
     }
 }
@@ -50,14 +55,29 @@ impl Endpoint for KcpEndpoint {
         inner: Arc<ManagerInner>,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let cfg = KcpConfig::default();
             let acceptor = TlsAcceptor::from(self.server_tls.clone());
             for addr in self.listen_addrs.iter().copied() {
                 let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
-                let socket = bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?;
-                let listener = KcpListener::from_socket(cfg.clone(), socket)
-                    .await
-                    .map_err(|e| io::Error::other(format!("kcp bind {addr}: {e}")))?;
+                let listener = match self
+                    .mux
+                    .take_handle(addr, TransportKind::Kcp, inner.shutdown().child_token())
+                    .await?
+                {
+                    Some(handle) => {
+                        let cfg = kcp_config_for_mode(UdpDialMode::Muxed);
+                        KcpListener::from_io(cfg, Arc::new(handle))
+                            .await
+                            .map_err(|e| io::Error::other(format!("kcp mux bind {addr}: {e}")))?
+                    }
+                    None => {
+                        let cfg = KcpConfig::default();
+                        let socket =
+                            bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?;
+                        KcpListener::from_socket(cfg, socket)
+                            .await
+                            .map_err(|e| io::Error::other(format!("kcp bind {addr}: {e}")))?
+                    }
+                };
                 debug!(%addr, %ipv6_only, "kcp listener up");
                 tokio::spawn(accept_loop(listener, acceptor.clone(), inner.clone()));
             }
@@ -72,9 +92,17 @@ impl Endpoint for KcpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let cfg = KcpConfig::default();
-            let socket = bind_ephemeral_udp_dial_socket(addr).await?;
-            let sock = KcpStream::connect_with_socket(&cfg, socket, addr)
+            let mode = if remote_udp_addr_is_muxed(
+                &peer.snapshot_addresses(),
+                addr,
+                TransportKind::Kcp,
+            ) {
+                UdpDialMode::Muxed
+            } else {
+                UdpDialMode::Direct
+            };
+            let cfg = kcp_config_for_mode(mode);
+            let sock = connect_kcp_stream(&cfg, mode, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
             let native_sampler = native_stats::kcp_sampler(&sock);
@@ -116,9 +144,14 @@ impl Endpoint for KcpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
         async move {
-            let cfg = KcpConfig::default();
-            let socket = bind_ephemeral_udp_dial_socket(addr).await?;
-            let sock = KcpStream::connect_with_socket(&cfg, socket, addr)
+            let mode =
+                if seed_udp_addr_is_muxed(&inner.cfg().seed_targets(), addr, TransportKind::Kcp) {
+                    UdpDialMode::Muxed
+                } else {
+                    UdpDialMode::Direct
+                };
+            let cfg = kcp_config_for_mode(mode);
+            let sock = connect_kcp_stream(&cfg, mode, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
             let native_sampler = native_stats::kcp_sampler(&sock);
@@ -147,6 +180,31 @@ impl Endpoint for KcpEndpoint {
                 native_sampler,
             );
             Ok(peer_node)
+        }
+    }
+}
+
+fn kcp_config_for_mode(mode: UdpDialMode) -> KcpConfig {
+    let mut cfg = KcpConfig::default();
+    if mode == UdpDialMode::Muxed {
+        cfg.mtu = cfg.mtu.saturating_sub(DISCRIMINATOR_LEN);
+    }
+    cfg
+}
+
+async fn connect_kcp_stream(
+    cfg: &KcpConfig,
+    mode: UdpDialMode,
+    addr: SocketAddr,
+) -> Result<KcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    match mode {
+        UdpDialMode::Direct => {
+            let socket = bind_ephemeral_udp_dial_socket(addr).await?;
+            Ok(KcpStream::connect_with_socket(cfg, socket, addr).await?)
+        }
+        UdpDialMode::Muxed => {
+            let socket = PrefixedUdpSocket::bind_ephemeral(addr, TransportKind::Kcp).await?;
+            Ok(KcpStream::connect_with_io(cfg, Arc::new(socket), addr).await?)
         }
     }
 }

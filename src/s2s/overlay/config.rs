@@ -436,6 +436,15 @@ impl SeedPeer {
 /// fields (timers, transport masks, etc.) stay Rust-builder-only for now.
 #[derive(Deserialize, Debug, Clone)]
 pub struct OverlayTuning {
+    #[serde(default = "default_hello_interval_ms")]
+    pub hello_interval_ms: u64,
+
+    #[serde(default = "default_hello_dead_interval_ms")]
+    pub hello_dead_interval_ms: u64,
+
+    #[serde(default = "default_lsa_max_age_ms")]
+    pub lsa_max_age_ms: u64,
+
     /// Whether this node forwards inbound overlay data whose final destination
     /// is another node. Local delivery and local origination are unaffected.
     #[serde(default = "default_route_transit_messages")]
@@ -486,6 +495,9 @@ pub struct OverlayTuning {
 impl Default for OverlayTuning {
     fn default() -> Self {
         Self {
+            hello_interval_ms: default_hello_interval_ms(),
+            hello_dead_interval_ms: default_hello_dead_interval_ms(),
+            lsa_max_age_ms: default_lsa_max_age_ms(),
             route_transit_messages: default_route_transit_messages(),
             lsdb_sync_max_response_lsas: default_lsdb_sync_max_response_lsas(),
             lsa_flood_pacing_interval_ms: default_lsa_flood_pacing_interval_ms(),
@@ -510,7 +522,10 @@ impl OverlayTuning {
     /// Apply the tunables on top of an `OverlayConfig` built from the
     /// existing seed-peer / persistence-dir machinery.
     pub fn apply(&self, cfg: OverlayConfig) -> OverlayConfig {
-        cfg.with_route_transit_messages(self.route_transit_messages)
+        cfg.with_hello_interval(Duration::from_millis(self.hello_interval_ms))
+            .with_hello_dead_interval(Duration::from_millis(self.hello_dead_interval_ms))
+            .with_lsa_max_age(Duration::from_millis(self.lsa_max_age_ms))
+            .with_route_transit_messages(self.route_transit_messages)
             .with_lsdb_sync_max_response_lsas(self.lsdb_sync_max_response_lsas)
             .with_lsa_flood_pacing_interval(Duration::from_millis(
                 self.lsa_flood_pacing_interval_ms,
@@ -534,6 +549,18 @@ impl OverlayTuning {
             .with_ordered_retry_initial(Duration::from_millis(self.ordered_retry_initial_ms))
             .with_ordered_retry_max(Duration::from_millis(self.ordered_retry_max_ms))
     }
+}
+
+fn default_hello_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_hello_dead_interval_ms() -> u64 {
+    4_000
+}
+
+fn default_lsa_max_age_ms() -> u64 {
+    120_000
 }
 
 fn default_route_transit_messages() -> bool {

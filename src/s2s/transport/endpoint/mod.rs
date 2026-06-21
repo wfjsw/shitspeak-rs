@@ -37,6 +37,7 @@ use super::service_level::{PeerAddress, SeedAddress, ServiceShape, TransportKind
 use super::stream_io::{StreamPumpConfig, spawn_stream_pump};
 
 pub(crate) mod kcp;
+pub(crate) mod mux;
 pub(crate) mod quic;
 pub(crate) mod tcp;
 pub(crate) mod udp;
@@ -58,6 +59,33 @@ pub(crate) fn socket_addr_supports_remote(
             && local_addr.is_ipv6()
             && !ipv6_only
             && local_addr.ip().is_unspecified())
+}
+
+pub(crate) fn remote_udp_addr_is_muxed(
+    addrs: &[PeerAddress],
+    addr: SocketAddr,
+    transport: TransportKind,
+) -> bool {
+    addrs.iter().any(|candidate| {
+        candidate.addr() == addr
+            && candidate.transport() != TransportKind::Tcp
+            && candidate.transport() != transport
+    })
+}
+
+pub(crate) fn seed_udp_addr_is_muxed(
+    seeds: &[SeedAddress],
+    addr: SocketAddr,
+    transport: TransportKind,
+) -> bool {
+    seeds
+        .iter()
+        .filter_map(SeedAddress::as_static_peer_address)
+        .any(|candidate| {
+            candidate.addr() == addr
+                && candidate.transport() != TransportKind::Tcp
+                && candidate.transport() != transport
+        })
 }
 
 pub(crate) async fn bind_tcp_listener(
@@ -1239,5 +1267,66 @@ mod tests {
 
         assert!(!should_remove_failed_address(&refused));
         assert!(!should_remove_failed_address(&timed_out));
+    }
+
+    #[test]
+    fn remote_udp_addr_is_muxed_only_for_shared_udp_family_address() {
+        let shared: SocketAddr = "127.0.0.1:64739".parse().unwrap();
+        let direct: SocketAddr = "127.0.0.1:64740".parse().unwrap();
+        let addrs = [
+            PeerAddress::new(shared, TransportKind::Kcp),
+            PeerAddress::new(shared, TransportKind::Quic),
+            PeerAddress::new(direct, TransportKind::Udp),
+            PeerAddress::new(shared, TransportKind::Tcp),
+        ];
+
+        assert!(remote_udp_addr_is_muxed(
+            &addrs,
+            shared,
+            TransportKind::Kcp
+        ));
+        assert!(remote_udp_addr_is_muxed(
+            &addrs,
+            shared,
+            TransportKind::Quic
+        ));
+        assert!(!remote_udp_addr_is_muxed(
+            &addrs,
+            direct,
+            TransportKind::Udp
+        ));
+        assert!(!remote_udp_addr_is_muxed(
+            &[PeerAddress::new(shared, TransportKind::Udp)],
+            shared,
+            TransportKind::Udp
+        ));
+    }
+
+    #[test]
+    fn seed_udp_addr_is_muxed_for_static_shared_udp_family_seed_addresses() {
+        let shared: SocketAddr = "127.0.0.1:64739".parse().unwrap();
+        let direct: SocketAddr = "127.0.0.1:64740".parse().unwrap();
+        let seeds = [
+            SeedAddress::new(shared.to_string(), TransportKind::Kcp),
+            SeedAddress::new(shared.to_string(), TransportKind::Quic),
+            SeedAddress::new(direct.to_string(), TransportKind::Udp),
+            SeedAddress::new("seed.example:64739", TransportKind::Udp),
+        ];
+
+        assert!(seed_udp_addr_is_muxed(
+            &seeds,
+            shared,
+            TransportKind::Kcp
+        ));
+        assert!(seed_udp_addr_is_muxed(
+            &seeds,
+            shared,
+            TransportKind::Quic
+        ));
+        assert!(!seed_udp_addr_is_muxed(
+            &seeds,
+            direct,
+            TransportKind::Udp
+        ));
     }
 }

@@ -16,11 +16,11 @@ use tokio::{
     time,
 };
 
-use crate::{config::KcpConfig, session::KcpSessionManager, stream::KcpStream};
+use crate::{config::KcpConfig, session::KcpSessionManager, stream::KcpStream, udp_io::SharedUdpIo};
 
 #[derive(Debug)]
 pub struct KcpListener {
-    udp: Arc<UdpSocket>,
+    udp: SharedUdpIo,
     accept_rx: mpsc::Receiver<(KcpStream, SocketAddr)>,
     task_watcher: JoinHandle<()>,
 }
@@ -41,6 +41,11 @@ impl KcpListener {
     /// Create a `KcpListener` from an existed `UdpSocket`
     pub async fn from_socket(config: KcpConfig, udp: UdpSocket) -> KcpResult<KcpListener> {
         let udp = Arc::new(udp);
+        KcpListener::from_io(config, udp).await
+    }
+
+    /// Create a `KcpListener` from abstract UDP I/O.
+    pub async fn from_io(config: KcpConfig, udp: SharedUdpIo) -> KcpResult<KcpListener> {
         let server_udp = udp.clone();
 
         let (accept_tx, accept_rx) = mpsc::channel(1024 /* backlogs */);
@@ -159,20 +164,6 @@ impl KcpListener {
     /// Get the local address of the underlying socket
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.udp.local_addr()
-    }
-}
-
-#[cfg(unix)]
-impl std::os::unix::io::AsRawFd for KcpListener {
-    fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
-        self.udp.as_raw_fd()
-    }
-}
-
-#[cfg(windows)]
-impl std::os::windows::io::AsRawSocket for KcpListener {
-    fn as_raw_socket(&self) -> std::os::windows::prelude::RawSocket {
-        self.udp.as_raw_socket()
     }
 }
 

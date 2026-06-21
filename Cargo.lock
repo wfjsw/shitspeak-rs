@@ -4913,6 +4913,7 @@ dependencies = [
 name = "tokio_kcp"
 version = "0.9.8"
 dependencies = [
+ "async-trait",
  "byte_string",
  "bytes",
  "futures-util",

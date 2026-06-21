@@ -47,6 +47,8 @@ use super::super::service_level::{MessageClass, ServiceLevel, ServiceShape, Tran
 use super::super::tls;
 use super::{
     Endpoint, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
+    mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxHandle, UdpMuxSet},
+    remote_udp_addr_is_muxed,
     socket_addr_supports_remote,
 };
 
@@ -70,6 +72,7 @@ const SUPPORTED_SIGNATURE_SCHEMES: &[SignatureScheme] = &[
 pub(crate) struct UdpEndpoint {
     identity: Arc<NodeIdentity>,
     listen_addrs: Vec<SocketAddr>,
+    mux: UdpMuxSet,
     sockets: Mutex<UdpSocketSet>,
 }
 
@@ -77,10 +80,12 @@ impl UdpEndpoint {
     pub fn new(
         identity: Arc<NodeIdentity>,
         listen_addrs: impl IntoIterator<Item = SocketAddr>,
+        mux: UdpMuxSet,
     ) -> Self {
         Self {
             identity,
             listen_addrs: listen_addrs.into_iter().collect(),
+            mux,
             sockets: Mutex::new(UdpSocketSet::default()),
         }
     }
@@ -96,7 +101,16 @@ impl UdpEndpoint {
             return Ok(existing.clone());
         }
 
-        let state = Arc::new(UdpSocketState::bind(addr, ipv6_only).await?);
+        let state = Arc::new(
+            match self
+                .mux
+                .take_handle(addr, TransportKind::Udp, inner.shutdown().child_token())
+                .await?
+            {
+                Some(handle) => UdpSocketState::from_mux(handle),
+                None => UdpSocketState::bind(addr, ipv6_only).await?,
+            },
+        );
         sockets.insert(addr, ipv6_only, state.clone());
         tokio::spawn(run_socket_read_loop(
             state.clone(),
@@ -110,14 +124,25 @@ impl UdpEndpoint {
         &self,
         remote_addr: SocketAddr,
         inner: Arc<ManagerInner>,
+        muxed_remote: bool,
     ) -> io::Result<Arc<UdpSocketState>> {
         let mut sockets = self.sockets.lock().await;
-        if let Some(existing) = sockets.for_addr(remote_addr) {
+        if let Some(existing) = sockets.for_addr(remote_addr, muxed_remote) {
             return Ok(existing.clone());
         }
 
-        let bind = bind_addr_for_udp_socket(&self.listen_addrs, remote_addr);
-        let state = Arc::new(UdpSocketState::bind(bind.addr, bind.ipv6_only).await?);
+        let (state, bind) = if muxed_remote {
+            Arc::new(UdpSocketState::from_prefixed(
+                PrefixedUdpSocket::bind_ephemeral(remote_addr, TransportKind::Udp).await?,
+            ))
+            .with_bind_addr()?
+        } else {
+            let bind = bind_addr_for_udp_socket(&self.listen_addrs, remote_addr);
+            (
+                Arc::new(UdpSocketState::bind(bind.addr, bind.ipv6_only).await?),
+                bind,
+            )
+        };
         sockets.insert(bind.addr, bind.ipv6_only, state.clone());
         tokio::spawn(run_socket_read_loop(
             state.clone(),
@@ -152,7 +177,9 @@ impl Endpoint for UdpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let socket = self.ensure_socket(addr, inner.clone()).await?;
+            let muxed_remote =
+                remote_udp_addr_is_muxed(&peer.snapshot_addresses(), addr, TransportKind::Udp);
+            let socket = self.ensure_socket(addr, inner.clone(), muxed_remote).await?;
             let completion =
                 start_key_exchange(&inner, &self.identity, socket, peer.node_id(), addr).await?;
             completion.await.map_err(|_| {
@@ -186,14 +213,18 @@ struct UdpSocketSet {
 struct UdpSocketEntry {
     addr: SocketAddr,
     ipv6_only: bool,
+    muxed: bool,
     state: Arc<UdpSocketState>,
 }
 
 impl UdpSocketSet {
-    fn for_addr(&self, addr: SocketAddr) -> Option<&Arc<UdpSocketState>> {
+    fn for_addr(&self, addr: SocketAddr, muxed: bool) -> Option<&Arc<UdpSocketState>> {
         self.entries
             .iter()
-            .find(|entry| socket_addr_supports_remote(entry.addr, entry.ipv6_only, addr))
+            .find(|entry| {
+                entry.muxed == muxed
+                    && socket_addr_supports_remote(entry.addr, entry.ipv6_only, addr)
+            })
             .map(|entry| &entry.state)
     }
 
@@ -208,13 +239,18 @@ impl UdpSocketSet {
         if let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.addr == addr && entry.ipv6_only == ipv6_only)
+            .find(|entry| {
+                entry.addr == addr
+                    && entry.ipv6_only == ipv6_only
+                    && entry.muxed == state.socket.is_muxed()
+            })
         {
             entry.state = state;
         } else {
             self.entries.push(UdpSocketEntry {
                 addr,
                 ipv6_only,
+                muxed: state.socket.is_muxed(),
                 state,
             });
         }
@@ -245,7 +281,7 @@ fn bind_addr_for_udp_socket(listen_addrs: &[SocketAddr], remote_addr: SocketAddr
 }
 
 struct UdpSocketState {
-    socket: Arc<UdpSocket>,
+    socket: UdpIo,
     sessions: Mutex<HashMap<NodeIdentifier, Arc<UdpCryptoSession>>>,
     exchanges: Mutex<HashMap<NodeIdentifier, PeerKeyExchange>>,
     shutdown: CancellationToken,
@@ -254,11 +290,31 @@ struct UdpSocketState {
 impl UdpSocketState {
     async fn bind(addr: SocketAddr, ipv6_only: bool) -> io::Result<Self> {
         Ok(Self {
-            socket: Arc::new(bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?),
+            socket: UdpIo::Direct(Arc::new(
+                bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?,
+            )),
             sessions: Mutex::new(HashMap::new()),
             exchanges: Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
         })
+    }
+
+    fn from_mux(handle: UdpMuxHandle) -> Self {
+        Self {
+            socket: UdpIo::Mux(Arc::new(handle)),
+            sessions: Mutex::new(HashMap::new()),
+            exchanges: Mutex::new(HashMap::new()),
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    fn from_prefixed(socket: PrefixedUdpSocket) -> Self {
+        Self {
+            socket: UdpIo::Prefixed(Arc::new(socket)),
+            sessions: Mutex::new(HashMap::new()),
+            exchanges: Mutex::new(HashMap::new()),
+            shutdown: CancellationToken::new(),
+        }
     }
 
     async fn session(&self, node: NodeIdentifier) -> Option<Arc<UdpCryptoSession>> {
@@ -291,6 +347,65 @@ impl UdpSocketState {
         };
         if removed {
             self.exchanges.lock().await.remove(&node);
+        }
+    }
+
+    fn with_bind_addr(self: Arc<Self>) -> io::Result<(Arc<Self>, UdpBindAddr)> {
+        let addr = self.socket.local_addr()?;
+        Ok((
+            self,
+            UdpBindAddr {
+                addr,
+                ipv6_only: false,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum UdpIo {
+    Direct(Arc<UdpSocket>),
+    Mux(Arc<UdpMuxHandle>),
+    Prefixed(Arc<PrefixedUdpSocket>),
+}
+
+impl UdpIo {
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Direct(socket) => socket.recv_from(buf).await,
+            Self::Mux(handle) => handle.recv_from(buf).await,
+            Self::Prefixed(socket) => socket.recv_from(buf).await,
+        }
+    }
+
+    async fn send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Direct(socket) => socket.send_to(payload, target).await,
+            Self::Mux(handle) => handle.send_to(payload, target).await,
+            Self::Prefixed(socket) => socket.send_to(payload, target).await,
+        }
+    }
+
+    fn overhead(&self) -> usize {
+        match self {
+            Self::Direct(_) => 0,
+            Self::Mux(_) | Self::Prefixed(_) => DISCRIMINATOR_LEN,
+        }
+    }
+
+    fn payload_mtu(&self, udp_mtu: usize) -> usize {
+        udp_mtu.saturating_sub(self.overhead())
+    }
+
+    fn is_muxed(&self) -> bool {
+        matches!(self, Self::Mux(_) | Self::Prefixed(_))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Direct(socket) => socket.local_addr(),
+            Self::Mux(handle) => handle.local_addr(),
+            Self::Prefixed(socket) => socket.local_addr(),
         }
     }
 }
@@ -347,7 +462,7 @@ struct PromoteSession {
 struct UdpCryptoSession {
     peer_node: NodeIdentifier,
     peer_addr: parking_lot::Mutex<SocketAddr>,
-    socket: Arc<UdpSocket>,
+    socket: UdpIo,
     seal_key: LessSafeKey,
     open_key: LessSafeKey,
     send_seq: AtomicU64,
@@ -361,7 +476,7 @@ impl UdpCryptoSession {
     fn new(
         peer_node: NodeIdentifier,
         peer_addr: SocketAddr,
-        socket: Arc<UdpSocket>,
+        socket: UdpIo,
         seal_key: [u8; 32],
         open_key: [u8; 32],
         max_pending_pings: usize,
@@ -394,7 +509,7 @@ impl UdpCryptoSession {
         peer: &PeerState,
         udp_mtu: usize,
     ) -> io::Result<usize> {
-        let datagram = self.encrypt_frame(frame, udp_mtu)?;
+        let datagram = self.encrypt_frame(frame, self.socket.payload_mtu(udp_mtu))?;
         let addr = *self.peer_addr.lock();
         let n = self
             .socket

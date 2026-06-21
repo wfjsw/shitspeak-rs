@@ -61,6 +61,9 @@ version = "0.5.3"
 [dependencies.log]
 version = "0.4"
 
+[dependencies.async-trait]
+version = "0.1"
+
 [dependencies.rand]
 version = "0.8"
 

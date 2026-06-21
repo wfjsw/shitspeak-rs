@@ -15,12 +15,11 @@ use kcp::{KcpResult, KcpStats};
 use log::{error, trace};
 use spin::Mutex as SpinMutex;
 use tokio::{
-    net::UdpSocket,
     sync::{mpsc, Notify},
     time::{self, Instant},
 };
 
-use crate::{skcp::KcpSocket, KcpConfig};
+use crate::{skcp::KcpSocket, udp_io::SharedUdpIo, KcpConfig};
 
 pub struct KcpSession {
     socket: SpinMutex<KcpSocket>,
@@ -354,7 +353,7 @@ impl KcpSessionManager {
         config: &KcpConfig,
         conv: u32,
         sn: u32,
-        udp: &Arc<UdpSocket>,
+        udp: &SharedUdpIo,
         peer_addr: SocketAddr,
         session_close_notifier: &mpsc::Sender<SocketAddr>,
     ) -> KcpResult<(Arc<KcpSession>, bool)> {

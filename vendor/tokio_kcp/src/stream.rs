@@ -19,6 +19,7 @@ use crate::{
     config::KcpConfig,
     session::{KcpSession, KcpStatsHandle},
     skcp::KcpSocket,
+    udp_io::SharedUdpIo,
 };
 
 pub struct KcpStream {
@@ -91,6 +92,29 @@ impl KcpStream {
         addr: SocketAddr,
     ) -> KcpResult<KcpStream> {
         let udp = Arc::new(udp);
+        KcpStream::connect_with_io_conv(config, conv, udp, addr).await
+    }
+
+    /// Create a `KcpStream` with an abstract UDP I/O object connecting to `addr`.
+    ///
+    /// NOTE: `conv` will be randomly generated
+    pub async fn connect_with_io(config: &KcpConfig, udp: SharedUdpIo, addr: SocketAddr) -> KcpResult<KcpStream> {
+        let mut conv = rand::random();
+        while conv == 0 {
+            conv = rand::random();
+        }
+        KcpStream::connect_with_io_conv(config, conv, udp, addr).await
+    }
+
+    /// Create a `KcpStream` with an abstract UDP I/O object connecting to `addr`.
+    ///
+    /// `conv` is the conversation identifier, setting to `0` will let server to randomly generate one for you.
+    pub async fn connect_with_io_conv(
+        config: &KcpConfig,
+        conv: u32,
+        udp: SharedUdpIo,
+        addr: SocketAddr,
+    ) -> KcpResult<KcpStream> {
         let socket = KcpSocket::new(config, conv, udp, addr, config.stream)?;
 
         let session = KcpSession::new_shared(socket, config.session_expire, None);
@@ -228,22 +252,6 @@ impl AsyncWrite for KcpStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Ok(()).into()
-    }
-}
-
-#[cfg(unix)]
-impl std::os::unix::io::AsRawFd for KcpStream {
-    fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
-        let kcp_socket = self.session.kcp_socket().lock();
-        kcp_socket.udp_socket().as_raw_fd()
-    }
-}
-
-#[cfg(windows)]
-impl std::os::windows::io::AsRawSocket for KcpStream {
-    fn as_raw_socket(&self) -> std::os::windows::prelude::RawSocket {
-        let kcp_socket = self.session.kcp_socket().lock();
-        kcp_socket.udp_socket().as_raw_socket()
     }
 }
 
