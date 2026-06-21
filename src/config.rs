@@ -909,6 +909,234 @@ impl PrivacyConfig {
     }
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticatorBackend {
+    #[default]
+    Demo,
+    Wasm,
+    Exec,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecAuthenticatorMode {
+    #[default]
+    #[serde(
+        rename = "exec_ephemeral",
+        alias = "ephemeral",
+        alias = "executable_ephemeral"
+    )]
+    Ephemeral,
+    #[serde(
+        rename = "exec_long_running",
+        alias = "long_running",
+        alias = "executable_long_running"
+    )]
+    LongRunning,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExecAuthenticatorConfig {
+    #[serde(default)]
+    mode: ExecAuthenticatorMode,
+    #[serde(default)]
+    command: Option<PathBuf>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    working_dir: Option<PathBuf>,
+    #[serde(default)]
+    uid: Option<u32>,
+    #[serde(default)]
+    gid: Option<u32>,
+    #[serde(default = "default_exec_authenticator_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_exec_authenticator_max_response_bytes")]
+    max_response_bytes: usize,
+}
+
+impl Default for ExecAuthenticatorConfig {
+    fn default() -> Self {
+        Self {
+            mode: ExecAuthenticatorMode::default(),
+            command: None,
+            args: Vec::new(),
+            working_dir: None,
+            uid: None,
+            gid: None,
+            timeout_ms: default_exec_authenticator_timeout_ms(),
+            max_response_bytes: default_exec_authenticator_max_response_bytes(),
+        }
+    }
+}
+
+impl ExecAuthenticatorConfig {
+    pub fn new(command: impl Into<PathBuf>) -> Self {
+        Self {
+            command: Some(command.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_mode(mut self, mode: ExecAuthenticatorMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    pub fn with_uid(mut self, uid: u32) -> Self {
+        self.uid = Some(uid);
+        self
+    }
+
+    pub fn with_gid(mut self, gid: u32) -> Self {
+        self.gid = Some(gid);
+        self
+    }
+
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    pub fn command(&self) -> Option<&PathBuf> {
+        self.command.as_ref()
+    }
+
+    pub fn mode(&self) -> ExecAuthenticatorMode {
+        self.mode
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn working_dir(&self) -> Option<&PathBuf> {
+        self.working_dir.as_ref()
+    }
+
+    pub fn uid(&self) -> Option<u32> {
+        self.uid
+    }
+
+    pub fn gid(&self) -> Option<u32> {
+        self.gid
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    pub fn max_response_bytes(&self) -> usize {
+        self.max_response_bytes
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct WasmAuthenticatorConfig {
+    /// Optional WASM authenticator module loaded by the binary at startup and
+    /// on hot reload.
+    #[serde(default)]
+    path: Option<PathBuf>,
+    /// Optional directories that bound WASM authenticator file stream access.
+    /// When empty, file stream imports are unavailable.
+    #[serde(default)]
+    file_access_dir: Vec<PathBuf>,
+    /// Optional working directory used to resolve relative WASM authenticator
+    /// file stream paths. Access is still bounded by `file_access_dir`.
+    #[serde(default)]
+    working_dir: Option<PathBuf>,
+}
+
+impl WasmAuthenticatorConfig {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: Some(path.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_file_access_dir(
+        mut self,
+        dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> Self {
+        self.file_access_dir = dirs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    pub fn path(&self) -> Option<&PathBuf> {
+        self.path.as_ref()
+    }
+
+    pub fn file_access_dir(&self) -> &[PathBuf] {
+        &self.file_access_dir
+    }
+
+    pub fn working_dir(&self) -> Option<&PathBuf> {
+        self.working_dir.as_ref()
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuthenticatorConfig {
+    #[serde(default)]
+    backend: AuthenticatorBackend,
+    #[serde(default)]
+    wasm: WasmAuthenticatorConfig,
+    #[serde(default)]
+    exec: ExecAuthenticatorConfig,
+}
+
+impl AuthenticatorConfig {
+    pub fn new(backend: AuthenticatorBackend) -> Self {
+        Self {
+            backend,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_exec(mut self, exec: ExecAuthenticatorConfig) -> Self {
+        self.exec = exec;
+        self
+    }
+
+    pub fn with_wasm(mut self, wasm: WasmAuthenticatorConfig) -> Self {
+        self.wasm = wasm;
+        self
+    }
+
+    pub fn backend(&self) -> AuthenticatorBackend {
+        self.backend
+    }
+
+    pub fn wasm(&self) -> &WasmAuthenticatorConfig {
+        &self.wasm
+    }
+
+    pub fn exec(&self) -> &ExecAuthenticatorConfig {
+        &self.exec
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub listen: String,
@@ -920,7 +1148,7 @@ pub struct Config {
     /// Password for authenticating with the public server registry.
     #[serde(default)]
     pub register_password: Option<String>,
-    /// URL of the public server registry.
+    /// Public URL advertised in the registration payload.
     #[serde(default)]
     pub register_url: Option<String>,
     /// Hostname (or IP) that the registry should advertise for this server.
@@ -946,18 +1174,10 @@ pub struct Config {
     pub max_users: u64,
 
     // ── Authentication backend ───────────────────────────────────────────
-    /// Optional WASM authenticator module loaded by the binary at startup and
-    /// on hot reload. `None` falls back to the built-in demo authenticator.
+    /// Selects the built-in authenticator backend. Defaults to the demo
+    /// authenticator.
     #[serde(default)]
-    pub authenticator_wasm_path: Option<PathBuf>,
-    /// Optional directories that bound WASM authenticator file stream access.
-    /// When empty, file stream imports are unavailable.
-    #[serde(default)]
-    pub authenticator_file_access_dir: Vec<PathBuf>,
-    /// Optional working directory used to resolve relative WASM authenticator
-    /// file stream paths. Access is still bounded by authenticator_file_access_dir.
-    #[serde(default)]
-    pub authenticator_working_dir: Option<PathBuf>,
+    pub authenticator: AuthenticatorConfig,
 
     // ── Mumble standard server config ──────────────────────────────────────
     #[serde(default)]
@@ -1094,6 +1314,12 @@ fn default_idle_timeout() -> u64 {
 fn default_pending_delete_timeout_ms() -> u64 {
     5_000
 }
+fn default_exec_authenticator_timeout_ms() -> u64 {
+    30_000
+}
+fn default_exec_authenticator_max_response_bytes() -> usize {
+    16 * 1024 * 1024
+}
 fn default_channel_log_max_entries() -> usize {
     10_000
 }
@@ -1217,6 +1443,7 @@ mod tests {
         assert!(!cfg.acl.preserve_write_acl_on_edit());
         assert!(cfg.acl.grant_temp_channel_creator_acl());
         assert_eq!(cfg.root_channel_name, "Root");
+        assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Demo);
     }
 
     #[test]
@@ -1265,6 +1492,178 @@ mod tests {
             .try_deserialize()
             .expect("config deserialize");
         assert_eq!(cfg.root_channel_name, "Lobby");
+    }
+
+    #[test]
+    fn authenticator_config_defaults_to_demo_backend() {
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    listen = "127.0.0.1:64738"
+                    register_name = "test"
+                    cert_path = "cert.pem"
+                    key_path = "key.pem"
+                    send_version = true
+                    send_build_info = true
+                    send_os_info = true
+                    allowed_proxies = []
+                    min_client_version = 0
+                    max_users = 100
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+
+        assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Demo);
+        assert_eq!(cfg.authenticator.exec().command(), None);
+        assert_eq!(cfg.authenticator.wasm().path(), None);
+    }
+
+    #[test]
+    fn authenticator_config_parses_exec_backend() {
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    listen = "127.0.0.1:64738"
+                    register_name = "test"
+                    cert_path = "cert.pem"
+                    key_path = "key.pem"
+                    send_version = true
+                    send_build_info = true
+                    send_os_info = true
+                    allowed_proxies = []
+                    min_client_version = 0
+                    max_users = 100
+
+                    [authenticator]
+                    backend = "exec"
+
+                    [authenticator.exec]
+                    mode = "exec_long_running"
+                    command = "auth-helper"
+                    args = ["--mode", "server"]
+                    working_dir = "auth"
+                    uid = 1001
+                    gid = 1002
+                    timeout_ms = 7500
+                    max_response_bytes = 4096
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+
+        assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Exec);
+        assert_eq!(
+            cfg.authenticator.exec().mode(),
+            ExecAuthenticatorMode::LongRunning
+        );
+        assert_eq!(
+            cfg.authenticator.exec().command().map(PathBuf::as_path),
+            Some(Path::new("auth-helper"))
+        );
+        assert_eq!(cfg.authenticator.exec().args(), ["--mode", "server"]);
+        assert_eq!(
+            cfg.authenticator.exec().working_dir().map(PathBuf::as_path),
+            Some(Path::new("auth"))
+        );
+        assert_eq!(cfg.authenticator.exec().uid(), Some(1001));
+        assert_eq!(cfg.authenticator.exec().gid(), Some(1002));
+        assert_eq!(cfg.authenticator.exec().timeout_ms(), 7500);
+        assert_eq!(cfg.authenticator.exec().max_response_bytes(), 4096);
+    }
+
+    #[test]
+    fn authenticator_config_parses_wasm_backend() {
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    listen = "127.0.0.1:64738"
+                    register_name = "test"
+                    cert_path = "cert.pem"
+                    key_path = "key.pem"
+                    send_version = true
+                    send_build_info = true
+                    send_os_info = true
+                    allowed_proxies = []
+                    min_client_version = 0
+                    max_users = 100
+
+                    [authenticator]
+                    backend = "wasm"
+
+                    [authenticator.wasm]
+                    path = "auth.wasm"
+                    file_access_dir = ["auth-files", "shared-auth-files"]
+                    working_dir = "auth-files"
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+
+        assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Wasm);
+        assert_eq!(
+            cfg.authenticator.wasm().path().map(PathBuf::as_path),
+            Some(Path::new("auth.wasm"))
+        );
+        assert_eq!(
+            cfg.authenticator.wasm().file_access_dir(),
+            [
+                PathBuf::from("auth-files"),
+                PathBuf::from("shared-auth-files")
+            ]
+        );
+        assert_eq!(
+            cfg.authenticator.wasm().working_dir().map(PathBuf::as_path),
+            Some(Path::new("auth-files"))
+        );
+    }
+
+    #[test]
+    fn authenticator_exec_config_accepts_short_mode_aliases() {
+        let cfg: AuthenticatorConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    backend = "exec"
+
+                    [exec]
+                    mode = "ephemeral"
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+
+        assert_eq!(cfg.backend(), AuthenticatorBackend::Exec);
+        assert_eq!(cfg.exec().mode(), ExecAuthenticatorMode::Ephemeral);
+    }
+
+    #[test]
+    fn authenticator_exec_config_defaults_to_ephemeral_mode() {
+        let cfg: AuthenticatorConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    backend = "exec"
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+
+        assert_eq!(cfg.backend(), AuthenticatorBackend::Exec);
+        assert_eq!(cfg.exec().mode(), ExecAuthenticatorMode::Ephemeral);
     }
 
     #[test]

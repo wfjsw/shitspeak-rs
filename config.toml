@@ -7,7 +7,8 @@ register_name = "ShitSpeak Test"
 # Uncomment and fill in to register this server with the public Mumble
 # server list.  All three fields are required for registration to activate.
 # register_password = "your-registry-password"
-# register_url = "https://publist-registration.mumble.info/v1/register"
+# Public URL shown for this server in the registry response.
+# register_url = "mumble://my-server.example.com:64738"
 # register_hostname = "my-server.example.com"
 # register_location = "New York, USA"
 cert_path = "cert.pem"
@@ -18,17 +19,6 @@ send_os_info = true
 allowed_proxies = []
 min_client_version = 0
 max_users = 100
-
-# Authentication backend. Omit this to use the built-in demo authenticator.
-# The configured WASM file is loaded at startup and hot-reloaded when the file
-# or config.toml changes.
-# authenticator_wasm_path = "auth.wasm"
-# Optional root directories for WASM authenticator file stream imports.
-# Omit to disable file access from the authenticator.
-# authenticator_file_access_dir = ["auth-files"]
-# Optional working directory for relative WASM authenticator file paths.
-# Relative paths are still allowed only when they resolve under one of the roots above.
-# authenticator_working_dir = "auth-files"
 
 # Mumble standard
 welcome_text = "Welcome to ShitSpeak test server!"
@@ -66,6 +56,29 @@ client_log_max_entries = 10000
 channel_snapshot_every_ops = 10
 channel_snapshot_every_secs = 60
 channel_wal_compaction_expire_count = 2000
+
+# Authentication backend. Defaults to `demo`; other built-in backends are
+# `wasm` and `exec`.
+[authenticator]
+backend = "demo"
+
+# WASM authenticator configuration used when `backend = "wasm"`.
+# [authenticator.wasm]
+# path = "auth.wasm"
+# file_access_dir = ["auth-files"]
+# working_dir = "auth-files"
+
+# ExecAuthenticator configuration. Requests are JSON lines on stdin; responses
+# are JSON on stdout. Optional uid/gid dropping is supported on Unix.
+# [authenticator.exec]
+# mode = "exec_ephemeral" # exec_ephemeral, exec_long_running
+# command = "auth-helper"
+# args = []
+# working_dir = "auth"
+# uid = 1001
+# gid = 1001
+# timeout_ms = 30000
+# max_response_bytes = 16777216
 
 # ACL behavior toggles
 [acl]

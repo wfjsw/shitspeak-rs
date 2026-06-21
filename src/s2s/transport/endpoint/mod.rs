@@ -1280,11 +1280,7 @@ mod tests {
             PeerAddress::new(shared, TransportKind::Tcp),
         ];
 
-        assert!(remote_udp_addr_is_muxed(
-            &addrs,
-            shared,
-            TransportKind::Kcp
-        ));
+        assert!(remote_udp_addr_is_muxed(&addrs, shared, TransportKind::Kcp));
         assert!(remote_udp_addr_is_muxed(
             &addrs,
             shared,
@@ -1313,20 +1309,8 @@ mod tests {
             SeedAddress::new("seed.example:64739", TransportKind::Udp),
         ];
 
-        assert!(seed_udp_addr_is_muxed(
-            &seeds,
-            shared,
-            TransportKind::Kcp
-        ));
-        assert!(seed_udp_addr_is_muxed(
-            &seeds,
-            shared,
-            TransportKind::Quic
-        ));
-        assert!(!seed_udp_addr_is_muxed(
-            &seeds,
-            direct,
-            TransportKind::Udp
-        ));
+        assert!(seed_udp_addr_is_muxed(&seeds, shared, TransportKind::Kcp));
+        assert!(seed_udp_addr_is_muxed(&seeds, shared, TransportKind::Quic));
+        assert!(!seed_udp_addr_is_muxed(&seeds, direct, TransportKind::Udp));
     }
 }

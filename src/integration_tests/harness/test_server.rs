@@ -13,7 +13,8 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
 use crate::config::{
-    Config, PrivacyConfig, S2sConfig, S2sSeedAddressConfig, UdpPingUserCountScope, WebConfig,
+    AuthenticatorConfig, Config, PrivacyConfig, S2sConfig, S2sSeedAddressConfig,
+    UdpPingUserCountScope, WebConfig,
 };
 use crate::constants::APP_PROTO_VER;
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
@@ -186,9 +187,7 @@ async fn spawn_test_server_with_pki(
         allowed_proxies: Vec::new(),
         min_client_version: 0,
         max_users: opts.max_users,
-        authenticator_wasm_path: None,
-        authenticator_file_access_dir: Vec::new(),
-        authenticator_working_dir: None,
+        authenticator: AuthenticatorConfig::default(),
         welcome_text: opts.welcome_text.clone(),
         max_bandwidth: 72_000,
         allow_html: true,

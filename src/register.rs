@@ -1,6 +1,6 @@
 //! Public server registration with the Mumble server list.
 //!
-//! Periodically sends an XML payload to the configured registry URL so that
+//! Periodically sends an XML payload to the fixed registry URL so that
 //! the server appears in the public server browser.
 //!
 //! Based on Murmur's `Register.cpp`.
@@ -15,8 +15,8 @@ use crate::http_client;
 use crate::server::Server;
 use crate::types::DEFAULT_SERVER_ID;
 
-/// Default Mumble public server registry URL.
-const DEFAULT_REGISTRY_URL: &str = "https://publist-registration.mumble.info/v1/register";
+/// Mumble public server registry submission URL.
+const REGISTRY_URL: &str = "https://publist-registration.mumble.info/v1/register";
 
 /// Initial registration delay range: 60–120 seconds after startup.
 const INITIAL_DELAY_MIN_SECS: u64 = 60;
@@ -31,6 +31,14 @@ async fn build_register_xml(server: &Arc<Box<Server>>, config: &Config) -> Strin
     let user_count = server.get_clients().len_in_server(DEFAULT_SERVER_ID).await;
     let channel_count = server.get_channels().len_in_server(DEFAULT_SERVER_ID).await;
 
+    build_register_xml_with_counts(config, user_count, channel_count)
+}
+
+fn build_register_xml_with_counts(
+    config: &Config,
+    user_count: usize,
+    channel_count: usize,
+) -> String {
     let host = config
         .register_hostname
         .as_deref()
@@ -45,6 +53,7 @@ async fn build_register_xml(server: &Arc<Box<Server>>, config: &Config) -> Strin
         .unwrap_or(64738);
 
     let location = config.register_location.as_deref().unwrap_or("");
+    let advertised_url = config.register_url.as_deref().unwrap_or("");
 
     let mut xml = String::new();
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -72,8 +81,10 @@ async fn build_register_xml(server: &Arc<Box<Server>>, config: &Config) -> Strin
         xml.push_str("</password>\n");
     }
 
-    // URL
-    xml.push_str("  <url></url>\n");
+    // Public server URL
+    xml.push_str("  <url>");
+    xml.push_str(&escape_xml(advertised_url));
+    xml.push_str("</url>\n");
 
     // User count
     xml.push_str("  <users>");
@@ -141,20 +152,17 @@ pub fn spawn_register_task(
         if !should_register(&config) {
             info!(
                 "Not registering server as public (missing register_name, register_password, \
-                 register_url, or udp_ping_enabled)"
+                 advertised register_url, or udp_ping_enabled)"
             );
             return;
         }
 
-        let registry_url = config
-            .register_url
-            .as_deref()
-            .unwrap_or(DEFAULT_REGISTRY_URL)
-            .to_string();
-
         info!(
-            "Public server registration enabled: name=\"{}\", url=\"{}\"",
-            config.register_name, registry_url
+            "Public server registration enabled: name=\"{}\", registry_url=\"{}\", \
+             advertised_url=\"{}\"",
+            config.register_name,
+            REGISTRY_URL,
+            config.register_url.as_deref().unwrap_or("")
         );
 
         // Initial delay with jitter (using time-based pseudo-randomness)
@@ -200,18 +208,12 @@ pub fn spawn_register_task(
                 return;
             }
 
-            let registry_url = config
-                .register_url
-                .as_deref()
-                .unwrap_or(DEFAULT_REGISTRY_URL)
-                .to_string();
-
             let xml = build_register_xml(&server, &config).await;
 
-            info!("Registering server with public list at {}", registry_url);
+            info!("Registering server with public list at {}", REGISTRY_URL);
 
             match client
-                .post(&registry_url)
+                .post(REGISTRY_URL)
                 .header("Content-Type", "text/xml")
                 .body(xml.clone())
                 .send()
@@ -254,4 +256,55 @@ pub fn spawn_register_task(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_config(raw: &str) -> Config {
+        ::config::Config::builder()
+            .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize")
+    }
+
+    #[test]
+    fn register_url_is_written_to_xml_url_element() {
+        let config = parse_config(
+            r#"
+                listen = "127.0.0.1:64738"
+                register_name = "test"
+                register_password = "secret"
+                register_url = "mumble://voice.example.test:64738/?title=ShitSpeak&region=us"
+                register_hostname = "voice.example.test"
+                cert_path = "cert.pem"
+                key_path = "key.pem"
+                send_version = true
+                send_build_info = true
+                send_os_info = true
+                allowed_proxies = []
+                min_client_version = 0
+                max_users = 100
+            "#,
+        );
+
+        let xml = build_register_xml_with_counts(&config, 12, 3);
+
+        assert!(xml.contains(
+            "<url>mumble://voice.example.test:64738/?title=ShitSpeak&amp;region=us</url>"
+        ));
+        assert!(xml.contains("<users>12</users>"));
+        assert!(xml.contains("<channels>3</channels>"));
+    }
+
+    #[test]
+    fn registry_submission_url_is_fixed_to_mumble_endpoint() {
+        assert_eq!(
+            REGISTRY_URL,
+            "https://publist-registration.mumble.info/v1/register"
+        );
+    }
 }

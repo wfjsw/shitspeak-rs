@@ -21,9 +21,9 @@ use super::super::manager::ManagerInner;
 use super::super::native_stats;
 use super::super::service_level::TransportKind;
 use super::{
-    Endpoint, install_stream_session, ipv6_only_for_address, socket_addr_supports_remote,
+    Endpoint, install_stream_session, ipv6_only_for_address,
     mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxSet},
-    remote_udp_addr_is_muxed, seed_udp_addr_is_muxed,
+    remote_udp_addr_is_muxed, seed_udp_addr_is_muxed, socket_addr_supports_remote,
 };
 
 /// QUIC endpoint state. Owns the bound `quinn::Endpoint` and the QUIC
@@ -94,11 +94,7 @@ impl QuicEndpoint {
         })
     }
 
-    async fn client_handle(
-        &self,
-        addr: SocketAddr,
-        muxed: bool,
-    ) -> io::Result<QuinnEndpoint> {
+    async fn client_handle(&self, addr: SocketAddr, muxed: bool) -> io::Result<QuinnEndpoint> {
         if muxed {
             return bind_prefixed_client_endpoint(addr).await;
         }
@@ -115,7 +111,8 @@ impl QuicEndpoint {
     fn accept_handle_for_family(&self, addr: SocketAddr) -> Option<QuinnEndpoint> {
         self.accept_handles.lock().iter().find_map(|accept| {
             let local = accept.handle.local_addr().ok()?;
-            socket_addr_supports_remote(local, accept.ipv6_only, addr).then_some(accept.handle.clone())
+            socket_addr_supports_remote(local, accept.ipv6_only, addr)
+                .then_some(accept.handle.clone())
         })
     }
 }

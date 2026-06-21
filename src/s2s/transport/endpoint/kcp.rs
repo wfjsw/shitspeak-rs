@@ -92,15 +92,12 @@ impl Endpoint for KcpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let mode = if remote_udp_addr_is_muxed(
-                &peer.snapshot_addresses(),
-                addr,
-                TransportKind::Kcp,
-            ) {
-                UdpDialMode::Muxed
-            } else {
-                UdpDialMode::Direct
-            };
+            let mode =
+                if remote_udp_addr_is_muxed(&peer.snapshot_addresses(), addr, TransportKind::Kcp) {
+                    UdpDialMode::Muxed
+                } else {
+                    UdpDialMode::Direct
+                };
             let cfg = kcp_config_for_mode(mode);
             let sock = connect_kcp_stream(&cfg, mode, addr)
                 .await

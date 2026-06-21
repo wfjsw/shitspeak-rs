@@ -1168,21 +1168,9 @@ mod tests {
     fn listen_addresses_can_publish_same_udp_socket_for_all_udp_family_transports() {
         let shared = socket("127.0.0.1:64739");
         let mut addrs = Vec::new();
-        addrs.extend(advertised_addresses(
-            &[],
-            &[shared],
-            TransportKind::Kcp,
-        ));
-        addrs.extend(advertised_addresses(
-            &[],
-            &[shared],
-            TransportKind::Quic,
-        ));
-        addrs.extend(advertised_addresses(
-            &[],
-            &[shared],
-            TransportKind::Udp,
-        ));
+        addrs.extend(advertised_addresses(&[], &[shared], TransportKind::Kcp));
+        addrs.extend(advertised_addresses(&[], &[shared], TransportKind::Quic));
+        addrs.extend(advertised_addresses(&[], &[shared], TransportKind::Udp));
 
         assert_eq!(
             addrs,

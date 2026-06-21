@@ -48,8 +48,7 @@ use super::super::tls;
 use super::{
     Endpoint, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
     mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxHandle, UdpMuxSet},
-    remote_udp_addr_is_muxed,
-    socket_addr_supports_remote,
+    remote_udp_addr_is_muxed, socket_addr_supports_remote,
 };
 
 const MAGIC: [u8; 4] = *b"SSU1";
@@ -179,7 +178,9 @@ impl Endpoint for UdpEndpoint {
         async move {
             let muxed_remote =
                 remote_udp_addr_is_muxed(&peer.snapshot_addresses(), addr, TransportKind::Udp);
-            let socket = self.ensure_socket(addr, inner.clone(), muxed_remote).await?;
+            let socket = self
+                .ensure_socket(addr, inner.clone(), muxed_remote)
+                .await?;
             let completion =
                 start_key_exchange(&inner, &self.identity, socket, peer.node_id(), addr).await?;
             completion.await.map_err(|_| {
@@ -236,15 +237,11 @@ impl UdpSocketSet {
     }
 
     fn insert(&mut self, addr: SocketAddr, ipv6_only: bool, state: Arc<UdpSocketState>) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| {
-                entry.addr == addr
-                    && entry.ipv6_only == ipv6_only
-                    && entry.muxed == state.socket.is_muxed()
-            })
-        {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.addr == addr
+                && entry.ipv6_only == ipv6_only
+                && entry.muxed == state.socket.is_muxed()
+        }) {
             entry.state = state;
         } else {
             self.entries.push(UdpSocketEntry {

@@ -37,7 +37,10 @@ use crate::user_channel_cache::UserChannelCache;
 use crate::{
     client_repository::ClientRepository,
     codec_info::CodecInfo,
-    config::{CertificateHashProtection, Config, ServerEntrypointConfig, UdpPingUserCountScope},
+    config::{
+        AuthenticatorConfig, CertificateHashProtection, Config, ServerEntrypointConfig,
+        UdpPingUserCountScope,
+    },
     constants::MTU,
     s2s::S2SManager,
     types::{DEFAULT_SERVER_ID, NodeIdentifier, default_server_id},
@@ -410,9 +413,7 @@ mod tests {
             allowed_proxies: Vec::new(),
             min_client_version: 0,
             max_users: 100,
-            authenticator_wasm_path: None,
-            authenticator_file_access_dir: Vec::new(),
-            authenticator_working_dir: None,
+            authenticator: AuthenticatorConfig::default(),
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,
@@ -1184,8 +1185,16 @@ impl Server {
         let _ = self.shutdown_tx.send(());
     }
 
-    pub fn authenticator_wasm_path(&self) -> Option<PathBuf> {
-        self.read_config().authenticator_wasm_path.clone()
+    pub fn authenticator_watch_paths(&self) -> Vec<PathBuf> {
+        let config = self.read_config();
+        let mut paths = Vec::new();
+        if let Some(path) = config.authenticator.wasm().path() {
+            paths.push(path.clone());
+        }
+        if let Some(path) = config.authenticator.exec().command() {
+            paths.push(path.clone());
+        }
+        paths
     }
 
     pub fn c2s_tls_identity_paths(&self) -> (PathBuf, PathBuf) {
@@ -2542,12 +2551,7 @@ impl Server {
             Ok(Some(new_config)) => {
                 validate_privacy_config(&new_config)?;
                 let next_tls_acceptor = load_c2s_tls_acceptor(&new_config)?;
-                let prepared_authenticator = self.authenticator.prepare_wasm_reload(
-                    new_config.authenticator_wasm_path.as_deref(),
-                    new_config.blob_storage_dir.as_deref(),
-                    &new_config.authenticator_file_access_dir,
-                    new_config.authenticator_working_dir.as_deref(),
-                )?;
+                let prepared_authenticator = self.authenticator.prepare_reload(&new_config)?;
                 let authenticator_reloaded = prepared_authenticator.is_some();
 
                 self.apply_entrypoint_config(&new_config).await?;
@@ -2583,26 +2587,11 @@ impl Server {
                     );
                     self.s2s_manager.update_max_users(new_config.max_users);
                 }
-                if current.authenticator_wasm_path != new_config.authenticator_wasm_path {
+                if current.authenticator != new_config.authenticator {
                     tracing::info!(
-                        "config reload: authenticator_wasm_path {:?} -> {:?}",
-                        current.authenticator_wasm_path,
-                        new_config.authenticator_wasm_path
-                    );
-                }
-                if current.authenticator_file_access_dir != new_config.authenticator_file_access_dir
-                {
-                    tracing::info!(
-                        "config reload: authenticator_file_access_dir {:?} -> {:?}",
-                        current.authenticator_file_access_dir,
-                        new_config.authenticator_file_access_dir
-                    );
-                }
-                if current.authenticator_working_dir != new_config.authenticator_working_dir {
-                    tracing::info!(
-                        "config reload: authenticator_working_dir {:?} -> {:?}",
-                        current.authenticator_working_dir,
-                        new_config.authenticator_working_dir
+                        "config reload: authenticator {:?} -> {:?}",
+                        current.authenticator,
+                        new_config.authenticator
                     );
                 }
                 if current.cert_path != new_config.cert_path

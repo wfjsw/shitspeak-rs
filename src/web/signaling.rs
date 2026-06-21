@@ -2668,7 +2668,7 @@ mod tests {
             allowed_proxies: Vec::new(),
             min_client_version: 0,
             max_users: 100,
-            authenticator_wasm_path: None,
+            authenticator: crate::config::AuthenticatorConfig::default(),
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,

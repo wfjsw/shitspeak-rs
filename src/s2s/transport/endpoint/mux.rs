@@ -15,8 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::{
-    bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only,
-    ipv6_only_for_address,
+    bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
 };
 use crate::s2s::transport::service_level::TransportKind;
 
@@ -172,9 +171,8 @@ impl UdpMuxSocket {
             return Ok(socket.clone());
         }
 
-        let socket = Arc::new(
-            bind_reusable_udp_socket_with_ipv6_only(self.addr, self.ipv6_only).await?,
-        );
+        let socket =
+            Arc::new(bind_reusable_udp_socket_with_ipv6_only(self.addr, self.ipv6_only).await?);
         tokio::spawn(run_mux_read_loop(self.clone(), socket.clone(), shutdown));
         *guard = Some(socket.clone());
         Ok(socket)
@@ -292,11 +290,7 @@ pub(crate) struct UdpMuxHandle {
 }
 
 impl UdpMuxHandle {
-    fn new(
-        socket: Arc<UdpSocket>,
-        protocol: MuxProtocol,
-        rx: mpsc::Receiver<MuxDatagram>,
-    ) -> Self {
+    fn new(socket: Arc<UdpSocket>, protocol: MuxProtocol, rx: mpsc::Receiver<MuxDatagram>) -> Self {
         Self {
             socket,
             protocol,
@@ -453,9 +447,10 @@ impl quinn::AsyncUdpSocket for PrefixedUdpSocket {
         let mut recv = vec![0u8; bufs.first().map_or(0, |buf| buf.len() + DISCRIMINATOR_LEN)];
         loop {
             ready!(self.socket.poll_recv_ready(cx))?;
-            match self.socket.try_io(Interest::READABLE, || {
-                self.socket.try_recv_from(&mut recv)
-            }) {
+            match self
+                .socket
+                .try_io(Interest::READABLE, || self.socket.try_recv_from(&mut recv))
+            {
                 Ok((n, peer_addr)) => {
                     let Some(payload) = decode_prefixed(self.protocol, &recv[..n])? else {
                         continue;
@@ -478,17 +473,12 @@ struct SocketWritablePoller {
 
 impl SocketWritablePoller {
     fn new(socket: Arc<UdpSocket>) -> Self {
-        Self {
-            socket,
-        }
+        Self { socket }
     }
 }
 
 impl quinn::UdpPoller for SocketWritablePoller {
-    fn poll_writable(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_writable(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.socket.poll_send_ready(cx)
     }
 }
@@ -576,10 +566,7 @@ fn prefixed_datagram(protocol: MuxProtocol, payload: &[u8]) -> Vec<u8> {
     datagram
 }
 
-fn decode_prefixed<'a>(
-    expected: MuxProtocol,
-    datagram: &'a [u8],
-) -> io::Result<Option<&'a [u8]>> {
+fn decode_prefixed<'a>(expected: MuxProtocol, datagram: &'a [u8]) -> io::Result<Option<&'a [u8]>> {
     let Some((&discriminator, payload)) = datagram.split_first() else {
         return Ok(None);
     };

@@ -119,9 +119,9 @@ pub fn spawn_config_watcher(
             let should_reload = changed_paths.iter().any(|changed| {
                 same_fileish(changed, &config_path)
                     || server
-                        .authenticator_wasm_path()
-                        .as_deref()
-                        .is_some_and(|auth_path| same_fileish(changed, auth_path))
+                        .authenticator_watch_paths()
+                        .iter()
+                        .any(|auth_path| same_fileish(changed, auth_path))
                     || {
                         let (cert_path, key_path) = server.c2s_tls_identity_paths();
                         same_fileish(changed, &cert_path) || same_fileish(changed, &key_path)
@@ -145,18 +145,8 @@ fn watch_authenticator_directory(
     watched_dirs: &mut HashSet<PathBuf>,
     server: &Arc<Box<Server>>,
 ) {
-    if let Some(path) = server.authenticator_wasm_path() {
-        let normalized = normalize_path(&path);
-        let dir = normalized
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        watch_directory(
-            watcher,
-            watched_dirs,
-            normalize_path(&dir),
-            "WASM authenticator",
-        );
+    for path in server.authenticator_watch_paths() {
+        watch_file_parent_directory(watcher, watched_dirs, &path, "authenticator");
     }
 }
 

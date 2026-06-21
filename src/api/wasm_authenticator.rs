@@ -1,15 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write as _};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -23,10 +21,16 @@ use wasmtime::{
 };
 
 use crate::blob_store::sha1_hex;
+use crate::config::{AuthenticatorBackend, Config, ExecAuthenticatorMode};
 use crate::http_client;
 use crate::localization::Language;
-use crate::protocol_version::ProtocolVersion;
 
+use super::ExecAuthenticator;
+use super::authenticator_json::{
+    AuthenticatorJsonAuthenticateRequest, AuthenticatorJsonAuthenticateResponse,
+    AuthenticatorJsonExternalAuthenticateRequest, AuthenticatorJsonLanguageRequest,
+    AuthenticatorJsonLanguageResponse, authenticate_result_from_external_claims,
+};
 use super::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     ExternalAuthClaims, RegisteredUser,
@@ -76,6 +80,16 @@ pub enum WasmAuthenticatorError {
     Json(#[from] serde_json::Error),
 }
 
+#[derive(Debug, Error)]
+pub enum AuthenticatorBackendError {
+    #[error(transparent)]
+    Wasm(#[from] WasmAuthenticatorError),
+    #[error(transparent)]
+    Exec(#[from] super::ExecAuthenticatorError),
+    #[error("authenticator.backend = \"wasm\" requires authenticator.wasm.path")]
+    MissingWasmPath,
+}
+
 pub struct DemoAuthenticator;
 
 #[async_trait]
@@ -107,7 +121,7 @@ impl Authenticator for DemoAuthenticator {
 
 pub struct ReloadableAuthenticator {
     inner: RwLock<Arc<dyn Authenticator>>,
-    reloads_from_wasm_config: bool,
+    reloads_from_config: bool,
 }
 
 impl ReloadableAuthenticator {
@@ -115,39 +129,25 @@ impl ReloadableAuthenticator {
         let inner: Arc<dyn Authenticator> = Arc::new(authenticator);
         Self {
             inner: RwLock::new(inner),
-            reloads_from_wasm_config: false,
+            reloads_from_config: false,
         }
     }
 
-    pub fn from_wasm_path(
-        path: Option<&Path>,
-        storage_dir: Option<&Path>,
-        file_access_dirs: &[PathBuf],
-        working_dir: Option<&Path>,
-    ) -> Result<Self, WasmAuthenticatorError> {
+    pub fn from_config(config: &Config) -> Result<Self, AuthenticatorBackendError> {
         Ok(Self {
-            inner: RwLock::new(load_authenticator_from_wasm_path(
-                path,
-                storage_dir,
-                file_access_dirs,
-                working_dir,
-            )?),
-            reloads_from_wasm_config: true,
+            inner: RwLock::new(load_authenticator_from_config(config)?),
+            reloads_from_config: true,
         })
     }
 
-    pub fn prepare_wasm_reload(
+    pub fn prepare_reload(
         &self,
-        path: Option<&Path>,
-        storage_dir: Option<&Path>,
-        file_access_dirs: &[PathBuf],
-        working_dir: Option<&Path>,
-    ) -> Result<Option<Arc<dyn Authenticator>>, WasmAuthenticatorError> {
-        if !self.reloads_from_wasm_config {
+        config: &Config,
+    ) -> Result<Option<Arc<dyn Authenticator>>, AuthenticatorBackendError> {
+        if !self.reloads_from_config {
             return Ok(None);
         }
-        load_authenticator_from_wasm_path(path, storage_dir, file_access_dirs, working_dir)
-            .map(Some)
+        load_authenticator_from_config(config).map(Some)
     }
 
     pub fn apply_prepared_reload(&self, next: Option<Arc<dyn Authenticator>>) {
@@ -220,20 +220,157 @@ impl Authenticator for ReloadableAuthenticator {
     }
 }
 
-fn load_authenticator_from_wasm_path(
-    path: Option<&Path>,
+fn load_authenticator_from_config(
+    config: &Config,
+) -> Result<Arc<dyn Authenticator>, AuthenticatorBackendError> {
+    let wasm = config.authenticator.wasm();
+    match config.authenticator.backend() {
+        AuthenticatorBackend::Demo => Ok(Arc::new(DemoAuthenticator)),
+        AuthenticatorBackend::Wasm => {
+            let Some(path) = wasm.path().map(PathBuf::as_path) else {
+                return Err(AuthenticatorBackendError::MissingWasmPath);
+            };
+            load_wasm_authenticator(
+                path,
+                config.blob_storage_dir.as_deref(),
+                wasm.file_access_dir(),
+                wasm.working_dir().map(PathBuf::as_path),
+            )
+            .map_err(AuthenticatorBackendError::Wasm)
+        }
+        AuthenticatorBackend::Exec => match config.authenticator.exec().mode() {
+            ExecAuthenticatorMode::Ephemeral => Ok(Arc::new(ExecAuthenticator::ephemeral(
+                config.authenticator.exec().clone(),
+            )?)),
+            ExecAuthenticatorMode::LongRunning => Ok(Arc::new(ExecAuthenticator::long_running(
+                config.authenticator.exec().clone(),
+            )?)),
+        },
+    }
+}
+
+fn load_wasm_authenticator(
+    path: &Path,
     storage_dir: Option<&Path>,
     file_access_dirs: &[PathBuf],
     working_dir: Option<&Path>,
 ) -> Result<Arc<dyn Authenticator>, WasmAuthenticatorError> {
-    match path.filter(|path| !path.as_os_str().is_empty()) {
-        Some(path) => Ok(Arc::new(WasmAuthenticator::from_file(
-            path,
-            storage_dir,
-            file_access_dirs,
-            working_dir,
-        )?)),
-        None => Ok(Arc::new(DemoAuthenticator)),
+    Ok(Arc::new(WasmAuthenticator::from_file(
+        path,
+        storage_dir,
+        file_access_dirs,
+        working_dir,
+    )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AuthenticatorConfig, ExecAuthenticatorConfig, WasmAuthenticatorConfig};
+
+    fn minimal_config() -> Config {
+        Config {
+            listen: "127.0.0.1:0".to_owned(),
+            server_entrypoints: Vec::new(),
+            register_name: "test".to_owned(),
+            register_password: None,
+            register_url: None,
+            register_hostname: None,
+            register_location: None,
+            cert_path: "cert.pem".to_owned(),
+            key_path: "key.pem".to_owned(),
+            send_version: false,
+            send_build_info: false,
+            send_os_info: false,
+            server_protocol_version: crate::constants::APP_PROTO_VER,
+            allowed_proxies: Vec::new(),
+            min_client_version: 0,
+            max_users: 100,
+            authenticator: AuthenticatorConfig::default(),
+            welcome_text: None,
+            max_bandwidth: 72_000,
+            allow_html: true,
+            max_text_message_length: 5_000,
+            max_image_message_length: 131_072,
+            root_channel_name: "Root".to_owned(),
+            default_channel: 0,
+            cert_required: false,
+            blob_storage_dir: None,
+            channel_log_max_entries: 10_000,
+            client_log_max_entries: 10_000,
+            channel_snapshot_every_ops: 10,
+            channel_snapshot_every_secs: 60,
+            channel_wal_compaction_expire_count: 2_000,
+            udp_voice_enabled: true,
+            udp_ping_enabled: true,
+            udp_ping_user_count_scope: crate::config::UdpPingUserCountScope::Cluster,
+            udp_channel_size: 2_048,
+            client_idle_timeout_secs: 30,
+            pending_delete_timeout_ms: 5_000,
+            required_groups: Vec::new(),
+            send_permission_info: false,
+            hide_users_without_traverse: false,
+            acl: crate::config::AclConfig::default(),
+            privacy: crate::config::PrivacyConfig::default(),
+            s2s: crate::config::S2sConfig::default(),
+            web: crate::config::WebConfig::default(),
+        }
+    }
+
+    #[test]
+    fn demo_backend_ignores_wasm_path() {
+        let mut config = minimal_config();
+        config.authenticator = AuthenticatorConfig::new(AuthenticatorBackend::Demo);
+        config.authenticator = config
+            .authenticator
+            .with_wasm(WasmAuthenticatorConfig::new("auth.wasm"));
+
+        assert!(load_authenticator_from_config(&config).is_ok());
+    }
+
+    #[test]
+    fn explicit_wasm_backend_requires_wasm_path() {
+        let mut config = minimal_config();
+        config.authenticator = AuthenticatorConfig::new(AuthenticatorBackend::Wasm);
+
+        let error = match load_authenticator_from_config(&config) {
+            Ok(_) => panic!("missing WASM path was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AuthenticatorBackendError::MissingWasmPath));
+    }
+
+    #[test]
+    fn explicit_wasm_backend_uses_nested_wasm_path() {
+        let mut config = minimal_config();
+        config.authenticator = AuthenticatorConfig::new(AuthenticatorBackend::Wasm)
+            .with_wasm(WasmAuthenticatorConfig::new("missing-auth.wasm"));
+
+        let error = match load_authenticator_from_config(&config) {
+            Ok(_) => panic!("missing WASM file was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            AuthenticatorBackendError::Wasm(WasmAuthenticatorError::Read { path, .. })
+                if path == PathBuf::from("missing-auth.wasm")
+        ));
+    }
+
+    #[test]
+    fn exec_backend_requires_command() {
+        let mut config = minimal_config();
+        config.authenticator = AuthenticatorConfig::new(AuthenticatorBackend::Exec)
+            .with_exec(ExecAuthenticatorConfig::default());
+
+        let error = match load_authenticator_from_config(&config) {
+            Ok(_) => panic!("missing exec command was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            AuthenticatorBackendError::Exec(super::super::ExecAuthenticatorError::MissingCommand)
+        ));
     }
 }
 
@@ -346,13 +483,13 @@ impl Authenticator for WasmAuthenticator {
         password: Option<&str>,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Result<AuthenticateResult, AuthenticationRejection> {
-        let request = WasmAuthenticateRequest {
-            username: username.to_owned(),
-            password: password.map(ToOwned::to_owned),
-            auxiliary_data: WasmAuthenticateAuxiliaryData::from(auxiliary_data),
-        };
+        let request = AuthenticatorJsonAuthenticateRequest::new(
+            username.to_owned(),
+            password.map(ToOwned::to_owned),
+            auxiliary_data,
+        );
         match self
-            .invoke_required::<_, WasmAuthenticateResponse>("authenticate", request)
+            .invoke_required::<_, AuthenticatorJsonAuthenticateResponse>("authenticate", request)
             .await
         {
             Ok(response) => response.into_authenticate_result(),
@@ -368,29 +505,16 @@ impl Authenticator for WasmAuthenticator {
         claims: &ExternalAuthClaims,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Result<AuthenticateResult, AuthenticationRejection> {
-        let request = WasmExternalAuthenticateRequest {
-            claims: WasmExternalAuthClaims::from(claims),
-            auxiliary_data: WasmAuthenticateAuxiliaryData::from(auxiliary_data),
-        };
+        let request = AuthenticatorJsonExternalAuthenticateRequest::new(claims, auxiliary_data);
         match self
-            .invoke_optional::<_, WasmAuthenticateResponse>("authenticate_external", request)
+            .invoke_optional::<_, AuthenticatorJsonAuthenticateResponse>(
+                "authenticate_external",
+                request,
+            )
             .await
         {
             Ok(Some(response)) => response.into_authenticate_result(),
-            Ok(None) => Ok(AuthenticateResult {
-                user_id: Some(claims.subject),
-                display_name: claims
-                    .display_name
-                    .clone()
-                    .or_else(|| Some(claims.username.clone())),
-                groups: claims.groups.clone(),
-                is_superuser: false,
-                virtual_server_id: None,
-                language: Language::default(),
-                max_bandwidth: None,
-                texture_url: None,
-                comment_url: None,
-            }),
+            Ok(None) => Ok(authenticate_result_from_external_claims(claims)),
             Err(error) => {
                 tracing::warn!(error = %error, "WASM external authenticator failed");
                 Err(AuthenticationRejection::RetryLater)
@@ -403,15 +527,13 @@ impl Authenticator for WasmAuthenticator {
         username: Option<&str>,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Language {
-        let request = WasmLanguageRequest {
-            username: username.map(ToOwned::to_owned),
-            auxiliary_data: WasmAuthenticateAuxiliaryData::from(auxiliary_data),
-        };
+        let request =
+            AuthenticatorJsonLanguageRequest::new(username.map(ToOwned::to_owned), auxiliary_data);
         match self
-            .invoke_optional::<_, WasmLanguageResponse>("language", request)
+            .invoke_optional::<_, AuthenticatorJsonLanguageResponse>("language", request)
             .await
         {
-            Ok(Some(response)) => Language::from_code(&response.language),
+            Ok(Some(response)) => response.language(),
             Ok(None) => Language::default(),
             Err(error) => {
                 tracing::warn!(error = %error, "WASM authenticator language lookup failed");
@@ -1528,7 +1650,7 @@ impl WasmAuthState {
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "file path is outside authenticator_file_access_dir",
+                "file path is outside authenticator.wasm.file_access_dir",
             ));
         }
     }
@@ -1586,140 +1708,6 @@ fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
         }
     }
     fs::rename(src, dst)
-}
-
-#[derive(Serialize)]
-struct WasmAuthenticateRequest {
-    username: String,
-    password: Option<String>,
-    auxiliary_data: WasmAuthenticateAuxiliaryData,
-}
-
-#[derive(Serialize)]
-struct WasmExternalAuthenticateRequest {
-    claims: WasmExternalAuthClaims,
-    auxiliary_data: WasmAuthenticateAuxiliaryData,
-}
-
-#[derive(Serialize)]
-struct WasmLanguageRequest {
-    username: Option<String>,
-    auxiliary_data: WasmAuthenticateAuxiliaryData,
-}
-
-#[derive(Serialize)]
-struct WasmAuthenticateAuxiliaryData {
-    certificate_hash_base64: Option<String>,
-    session_id: u32,
-    ip_address: IpAddr,
-    tls_ja4: Option<String>,
-    uses_proxy_protocol: bool,
-    version: Option<ProtocolVersion>,
-    client_name: Option<String>,
-    os_name: Option<String>,
-    os_version: Option<String>,
-}
-
-impl From<&AuthenticateAuxiliaryData> for WasmAuthenticateAuxiliaryData {
-    fn from(value: &AuthenticateAuxiliaryData) -> Self {
-        Self {
-            certificate_hash_base64: value
-                .certificate_hash
-                .as_ref()
-                .map(|hash| BASE64_STANDARD.encode(hash)),
-            session_id: value.session_id,
-            ip_address: value.ip_address,
-            tls_ja4: value.tls_ja4.clone(),
-            uses_proxy_protocol: value.uses_proxy_protocol,
-            version: value.version,
-            client_name: value.client_name.clone(),
-            os_name: value.os_name.clone(),
-            os_version: value.os_version.clone(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct WasmExternalAuthClaims {
-    subject: u32,
-    username: String,
-    display_name: Option<String>,
-    groups: Vec<String>,
-}
-
-impl From<&ExternalAuthClaims> for WasmExternalAuthClaims {
-    fn from(value: &ExternalAuthClaims) -> Self {
-        Self {
-            subject: value.subject,
-            username: value.username.clone(),
-            display_name: value.display_name.clone(),
-            groups: value.groups.clone(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct WasmAuthenticateResponse {
-    #[serde(default = "default_true")]
-    accepted: bool,
-    #[serde(default)]
-    rejection: Option<String>,
-    #[serde(default)]
-    user_id: Option<u32>,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    groups: Vec<String>,
-    #[serde(default)]
-    is_superuser: bool,
-    #[serde(default)]
-    virtual_server_id: Option<String>,
-    #[serde(default)]
-    language: Option<String>,
-    #[serde(default)]
-    max_bandwidth: Option<u32>,
-    #[serde(default)]
-    texture_url: Option<String>,
-    #[serde(default)]
-    comment_url: Option<String>,
-}
-
-impl WasmAuthenticateResponse {
-    fn into_authenticate_result(self) -> Result<AuthenticateResult, AuthenticationRejection> {
-        if !self.accepted {
-            return Err(match self.rejection.as_deref() {
-                Some("no_such_user") | Some("invalid_username") => {
-                    AuthenticationRejection::NoSuchUser
-                }
-                Some("wrong_password") => AuthenticationRejection::WrongPassword,
-                _ => AuthenticationRejection::RetryLater,
-            });
-        }
-        Ok(AuthenticateResult {
-            user_id: self.user_id,
-            display_name: self.display_name,
-            groups: self.groups,
-            is_superuser: self.is_superuser,
-            virtual_server_id: self.virtual_server_id,
-            language: self
-                .language
-                .as_deref()
-                .map(Language::from_code)
-                .unwrap_or_default(),
-            max_bandwidth: self.max_bandwidth,
-            texture_url: self.texture_url,
-            comment_url: self.comment_url,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-struct WasmLanguageResponse {
-    language: String,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Deserialize)]
