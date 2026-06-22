@@ -108,6 +108,12 @@ protect_certificate_hashes = false
 # certificate_hash_secret = "replace-with-a-long-random-cluster-secret"
 
 # S2S (server-to-server)
+# [s2s]
+# Whether to advertise private RFC1918/ULA listen or advertise addresses into
+# the cluster. Keep true for LAN/VPN/container clusters; set false for
+# deployments where those private addresses should not be published.
+# advertise_private_ips = true
+
 # ── L1 transport tunables ─────────────────────────────────────────────
 # Per-link metrics smoothing (EWMA coefficients) and ping-cap.
 [s2s.transport]

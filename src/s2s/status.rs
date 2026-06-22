@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::s2s::overlay::{MemberStatus, OverlayNetwork, RoutingMetric};
-use crate::s2s::transport::{ConnectionManager, TransportKind};
+use crate::s2s::transport::{ConnectionManager, MetricsSnapshot, TransportKind};
 use crate::s2s::transport::{MessageClass, ServiceLevel, ServiceShape};
 use crate::types::NodeIdentifier;
 
@@ -67,7 +67,10 @@ struct TopologyRoute {
     metric: &'static str,
     level: &'static str,
     next_hop: NodeIdentifier,
+    transport: &'static str,
+    service_fit: &'static str,
     cost: u64,
+    transport_cost: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -325,13 +328,25 @@ fn build_topology_snapshot(
         for level in ServiceLevel::ALL {
             append_routes(
                 &mut routes,
+                transport,
+                &metrics,
+                metric,
                 metric.name(),
+                level,
                 service_level_name(level),
                 routing.for_metric_level(metric, level).iter(),
             );
         }
     }
-    routes.sort_by_key(|route| (route.metric, route.level, route.dst));
+    routes.sort_by_key(|route| {
+        (
+            route.metric,
+            route.level,
+            route.dst,
+            route.next_hop,
+            route.transport,
+        )
+    });
 
     let mut local_metrics = Vec::new();
     let transport_cfg = transport.inner.cfg();
@@ -404,17 +419,115 @@ fn build_topology_snapshot(
 
 fn append_routes<'a>(
     out: &mut Vec<TopologyRoute>,
-    metric: &'static str,
-    level: &'static str,
+    transport: &ConnectionManager,
+    metrics: &MetricsSnapshot,
+    metric_kind: RoutingMetric,
+    metric_name: &'static str,
+    level: ServiceLevel,
+    level_name: &'static str,
     iter: impl Iterator<Item = (&'a NodeIdentifier, &'a crate::s2s::overlay::RouteEntry)>,
 ) {
-    out.extend(iter.map(|(dst, route)| TopologyRoute {
-        dst: *dst,
-        metric,
-        level,
-        next_hop: route.next_hop,
-        cost: route.cost,
-    }));
+    for (dst, route) in iter {
+        let kinds = route_transport_rows(transport, metrics, route.next_hop);
+        let chosen = choose_route_transport(transport, route.next_hop, level, metric_kind);
+        for kind in kinds {
+            let transport_cost = metrics
+                .for_node(route.next_hop)
+                .and_then(|per_transport| per_transport.get(&kind))
+                .and_then(|link| link.routing_cost(level, metric_kind))
+                .map(|cost| cost.ceil().max(1.0) as u64);
+            out.push(TopologyRoute {
+                dst: *dst,
+                metric: metric_name,
+                level: level_name,
+                next_hop: route.next_hop,
+                transport: transport_kind_name(kind),
+                service_fit: route_transport_fit(kind, chosen, level),
+                cost: route.cost,
+                transport_cost,
+            });
+        }
+    }
+}
+
+fn route_transport_rows(
+    transport: &ConnectionManager,
+    metrics: &MetricsSnapshot,
+    next_hop: NodeIdentifier,
+) -> Vec<TransportKind> {
+    let mut kinds = transport
+        .inner
+        .get_peer(next_hop)
+        .map(|peer| peer.live_kinds())
+        .unwrap_or_default();
+    if kinds.is_empty() {
+        kinds.extend(
+            metrics
+                .for_node(next_hop)
+                .into_iter()
+                .flat_map(|per_transport| per_transport.keys().copied()),
+        );
+    }
+    kinds.sort_by_key(|kind| transport_kind_name(*kind));
+    kinds.dedup();
+    kinds
+}
+
+fn choose_route_transport(
+    transport: &ConnectionManager,
+    next_hop: NodeIdentifier,
+    level: ServiceLevel,
+    metric: RoutingMetric,
+) -> Option<TransportKind> {
+    let peer = transport.inner.get_peer(next_hop)?;
+    let mut candidates = peer
+        .live_kinds()
+        .into_iter()
+        .filter(|kind| kind.is_acceptable_for(level))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut ranked = peer
+        .metrics()
+        .ranked_transports_for(level, metric, &candidates);
+    candidates.sort_by_key(|kind| fallback_transport_rank(*kind, level));
+    for candidate in candidates {
+        if !ranked.contains(&candidate) {
+            ranked.push(candidate);
+        }
+    }
+    ranked.into_iter().next()
+}
+
+fn route_transport_fit(
+    kind: TransportKind,
+    chosen: Option<TransportKind>,
+    level: ServiceLevel,
+) -> &'static str {
+    if !kind.is_acceptable_for(level) {
+        "ineligible"
+    } else if Some(kind) == chosen {
+        "chosen"
+    } else {
+        "candidate"
+    }
+}
+
+fn fallback_transport_rank(kind: TransportKind, level: ServiceLevel) -> (u8, u8, u8) {
+    let provided = kind.service_level();
+    let exact_first = if provided == level { 0 } else { 1 };
+    (exact_first, provided as u8, transport_kind_order(kind))
+}
+
+fn transport_kind_order(kind: TransportKind) -> u8 {
+    match kind {
+        TransportKind::Tcp => 3,
+        TransportKind::Quic => 1,
+        TransportKind::Kcp => 2,
+        TransportKind::Udp => 0,
+    }
 }
 
 fn member_status_name(status: MemberStatus) -> &'static str {
@@ -485,6 +598,7 @@ main { display: grid; grid-template-columns: minmax(420px, 1.35fr) minmax(320px,
 section { min-width: 0; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .panel h2 { margin: 0; padding: 12px 14px; font-size: 14px; border-bottom: 1px solid var(--line); }
+.wide-panel { grid-column: 1 / -1; }
 #graph { width: 100%; height: min(62vh, 640px); min-height: 420px; background: #fbfcfe; }
 .vis-network { outline: none; }
 .vis-tooltip { position: absolute; visibility: hidden; padding: 8px 10px; max-width: 360px; color: var(--ink); background: #fff; border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 8px 24px rgba(24, 32, 43, .12); font-size: 12px; line-height: 1.4; white-space: normal; }
@@ -493,6 +607,9 @@ table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
 th { color: var(--muted); font-weight: 600; background: #fafbfc; }
 .pill { display: inline-block; min-width: 54px; padding: 2px 6px; border-radius: 999px; text-align: center; color: #fff; font-size: 11px; }
+.chosen { background: var(--good); }
+.candidate { background: var(--accent); }
+.ineligible { background: var(--muted); }
 .alive, .active { background: var(--good); }
 .left, .stale { background: var(--warn); }
 .failed { background: var(--bad); }
@@ -514,7 +631,10 @@ th { color: var(--muted); font-weight: 600; background: #fafbfc; }
     <div class="panel"><h2>Nodes</h2><table><thead><tr><th>Node</th><th>Status</th><th>LSA</th><th>Addresses</th></tr></thead><tbody id="nodes"></tbody></table></div>
     <div class="panel"><h2>Packet IO</h2><table><thead><tr><th>Kind</th><th>Total</th><th>Sent</th><th>Recv</th><th>Count</th><th>Avg</th></tr></thead><tbody id="packet-io"></tbody></table></div>
     <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Loss</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Compression</th><th>Voice</th><th>Control</th><th>Bulk</th></tr></thead><tbody id="metrics"></tbody></table></div>
-    <div class="panel"><h2>Routes</h2><table><thead><tr><th>Metric</th><th>Level</th><th>Dst</th><th>Next hop</th><th>Cost</th></tr></thead><tbody id="routes"></tbody></table></div>
+  </section>
+  <section class="panel wide-panel">
+    <h2>Routes</h2>
+    <table><thead><tr><th>Metric</th><th>Level</th><th>Dst</th><th>Next hop</th><th>Transport</th><th>Service fit</th><th>Route cost</th><th>Transport cost</th></tr></thead><tbody id="routes"></tbody></table>
   </section>
 </main>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/10.0.2/dist/vis-network.min.js" integrity="sha512-5qYRU42HLweh0Ehlsu9bVWc13gwZviSNGsnfx+PqGRQRM4NltzGzb8dO3WY20CTsbkTBzhyKlso9cfYz2A5lOQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
@@ -696,7 +816,7 @@ function renderTables(data) {
     ? packetRows.map(p => `<tr><td>${esc(p.kind)}</td><td>${fmtBytes(p.total_bytes)}</td><td>${fmtBytes(p.sent_bytes)}<br><span class="transport">${p.sent_count}</span></td><td>${fmtBytes(p.recv_bytes)}<br><span class="transport">${p.recv_count}</span></td><td>${p.total_count}</td><td>${fmtBps(p.avg_total_bps)}</td></tr>`).join('')
     : `<tr><td colspan="6" class="transport">-</td></tr>`;
   metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${compressionCell(m)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
-  routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${r.cost}</td></tr>`).join('');
+  routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${esc(r.transport)}</td><td><span class="pill ${esc(r.service_fit)}">${esc(r.service_fit)}</span></td><td>${r.cost}</td><td>${r.transport_cost ?? '-'}</td></tr>`).join('');
 }
 async function refresh() {
   try {
@@ -751,5 +871,8 @@ mod tests {
         assert!(STATUS_HTML.contains("Compression"));
         assert!(STATUS_HTML.contains("compression_total_ratio"));
         assert!(STATUS_HTML.contains("network.setOptions({ physics: false })"));
+        assert!(STATUS_HTML.contains("Service fit"));
+        assert!(STATUS_HTML.contains("wide-panel"));
+        assert!(STATUS_HTML.contains("transport_cost"));
     }
 }

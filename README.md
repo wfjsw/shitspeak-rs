@@ -156,6 +156,8 @@ The server-to-server subsystem supports multi-node operation with transport metr
 
 A clustered deployment must provide unique S2S certificates whose leaf certificate Common Name is the numeric node id, plus listener addresses, advertised addresses, seed peers, and a persistence directory for cluster state. When S2S is disabled or no S2S certificate is configured, the local node id defaults to `0`.
 
+By default, S2S advertises private RFC1918 IPv4 and IPv6 unique-local addresses so LAN, VPN, and container clusters continue to work. Set `s2s.advertise_private_ips = false` when this node should only advertise non-private addresses.
+
 When `s2s.persistence_dir` is set, the transport caches the latest learned adaptive compression dictionary under that directory and renegotiates it with peers after restart.
 
 Generate S2S test certificates with:

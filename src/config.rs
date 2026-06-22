@@ -17,11 +17,16 @@ use crate::s2s::transport::{
 
 const DEFAULT_LOCAL_NODE_ID: NodeIdentifier = 0;
 
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct S2sConfig {
     /// S2S is explicit opt-in. Disabled configs do not need PKI/listen fields.
     #[serde(default)]
     pub enabled: bool,
+
+    /// Whether private listen/advertise addresses are published into the
+    /// overlay LSAs. Keep enabled for LAN/VPN/container clusters.
+    #[serde(default = "default_true")]
+    pub advertise_private_ips: bool,
 
     #[serde(default)]
     pub ca_path: Option<PathBuf>,
@@ -77,6 +82,33 @@ pub struct S2sConfig {
     pub replications: ReplicationTuning,
 }
 
+impl Default for S2sConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            advertise_private_ips: true,
+            ca_path: None,
+            cert_path: None,
+            key_path: None,
+            tcp_listen: Vec::new(),
+            kcp_listen: Vec::new(),
+            quic_listen: Vec::new(),
+            udp_listen: Vec::new(),
+            tcp_advertise: Vec::new(),
+            kcp_advertise: Vec::new(),
+            quic_advertise: Vec::new(),
+            udp_advertise: Vec::new(),
+            status_http_listen: None,
+            persistence_dir: None,
+            seed_addresses: Vec::new(),
+            application: ApplicationConfig::default(),
+            transport: TransportTuning::default(),
+            overlay: OverlayTuning::default(),
+            replications: ReplicationTuning::default(),
+        }
+    }
+}
+
 impl S2sConfig {
     pub fn is_enabled(&self) -> bool {
         self.enabled
@@ -130,7 +162,8 @@ impl S2sConfig {
             .clone()
             .ok_or_else(|| "s2s.enabled=true requires s2s.key_path".to_string())?;
 
-        let mut cfg = TransportConfig::new(ca_path, cert_path, key_path);
+        let mut cfg = TransportConfig::new(ca_path, cert_path, key_path)
+            .with_advertise_private_ips(self.advertise_private_ips);
         cfg = cfg
             .with_tcp_listen_addrs(self.tcp_listen.iter().copied())
             .with_kcp_listen_addrs(self.kcp_listen.iter().copied())
@@ -1980,6 +2013,7 @@ mod tests {
             ca_path = "s2s-ca.pem"
             cert_path = "s2s-node.pem"
             key_path = "s2s-node.key"
+            advertise_private_ips = false
             tcp_listen = "0.0.0.0:64739"
             kcp_listen = "0.0.0.0:64740"
             quic_listen = "0.0.0.0:64741"
@@ -2019,6 +2053,7 @@ mod tests {
         .replace("__DICT__", &dictionary_path.display().to_string());
         let cfg: S2sConfig = parse_s2s(&raw).expect("s2s config parses");
         assert!(cfg.is_enabled());
+        assert!(!cfg.advertise_private_ips);
         assert_eq!(cfg.seed_addresses.len(), 3);
         assert_eq!(
             cfg.seed_addresses[0].transport(),
@@ -2080,6 +2115,7 @@ mod tests {
             transport.udp_advertise(),
             &["127.0.0.1:64742".parse::<SocketAddr>().unwrap()]
         );
+        assert!(!transport.advertise_private_ips());
         assert_eq!(transport.backoff_cap(), Duration::from_secs(31));
         assert_eq!(transport.stale_backoff_cap(), Duration::from_secs(601));
         assert_eq!(transport.stale_backoff_after(), Duration::from_secs(3601));
@@ -2402,5 +2438,23 @@ mod tests {
             transport.tcp_advertise(),
             &["127.0.0.1:64739".parse::<SocketAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn s2s_advertise_private_ips_defaults_to_true() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+        "#;
+        let cfg = parse_s2s(raw).expect("s2s config parses");
+        let transport = cfg
+            .transport_config()
+            .expect("valid transport config")
+            .expect("s2s enabled");
+
+        assert!(cfg.advertise_private_ips);
+        assert!(transport.advertise_private_ips());
     }
 }

@@ -394,21 +394,25 @@ impl ConnectionManager {
             cfg.tcp_advertise(),
             cfg.tcp_listen_addrs(),
             TransportKind::Tcp,
+            cfg.advertise_private_ips(),
         ));
         addrs.extend(advertised_addresses(
             cfg.kcp_advertise(),
             cfg.kcp_listen_addrs(),
             TransportKind::Kcp,
+            cfg.advertise_private_ips(),
         ));
         addrs.extend(advertised_addresses(
             cfg.quic_advertise(),
             cfg.quic_listen_addrs(),
             TransportKind::Quic,
+            cfg.advertise_private_ips(),
         ));
         addrs.extend(advertised_addresses(
             cfg.udp_advertise(),
             cfg.udp_listen_addrs(),
             TransportKind::Udp,
+            cfg.advertise_private_ips(),
         ));
 
         addrs
@@ -830,18 +834,27 @@ fn advertised_addresses(
     explicit: &[SocketAddr],
     listen: &[SocketAddr],
     transport: TransportKind,
+    advertise_private_ips: bool,
 ) -> Vec<PeerAddress> {
     if !explicit.is_empty() {
         let mut addrs = Vec::with_capacity(explicit.len());
         for addr in explicit.iter().copied() {
             let peer_addr = PeerAddress::new(addr, transport);
-            if peer_addr.is_dialable() {
+            if peer_addr.is_dialable()
+                && (advertise_private_ips || !is_private_ip(peer_addr.addr().ip()))
+            {
                 addrs.push(peer_addr);
-            } else {
+            } else if !peer_addr.is_dialable() {
                 debug!(
                     ?transport,
                     %addr,
                     "not advertising wildcard S2S explicit address"
+                );
+            } else {
+                debug!(
+                    ?transport,
+                    %addr,
+                    "not advertising private S2S explicit address"
                 );
             }
         }
@@ -851,13 +864,21 @@ fn advertised_addresses(
     let mut addrs = Vec::with_capacity(listen.len());
     for addr in listen.iter().copied() {
         let peer_addr = PeerAddress::new(addr, transport);
-        if peer_addr.is_dialable() {
+        if peer_addr.is_dialable()
+            && (advertise_private_ips || !is_private_ip(peer_addr.addr().ip()))
+        {
             addrs.push(peer_addr);
-        } else {
+        } else if !peer_addr.is_dialable() {
             debug!(
                 ?transport,
                 %addr,
                 "not advertising wildcard S2S listen address; configure the matching *_advertise address"
+            );
+        } else {
+            debug!(
+                ?transport,
+                %addr,
+                "not advertising private S2S listen address"
             );
         }
     }
@@ -928,6 +949,13 @@ fn push_public_ip_advertise_addresses(
 fn listen_supports_ip_family(listen: SocketAddr, ip: IpAddr) -> bool {
     listen.is_ipv4() == ip.is_ipv4()
         || (ip.is_ipv4() && listen.is_ipv6() && listen.ip().is_unspecified())
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00) == 0xfc00,
+    }
 }
 
 /// Build every endpoint for which the corresponding `<kind>_listen` is set.
@@ -1144,7 +1172,7 @@ mod tests {
     #[test]
     fn advertised_addresses_skip_wildcard_listen_without_advertise() {
         assert_eq!(
-            advertised_addresses(&[], &[socket("0.0.0.0:64739")], TransportKind::Tcp),
+            advertised_addresses(&[], &[socket("0.0.0.0:64739")], TransportKind::Tcp, true),
             Vec::<PeerAddress>::new()
         );
     }
@@ -1156,6 +1184,7 @@ mod tests {
                 &[socket("127.0.0.1:64740"), socket("127.0.0.2:64740")],
                 &[socket("0.0.0.0:64740")],
                 TransportKind::Kcp,
+                true,
             ),
             vec![
                 PeerAddress::new(socket("127.0.0.1:64740"), TransportKind::Kcp),
@@ -1168,9 +1197,24 @@ mod tests {
     fn listen_addresses_can_publish_same_udp_socket_for_all_udp_family_transports() {
         let shared = socket("127.0.0.1:64739");
         let mut addrs = Vec::new();
-        addrs.extend(advertised_addresses(&[], &[shared], TransportKind::Kcp));
-        addrs.extend(advertised_addresses(&[], &[shared], TransportKind::Quic));
-        addrs.extend(advertised_addresses(&[], &[shared], TransportKind::Udp));
+        addrs.extend(advertised_addresses(
+            &[],
+            &[shared],
+            TransportKind::Kcp,
+            true,
+        ));
+        addrs.extend(advertised_addresses(
+            &[],
+            &[shared],
+            TransportKind::Quic,
+            true,
+        ));
+        addrs.extend(advertised_addresses(
+            &[],
+            &[shared],
+            TransportKind::Udp,
+            true,
+        ));
 
         assert_eq!(
             addrs,
@@ -1185,7 +1229,7 @@ mod tests {
     #[test]
     fn advertised_addresses_use_concrete_listen_when_no_advertise_set() {
         assert_eq!(
-            advertised_addresses(&[], &[socket("127.0.0.1:64741")], TransportKind::Quic),
+            advertised_addresses(&[], &[socket("127.0.0.1:64741")], TransportKind::Quic, true),
             vec![PeerAddress::new(
                 socket("127.0.0.1:64741"),
                 TransportKind::Quic
@@ -1200,6 +1244,7 @@ mod tests {
                 &[socket("0.0.0.0:64742")],
                 &[socket("127.0.0.1:64742")],
                 TransportKind::Udp,
+                true,
             ),
             Vec::<PeerAddress>::new()
         );
@@ -1212,11 +1257,38 @@ mod tests {
                 &[],
                 &[socket("192.0.2.10:64739"), socket("[2001:db8::10]:64739")],
                 TransportKind::Tcp,
+                true,
             ),
             vec![
                 PeerAddress::new(socket("192.0.2.10:64739"), TransportKind::Tcp),
                 PeerAddress::new(socket("[2001:db8::10]:64739"), TransportKind::Tcp),
             ]
+        );
+    }
+
+    #[test]
+    fn advertised_addresses_can_suppress_private_explicit_advertise_values() {
+        assert_eq!(
+            advertised_addresses(
+                &[socket("10.0.0.10:64739"), socket("[fd00::10]:64739")],
+                &[socket("0.0.0.0:64739")],
+                TransportKind::Tcp,
+                false,
+            ),
+            Vec::<PeerAddress>::new()
+        );
+    }
+
+    #[test]
+    fn advertised_addresses_can_suppress_private_concrete_listen_addresses() {
+        assert_eq!(
+            advertised_addresses(
+                &[],
+                &[socket("172.16.0.10:64739"), socket("[fc00::10]:64739")],
+                TransportKind::Tcp,
+                false,
+            ),
+            Vec::<PeerAddress>::new()
         );
     }
 
