@@ -420,6 +420,11 @@ impl ConnectionManager {
 
     pub(crate) async fn listen_addresses_with_public_ip_probe(&self) -> Vec<PeerAddress> {
         let mut addrs = self.listen_addresses();
+        let local_ips =
+            super::local_ip::discover_interface_ips(self.inner.cfg().local_advertise_interfaces());
+        if !local_ips.is_empty() {
+            add_discovered_ip_advertise_addresses(&mut addrs, self.inner.cfg(), &local_ips);
+        }
         let public_ips = super::public_ip::discover_public_ips().await;
         if public_ips.is_empty() {
             return addrs;
@@ -890,42 +895,55 @@ fn add_public_ip_advertise_addresses(
     cfg: &TransportConfig,
     public_ips: &[IpAddr],
 ) {
-    push_public_ip_advertise_addresses(
+    add_discovered_ip_advertise_addresses(addrs, cfg, public_ips);
+}
+
+fn add_discovered_ip_advertise_addresses(
+    addrs: &mut Vec<PeerAddress>,
+    cfg: &TransportConfig,
+    ips: &[IpAddr],
+) {
+    push_discovered_ip_advertise_addresses(
         addrs,
-        public_ips,
+        ips,
         cfg.tcp_advertise_override(),
         cfg.tcp_listen_addrs(),
         TransportKind::Tcp,
+        cfg.advertise_private_ips(),
     );
-    push_public_ip_advertise_addresses(
+    push_discovered_ip_advertise_addresses(
         addrs,
-        public_ips,
+        ips,
         cfg.kcp_advertise_override(),
         cfg.kcp_listen_addrs(),
         TransportKind::Kcp,
+        cfg.advertise_private_ips(),
     );
-    push_public_ip_advertise_addresses(
+    push_discovered_ip_advertise_addresses(
         addrs,
-        public_ips,
+        ips,
         cfg.quic_advertise_override(),
         cfg.quic_listen_addrs(),
         TransportKind::Quic,
+        cfg.advertise_private_ips(),
     );
-    push_public_ip_advertise_addresses(
+    push_discovered_ip_advertise_addresses(
         addrs,
-        public_ips,
+        ips,
         cfg.udp_advertise_override(),
         cfg.udp_listen_addrs(),
         TransportKind::Udp,
+        cfg.advertise_private_ips(),
     );
 }
 
-fn push_public_ip_advertise_addresses(
+fn push_discovered_ip_advertise_addresses(
     addrs: &mut Vec<PeerAddress>,
-    public_ips: &[IpAddr],
+    ips: &[IpAddr],
     explicit_override: bool,
     listen: &[SocketAddr],
     transport: TransportKind,
+    advertise_private_ips: bool,
 ) {
     if explicit_override {
         return;
@@ -934,8 +952,11 @@ fn push_public_ip_advertise_addresses(
         if listen_addr.port() == 0 || listen_addr.ip().is_loopback() {
             continue;
         }
-        for ip in public_ips.iter().copied() {
+        for ip in ips.iter().copied() {
             if !listen_supports_ip_family(listen_addr, ip) {
+                continue;
+            }
+            if !advertise_private_ips && is_private_ip(ip) {
                 continue;
             }
             let candidate = PeerAddress::new(SocketAddr::new(ip, listen_addr.port()), transport);
@@ -953,7 +974,10 @@ fn listen_supports_ip_family(listen: SocketAddr, ip: IpAddr) -> bool {
 
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip.is_private() || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
         IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00) == 0xfc00,
     }
 }
@@ -1303,6 +1327,62 @@ mod tests {
             &cfg,
             &[
                 "8.8.8.8".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+            ],
+        );
+
+        assert_eq!(
+            addrs,
+            vec![
+                PeerAddress::new(socket("8.8.8.8:64739"), TransportKind::Tcp),
+                PeerAddress::new(socket("8.8.8.8:64741"), TransportKind::Quic),
+                PeerAddress::new(socket("[2001:4860:4860::8888]:64741"), TransportKind::Quic),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovered_ip_advertise_addresses_can_publish_tailscale_and_ipv6_addresses() {
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into())
+            .with_tcp_listen(socket("0.0.0.0:64739"))
+            .with_quic_listen(socket("[::]:64741"));
+        let mut addrs = Vec::new();
+        add_discovered_ip_advertise_addresses(
+            &mut addrs,
+            &cfg,
+            &[
+                "100.64.12.34".parse().unwrap(),
+                "fd00::12".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+            ],
+        );
+
+        assert_eq!(
+            addrs,
+            vec![
+                PeerAddress::new(socket("100.64.12.34:64739"), TransportKind::Tcp),
+                PeerAddress::new(socket("100.64.12.34:64741"), TransportKind::Quic),
+                PeerAddress::new(socket("[fd00::12]:64741"), TransportKind::Quic),
+                PeerAddress::new(socket("[2001:4860:4860::8888]:64741"), TransportKind::Quic),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovered_ip_advertise_addresses_respect_private_ip_suppression() {
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into())
+            .with_advertise_private_ips(false)
+            .with_tcp_listen(socket("0.0.0.0:64739"))
+            .with_quic_listen(socket("[::]:64741"));
+        let mut addrs = Vec::new();
+        add_discovered_ip_advertise_addresses(
+            &mut addrs,
+            &cfg,
+            &[
+                "100.64.12.34".parse().unwrap(),
+                "10.0.0.12".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+                "fd00::12".parse().unwrap(),
                 "2001:4860:4860::8888".parse().unwrap(),
             ],
         );

@@ -101,6 +101,10 @@ pub struct TransportConfig {
     /// Whether private listen/advertise addresses should be published in the
     /// overlay. LAN/VPN/container clusters usually need this enabled.
     advertise_private_ips: bool,
+
+    /// Local interface names whose addresses should be published when listen
+    /// addresses need automatic advertise expansion.
+    local_advertise_interfaces: Vec<String>,
 }
 
 impl TransportConfig {
@@ -153,6 +157,7 @@ impl TransportConfig {
             max_pending_pings: 64,
             max_outgoing_connections: 1024,
             advertise_private_ips: true,
+            local_advertise_interfaces: Vec::new(),
         }
     }
 
@@ -418,6 +423,10 @@ impl TransportConfig {
 
     pub fn advertise_private_ips(&self) -> bool {
         self.advertise_private_ips
+    }
+
+    pub fn local_advertise_interfaces(&self) -> &[String] {
+        &self.local_advertise_interfaces
     }
 
     // --- Chainable setters ---
@@ -724,6 +733,25 @@ impl TransportConfig {
 
     pub fn with_advertise_private_ips(mut self, enabled: bool) -> Self {
         self.advertise_private_ips = enabled;
+        self
+    }
+
+    pub fn with_local_advertise_interfaces(
+        mut self,
+        interfaces: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.local_advertise_interfaces.clear();
+        for interface in interfaces {
+            let interface = interface.trim();
+            if !interface.is_empty()
+                && !self
+                    .local_advertise_interfaces
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(interface))
+            {
+                self.local_advertise_interfaces.push(interface.to_string());
+            }
+        }
         self
     }
 }

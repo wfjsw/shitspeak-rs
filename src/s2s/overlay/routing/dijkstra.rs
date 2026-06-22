@@ -464,7 +464,7 @@ mod tests {
     }
 
     fn build_db(lsas: Vec<LsaEntry>) -> LinkStateDb {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         for l in lsas {
             db.admit(l);
@@ -818,7 +818,7 @@ mod tests {
 
     #[test]
     fn empty_graph_returns_empty_table() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         let table = compute(&db, 1, ServiceLevel::Reliable, &cfg());
         assert!(table.is_empty());

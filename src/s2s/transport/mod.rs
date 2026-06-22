@@ -14,6 +14,7 @@ mod endpoint;
 mod error;
 mod frame;
 mod identity;
+mod local_ip;
 mod manager;
 mod metrics;
 mod native_stats;

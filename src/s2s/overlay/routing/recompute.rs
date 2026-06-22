@@ -216,7 +216,7 @@ mod tests {
     }
 
     fn build_db(entries: Vec<LsaEntry>) -> LinkStateDb {
-        let db = LinkStateDb::new(Arc::new(LsaFloor::new(None)));
+        let db = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
         for entry in entries {
             db.admit(entry);
         }

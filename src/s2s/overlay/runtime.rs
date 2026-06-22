@@ -10,11 +10,14 @@
 //!     whenever the LSDB changes.
 //!   * `ServiceRegistry` dispatches inbound `OverlayData` by tag.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::s2s::transport::{ConnectionManager, Inbound, PeerAddress};
 use crate::types::NodeIdentifier;
@@ -33,6 +36,104 @@ use super::neighbor::monitor::NeighborMonitor;
 use super::routing::{RoutingHandle, new_handle as new_routing_handle, spawn_recomputer};
 
 const METRIC_CHANGE_STABLE_CHECKS: u8 = 3;
+static LAST_PROCESS_BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LocalBootEpochFileV1 {
+    version: u32,
+    node_id: NodeIdentifier,
+    boot_epoch: u64,
+}
+
+fn local_boot_epoch_path(dir: &Path, self_id: NodeIdentifier) -> PathBuf {
+    dir.join("overlay")
+        .join(format!("local_boot_epoch_{self_id}.json"))
+}
+
+fn capture_monotonic_boot_epoch(self_id: NodeIdentifier, persistence_dir: Option<&PathBuf>) -> u64 {
+    let captured = capture_boot_epoch();
+    let Some(dir) = persistence_dir else {
+        return reserve_process_boot_epoch(captured);
+    };
+    let path = local_boot_epoch_path(dir, self_id);
+    let previous = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<LocalBootEpochFileV1>(&bytes) {
+            Ok(file) if file.version == 1 && file.node_id == self_id => Some(file.boot_epoch),
+            Ok(_) => {
+                warn!(?path, "local boot epoch: unrecognized file, replacing");
+                None
+            }
+            Err(error) => {
+                warn!(?path, %error, "local boot epoch: parse failed, replacing");
+                None
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            warn!(?path, %error, "local boot epoch: read failed, using wall clock");
+            None
+        }
+    };
+    let boot_epoch = reserve_process_boot_epoch(next_boot_epoch(captured, previous));
+    persist_local_boot_epoch(&path, self_id, boot_epoch);
+    boot_epoch
+}
+
+fn next_boot_epoch(captured: u64, previous: Option<u64>) -> u64 {
+    previous
+        .and_then(|previous| previous.checked_add(1))
+        .map(|next| captured.max(next))
+        .unwrap_or(captured)
+}
+
+fn reserve_process_boot_epoch(candidate: u64) -> u64 {
+    let mut next = candidate;
+    loop {
+        let previous = LAST_PROCESS_BOOT_EPOCH.load(Ordering::Relaxed);
+        if next <= previous {
+            let Some(incremented) = previous.checked_add(1) else {
+                return previous;
+            };
+            next = incremented;
+        }
+        match LAST_PROCESS_BOOT_EPOCH.compare_exchange(
+            previous,
+            next,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(_) => continue,
+        }
+    }
+}
+
+fn persist_local_boot_epoch(path: &Path, self_id: NodeIdentifier, boot_epoch: u64) {
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            warn!(?parent, %error, "local boot epoch: cannot create dir");
+            return;
+        }
+    }
+    let body = LocalBootEpochFileV1 {
+        version: 1,
+        node_id: self_id,
+        boot_epoch,
+    };
+    match serde_json::to_vec_pretty(&body) {
+        Ok(bytes) => {
+            let tmp = path.with_extension("json.tmp");
+            if let Err(error) = std::fs::write(&tmp, &bytes) {
+                warn!(?tmp, %error, "local boot epoch: write tmp failed");
+                return;
+            }
+            if let Err(error) = std::fs::rename(&tmp, path) {
+                warn!(?path, %error, "local boot epoch: rename failed");
+            }
+        }
+        Err(error) => warn!(%error, "local boot epoch: serialize failed"),
+    }
+}
 
 pub(crate) struct OverlayInner {
     pub self_id: NodeIdentifier,
@@ -59,9 +160,9 @@ impl OverlayInner {
         self_addresses: Vec<PeerAddress>,
     ) -> Self {
         let self_id = transport.local_node_id();
-        let boot_epoch = capture_boot_epoch();
+        let boot_epoch = capture_monotonic_boot_epoch(self_id, cfg.persistence_dir());
 
-        let floor = Arc::new(LsaFloor::new(cfg.persistence_dir().cloned()));
+        let floor = Arc::new(LsaFloor::new(self_id, cfg.persistence_dir().cloned()));
         floor.load();
         let lsdb = Arc::new(LinkStateDb::new(floor));
 
@@ -326,4 +427,48 @@ pub(crate) async fn start_inner(
     inner.spawn_tasks(inbound);
 
     Ok(inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_boot_epoch_handles_backward_clock() {
+        assert_eq!(next_boot_epoch(100, Some(200)), 201);
+        assert_eq!(next_boot_epoch(300, Some(200)), 300);
+        assert_eq!(next_boot_epoch(100, Some(u64::MAX)), 100);
+    }
+
+    #[test]
+    fn monotonic_boot_epoch_advances_persisted_future_epoch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = local_boot_epoch_path(dir.path(), 7);
+        persist_local_boot_epoch(&path, 7, u64::MAX - 10);
+
+        let boot_epoch = capture_monotonic_boot_epoch(7, Some(&dir.path().to_path_buf()));
+        assert_eq!(boot_epoch, u64::MAX - 9);
+
+        let reloaded = std::fs::read(&path).unwrap();
+        let file: LocalBootEpochFileV1 = serde_json::from_slice(&reloaded).unwrap();
+        assert_eq!(file.node_id, 7);
+        assert_eq!(file.boot_epoch, u64::MAX - 9);
+    }
+
+    #[test]
+    fn monotonic_boot_epoch_uses_node_specific_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        persist_local_boot_epoch(&local_boot_epoch_path(dir.path(), 7), 7, u64::MAX - 10);
+
+        let boot_epoch = capture_monotonic_boot_epoch(8, Some(&dir.path().to_path_buf()));
+        assert!(local_boot_epoch_path(dir.path(), 8).exists());
+
+        let node7 = std::fs::read(&local_boot_epoch_path(dir.path(), 7)).unwrap();
+        let node7: LocalBootEpochFileV1 = serde_json::from_slice(&node7).unwrap();
+        assert_eq!(node7.boot_epoch, u64::MAX - 10);
+
+        let node8 = std::fs::read(&local_boot_epoch_path(dir.path(), 8)).unwrap();
+        let node8: LocalBootEpochFileV1 = serde_json::from_slice(&node8).unwrap();
+        assert_eq!(node8.boot_epoch, boot_epoch);
+    }
 }

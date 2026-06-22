@@ -60,7 +60,7 @@ moq-native = { version = "0.14", default-features = false, features = ["quinn", 
 hang = { version = "0.16", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [patch.crates-io]
 kcp = { path = "vendor/kcp" }

@@ -113,6 +113,11 @@ protect_certificate_hashes = false
 # the cluster. Keep true for LAN/VPN/container clusters; set false for
 # deployments where those private addresses should not be published.
 # advertise_private_ips = true
+# Optional interface-name allowlist for automatic local IP discovery. Useful
+# for wildcard listeners on VPN interfaces such as Tailscale. Names are matched
+# case-insensitively; on Windows the adapter name, friendly name, and
+# description are checked.
+# local_interface_advertise = ["tailscale0", "Tailscale"]
 
 # ── L1 transport tunables ─────────────────────────────────────────────
 # Per-link metrics smoothing (EWMA coefficients) and ping-cap.

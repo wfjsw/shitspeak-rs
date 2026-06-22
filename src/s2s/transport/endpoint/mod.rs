@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -331,10 +331,11 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
         }
         let now = Instant::now();
         let wall_now = SystemTime::now();
+        let local_ip_capability = LocalIpCapability::discover();
         let mut candidates: Vec<_> = inner
             .iter_peers()
             .into_iter()
-            .filter(|(_, peer)| needs_dial(peer, inner.cfg(), now, wall_now))
+            .filter(|(_, peer)| needs_dial(peer, inner.cfg(), now, wall_now, local_ip_capability))
             .collect();
         let mandatory_targets = mandatory_backbone_targets(&inner);
         candidates.sort_by(|a, b| compare_dial_candidates(a, b, &mandatory_targets));
@@ -371,9 +372,12 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
                 now,
             )
         {
-            if let Some((node, peer)) =
-                select_unselected_probe_candidate(&candidates, &mandatory_targets, inner.cfg())
-            {
+            if let Some((node, peer)) = select_unselected_probe_candidate(
+                &candidates,
+                &mandatory_targets,
+                inner.cfg(),
+                local_ip_capability,
+            ) {
                 if peer.try_begin_connect() {
                     last_unselected_probe = Some(now);
                     let inner_c = inner.clone();
@@ -501,13 +505,15 @@ fn select_unselected_probe_candidate(
     candidates: &[(NodeIdentifier, Arc<PeerState>)],
     mandatory_targets: &HashSet<NodeIdentifier>,
     cfg: &TransportConfig,
+    local_ip_capability: LocalIpCapability,
 ) -> Option<(NodeIdentifier, Arc<PeerState>)> {
     let now = Instant::now();
     let wall_now = SystemTime::now();
     candidates
         .iter()
         .find(|(node, peer)| {
-            !mandatory_targets.contains(node) && peer_retry_ready(peer, cfg, now, wall_now)
+            !mandatory_targets.contains(node)
+                && peer_retry_ready(peer, cfg, now, wall_now, local_ip_capability)
         })
         .map(|(node, peer)| (*node, peer.clone()))
 }
@@ -517,9 +523,13 @@ fn peer_retry_ready(
     cfg: &TransportConfig,
     now: Instant,
     wall_now: SystemTime,
+    local_ip_capability: LocalIpCapability,
 ) -> bool {
     let has_live_connection = peer.has_any_live_stream();
     peer.snapshot_addresses().iter().any(|addr| {
+        if !local_ip_capability.supports_remote(addr.addr().ip()) {
+            return false;
+        }
         if peer.has_live_outgoing_to(*addr) {
             return false;
         }
@@ -544,8 +554,31 @@ fn compare_dial_candidates(
 }
 
 /// True iff at least one known address candidate has no live outbound session.
-fn needs_dial(peer: &PeerState, cfg: &TransportConfig, now: Instant, wall_now: SystemTime) -> bool {
-    peer_retry_ready(peer, cfg, now, wall_now)
+fn needs_dial(
+    peer: &PeerState,
+    cfg: &TransportConfig,
+    now: Instant,
+    wall_now: SystemTime,
+    local_ip_capability: LocalIpCapability,
+) -> bool {
+    peer_retry_ready(peer, cfg, now, wall_now, local_ip_capability)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalIpCapability {
+    has_ipv6: bool,
+}
+
+impl LocalIpCapability {
+    fn discover() -> Self {
+        Self {
+            has_ipv6: super::local_ip::has_usable_ipv6_address(),
+        }
+    }
+
+    fn supports_remote(self, ip: IpAddr) -> bool {
+        ip.is_ipv4() || self.has_ipv6
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -719,7 +752,15 @@ async fn try_dial_peer(
 
     let mut attempts = Vec::new();
     let mut planned_outgoing = 0usize;
+    let local_ip_capability = LocalIpCapability::discover();
     for addr in addrs {
+        if !local_ip_capability.supports_remote(addr.addr().ip()) {
+            debug!(
+                ?addr,
+                "skipping S2S dial candidate without matching local outgoing IP family"
+            );
+            continue;
+        }
         let transport = addr.transport();
         if peer.has_live_outgoing_to(addr) {
             continue;
@@ -931,8 +972,23 @@ async fn dial_resolved_seed_address(
 }
 
 fn resolve_seed_address(seed: &SeedAddress) -> io::Result<Vec<PeerAddress>> {
+    resolve_seed_address_with_capability(seed, LocalIpCapability::discover())
+}
+
+fn resolve_seed_address_with_capability(
+    seed: &SeedAddress,
+    local_ip_capability: LocalIpCapability,
+) -> io::Result<Vec<PeerAddress>> {
     let mut addrs = Vec::new();
     for addr in seed.addr().to_socket_addrs()? {
+        if !local_ip_capability.supports_remote(addr.ip()) {
+            debug!(
+                %addr,
+                seed = seed.addr(),
+                "skipping resolved S2S seed address without matching local outgoing IP family"
+            );
+            continue;
+        }
         let peer_addr = PeerAddress::new(addr, seed.transport());
         if peer_addr.is_dialable() && !addrs.contains(&peer_addr) {
             addrs.push(peer_addr);
@@ -1156,10 +1212,73 @@ mod tests {
             (backed_off.node_id(), backed_off),
             (ready.node_id(), ready),
         ];
-        let selected = select_unselected_probe_candidate(&candidates, &HashSet::from([2]), &cfg)
-            .expect("ready non-mandatory peer should be selected");
+        let selected = select_unselected_probe_candidate(
+            &candidates,
+            &HashSet::from([2]),
+            &cfg,
+            LocalIpCapability { has_ipv6: true },
+        )
+        .expect("ready non-mandatory peer should be selected");
 
         assert_eq!(selected.0, 4);
+    }
+
+    #[test]
+    fn local_ip_capability_skips_ipv6_when_no_usable_local_ipv6_exists() {
+        let v4_only = LocalIpCapability { has_ipv6: false };
+        let dual_stack = LocalIpCapability { has_ipv6: true };
+
+        assert!(v4_only.supports_remote("100.64.12.34".parse().unwrap()));
+        assert!(!v4_only.supports_remote("fd00::12".parse().unwrap()));
+        assert!(dual_stack.supports_remote("fd00::12".parse().unwrap()));
+    }
+
+    #[test]
+    fn peer_retry_ready_ignores_ipv6_candidate_without_local_ipv6() {
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into());
+        let peer = PeerState::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            MetricsTuning::default(),
+        );
+        peer.add_address(PeerAddress::new(
+            "[fd00::12]:64739".parse().unwrap(),
+            TransportKind::Tcp,
+        ));
+
+        assert!(!peer_retry_ready(
+            &peer,
+            &cfg,
+            Instant::now(),
+            SystemTime::now(),
+            LocalIpCapability { has_ipv6: false },
+        ));
+        assert!(peer_retry_ready(
+            &peer,
+            &cfg,
+            Instant::now(),
+            SystemTime::now(),
+            LocalIpCapability { has_ipv6: true },
+        ));
+    }
+
+    #[test]
+    fn seed_resolution_skips_ipv6_without_local_ipv6() {
+        let seed = SeedAddress::new("[fd00::12]:64739".to_string(), TransportKind::Tcp);
+        let err =
+            resolve_seed_address_with_capability(&seed, LocalIpCapability { has_ipv6: false })
+                .expect_err("IPv6 seed is not usable on an IPv4-only host");
+
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        assert_eq!(
+            resolve_seed_address_with_capability(&seed, LocalIpCapability { has_ipv6: true })
+                .expect("IPv6 seed remains usable when local IPv6 exists"),
+            vec![PeerAddress::new(
+                "[fd00::12]:64739".parse().unwrap(),
+                TransportKind::Tcp,
+            )]
+        );
     }
 
     #[test]

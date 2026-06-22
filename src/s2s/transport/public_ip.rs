@@ -22,7 +22,7 @@ const STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
 ];
-const IPV4_PROBE_URLS: &[&str] = &["https://ip-check-perf.radar.cloudflare.com/"];
+const IPV4_PROBE_URLS: &[&str] = &["https://ipv4-check-perf.radar.cloudflare.com/"];
 const IPV6_PROBE_URLS: &[&str] = &["https://ipv6-check-perf.radar.cloudflare.com/"];
 
 #[derive(Debug, Clone, Copy)]
@@ -394,6 +394,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_ip_probe_urls_are_family_specific() {
+        assert_eq!(
+            IPV4_PROBE_URLS,
+            &["https://ipv4-check-perf.radar.cloudflare.com/"]
+        );
+        assert_eq!(
+            IPV6_PROBE_URLS,
+            &["https://ipv6-check-perf.radar.cloudflare.com/"]
+        );
+    }
+
+    #[test]
     fn parse_public_ip_accepts_matching_public_family() {
         assert_eq!(
             parse_public_ip("8.8.8.8\n", IpFamily::V4),
@@ -420,6 +432,20 @@ mod tests {
                 IpFamily::V6,
             ),
             Some("2606:4700:4700::1111".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_public_ip_rejects_wrong_family_from_probe_endpoint() {
+        assert_eq!(
+            parse_public_ip(
+                r#"{
+                    "ip_address": "2607:5300:205:200::80fa",
+                    "ip_version": "IPv6"
+                }"#,
+                IpFamily::V4,
+            ),
+            None
         );
     }
 

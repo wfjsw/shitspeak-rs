@@ -28,6 +28,12 @@ pub struct S2sConfig {
     #[serde(default = "default_true")]
     pub advertise_private_ips: bool,
 
+    /// Local interface names whose unicast addresses should be added to
+    /// automatic S2S advertisement. Empty by default so wildcard listeners do
+    /// not publish every local interface.
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub local_interface_advertise: Vec<String>,
+
     #[serde(default)]
     pub ca_path: Option<PathBuf>,
     #[serde(default)]
@@ -87,6 +93,7 @@ impl Default for S2sConfig {
         Self {
             enabled: false,
             advertise_private_ips: true,
+            local_interface_advertise: Vec::new(),
             ca_path: None,
             cert_path: None,
             key_path: None,
@@ -163,7 +170,8 @@ impl S2sConfig {
             .ok_or_else(|| "s2s.enabled=true requires s2s.key_path".to_string())?;
 
         let mut cfg = TransportConfig::new(ca_path, cert_path, key_path)
-            .with_advertise_private_ips(self.advertise_private_ips);
+            .with_advertise_private_ips(self.advertise_private_ips)
+            .with_local_advertise_interfaces(self.local_interface_advertise.clone());
         cfg = cfg
             .with_tcp_listen_addrs(self.tcp_listen.iter().copied())
             .with_kcp_listen_addrs(self.kcp_listen.iter().copied())
@@ -314,6 +322,13 @@ where
 }
 
 fn deserialize_advertise_overrides<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_string_list(deserializer)
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -2456,5 +2471,34 @@ mod tests {
 
         assert!(cfg.advertise_private_ips);
         assert!(transport.advertise_private_ips());
+    }
+
+    #[test]
+    fn s2s_local_interface_advertise_parses_and_propagates() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            local_interface_advertise = ["tailscale0", "Tailscale", " "]
+        "#;
+        let cfg = parse_s2s(raw).expect("s2s config parses");
+        assert_eq!(
+            cfg.local_interface_advertise,
+            vec!["tailscale0".to_string(), "Tailscale".to_string()]
+        );
+
+        let transport = cfg
+            .transport_config()
+            .expect("valid transport config")
+            .expect("s2s enabled");
+        assert_eq!(
+            transport
+                .local_advertise_interfaces()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["tailscale0", "Tailscale"]
+        );
     }
 }

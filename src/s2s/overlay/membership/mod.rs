@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn alive_max_users_sums_alive_members_only() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let lsdb = Arc::new(LinkStateDb::new(floor));
         let (table, _) = new_table(1, lsdb.clone(), 8);
 

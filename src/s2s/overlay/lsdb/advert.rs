@@ -828,9 +828,24 @@ async fn emit_once_with_reason(
         return;
     }
     let lsa = stamp_local_lsa(emitter, content);
+    let lsa_origin = lsa.origin;
+    let lsa_boot_epoch = lsa.boot_epoch;
+    let lsa_seq = lsa.seq;
     let pb_lsa = lsa.to_pb();
+    match lsdb.admit(lsa) {
+        AdmissionResult::Accepted => {}
+        AdmissionResult::Stale | AdmissionResult::BelowFloor => {
+            warn!(
+                origin = lsa_origin,
+                boot_epoch = lsa_boot_epoch,
+                seq = lsa_seq,
+                reason = ?reason,
+                "local lsa rejected by local lsdb; suppressing flood"
+            );
+            return;
+        }
+    }
     record_published(emitter, &snap, cfg);
-    let _ = lsdb.admit(lsa);
     record_emitted_content(emitter, fingerprint);
     if tombstone {
         flood_to_neighbors(transport, &snap, vec![pb_lsa], None).await;

@@ -270,7 +270,19 @@ impl S2SManager {
     }
 
     pub fn cluster_max_users(&self) -> Option<u64> {
-        self.overlay().map(|overlay| overlay.alive_max_users())
+        self.overlay().map(|overlay| {
+            let local_node_id = overlay.local_node_id();
+            let local_max_users = self.max_users.load(std::sync::atomic::Ordering::Relaxed);
+            overlay
+                .members()
+                .into_iter()
+                .filter(|member| {
+                    member.node_id() != local_node_id
+                        && member.status() == overlay::MemberStatus::Alive
+                })
+                .map(|member| member.max_users())
+                .fold(local_max_users, u64::saturating_add)
+        })
     }
 
     pub fn replications(&self) -> Option<Arc<ReplicationManager>> {

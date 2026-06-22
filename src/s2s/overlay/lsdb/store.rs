@@ -388,14 +388,16 @@ struct FloorFileV1 {
 /// seen. Persisted to disk debounced.
 pub struct LsaFloor {
     inner: RwLock<HashMap<NodeIdentifier, OriginVersion>>,
+    local_node_id: NodeIdentifier,
     persistence_dir: Option<PathBuf>,
     persist_signal: Notify,
 }
 
 impl LsaFloor {
-    pub fn new(persistence_dir: Option<PathBuf>) -> Self {
+    pub fn new(local_node_id: NodeIdentifier, persistence_dir: Option<PathBuf>) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            local_node_id,
             persistence_dir,
             persist_signal: Notify::new(),
         }
@@ -413,7 +415,9 @@ impl LsaFloor {
                 Ok(v1) if v1.version == 1 => {
                     let mut g = self.inner.write();
                     for e in v1.floor {
-                        if e.origin <= u16::MAX as u32 {
+                        if e.origin <= u16::MAX as u32
+                            && e.origin as NodeIdentifier != self.local_node_id
+                        {
                             g.insert(
                                 e.origin as NodeIdentifier,
                                 OriginVersion {
@@ -434,12 +438,18 @@ impl LsaFloor {
     }
 
     pub fn get(&self, origin: NodeIdentifier) -> Option<OriginVersion> {
+        if origin == self.local_node_id {
+            return None;
+        }
         self.inner.read().get(&origin).copied()
     }
 
     /// Advance the floor for `origin` to `(boot_epoch, seq)` if strictly
     /// greater. Returns true if changed.
     pub fn advance(&self, origin: NodeIdentifier, boot_epoch: u64, seq: u64) -> bool {
+        if origin == self.local_node_id {
+            return false;
+        }
         let mut g = self.inner.write();
         let entry = g.entry(origin).or_insert(OriginVersion {
             boot_epoch: 0,
@@ -460,6 +470,7 @@ impl LsaFloor {
         self.inner
             .read()
             .iter()
+            .filter(|(origin, _)| **origin != self.local_node_id)
             .map(|(origin, v)| FloorEntryDisk {
                 origin: *origin as u32,
                 boot_epoch: v.boot_epoch,
@@ -770,7 +781,7 @@ mod tests {
 
     #[test]
     fn admit_first_lsa() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         assert_eq!(db.admit(entry(1, 100, 1, false)), AdmissionResult::Accepted);
         assert!(db.get(1).is_some());
@@ -839,7 +850,7 @@ mod tests {
 
     #[test]
     fn link_state_db_sums_alive_max_users() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         let mut first = entry(1, 100, 1, false);
         first.max_users = 100;
@@ -855,7 +866,7 @@ mod tests {
 
     #[test]
     fn edge_rtt_snapshot_skips_zero_and_tombstoned_links() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         let mut alive = entry(1, 100, 1, false);
         alive.links = vec![
@@ -905,7 +916,7 @@ mod tests {
 
     #[test]
     fn reject_stale_seq() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         db.admit(entry(1, 100, 5, false));
         assert_eq!(db.admit(entry(1, 100, 3, false)), AdmissionResult::Stale);
@@ -913,7 +924,7 @@ mod tests {
 
     #[test]
     fn higher_boot_epoch_supersedes() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         db.admit(entry(1, 100, 10, false));
         assert_eq!(db.admit(entry(1, 200, 0, false)), AdmissionResult::Accepted);
@@ -924,7 +935,7 @@ mod tests {
 
     #[test]
     fn floor_blocks_zombie_after_age_out() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         // Floor has been advanced (e.g., by a tombstone admitted earlier).
         floor.advance(1, 100, 50);
         let db = LinkStateDb::new(floor);
@@ -939,7 +950,7 @@ mod tests {
 
     #[test]
     fn floor_admits_legitimate_restart() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         floor.advance(1, 100, 50);
         let db = LinkStateDb::new(floor);
         // Higher boot_epoch always wins.
@@ -948,7 +959,7 @@ mod tests {
 
     #[test]
     fn admit_advances_floor() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor.clone());
         db.admit(entry(1, 100, 5, false));
         let v = floor.get(1).unwrap();
@@ -957,8 +968,20 @@ mod tests {
     }
 
     #[test]
+    fn local_origin_is_not_written_to_floor() {
+        let floor = Arc::new(LsaFloor::new(1, None));
+        let db = LinkStateDb::new(floor.clone());
+        db.admit(entry(1, 100, 5, false));
+        assert!(floor.get(1).is_none());
+
+        // A later local LSA with the same boot epoch is judged against the
+        // live LSDB entry, not against a persisted zombie-defense floor.
+        assert_eq!(db.admit(entry(1, 100, 6, false)), AdmissionResult::Accepted);
+    }
+
+    #[test]
     fn dirty_origins_track_admit_and_sweep_once() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         db.admit(entry(1, 100, 5, false));
         db.admit(entry(2, 100, 1, false));
@@ -977,7 +1000,7 @@ mod tests {
 
     #[test]
     fn sweep_ages_out_non_tombstone() {
-        let floor = Arc::new(LsaFloor::new(None));
+        let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         db.admit(entry(1, 100, 5, false));
         // Shift ts_local_received back.
@@ -993,14 +1016,30 @@ mod tests {
     #[test]
     fn floor_disk_roundtrip() {
         let dir = tempfile::TempDir::new().unwrap();
-        let f1 = LsaFloor::new(Some(dir.path().to_path_buf()));
+        let f1 = LsaFloor::new(0, Some(dir.path().to_path_buf()));
         f1.advance(7, 1234, 9);
         f1.advance(8, 5678, 1);
         f1.write_now();
-        let f2 = LsaFloor::new(Some(dir.path().to_path_buf()));
+        let f2 = LsaFloor::new(0, Some(dir.path().to_path_buf()));
         f2.load();
         assert_eq!(f2.get(7).unwrap().boot_epoch, 1234);
         assert_eq!(f2.get(7).unwrap().seq, 9);
         assert_eq!(f2.get(8).unwrap().boot_epoch, 5678);
+    }
+
+    #[test]
+    fn floor_disk_omits_and_ignores_local_origin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f1 = LsaFloor::new(7, Some(dir.path().to_path_buf()));
+        assert!(!f1.advance(7, 1234, 9));
+        f1.advance(8, 5678, 1);
+        f1.write_now();
+
+        let raw = std::fs::read_to_string(floor_path(dir.path())).unwrap();
+        assert!(!raw.contains("\"origin\": 7"));
+
+        let f2 = LsaFloor::new(8, Some(dir.path().to_path_buf()));
+        f2.load();
+        assert!(f2.get(8).is_none());
     }
 }
