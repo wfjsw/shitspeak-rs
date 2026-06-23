@@ -39,6 +39,7 @@ pub struct TestServerOpts {
     pub privacy: PrivacyConfig,
     pub server_protocol_version: ProtocolVersion,
     pub channel_log_max_entries: usize,
+    pub authenticate_timeout_ms: u64,
 }
 
 impl Default for TestServerOpts {
@@ -59,6 +60,7 @@ impl Default for TestServerOpts {
             privacy: PrivacyConfig::default(),
             server_protocol_version: APP_PROTO_VER,
             channel_log_max_entries: 10_000,
+            authenticate_timeout_ms: 30_000,
         }
     }
 }
@@ -207,6 +209,7 @@ async fn spawn_test_server_with_pki(
         udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
         udp_channel_size: 2_048,
         client_idle_timeout_secs: 30,
+        authenticate_timeout_ms: opts.authenticate_timeout_ms,
         pending_delete_timeout_ms: 5_000,
         required_groups: Vec::new(),
         send_permission_info: opts.send_permission_info,

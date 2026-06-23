@@ -82,7 +82,15 @@ async fn handle_message_inner(
     let session = u32::from(client.get_session_id());
     let result = match message {
         Message::Version(version) => {
-            tracing::debug!(session, "handling Version");
+            tracing::debug!(
+                session,
+                version_v1 = ?version.version_v1,
+                version_v2 = ?version.version_v2,
+                release = ?version.release.as_deref(),
+                os = ?version.os.as_deref(),
+                os_version = ?version.os_version.as_deref(),
+                "handling Version"
+            );
             handle_version(server, client, version.into()).await
         }
         Message::UDPTunnel(data) => {
@@ -90,11 +98,30 @@ async fn handle_message_inner(
             handle_udp_tunnel(server, client, data).await
         }
         Message::Authenticate(authenticate) => {
-            tracing::debug!(session, "handling Authenticate");
+            tracing::debug!(
+                session,
+                username = ?authenticate.username.as_deref(),
+                has_password = authenticate.password.is_some(),
+                token_count = authenticate.tokens.len(),
+                celt_versions = ?authenticate.celt_versions,
+                opus = ?authenticate.opus,
+                client_type = ?authenticate.client_type,
+                "handling Authenticate"
+            );
             handle_authenticate(server, client, authenticate.into()).await
         }
         Message::Ping(ping) => {
-            tracing::trace!(session, "handling Ping");
+            tracing::trace!(
+                session,
+                timestamp = ?ping.timestamp,
+                good = ?ping.good,
+                late = ?ping.late,
+                lost = ?ping.lost,
+                resync = ?ping.resync,
+                udp_packets = ?ping.udp_packets,
+                tcp_packets = ?ping.tcp_packets,
+                "handling Ping"
+            );
             handle_ping(
                 server,
                 client,
@@ -102,12 +129,26 @@ async fn handle_message_inner(
             )
             .await
         }
-        Message::Reject(_) => {
-            tracing::debug!(session, "rejecting incoming Reject");
+        Message::Reject(reject) => {
+            tracing::debug!(
+                session,
+                reject_type = ?reject.r#type,
+                has_reason = reject.reason.is_some(),
+                "rejecting incoming Reject"
+            );
+            let message = Message::Reject(reject);
             Err(MessageTypeNotForIncoming::new(message).into())
         }
-        Message::ServerSync(_) => {
-            tracing::debug!(session, "rejecting incoming ServerSync");
+        Message::ServerSync(server_sync) => {
+            tracing::debug!(
+                session,
+                sync_session = ?server_sync.session,
+                max_bandwidth = ?server_sync.max_bandwidth,
+                has_welcome_text = server_sync.welcome_text.is_some(),
+                permissions = ?server_sync.permissions,
+                "rejecting incoming ServerSync"
+            );
+            let message = Message::ServerSync(server_sync);
             Err(MessageTypeNotForIncoming::new(message).into())
         }
         Message::ChannelRemove(channel_remove) => {
@@ -122,16 +163,59 @@ async fn handle_message_inner(
             tracing::debug!(
                 session,
                 channel_id = channel_state.channel_id,
+                parent = ?channel_state.parent,
+                name = ?channel_state.name.as_deref(),
+                links = channel_state.links.len(),
+                links_add = channel_state.links_add.len(),
+                links_remove = channel_state.links_remove.len(),
+                temporary = ?channel_state.temporary,
+                position = ?channel_state.position,
+                has_description = channel_state.description.is_some(),
+                has_description_hash = channel_state.description_hash.is_some(),
+                max_users = ?channel_state.max_users,
                 "handling ChannelState"
             );
             handle_channel_state(server, client, channel_state.into()).await
         }
         Message::UserRemove(user_remove) => {
-            tracing::debug!(session, target = user_remove.session, "handling UserRemove");
+            tracing::debug!(
+                session,
+                target = user_remove.session,
+                actor = ?user_remove.actor,
+                ban = ?user_remove.ban,
+                has_reason = user_remove.reason.is_some(),
+                "handling UserRemove"
+            );
             handle_user_remove(server, client, user_remove.into()).await
         }
         Message::UserState(user_state) => {
-            tracing::debug!(session, target = user_state.session, "handling UserState");
+            tracing::debug!(
+                session,
+                target = ?user_state.session,
+                actor = ?user_state.actor,
+                name = ?user_state.name.as_deref(),
+                user_id = ?user_state.user_id,
+                channel_id = ?user_state.channel_id,
+                mute = ?user_state.mute,
+                deaf = ?user_state.deaf,
+                suppress = ?user_state.suppress,
+                self_mute = ?user_state.self_mute,
+                self_deaf = ?user_state.self_deaf,
+                priority_speaker = ?user_state.priority_speaker,
+                recording = ?user_state.recording,
+                texture_len = user_state.texture.as_ref().map(|texture| texture.len()),
+                plugin_context_len = user_state.plugin_context.as_ref().map(|context| context.len()),
+                has_plugin_identity = user_state.plugin_identity.is_some(),
+                has_comment = user_state.comment.is_some(),
+                has_hash = user_state.hash.is_some(),
+                has_comment_hash = user_state.comment_hash.is_some(),
+                has_texture_hash = user_state.texture_hash.is_some(),
+                temporary_access_tokens = user_state.temporary_access_tokens.len(),
+                listening_channel_add = user_state.listening_channel_add.len(),
+                listening_channel_remove = user_state.listening_channel_remove.len(),
+                listening_volume_adjustments = user_state.listening_volume_adjustment.len(),
+                "handling UserState"
+            );
             handle_user_state(
                 server,
                 client,
@@ -140,40 +224,92 @@ async fn handle_message_inner(
             .await
         }
         Message::BanList(ban_list) => {
-            tracing::debug!(session, query = ban_list.query, "handling BanList");
+            tracing::debug!(
+                session,
+                query = ?ban_list.query,
+                bans = ban_list.bans.len(),
+                "handling BanList"
+            );
             handle_ban_list(server, client, ban_list.into()).await
         }
         Message::TextMessage(text_message) => {
-            tracing::debug!(session, channels = ?text_message.channel_id, trees = ?text_message.tree_id, "handling TextMessage");
+            tracing::debug!(
+                session,
+                actor = ?text_message.actor,
+                targets = ?text_message.session,
+                channels = ?text_message.channel_id,
+                trees = ?text_message.tree_id,
+                message_len = text_message.message.len(),
+                "handling TextMessage"
+            );
             handle_text_message(server, client, text_message.into()).await
         }
-        Message::PermissionDenied(_) => {
-            tracing::debug!(session, "rejecting incoming PermissionDenied");
+        Message::PermissionDenied(permission_denied) => {
+            tracing::debug!(
+                session,
+                denied_session = permission_denied.session,
+                deny_type = ?permission_denied.r#type,
+                channel_id = ?permission_denied.channel_id,
+                permission = ?permission_denied.permission,
+                has_reason = permission_denied.reason.is_some(),
+                has_name = permission_denied.name.is_some(),
+                "rejecting incoming PermissionDenied"
+            );
+            let message = Message::PermissionDenied(permission_denied);
             Err(MessageTypeNotForIncoming::new(message).into())
         }
         Message::ACL(acl) => {
             tracing::debug!(
                 session,
                 channel_id = acl.channel_id,
-                query = acl.query,
+                inherit_acls = ?acl.inherit_acls,
+                groups = acl.groups.len(),
+                acls = acl.acls.len(),
+                query = ?acl.query,
                 "handling ACL"
             );
             handle_acl(server, client, acl.into()).await
         }
         Message::QueryUsers(query_users) => {
-            tracing::debug!(session, ids = ?query_users.ids, names = ?query_users.names, "handling QueryUsers");
+            tracing::debug!(
+                session,
+                ids = ?query_users.ids,
+                names = ?query_users.names,
+                "handling QueryUsers"
+            );
             handle_query_users(server, client, query_users.into()).await
         }
         Message::CryptSetup(crypt_setup) => {
-            tracing::debug!(session, "handling CryptSetup");
+            tracing::debug!(
+                session,
+                is_resync_request = crypt_setup.client_nonce.is_none(),
+                key_len = crypt_setup.key.as_ref().map(|key| key.len()),
+                client_nonce_len = crypt_setup.client_nonce.as_ref().map(|nonce| nonce.len()),
+                server_nonce_len = crypt_setup.server_nonce.as_ref().map(|nonce| nonce.len()),
+                "handling CryptSetup"
+            );
             handle_crypt_setup(server, client, crypt_setup.into()).await
         }
-        Message::ContextActionModify(_) => {
-            tracing::debug!(session, "rejecting incoming ContextActionModify");
+        Message::ContextActionModify(context_action_modify) => {
+            tracing::debug!(
+                session,
+                action = %context_action_modify.action,
+                context = ?context_action_modify.context,
+                operation = ?context_action_modify.operation,
+                has_text = context_action_modify.text.is_some(),
+                "rejecting incoming ContextActionModify"
+            );
+            let message = Message::ContextActionModify(context_action_modify);
             Err(MessageTypeNotForIncoming::new(message).into())
         }
         Message::ContextAction(context_action) => {
-            tracing::debug!(session, action = %context_action.action, "handling ContextAction");
+            tracing::debug!(
+                session,
+                target_session = ?context_action.session,
+                channel_id = ?context_action.channel_id,
+                action = %context_action.action,
+                "handling ContextAction"
+            );
             handle_context_action(server, client, context_action.into()).await
         }
         Message::UserList(user_list) => {
@@ -185,23 +321,50 @@ async fn handle_message_inner(
             handle_user_list(server, client, user_list.into()).await
         }
         Message::VoiceTarget(voice_target) => {
-            tracing::debug!(session, target_id = voice_target.id, "handling VoiceTarget");
+            tracing::debug!(
+                session,
+                target_id = ?voice_target.id,
+                targets = voice_target.targets.len(),
+                "handling VoiceTarget"
+            );
             handle_voice_target(server, client, voice_target.into()).await
         }
         Message::PermissionQuery(permission_query) => {
             tracing::debug!(
                 session,
-                channel_id = permission_query.channel_id,
+                channel_id = ?permission_query.channel_id,
+                permissions = ?permission_query.permissions,
+                flush = ?permission_query.flush,
                 "handling PermissionQuery"
             );
             handle_permission_query(server, client, permission_query.into()).await
         }
-        Message::CodecVersion(_) => {
-            tracing::debug!(session, "rejecting incoming CodecVersion");
+        Message::CodecVersion(codec_version) => {
+            tracing::debug!(
+                session,
+                alpha = codec_version.alpha,
+                beta = codec_version.beta,
+                prefer_alpha = codec_version.prefer_alpha,
+                opus = ?codec_version.opus,
+                "rejecting incoming CodecVersion"
+            );
+            let message = Message::CodecVersion(codec_version);
             Err(MessageTypeNotForIncoming::new(message).into())
         }
         Message::UserStats(user_stats) => {
-            tracing::debug!(session, target = user_stats.session, "handling UserStats");
+            tracing::debug!(
+                session,
+                target = ?user_stats.session,
+                stats_only = ?user_stats.stats_only,
+                certificates = user_stats.certificates.len(),
+                has_from_client = user_stats.from_client.is_some(),
+                has_from_server = user_stats.from_server.is_some(),
+                celt_versions = ?user_stats.celt_versions,
+                address = ?user_stats.address,
+                bandwidth = ?user_stats.bandwidth,
+                opus = ?user_stats.opus,
+                "handling UserStats"
+            );
             handle_user_stats(server, client, user_stats.into()).await
         }
         Message::RequestBlob(request_blob) => {
@@ -213,18 +376,39 @@ async fn handle_message_inner(
             );
             handle_request_blob(server, client, request_blob.into()).await
         }
-        Message::ServerConfig(_) => {
-            tracing::debug!(session, "rejecting incoming ServerConfig");
+        Message::ServerConfig(server_config) => {
+            tracing::debug!(
+                session,
+                max_bandwidth = ?server_config.max_bandwidth,
+                has_welcome_text = server_config.welcome_text.is_some(),
+                allow_html = ?server_config.allow_html,
+                message_length = ?server_config.message_length,
+                image_message_length = ?server_config.image_message_length,
+                max_users = ?server_config.max_users,
+                "rejecting incoming ServerConfig"
+            );
+            let message = Message::ServerConfig(server_config);
             Err(MessageTypeNotForIncoming::new(message).into())
         }
-        Message::SuggestConfig(_) => {
-            tracing::debug!(session, "rejecting incoming SuggestConfig");
+        Message::SuggestConfig(suggest_config) => {
+            tracing::debug!(
+                session,
+                version_v1 = ?suggest_config.version_v1,
+                version_v2 = ?suggest_config.version_v2,
+                positional = ?suggest_config.positional,
+                push_to_talk = ?suggest_config.push_to_talk,
+                "rejecting incoming SuggestConfig"
+            );
+            let message = Message::SuggestConfig(suggest_config);
             Err(MessageTypeNotForIncoming::new(message).into())
         }
         Message::PluginDataTransmission(plugin_data) => {
             tracing::debug!(
                 session,
+                sender_session = ?plugin_data.sender_session,
                 receivers = plugin_data.receiver_sessions.len(),
+                data_id = ?plugin_data.data_id.as_deref(),
+                data_len = plugin_data.data.as_ref().map(|data| data.len()),
                 "handling PluginDataTransmission"
             );
             handle_plugin_data_transmission(server, client, plugin_data.into()).await

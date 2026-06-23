@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Shutdown, SocketAddr},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -13,10 +14,12 @@ use parking_lot::{
     RwLockReadGuard as ParkingRwLockReadGuard, RwLockWriteGuard as ParkingRwLockWriteGuard,
 };
 use rustls::pki_types::CertificateDer;
+use socket2::Socket;
 use tokio::{
     io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
     net::TcpStream,
     sync::{Mutex as AsyncMutex, RwLock, RwLockWriteGuard, mpsc, watch},
+    time::timeout,
 };
 use tokio_rustls::server::TlsStream;
 
@@ -37,6 +40,7 @@ use crate::{
 
 const VOICE_ROUTING_QUEUE_CAPACITY: usize = 256;
 const VOICE_TCP_QUEUE_CAPACITY: usize = 256;
+const GRACEFUL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sentinel bit on the packed `protocol_version` atomic indicating that
 /// the value has been set. The packed-u64 encoding from
@@ -166,6 +170,7 @@ enum ClientTransport {
     NativeTls {
         rx: AsyncMutex<ReadHalf<TlsStream<TcpStream>>>,
         tx: AsyncMutex<WriteHalf<TlsStream<TcpStream>>>,
+        socket: Option<Socket>,
     },
     WebGateway {
         kind: ClientTransportKind,
@@ -268,6 +273,9 @@ impl Client {
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
         let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
 
+        let socket = socket2::SockRef::from(connection.get_ref().0)
+            .try_clone()
+            .ok();
         let (connection_rx, connection_tx) = tokio::io::split(connection);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
@@ -285,6 +293,7 @@ impl Client {
             transport: ClientTransport::NativeTls {
                 rx: AsyncMutex::new(connection_rx),
                 tx: AsyncMutex::new(connection_tx),
+                socket,
             },
             disconnect_tx,
             disconnect_rx,
@@ -801,12 +810,40 @@ impl Client {
 
     pub async fn disconnect(&self) -> Result<(), WriteProtoMessageError> {
         let _ = self.disconnect_tx.send(true);
-
-        if let ClientTransport::NativeTls { tx, .. } = &self.transport {
-            let mut guard = tx.lock().await;
-            guard.shutdown().await?;
+        if let ClientTransport::NativeTls { tx, socket, .. } = &self.transport {
+            match timeout(GRACEFUL_DISCONNECT_TIMEOUT, async {
+                let mut guard = tx.lock().await;
+                guard.shutdown().await
+            })
+            .await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) => {
+                    tracing::debug!(
+                        session = u32::from(self.get_session_id()),
+                        timeout_ms = GRACEFUL_DISCONNECT_TIMEOUT.as_millis(),
+                        "graceful disconnect timed out; forcibly shutting down socket",
+                    );
+                    Self::shutdown_socket(socket);
+                }
+            }
         }
         Ok(())
+    }
+
+    pub async fn force_disconnect(&self) -> Result<(), WriteProtoMessageError> {
+        let _ = self.disconnect_tx.send(true);
+        if let ClientTransport::NativeTls { socket, .. } = &self.transport {
+            Self::shutdown_socket(socket);
+        }
+        Ok(())
+    }
+
+    fn shutdown_socket(socket: &Option<Socket>) {
+        if let Some(socket) = socket {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
     }
 
     pub async fn disconnected(&self) {

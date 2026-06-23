@@ -142,11 +142,11 @@ pub async fn handle_user_remove(
         .remove_client_in_server(&server_id, target_session)
         .await;
     let target = removed.as_ref().unwrap_or(&target);
-    if let Err(e) = target.disconnect().await {
+    if let Err(e) = target.force_disconnect().await {
         tracing::debug!(
             error = %e,
             target = target_raw,
-            "failed to gracefully disconnect removed client",
+            "failed to forcibly disconnect removed client",
         );
     }
     crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(

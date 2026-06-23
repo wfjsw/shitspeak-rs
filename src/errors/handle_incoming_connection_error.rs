@@ -13,6 +13,8 @@ pub enum HandleIncomingConnectionError {
     ClientLogGapUnrecoverable,
     /// The client's channel log gap is unrecoverable.
     ChannelLogGapUnrecoverable,
+    /// The client did not complete Authenticate before the configured deadline.
+    AuthenticateTimeout(std::time::Duration),
     /// Failed to write a message to the client (connection lost).
     ClientWriteFailed(WriteProtoMessageError),
     /// Authentication was rejected after the server sent a Reject message.
@@ -65,6 +67,13 @@ impl std::fmt::Display for HandleIncomingConnectionError {
             }
             HandleIncomingConnectionError::ChannelLogGapUnrecoverable => {
                 write!(f, "Channel log gap unrecoverable (log pruned)")
+            }
+            HandleIncomingConnectionError::AuthenticateTimeout(timeout) => {
+                write!(
+                    f,
+                    "Client did not authenticate within {}ms",
+                    timeout.as_millis()
+                )
             }
             HandleIncomingConnectionError::ClientWriteFailed(err) => {
                 write!(f, "Client write failed: {}", err)

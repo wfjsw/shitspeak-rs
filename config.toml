@@ -47,6 +47,8 @@ udp_channel_size = 2048
 
 # Idle timeout (seconds)
 client_idle_timeout_secs = 30
+# Authenticate timeout (milliseconds) after TLS setup.
+authenticate_timeout_ms = 30000
 pending_delete_timeout_ms = 5000
 
 # Persistence

@@ -2688,6 +2688,7 @@ mod tests {
             udp_ping_user_count_scope: crate::config::UdpPingUserCountScope::Cluster,
             udp_channel_size: 2_048,
             client_idle_timeout_secs: 30,
+            authenticate_timeout_ms: 30_000,
             pending_delete_timeout_ms: 5_000,
             required_groups: Vec::new(),
             send_permission_info: false,

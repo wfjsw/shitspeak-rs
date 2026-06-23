@@ -3,6 +3,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock as StdRwLock};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock as ParkingRwLock};
@@ -55,6 +56,7 @@ const ALPN_MUMBLE: &[u8] = b"mumble";
 const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 128;
 const DYNAMIC_ENTRYPOINT_MIN_PORT: u16 = 49152;
 const DYNAMIC_ENTRYPOINT_MAX_PORT: u16 = 65535;
+const MIN_AUTHENTICATE_TIMEOUT_MS: u64 = 1;
 
 fn startup_file_error(
     config_key: &str,
@@ -433,6 +435,7 @@ mod tests {
             udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
             udp_channel_size: 2_048,
             client_idle_timeout_secs: 30,
+            authenticate_timeout_ms: 30_000,
             pending_delete_timeout_ms: 5_000,
             required_groups: Vec::new(),
             send_permission_info: false,
@@ -872,6 +875,10 @@ struct EntrypointRuntime {
 
 fn is_realtime_client_message(message: &Message) -> bool {
     matches!(message, Message::Ping(_) | Message::UDPTunnel(_))
+}
+
+fn authenticate_timeout_duration(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.max(MIN_AUTHENTICATE_TIMEOUT_MS))
 }
 
 fn map_handler_result(
@@ -1995,6 +2002,13 @@ impl Server {
                     timeout_secs,
                 );
                 self.clients.remove_client_in_server(&server_id, sid).await;
+                if let Err(e) = client.disconnect().await {
+                    tracing::debug!(
+                        error = %e,
+                        session = u32::from(sid),
+                        "failed to disconnect idle client",
+                    );
+                }
                 crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
                     self,
                     &server_id,
@@ -2062,6 +2076,11 @@ impl Server {
         remote_addr: std::net::SocketAddr,
         provisional_server_id: String,
     ) -> Result<(), HandleIncomingConnectionError> {
+        tracing::info!(
+            %remote_addr,
+            provisional_server_id,
+            "TCP connection established"
+        );
         let proxy_connection = if self
             .allowed_proxies
             .iter()
@@ -2079,10 +2098,26 @@ impl Server {
         let real_ip = client_addr.ip();
 
         let local_addr = tcp_stream.local_addr()?;
+        tracing::info!(
+            %remote_addr,
+            %client_addr,
+            %local_addr,
+            uses_proxy_protocol,
+            "TLS handshake starting"
+        );
         let tls_ja4 = crate::tls_fingerprint::peek_tls_ja4(&tcp_stream).await?;
         let tls_acceptor = self.tls_acceptor.read().clone();
         let tls_stream = tls_acceptor.accept(tcp_stream).await?;
         let server_id = self.resolve_tls_server_id(&provisional_server_id, local_addr, &tls_stream);
+        tracing::info!(
+            %remote_addr,
+            %client_addr,
+            %local_addr,
+            server_id,
+            alpn = ?tls_stream.get_ref().1.alpn_protocol().map(String::from_utf8_lossy),
+            tls_ja4 = ?tls_ja4,
+            "TLS handshake completed"
+        );
         match tls_stream.get_ref().1.alpn_protocol() {
             #[cfg(feature = "web")]
             Some(ALPN_HTTP_1_1) => {
@@ -2160,6 +2195,8 @@ impl Server {
         tls_ja4: Option<String>,
         uses_proxy_protocol: bool,
     ) -> Result<(), HandleIncomingConnectionError> {
+        let authenticate_timeout =
+            authenticate_timeout_duration(self.read_config().authenticate_timeout_ms);
         // Send server version (these are startup-only, read once)
         let version = {
             let cfg = self.read_config();
@@ -2200,9 +2237,21 @@ impl Server {
         // the client and return the error to the caller.
         let result: Result<(), HandleIncomingConnectionError> = async {
             let mut handler_tasks = JoinSet::new();
+            let mut authenticate_deadline = Box::pin(tokio::time::sleep(authenticate_timeout));
 
             loop {
                 tokio::select! {
+                    // ── Authenticate timeout ────────────────────────────────
+                    _ = &mut authenticate_deadline, if !client.is_authenticated() => {
+                        tracing::info!(
+                            server_id = %client.server_id(),
+                            session = u32::from(client.get_session_id()),
+                            timeout_ms = authenticate_timeout.as_millis(),
+                            "closing connection after authenticate timeout"
+                        );
+                        return Err(HandleIncomingConnectionError::AuthenticateTimeout(authenticate_timeout));
+                    }
+
                     // ── Local disconnect request ─────────────────────────────
                     _ = client.disconnected() => {
                         tracing::debug!(

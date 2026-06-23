@@ -4,8 +4,64 @@
 use crate::acl::{ACL, ACLPermissions};
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::localization::Language;
-use crate::messages::Message;
 use crate::messages::encoder::{ContextActionModify, RejectType};
+use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+use rustls::ClientConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
+
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
 
 /// Checks that two registered users can authenticate concurrently.
 /// Expected: each client gets a distinct session, its registered user id, and
@@ -66,6 +122,67 @@ async fn authenticator_receives_tls_ja4_and_proxy_protocol_flag() {
     assert!(
         !auxiliary.uses_proxy_protocol(),
         "direct test connection should not use PROXY protocol"
+    );
+}
+
+#[tokio::test]
+async fn native_client_must_authenticate_before_timeout() {
+    let server = spawn_test_server(TestServerOpts {
+        authenticate_timeout_ms: 50,
+        ..TestServerOpts::default()
+    })
+    .await;
+
+    let key_pair = KeyPair::generate().expect("client keypair");
+    let mut cert_params =
+        CertificateParams::new(vec!["test-client".into()]).expect("client cert params");
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "test-client");
+    cert_params.distinguished_name = dn;
+    let cert = cert_params
+        .self_signed(&key_pair)
+        .expect("self-signed client cert");
+    let cert_der = CertificateDer::pem_slice_iter(cert.pem().as_bytes())
+        .next()
+        .expect("client cert pem contains cert")
+        .expect("parse client cert");
+    let key_der: PrivateKeyDer<'static> =
+        PrivateKeyDer::from_pem_slice(key_pair.serialize_pem().as_bytes())
+            .expect("parse client key");
+    let tls_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_client_auth_cert(vec![cert_der], key_der)
+        .expect("client TLS config");
+    let connector = TlsConnector::from(Arc::new(tls_config));
+
+    let tcp = TcpStream::connect(server.addr).await.expect("TCP connect");
+    let server_name = ServerName::try_from("localhost").expect("static server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS handshake");
+
+    let version = tls.read_proto_message().await.expect("server Version");
+    assert!(matches!(version, Message::Version(_)));
+    tls.write_proto_message(
+        &crate::messages::encoder::Version {
+            version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
+            release: Some("test-client".into()),
+            os: Some("test".into()),
+            os_version: Some("test".into()),
+        }
+        .into(),
+    )
+    .await
+    .expect("write client Version");
+
+    let closed = timeout(Duration::from_secs(2), tls.read_proto_message())
+        .await
+        .expect("connection should close after authenticate timeout");
+    assert!(
+        closed.is_err(),
+        "server should close unauthenticated native client"
     );
 }
 

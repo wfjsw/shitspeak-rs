@@ -1292,6 +1292,10 @@ pub struct Config {
     /// Default: 30.
     #[serde(default = "default_idle_timeout")]
     pub client_idle_timeout_secs: u64,
+    /// Milliseconds after TLS setup before a native client must finish Authenticate.
+    /// Default: 30000.
+    #[serde(default = "default_authenticate_timeout_ms")]
+    pub authenticate_timeout_ms: u64,
     /// Milliseconds before a pending two-phase channel delete is rolled back.
     /// Default: 5000.
     #[serde(default = "default_pending_delete_timeout_ms")]
@@ -1358,6 +1362,9 @@ fn default_udp_ping_user_count_scope() -> UdpPingUserCountScope {
 }
 fn default_idle_timeout() -> u64 {
     30
+}
+fn default_authenticate_timeout_ms() -> u64 {
+    30_000
 }
 fn default_pending_delete_timeout_ms() -> u64 {
     5_000

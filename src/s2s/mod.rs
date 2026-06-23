@@ -1623,11 +1623,11 @@ async fn apply_user_remove_patch(
         .remove_client_in_server(server_id, target_id)
         .await;
     let target = removed.as_ref().unwrap_or(&target);
-    if let Err(e) = target.disconnect().await {
+    if let Err(e) = target.force_disconnect().await {
         trace!(
             error = %e,
             target = u32::from(target_id),
-            "s2s moderation failed to gracefully disconnect removed client",
+            "s2s moderation failed to forcibly disconnect removed client",
         );
     }
     crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
