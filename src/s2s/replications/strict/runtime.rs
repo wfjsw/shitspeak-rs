@@ -27,7 +27,7 @@ use super::super::proto::{
     StrictProposeAck, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
 };
 use super::super::topic::ErasedStrictRuntime;
-use super::{HistoryMetadata, LogSlice, StrictReplicable};
+use super::{HistoryMetadata, LogSlice, StrictLogMetadata, StrictReplicable};
 use crate::s2s::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use crate::s2s::transport::{MessageClass, RoutingMetric, ServiceLevel};
 use crate::types::NodeIdentifier;
@@ -42,8 +42,10 @@ use crate::types::NodeIdentifier;
 /// always-on heartbeat behavior.
 const CLOCK_TICK_ACTIVE_BURST_TICKS: usize = 3;
 const CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER: u32 = 4;
-const COMMIT_FANOUT_RETRY_TICKS: usize = 8;
-
+// Keep commit gossip alive through the hostile-link/jitter window. A peer can
+// miss the first quorum commit fanout but still be alive and routable shortly
+// after; these retries are the steady-state repair path for that case.
+const COMMIT_FANOUT_RETRY_TICKS: usize = 80;
 /// Compute p95 of a slice of edge RTTs, clamped to
 /// `[cfg.min_clock_tick(), cfg.max_clock_tick()]`. Empty input
 /// → `cfg.fallback_clock_tick()`. Uses nearest-rank:
@@ -420,6 +422,18 @@ impl StrictState {
         out
     }
 
+    /// Earliest timestamp of a proposal this node has observed but not yet
+    /// seen committed. A future commit for it can still land at this timestamp
+    /// or later, so delivery must not pass it.
+    pub fn earliest_uncommitted_proposal_ts(&self) -> Option<u64> {
+        self.proposals
+            .values()
+            .filter(|p| !p.committed)
+            .map(|p| p.ts_propose)
+            .chain(self.pending_proposes.values().map(|p| p.ts_local))
+            .min()
+    }
+
     /// Fail every in-flight proposal whose still-alive target subset has
     /// shrunk below fast-quorum. Returns the wakers to fire externally
     /// (locking discipline: state lock held during the search, then
@@ -768,6 +782,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         spawn_delivery_loop(self.clone());
         spawn_clock_tick_loop(self.clone());
         spawn_bootstrap_retry_loop(self.clone());
+        spawn_steady_state_catchup_loop(self.clone());
     }
 
     fn wake_clock_tick_loop(&self) {
@@ -1651,7 +1666,10 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     let alive = rt.net.alive_members();
     let to_apply: Vec<BufferedOp> = {
         let mut s = rt.state.lock();
-        let hw = s.delivery_high_water(rt.self_id, &alive);
+        let mut hw = s.delivery_high_water(rt.self_id, &alive);
+        if let Some(ts) = s.earliest_uncommitted_proposal_ts() {
+            hw = hw.min(ts.saturating_sub(1));
+        }
         s.drain_deliverable(hw)
     };
     for buf in to_apply {
@@ -1663,7 +1681,17 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             }
         };
         let version = rt.repo.current_version() + 1;
-        rt.repo.apply_committed(version, op).await;
+        rt.repo
+            .apply_committed_with_metadata(
+                version,
+                op,
+                Some(StrictLogMetadata {
+                    op_id_hi: buf.op_id.0,
+                    op_id_lo: buf.op_id.1,
+                    ts_final: buf.ts_final,
+                }),
+            )
+            .await;
         // Fire local proposer's waker, if any, and clear the proposal.
         let waker = {
             let mut s = rt.state.lock();
@@ -1847,6 +1875,55 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             }
         }
     });
+}
+
+fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
+    let weak = Arc::downgrade(&rt);
+    drop(rt);
+    tokio::spawn(async move {
+        let Some(rt) = weak.upgrade() else {
+            return;
+        };
+        let mut ticker = tokio::time::interval(rt.cfg.strict_bootstrap_retry_interval());
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = rt.shutdown.cancelled() => return,
+                _ = ticker.tick() => {
+                    request_steady_state_catchup(&rt).await;
+                }
+            }
+        }
+    });
+}
+
+async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
+    if rt.state.lock().can_bootstrap_catchup() {
+        return;
+    }
+    let alive = rt.net.alive_members();
+    let mut peers: Vec<NodeIdentifier> = alive
+        .into_iter()
+        .filter(|node| *node != rt.self_id && rt.net.has_route(*node, ServiceLevel::Reliable))
+        .collect();
+    if peers.is_empty() {
+        return;
+    }
+    let dst = {
+        let mut rng = rand::rng();
+        peers.shuffle(&mut rng);
+        peers[0]
+    };
+    let req = StrictCatchupReq {
+        src_node: rt.self_id as u32,
+        since_version: rt.repo.current_version(),
+        chunk_token: 0,
+        force_snapshot: false,
+    };
+    let _ = rt
+        .net
+        .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))
+        .await;
 }
 
 // ---------- Helpers ----------
@@ -2051,6 +2128,32 @@ mod tests {
         assert_eq!(d[0].ts_final, 5);
         // The unread one stays.
         assert_eq!(s.commit_buffer.len(), 1);
+    }
+
+    #[test]
+    fn earliest_uncommitted_proposal_ts_blocks_delivery_past_pending_work() {
+        let mut s = StrictState::new();
+        s.pending_proposes.insert(
+            (1, 1),
+            PendingPropose {
+                coord_node: 20,
+                op_msgpack: Bytes::new(),
+                ts_local: 5,
+                seen_at: Instant::now(),
+            },
+        );
+        s.buffer_commit((2, 2), 6, Bytes::from_static(b"later"));
+
+        let hw = s
+            .earliest_uncommitted_proposal_ts()
+            .map(|ts| 10.min(ts.saturating_sub(1)))
+            .unwrap_or(10);
+        let drained = s.drain_deliverable(hw);
+
+        assert!(drained.is_empty());
+        assert_eq!(s.commit_buffer.len(), 1);
+        s.pending_proposes.clear();
+        assert_eq!(s.drain_deliverable(10).len(), 1);
     }
 
     #[test]

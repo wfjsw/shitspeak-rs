@@ -228,11 +228,11 @@ impl OwnerNet for MockNet {
 // ---------- In-memory test repos ----------
 
 use super::owner::{LogSlice as OwnerLog, OwnerReplicable};
-use super::strict::{LogSlice as StrictLog, StrictReplicable};
+use super::strict::{LogSlice as StrictLog, StrictLogEntry, StrictLogMetadata, StrictReplicable};
 
-/// Mock strict-mode repo: holds a `(version, Vec<(version, op)>)` log.
+/// Mock strict-mode repo: holds a `(version, Vec<(version, op, metadata)>)` log.
 pub(crate) struct CountingStrictRepo {
-    pub state: Mutex<(u64, Vec<(u64, u64)>)>,
+    pub state: Mutex<(u64, Vec<(u64, u64, Option<StrictLogMetadata>)>)>,
 }
 
 impl CountingStrictRepo {
@@ -243,7 +243,12 @@ impl CountingStrictRepo {
     }
 
     pub fn log(&self) -> Vec<(u64, u64)> {
-        self.state.lock().1.clone()
+        self.state
+            .lock()
+            .1
+            .iter()
+            .map(|(version, op, _)| (*version, *op))
+            .collect()
     }
 }
 
@@ -258,27 +263,52 @@ impl StrictReplicable for CountingStrictRepo {
     fn snapshot(&self) -> (u64, Bytes) {
         let s = self.state.lock();
         let v = s.0;
-        let bytes = Bytes::from(rmp_serde::to_vec(&s.1).unwrap_or_default());
+        let entries: Vec<(u64, u64)> = s.1.iter().map(|(version, op, _)| (*version, *op)).collect();
+        let bytes = Bytes::from(rmp_serde::to_vec(&entries).unwrap_or_default());
         (v, bytes)
     }
 
-    fn log_since(&self, since: u64) -> StrictLog<Self::Op> {
+    fn log_since(&self, since: u64) -> StrictLog<StrictLogEntry<Self::Op>> {
         let s = self.state.lock();
-        let log: Vec<(u64, u64)> = s.1.iter().copied().filter(|(v, _)| *v > since).collect();
+        let log: Vec<_> =
+            s.1.iter()
+                .filter(|(v, _, _)| *v > since)
+                .map(|(version, op, metadata)| {
+                    (
+                        *version,
+                        StrictLogEntry {
+                            op: *op,
+                            metadata: *metadata,
+                        },
+                    )
+                })
+                .collect();
         StrictLog::Available(log)
     }
 
     async fn apply_committed(&self, version: u64, op: Self::Op) {
+        self.apply_committed_with_metadata(version, op, None).await;
+    }
+
+    async fn apply_committed_with_metadata(
+        &self,
+        version: u64,
+        op: Self::Op,
+        metadata: Option<StrictLogMetadata>,
+    ) {
         let mut s = self.state.lock();
         s.0 = version;
-        s.1.push((version, op));
+        s.1.push((version, op, metadata));
     }
 
     async fn install_snapshot(&self, version: u64, snapshot: Bytes) {
         let entries: Vec<(u64, u64)> = rmp_serde::from_slice(&snapshot).unwrap_or_default();
         let mut s = self.state.lock();
         s.0 = version;
-        s.1 = entries;
+        s.1 = entries
+            .into_iter()
+            .map(|(version, op)| (version, op, None))
+            .collect();
     }
 }
 
@@ -727,6 +757,9 @@ mod e2e_tests {
             .map(|version| CatchupOp {
                 version,
                 op_msgpack: Bytes::from(rmp_serde::to_vec(&(700 + version - 1)).unwrap()),
+                strict_op_id_hi: 0,
+                strict_op_id_lo: 0,
+                strict_ts_final: 0,
             })
             .collect();
         let resp = OwnerCatchupResp {

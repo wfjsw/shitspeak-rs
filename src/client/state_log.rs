@@ -153,7 +153,8 @@ impl ClientGlobalStateDelta {
     }
 
     pub fn affects_acl_generation(&self) -> bool {
-        self.user_id.is_some()
+        self.current_channel_id.is_some()
+            || self.user_id.is_some()
             || self.groups.is_some()
             || self.is_superuser.is_some()
             || self.tokens.is_some()

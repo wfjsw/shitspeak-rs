@@ -180,10 +180,16 @@ mod tests {
                     CatchupOp {
                         version: 6,
                         op_msgpack: pretend_msgpack(0x01),
+                        strict_op_id_hi: 0,
+                        strict_op_id_lo: 0,
+                        strict_ts_final: 0,
                     },
                     CatchupOp {
                         version: 7,
                         op_msgpack: pretend_msgpack(0x02),
+                        strict_op_id_hi: 0,
+                        strict_op_id_lo: 0,
+                        strict_ts_final: 0,
                     },
                 ],
                 has_more: true,
@@ -255,6 +261,9 @@ mod tests {
                 ops: vec![CatchupOp {
                     version: 1,
                     op_msgpack: pretend_msgpack(0x11),
+                    strict_op_id_hi: 0,
+                    strict_op_id_lo: 0,
+                    strict_ts_final: 0,
                 }],
                 has_more: false,
                 next_chunk_token: 0,

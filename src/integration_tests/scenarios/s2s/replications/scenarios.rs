@@ -17,7 +17,7 @@ use crate::channels::Channel;
 use crate::s2s::replications::proto::{
     self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG,
 };
-use crate::s2s::replications::strict::{HistoryMetadata, LogSlice};
+use crate::s2s::replications::strict::{HistoryMetadata, LogSlice, StrictLogEntry};
 use crate::s2s::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
 use crate::s2s::replications::{
     OwnerReplicable, ReplicationConfig, ReplicationError, StrictReplicable,
@@ -78,7 +78,7 @@ impl StrictReplicable for TestChannelReplicationAdapter {
         (version, bytes)
     }
 
-    fn log_since(&self, since: u64) -> LogSlice<Self::Op> {
+    fn log_since(&self, since: u64) -> LogSlice<StrictLogEntry<Self::Op>> {
         let repo = self.repo.clone();
         let entries =
             block_in_place_or_current(|handle| handle.block_on(repo.get_log_since(since)));
@@ -86,7 +86,7 @@ impl StrictReplicable for TestChannelReplicationAdapter {
             entries
                 .unwrap_or_default()
                 .into_iter()
-                .map(|op| (op.version, (*op).clone()))
+                .map(|op| (op.version, StrictLogEntry::new((*op).clone())))
                 .collect(),
         )
     }

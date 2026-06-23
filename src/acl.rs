@@ -1,7 +1,7 @@
 use enumflags2::{BitFlags, bitflags};
 use serde::{Deserialize, Serialize};
 
-use crate::client::group::{ClientMembershipQuery, is_member_in_group};
+use crate::client::group::{ChannelHierarchy, ClientMembershipQuery, is_member_in_group};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ACL {
@@ -70,16 +70,16 @@ impl ACL {
 
     pub fn match_group(
         &self,
-        current_channel_id: u32,
-        target_channel_id: Option<u32>,
+        evaluation_channel: ChannelHierarchy<'_>,
+        acl_channel: Option<ChannelHierarchy<'_>>,
         join_passwords: &[&str],
         client: &ClientMembershipQuery,
     ) -> bool {
         match &self.group {
             Some(group_name) => is_member_in_group(
                 group_name,
-                current_channel_id,
-                target_channel_id,
+                evaluation_channel,
+                acl_channel,
                 join_passwords,
                 client,
             ),
@@ -133,16 +133,8 @@ pub fn evaluate_permission(
     ancestors: &[crate::channels::Channel],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
-    current_channel_id: u32,
 ) -> BitFlags<ACLPermissions> {
-    evaluate_permission_with_behavior(
-        channel,
-        ancestors,
-        user_id,
-        client,
-        current_channel_id,
-        false,
-    )
+    evaluate_permission_with_behavior(channel, ancestors, user_id, client, false)
 }
 
 /// Evaluate permissions with configurable ACL compatibility behavior.
@@ -151,16 +143,24 @@ pub(crate) fn evaluate_permission_with_behavior(
     ancestors: &[crate::channels::Channel],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
-    current_channel_id: u32,
     explicit_enter_deny_overrides_write: bool,
 ) -> BitFlags<ACLPermissions> {
     let mut permissions = default_permissions();
     let mut enter_explicitly_denied = false;
     let target_id = channel.id;
     let chain = effective_acl_chain(channel, ancestors);
+    let target_ancestor_ids: Vec<u32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
+    let evaluation_channel = ChannelHierarchy::new(target_id, &target_ancestor_ids);
 
-    for ch in chain {
+    for index in 0..chain.len() {
+        let ch = chain[index];
         let is_target_channel = ch.id == target_id;
+        let acl_ancestor_ids: Vec<u32> = chain[..index]
+            .iter()
+            .rev()
+            .map(|ancestor| ancestor.id)
+            .collect();
+        let acl_channel = ChannelHierarchy::new(ch.id, &acl_ancestor_ids);
 
         for acl in &ch.acls {
             let applies = if is_target_channel {
@@ -175,7 +175,7 @@ pub(crate) fn evaluate_permission_with_behavior(
             let matches = if let Some(uid) = acl.user_id {
                 user_id.is_some_and(|u| u as i32 == uid)
             } else {
-                acl.match_group(current_channel_id, Some(ch.id), &[], client)
+                acl.match_group(evaluation_channel, Some(acl_channel), &[], client)
             };
             if !matches {
                 continue;
@@ -256,4 +256,84 @@ pub fn channel_has_effective_restriction(
                 applies && (acl.deny.contains(perm) || acl.deny.contains(ACLPermissions::Traverse))
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channels::Channel;
+    use crate::client::group::{ChannelHierarchy, ClientMembershipQuery};
+
+    fn membership<'a>(
+        home_channel_id: u32,
+        home_ancestors: &'a [u32],
+    ) -> ClientMembershipQuery<'a> {
+        ClientMembershipQuery::new(&[], true, &[], None, false, None)
+            .with_home_channel(ChannelHierarchy::new(home_channel_id, home_ancestors))
+    }
+
+    fn group_acl(
+        group: &str,
+        allow: BitFlags<ACLPermissions>,
+        deny: BitFlags<ACLPermissions>,
+    ) -> ACL {
+        ACL {
+            user_id: None,
+            group: Some(group.to_owned()),
+            apply_here: true,
+            apply_subs: false,
+            allow,
+            deny,
+        }
+    }
+
+    #[test]
+    fn in_group_uses_client_home_channel_when_evaluating_destination_permissions() {
+        let mut destination = Channel::new(2, "Command", 0, 0, Some(1));
+        destination.acls = vec![
+            group_acl("all", BitFlags::empty(), ACLPermissions::Speak.into()),
+            group_acl("in", ACLPermissions::Speak.into(), BitFlags::empty()),
+        ];
+        let ancestors = vec![
+            Channel::new(1, "Fleet", 0, 0, Some(0)),
+            Channel::new(0, "Root", 0, 0, None),
+        ];
+
+        let local_member = membership(2, &[1, 0]);
+        let remote_member = membership(3, &[1, 0]);
+
+        assert!(
+            evaluate_permission(&destination, &ancestors, Some(1), &local_member)
+                .contains(ACLPermissions::Speak)
+        );
+        assert!(
+            !evaluate_permission(&destination, &ancestors, Some(2), &remote_member)
+                .contains(ACLPermissions::Speak)
+        );
+    }
+
+    #[test]
+    fn sub_group_matches_clients_under_destination_parent_with_target_context() {
+        let mut destination = Channel::new(2, "Command", 0, 0, Some(1));
+        destination.acls = vec![
+            group_acl("all", BitFlags::empty(), ACLPermissions::Speak.into()),
+            group_acl("~sub,-1,0", ACLPermissions::Speak.into(), BitFlags::empty()),
+        ];
+        let ancestors = vec![
+            Channel::new(1, "Fleet", 0, 0, Some(0)),
+            Channel::new(0, "Root", 0, 0, None),
+        ];
+
+        let fleet_descendant = membership(4, &[3, 1, 0]);
+        let outside_fleet = membership(6, &[5, 0]);
+
+        assert!(
+            evaluate_permission(&destination, &ancestors, Some(1), &fleet_descendant)
+                .contains(ACLPermissions::Speak)
+        );
+        assert!(
+            !evaluate_permission(&destination, &ancestors, Some(2), &outside_fleet)
+                .contains(ACLPermissions::Speak)
+        );
+    }
 }

@@ -83,6 +83,9 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
             Ok(b) => catchup_ops.push(CatchupOp {
                 version: *v,
                 op_msgpack: Bytes::from(b),
+                strict_op_id_hi: 0,
+                strict_op_id_lo: 0,
+                strict_ts_final: 0,
             }),
             Err(e) => warn!(error=%e, "owner catchup op encode failed; skipping"),
         }

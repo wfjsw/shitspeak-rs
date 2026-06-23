@@ -33,6 +33,32 @@ pub struct HistoryMetadata {
     pub freshness: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StrictLogMetadata {
+    pub op_id_hi: u64,
+    pub op_id_lo: u64,
+    pub ts_final: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct StrictLogEntry<Op> {
+    pub op: Op,
+    pub metadata: Option<StrictLogMetadata>,
+}
+
+impl<Op> StrictLogEntry<Op> {
+    pub fn new(op: Op) -> Self {
+        Self { op, metadata: None }
+    }
+
+    pub fn with_metadata(op: Op, metadata: StrictLogMetadata) -> Self {
+        Self {
+            op,
+            metadata: Some(metadata),
+        }
+    }
+}
+
 /// Repository-side contract for the strict (Tempo) replication mode.
 ///
 /// # Apply ordering
@@ -75,12 +101,21 @@ pub trait StrictReplicable: Send + Sync + 'static {
     /// Ops with version in `(since, current_version]`. Returns
     /// `LogSlice::TooOld` when the structure can no longer satisfy from its
     /// in-memory log; the runtime will fall back to a snapshot.
-    fn log_since(&self, since: u64) -> LogSlice<Self::Op>;
+    fn log_since(&self, since: u64) -> LogSlice<StrictLogEntry<Self::Op>>;
 
     /// Apply a committed op. Called by the runtime on the delivery path,
     /// in `(ts_final, op_id)` order, with monotonically increasing
     /// `version`.
     async fn apply_committed(&self, version: u64, op: Self::Op);
+
+    async fn apply_committed_with_metadata(
+        &self,
+        version: u64,
+        op: Self::Op,
+        _metadata: Option<StrictLogMetadata>,
+    ) {
+        self.apply_committed(version, op).await;
+    }
 
     /// Replace local state with the supplied snapshot.
     async fn install_snapshot(&self, version: u64, snapshot: Bytes);

@@ -15,7 +15,7 @@ use super::super::proto::{CatchupOp, StrictBody, StrictCatchupReq, StrictCatchup
 use super::runtime::{
     HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryElectionCandidate, HistoryRank, StrictRuntime,
 };
-use super::{LogSlice, StrictReplicable};
+use super::{LogSlice, StrictLogMetadata, StrictReplicable};
 use crate::types::NodeIdentifier;
 
 /// Build and send a `StrictCatchupResp` answering `req`.
@@ -54,11 +54,14 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     let total = effective_ops.len();
     let take = total.min(rt.cfg.strict_max_catchup_ops());
     let mut catchup_ops: Vec<CatchupOp> = Vec::with_capacity(take);
-    for (v, op) in effective_ops.iter().take(take) {
-        match rmp_serde::to_vec(op) {
+    for (v, entry) in effective_ops.iter().take(take) {
+        match rmp_serde::to_vec(&entry.op) {
             Ok(b) => catchup_ops.push(CatchupOp {
                 version: *v,
                 op_msgpack: Bytes::from(b),
+                strict_op_id_hi: entry.metadata.map(|m| m.op_id_hi).unwrap_or(0),
+                strict_op_id_lo: entry.metadata.map(|m| m.op_id_lo).unwrap_or(0),
+                strict_ts_final: entry.metadata.map(|m| m.ts_final).unwrap_or(0),
             }),
             Err(e) => {
                 warn!(error=%e, "catchup op msgpack encode failed; skipping");
@@ -98,9 +101,6 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     from: NodeIdentifier,
     resp: StrictCatchupResp,
 ) {
-    if !rt.state.lock().can_bootstrap_catchup() {
-        return;
-    }
     let Some(remote_node) = super::runtime::node_from_u32(resp.history_node) else {
         warn!(
             node = resp.history_node,
@@ -115,8 +115,12 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         node_id: remote_node,
     };
     let local_rank = HistoryRank::local(rt);
+    let can_bootstrap = rt.state.lock().can_bootstrap_catchup();
 
     if resp.too_old_use_snapshot {
+        if !can_bootstrap {
+            return;
+        }
         let candidate = if remote_rank.beats(local_rank) && !resp.snapshot_msgpack.is_empty() {
             Some(HistoryElectionCandidate {
                 rank: remote_rank,
@@ -139,10 +143,14 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         return;
     }
 
-    if !remote_rank.beats(local_rank) {
+    if can_bootstrap && !remote_rank.beats(local_rank) {
         rt.state
             .lock()
             .record_history_election_response(remote_node, None);
+        return;
+    }
+
+    if !can_bootstrap && resp.ops.is_empty() {
         return;
     }
 
@@ -162,7 +170,29 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 return;
             }
         };
-        rt.repo.apply_committed(cop.version, op).await;
+        if let Some(metadata) = strict_metadata(&cop) {
+            let op_msgpack = match rmp_serde::to_vec(&op) {
+                Ok(bytes) => Bytes::from(bytes),
+                Err(e) => {
+                    warn!(error=%e, "catchup op re-encode failed; aborting chunk");
+                    return;
+                }
+            };
+            let op_id = (metadata.op_id_hi, metadata.op_id_lo);
+            let mut should_wake = false;
+            {
+                let mut state = rt.state.lock();
+                if state.mark_committed(op_id, metadata.ts_final) {
+                    state.buffer_commit(op_id, metadata.ts_final, op_msgpack);
+                    should_wake = true;
+                }
+            }
+            if should_wake {
+                rt.deliver_signal.notify_one();
+            }
+        } else if can_bootstrap {
+            rt.repo.apply_committed(cop.version, op).await;
+        }
     }
     if resp.has_more {
         let alive = rt.net.alive_members();
@@ -187,9 +217,20 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))
             .await;
     }
-    if !resp.has_more {
+    if can_bootstrap && !resp.has_more {
         rt.state
             .lock()
             .record_history_election_response(remote_node, None);
     }
+}
+
+fn strict_metadata(op: &CatchupOp) -> Option<StrictLogMetadata> {
+    if op.strict_op_id_hi == 0 && op.strict_op_id_lo == 0 && op.strict_ts_final == 0 {
+        return None;
+    }
+    Some(StrictLogMetadata {
+        op_id_hi: op.strict_op_id_hi,
+        op_id_lo: op.strict_op_id_lo,
+        ts_final: op.strict_ts_final,
+    })
 }

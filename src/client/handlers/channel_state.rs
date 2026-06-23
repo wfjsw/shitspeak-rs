@@ -402,23 +402,34 @@ async fn inherited_creator_permissions(
     let group_refs: Vec<&str> = groups.iter().map(String::as_str).collect();
     let tokens: Vec<String> = sender.get_tokens_clone().into_iter().collect();
     let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    let membership = crate::client::group::ClientMembershipQuery {
-        groups: &group_refs,
-        authenticated: user_id.is_some(),
-        access_tokens: &token_refs,
-        cert_hash: sender.get_certificate_hash(),
-        has_verified_cert_chain: sender.is_verified(),
-        ip_address: Some(sender.get_real_ip_address()),
-        asn: None,
-        country_code: None,
+    let home_channel_id = sender.get_current_channel_id();
+    let home_ancestors: Vec<u32> = if home_channel_id == channel.id {
+        ancestors.iter().map(|ancestor| ancestor.id).collect()
+    } else {
+        channels
+            .get_ancestors_in_server(&sender.server_id(), home_channel_id)
+            .await
+            .into_iter()
+            .map(|ancestor| ancestor.id)
+            .collect()
     };
+    let home_channel =
+        crate::client::group::ChannelHierarchy::new(home_channel_id, &home_ancestors);
+    let membership = crate::client::group::ClientMembershipQuery::new(
+        &group_refs,
+        user_id.is_some(),
+        &token_refs,
+        sender.get_certificate_hash(),
+        sender.is_verified(),
+        Some(sender.get_real_ip_address()),
+    )
+    .with_home_channel(home_channel);
 
     crate::acl::evaluate_permission_with_behavior(
         channel,
         &ancestors,
         user_id,
         &membership,
-        channel.id,
         server.get_explicit_enter_deny_overrides_write(),
     )
 }

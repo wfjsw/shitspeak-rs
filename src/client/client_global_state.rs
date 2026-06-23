@@ -95,6 +95,7 @@ impl ClientGlobalState {
             return false;
         }
         self.current_channel_id = channel_id;
+        self.bump_acl_generation();
         if self.delta_recording {
             self.pending_delta.current_channel_id = Some(channel_id);
         }

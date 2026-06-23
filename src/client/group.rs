@@ -4,6 +4,27 @@ use bytes::Bytes;
 
 use cidr::AnyIpCidr;
 
+#[derive(Clone, Copy)]
+pub struct ChannelHierarchy<'a> {
+    current_channel_id: u32,
+    ancestors: &'a [u32],
+}
+
+impl<'a> ChannelHierarchy<'a> {
+    pub fn new(current_channel_id: u32, ancestors: &'a [u32]) -> Self {
+        Self {
+            current_channel_id,
+            ancestors,
+        }
+    }
+
+    fn root_to_current(&self) -> Vec<u32> {
+        let mut hierarchy: Vec<u32> = self.ancestors.iter().rev().copied().collect();
+        hierarchy.push(self.current_channel_id);
+        hierarchy
+    }
+}
+
 enum IPMaskType<'a> {
     FullMatch(IpAddr),
     CIDR(AnyIpCidr),
@@ -23,39 +44,82 @@ enum MatchType<'a> {
     Authenticated,
     HasVerifiedCertificateChain,
     CertificateHash(Bytes),
-    InChannel(u32),
-    OutOfChannel(u32),
+    InChannel,
+    OutOfChannel,
+    Subtree(SubtreeMatch),
     ClientGroup(&'a str),
     Token(TokenMatchType<'a>),
     IPMask(IPMaskType<'a>),
 }
 
+struct SubtreeMatch {
+    channel_offset: i32,
+    min_descendant_level: i32,
+    max_descendant_level: i32,
+}
+
 pub struct ClientMembershipQuery<'a> {
-    pub groups: &'a [&'a str],
-    pub authenticated: bool,
-    pub access_tokens: &'a [&'a str],
-    pub cert_hash: Option<&'a [u8]>,
-    pub has_verified_cert_chain: bool,
-    pub ip_address: Option<IpAddr>,
-    pub asn: Option<u32>,
-    pub country_code: Option<&'a str>,
+    groups: &'a [&'a str],
+    authenticated: bool,
+    access_tokens: &'a [&'a str],
+    cert_hash: Option<&'a [u8]>,
+    has_verified_cert_chain: bool,
+    ip_address: Option<IpAddr>,
+    asn: Option<u32>,
+    country_code: Option<&'a str>,
+    home_channel: ChannelHierarchy<'a>,
+}
+
+impl<'a> ClientMembershipQuery<'a> {
+    pub fn new(
+        groups: &'a [&'a str],
+        authenticated: bool,
+        access_tokens: &'a [&'a str],
+        cert_hash: Option<&'a [u8]>,
+        has_verified_cert_chain: bool,
+        ip_address: Option<IpAddr>,
+    ) -> Self {
+        Self {
+            groups,
+            authenticated,
+            access_tokens,
+            cert_hash,
+            has_verified_cert_chain,
+            ip_address,
+            asn: None,
+            country_code: None,
+            home_channel: ChannelHierarchy::new(0, &[]),
+        }
+    }
+
+    pub fn with_ip_metadata(mut self, asn: Option<u32>, country_code: Option<&'a str>) -> Self {
+        self.asn = asn;
+        self.country_code = country_code;
+        self
+    }
+
+    pub fn with_home_channel(mut self, home_channel: ChannelHierarchy<'a>) -> Self {
+        self.home_channel = home_channel;
+        self
+    }
+
+    pub fn authenticated(&self) -> bool {
+        self.authenticated
+    }
 }
 
 pub fn is_member_in_group(
     group: &str,
-    current_channel_id: u32,
-    target_channel_id: Option<u32>,
+    evaluation_channel: ChannelHierarchy<'_>,
+    acl_channel: Option<ChannelHierarchy<'_>>,
     join_passwords: &[&str],
     client: &ClientMembershipQuery,
 ) -> bool {
-    let (match_type, invert, use_target_channel) =
-        evaluate_group_string_match_type(group, current_channel_id, target_channel_id);
-    let channel_id = match use_target_channel {
-        true => match target_channel_id {
-            Some(id) => id,
-            None => current_channel_id,
-        },
-        false => current_channel_id,
+    let home_channel = client.home_channel;
+    let (match_type, invert, use_target_channel) = evaluate_group_string_match_type(group);
+    let context_channel = match use_target_channel {
+        true => acl_channel.unwrap_or(evaluation_channel),
+        false => evaluation_channel,
     };
 
     let in_group = match match_type {
@@ -68,8 +132,15 @@ pub fn is_member_in_group(
             Some(actual_hash) => actual_hash == expected_hash.as_ref(),
             None => false,
         },
-        Some(MatchType::InChannel(expected_channel_id)) => channel_id == expected_channel_id,
-        Some(MatchType::OutOfChannel(expected_channel_id)) => channel_id != expected_channel_id,
+        Some(MatchType::InChannel) => {
+            home_channel.current_channel_id == context_channel.current_channel_id
+        }
+        Some(MatchType::OutOfChannel) => {
+            home_channel.current_channel_id != context_channel.current_channel_id
+        }
+        Some(MatchType::Subtree(subtree)) => {
+            matches_subtree(home_channel, evaluation_channel, context_channel, &subtree)
+        }
         Some(MatchType::ClientGroup(expected_group)) => client
             .groups
             .iter()
@@ -111,11 +182,7 @@ pub fn is_member_in_group(
     if invert { !in_group } else { in_group }
 }
 
-fn evaluate_group_string_match_type<'a>(
-    group: &'a str,
-    current_channel_id: u32,
-    target_channel_id: Option<u32>,
-) -> (Option<MatchType<'a>>, bool, bool) {
+fn evaluate_group_string_match_type(group: &str) -> (Option<MatchType<'_>>, bool, bool) {
     let mut invert = false;
     let mut use_target_channel = false;
     let mut group_name_slice = group;
@@ -217,12 +284,12 @@ fn evaluate_group_string_match_type<'a>(
                     "none" => Some(MatchType::None),
                     "auth" => Some(MatchType::Authenticated),
                     "strong" => Some(MatchType::HasVerifiedCertificateChain),
-                    "in" => Some(MatchType::InChannel(
-                        target_channel_id.unwrap_or(current_channel_id),
-                    )),
-                    "out" => Some(MatchType::OutOfChannel(
-                        target_channel_id.unwrap_or(current_channel_id),
-                    )),
+                    "in" => Some(MatchType::InChannel),
+                    "out" => Some(MatchType::OutOfChannel),
+                    "sub" => Some(MatchType::Subtree(SubtreeMatch::default())),
+                    name if name.starts_with("sub,") => parse_subtree_match(name)
+                        .map(MatchType::Subtree)
+                        .or_else(|| Some(MatchType::ClientGroup(name))),
                     name => Some(MatchType::ClientGroup(name)),
                 };
                 break m;
@@ -230,4 +297,145 @@ fn evaluate_group_string_match_type<'a>(
         }
     };
     (match_type, invert, use_target_channel)
+}
+
+impl Default for SubtreeMatch {
+    fn default() -> Self {
+        Self {
+            channel_offset: 0,
+            min_descendant_level: 1,
+            max_descendant_level: 1000,
+        }
+    }
+}
+
+fn parse_subtree_match(group_name: &str) -> Option<SubtreeMatch> {
+    let args = group_name.strip_prefix("sub,")?;
+    let mut parsed = SubtreeMatch::default();
+
+    for (index, arg) in args.split(',').take(3).enumerate() {
+        if arg.is_empty() {
+            continue;
+        }
+        let value = arg.parse::<i32>().unwrap_or(0);
+        match index {
+            0 => parsed.channel_offset = value,
+            1 => parsed.min_descendant_level = value,
+            2 => parsed.max_descendant_level = value,
+            _ => {}
+        }
+    }
+
+    Some(parsed)
+}
+
+fn matches_subtree(
+    home_channel: ChannelHierarchy<'_>,
+    evaluation_channel: ChannelHierarchy<'_>,
+    context_channel: ChannelHierarchy<'_>,
+    subtree: &SubtreeMatch,
+) -> bool {
+    let home_hierarchy = home_channel.root_to_current();
+    let evaluation_hierarchy = evaluation_channel.root_to_current();
+
+    let Some(context_index) = evaluation_hierarchy
+        .iter()
+        .position(|id| *id == context_channel.current_channel_id)
+    else {
+        return false;
+    };
+
+    let mut required_index = context_index as i32 + subtree.channel_offset;
+    if required_index >= evaluation_hierarchy.len() as i32 {
+        return false;
+    }
+    if required_index < 0 {
+        required_index = 0;
+    }
+    let required_index = required_index as usize;
+    let required_channel = evaluation_hierarchy[required_index];
+
+    if !home_hierarchy.contains(&required_channel) {
+        return false;
+    }
+
+    let total_depth = home_hierarchy.len() as i32 - 1;
+    let min_depth = required_index as i32 + subtree.min_descendant_level;
+    let max_depth = required_index as i32 + subtree.max_descendant_level;
+
+    total_depth >= min_depth && total_depth <= max_depth
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn membership<'a>(home_channel: ChannelHierarchy<'a>) -> ClientMembershipQuery<'a> {
+        ClientMembershipQuery::new(&[], true, &[], None, false, None)
+            .with_home_channel(home_channel)
+    }
+
+    #[test]
+    fn sub_matches_descendants_of_current_context_by_default() {
+        let home_ancestors = [1, 0];
+        let evaluation_ancestors = [0];
+        let home = ChannelHierarchy::new(2, &home_ancestors);
+        let evaluation = ChannelHierarchy::new(1, &evaluation_ancestors);
+        let client = membership(home);
+
+        assert!(is_member_in_group("sub", evaluation, None, &[], &client));
+        assert!(!is_member_in_group("sub", home, None, &[], &client));
+        assert!(is_member_in_group("sub,0,0", home, None, &[], &client));
+        assert!(!is_member_in_group(
+            "sub,0,2",
+            evaluation,
+            None,
+            &[],
+            &client
+        ));
+    }
+
+    #[test]
+    fn sub_with_target_context_matches_mumble_depth_arguments() {
+        let home_ancestors = [3, 1, 0];
+        let acl_ancestors = [1, 0];
+        let home = ChannelHierarchy::new(4, &home_ancestors);
+        let acl = ChannelHierarchy::new(2, &acl_ancestors);
+        let client = membership(home);
+
+        assert!(is_member_in_group(
+            "~sub,-1,0",
+            acl,
+            Some(acl),
+            &[],
+            &client
+        ));
+        assert!(is_member_in_group(
+            "~sub,-1,1,2",
+            acl,
+            Some(acl),
+            &[],
+            &client
+        ));
+        assert!(!is_member_in_group(
+            "~sub,-1,0,0",
+            acl,
+            Some(acl),
+            &[],
+            &client
+        ));
+        assert!(!is_member_in_group("~sub,1", acl, Some(acl), &[], &client));
+    }
+
+    #[test]
+    fn inverted_sub_negates_the_match() {
+        let home_ancestors = [1, 0];
+        let evaluation_ancestors = [0];
+        let home = ChannelHierarchy::new(2, &home_ancestors);
+        let evaluation = ChannelHierarchy::new(1, &evaluation_ancestors);
+        let client = membership(home);
+
+        assert!(!is_member_in_group("!sub", evaluation, None, &[], &client));
+        assert!(is_member_in_group("!sub", home, None, &[], &client));
+    }
 }

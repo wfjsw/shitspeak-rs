@@ -1732,7 +1732,10 @@ impl StrictReplicable for ChannelReplicationAdapter {
         (version, bytes)
     }
 
-    fn log_since(&self, since: u64) -> replications::strict::LogSlice<Self::Op> {
+    fn log_since(
+        &self,
+        since: u64,
+    ) -> replications::strict::LogSlice<replications::strict::StrictLogEntry<Self::Op>> {
         let repo = self.repo.clone();
         let server_id = self.server_id.clone();
         let entries = block_in_place_or_current(|handle| {
@@ -1742,7 +1745,12 @@ impl StrictReplicable for ChannelReplicationAdapter {
             Some(entries) => replications::strict::LogSlice::Available(
                 entries
                     .into_iter()
-                    .map(|op| (op.version, (*op).clone()))
+                    .map(|op| {
+                        (
+                            op.version,
+                            replications::strict::StrictLogEntry::new((*op).clone()),
+                        )
+                    })
                     .collect(),
             ),
             None => replications::strict::LogSlice::TooOld,
@@ -1888,7 +1896,10 @@ impl StrictReplicable for BanReplicationAdapter {
         (version, bytes)
     }
 
-    fn log_since(&self, since: u64) -> replications::strict::LogSlice<Self::Op> {
+    fn log_since(
+        &self,
+        since: u64,
+    ) -> replications::strict::LogSlice<replications::strict::StrictLogEntry<Self::Op>> {
         let repo = self.repo.clone();
         let entries =
             block_in_place_or_current(|handle| handle.block_on(repo.get_log_since(since)));
@@ -1896,7 +1907,12 @@ impl StrictReplicable for BanReplicationAdapter {
             Some(entries) => replications::strict::LogSlice::Available(
                 entries
                     .into_iter()
-                    .map(|op| (op.version, (*op).clone()))
+                    .map(|op| {
+                        (
+                            op.version,
+                            replications::strict::StrictLogEntry::new((*op).clone()),
+                        )
+                    })
                     .collect(),
             ),
             None => replications::strict::LogSlice::TooOld,

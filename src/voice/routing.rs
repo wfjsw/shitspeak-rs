@@ -179,9 +179,10 @@ fn audio_context_from_target_kind(target_kind: u32) -> AudioContext {
     }
 }
 
-fn client_matches_voice_target_group(
+async fn client_matches_voice_target_group(
+    server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    source_channel: u32,
+    server_id: &str,
     target_channel: u32,
     group: &str,
 ) -> bool {
@@ -193,23 +194,24 @@ fn client_matches_voice_target_group(
     let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
     let tokens: Vec<String> = client.get_tokens_clone().into_iter().collect();
     let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-    let membership = crate::client::group::ClientMembershipQuery {
-        groups: &group_refs,
-        authenticated: client.get_user_id().is_some(),
-        access_tokens: &token_refs,
-        cert_hash: client.get_certificate_hash(),
-        has_verified_cert_chain: client.is_verified(),
-        ip_address: Some(client.get_real_ip_address()),
-        asn: None,
-        country_code: None,
-    };
-    crate::client::group::is_member_in_group(
-        group,
-        source_channel,
-        Some(target_channel),
-        &[],
-        &membership,
+    let ancestors: Vec<u32> = server
+        .get_channels()
+        .get_ancestors_in_server(server_id, target_channel)
+        .await
+        .into_iter()
+        .map(|ancestor| ancestor.id)
+        .collect();
+    let channel = crate::client::group::ChannelHierarchy::new(target_channel, &ancestors);
+    let membership = crate::client::group::ClientMembershipQuery::new(
+        &group_refs,
+        client.get_user_id().is_some(),
+        &token_refs,
+        client.get_certificate_hash(),
+        client.is_verified(),
+        Some(client.get_real_ip_address()),
     )
+    .with_home_channel(channel);
+    crate::client::group::is_member_in_group(group, channel, Some(channel), &[], &membership)
 }
 
 fn push_unique_target(
@@ -414,11 +416,14 @@ async fn resolve_voice_intent(
                         continue;
                     }
                     if !client_matches_voice_target_group(
+                        server,
                         &client,
-                        target.source_channel,
+                        server_id,
                         client_channel,
                         &ch_target.group,
-                    ) {
+                    )
+                    .await
+                    {
                         continue;
                     }
                     if let Some(sender) = sender {

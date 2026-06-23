@@ -167,24 +167,32 @@ pub async fn handle_acl(
                 let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
                 let tokens: Vec<String> = sender.get_tokens_clone().into_iter().collect();
                 let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-                let membership = crate::client::group::ClientMembershipQuery {
-                    groups: &group_refs,
-                    authenticated: user_id.is_some(),
-                    access_tokens: &token_refs,
-                    cert_hash: sender.get_certificate_hash(),
-                    has_verified_cert_chain: sender.is_verified(),
-                    ip_address: Some(sender.get_real_ip_address()),
-                    asn: None,
-                    country_code: None,
+                let home_channel_id = sender.get_current_channel_id();
+                let home_ancestors: Vec<u32> = if home_channel_id == channel_id {
+                    ancestors.iter().map(|ancestor| ancestor.id).collect()
+                } else {
+                    server
+                        .get_channels()
+                        .get_ancestors_in_server(&server_id, home_channel_id)
+                        .await
+                        .into_iter()
+                        .map(|ancestor| ancestor.id)
+                        .collect()
                 };
+                let home_channel =
+                    crate::client::group::ChannelHierarchy::new(home_channel_id, &home_ancestors);
+                let membership = crate::client::group::ClientMembershipQuery::new(
+                    &group_refs,
+                    user_id.is_some(),
+                    &token_refs,
+                    sender.get_certificate_hash(),
+                    sender.is_verified(),
+                    Some(sender.get_real_ip_address()),
+                )
+                .with_home_channel(home_channel);
 
-                let post_write = crate::acl::evaluate_permission(
-                    &channel,
-                    &ancestors,
-                    user_id,
-                    &membership,
-                    channel_id,
-                );
+                let post_write =
+                    crate::acl::evaluate_permission(&channel, &ancestors, user_id, &membership);
                 if !post_write.contains(ACLPermissions::Write) {
                     if let Some(uid) = user_id {
                         new_acls.push(ACL {

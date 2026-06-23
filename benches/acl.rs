@@ -4,7 +4,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use enumflags2::BitFlags;
 use shitspeak_rs::acl::{ACL, ACLPermissions, evaluate_permission};
 use shitspeak_rs::channels::Channel;
-use shitspeak_rs::client::group::ClientMembershipQuery;
+use shitspeak_rs::client::group::{ChannelHierarchy, ClientMembershipQuery};
 
 /// Build a channel with `n` ACL entries, half allowing and half denying.
 fn make_channel_with_acls(n: usize) -> Channel {
@@ -46,16 +46,8 @@ fn make_channel_with_acls(n: usize) -> Channel {
 fn make_membership() -> ClientMembershipQuery<'static> {
     let group_refs: &'static [&str] = Box::leak(Box::new(["admin", "user", "trusted"]));
     let token_refs: &'static [&str] = Box::leak(Box::new(["token_a", "token_b"]));
-    ClientMembershipQuery {
-        groups: group_refs,
-        authenticated: true,
-        access_tokens: token_refs,
-        cert_hash: None,
-        has_verified_cert_chain: false,
-        ip_address: None,
-        asn: None,
-        country_code: None,
-    }
+    ClientMembershipQuery::new(group_refs, true, token_refs, None, false, None)
+        .with_home_channel(ChannelHierarchy::new(1, &[0]))
 }
 
 // ── channel_has_restriction: for loop vs iter().any() ──────────────────────
@@ -125,7 +117,6 @@ fn bench_evaluate_permission(c: &mut Criterion) {
                         black_box(anc),
                         black_box(Some(42)),
                         black_box(&membership),
-                        black_box(ch.id),
                     )
                 });
             },
@@ -165,7 +156,6 @@ fn bench_evaluate_permission_deep(c: &mut Criterion) {
                         black_box(anc),
                         black_box(Some(42)),
                         black_box(&membership),
-                        black_box(ch.id),
                     )
                 });
             },
@@ -205,7 +195,6 @@ fn bench_evaluate_permission_mixed_inherit(c: &mut Criterion) {
                         black_box(anc),
                         black_box(Some(42)),
                         black_box(&membership),
-                        black_box(ch.id),
                     )
                 });
             },
@@ -240,8 +229,8 @@ fn bench_acl_match_group(c: &mut Criterion) {
     c.bench_function("acl_match_group", |b| {
         b.iter(|| {
             acl_group.match_group(
-                black_box(1),
-                black_box(Some(1)),
+                black_box(ChannelHierarchy::new(1, &[0])),
+                black_box(Some(ChannelHierarchy::new(1, &[0]))),
                 black_box(&[]),
                 black_box(&membership),
             )
