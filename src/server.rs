@@ -11,6 +11,7 @@ use rand::RngExt;
 
 use cidr::AnyIpCidr;
 use prost::{EncodeError, Message as _};
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use rustls::version::{TLS12, TLS13};
 use tokio::net::TcpStream;
@@ -80,7 +81,32 @@ fn first_socket_addr(address: &str) -> Result<SocketAddr, Box<dyn std::error::Er
     })
 }
 
-fn load_c2s_tls_acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+fn c2s_pfs_tls_provider() -> CryptoProvider {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.cipher_suites.retain(c2s_cipher_suite_provides_pfs);
+    provider
+}
+
+fn c2s_cipher_suite_provides_pfs(suite: &rustls::SupportedCipherSuite) -> bool {
+    matches!(
+        suite.suite(),
+        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+            | rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+            | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+            | rustls::CipherSuite::TLS13_AES_128_CCM_SHA256
+            | rustls::CipherSuite::TLS13_AES_128_CCM_8_SHA256
+            | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+    )
+}
+
+fn load_c2s_tls_config(
+    config: &Config,
+) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
     let certificate = CertificateDer::pem_file_iter(&config.cert_path)
         .map_err(|e| startup_file_error("cert_path", &config.cert_path, "read TLS certificate", e))?
         .collect::<Result<Vec<_>, _>>()
@@ -92,15 +118,24 @@ fn load_c2s_tls_acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::er
 
     let client_cert_verifier = Arc::new(ClientCertificateVerifier::new());
 
-    let mut tls_config = rustls::ServerConfig::builder_with_protocol_versions(&[&TLS12, &TLS13])
-        .with_client_cert_verifier(client_cert_verifier)
-        .with_single_cert(certificate, private_key)?;
+    let mut tls_config =
+        rustls::ServerConfig::builder_with_provider(Arc::new(c2s_pfs_tls_provider()))
+            .with_protocol_versions(&[&TLS13, &TLS12])?
+            .with_client_cert_verifier(client_cert_verifier)
+            .with_single_cert(certificate, private_key)?;
+    tls_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    tls_config.send_tls13_tickets = 0;
     #[cfg(feature = "web")]
     {
         tls_config.alpn_protocols.push(ALPN_HTTP_1_1.to_vec());
     }
     tls_config.alpn_protocols.push(ALPN_MUMBLE.to_vec());
 
+    Ok(tls_config)
+}
+
+fn load_c2s_tls_acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+    let tls_config = load_c2s_tls_config(config)?;
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 
@@ -470,7 +505,15 @@ mod tests {
         )
     }
 
-    async fn connect_tls_leaf_der(server: &Arc<Box<Server>>) -> Vec<u8> {
+    struct TestTlsHandshake {
+        leaf_der: Vec<u8>,
+        protocol_version: rustls::ProtocolVersion,
+        cipher_suite: rustls::CipherSuite,
+        key_exchange_group: Option<rustls::NamedGroup>,
+        handshake_kind: rustls::HandshakeKind,
+    }
+
+    async fn connect_tls(server: &Arc<Box<Server>>) -> TestTlsHandshake {
         let acceptor = server.tls_acceptor.read().clone();
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let accept_task = tokio::spawn(async move { acceptor.accept(server_io).await.map(drop) });
@@ -495,13 +538,33 @@ mod tests {
             .first()
             .expect("server leaf certificate")
             .to_vec();
+        let connection = tls.get_ref().1;
+        let protocol_version = connection.protocol_version().expect("TLS protocol version");
+        let cipher_suite = connection
+            .negotiated_cipher_suite()
+            .expect("negotiated cipher suite")
+            .suite();
+        let key_exchange_group = connection
+            .negotiated_key_exchange_group()
+            .map(|group| group.name());
+        let handshake_kind = connection.handshake_kind().expect("TLS handshake kind");
         drop(tls);
         match accept_task.await.expect("accept task joins") {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
             Err(err) => panic!("accept TLS: {err}"),
         }
-        leaf
+        TestTlsHandshake {
+            leaf_der: leaf,
+            protocol_version,
+            cipher_suite,
+            key_exchange_group,
+            handshake_kind,
+        }
+    }
+
+    async fn connect_tls_leaf_der(server: &Arc<Box<Server>>) -> Vec<u8> {
+        connect_tls(server).await.leaf_der
     }
 
     #[derive(Debug)]
@@ -677,6 +740,63 @@ mod tests {
         assert!(
             (DYNAMIC_ENTRYPOINT_MIN_PORT..=DYNAMIC_ENTRYPOINT_MAX_PORT).contains(&candidate.port())
         );
+    }
+
+    #[test]
+    fn c2s_tls_provider_only_advertises_pfs_cipher_suites() {
+        let provider = c2s_pfs_tls_provider();
+
+        assert!(!provider.cipher_suites.is_empty());
+        assert!(provider.kx_groups.iter().any(|group| {
+            group.name().key_exchange_algorithm() == rustls::crypto::KeyExchangeAlgorithm::ECDHE
+        }));
+        for suite in &provider.cipher_suites {
+            assert!(
+                c2s_cipher_suite_provides_pfs(suite),
+                "non-PFS C2S cipher suite left enabled: {:?}",
+                suite.suite()
+            );
+        }
+    }
+
+    #[test]
+    fn c2s_tls_config_disables_session_resumption() {
+        install_default_provider();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path, _) = write_test_cert(temp.path(), "c2s");
+        let mut config = test_config(Vec::new());
+        config.cert_path = cert_path;
+        config.key_path = key_path;
+
+        let tls_config = load_c2s_tls_config(&config).expect("C2S TLS config");
+
+        assert!(!tls_config.session_storage.can_cache());
+        assert_eq!(tls_config.send_tls13_tickets, 0);
+    }
+
+    #[tokio::test]
+    async fn c2s_tls_handshake_negotiates_ephemeral_key_exchange() {
+        install_default_provider();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path, _) = write_test_cert(temp.path(), "c2s");
+        let mut config = test_config(Vec::new());
+        config.cert_path = cert_path;
+        config.key_path = key_path;
+        let server = Server::new(config, TestAuthenticator)
+            .await
+            .expect("server");
+
+        let tls = connect_tls(&server).await;
+
+        assert_eq!(tls.protocol_version, rustls::ProtocolVersion::TLSv1_3);
+        assert!(matches!(
+            tls.cipher_suite,
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+                | rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+                | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        ));
+        assert!(tls.key_exchange_group.is_some());
+        assert_eq!(tls.handshake_kind, rustls::HandshakeKind::Full);
     }
 
     #[tokio::test]

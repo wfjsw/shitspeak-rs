@@ -6,6 +6,7 @@ pub const MTU: usize = 1600;
 
 pub const APP_NAME_FROM_ENV: Option<&str> = option_env!("APP_NAME");
 pub const APP_VERSION_FROM_ENV: Option<&str> = option_env!("APP_VERSION");
+pub const APP_VERSION_FROM_CARGO: &str = env!("CARGO_PKG_VERSION");
 pub const APP_PROTO_VER: ProtocolVersion = ProtocolVersion {
     major: 1,
     minor: 6,
@@ -34,7 +35,7 @@ pub fn app_name() -> &'static str {
 }
 
 pub fn app_version() -> &'static str {
-    APP_VERSION_FROM_ENV.unwrap_or("0.1.0")
+    APP_VERSION_FROM_ENV.unwrap_or(APP_VERSION_FROM_CARGO)
 }
 
 fn non_empty_prefix<'a>(value: &'a str, max_len: usize, fallback: &'a str) -> &'a str {
@@ -71,5 +72,12 @@ mod tests {
     #[test]
     fn build_date_is_fixed_for_tests() {
         assert_eq!(BUILD_DATE, FIXED_TEST_BUILD_DATE);
+    }
+
+    #[test]
+    fn app_version_defaults_to_cargo_package_version() {
+        if APP_VERSION_FROM_ENV.is_none() {
+            assert_eq!(app_version(), env!("CARGO_PKG_VERSION"));
+        }
     }
 }
