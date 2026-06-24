@@ -749,10 +749,10 @@ async fn try_dial_peer(
     let local_ip_capability = LocalIpCapability::discover();
     for addr in addrs {
         if !local_ip_capability.supports_remote(addr.addr().ip()) {
-            debug!(
-                ?addr,
-                "skipping S2S dial candidate without matching local outgoing IP family"
-            );
+            // debug!(
+            //     ?addr,
+            //     "skipping S2S dial candidate without matching local outgoing IP family"
+            // );
             continue;
         }
         let transport = addr.transport();
