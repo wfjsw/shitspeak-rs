@@ -167,6 +167,9 @@ fn build_local_lsa_content(
                 rtt_us: n.rtt_us,
                 jitter_us: n.jitter_us,
                 throughput_bps: n.throughput_bps,
+                observed_recv_bps: n.observed_recv_bps,
+                observed_sent_bps: n.observed_sent_bps,
+                throughput_confidence_ppm: n.throughput_confidence_ppm,
                 transports_mask: n.transports_mask,
                 loss_ppm: n.loss_ppm,
                 probe_loss_ppm: n.probe_loss_ppm,
@@ -222,6 +225,8 @@ struct LinkGate {
     rtt_us: u64,
     jitter_us: u64,
     throughput_bps: u64,
+    observed_sent_bps: u64,
+    throughput_confidence_ppm: u32,
     transports_mask: u32,
     loss_ppm: u32,
     loss_confident: bool,
@@ -234,6 +239,8 @@ impl LinkGate {
             n.rtt_us,
             n.jitter_us,
             n.throughput_bps,
+            n.observed_sent_bps,
+            n.throughput_confidence_ppm,
             n.transports_mask,
             n.loss_ppm,
             n.loss_sample_count,
@@ -246,6 +253,8 @@ impl LinkGate {
             link.rtt_us,
             link.jitter_us,
             link.throughput_bps,
+            link.observed_sent_bps,
+            link.throughput_confidence_ppm,
             link.transports_mask,
             link.loss_ppm,
             link.loss_sample_count,
@@ -257,6 +266,8 @@ impl LinkGate {
         rtt_us: u64,
         jitter_us: u64,
         throughput_bps: u64,
+        observed_sent_bps: u64,
+        throughput_confidence_ppm: u32,
         transports_mask: u32,
         loss_ppm: u32,
         loss_sample_count: u64,
@@ -268,6 +279,12 @@ impl LinkGate {
             rtt_us: round_up_u64(rtt_us, RTT_GATE_BUCKET_US),
             jitter_us: round_up_u64(jitter_us, JITTER_GATE_BUCKET_US),
             throughput_bps: round_down_throughput_gate(throughput_bps),
+            observed_sent_bps: round_down_throughput_gate(observed_sent_bps),
+            throughput_confidence_ppm: round_up_u32(
+                throughput_confidence_ppm,
+                LOSS_GATE_BUCKET_PPM,
+            )
+            .min(1_000_000),
             transports_mask,
             loss_ppm,
             loss_confident,
@@ -444,17 +461,28 @@ pub fn cost_changed_significantly(
             return true;
         }
         if gate_delta_ratio_changed(
-            previous.throughput_bps,
-            current.throughput_bps,
+            previous.observed_sent_bps,
+            current.observed_sent_bps,
             cfg.cost_rerun_throughput_pct(),
             1,
         ) {
             trace!(
                 peer = %n.node_id,
-                previous = previous.throughput_bps,
-                current = current.throughput_bps,
+                previous = previous.observed_sent_bps,
+                current = current.observed_sent_bps,
                 threshold_pct = cfg.cost_rerun_throughput_pct(),
-                "local lsa change gate crossed: throughput"
+                "local lsa change gate crossed: observed sent throughput"
+            );
+            return true;
+        }
+        if previous.throughput_confidence_ppm != current.throughput_confidence_ppm
+            && (previous.observed_sent_bps > 0 || current.observed_sent_bps > 0)
+        {
+            trace!(
+                peer = %n.node_id,
+                previous = previous.throughput_confidence_ppm,
+                current = current.throughput_confidence_ppm,
+                "local lsa change gate crossed: throughput confidence"
             );
             return true;
         }
@@ -952,6 +980,9 @@ mod tests {
                 rtt_us: 1_000,
                 jitter_us: 0,
                 throughput_bps: 1_000_000,
+                observed_recv_bps: 1_000_000,
+                observed_sent_bps: 1_000_000,
+                throughput_confidence_ppm: 1_000_000,
                 transports_mask: 1,
                 loss_ppm: 0,
                 probe_loss_ppm: 0,

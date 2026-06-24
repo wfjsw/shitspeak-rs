@@ -40,10 +40,7 @@ use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::super::frame::{FrameType, build_frame};
 use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
-use super::super::probe_schedule::{
-    StartupBandwidthProbe, bandwidth_probe_startup_jitter, stabilized_ping_interval,
-};
-use super::super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
+use super::super::service_level::{MessageClass, ServiceLevel, TransportKind};
 use super::super::tls;
 use super::{
     Endpoint, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
@@ -1941,6 +1938,10 @@ fn spawn_udp_write_pump(
     ActiveStream::new(TransportKind::Udp, Some(peer_addr), tx, closed, is_dialer)
 }
 
+fn stabilized_ping_interval(active: Duration, idle: Duration) -> Duration {
+    if idle.is_zero() { active } else { idle }
+}
+
 async fn run_write(
     state: Arc<UdpSocketState>,
     session: Arc<UdpCryptoSession>,
@@ -1950,17 +1951,6 @@ async fn run_write(
     closed: CancellationToken,
 ) {
     let level = TransportKind::Udp.service_level();
-    let probe_enabled = inner.cfg().bandwidth_probe_size() > 0;
-    let startup_probe_delay = bandwidth_probe_startup_jitter(
-        inner.self_id(),
-        peer.node_id(),
-        TransportKind::Udp,
-        inner.cfg().ping_interval(),
-    );
-    let mut startup_probe = StartupBandwidthProbe::new(
-        probe_enabled && !inner.cfg().bandwidth_probe_interval().is_zero(),
-        startup_probe_delay,
-    );
     let active_ping_interval = inner.cfg().ping_interval();
     let stable_ping_interval =
         stabilized_ping_interval(active_ping_interval, inner.cfg().idle_ping_interval());
@@ -1970,15 +1960,6 @@ async fn run_write(
         .saturating_mul(2)
         .max(Duration::from_secs(1));
     let mut ping_tick = MaybeInterval::maybe(active_ping_interval);
-    let periodic_probe_delay = startup_probe_delay.min(inner.cfg().bandwidth_probe_interval());
-    let mut probe_tick = if probe_enabled {
-        MaybeInterval::maybe_with_initial_delay(
-            inner.cfg().bandwidth_probe_interval(),
-            periodic_probe_delay,
-        )
-    } else {
-        MaybeInterval::Disabled
-    };
 
     let hello = build_frame(
         inner.self_id(),
@@ -2045,30 +2026,11 @@ async fn run_write(
             }
 
             _ = session.startup_probe_ready.notified() => {
-                startup_probe.arm();
                 if !stable_ping_interval_armed
                     && stable_ping_interval != active_ping_interval
                 {
                     ping_tick = MaybeInterval::maybe(stable_ping_interval);
                     stable_ping_interval_armed = true;
-                }
-            }
-
-            _ = startup_probe.tick() => {
-                startup_probe.complete();
-                if record_expired_udp_pending(&session, &peer, pending_timeout) {
-                    warn!(peer=%peer.node_id(), misses=UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD, "udp keepalive pongs missed; closing session");
-                    remove_session_on_exit = true;
-                    break;
-                }
-                if send_udp_bandwidth_probes(
-                    &session,
-                    &peer,
-                    inner.self_id(),
-                    inner.cfg(),
-                ).await.is_err() {
-                    remove_session_on_exit = true;
-                    break;
                 }
             }
 
@@ -2086,7 +2048,7 @@ async fn run_write(
                 );
                 match session.send_frame(&frame, &peer, inner.cfg().udp_mtu()).await {
                     Ok(_) => {
-                        if session.pending.lock().insert(ts, None, 0).is_some() {
+                        if session.pending.lock().insert(ts).is_some() {
                             peer.metrics().record_probe_lost(TransportKind::Udp);
                         }
                     }
@@ -2098,22 +2060,6 @@ async fn run_write(
                 }
             }
 
-            _ = probe_tick.tick() => {
-                if record_expired_udp_pending(&session, &peer, pending_timeout) {
-                    warn!(peer=%peer.node_id(), misses=UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD, "udp keepalive pongs missed; closing session");
-                    remove_session_on_exit = true;
-                    break;
-                }
-                if send_udp_bandwidth_probes(
-                    &session,
-                    &peer,
-                    inner.self_id(),
-                    inner.cfg(),
-                ).await.is_err() {
-                    remove_session_on_exit = true;
-                    break;
-                }
-            }
         }
     }
     if remove_session_on_exit {
@@ -2123,76 +2069,6 @@ async fn run_write(
     }
     closed.cancel();
     trace!(peer=%peer.node_id(), "udp encrypted write pump exited");
-}
-
-async fn send_udp_bandwidth_probes(
-    session: &Arc<UdpCryptoSession>,
-    peer: &PeerState,
-    local_id: NodeIdentifier,
-    cfg: &super::super::config::TransportConfig,
-) -> io::Result<()> {
-    let mut ts = now_us();
-    for shape in ServiceShape::ALL {
-        let payload_size = cfg.service_probe_payload_size(shape);
-        match send_service_probe(
-            session,
-            peer,
-            local_id,
-            shape,
-            payload_size,
-            cfg.udp_mtu(),
-            ts,
-        )
-        .await
-        {
-            Ok(true) => {
-                if session
-                    .pending
-                    .lock()
-                    .insert(ts, Some(shape), payload_size)
-                    .is_some()
-                {
-                    peer.metrics().record_probe_lost(TransportKind::Udp);
-                }
-            }
-            Ok(false) => {}
-            Err(e) => {
-                warn!(peer=%peer.node_id(), service=%shape.name(), error=%e, "udp encrypted probe failed");
-                return Err(e);
-            }
-        }
-        ts = ts.saturating_add(1);
-    }
-    Ok(())
-}
-
-async fn send_service_probe(
-    session: &Arc<UdpCryptoSession>,
-    peer: &PeerState,
-    local_id: NodeIdentifier,
-    shape: ServiceShape,
-    payload_bytes: usize,
-    udp_mtu: usize,
-    ts: u64,
-) -> io::Result<bool> {
-    if payload_bytes == 0 {
-        return Ok(false);
-    }
-    let payload = bytes::BytesMut::zeroed(payload_bytes).freeze();
-    let frame = build_frame(
-        local_id,
-        peer.node_id(),
-        shape.service_level(),
-        FrameType::Ping,
-        shape.message_class(),
-        ts,
-        payload,
-    );
-    match session.send_frame(&frame, peer, udp_mtu).await {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(false),
-        Err(e) => Err(e),
-    }
 }
 
 fn record_expired_udp_pending(
@@ -2267,17 +2143,7 @@ async fn handle_frame(
                         .consecutive_keepalive_misses
                         .store(0, Ordering::Relaxed);
                     peer.metrics().record_probe_delivered(TransportKind::Udp);
-                    if pending.shape.is_none() {
-                        session.startup_probe_ready.notify_one();
-                    }
-                    if let Some(shape) = pending.shape {
-                        peer.metrics().record_probe(
-                            TransportKind::Udp,
-                            shape,
-                            pending.payload_bytes,
-                            rtt,
-                        );
-                    }
+                    session.startup_probe_ready.notify_one();
                 }
             }
         }
@@ -2302,26 +2168,8 @@ struct ExpiredPings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingPing {
-    Probe {
-        sent_at: Instant,
-        shape: Option<ServiceShape>,
-        payload_bytes: usize,
-    },
-}
-
-impl PendingPing {
-    fn shape(self) -> Option<ServiceShape> {
-        match self {
-            Self::Probe { shape, .. } => shape,
-        }
-    }
-
-    fn payload_bytes(self) -> usize {
-        match self {
-            Self::Probe { payload_bytes, .. } => payload_bytes,
-        }
-    }
+struct PendingPing {
+    sent_at: Instant,
 }
 
 impl PendingPings {
@@ -2332,12 +2180,7 @@ impl PendingPings {
         }
     }
 
-    fn insert(
-        &mut self,
-        ts: u64,
-        shape: Option<ServiceShape>,
-        payload_bytes: usize,
-    ) -> Option<PendingPing> {
+    fn insert(&mut self, ts: u64) -> Option<PendingPing> {
         if self.cap == 0 {
             return None;
         }
@@ -2348,50 +2191,37 @@ impl PendingPings {
         };
         self.inner.push_back((
             ts,
-            PendingPing::Probe {
+            PendingPing {
                 sent_at: Instant::now(),
-                shape,
-                payload_bytes,
             },
         ));
         evicted
     }
 
-    fn take(&mut self, ts: u64) -> Option<PendingPingInfo> {
+    fn take(&mut self, ts: u64) -> Option<PendingPing> {
         let idx = self
             .inner
             .iter()
             .position(|(pending_ts, _)| *pending_ts == ts)?;
         let (_, pending) = self.inner.remove(idx)?;
-        Some(PendingPingInfo {
-            shape: pending.shape(),
-            payload_bytes: pending.payload_bytes(),
-        })
+        Some(pending)
     }
 
     fn expire_older_than(&mut self, timeout: Duration) -> ExpiredPings {
         let now = Instant::now();
         let mut expired = ExpiredPings::default();
-        while self.inner.front().is_some_and(|(_, pending)| {
-            let sent_at = match pending {
-                PendingPing::Probe { sent_at, .. } => *sent_at,
-            };
-            now.saturating_duration_since(sent_at) >= timeout
-        }) {
-            if let Some((_, pending)) = self.inner.pop_front() {
+        while self
+            .inner
+            .front()
+            .is_some_and(|(_, pending)| now.saturating_duration_since(pending.sent_at) >= timeout)
+        {
+            if self.inner.pop_front().is_some() {
                 expired.total += 1;
-                if pending.shape().is_none() {
-                    expired.keepalive += 1;
-                }
+                expired.keepalive += 1;
             }
         }
         expired
     }
-}
-
-struct PendingPingInfo {
-    shape: Option<ServiceShape>,
-    payload_bytes: usize,
 }
 
 enum MaybeInterval {
@@ -2405,17 +2235,6 @@ impl MaybeInterval {
             Self::Disabled
         } else {
             Self::Enabled(interval_at(TokioInstant::now(), duration))
-        }
-    }
-
-    fn maybe_with_initial_delay(duration: Duration, initial_delay: Duration) -> Self {
-        if duration.is_zero() {
-            Self::Disabled
-        } else {
-            Self::Enabled(interval_at(
-                TokioInstant::now() + duration.saturating_add(initial_delay),
-                duration,
-            ))
         }
     }
 
@@ -2478,12 +2297,12 @@ mod tests {
     fn pending_expiration_counts_keepalives_separately() {
         let mut pending = PendingPings::new(4);
 
-        pending.insert(1, None, 0);
-        pending.insert(2, Some(ServiceShape::Voice), 160);
+        pending.insert(1);
+        pending.insert(2);
 
         let expired = pending.expire_older_than(Duration::ZERO);
         assert_eq!(expired.total, 2);
-        assert_eq!(expired.keepalive, 1);
+        assert_eq!(expired.keepalive, 2);
     }
 
     #[test]

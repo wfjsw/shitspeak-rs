@@ -128,8 +128,6 @@ protect_certificate_hashes = false
 latency_ewma_alpha = 0.2
 # Smoothing coefficient for the jitter EWMA (RFC 3550 uses 1/16).
 jitter_ewma_alpha = 0.0625
-# Smoothing coefficient for the active-probe throughput EWMA.
-throughput_ewma_alpha = 0.3
 # Smoothing coefficient for the long-term packet loss EWMA.
 packet_loss_ewma_alpha = 0.02
 # Fast transport keepalive interval used before a link has proven stable.

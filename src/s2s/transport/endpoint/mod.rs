@@ -33,7 +33,7 @@ use super::config::TransportConfig;
 use super::connection::{PeerState, StreamKey, retry_cap_for_last_seen_age};
 use super::manager::ManagerInner;
 use super::native_stats::BoxedNativeLossSampler;
-use super::service_level::{PeerAddress, SeedAddress, ServiceShape, TransportKind};
+use super::service_level::{PeerAddress, SeedAddress, TransportKind};
 use super::stream_io::{StreamPumpConfig, spawn_stream_pump};
 
 pub(crate) mod kcp;
@@ -291,8 +291,6 @@ pub(crate) fn install_stream_session<S>(
         inner.cfg().outbound_capacity(),
         inner.cfg().ping_interval(),
         inner.cfg().idle_ping_interval(),
-        inner.cfg().bandwidth_probe_interval(),
-        inner.cfg().bandwidth_probe_size(),
         inner.cfg().native_stats_interval(),
         inner.cfg().compression_config().clone(),
         inner.cfg().max_pending_pings(),
@@ -663,11 +661,7 @@ fn peer_priority(peer: &PeerState) -> f64 {
 
 fn exploratory_probe_hold_time(cfg: &TransportConfig) -> Duration {
     let ping_window = cfg.ping_interval() + cfg.ping_interval();
-    let mut hold = cfg.reconnect_check_interval().max(ping_window);
-    if cfg.bandwidth_probe_size() > 0 && !cfg.bandwidth_probe_interval().is_zero() {
-        hold = hold.max(cfg.bandwidth_probe_interval() + cfg.ping_interval());
-    }
-    hold
+    cfg.reconnect_check_interval().max(ping_window)
 }
 
 fn prune_outgoing_to_soft_cap(inner: &Arc<ManagerInner>) {
@@ -1151,12 +1145,9 @@ mod tests {
         connected
             .metrics()
             .record_rtt(TransportKind::Tcp, Duration::from_millis(1));
-        connected.metrics().record_probe(
-            TransportKind::Tcp,
-            ServiceShape::Bulk,
-            1024 * 1024,
-            Duration::from_millis(1),
-        );
+        connected
+            .metrics()
+            .record_payload_sent(TransportKind::Tcp, 1024 * 1024);
 
         let mut candidates = vec![
             (connected.node_id(), connected),
@@ -1188,14 +1179,14 @@ mod tests {
     }
 
     #[test]
-    fn exploratory_probe_hold_covers_bandwidth_probe_round_trip() {
+    fn exploratory_probe_hold_uses_reconnect_interval_without_bandwidth_probe_round_trip() {
         let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into())
             .with_reconnect_check_interval(Duration::from_secs(1))
             .with_ping_interval(Duration::from_secs(2))
             .with_bandwidth_probe_interval(Duration::from_secs(10))
             .with_bandwidth_probe_size(1024);
 
-        assert_eq!(exploratory_probe_hold_time(&cfg), Duration::from_secs(12));
+        assert_eq!(exploratory_probe_hold_time(&cfg), Duration::from_secs(4));
     }
 
     #[test]

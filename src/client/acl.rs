@@ -15,6 +15,28 @@ pub(crate) async fn compute_permissions_for_client(
     client: &Arc<Box<Client>>,
     channel_id: u32,
 ) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
+    compute_permissions_for_client_inner(server, client, channel_id, None).await
+}
+
+/// Compute permissions as if the client were already in `channel_id`.
+///
+/// This is intentionally separate from the normal helper: moving into a
+/// channel must check Enter permissions from the client's real current channel,
+/// but the resulting suppress state depends on Speak after the move.
+pub(crate) async fn compute_permissions_for_client_as_if_in_channel(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
+    compute_permissions_for_client_inner(server, client, channel_id, Some(channel_id)).await
+}
+
+async fn compute_permissions_for_client_inner(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+    home_channel_override: Option<u32>,
+) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
     use crate::acl::ACLPermissions;
 
     let session = u32::from(client.get_session_id());
@@ -27,7 +49,7 @@ pub(crate) async fn compute_permissions_for_client(
     let client_acl_generation = client.get_acl_generation();
     let channel_acl_generation = channels.channel_acl_generation();
     let cache_session = u64::from(session);
-    let use_acl_cache = !is_superuser;
+    let use_acl_cache = !is_superuser && home_channel_override.is_none();
 
     if use_acl_cache
         && let Some(permissions) = channels
@@ -63,7 +85,7 @@ pub(crate) async fn compute_permissions_for_client(
     let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
     let tokens: Vec<String> = client.get_tokens_clone().into_iter().collect();
     let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-    let home_channel_id = client.get_current_channel_id();
+    let home_channel_id = home_channel_override.unwrap_or_else(|| client.get_current_channel_id());
     let home_ancestors: Vec<u32> = if home_channel_id == channel_id {
         ancestors.iter().map(|ancestor| ancestor.id).collect()
     } else {
@@ -94,6 +116,8 @@ pub(crate) async fn compute_permissions_for_client(
         authenticated = membership.authenticated(),
         groups = ?group_refs,
         tokens = ?token_refs,
+        home_channel_id,
+        home_channel_override,
         ancestors = ancestors.len(),
         is_superuser,
         explicit_enter_deny_overrides_write,

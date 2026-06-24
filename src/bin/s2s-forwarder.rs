@@ -13,7 +13,7 @@ use shitspeak_rs::logging;
 use shitspeak_rs::s2s::overlay::{OverlayNetwork, ReplicationServices};
 use shitspeak_rs::s2s::replications::{ReplicationConfig, ReplicationManager};
 use shitspeak_rs::s2s::status;
-use shitspeak_rs::s2s::transport::ConnectionManager;
+use shitspeak_rs::s2s::transport::{ConnectionManager, TransportConfig};
 use shitspeak_rs::s2s::{
     BanReplicationAdapter, ChannelBlobReplicationAdapter, ChannelReplicationAdapter,
     channel_blob_topic, channel_topic, install_channel_blob_replication_resolver,
@@ -32,6 +32,20 @@ struct ForwarderConfig {
     s2s: S2sConfig,
     #[serde(default)]
     replication: ForwarderReplicationConfig,
+}
+
+impl ForwarderConfig {
+    fn auto_advertise_host(&self) -> Option<&str> {
+        self.register_hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+    }
+
+    fn transport_config(&self) -> Result<Option<TransportConfig>, String> {
+        self.s2s
+            .transport_config_with_auto_advertise_host(self.auto_advertise_host())
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -165,14 +179,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         return Err("s2s-forwarder requires [s2s].enabled = true".into());
     }
 
-    let auto_advertise_host = config
-        .register_hostname
-        .as_deref()
-        .map(str::trim)
-        .filter(|host| !host.is_empty());
     let transport_config = config
-        .s2s
-        .transport_config_with_auto_advertise_host(auto_advertise_host)?
+        .transport_config()?
         .ok_or("s2s-forwarder requires an S2S transport config")?;
 
     let mut overlay_config = config.s2s.overlay_config();
@@ -457,4 +465,65 @@ fn default_channel_snapshot_every_secs() -> i64 {
 
 fn default_channel_wal_compaction_expire_count() -> usize {
     2_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn parse_forwarder_config(raw: &str) -> ForwarderConfig {
+        config::Config::builder()
+            .add_source(config::File::from_str(raw, config::FileFormat::Toml))
+            .build()
+            .expect("forwarder config builds")
+            .try_deserialize()
+            .expect("forwarder config deserializes")
+    }
+
+    #[test]
+    fn register_hostname_can_be_omitted() {
+        let config = parse_forwarder_config(
+            r#"
+            [s2s]
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+            "#,
+        );
+
+        assert_eq!(config.auto_advertise_host(), None);
+        let transport = config
+            .transport_config()
+            .expect("omitted register_hostname is accepted")
+            .expect("s2s enabled");
+        assert!(transport.tcp_advertise().is_empty());
+    }
+
+    #[test]
+    fn register_hostname_still_auto_advertises_when_set() {
+        let config = parse_forwarder_config(
+            r#"
+            register_hostname = "127.0.0.1"
+
+            [s2s]
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+            "#,
+        );
+
+        let transport = config
+            .transport_config()
+            .expect("register_hostname can be used for auto advertise")
+            .expect("s2s enabled");
+        assert_eq!(
+            transport.tcp_advertise(),
+            &["127.0.0.1:64739".parse::<SocketAddr>().unwrap()]
+        );
+    }
 }

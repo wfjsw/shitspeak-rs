@@ -40,7 +40,7 @@ fn config_with_udp(pki: &Pki, node_idx: usize, udp: SocketAddr) -> TransportConf
         .with_backoff_initial(Duration::from_millis(20))
         .with_backoff_cap(Duration::from_millis(500))
         .with_ping_interval(Duration::from_millis(300))
-        .with_bandwidth_probe_interval(Duration::from_secs(60)) // off for these tests
+        .with_bandwidth_probe_interval(Duration::from_secs(60))
         .with_bandwidth_probe_size(0)
         .with_udp_mtu(1400)
 }
@@ -181,14 +181,11 @@ async fn two_node_tcp_data_roundtrip() {
     let _ = inbound_b;
 }
 
-/// Checks that idle transport probes produce a usable goodput metric.
-/// Expected: after service-shaped probe round trips, TCP probe goodput is
-/// positive and the estimated throughput is at least that probe-only value. The expected
-/// behavior is local to this crate's S2S transport health model; the reference
-/// projects provide the surrounding server model (`D:\mumble\src\murmur`) and
-/// shitspeak's side-channel precedent (`D:\shitspeak\slavehub.go`).
+/// Checks that an idle link does not synthesize throughput from bandwidth probes.
+/// Expected: liveness pings establish RTT samples, but passive throughput stays
+/// zero until real Data frames flow.
 #[tokio::test]
-async fn probe_throughput_reports_idle_link_bandwidth() {
+async fn idle_link_reports_zero_passive_throughput() {
     let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[100, 200]);
@@ -205,9 +202,6 @@ async fn probe_throughput_reports_idle_link_bandwidth() {
         .await;
     wait_for_link(&mgr_a, 200, TransportKind::Tcp).await;
 
-    // Idle the link: send no Data frames; let the periodic probe drive
-    // the goodput metric. The probe interval is 200ms; we wait long
-    // enough to register multiple round trips.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         if std::time::Instant::now() >= deadline {
@@ -215,25 +209,75 @@ async fn probe_throughput_reports_idle_link_bandwidth() {
         }
         if let Some(per_t) = mgr_a.metrics_snapshot().for_node(200) {
             if let Some(tcp) = per_t.get(&TransportKind::Tcp) {
-                if tcp.probe_samples() >= 2 {
-                    // We got at least two probe round trips; throughput EWMA
-                    // should be nonzero. On loopback this will be a very
-                    // large number — we just verify it is positive.
-                    assert!(
-                        tcp.max_probe_goodput_bps() > 0.0,
-                        "max_probe_goodput_bps should be positive after probes"
-                    );
-                    assert!(
-                        tcp.estimated_throughput_bps() >= tcp.max_probe_goodput_bps(),
-                        "estimate should not be less than probe alone"
-                    );
+                if tcp.samples() >= 1 {
+                    assert_eq!(tcp.observed_recv_bps(), 0.0);
+                    assert_eq!(tcp.observed_sent_bps(), 0.0);
+                    assert_eq!(tcp.estimated_throughput_bps(), 0.0);
+                    assert_eq!(tcp.throughput_confidence_ppm(), 0);
                     return;
                 }
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("never recorded a probe round trip");
+    panic!("never recorded keepalive RTT samples");
+}
+
+/// Checks passive throughput directionality for one-way data.
+/// Expected: sending A -> B raises only A's observed sent rate and B's
+/// observed recv rate; the opposite directions remain idle.
+#[tokio::test]
+async fn one_way_tcp_data_updates_directional_passive_throughput() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[101, 202]);
+    let port_a = pick_free_port().await;
+    let port_b = pick_free_port().await;
+    let cfg_a = config_for(&pki, 0, loopback(port_a));
+    let cfg_b = config_for(&pki, 1, loopback(port_b));
+
+    let (mgr_a, _inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+
+    mgr_a
+        .add_address(202, PeerAddress::new(loopback(port_b), TransportKind::Tcp))
+        .await;
+    wait_for_link(&mgr_a, 202, TransportKind::Tcp).await;
+    wait_for_link(&mgr_b, 101, TransportKind::Tcp).await;
+
+    let payload = Bytes::from_static(b"one-way-passive-throughput");
+    mgr_a
+        .send(
+            202,
+            ServiceLevel::Reliable,
+            None,
+            MessageClass::Regular,
+            payload.clone(),
+        )
+        .await
+        .unwrap();
+
+    let recv = timeout(Duration::from_secs(2), inbound_b.regular().recv())
+        .await
+        .expect("a->b recv timeout")
+        .expect("a->b recv channel closed");
+    assert_eq!(recv.from(), 101);
+    assert_eq!(recv.transport(), TransportKind::Tcp);
+    assert_eq!(recv.payload(), &payload);
+
+    let sender = tcp_metrics(&mgr_a, 202);
+    let receiver = tcp_metrics(&mgr_b, 101);
+    assert!(sender.observed_sent_bps() > 0.0);
+    assert_eq!(sender.observed_recv_bps(), 0.0);
+    assert_eq!(
+        sender.estimated_throughput_bps(),
+        sender.observed_sent_bps()
+    );
+    assert!(receiver.observed_recv_bps() > 0.0);
+    assert_eq!(receiver.observed_sent_bps(), 0.0);
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
 }
 
 /// Checks adaptive L1 compression over a real mTLS TCP transport.

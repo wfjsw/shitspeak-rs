@@ -367,6 +367,8 @@ stale_probe_age_secs = 3600
 max_outgoing_connections = 1024
 
 [s2s.overlay]
+hello_interval_ms = 1000
+hello_dead_interval_ms = 4000
 lsdb_sync_max_response_lsas = 2048
 route_transit_messages = true
 

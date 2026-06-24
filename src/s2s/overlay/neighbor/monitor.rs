@@ -37,6 +37,9 @@ pub struct NeighborSnapshot {
     pub rtt_us: u64,
     pub jitter_us: u64,
     pub throughput_bps: u64,
+    pub observed_recv_bps: u64,
+    pub observed_sent_bps: u64,
+    pub throughput_confidence_ppm: u32,
     pub transports_mask: u32,
     pub loss_ppm: u32,
     pub probe_loss_ppm: u32,
@@ -267,11 +270,19 @@ impl NeighborMonitor {
                 .get_peer(*nid)
                 .map(|peer| peer.live_kinds())
                 .unwrap_or_default();
-            let (rtt_us, jitter_us, throughput_bps) = match metrics.for_node(*nid) {
+            let (
+                rtt_us,
+                jitter_us,
+                observed_recv_bps,
+                observed_sent_bps,
+                throughput_confidence_ppm,
+            ) = match metrics.for_node(*nid) {
                 Some(per_t) => {
                     let mut best_rtt: Option<f64> = None;
                     let mut best_jitter: Option<f64> = None;
-                    let mut total_tput: f64 = 0.0;
+                    let mut total_recv_bps: f64 = 0.0;
+                    let mut total_sent_bps: f64 = 0.0;
+                    let mut confidence_ppm: u32 = 0;
                     for (k, m) in per_t {
                         if !kinds.contains(k) {
                             continue;
@@ -298,7 +309,9 @@ impl NeighborMonitor {
                                 None => m.jitter_us(),
                             });
                         }
-                        total_tput += m.estimated_throughput_bps();
+                        total_recv_bps += m.observed_recv_bps();
+                        total_sent_bps += m.observed_sent_bps();
+                        confidence_ppm = confidence_ppm.max(m.throughput_confidence_ppm());
                     }
                     (loss_ppm, loss_sample_count) = selected_edge_loss(
                         hello_loss_ppm,
@@ -309,11 +322,14 @@ impl NeighborMonitor {
                     (
                         best_rtt.unwrap_or(0.0) as u64,
                         best_jitter.unwrap_or(0.0) as u64,
-                        total_tput as u64,
+                        total_recv_bps as u64,
+                        total_sent_bps as u64,
+                        confidence_ppm,
                     )
                 }
-                None => (0, 0, 0),
+                None => (0, 0, 0, 0, 0),
             };
+            let throughput_bps = observed_recv_bps.max(observed_sent_bps);
             let transports_mask = transports_to_mask(&kinds);
             st.transports_mask = transports_mask;
             out.push(NeighborSnapshot {
@@ -321,6 +337,9 @@ impl NeighborMonitor {
                 rtt_us,
                 jitter_us,
                 throughput_bps,
+                observed_recv_bps,
+                observed_sent_bps,
+                throughput_confidence_ppm,
                 transports_mask,
                 loss_ppm,
                 probe_loss_ppm,

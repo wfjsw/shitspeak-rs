@@ -1677,6 +1677,75 @@ async fn entering_channel_sends_permission_query_for_channel_and_parent() {
 }
 
 #[tokio::test]
+async fn in_group_speak_allow_clears_suppress_after_entering_channel() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .set_acls(
+            0,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Speak.into(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(74, "Stage".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            74,
+            true,
+            vec![acl_for_group(
+                "in",
+                ACLPermissions::Speak.into(),
+                enumflags2::BitFlags::empty(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    assert!(
+        bob.initial_user_states
+            .iter()
+            .any(|state| { state.session == Some(bob.session_id) && state.suppress == Some(true) }),
+        "Root Speak deny should suppress Bob before the move"
+    );
+
+    bob.move_to_channel(74).await;
+
+    let moved = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id)
+                        && us.channel_id == Some(74)
+                        && us.suppress == Some(false))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        moved.is_some(),
+        "@in +Speak should clear suppression after Bob enters the channel"
+    );
+}
+
+#[tokio::test]
 async fn acl_cache_global_purge_sends_permission_query_flush_to_all_clients() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

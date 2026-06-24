@@ -130,7 +130,6 @@ pub async fn handle_user_state(
         .filter(|new_channel_id| *new_channel_id != target_current_channel_id);
 
     let mut actor_source_perms = None;
-    let mut target_destination_perms = None;
 
     // ── ACL: Channel move ────────────────────────────────────────────────
     // Check permissions before acquiring the guard, so we can return early.
@@ -186,7 +185,6 @@ pub async fn handle_user_state(
         let dst_perms =
             crate::client::acl::compute_permissions_for_client(server, &target, new_channel_id)
                 .await;
-        target_destination_perms = Some(dst_perms);
 
         if is_self {
             // Moving self: need Enter on destination.
@@ -258,6 +256,19 @@ pub async fn handle_user_state(
             }
         }
     }
+
+    let post_move_destination_perms = if let Some(new_channel_id) = requested_channel_change {
+        Some(
+            crate::client::acl::compute_permissions_for_client_as_if_in_channel(
+                server,
+                &target,
+                new_channel_id,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     if msg.suppress.is_some() && (!is_self || msg.suppress == Some(true)) {
         return Err(MessageHandlerError::PermissionDenied(
@@ -522,9 +533,8 @@ pub async fn handle_user_state(
                 channel_id: requested_channel_change,
                 mute: msg.mute,
                 deaf: msg.deaf,
-                suppress: requested_channel_change.and_then(|_| {
-                    target_destination_perms.map(|perms| !perms.contains(ACLPermissions::Speak))
-                }),
+                suppress: post_move_destination_perms
+                    .map(|perms| !perms.contains(ACLPermissions::Speak)),
                 priority_speaker: msg.priority_speaker,
                 listening_channel_add: msg.listening_channel_add.clone(),
                 listening_channel_remove: msg.listening_channel_remove.clone(),
@@ -638,7 +648,7 @@ pub async fn handle_user_state(
             }
             cache_last_channel_id = Some(new_channel_id);
 
-            if let Some(dst_perms) = target_destination_perms {
+            if let Some(dst_perms) = post_move_destination_perms {
                 gs.set_suppress(!dst_perms.contains(ACLPermissions::Speak));
             }
         }

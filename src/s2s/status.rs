@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::s2s::overlay::{MemberStatus, OverlayNetwork, RoutingMetric};
 use crate::s2s::transport::{ConnectionManager, MetricsSnapshot, TransportKind};
-use crate::s2s::transport::{MessageClass, ServiceLevel, ServiceShape};
+use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
 const MAX_REQUEST_BYTES: usize = 8192;
@@ -53,6 +53,9 @@ struct TopologyLink {
     rtt_us: u64,
     jitter_us: u64,
     throughput_bps: u64,
+    observed_recv_bps: u64,
+    observed_sent_bps: u64,
+    throughput_confidence_ppm: u32,
     loss_ppm: u32,
     probe_loss_ppm: u32,
     native_loss_ppm: u32,
@@ -99,23 +102,9 @@ struct TransportMetric {
     native_lost_samples: u64,
     data_health_samples: u64,
     data_health_failures: u64,
-    probe_goodput_bps: f64,
     estimated_throughput_bps: f64,
     samples: u64,
-    probe_samples: u64,
-    service_metrics: Vec<TransportServiceMetric>,
     last_update_age_ms: Option<u128>,
-}
-
-#[derive(Debug, Serialize)]
-struct TransportServiceMetric {
-    service: &'static str,
-    level: &'static str,
-    class: &'static str,
-    payload_bytes: usize,
-    supported: bool,
-    probe_goodput_bps: f64,
-    probe_samples: u64,
 }
 
 pub fn spawn_status_server(
@@ -312,6 +301,9 @@ fn build_topology_snapshot(
                 rtt_us: link.rtt_us,
                 jitter_us: link.jitter_us,
                 throughput_bps: link.throughput_bps,
+                observed_recv_bps: link.observed_recv_bps,
+                observed_sent_bps: link.observed_sent_bps,
+                throughput_confidence_ppm: link.throughput_confidence_ppm,
                 loss_ppm: link.loss_ppm,
                 probe_loss_ppm: link.probe_loss_ppm,
                 native_loss_ppm: link.native_loss_ppm,
@@ -349,24 +341,8 @@ fn build_topology_snapshot(
     });
 
     let mut local_metrics = Vec::new();
-    let transport_cfg = transport.inner.cfg();
     for (peer, per_transport) in metrics.per_node() {
         for (kind, metric) in per_transport {
-            let service_metrics = ServiceShape::ALL
-                .into_iter()
-                .map(|shape| {
-                    let probe = metric.service_probe(shape);
-                    TransportServiceMetric {
-                        service: shape.name(),
-                        level: service_level_name(shape.service_level()),
-                        class: message_class_name(shape.message_class()),
-                        payload_bytes: transport_cfg.service_probe_payload_size(shape),
-                        supported: transport_cfg.service_probe_supported(*kind, shape),
-                        probe_goodput_bps: probe.goodput_bps(),
-                        probe_samples: probe.samples(),
-                    }
-                })
-                .collect();
             local_metrics.push(TransportMetric {
                 peer: *peer,
                 transport: transport_kind_name(*kind),
@@ -392,11 +368,8 @@ fn build_topology_snapshot(
                 native_lost_samples: metric.native_lost_samples(),
                 data_health_samples: metric.data_health_samples(),
                 data_health_failures: metric.data_health_failures(),
-                probe_goodput_bps: metric.max_probe_goodput_bps(),
                 estimated_throughput_bps: metric.estimated_throughput_bps(),
                 samples: metric.samples(),
-                probe_samples: metric.probe_samples(),
-                service_metrics,
                 last_update_age_ms: metric
                     .last_update()
                     .map(|ts| now.duration_since(ts).as_millis()),
@@ -630,7 +603,7 @@ th { color: var(--muted); font-weight: 600; background: #fafbfc; }
   <section class="tables">
     <div class="panel"><h2>Nodes</h2><table><thead><tr><th>Node</th><th>Status</th><th>LSA</th><th>Addresses</th></tr></thead><tbody id="nodes"></tbody></table></div>
     <div class="panel"><h2>Packet IO</h2><table><thead><tr><th>Kind</th><th>Total</th><th>Sent</th><th>Recv</th><th>Count</th><th>Avg</th></tr></thead><tbody id="packet-io"></tbody></table></div>
-    <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Loss</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Compression</th><th>Voice</th><th>Control</th><th>Bulk</th></tr></thead><tbody id="metrics"></tbody></table></div>
+    <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Loss</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Compression</th></tr></thead><tbody id="metrics"></tbody></table></div>
   </section>
   <section class="panel wide-panel">
     <h2>Routes</h2>
@@ -655,7 +628,7 @@ function fmtBytes(v) { if (!v) return '-'; const u = ['B','KB','MB','GB']; let i
 function fmtBps(v) { if (!v) return '-'; const u = ['B/s','KB/s','MB/s','GB/s']; let i = 0; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return v.toFixed(i ? 1 : 0) + ' ' + u[i]; }
 function fmtLoss(v) { return v ? (v / 10000).toFixed(2) + '%' : '0%'; }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function fmtPair(a, b) { const v = Math.max(a || 0, b || 0); return fmtBps(v); }
+function fmtPair(a, b) { return `recv ${fmtBps(a)}<br><span class="transport">sent ${fmtBps(b)}</span>`; }
 function fmtCompressionRatio(v) {
     if (v === null || v === undefined || !Number.isFinite(Number(v)) || v <= 0) return '-';
     const factor = 1 / v;
@@ -668,12 +641,6 @@ function compressionCell(item) {
 }
 function lossBreakdown(item) {
     return `eff ${fmtLoss(item.loss_ppm ?? item.packet_loss_ppm)}<br><span class="transport">probe ${fmtLoss(item.probe_loss_ppm)} &middot; native ${fmtLoss(item.native_loss_ppm)} &middot; data ${fmtLoss(item.data_health_ppm)}</span>`;
-}
-function serviceProbeCell(metric, service) {
-    const item = (metric.service_metrics || []).find(s => s.service === service);
-    if (!item || !item.supported) return 'n/a';
-    const value = fmtBps(item.probe_goodput_bps);
-    return `${value}<br><span class="transport">${item.payload_bytes} B</span>`;
 }
 function tooltipHtml(lines) {
   const el = document.createElement('div');
@@ -795,7 +762,9 @@ function renderGraph(data) {
         `Loss: ${fmtLoss(link.loss_ppm)}`,
         `Probe/native/data: ${fmtLoss(link.probe_loss_ppm)} / ${fmtLoss(link.native_loss_ppm)} / ${fmtLoss(link.data_health_ppm)}`,
         `Loss samples: ${esc(link.loss_sample_count)}`,
-        `Throughput: ${fmtBps(link.throughput_bps)}`
+        `Throughput: ${fmtBps(link.throughput_bps)}`,
+        `Observed recv/sent: ${fmtBps(link.observed_recv_bps)} / ${fmtBps(link.observed_sent_bps)}`,
+        `Throughput confidence: ${fmtLoss(link.throughput_confidence_ppm)}`
       ]),
       color: linkColor(link.status),
       width: edgeWidth(link.throughput_bps),
@@ -815,7 +784,7 @@ function renderTables(data) {
   packetIoTbody.innerHTML = packetRows.length
     ? packetRows.map(p => `<tr><td>${esc(p.kind)}</td><td>${fmtBytes(p.total_bytes)}</td><td>${fmtBytes(p.sent_bytes)}<br><span class="transport">${p.sent_count}</span></td><td>${fmtBytes(p.recv_bytes)}<br><span class="transport">${p.recv_count}</span></td><td>${p.total_count}</td><td>${fmtBps(p.avg_total_bps)}</td></tr>`).join('')
     : `<tr><td colspan="6" class="transport">-</td></tr>`;
-  metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${compressionCell(m)}</td><td>${serviceProbeCell(m, 'voice')}</td><td>${serviceProbeCell(m, 'control')}</td><td>${serviceProbeCell(m, 'bulk')}</td></tr>`).join('');
+  metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${compressionCell(m)}</td></tr>`).join('');
   routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${esc(r.transport)}</td><td><span class="pill ${esc(r.service_fit)}">${esc(r.service_fit)}</span></td><td>${r.cost}</td><td>${r.transport_cost ?? '-'}</td></tr>`).join('');
 }
 async function refresh() {

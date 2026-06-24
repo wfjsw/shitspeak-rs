@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 
 use crate::types::NodeIdentifier;
 
-use super::service_level::{RoutingMetric, ServiceLevel, ServiceShape, TransportKind};
+use super::service_level::{RoutingMetric, ServiceLevel, TransportKind};
 
 const E_MODEL_R0: f64 = 93.2;
 const E_MODEL_DELAY_KNEE_MS: f64 = 177.3;
@@ -110,7 +110,7 @@ pub struct MetricsTuning {
     pub latency_alpha: f64,
     /// Smoothing coefficient for the jitter EWMA (RFC 3550 uses 1/16).
     pub jitter_alpha: f64,
-    /// Smoothing coefficient for the active-probe throughput EWMA.
+    /// Deprecated no-op retained for compatibility with old configs.
     pub throughput_alpha: f64,
     /// Smoothing coefficient for the long-term packet-loss EWMA.
     pub packet_loss_alpha: f64,
@@ -156,8 +156,7 @@ pub struct LinkMetrics {
     loss: LossBreakdown,
     samples: u64,
     last_update: Option<Instant>,
-    /// EWMA of service-shaped active probe goodput, in useful payload bytes/sec.
-    service_probes: HashMap<ServiceShape, ServiceProbeMetrics>,
+    throughput_confidence_ppm: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -283,22 +282,6 @@ impl LossBreakdown {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ServiceProbeMetrics {
-    goodput_bps: f64,
-    samples: u64,
-}
-
-impl ServiceProbeMetrics {
-    pub fn goodput_bps(&self) -> f64 {
-        self.goodput_bps
-    }
-
-    pub fn samples(&self) -> u64 {
-        self.samples
-    }
-}
-
 impl LinkMetrics {
     pub fn rtt_us(&self) -> f64 {
         self.rtt_us
@@ -416,24 +399,6 @@ impl LinkMetrics {
         self.last_update
     }
 
-    pub fn probe_samples(&self) -> u64 {
-        self.service_probes
-            .values()
-            .map(ServiceProbeMetrics::samples)
-            .sum()
-    }
-
-    pub fn service_probe(&self, shape: ServiceShape) -> ServiceProbeMetrics {
-        self.service_probes.get(&shape).copied().unwrap_or_default()
-    }
-
-    pub fn max_probe_goodput_bps(&self) -> f64 {
-        self.service_probes
-            .values()
-            .map(ServiceProbeMetrics::goodput_bps)
-            .fold(0.0, f64::max)
-    }
-
     /// Approximate average inbound bandwidth in bytes/sec over the current window.
     pub fn recv_bps(&self) -> f64 {
         if self.window.is_zero() {
@@ -448,6 +413,18 @@ impl LinkMetrics {
             return 0.0;
         }
         (self.sent_bytes as f64) / self.window.as_secs_f64()
+    }
+
+    pub fn observed_recv_bps(&self) -> f64 {
+        self.recv_bps()
+    }
+
+    pub fn observed_sent_bps(&self) -> f64 {
+        self.sent_bps()
+    }
+
+    pub fn throughput_confidence_ppm(&self) -> u32 {
+        self.throughput_confidence_ppm
     }
 
     pub fn wire_recv_bps(&self) -> f64 {
@@ -481,13 +458,10 @@ impl LinkMetrics {
         )
     }
 
-    /// Best estimate of the link's available throughput. Returns whichever is
-    /// larger of (a) actual bytes flowing in/out across the rolling window
-    /// and (b) the active probe's measured throughput. This ensures an idle
-    /// link still reports a non-zero throughput estimate.
+    /// Passive outbound payload throughput in bytes/sec. This is a lower bound
+    /// based only on real application data, not active probes.
     pub fn estimated_throughput_bps(&self) -> f64 {
-        let utilized = self.recv_bps().max(self.sent_bps());
-        utilized.max(self.max_probe_goodput_bps())
+        self.observed_sent_bps()
     }
 
     /// E-model-inspired conversational link-quality score. Higher is better.
@@ -669,8 +643,28 @@ impl SlidingCounters {
         }
     }
     fn snapshot(&self) -> (u64, Duration) {
-        (self.bytes, self.window_start.elapsed())
+        let age = self.window_start.elapsed();
+        if age >= self.window {
+            return (0, age);
+        }
+        (self.bytes, age)
     }
+}
+
+fn throughput_confidence_ppm(
+    sent_bytes: u64,
+    recv_bytes: u64,
+    sent_age: Duration,
+    recv_age: Duration,
+) -> u32 {
+    if sent_bytes == 0 && recv_bytes == 0 {
+        return 0;
+    }
+    let age = sent_age.max(recv_age).as_secs_f64();
+    if age <= 0.0 {
+        return MAX_PACKET_LOSS_PPM;
+    }
+    ((age / 1.0).min(1.0) * MAX_PACKET_LOSS_PPM as f64).round() as u32
 }
 
 #[derive(Debug)]
@@ -748,13 +742,6 @@ struct LinkInner {
     native_loss_ewma_ppm: f64,
     native_loss_ewma_samples: u64,
     data_health: LossWindow,
-    service_probes: HashMap<ServiceShape, ServiceProbeInner>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ServiceProbeInner {
-    goodput_bps: f64,
-    samples: u64,
 }
 
 impl LinkInner {
@@ -780,7 +767,6 @@ impl LinkInner {
             native_loss_ewma_ppm: 0.0,
             native_loss_ewma_samples: 0,
             data_health: LossWindow::new(window),
-            service_probes: HashMap::new(),
         }
     }
 
@@ -985,37 +971,6 @@ impl PeerMetrics {
         entry.last_update = Some(Instant::now());
     }
 
-    /// Record one service-shaped active probe: `payload_bytes` useful bytes
-    /// were delivered by this transport shape in `elapsed`.
-    pub fn record_probe(
-        &self,
-        transport: TransportKind,
-        shape: ServiceShape,
-        payload_bytes: usize,
-        elapsed: Duration,
-    ) {
-        if payload_bytes == 0 {
-            return;
-        }
-        let secs = elapsed.as_secs_f64().max(1e-6);
-        let bps = (payload_bytes as f64) / secs;
-        let mut g = self.inner.lock();
-        let entry = g
-            .entry(transport)
-            .or_insert_with(|| LinkInner::new(self.window));
-        let probe = entry
-            .service_probes
-            .entry(shape)
-            .or_insert(ServiceProbeInner {
-                goodput_bps: bps,
-                samples: 0,
-            });
-        if probe.samples > 0 {
-            probe.goodput_bps += self.tuning.throughput_alpha * (bps - probe.goodput_bps);
-        }
-        probe.samples += 1;
-    }
-
     pub fn snapshot_per_transport(&self) -> HashMap<TransportKind, LinkMetrics> {
         let g = self.inner.lock();
         g.iter()
@@ -1075,6 +1030,8 @@ impl PeerMetrics {
                         .max(data_health_age)
                         .max(Duration::from_micros(1)),
                 );
+                let throughput_confidence_ppm =
+                    throughput_confidence_ppm(sent_bytes, recv_bytes, sent_age, recv_age);
                 let m = LinkMetrics {
                     rtt_us: inner.rtt_us.unwrap_or(0.0),
                     jitter_us: inner.jitter_us,
@@ -1090,19 +1047,7 @@ impl PeerMetrics {
                     loss,
                     samples: inner.samples,
                     last_update: inner.last_update,
-                    service_probes: inner
-                        .service_probes
-                        .iter()
-                        .map(|(shape, probe)| {
-                            (
-                                *shape,
-                                ServiceProbeMetrics {
-                                    goodput_bps: probe.goodput_bps,
-                                    samples: probe.samples,
-                                },
-                            )
-                        })
-                        .collect(),
+                    throughput_confidence_ppm,
                 };
                 (*t, m)
             })
@@ -1263,21 +1208,35 @@ mod tests {
         let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
         let candidates = [TransportKind::Tcp, TransportKind::Quic];
 
-        m.record_rtt(TransportKind::Tcp, Duration::from_millis(5));
-        m.record_probe(
-            TransportKind::Tcp,
-            ServiceShape::Bulk,
-            100,
-            Duration::from_secs(1),
-        );
-
-        m.record_rtt(TransportKind::Quic, Duration::from_millis(25));
-        m.record_probe(
-            TransportKind::Quic,
-            ServiceShape::Bulk,
-            1024 * 1024,
-            Duration::from_millis(50),
-        );
+        {
+            let mut g = m.inner.lock();
+            g.insert(
+                TransportKind::Tcp,
+                LinkInner {
+                    rtt_us: Some(5_000.0),
+                    samples: 1,
+                    sent: SlidingCounters {
+                        bytes: 1_024,
+                        window_start: Instant::now() - Duration::from_secs(1),
+                        window: Duration::from_secs(60),
+                    },
+                    ..LinkInner::new(Duration::from_secs(60))
+                },
+            );
+            g.insert(
+                TransportKind::Quic,
+                LinkInner {
+                    rtt_us: Some(25_000.0),
+                    samples: 1,
+                    sent: SlidingCounters {
+                        bytes: 1024 * 1024,
+                        window_start: Instant::now() - Duration::from_secs(1),
+                        window: Duration::from_secs(60),
+                    },
+                    ..LinkInner::new(Duration::from_secs(60))
+                },
+            );
+        }
 
         assert_eq!(
             m.best_transport_for(
@@ -1587,84 +1546,42 @@ mod tests {
     }
 
     #[test]
-    fn probe_throughput_smooths() {
-        let m = PeerMetrics::new(Duration::from_secs(5), MetricsTuning::default());
-        // 8 KB useful payload in 1 ms = 8 MB/s.
-        m.record_probe(
-            TransportKind::Tcp,
-            ServiceShape::Bulk,
-            8192,
-            Duration::from_millis(1),
-        );
-        m.record_probe(
-            TransportKind::Tcp,
-            ServiceShape::Bulk,
-            8192,
-            Duration::from_millis(1),
-        );
-        m.record_probe(
-            TransportKind::Tcp,
-            ServiceShape::Bulk,
-            8192,
-            Duration::from_millis(1),
-        );
-        let snap = m.snapshot_per_transport();
-        let tcp = snap.get(&TransportKind::Tcp).unwrap();
-        let expected = 8192.0 / 1e-3;
-        assert!((tcp.max_probe_goodput_bps() - expected).abs() < 1.0);
-        assert_eq!(tcp.probe_samples(), 3);
-        assert_eq!(tcp.service_probe(ServiceShape::Bulk).samples(), 3);
-    }
-
-    #[test]
-    fn estimated_throughput_takes_max() {
+    fn observed_throughput_is_directional_and_passive() {
         let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
-        m.record_payload_sent(TransportKind::Tcp, 100); // tiny actual flow
-        m.record_probe(
-            TransportKind::Tcp,
-            ServiceShape::Bulk,
-            8192,
-            Duration::from_millis(1),
-        ); // probe says 8 MB/s
+        m.record_probe_delivered(TransportKind::Tcp);
+        m.record_payload_sent(TransportKind::Tcp, 100);
+        m.record_payload_recv(TransportKind::Tcp, 50);
         let snap = m.snapshot_per_transport();
         let tcp = snap.get(&TransportKind::Tcp).unwrap();
-        // Probe estimate dominates because actual flow is tiny.
-        assert!(tcp.estimated_throughput_bps() > 1_000_000.0);
+        assert!(tcp.observed_sent_bps() > tcp.observed_recv_bps());
+        assert_eq!(tcp.estimated_throughput_bps(), tcp.observed_sent_bps());
+        assert!(tcp.throughput_confidence_ppm() > 0);
     }
 
     #[test]
     fn quality_score_prefers_stronger_composite_link() {
         assert_eq!(LinkMetrics::default().quality_score(), None);
 
-        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
-
-        m.record_rtt(TransportKind::Tcp, Duration::from_millis(5));
-        m.record_rtt(TransportKind::Tcp, Duration::from_millis(80));
-        m.record_probe(
-            TransportKind::Tcp,
-            ServiceShape::Bulk,
-            1024,
-            Duration::from_millis(100),
-        );
-
-        m.record_rtt(TransportKind::Quic, Duration::from_millis(25));
-        m.record_rtt(TransportKind::Quic, Duration::from_millis(26));
-        m.record_probe(
-            TransportKind::Quic,
-            ServiceShape::Bulk,
-            1024 * 1024,
-            Duration::from_millis(50),
-        );
-
-        let snap = m.snapshot_per_transport();
-        let tcp = snap
-            .get(&TransportKind::Tcp)
-            .and_then(LinkMetrics::quality_score)
-            .unwrap();
-        let quic = snap
-            .get(&TransportKind::Quic)
-            .and_then(LinkMetrics::quality_score)
-            .unwrap();
+        let tcp = LinkMetrics {
+            rtt_us: 5_000.0,
+            jitter_us: 75_000.0,
+            sent_bytes: 1_024,
+            window: Duration::from_secs(1),
+            samples: 2,
+            ..LinkMetrics::default()
+        }
+        .quality_score()
+        .unwrap();
+        let quic = LinkMetrics {
+            rtt_us: 25_000.0,
+            jitter_us: 1_000.0,
+            sent_bytes: 1024 * 1024,
+            window: Duration::from_secs(1),
+            samples: 2,
+            ..LinkMetrics::default()
+        }
+        .quality_score()
+        .unwrap();
 
         assert!(quic > tcp, "quic={quic} tcp={tcp}");
     }

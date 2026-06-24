@@ -18,7 +18,6 @@ mod local_ip;
 mod manager;
 mod metrics;
 mod native_stats;
-mod probe_schedule;
 mod public_ip;
 mod service_level;
 mod stream_io;

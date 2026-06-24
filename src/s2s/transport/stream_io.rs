@@ -7,13 +7,10 @@
 //!     local `NodeIdentifier` as `src_node`, then encodes with prost +
 //!     length-prefix via `LengthDelimitedCodec`;
 //!   * decodes incoming length-prefixed frames, dispatches `Data` to the
-//!     appropriate inbound mpsc, generates `Pong` for `Ping` (echoing the
-//!     ping's payload back so bandwidth probes round-trip enough bytes),
-//!     and updates RTT + jitter + probe-goodput metrics for `Pong`;
-//!   * periodically issues two kinds of self-driven Pings:
-//!       - a small Ping every `ping_interval` for latency / jitter;
-//!       - service-shaped probe Pings derived from `bandwidth_probe_size` every
-//!         `bandwidth_probe_interval` for throughput estimation;
+//!     appropriate inbound mpsc, generates `Pong` for `Ping`, and updates RTT
+//!     + jitter metrics for `Pong`;
+//!   * periodically issues a small keepalive Ping every `ping_interval` for
+//!     latency / jitter and liveness;
 //!   * exits on EOF, write error, or `closed` cancellation.
 
 use std::collections::{HashMap, VecDeque};
@@ -44,10 +41,7 @@ use super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::frame::{FrameType, build_frame, stream_codec};
 use super::manager::InboundDispatch;
 use super::native_stats::BoxedNativeLossSampler;
-use super::probe_schedule::{
-    StartupBandwidthProbe, bandwidth_probe_startup_jitter, stabilized_ping_interval,
-};
-use super::service_level::{MessageClass, ServiceLevel, ServiceShape, TransportKind};
+use super::service_level::{MessageClass, ServiceLevel, TransportKind};
 
 const DICTIONARY_COMPRESSION_HELLO_CAPABILITY: &[u8] = b"shitspeak-s2s-l1-zstd-dict-v1";
 const DICTIONARY_COMPRESSION_LEGACY_ADAPTIVE_FLAG: u8 = 0x01;
@@ -123,8 +117,6 @@ pub(crate) struct StreamPumpConfig {
     outbound_capacity: usize,
     ping_interval: Duration,
     idle_ping_interval: Duration,
-    bandwidth_probe_interval: Duration,
-    bandwidth_probe_size: usize,
     native_stats_interval: Duration,
     compression: CompressionConfig,
     /// Cap on how many in-flight pings we remember. Older entries are
@@ -143,8 +135,6 @@ impl StreamPumpConfig {
         outbound_capacity: usize,
         ping_interval: Duration,
         idle_ping_interval: Duration,
-        bandwidth_probe_interval: Duration,
-        bandwidth_probe_size: usize,
         native_stats_interval: Duration,
         compression: CompressionConfig,
         max_pending_pings: usize,
@@ -157,8 +147,6 @@ impl StreamPumpConfig {
             outbound_capacity,
             ping_interval,
             idle_ping_interval,
-            bandwidth_probe_interval,
-            bandwidth_probe_size,
             native_stats_interval,
             compression,
             max_pending_pings,
@@ -207,8 +195,6 @@ struct PendingPings {
 #[derive(Debug, Clone, Copy)]
 struct PendingPing {
     sent_at: Instant,
-    shape: Option<ServiceShape>,
-    payload_bytes: usize,
 }
 
 impl PendingPings {
@@ -218,12 +204,7 @@ impl PendingPings {
             cap,
         }
     }
-    fn insert(
-        &mut self,
-        ts_us: u64,
-        shape: Option<ServiceShape>,
-        payload_bytes: usize,
-    ) -> Option<PendingPing> {
+    fn insert(&mut self, ts_us: u64) -> Option<PendingPing> {
         if self.cap == 0 {
             return None;
         }
@@ -236,8 +217,6 @@ impl PendingPings {
             ts_us,
             PendingPing {
                 sent_at: Instant::now(),
-                shape,
-                payload_bytes,
             },
         ));
         evicted
@@ -255,11 +234,7 @@ impl PendingPings {
             .front()
             .is_some_and(|(_, pending)| now.saturating_duration_since(pending.sent_at) >= timeout)
         {
-            if self
-                .inner
-                .pop_front()
-                .is_some_and(|(_, pending)| pending.shape.is_none())
-            {
+            if self.inner.pop_front().is_some() {
                 expired_liveness += 1;
             }
         }
@@ -279,17 +254,6 @@ impl MaybeInterval {
             Self::Disabled
         } else {
             Self::Active(interval_at(TokioInstant::now() + period, period))
-        }
-    }
-
-    fn maybe_with_initial_delay(period: Duration, initial_delay: Duration) -> Self {
-        if period.is_zero() {
-            Self::Disabled
-        } else {
-            Self::Active(interval_at(
-                TokioInstant::now() + period.saturating_add(initial_delay),
-                period,
-            ))
         }
     }
 
@@ -322,6 +286,10 @@ fn is_peer_closed_initial_write(error: &io::Error) -> bool {
     )
 }
 
+fn stabilized_ping_interval(active: Duration, idle: Duration) -> Duration {
+    if idle.is_zero() { active } else { idle }
+}
+
 async fn run_pump<S>(
     stream: S,
     cfg: StreamPumpConfig,
@@ -338,23 +306,6 @@ async fn run_pump<S>(
     let mut ping_tick = MaybeInterval::maybe(cfg.ping_interval);
     let stable_ping_interval = stabilized_ping_interval(cfg.ping_interval, cfg.idle_ping_interval);
     let mut stable_ping_interval_armed = false;
-    let probe_enabled = cfg.bandwidth_probe_size > 0;
-    let startup_probe_delay = bandwidth_probe_startup_jitter(
-        cfg.local_node,
-        cfg.peer_node,
-        cfg.transport,
-        cfg.ping_interval,
-    );
-    let mut startup_probe = StartupBandwidthProbe::new(
-        probe_enabled && !cfg.bandwidth_probe_interval.is_zero(),
-        startup_probe_delay,
-    );
-    let periodic_probe_delay = startup_probe_delay.min(cfg.bandwidth_probe_interval);
-    let mut probe_tick = if probe_enabled {
-        MaybeInterval::maybe_with_initial_delay(cfg.bandwidth_probe_interval, periodic_probe_delay)
-    } else {
-        MaybeInterval::Disabled
-    };
     let mut native_tick = if native_sampler.is_some() {
         MaybeInterval::maybe(cfg.native_stats_interval)
     } else {
@@ -475,7 +426,6 @@ async fn run_pump<S>(
                                     break;
                                 }
                                 if transport_link_stable {
-                                    startup_probe.arm();
                                     if !stable_ping_interval_armed
                                         && stable_ping_interval != cfg.ping_interval
                                     {
@@ -594,7 +544,7 @@ async fn run_pump<S>(
                 match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
                     Ok(_) => {
                         record_evicted_pending(
-                            pending.insert(ts, None, 0),
+                            pending.insert(ts),
                             cfg.transport,
                             &peer,
                         );
@@ -603,31 +553,6 @@ async fn run_pump<S>(
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "keepalive write failed");
                         break;
                     }
-                }
-            }
-
-            _ = startup_probe.tick() => {
-                startup_probe.complete();
-                if send_bandwidth_probes(
-                    &mut framed,
-                    &cfg,
-                    &peer,
-                    &mut pending,
-                    pending_timeout,
-                ).await.is_err() {
-                    break;
-                }
-            }
-
-            _ = probe_tick.tick() => {
-                if send_bandwidth_probes(
-                    &mut framed,
-                    &cfg,
-                    &peer,
-                    &mut pending,
-                    pending_timeout,
-                ).await.is_err() {
-                    break;
                 }
             }
 
@@ -649,54 +574,6 @@ async fn run_pump<S>(
     trace!(peer=%peer.node_id(), transport=?cfg.transport, "stream pump exiting");
 }
 
-async fn send_bandwidth_probes<S>(
-    framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
-    cfg: &StreamPumpConfig,
-    peer: &PeerState,
-    pending: &mut PendingPings,
-    pending_timeout: Duration,
-) -> std::io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Send + Unpin,
-{
-    record_expired_pending(pending, pending_timeout, cfg.transport, peer);
-    let mut ts = now_us();
-    for shape in ServiceShape::ALL {
-        let payload_bytes = shape.probe_payload_bytes(cfg.bandwidth_probe_size);
-        if payload_bytes == 0 {
-            continue;
-        }
-        let payload = BytesMut::zeroed(payload_bytes).freeze();
-        let frame = build_frame(
-            cfg.local_node,
-            cfg.peer_node,
-            shape.service_level(),
-            FrameType::Ping,
-            shape.message_class(),
-            ts,
-            payload,
-        );
-        if frame.encoded_len() > cfg.max_frame_bytes {
-            continue;
-        }
-        match encode_and_send_returning_size(framed, &frame, cfg.transport, peer).await {
-            Ok(_) => {
-                record_evicted_pending(
-                    pending.insert(ts, Some(shape), payload_bytes),
-                    cfg.transport,
-                    peer,
-                );
-            }
-            Err(e) => {
-                warn!(peer=%peer.node_id(), transport=?cfg.transport, service=%shape.name(), error=%e, "probe write failed");
-                return Err(e);
-            }
-        }
-        ts = ts.saturating_add(1);
-    }
-    Ok(())
-}
-
 fn record_expired_pending(
     pending: &mut PendingPings,
     timeout: Duration,
@@ -713,7 +590,7 @@ fn record_evicted_pending(
     transport: TransportKind,
     peer: &PeerState,
 ) {
-    if evicted.is_some_and(|pending| pending.shape.is_none()) {
+    if evicted.is_some() {
         peer.metrics().record_probe_lost(transport);
     }
 }
@@ -1087,18 +964,8 @@ where
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(cfg.transport, rtt);
                 if let Some(pending) = pending.take(frame.ts_us) {
-                    if pending.shape.is_none() {
-                        peer.metrics().record_probe_delivered(cfg.transport);
-                        transport_link_stable = true;
-                    }
-                    if let Some(shape) = pending.shape {
-                        peer.metrics().record_probe(
-                            cfg.transport,
-                            shape,
-                            pending.payload_bytes,
-                            rtt,
-                        );
-                    }
+                    peer.metrics().record_probe_delivered(cfg.transport);
+                    transport_link_stable = true;
                 }
             }
         }
@@ -1463,28 +1330,19 @@ mod tests {
     }
 
     #[test]
-    fn expiring_service_probe_does_not_count_as_liveness_loss() {
+    fn expiring_keepalive_counts_as_liveness_loss() {
         let mut pending = PendingPings::new(4);
-        assert!(pending.insert(1, None, 0).is_none());
-        assert!(
-            pending
-                .insert(2, Some(ServiceShape::Bulk), 64 * 1024)
-                .is_none()
-        );
+        assert!(pending.insert(1).is_none());
+        assert!(pending.insert(2).is_none());
 
-        assert_eq!(pending.expire_older_than(Duration::ZERO), 1);
+        assert_eq!(pending.expire_older_than(Duration::ZERO), 2);
     }
 
     #[test]
-    fn evicted_pending_probe_preserves_shape_for_loss_accounting() {
+    fn evicted_pending_keepalive_is_returned_for_loss_accounting() {
         let mut pending = PendingPings::new(1);
-        assert!(
-            pending
-                .insert(1, Some(ServiceShape::Control), 1024)
-                .is_none()
-        );
+        assert!(pending.insert(1).is_none());
 
-        let evicted = pending.insert(2, None, 0).expect("old probe evicted");
-        assert_eq!(evicted.shape, Some(ServiceShape::Control));
+        assert!(pending.insert(2).is_some());
     }
 }

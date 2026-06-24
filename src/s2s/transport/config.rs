@@ -12,9 +12,7 @@ use super::compression::{
     default_compression_level, default_compression_min_bytes,
     default_compression_min_savings_percent,
 };
-use super::service_level::{PeerAddress, SeedAddress, ServiceShape, TransportKind};
-
-const PROBE_FRAME_OVERHEAD_BUDGET: usize = 128;
+use super::service_level::{PeerAddress, SeedAddress, TransportKind};
 
 /// Knobs for [`super::ConnectionManager::start`]. All listeners are optional —
 /// at least one must be set or [`super::ConfigError::NoListener`] is returned.
@@ -56,15 +54,9 @@ pub struct TransportConfig {
     idle_ping_interval: Duration,
     bandwidth_window: Duration,
 
-    /// How often to send a bandwidth-probe Ping (in addition to the small,
-    /// latency-only `ping_interval`). The receiver echoes the payload back as
-    /// a Pong so the round trip carries enough bytes to be meaningful.
-    /// Set to zero to disable.
+    /// Deprecated no-op retained so older config files and tests still parse.
     bandwidth_probe_interval: Duration,
-    /// Payload size of the bulk service-shaped probe, in bytes. Voice and
-    /// control probes derive smaller payloads from this cap. The link's
-    /// payload traffic meter measures only real Data bytes; probes provide an
-    /// idle-link goodput estimate by service shape.
+    /// Deprecated no-op retained so older config files and tests still parse.
     bandwidth_probe_size: usize,
 
     inbound_control_capacity: usize,
@@ -81,7 +73,7 @@ pub struct TransportConfig {
     latency_ewma_alpha: f64,
     /// EWMA coefficient for the jitter estimate (RFC 3550 uses 1/16).
     jitter_ewma_alpha: f64,
-    /// EWMA coefficient for the active-probe throughput estimate.
+    /// Deprecated no-op retained for compatibility with old configs.
     throughput_ewma_alpha: f64,
     /// EWMA coefficient for the long-term packet-loss estimate.
     packet_loss_ewma_alpha: f64,
@@ -140,8 +132,8 @@ impl TransportConfig {
             ping_interval: Duration::from_secs(2),
             idle_ping_interval: Duration::from_secs(10),
             bandwidth_window: Duration::from_secs(5),
-            bandwidth_probe_interval: Duration::from_secs(3 * 60 * 60),
-            bandwidth_probe_size: 64 * 1024,
+            bandwidth_probe_interval: Duration::ZERO,
+            bandwidth_probe_size: 0,
             inbound_control_capacity: 1024,
             inbound_high_capacity: 1024,
             inbound_regular_capacity: 1024,
@@ -317,24 +309,6 @@ impl TransportConfig {
 
     pub fn bandwidth_probe_size(&self) -> usize {
         self.bandwidth_probe_size
-    }
-
-    pub fn service_probe_payload_size(&self, shape: ServiceShape) -> usize {
-        shape.probe_payload_bytes(self.bandwidth_probe_size)
-    }
-
-    pub fn service_probe_supported(&self, transport: TransportKind, shape: ServiceShape) -> bool {
-        let payload = self.service_probe_payload_size(shape);
-        if payload == 0 || self.bandwidth_probe_interval.is_zero() {
-            return false;
-        }
-        let budgeted_frame = payload.saturating_add(PROBE_FRAME_OVERHEAD_BUDGET);
-        match transport {
-            TransportKind::Udp => budgeted_frame <= self.udp_mtu,
-            TransportKind::Tcp | TransportKind::Kcp | TransportKind::Quic => {
-                budgeted_frame <= self.max_frame_bytes
-            }
-        }
     }
 
     pub fn inbound_control_capacity(&self) -> usize {
@@ -609,12 +583,14 @@ impl TransportConfig {
     }
 
     pub fn with_bandwidth_probe_interval(mut self, d: Duration) -> Self {
-        self.bandwidth_probe_interval = d;
+        let _ = d;
+        self.bandwidth_probe_interval = Duration::ZERO;
         self
     }
 
     pub fn with_bandwidth_probe_size(mut self, n: usize) -> Self {
-        self.bandwidth_probe_size = n;
+        let _ = n;
+        self.bandwidth_probe_size = 0;
         self
     }
 
@@ -959,4 +935,47 @@ fn default_unselected_link_probe_interval_secs() -> u64 {
 }
 fn default_max_outgoing_connections() -> usize {
     1024
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> TransportConfig {
+        TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into())
+    }
+
+    #[test]
+    fn deprecated_bandwidth_probe_builders_are_noops() {
+        let cfg = base_config()
+            .with_bandwidth_probe_interval(Duration::from_secs(5))
+            .with_bandwidth_probe_size(65_536)
+            .with_throughput_ewma_alpha(0.75);
+
+        assert_eq!(cfg.bandwidth_probe_interval(), Duration::ZERO);
+        assert_eq!(cfg.bandwidth_probe_size(), 0);
+        assert_eq!(cfg.throughput_ewma_alpha(), 0.75);
+    }
+
+    #[test]
+    fn deprecated_bandwidth_probe_tuning_keys_parse_without_enabling_probes() {
+        let tuning: TransportTuning = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    throughput_ewma_alpha = 0.75
+                    bandwidth_probe_interval_secs = 2
+                    bandwidth_probe_size = 65536
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("transport tuning parses");
+        let cfg = tuning.apply(base_config());
+
+        assert_eq!(cfg.bandwidth_probe_interval(), Duration::ZERO);
+        assert_eq!(cfg.bandwidth_probe_size(), 0);
+        assert_eq!(cfg.throughput_ewma_alpha(), 0.75);
+    }
 }

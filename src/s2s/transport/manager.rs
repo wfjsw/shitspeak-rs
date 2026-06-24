@@ -1065,7 +1065,6 @@ fn udp_family_listen_addrs(cfg: &TransportConfig) -> Vec<(TransportKind, SocketA
 #[cfg(test)]
 mod tests {
     use super::super::connection::ActiveStream;
-    use super::super::service_level::ServiceShape;
     use super::*;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1140,20 +1139,11 @@ mod tests {
 
         peer.metrics()
             .record_rtt(TransportKind::Tcp, Duration::from_millis(5));
-        peer.metrics().record_probe(
-            TransportKind::Tcp,
-            ServiceShape::Bulk,
-            100,
-            Duration::from_secs(1),
-        );
+        peer.metrics().record_payload_sent(TransportKind::Tcp, 100);
         peer.metrics()
             .record_rtt(TransportKind::Quic, Duration::from_millis(25));
-        peer.metrics().record_probe(
-            TransportKind::Quic,
-            ServiceShape::Bulk,
-            1024 * 1024,
-            Duration::from_millis(50),
-        );
+        peer.metrics()
+            .record_payload_sent(TransportKind::Quic, 1024 * 1024);
 
         assert_eq!(
             pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::ReliableCost),

@@ -285,9 +285,11 @@ fn has_confident_excessive_loss(link: &LinkAdvertised, max_loss_ppm: u32) -> boo
 }
 
 fn compute_cost(link: &LinkAdvertised, metric: RoutingMetric, cfg: &OverlayConfig) -> EdgeCost {
+    let route_throughput_bps =
+        confidence_weighted_throughput_bps(link.observed_sent_bps, link.throughput_confidence_ppm);
     let primary = match metric {
         RoutingMetric::ReliableCost => {
-            compute_reliable_cost(link.rtt_us, link.throughput_bps, link.loss_ppm, cfg)
+            compute_reliable_cost(link.rtt_us, route_throughput_bps, link.loss_ppm, cfg)
         }
         RoutingMetric::ReliableLowLatencyCost => {
             compute_reliable_low_latency_cost(link.rtt_us, link.jitter_us, link.loss_ppm, cfg)
@@ -298,7 +300,7 @@ fn compute_cost(link: &LinkAdvertised, metric: RoutingMetric, cfg: &OverlayConfi
         RoutingMetric::ConversationalQuality => (conversational_impairment(
             link.rtt_us as f64,
             link.jitter_us as f64,
-            link.throughput_bps as f64,
+            route_throughput_bps as f64,
             link.loss_ppm,
         ) * 1_000.0)
             .ceil()
@@ -316,6 +318,16 @@ fn compute_cost(link: &LinkAdvertised, metric: RoutingMetric, cfg: &OverlayConfi
         primary: primary.max(1),
         latency_us,
     }
+}
+
+fn confidence_weighted_throughput_bps(observed_sent_bps: u64, confidence_ppm: u32) -> u64 {
+    if observed_sent_bps == 0 {
+        return 0;
+    }
+    let confidence = u64::from(confidence_ppm.min(1_000_000));
+    observed_sent_bps
+        .saturating_mul(confidence)
+        .saturating_div(1_000_000)
 }
 
 fn route_loss_is_confident(link: &LinkAdvertised) -> bool {
@@ -401,6 +413,9 @@ mod tests {
                     rtt_us: rtt,
                     jitter_us: jitter,
                     throughput_bps: tput,
+                    observed_recv_bps: tput,
+                    observed_sent_bps: tput,
+                    throughput_confidence_ppm: 1_000_000,
                     transports_mask: super::super::super::config::transport_bit(
                         crate::s2s::transport::TransportKind::Tcp,
                     ),
@@ -448,6 +463,9 @@ mod tests {
                         rtt_us: rtt,
                         jitter_us: jitter,
                         throughput_bps: tput,
+                        observed_recv_bps: tput,
+                        observed_sent_bps: tput,
+                        throughput_confidence_ppm: 1_000_000,
                         transports_mask: super::super::super::config::transport_bit(
                             crate::s2s::transport::TransportKind::Tcp,
                         ),

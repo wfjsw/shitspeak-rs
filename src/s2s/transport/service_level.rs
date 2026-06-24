@@ -126,8 +126,8 @@ pub enum MessageClass {
     Regular,
 }
 
-/// Application traffic shape used by active transport probes and topology
-/// reporting. These are workload shapes, not new reliability tiers.
+/// Application traffic shape used by topology reporting. These are workload
+/// shapes, not new reliability tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ServiceShape {
     Voice,
@@ -158,17 +158,6 @@ impl ServiceShape {
         match self {
             Self::Voice | Self::Control => MessageClass::HighPriority,
             Self::Bulk => MessageClass::Regular,
-        }
-    }
-
-    pub fn probe_payload_bytes(self, bulk_payload_bytes: usize) -> usize {
-        if bulk_payload_bytes == 0 {
-            return 0;
-        }
-        match self {
-            Self::Voice => 160.min(bulk_payload_bytes),
-            Self::Control => 1024.min(bulk_payload_bytes),
-            Self::Bulk => bulk_payload_bytes,
         }
     }
 }

@@ -116,6 +116,9 @@ pub struct LinkAdvertised {
     pub rtt_us: u64,
     pub jitter_us: u64,
     pub throughput_bps: u64,
+    pub observed_recv_bps: u64,
+    pub observed_sent_bps: u64,
+    pub throughput_confidence_ppm: u32,
     pub transports_mask: u32,
     /// Legacy route-cost value: the conservative effective loss.
     pub loss_ppm: u32,
@@ -305,6 +308,24 @@ fn describe_single_link_delta(
         previous.throughput_bps,
         current.throughput_bps,
     );
+    push_scalar_change(
+        &mut fields,
+        "observed_recv_bps",
+        previous.observed_recv_bps,
+        current.observed_recv_bps,
+    );
+    push_scalar_change(
+        &mut fields,
+        "observed_sent_bps",
+        previous.observed_sent_bps,
+        current.observed_sent_bps,
+    );
+    push_scalar_change(
+        &mut fields,
+        "throughput_confidence_ppm",
+        previous.throughput_confidence_ppm,
+        current.throughput_confidence_ppm,
+    );
     if previous.transports_mask != current.transports_mask {
         fields.push(format!(
             "transports_mask {:#x}->{:#x}",
@@ -355,11 +376,29 @@ impl LsaEntry {
             .iter()
             .filter_map(|l| {
                 let neighbor = NodeIdentifier::try_from(l.neighbor).ok()?;
+                let observed_recv_bps = l.observed_recv_bps;
+                let observed_sent_bps = if l.observed_sent_bps > 0 {
+                    l.observed_sent_bps
+                } else {
+                    l.throughput_bps
+                };
+                let throughput_confidence_ppm = if l.throughput_confidence_ppm > 0 {
+                    l.throughput_confidence_ppm.min(1_000_000)
+                } else if l.throughput_bps > 0 {
+                    1_000_000
+                } else {
+                    0
+                };
                 Some(LinkAdvertised {
                     neighbor,
                     rtt_us: l.rtt_us,
                     jitter_us: l.jitter_us,
-                    throughput_bps: l.throughput_bps,
+                    throughput_bps: l
+                        .throughput_bps
+                        .max(observed_recv_bps.max(observed_sent_bps)),
+                    observed_recv_bps,
+                    observed_sent_bps,
+                    throughput_confidence_ppm,
                     transports_mask: l.transports_mask,
                     loss_ppm: l.loss_ppm,
                     probe_loss_ppm: l.probe_loss_ppm,
@@ -403,7 +442,10 @@ impl LsaEntry {
                     neighbor: node_to_wire(l.neighbor),
                     rtt_us: l.rtt_us,
                     jitter_us: l.jitter_us,
-                    throughput_bps: l.throughput_bps,
+                    throughput_bps: l.observed_recv_bps.max(l.observed_sent_bps),
+                    observed_recv_bps: l.observed_recv_bps,
+                    observed_sent_bps: l.observed_sent_bps,
+                    throughput_confidence_ppm: l.throughput_confidence_ppm.min(1_000_000),
                     transports_mask: l.transports_mask,
                     loss_ppm: l.loss_ppm,
                     probe_loss_ppm: l.probe_loss_ppm,
@@ -894,6 +936,24 @@ mod tests {
         }
     }
 
+    fn test_link(neighbor: NodeIdentifier, rtt_us: u64) -> LinkAdvertised {
+        LinkAdvertised {
+            neighbor,
+            rtt_us,
+            jitter_us: 0,
+            throughput_bps: 0,
+            observed_recv_bps: 0,
+            observed_sent_bps: 0,
+            throughput_confidence_ppm: 0,
+            transports_mask: 0,
+            loss_ppm: 0,
+            probe_loss_ppm: 0,
+            native_loss_ppm: 0,
+            data_health_ppm: 0,
+            loss_sample_count: 0,
+        }
+    }
+
     #[test]
     fn admit_first_lsa() {
         let floor = Arc::new(LsaFloor::new(0, None));
@@ -913,6 +973,9 @@ mod tests {
             rtt_us: 1_000,
             jitter_us: 100,
             throughput_bps: 10_000,
+            observed_recv_bps: 4_000,
+            observed_sent_bps: 10_000,
+            throughput_confidence_ppm: 750_000,
             transports_mask: 1,
             loss_ppm: 25_000,
             probe_loss_ppm: 10_000,
@@ -932,6 +995,10 @@ mod tests {
         assert_eq!(wire_link.native_loss_ppm, 40_000);
         assert_eq!(wire_link.data_health_ppm, 5_000);
         assert_eq!(wire_link.loss_sample_count, 123);
+        assert_eq!(wire_link.throughput_bps, 10_000);
+        assert_eq!(wire_link.observed_recv_bps, 4_000);
+        assert_eq!(wire_link.observed_sent_bps, 10_000);
+        assert_eq!(wire_link.throughput_confidence_ppm, 750_000);
         let roundtrip = LsaEntry::from_pb(&pb).unwrap();
         assert_eq!(roundtrip.max_users, 250);
         assert!(roundtrip.transit_disabled);
@@ -945,6 +1012,10 @@ mod tests {
         assert_eq!(link.native_loss_ppm, 40_000);
         assert_eq!(link.data_health_ppm, 5_000);
         assert_eq!(link.loss_sample_count, 123);
+        assert_eq!(link.throughput_bps, 10_000);
+        assert_eq!(link.observed_recv_bps, 4_000);
+        assert_eq!(link.observed_sent_bps, 10_000);
+        assert_eq!(link.throughput_confidence_ppm, 750_000);
     }
 
     #[test]
@@ -969,6 +1040,9 @@ mod tests {
         assert_eq!(link.native_loss_ppm, 0);
         assert_eq!(link.data_health_ppm, 0);
         assert_eq!(link.loss_sample_count, 0);
+        assert_eq!(link.observed_recv_bps, 0);
+        assert_eq!(link.observed_sent_bps, 0);
+        assert_eq!(link.throughput_confidence_ppm, 0);
     }
 
     #[test]
@@ -992,45 +1066,9 @@ mod tests {
         let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
         let mut alive = entry(1, 100, 1, false);
-        alive.links = vec![
-            LinkAdvertised {
-                neighbor: 2,
-                rtt_us: 1_500,
-                jitter_us: 0,
-                throughput_bps: 0,
-                transports_mask: 0,
-                loss_ppm: 0,
-                probe_loss_ppm: 0,
-                native_loss_ppm: 0,
-                data_health_ppm: 0,
-                loss_sample_count: 0,
-            },
-            LinkAdvertised {
-                neighbor: 3,
-                rtt_us: 0,
-                jitter_us: 0,
-                throughput_bps: 0,
-                transports_mask: 0,
-                loss_ppm: 0,
-                probe_loss_ppm: 0,
-                native_loss_ppm: 0,
-                data_health_ppm: 0,
-                loss_sample_count: 0,
-            },
-        ];
+        alive.links = vec![test_link(2, 1_500), test_link(3, 0)];
         let mut left = entry(4, 100, 1, true);
-        left.links = vec![LinkAdvertised {
-            neighbor: 5,
-            rtt_us: 9_000,
-            jitter_us: 0,
-            throughput_bps: 0,
-            transports_mask: 0,
-            loss_ppm: 0,
-            probe_loss_ppm: 0,
-            native_loss_ppm: 0,
-            data_health_ppm: 0,
-            loss_sample_count: 0,
-        }];
+        left.links = vec![test_link(5, 9_000)];
         db.admit(alive);
         db.admit(left);
 

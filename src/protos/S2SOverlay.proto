@@ -65,6 +65,9 @@ message LinkAdvert {
   uint32 native_loss_ppm = 8;  // Native transport declared-loss rate, parts per million.
   uint32 data_health_ppm = 9;  // Stream data-health failure rate, parts per million.
   uint64 loss_sample_count = 10; // Samples behind the current loss breakdown.
+  uint64 observed_recv_bps = 11; // Passive payload bytes/sec received by origin from neighbor.
+  uint64 observed_sent_bps = 12; // Passive payload bytes/sec sent by origin to neighbor.
+  uint32 throughput_confidence_ppm = 13; // Confidence in observed throughput, parts per million.
 }
 
 // Address entry (kept compatible with Phase 1's existing AddressEntry).
