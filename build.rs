@@ -326,12 +326,21 @@ fn pack_index_offset(idx_path: &Path, object_id: &[u8; 20]) -> Result<Option<u64
     ensure_len(&idx, names_end, idx_path)?;
 
     let names = &idx[names_start..names_end];
-    let search = names
-        .chunks_exact(20)
-        .binary_search_by(|candidate| candidate.cmp(object_id.as_slice()));
-    let object_index = match search {
-        Ok(index) => index,
-        Err(_) => return Ok(None),
+    let mut low = 0;
+    let mut high = object_count;
+    let object_index = loop {
+        if low >= high {
+            return Ok(None);
+        }
+
+        let mid = low + (high - low) / 2;
+        let candidate_start = mid * 20;
+        let candidate = &names[candidate_start..candidate_start + 20];
+        match candidate.cmp(object_id.as_slice()) {
+            std::cmp::Ordering::Less => low = mid + 1,
+            std::cmp::Ordering::Equal => break mid,
+            std::cmp::Ordering::Greater => high = mid,
+        }
     };
 
     let crcs_start = names_end;
