@@ -4,7 +4,7 @@ use crate::acl::{ACL, ACLPermissions};
 use crate::channels::Channel;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
-use crate::messages::encoder::UserStats;
+use crate::messages::encoder::{Ping, UserStats};
 
 #[tokio::test]
 async fn user_stats_omits_sensitive_fields_for_non_superuser() {
@@ -104,6 +104,24 @@ async fn user_stats_reports_bandwidth_and_idle_time() {
         .expect("alice");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
+    alice
+        .send(
+            Ping {
+                timestamp: 1,
+                tcp_packets: Some(1),
+                ..Ping::default()
+            }
+            .into(),
+        )
+        .await;
+    alice
+        .recv_until(
+            |m| matches!(m, Message::Ping(ping) if ping.timestamp == Some(1)),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Alice should receive her Ping response");
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     alice
         .send(
@@ -131,9 +149,10 @@ async fn user_stats_reports_bandwidth_and_idle_time() {
         stats.bandwidth.unwrap_or_default() > 0,
         "UserStats bandwidth should include observed TCP traffic"
     );
-    assert!(
-        stats.tcp_packets.unwrap_or_default() > 0,
-        "UserStats TCP packet count should include observed TCP frames"
+    assert_eq!(
+        stats.tcp_packets,
+        Some(1),
+        "UserStats TCP packet count should reflect Ping.tcp_packets, not all observed TCP frames"
     );
     assert!(
         stats.idlesecs.unwrap_or_default() >= 1,

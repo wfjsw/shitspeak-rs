@@ -91,6 +91,5 @@ impl ClientStats {
     }
     pub fn tcp_packets(&self) -> u32 {
         self.tcp_packets
-            .max(self.tcp_total_packets.min(u32::MAX as u64) as u32)
     }
 }
