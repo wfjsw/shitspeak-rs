@@ -98,7 +98,7 @@ enum NativeToS2SCommand {
     ProposeChannel {
         server_id: String,
         op: ChannelOp,
-        respond: oneshot::Sender<bool>,
+        respond: oneshot::Sender<ChannelOpProposeResult>,
     },
     ProposeBan {
         op: BanOp,
@@ -137,6 +137,24 @@ enum NativeToS2SCommand {
         payload: Bytes,
         intent: VoiceIntent,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ChannelOpProposeResult {
+    Proposed,
+    Unavailable,
+    Failed,
+}
+
+impl ChannelOpProposeResult {
+    pub fn is_proposed(self) -> bool {
+        matches!(self, Self::Proposed)
+    }
+
+    pub fn should_apply_locally(self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
 }
 
 struct S2SGateways {
@@ -314,10 +332,14 @@ impl S2SManager {
         self.state.write().gateway_tx = None;
     }
 
-    pub async fn propose_channel_op(&self, server_id: Option<&str>, op: ChannelOp) -> bool {
+    pub async fn propose_channel_op(
+        &self,
+        server_id: Option<&str>,
+        op: ChannelOp,
+    ) -> ChannelOpProposeResult {
         let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID).to_owned();
         let Some(tx) = self.state.read().gateway_tx.clone() else {
-            return false;
+            return ChannelOpProposeResult::Unavailable;
         };
         let (respond, rx) = oneshot::channel();
         match tx.try_send(NativeToS2SCommand::ProposeChannel {
@@ -325,23 +347,33 @@ impl S2SManager {
             op,
             respond,
         }) {
-            Ok(()) => tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(false),
+            Ok(()) => match tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => {
+                    warn!("s2s gateway dropped channel proposal response");
+                    ChannelOpProposeResult::Failed
+                }
+                Err(_) => {
+                    warn!("s2s channel proposal timed out waiting for gateway response");
+                    ChannelOpProposeResult::Failed
+                }
+            },
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!("s2s gateway full; dropping channel proposal");
-                false
+                ChannelOpProposeResult::Failed
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => ChannelOpProposeResult::Unavailable,
         }
     }
 
-    async fn propose_channel_op_direct(&self, server_id: &str, op: ChannelOp) -> bool {
+    async fn propose_channel_op_direct(
+        &self,
+        server_id: &str,
+        op: ChannelOp,
+    ) -> ChannelOpProposeResult {
         let handle = match self.channel_replication_handle(server_id) {
             Some(handle) => handle,
-            None => return false,
+            None => return ChannelOpProposeResult::Failed,
         };
         let operation = ChannelOperation {
             server_id: server_id.to_owned(),
@@ -352,10 +384,10 @@ impl S2SManager {
             op,
         };
         match handle.propose(operation).await {
-            Ok(_) => true,
+            Ok(_) => ChannelOpProposeResult::Proposed,
             Err(e) => {
                 warn!(error = %e, "s2s channel op propose failed");
-                false
+                ChannelOpProposeResult::Failed
             }
         }
     }
@@ -1638,7 +1670,7 @@ async fn apply_user_remove_patch(
     .await;
 }
 
-fn server_id_from_channel_topic(topic: &str) -> Option<String> {
+pub fn server_id_from_channel_topic(topic: &str) -> Option<String> {
     if topic == "channels" {
         Some(DEFAULT_SERVER_ID.to_owned())
     } else {
@@ -1649,7 +1681,7 @@ fn server_id_from_channel_topic(topic: &str) -> Option<String> {
     }
 }
 
-fn server_id_from_channel_blob_topic(topic: &str) -> Option<String> {
+pub fn server_id_from_channel_blob_topic(topic: &str) -> Option<String> {
     if topic == "channel_blobs" {
         Some(DEFAULT_SERVER_ID.to_owned())
     } else {
@@ -1660,7 +1692,7 @@ fn server_id_from_channel_blob_topic(topic: &str) -> Option<String> {
     }
 }
 
-fn channel_topic(server_id: &str) -> String {
+pub fn channel_topic(server_id: &str) -> String {
     if server_id == DEFAULT_SERVER_ID {
         "channels".to_owned()
     } else {
@@ -1668,7 +1700,7 @@ fn channel_topic(server_id: &str) -> String {
     }
 }
 
-fn channel_blob_topic(server_id: &str) -> String {
+pub fn channel_blob_topic(server_id: &str) -> String {
     if server_id == DEFAULT_SERVER_ID {
         "channel_blobs".to_owned()
     } else {
@@ -1676,18 +1708,49 @@ fn channel_blob_topic(server_id: &str) -> String {
     }
 }
 
+pub fn install_channel_replication_resolver(
+    replications: &Arc<ReplicationManager>,
+    channels: Arc<ChannelRepository>,
+) {
+    replications.set_strict_topic_resolver(Some(Arc::new(move |topic, parts| {
+        let server_id = server_id_from_channel_topic(topic)?;
+        let repo = Arc::new(ChannelReplicationAdapter::new(server_id, channels.clone()));
+        let runtime = parts.build_runtime(topic.to_owned(), repo);
+        runtime.start();
+        Some(runtime)
+    })));
+}
+
+pub fn install_channel_blob_replication_resolver(
+    replications: &Arc<ReplicationManager>,
+    blobs: Arc<ChannelBlobStore>,
+    channels: Arc<ChannelRepository>,
+) {
+    replications.set_blob_topic_resolver(Some(Arc::new(move |topic, parts| {
+        let server_id = server_id_from_channel_blob_topic(topic)?;
+        let repo = Arc::new(ChannelBlobReplicationAdapter::new(
+            server_id,
+            blobs.clone(),
+            channels.clone(),
+        ));
+        let runtime = parts.build_runtime(topic.to_owned(), repo);
+        runtime.start();
+        Some(runtime)
+    })));
+}
+
 fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
 #[derive(Clone)]
-struct ChannelReplicationAdapter {
+pub struct ChannelReplicationAdapter {
     server_id: String,
     repo: Arc<ChannelRepository>,
 }
 
 impl ChannelReplicationAdapter {
-    fn new(server_id: String, repo: Arc<ChannelRepository>) -> Self {
+    pub fn new(server_id: String, repo: Arc<ChannelRepository>) -> Self {
         Self { server_id, repo }
     }
 }
@@ -1791,14 +1854,14 @@ impl StrictReplicable for ChannelReplicationAdapter {
 }
 
 #[derive(Clone)]
-struct ChannelBlobReplicationAdapter {
+pub struct ChannelBlobReplicationAdapter {
     server_id: String,
     blobs: Arc<ChannelBlobStore>,
     channels: Arc<ChannelRepository>,
 }
 
 impl ChannelBlobReplicationAdapter {
-    fn new(
+    pub fn new(
         server_id: String,
         blobs: Arc<ChannelBlobStore>,
         channels: Arc<ChannelRepository>,
@@ -1853,12 +1916,12 @@ impl BlobReplicable for ChannelBlobReplicationAdapter {
 }
 
 #[derive(Clone)]
-struct BanReplicationAdapter {
+pub struct BanReplicationAdapter {
     repo: Arc<BanRepository>,
 }
 
 impl BanReplicationAdapter {
-    fn new(repo: Arc<BanRepository>) -> Self {
+    pub fn new(repo: Arc<BanRepository>) -> Self {
         Self { repo }
     }
 }

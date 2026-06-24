@@ -327,7 +327,7 @@ mod tests {
 
     use super::*;
     use crate::s2s::overlay::config::transport_bit;
-    use crate::s2s::overlay::lsdb::{LinkAdvertised, LsaEntry, LsaFloor};
+    use crate::s2s::overlay::lsdb::{LinkAdvertised, LsaEntry, LsaFloor, ReplicationServices};
     use crate::s2s::transport::TransportKind;
 
     fn cfg() -> OverlayConfig {
@@ -360,6 +360,7 @@ mod tests {
             links,
             max_users: 0,
             transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
         }
     }
 

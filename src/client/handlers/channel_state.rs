@@ -134,7 +134,7 @@ pub async fn handle_channel_state(
                 .s2s_manager()
                 .propose_channel_op(Some(&server_id), op.clone())
                 .await;
-            if proposed_s2s {
+            if proposed_s2s.is_proposed() {
                 if is_temp {
                     sender.set_current_channel_id(
                         new_id,
@@ -142,7 +142,7 @@ pub async fn handle_channel_state(
                         channels.current_version_in_server(&server_id),
                     );
                 }
-            } else {
+            } else if proposed_s2s.should_apply_locally() {
                 let created = match channels.create_channel_in_server(&server_id, new_ch).await {
                     Ok(channel) => channel,
                     Err(e) => {
@@ -165,6 +165,11 @@ pub async fn handle_channel_state(
                         channels.current_version_in_server(&server_id),
                     );
                 }
+            } else {
+                return Err(super::channel_op_propose_failed(
+                    u32::from(session),
+                    Some(parent_id),
+                ));
             }
         }
 
@@ -321,11 +326,11 @@ pub async fn handle_channel_state(
                 tracing::warn!("update_channel {channel_id} failed: {:?}", e);
                 return Ok(());
             }
-            if !server
+            let proposed_s2s = server
                 .s2s_manager()
                 .propose_channel_op(Some(&server_id), op)
-                .await
-            {
+                .await;
+            if proposed_s2s.should_apply_locally() {
                 if let Err(e) = channels
                     .edit_channel_in_server(
                         &server_id,
@@ -339,6 +344,11 @@ pub async fn handle_channel_state(
                     tracing::warn!("update_channel {channel_id} failed: {:?}", e);
                     return Ok(());
                 }
+            } else if !proposed_s2s.is_proposed() {
+                return Err(super::channel_op_propose_failed(
+                    u32::from(session),
+                    Some(channel_id),
+                ));
             }
         }
     }

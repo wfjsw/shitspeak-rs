@@ -70,8 +70,17 @@ impl BlobNet for OverlayBlobNet {
     async fn send_broadcast(&self, topic: &str, body: BlobBody) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_blob(topic, body);
         let bytes = repl_proto::encode(&msg)?;
+        let dsts = self
+            .alive_members()
+            .into_iter()
+            .filter(|node| *node != self.local_node_id())
+            .collect::<Vec<_>>();
+        if dsts.is_empty() {
+            return Ok(());
+        }
         self.overlay
-            .send_broadcast(
+            .send_multicast(
+                &dsts,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 MessageClass::Regular,
@@ -82,7 +91,7 @@ impl BlobNet for OverlayBlobNet {
     }
 
     fn alive_members(&self) -> Vec<NodeIdentifier> {
-        self.overlay.alive_members()
+        self.overlay.content_replication_members()
     }
 
     fn local_node_id(&self) -> NodeIdentifier {

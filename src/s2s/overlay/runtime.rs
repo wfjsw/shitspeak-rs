@@ -26,8 +26,8 @@ use super::config::OverlayConfig;
 use super::error::OverlayError;
 use super::lsdb::advert::cost_changed_significantly;
 use super::lsdb::{
-    LinkStateDb, LsaEmitter, LsaFloodPacer, LsaFloor, capture_boot_epoch, emit_once,
-    spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
+    LinkStateDb, LsaEmitter, LsaFloodPacer, LsaFloor, ReplicationServices, capture_boot_epoch,
+    emit_once, spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
 };
 use super::membership::{MembershipTable, spawn_diff_watcher};
 use super::messaging::{ServiceRegistry, ordering::OverlayOrdering};
@@ -157,6 +157,7 @@ impl OverlayInner {
         transport: ConnectionManager,
         cfg: OverlayConfig,
         max_users: Arc<AtomicU64>,
+        replication_services: ReplicationServices,
         self_addresses: Vec<PeerAddress>,
     ) -> Self {
         let self_id = transport.local_node_id();
@@ -185,6 +186,7 @@ impl OverlayInner {
             self_addresses,
             max_users,
             cfg.route_transit_messages(),
+            replication_services,
         ));
         let flood_pacer = Arc::new(LsaFloodPacer::new(transport.clone()));
 
@@ -418,9 +420,16 @@ pub(crate) async fn start_inner(
     inbound: Inbound,
     cfg: OverlayConfig,
     max_users: Arc<AtomicU64>,
+    replication_services: ReplicationServices,
 ) -> Result<Arc<OverlayInner>, OverlayError> {
     let self_addresses = transport.listen_addresses_with_public_ip_probe().await;
-    let inner = Arc::new(OverlayInner::new(transport, cfg, max_users, self_addresses));
+    let inner = Arc::new(OverlayInner::new(
+        transport,
+        cfg,
+        max_users,
+        replication_services,
+        self_addresses,
+    ));
 
     super::discovery::bootstrap(&inner.cfg, &inner.transport);
 

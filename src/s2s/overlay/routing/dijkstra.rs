@@ -348,7 +348,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use super::super::super::lsdb::{LsaEntry, LsaFloor};
+    use super::super::super::lsdb::{LsaEntry, LsaFloor, ReplicationServices};
 
     fn cfg() -> OverlayConfig {
         OverlayConfig::new(vec![])
@@ -413,6 +413,7 @@ mod tests {
                 .collect(),
             max_users: 0,
             transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
         }
     }
 
@@ -460,6 +461,7 @@ mod tests {
                 .collect(),
             max_users: 0,
             transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
         }
     }
 

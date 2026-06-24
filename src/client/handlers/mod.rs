@@ -52,6 +52,17 @@ use crate::{
     server::Server,
 };
 
+fn channel_op_propose_failed(session: u32, channel_id: Option<u32>) -> MessageHandlerError {
+    MessageHandlerError::PermissionDenied(crate::messages::encoder::PermissionDenied {
+        r#type: crate::messages::encoder::DenyType::Permission,
+        session,
+        channel_id,
+        reason: Some("Channel operation failed; please try again".into()),
+        name: None,
+        permission: None,
+    })
+}
+
 pub trait AsyncMessageHandlerExt {
     /// Dispatch a message to the appropriate handler.
     async fn handle_message(

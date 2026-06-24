@@ -1170,6 +1170,9 @@ mod tests {
                         .collect(),
                     max_users: 100,
                     transit_disabled: false,
+                    strict_replication_disabled: false,
+                    content_replication_disabled: false,
+                    owner_replication_disabled: false,
                 })
                 .collect(),
         };

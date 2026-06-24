@@ -48,6 +48,9 @@ message LinkStateAdvert {
   repeated LinkAdvert links = 7;
   uint64 max_users = 8;     // origin's local max_users capacity
   bool transit_disabled = 9; // origin should not be used as a transit router
+  bool strict_replication_disabled = 10;  // origin does not run strict replication
+  bool content_replication_disabled = 11; // origin does not run content/blob replication
+  bool owner_replication_disabled = 12;   // origin does not run owner-scoped replication
 }
 
 // One advertised edge from `origin` to `neighbor`.

@@ -221,11 +221,11 @@ pub async fn handle_acl(
             tracing::warn!("set_acls {channel_id} failed: {:?}", e);
             return Ok(());
         }
-        if !server
+        let proposed_s2s = server
             .s2s_manager()
             .propose_channel_op(Some(&server_id), op)
-            .await
-        {
+            .await;
+        if proposed_s2s.should_apply_locally() {
             if let Err(e) = server
                 .get_channels()
                 .set_acls_in_server(&server_id, channel_id, inherit_acl, new_acls)
@@ -234,6 +234,11 @@ pub async fn handle_acl(
                 tracing::warn!("set_acls {channel_id} failed: {:?}", e);
                 return Ok(());
             }
+        } else if !proposed_s2s.is_proposed() {
+            return Err(super::channel_op_propose_failed(
+                u32::from(sender.get_session_id()),
+                Some(channel_id),
+            ));
         }
 
         // Permission refresh fanout is handled in each client's channel-log

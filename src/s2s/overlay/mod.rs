@@ -47,6 +47,7 @@ use crate::types::NodeIdentifier;
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use error::OverlayError;
 pub use lane::LaneId;
+pub use lsdb::ReplicationServices;
 pub use membership::{MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{OverlayInboundMessage, OverlaySendOptions, ServiceInbound};
 pub use routing::{RouteEntry, RoutingMetric};
@@ -80,7 +81,27 @@ impl OverlayNetwork {
         cfg: OverlayConfig,
         max_users: Arc<AtomicU64>,
     ) -> Result<Self, OverlayError> {
-        let inner = runtime::start_inner(transport, inbound, cfg, max_users).await?;
+        Self::start_with_max_users_and_replication_services(
+            transport,
+            inbound,
+            cfg,
+            max_users,
+            ReplicationServices::ALL,
+        )
+        .await
+    }
+
+    /// Bring up the overlay with local server capacity and replication service
+    /// capability advertised in this node's LSA.
+    pub async fn start_with_max_users_and_replication_services(
+        transport: ConnectionManager,
+        inbound: Inbound,
+        cfg: OverlayConfig,
+        max_users: Arc<AtomicU64>,
+        replication_services: ReplicationServices,
+    ) -> Result<Self, OverlayError> {
+        let inner =
+            runtime::start_inner(transport, inbound, cfg, max_users, replication_services).await?;
         Ok(Self { inner })
     }
 
@@ -131,6 +152,21 @@ impl OverlayNetwork {
         self.inner.table.alive_members()
     }
 
+    /// IDs of active members that advertise strict replication service.
+    pub fn strict_replication_members(&self) -> Vec<NodeIdentifier> {
+        self.inner.table.strict_replication_members()
+    }
+
+    /// IDs of active members that advertise content/blob replication service.
+    pub fn content_replication_members(&self) -> Vec<NodeIdentifier> {
+        self.inner.table.content_replication_members()
+    }
+
+    /// IDs of active members that advertise owner-scoped replication service.
+    pub fn owner_replication_members(&self) -> Vec<NodeIdentifier> {
+        self.inner.table.owner_replication_members()
+    }
+
     /// Sum local max_users advertised by alive cluster members.
     pub fn alive_max_users(&self) -> u64 {
         self.inner.table.alive_max_users()
@@ -148,6 +184,11 @@ impl OverlayNetwork {
     /// Publish a changed local transit-routing policy in the next local LSA.
     pub fn update_route_transit_messages(&self, enabled: bool) {
         self.inner.emitter.update_route_transit_messages(enabled);
+    }
+
+    /// Publish changed local replication service capabilities in the next LSA.
+    pub fn update_replication_services(&self, services: ReplicationServices) {
+        self.inner.emitter.update_replication_services(services);
     }
 
     /// Subscribe to the membership-event stream. Each subscriber receives

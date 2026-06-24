@@ -2165,10 +2165,11 @@ impl Server {
                             id: channel_id,
                             nonce,
                         };
-                        if !server
+                        if server
                             .s2s_manager()
                             .propose_channel_op(Some(&server_id), op)
                             .await
+                            .should_apply_locally()
                         {
                             if let Err(e) = server
                                 .channels

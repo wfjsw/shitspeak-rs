@@ -92,14 +92,20 @@ pub async fn reap_if_empty_temporary_on_server(
         .s2s_manager()
         .propose_channel_op(Some(server_id), mark)
         .await;
-    if !s2s_marked
-        && channels
+    let marked_locally = if s2s_marked.should_apply_locally() {
+        if channels
             .mark_pending_delete_in_server(server_id, channel_id, nonce)
             .await
             .is_err()
-    {
+        {
+            return false;
+        }
+        true
+    } else if s2s_marked.is_proposed() {
+        false
+    } else {
         return false;
-    }
+    };
 
     if clients
         .has_client_in_channel_in_server(server_id, channel_id)
@@ -109,10 +115,12 @@ pub async fn reap_if_empty_temporary_on_server(
             id: channel_id,
             nonce,
         };
-        if !server
+        if server
             .s2s_manager()
             .propose_channel_op(Some(server_id), cancel)
             .await
+            .should_apply_locally()
+            || marked_locally
         {
             let _ = channels
                 .cancel_pending_delete_in_server(server_id, channel_id, nonce)
@@ -134,10 +142,12 @@ pub async fn reap_if_empty_temporary_on_server(
             id: channel_id,
             nonce,
         };
-        if !server
+        if server
             .s2s_manager()
             .propose_channel_op(Some(server_id), cancel)
             .await
+            .should_apply_locally()
+            || marked_locally
         {
             let _ = channels
                 .cancel_pending_delete_in_server(server_id, channel_id, nonce)
@@ -146,13 +156,13 @@ pub async fn reap_if_empty_temporary_on_server(
         return false;
     }
 
-    if server
+    let s2s_deleted = server
         .s2s_manager()
         .propose_channel_op(Some(server_id), delete)
-        .await
-    {
+        .await;
+    if s2s_deleted.is_proposed() {
         true
-    } else {
+    } else if s2s_deleted.should_apply_locally() || marked_locally {
         match channels
             .apply_delete_channel_in_server(server_id, channel_id, nonce)
             .await
@@ -166,6 +176,8 @@ pub async fn reap_if_empty_temporary_on_server(
                 false
             }
         }
+    } else {
+        false
     }
 }
 

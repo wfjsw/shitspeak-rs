@@ -11,7 +11,7 @@ pub use advert::{
 };
 pub use store::{
     AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry, LsaFloor, OriginVersion,
-    spawn_floor_persister,
+    ReplicationServices, spawn_floor_persister,
 };
 pub use sync::{
     full_pull, handle_request as handle_sync_request, handle_response as handle_sync_response,

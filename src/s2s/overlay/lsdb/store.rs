@@ -38,6 +38,63 @@ use crate::types::NodeIdentifier;
 use super::super::proto::{address_from_pb, address_to_pb};
 use crate::s2s_overlay_proto as pb;
 
+/// Replication service kinds advertised by one overlay member.
+///
+/// Missing fields on the wire default to enabled to keep rolling upgrades
+/// compatible with existing full S2S nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationServices {
+    strict: bool,
+    content: bool,
+    owner: bool,
+}
+
+impl ReplicationServices {
+    pub const ALL: Self = Self {
+        strict: true,
+        content: true,
+        owner: true,
+    };
+
+    pub const NONE: Self = Self {
+        strict: false,
+        content: false,
+        owner: false,
+    };
+
+    pub const STRICT_AND_CONTENT: Self = Self {
+        strict: true,
+        content: true,
+        owner: false,
+    };
+
+    pub fn new(strict: bool, content: bool, owner: bool) -> Self {
+        Self {
+            strict,
+            content,
+            owner,
+        }
+    }
+
+    pub fn strict(self) -> bool {
+        self.strict
+    }
+
+    pub fn content(self) -> bool {
+        self.content
+    }
+
+    pub fn owner(self) -> bool {
+        self.owner
+    }
+}
+
+impl Default for ReplicationServices {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 /// One LSA's domain-side representation.
 #[derive(Clone, Debug)]
 pub struct LsaEntry {
@@ -50,6 +107,7 @@ pub struct LsaEntry {
     pub links: Vec<LinkAdvertised>,
     pub max_users: u64,
     pub transit_disabled: bool,
+    pub replication_services: ReplicationServices,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +150,24 @@ fn describe_lsa_entry_delta(previous: Option<&LsaEntry>, current: &LsaEntry) -> 
         "transit_disabled",
         previous.transit_disabled,
         current.transit_disabled,
+    );
+    push_scalar_change(
+        &mut changes,
+        "strict_replication",
+        previous.replication_services.strict(),
+        current.replication_services.strict(),
+    );
+    push_scalar_change(
+        &mut changes,
+        "content_replication",
+        previous.replication_services.content(),
+        current.replication_services.content(),
+    );
+    push_scalar_change(
+        &mut changes,
+        "owner_replication",
+        previous.replication_services.owner(),
+        current.replication_services.owner(),
     );
     describe_address_delta(&mut changes, &previous.addresses, &current.addresses);
     describe_link_delta(&mut changes, &previous.links, &current.links);
@@ -303,6 +379,11 @@ impl LsaEntry {
             links,
             max_users: pb.max_users,
             transit_disabled: pb.transit_disabled,
+            replication_services: ReplicationServices::new(
+                !pb.strict_replication_disabled,
+                !pb.content_replication_disabled,
+                !pb.owner_replication_disabled,
+            ),
         })
     }
 
@@ -333,6 +414,9 @@ impl LsaEntry {
                 .collect(),
             max_users: self.max_users,
             transit_disabled: self.transit_disabled,
+            strict_replication_disabled: !self.replication_services.strict(),
+            content_replication_disabled: !self.replication_services.content(),
+            owner_replication_disabled: !self.replication_services.owner(),
         }
     }
 }
@@ -731,6 +815,36 @@ impl LinkStateDb {
         out.sort();
         out
     }
+
+    fn active_origins_by_replication_kind(
+        &self,
+        enabled: impl Fn(ReplicationServices) -> bool,
+    ) -> Vec<NodeIdentifier> {
+        let mut out: Vec<_> = self
+            .inner
+            .read()
+            .values()
+            .filter(|e| !e.tombstone && enabled(e.replication_services))
+            .map(|e| e.origin)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Set of active origins that advertise strict replication service.
+    pub fn strict_replication_origins(&self) -> Vec<NodeIdentifier> {
+        self.active_origins_by_replication_kind(ReplicationServices::strict)
+    }
+
+    /// Set of active origins that advertise content/blob replication service.
+    pub fn content_replication_origins(&self) -> Vec<NodeIdentifier> {
+        self.active_origins_by_replication_kind(ReplicationServices::content)
+    }
+
+    /// Set of active origins that advertise owner-scoped replication service.
+    pub fn owner_replication_origins(&self) -> Vec<NodeIdentifier> {
+        self.active_origins_by_replication_kind(ReplicationServices::owner)
+    }
 }
 
 /// Background task: write the floor to disk once per `interval` whenever
@@ -776,6 +890,7 @@ mod tests {
             links: vec![],
             max_users: 0,
             transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
         }
     }
 
@@ -792,6 +907,7 @@ mod tests {
         let mut lsa = entry(1, 100, 1, false);
         lsa.max_users = 250;
         lsa.transit_disabled = true;
+        lsa.replication_services = ReplicationServices::STRICT_AND_CONTENT;
         lsa.links = vec![LinkAdvertised {
             neighbor: 2,
             rtt_us: 1_000,
@@ -807,6 +923,9 @@ mod tests {
         let pb = lsa.to_pb();
         assert_eq!(pb.max_users, 250);
         assert!(pb.transit_disabled);
+        assert!(!pb.strict_replication_disabled);
+        assert!(!pb.content_replication_disabled);
+        assert!(pb.owner_replication_disabled);
         let wire_link = pb.links.first().unwrap();
         assert_eq!(wire_link.loss_ppm, 25_000);
         assert_eq!(wire_link.probe_loss_ppm, 10_000);
@@ -816,6 +935,10 @@ mod tests {
         let roundtrip = LsaEntry::from_pb(&pb).unwrap();
         assert_eq!(roundtrip.max_users, 250);
         assert!(roundtrip.transit_disabled);
+        assert_eq!(
+            roundtrip.replication_services,
+            ReplicationServices::STRICT_AND_CONTENT
+        );
         let link = roundtrip.links.first().unwrap();
         assert_eq!(link.loss_ppm, 25_000);
         assert_eq!(link.probe_loss_ppm, 10_000);
@@ -912,6 +1035,31 @@ mod tests {
         db.admit(left);
 
         assert_eq!(db.edge_rtt_snapshot(), vec![Duration::from_micros(1_500)]);
+    }
+
+    #[test]
+    fn replication_origins_filter_by_enabled_service() {
+        let floor = Arc::new(LsaFloor::new(0, None));
+        let db = LinkStateDb::new(floor);
+        let strict_only = entry(1, 100, 1, false);
+        let mut content_only = entry(2, 100, 1, false);
+        content_only.replication_services = ReplicationServices::new(false, true, false);
+        let mut owner_only = entry(3, 100, 1, false);
+        owner_only.replication_services = ReplicationServices::new(false, false, true);
+        let mut none = entry(4, 100, 1, false);
+        none.replication_services = ReplicationServices::NONE;
+        let mut left = entry(5, 100, 1, true);
+        left.replication_services = ReplicationServices::ALL;
+
+        db.admit(strict_only);
+        db.admit(content_only);
+        db.admit(owner_only);
+        db.admit(none);
+        db.admit(left);
+
+        assert_eq!(db.strict_replication_origins(), vec![1]);
+        assert_eq!(db.content_replication_origins(), vec![1, 2]);
+        assert_eq!(db.owner_replication_origins(), vec![1, 3]);
     }
 
     #[test]

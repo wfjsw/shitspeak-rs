@@ -78,8 +78,17 @@ impl OwnerNet for OverlayOwnerNet {
     async fn send_broadcast(&self, topic: &str, body: OwnerBody) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_owner(topic, body);
         let bytes = repl_proto::encode(&msg)?;
+        let dsts = self
+            .alive_members()
+            .into_iter()
+            .filter(|node| *node != self.local_node_id())
+            .collect::<Vec<_>>();
+        if dsts.is_empty() {
+            return Ok(());
+        }
         self.overlay
-            .send_broadcast(
+            .send_multicast(
+                &dsts,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 MessageClass::Regular,
@@ -90,7 +99,7 @@ impl OwnerNet for OverlayOwnerNet {
     }
 
     fn alive_members(&self) -> Vec<NodeIdentifier> {
-        self.overlay.alive_members()
+        self.overlay.owner_replication_members()
     }
 
     fn local_node_id(&self) -> NodeIdentifier {

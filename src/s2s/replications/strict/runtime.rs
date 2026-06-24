@@ -167,22 +167,12 @@ impl StrictNet for OverlayStrictNet {
     }
 
     async fn send_broadcast(&self, topic: &str, body: StrictBody) -> Result<(), ReplicationError> {
-        let msg = repl_proto::wrap_strict(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
-        self.overlay
-            .send_broadcast_unordered_with_routing_metric(
-                REPLICATION_SERVICE_TAG,
-                ServiceLevel::Reliable,
-                RoutingMetric::ReliableCost,
-                MessageClass::Regular,
-                bytes,
-            )
-            .await?;
-        Ok(())
+        let dsts = self.alive_members();
+        self.send_multicast(&dsts, topic, body).await
     }
 
     fn alive_members(&self) -> Vec<NodeIdentifier> {
-        self.overlay.alive_members()
+        self.overlay.strict_replication_members()
     }
 
     fn has_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {

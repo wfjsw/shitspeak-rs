@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::s2s::transport::PeerAddress;
 use crate::types::NodeIdentifier;
 
-use super::lsdb::LinkStateDb;
+use super::lsdb::{LinkStateDb, ReplicationServices};
 pub use view::MemberStatus;
 
 /// Caller-facing snapshot of one cluster member.
@@ -35,6 +35,7 @@ pub struct MemberSnapshot {
     addresses: Vec<PeerAddress>,
     boot_epoch: u64,
     max_users: u64,
+    replication_services: ReplicationServices,
 }
 
 impl MemberSnapshot {
@@ -56,6 +57,10 @@ impl MemberSnapshot {
 
     pub fn max_users(&self) -> u64 {
         self.max_users
+    }
+
+    pub fn replication_services(&self) -> ReplicationServices {
+        self.replication_services
     }
 
     /// Phase-1 compatibility: callers expect an "incarnation"; we map it
@@ -134,6 +139,7 @@ impl MembershipTable {
                 addresses: e.addresses.clone(),
                 boot_epoch: e.boot_epoch,
                 max_users: e.max_users,
+                replication_services: e.replication_services,
             })
             .collect();
         out.sort_by_key(|m| m.node_id);
@@ -151,12 +157,28 @@ impl MembershipTable {
             addresses: e.addresses.clone(),
             boot_epoch: e.boot_epoch,
             max_users: e.max_users,
+            replication_services: e.replication_services,
         })
     }
 
     /// IDs of every origin with a current non-tombstone LSA.
     pub fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.lsdb.active_origins()
+    }
+
+    /// IDs of active origins that advertise strict replication service.
+    pub fn strict_replication_members(&self) -> Vec<NodeIdentifier> {
+        self.lsdb.strict_replication_origins()
+    }
+
+    /// IDs of active origins that advertise content/blob replication service.
+    pub fn content_replication_members(&self) -> Vec<NodeIdentifier> {
+        self.lsdb.content_replication_origins()
+    }
+
+    /// IDs of active origins that advertise owner-scoped replication service.
+    pub fn owner_replication_members(&self) -> Vec<NodeIdentifier> {
+        self.lsdb.owner_replication_origins()
     }
 
     /// Sum max_users advertised by every current non-tombstone LSA.
@@ -263,6 +285,7 @@ mod tests {
             links: Vec::new(),
             max_users,
             transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
         }
     }
 
@@ -278,6 +301,34 @@ mod tests {
 
         assert_eq!(table.alive_max_users(), 300);
         assert_eq!(table.snapshot_one(1).unwrap().max_users(), 100);
+    }
+
+    #[test]
+    fn replication_members_filter_by_service_kind() {
+        let floor = Arc::new(LsaFloor::new(0, None));
+        let lsdb = Arc::new(LinkStateDb::new(floor));
+        let (table, _) = new_table(1, lsdb.clone(), 8);
+
+        let strict = entry(1, 1, false, 100);
+        let mut content = entry(2, 1, false, 200);
+        content.replication_services = ReplicationServices::new(false, true, false);
+        let mut owner = entry(3, 1, false, 300);
+        owner.replication_services = ReplicationServices::new(false, false, true);
+
+        lsdb.admit(strict);
+        lsdb.admit(content);
+        lsdb.admit(owner);
+
+        assert_eq!(table.strict_replication_members(), vec![1]);
+        assert_eq!(table.content_replication_members(), vec![1, 2]);
+        assert_eq!(table.owner_replication_members(), vec![1, 3]);
+        assert!(
+            table
+                .snapshot_one(2)
+                .unwrap()
+                .replication_services()
+                .content()
+        );
     }
 }
 

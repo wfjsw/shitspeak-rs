@@ -38,7 +38,9 @@ use super::super::discovery::learn_from_lsa;
 use super::super::neighbor::monitor::{NeighborMonitor, NeighborSnapshot};
 use super::super::proto::{OverlayBody, encode_message, node_to_wire, wrap};
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
-use super::store::{AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry, is_strictly_newer};
+use super::store::{
+    AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry, ReplicationServices, is_strictly_newer,
+};
 
 const RTT_GATE_BUCKET_US: u64 = 25_000;
 const JITTER_GATE_BUCKET_US: u64 = 10_000;
@@ -53,6 +55,9 @@ pub struct LsaEmitter {
     next_seq: AtomicU64,
     /// Whether this node asks peers not to use it as a transit router.
     transit_disabled: AtomicBool,
+    strict_replication_enabled: AtomicBool,
+    content_replication_enabled: AtomicBool,
+    owner_replication_enabled: AtomicBool,
     /// Last cost/breakdown tuple per neighbor we published. Used to apply the
     /// cost-change-threshold filter.
     last_published: parking_lot::Mutex<HashMap<NodeIdentifier, LinkGate>>,
@@ -70,6 +75,7 @@ impl LsaEmitter {
         self_addresses: Vec<crate::s2s::transport::PeerAddress>,
         max_users: Arc<AtomicU64>,
         route_transit_messages: bool,
+        replication_services: ReplicationServices,
     ) -> Self {
         Self {
             self_id,
@@ -77,6 +83,9 @@ impl LsaEmitter {
             max_users,
             force_next_emit: AtomicBool::new(false),
             transit_disabled: AtomicBool::new(!route_transit_messages),
+            strict_replication_enabled: AtomicBool::new(replication_services.strict()),
+            content_replication_enabled: AtomicBool::new(replication_services.content()),
+            owner_replication_enabled: AtomicBool::new(replication_services.owner()),
             next_seq: AtomicU64::new(1),
             last_published: parking_lot::Mutex::new(HashMap::new()),
             self_addresses,
@@ -108,6 +117,24 @@ impl LsaEmitter {
         self.transit_disabled.store(!enabled, Ordering::Relaxed);
         self.poke_force();
     }
+
+    pub fn replication_services(&self) -> ReplicationServices {
+        ReplicationServices::new(
+            self.strict_replication_enabled.load(Ordering::Relaxed),
+            self.content_replication_enabled.load(Ordering::Relaxed),
+            self.owner_replication_enabled.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn update_replication_services(&self, services: ReplicationServices) {
+        self.strict_replication_enabled
+            .store(services.strict(), Ordering::Relaxed);
+        self.content_replication_enabled
+            .store(services.content(), Ordering::Relaxed);
+        self.owner_replication_enabled
+            .store(services.owner(), Ordering::Relaxed);
+        self.poke_force();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +144,7 @@ struct LsaContent {
     links: Vec<LinkAdvertised>,
     max_users: u64,
     transit_disabled: bool,
+    replication_services: ReplicationServices,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +194,11 @@ fn build_local_lsa_content(
         } else {
             emitter.transit_disabled()
         },
+        replication_services: if tombstone {
+            ReplicationServices::NONE
+        } else {
+            emitter.replication_services()
+        },
     }
 }
 
@@ -180,6 +213,7 @@ fn stamp_local_lsa(emitter: &LsaEmitter, content: LsaContent) -> LsaEntry {
         links: content.links,
         max_users: content.max_users,
         transit_disabled: content.transit_disabled,
+        replication_services: content.replication_services,
     }
 }
 
@@ -302,6 +336,9 @@ fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     }
     content.max_users.hash(&mut hasher);
     content.transit_disabled.hash(&mut hasher);
+    content.replication_services.strict().hash(&mut hasher);
+    content.replication_services.content().hash(&mut hasher);
+    content.replication_services.owner().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -317,6 +354,9 @@ fn content_identity_fingerprint(content: &LsaContent) -> u64 {
     }
     content.max_users.hash(&mut hasher);
     content.transit_disabled.hash(&mut hasher);
+    content.replication_services.strict().hash(&mut hasher);
+    content.replication_services.content().hash(&mut hasher);
+    content.replication_services.owner().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -927,7 +967,14 @@ mod tests {
     }
 
     fn test_emitter() -> LsaEmitter {
-        LsaEmitter::new(1, 100, vec![], Arc::new(AtomicU64::new(10)), true)
+        LsaEmitter::new(
+            1,
+            100,
+            vec![],
+            Arc::new(AtomicU64::new(10)),
+            true,
+            ReplicationServices::ALL,
+        )
     }
 
     fn pb_lsa(origin: NodeIdentifier, seq: u64) -> pb::LinkStateAdvert {
@@ -1200,7 +1247,14 @@ mod tests {
     #[test]
     fn refresh_reduction_suppresses_unchanged_periodic_lsa() {
         let max_users = Arc::new(AtomicU64::new(10));
-        let emitter = LsaEmitter::new(1, 100, vec![], max_users.clone(), true);
+        let emitter = LsaEmitter::new(
+            1,
+            100,
+            vec![],
+            max_users.clone(),
+            true,
+            ReplicationServices::ALL,
+        );
         let cfg = OverlayConfig::new(vec![])
             .with_lsa_max_age(Duration::from_secs(120))
             .with_lsa_unchanged_refresh_interval(Duration::from_secs(90));

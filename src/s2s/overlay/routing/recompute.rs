@@ -184,7 +184,7 @@ mod tests {
     use super::*;
 
     use super::super::super::config::transport_bit;
-    use super::super::super::lsdb::{LinkAdvertised, LsaEntry, LsaFloor};
+    use super::super::super::lsdb::{LinkAdvertised, LsaEntry, LsaFloor, ReplicationServices};
     use crate::s2s::transport::TransportKind;
 
     fn entry(origin: NodeIdentifier, links: Vec<NodeIdentifier>) -> LsaEntry {
@@ -212,6 +212,7 @@ mod tests {
                 .collect(),
             max_users: 0,
             transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
         }
     }
 
