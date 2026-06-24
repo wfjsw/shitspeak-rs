@@ -4,7 +4,7 @@
 //! neighbors* whose edges feed into our locally-emitted LSA. State per
 //! neighbor:
 //!   * `boot_epoch` — last observed via Hello/HelloAck.
-//!   * `miss_count` — consecutive missed Hellos; once it crosses
+//!   * `miss_count` — consecutive stale Hello windows; once it crosses
 //!     `hello_dead_interval / hello_interval`, the link is declared down.
 //!   * `is_up` — whether we currently include this neighbor in our LSA.
 //!
@@ -91,6 +91,43 @@ fn prune_loss_samples(st: &mut NeighborState, now: Instant, window: Duration) {
     {
         st.loss_samples.pop_front();
     }
+}
+
+fn expire_pending(st: &mut NeighborState, now: Instant, window: Duration) -> usize {
+    let cutoff = now.checked_sub(window).unwrap_or(now);
+    let mut expired = 0;
+    st.pending.retain(|_, sent| {
+        let keep = *sent > cutoff;
+        if !keep {
+            expired += 1;
+        }
+        keep
+    });
+    expired
+}
+
+fn record_expired_pending(st: &mut NeighborState, now: Instant, window: Duration) -> usize {
+    let expired = expire_pending(st, now, window);
+    if st.is_up {
+        for _ in 0..expired {
+            record_loss_sample(st, now, window, true);
+        }
+        expired
+    } else {
+        0
+    }
+}
+
+fn missed_hello_window_threshold(cfg: &OverlayConfig) -> u32 {
+    let interval = cfg.hello_interval().as_nanos().max(1);
+    let dead = cfg.hello_dead_interval().as_nanos();
+    let threshold = dead.saturating_add(interval - 1) / interval;
+    threshold.clamp(1, u32::MAX as u128) as u32
+}
+
+fn note_stale_hello_window(st: &mut NeighborState, threshold: u32) -> bool {
+    st.miss_count = st.miss_count.saturating_add(1);
+    st.miss_count >= threshold.max(1)
 }
 
 fn packet_loss_snapshot(st: &mut NeighborState, now: Instant, window: Duration) -> (u32, u64, u64) {
@@ -308,24 +345,11 @@ impl NeighborMonitor {
     /// Record an outbound Hello so we can match its ack later.
     pub fn record_outbound_ping(&self, dst: NodeIdentifier, nonce: u64) {
         let now = Instant::now();
-        let cutoff = now
-            .checked_sub(self.cfg.hello_dead_interval())
-            .unwrap_or(now);
         let mut g = self.state.lock();
         let st = g.entry(dst).or_insert_with(NeighborState::new);
-        let expired = st
-            .pending
-            .iter()
-            .filter(|(_, sent)| **sent <= cutoff)
-            .count();
+        let expired = record_expired_pending(st, now, self.cfg.hello_dead_interval());
         if expired > 0 {
-            st.pending.retain(|_, sent| *sent > cutoff);
-            if st.is_up {
-                for _ in 0..expired {
-                    record_loss_sample(st, now, self.cfg.hello_dead_interval(), true);
-                }
-                self.on_metric_change.notify_one();
-            }
+            self.on_metric_change.notify_one();
         }
         st.pending.insert(nonce, now);
     }
@@ -436,7 +460,7 @@ impl NeighborMonitor {
     }
 
     /// Sweep neighbors on a tick. For each peer with a live L1 stream:
-    ///   * if `last_ack_at` older than `hello_dead_interval`, increment
+    ///   * if `last_ack_at` is older than `hello_dead_interval`, increment
     ///     `miss_count`. Once miss_count crosses the dead threshold, drop
     ///     the link from the LSA.
     /// For peers no longer in L1's live set, mark down.
@@ -449,6 +473,7 @@ impl NeighborMonitor {
             .collect();
         let now = Instant::now();
         let dead = self.cfg.hello_dead_interval();
+        let missed_threshold = missed_hello_window_threshold(&self.cfg);
         let (transitions, mask_changes) = {
             let mut g = self.state.lock();
             let mut transitions = Vec::new();
@@ -460,6 +485,7 @@ impl NeighborMonitor {
                 if !live_ids.contains(nid) {
                     if st.is_up {
                         st.is_up = false;
+                        st.miss_count = 0;
                         st.transports_mask = 0;
                         transitions.push((*nid, false));
                     }
@@ -481,20 +507,15 @@ impl NeighborMonitor {
                 }
                 if let Some(last) = st.last_ack_at {
                     if now.duration_since(last) >= dead {
-                        let expired = st.pending.len();
-                        if expired > 0 {
-                            st.pending.clear();
-                            if st.is_up {
-                                for _ in 0..expired {
-                                    record_loss_sample(st, now, dead, true);
-                                }
-                            }
-                        }
-                        if st.is_up {
+                        record_expired_pending(st, now, dead);
+                        if st.is_up && note_stale_hello_window(st, missed_threshold) {
                             st.is_up = false;
+                            st.miss_count = 0;
                             st.transports_mask = 0;
                             transitions.push((*nid, false));
                         }
+                    } else {
+                        st.miss_count = 0;
                     }
                 }
             }
@@ -624,5 +645,31 @@ mod tests {
     #[test]
     fn selected_edge_loss_falls_back_to_hello_when_no_transport_is_sampled() {
         assert_eq!(selected_edge_loss(333_333, 4, None, None), (333_333, 4));
+    }
+
+    #[test]
+    fn missed_hello_window_threshold_ceilings_dead_over_interval() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_hello_interval(Duration::from_millis(250))
+            .with_hello_dead_interval(Duration::from_secs(1));
+        assert_eq!(missed_hello_window_threshold(&cfg), 4);
+
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_hello_interval(Duration::from_millis(300))
+            .with_hello_dead_interval(Duration::from_secs(1));
+        assert_eq!(missed_hello_window_threshold(&cfg), 4);
+    }
+
+    #[test]
+    fn stale_hello_windows_require_threshold_before_down() {
+        let mut state = NeighborState::new();
+        state.is_up = true;
+
+        assert!(!note_stale_hello_window(&mut state, 3));
+        assert_eq!(state.miss_count, 1);
+        assert!(!note_stale_hello_window(&mut state, 3));
+        assert_eq!(state.miss_count, 2);
+        assert!(note_stale_hello_window(&mut state, 3));
+        assert_eq!(state.miss_count, 3);
     }
 }

@@ -29,6 +29,8 @@ use super::super::lsdb::{LinkStateDb, full_pull, push_snapshot};
 use super::super::proto::{OverlayBody, encode_message, node_to_wire, wrap};
 use super::monitor::NeighborMonitor;
 
+const HELLO_MESSAGE_CLASS: MessageClass = MessageClass::Control;
+
 /// Mutable state shared by the Hello ticker.
 pub struct HelloContext {
     pub self_id: NodeIdentifier,
@@ -85,7 +87,7 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
             dst,
             ServiceLevel::Reliable,
             None,
-            MessageClass::Regular,
+            HELLO_MESSAGE_CLASS,
             payload,
         )
         .await
@@ -177,7 +179,7 @@ pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: p
             from,
             ServiceLevel::Reliable,
             None,
-            MessageClass::Regular,
+            HELLO_MESSAGE_CLASS,
             payload,
         )
         .await
@@ -204,4 +206,14 @@ pub fn handle_hello_ack(
         ack.ts_send_us,
         Some(transport_kind),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_traffic_uses_control_class() {
+        assert_eq!(HELLO_MESSAGE_CLASS, MessageClass::Control);
+    }
 }

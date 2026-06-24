@@ -175,6 +175,10 @@ compression_adaptive_dictionary_enabled = true
 
 # ── L2 overlay tunables ───────────────────────────────────────────────
 [s2s.overlay]
+# Direct-neighbor liveness probe cadence. Increase hello_dead_interval_ms
+# when recoverable scheduler/network pauses cause direct-link churn.
+hello_interval_ms = 1000
+hello_dead_interval_ms = 4000
 # Max LSAs per `LsdbSyncResp` frame. Larger = fewer round trips on a
 # big diff but bigger response packets.
 lsdb_sync_max_response_lsas = 2048
