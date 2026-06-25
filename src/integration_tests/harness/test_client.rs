@@ -436,7 +436,7 @@ impl TestClient {
             _reader: reader_handle,
         };
 
-        // ── Send Version ──────────────────────────────────────────────────
+        // ── Send pre-auth handshake burst ─────────────────────────────────
         let version: Message = Version {
             version: Some(declared_version),
             release: Some("test-client".into()),
@@ -444,13 +444,7 @@ impl TestClient {
             os_version: Some("test".into()),
         }
         .into();
-        client.send(version).await;
 
-        for message in pre_auth_messages {
-            client.send(message).await;
-        }
-
-        // ── Send Authenticate ─────────────────────────────────────────────
         let authenticate: Message = Authenticate {
             username: Some(username.into()),
             password: password.map(str::to_owned),
@@ -460,7 +454,12 @@ impl TestClient {
             client_type: ClientType::Regular,
         }
         .into();
-        client.send(authenticate).await;
+
+        let mut handshake = Vec::with_capacity(pre_auth_messages.len() + 2);
+        handshake.push(version);
+        handshake.extend(pre_auth_messages);
+        handshake.push(authenticate);
+        client.send_batch(&handshake).await;
 
         // ── Drain until ServerSync (collecting state along the way) ───────
         let deadline = Duration::from_secs(5);
@@ -537,6 +536,11 @@ impl TestClient {
     pub async fn send(&self, message: Message) {
         let mut w = self.write.lock().await;
         let _ = w.write_proto_message(&message).await;
+    }
+
+    async fn send_batch(&self, messages: &[Message]) {
+        let mut w = self.write.lock().await;
+        let _ = w.write_proto_message_batch(messages).await;
     }
 
     async fn recv_one(&self) -> Option<Message> {

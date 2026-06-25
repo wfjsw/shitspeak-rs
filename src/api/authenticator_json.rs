@@ -9,6 +9,7 @@ use crate::protocol_version::ProtocolVersion;
 
 use super::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, ExternalAuthClaims,
+    canonical_authenticator_ip,
 };
 
 #[derive(Serialize)]
@@ -141,7 +142,7 @@ impl From<&AuthenticateAuxiliaryData> for AuthenticatorJsonAuxiliaryData {
                 .as_ref()
                 .map(|hash| BASE64_STANDARD.encode(hash)),
             session_id: value.session_id,
-            ip_address: value.ip_address,
+            ip_address: canonical_authenticator_ip(value.ip_address),
             tls_ja4: value.tls_ja4.clone(),
             uses_proxy_protocol: value.uses_proxy_protocol,
             version: value.version,

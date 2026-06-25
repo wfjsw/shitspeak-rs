@@ -2358,6 +2358,7 @@ impl Server {
         // the client and return the error to the caller.
         let result: Result<(), HandleIncomingConnectionError> = async {
             let mut handler_tasks = JoinSet::new();
+            let mut pre_auth_handler_in_flight = false;
             let mut authenticate_deadline = Box::pin(tokio::time::sleep(authenticate_timeout));
 
             loop {
@@ -2385,6 +2386,7 @@ impl Server {
                     // ── Completed client message handler ─────────────────────
                     result = handler_tasks.join_next(), if !handler_tasks.is_empty() => {
                         let Some(result) = result else { continue };
+                        pre_auth_handler_in_flight = false;
                         let result = result
                             .map_err(HandleIncomingConnectionError::MessageHandlerTaskFailed)?;
                         finish_handler_result(
@@ -2403,7 +2405,7 @@ impl Server {
                     }
 
                     // ── Incoming message from this client ────────────────────
-                    result = client.read_proto_message() => {
+                    result = client.read_proto_message(), if !pre_auth_handler_in_flight => {
                         match result {
                             Ok(message) => {
                                 if is_realtime_client_message(&message) {
@@ -2424,9 +2426,17 @@ impl Server {
                                 } else {
                                     let handler_server = Arc::clone(self);
                                     let handler_client = Arc::clone(&client);
+                                    let spawned_before_auth = !client.is_authenticated();
                                     handler_tasks.spawn(async move {
                                         handler_client.handle_message(&handler_server, message).await
                                     });
+                                    if spawned_before_auth {
+                                        // Version and Authenticate often arrive back-to-back in
+                                        // one TCP read window. Keep pre-auth handlers ordered so
+                                        // Authenticate sees the Version data before it builds the
+                                        // authenticator auxiliary payload.
+                                        pre_auth_handler_in_flight = true;
+                                    }
                                 }
                             }
                             Err(crate::errors::ReadProtoMessageError::UnknownMessageType(err)) => {

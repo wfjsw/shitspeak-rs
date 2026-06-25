@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
+    canonical_authenticator_ip,
 };
 use crate::channel_handler::SessionChannelShadow;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
@@ -445,7 +446,7 @@ impl SignalingContext {
         AuthenticateAuxiliaryData {
             certificate_hash: None,
             session_id,
-            ip_address: self.real_ip,
+            ip_address: canonical_authenticator_ip(self.real_ip),
             tls_ja4: self.tls_ja4.clone(),
             uses_proxy_protocol: self.uses_proxy_protocol,
             version: None,

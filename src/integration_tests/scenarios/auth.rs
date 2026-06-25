@@ -9,6 +9,7 @@ use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -123,6 +124,14 @@ async fn authenticator_receives_tls_ja4_and_proxy_protocol_flag() {
         !auxiliary.uses_proxy_protocol(),
         "direct test connection should not use PROXY protocol"
     );
+    assert_eq!(auxiliary.ip_address(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(
+        auxiliary.version(),
+        Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0))
+    );
+    assert_eq!(auxiliary.client_name(), Some("test-client"));
+    assert_eq!(auxiliary.os_name(), Some("test"));
+    assert_eq!(auxiliary.os_version(), Some("test"));
 }
 
 #[tokio::test]

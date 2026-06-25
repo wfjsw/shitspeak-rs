@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::{
-    api::{AuthenticateAuxiliaryData, AuthenticationRejection},
+    api::{AuthenticateAuxiliaryData, AuthenticationRejection, canonical_authenticator_ip},
     channel_handler::build_channel_state_message,
     client::{Client, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
@@ -59,7 +59,7 @@ pub async fn handle_authenticate(
     // ── Authentication context and language ───────────────────────────────
     let certificate_hash = sender.get_certificate_hash().map(Bytes::copy_from_slice);
     let mut session_id = sender.get_session_id();
-    let ip_address = sender.get_real_ip_address();
+    let ip_address = canonical_authenticator_ip(sender.get_real_ip_address());
     let (version, client_name, os_name, os_version) = {
         let protocol_version = sender.protocol_version();
         let local_state = sender.read_local_state();

@@ -6,6 +6,16 @@ use bytes::Bytes;
 
 use crate::protocol_version::ProtocolVersion;
 
+pub(crate) fn canonical_authenticator_ip(ip_address: IpAddr) -> IpAddr {
+    match ip_address {
+        IpAddr::V4(_) => ip_address,
+        IpAddr::V6(ipv6) => ipv6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ipv6)),
+    }
+}
+
 #[derive(Debug)]
 pub enum AuthenticationRejection {
     WrongPassword,
@@ -142,5 +152,29 @@ pub trait Authenticator: Send + Sync + 'static {
     /// Default: silently succeeds (no-op).
     async fn unregister_user(&self, _user_id: u32) -> Result<(), ()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::canonical_authenticator_ip;
+
+    #[test]
+    fn canonical_authenticator_ip_unmaps_ipv4_mapped_ipv6() {
+        let mapped = IpAddr::V6(Ipv6Addr::from([0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001]));
+
+        assert_eq!(
+            canonical_authenticator_ip(mapped),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn canonical_authenticator_ip_keeps_native_ipv6() {
+        let native = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+        assert_eq!(canonical_authenticator_ip(native), native);
     }
 }

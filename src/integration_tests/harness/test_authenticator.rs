@@ -5,6 +5,7 @@
 //! delegating to the shared `Arc<TestAuthenticator>`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use crate::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
 };
 use crate::localization::Language;
+use crate::protocol_version::ProtocolVersion;
 
 #[derive(Debug, Clone)]
 struct ScriptedUser {
@@ -33,17 +35,42 @@ pub struct TestAuthenticator {
 
 #[derive(Debug, Clone)]
 pub struct TestAuthenticateAuxiliaryData {
+    ip_address: IpAddr,
     tls_ja4: Option<String>,
     uses_proxy_protocol: bool,
+    version: Option<ProtocolVersion>,
+    client_name: Option<String>,
+    os_name: Option<String>,
+    os_version: Option<String>,
 }
 
 impl TestAuthenticateAuxiliaryData {
+    pub fn ip_address(&self) -> IpAddr {
+        self.ip_address
+    }
+
     pub fn tls_ja4(&self) -> Option<&str> {
         self.tls_ja4.as_deref()
     }
 
     pub fn uses_proxy_protocol(&self) -> bool {
         self.uses_proxy_protocol
+    }
+
+    pub fn version(&self) -> Option<ProtocolVersion> {
+        self.version
+    }
+
+    pub fn client_name(&self) -> Option<&str> {
+        self.client_name.as_deref()
+    }
+
+    pub fn os_name(&self) -> Option<&str> {
+        self.os_name.as_deref()
+    }
+
+    pub fn os_version(&self) -> Option<&str> {
+        self.os_version.as_deref()
     }
 }
 
@@ -182,8 +209,13 @@ impl Authenticator for AuthenticatorAdapter {
             .lock()
             .unwrap()
             .push(TestAuthenticateAuxiliaryData {
+                ip_address: auxiliary_data.ip_address,
                 tls_ja4: auxiliary_data.tls_ja4.clone(),
                 uses_proxy_protocol: auxiliary_data.uses_proxy_protocol,
+                version: auxiliary_data.version,
+                client_name: auxiliary_data.client_name.clone(),
+                os_name: auxiliary_data.os_name.clone(),
+                os_version: auxiliary_data.os_version.clone(),
             });
         let entry = {
             let users = self.0.users.lock().unwrap();
