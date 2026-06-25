@@ -127,8 +127,12 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
     }
 
     match &op.op {
-        ChannelOp::MarkPendingDelete { id, nonce } => {
-            if let Some(shadow) = session_channel_shadow.as_deref_mut() {
+        ChannelOp::MarkPendingDelete {
+            id,
+            nonce,
+            evict_clients,
+        } => {
+            if *evict_clients && let Some(shadow) = session_channel_shadow.as_deref_mut() {
                 append_pending_delete_synthetic_moves(
                     server,
                     channels,
@@ -275,6 +279,16 @@ async fn synthetic_move_if_pending_delete(
     let target = channels
         .redirect_pending_delete_target_in_server(server_id, channel_id)
         .await;
+    let Some(target_client) = server
+        .get_clients()
+        .get_client_in_server(server_id, session)
+        .await
+    else {
+        return Vec::new();
+    };
+    let target =
+        crate::user_channel_cache::resolve_forced_move_channel(server, &target_client, target)
+            .await;
     if target == channel_id {
         return Vec::new();
     }
@@ -306,7 +320,7 @@ async fn append_pending_delete_synthetic_moves(
         return;
     }
 
-    let target = channels
+    let initial_target = channels
         .redirect_pending_delete_target_in_server(server_id, id)
         .await;
     let sessions: Vec<_> = shadow
@@ -318,6 +332,19 @@ async fn append_pending_delete_synthetic_moves(
         let Some(current) = shadow.get(&session).copied() else {
             continue;
         };
+        let Some(target_client) = server
+            .get_clients()
+            .get_client_in_server(server_id, session)
+            .await
+        else {
+            continue;
+        };
+        let target = crate::user_channel_cache::resolve_forced_move_channel(
+            server,
+            &target_client,
+            initial_target,
+        )
+        .await;
         if let Some(message) = synthetic_user_move(server, shadow, session, current, target) {
             messages.push(message);
         }

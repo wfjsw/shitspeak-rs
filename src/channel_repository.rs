@@ -236,6 +236,8 @@ pub enum ChannelOp {
     MarkPendingDelete {
         id: u32,
         nonce: u64,
+        #[serde(default = "default_mark_pending_delete_evict_clients")]
+        evict_clients: bool,
     },
     DeleteChannel {
         id: u32,
@@ -263,6 +265,10 @@ pub enum ChannelOp {
         channels: Vec<Channel>,
         removed: Vec<u32>,
     },
+}
+
+fn default_mark_pending_delete_evict_clients() -> bool {
+    true
 }
 
 // ─── Snapshot ─────────────────────────────────────────────────────────────────
@@ -862,58 +868,16 @@ impl ChannelRepository {
         expired
     }
 
-    /// Move locally owned clients out of a newly pending delete subtree.
-    ///
-    /// Each node performs this independently when it observes the replicated
-    /// mark-pending operation. The emitted `UserState` messages are local
-    /// client-log entries, so observer sockets see synthetic moves before the
-    /// later nonce-bearing `ChannelRemove`.
-    pub async fn move_local_clients_out_of_pending_delete(
-        &self,
-        id: u32,
-        nonce: u64,
-        parent_id: u32,
-        channel_version: u64,
-    ) -> usize {
-        self.move_local_clients_out_of_pending_delete_in_server(
-            DEFAULT_SERVER_ID,
-            id,
-            nonce,
-            parent_id,
-            channel_version,
-        )
-        .await
-    }
-
-    pub async fn move_local_clients_out_of_pending_delete_in_server(
+    pub async fn pending_delete_subtree_set_in_server(
         &self,
         server_id: &str,
         id: u32,
         nonce: u64,
-        parent_id: u32,
-        channel_version: u64,
-    ) -> usize {
-        let Some(client_repo) = self.client_repo.lock().clone() else {
-            return 0;
-        };
-        let subtree: std::collections::HashSet<u32> = self
-            .pending_delete_subtree_in_server(server_id, id, nonce)
+    ) -> std::collections::HashSet<u32> {
+        self.pending_delete_subtree_in_server(server_id, id, nonce)
             .await
             .into_iter()
-            .collect();
-        if subtree.is_empty() {
-            return 0;
-        }
-
-        let mut moved = 0;
-        for client in client_repo.get_local_clients_in_server(server_id).await {
-            if !subtree.contains(&client.get_current_channel_id()) {
-                continue;
-            }
-            client.set_current_channel_id(parent_id, &client_repo, channel_version);
-            moved += 1;
-        }
-        moved
+            .collect()
     }
 
     pub async fn move_local_clients_out_of_missing_channels_in_server(
@@ -1438,6 +1402,17 @@ impl ChannelRepository {
         id: u32,
         nonce: u64,
     ) -> Result<Vec<u32>, ChannelRepoError> {
+        self.mark_pending_delete_in_server_with_evict_clients(server_id, id, nonce, true)
+            .await
+    }
+
+    pub async fn mark_pending_delete_in_server_with_evict_clients(
+        self: &Arc<Self>,
+        server_id: &str,
+        id: u32,
+        nonce: u64,
+        evict_clients: bool,
+    ) -> Result<Vec<u32>, ChannelRepoError> {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
@@ -1462,7 +1437,14 @@ impl ChannelRepository {
             }
             to_delete
         };
-        let op = self.make_op_in_server(server_id, ChannelOp::MarkPendingDelete { id, nonce });
+        let op = self.make_op_in_server(
+            server_id,
+            ChannelOp::MarkPendingDelete {
+                id,
+                nonce,
+                evict_clients,
+            },
+        );
         self.commit(op).await?;
         Ok(to_delete)
     }
@@ -1977,16 +1959,21 @@ impl ChannelRepository {
 
         let mut acl_changed = channel_op_affects_acl_generation(&op.op);
         let server_id = op.server_id.clone();
-        let pending_delete_move = {
+        let evicting_pending_delete = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.clone()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
             op.op = normalize_op_for_root(&op.op, &root_config);
-            let pending_delete_move = match &op.op {
-                ChannelOp::MarkPendingDelete { id, nonce } => channels
-                    .get(id)
-                    .map(|channel| (*id, *nonce, channel.parent_id.unwrap_or(0))),
+            let evicting_pending_delete = match &op.op {
+                ChannelOp::MarkPendingDelete {
+                    id,
+                    nonce,
+                    evict_clients,
+                } if *evict_clients => channels.get(id).map(|channel| {
+                    let _ = channel;
+                    (*id, *nonce)
+                }),
                 ChannelOp::DeleteChannel { id, nonce } => {
                     let can_delete = channels
                         .get(id)
@@ -2003,7 +1990,7 @@ impl ChannelRepository {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, &server_id, channels);
             }
-            pending_delete_move
+            evicting_pending_delete
         };
 
         if acl_changed {
@@ -2012,23 +1999,16 @@ impl ChannelRepository {
         self.invalidate_acl_cache_for_op(&op.op).await;
         let committed = self.commit_assigned_operation(op).await?;
 
-        if let Some((id, nonce, parent_id)) = pending_delete_move {
-            let moved = self
-                .move_local_clients_out_of_pending_delete_in_server(
-                    &server_id,
-                    id,
-                    nonce,
-                    parent_id,
-                    committed.version,
-                )
+        if let Some((id, nonce)) = evicting_pending_delete {
+            let subtree = self
+                .pending_delete_subtree_set_in_server(&server_id, id, nonce)
                 .await;
-            if moved > 0 {
+            if !subtree.is_empty() {
                 tracing::trace!(
                     channel_id = id,
                     nonce,
-                    parent_id,
-                    moved,
-                    "moved local clients out of replicated pending-delete subtree"
+                    subtree_len = subtree.len(),
+                    "replicated pending-delete subtree is ready for caller-side local client eviction"
                 );
             }
         }
@@ -2439,7 +2419,7 @@ fn apply_op_to_map(
                 apply_patch(ch, patch);
             }
         }
-        ChannelOp::MarkPendingDelete { id, nonce } => {
+        ChannelOp::MarkPendingDelete { id, nonce, .. } => {
             let started_at_ms = chrono::Utc::now().timestamp_millis();
             let to_mark = collect_subtree(channels, *id);
             for mark_id in to_mark {

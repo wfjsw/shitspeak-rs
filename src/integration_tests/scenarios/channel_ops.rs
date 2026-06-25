@@ -911,3 +911,91 @@ async fn remove_channel_migrates_users_to_parent() {
         "Alice should observe Bob being migrated back to root after channel 20 was removed"
     );
 }
+
+#[tokio::test]
+async fn remove_channel_migrates_users_to_first_enterable_fallback() {
+    let server = spawn_test_server(TestServerOpts {
+        default_channel: 30,
+        debug_acl_enter: false,
+        explicit_enter_deny_overrides_write: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(30, "Lobby".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(40, "DeniedParent".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(41, "Doomed".to_owned(), 0, 0, Some(40)))
+        .await
+        .unwrap();
+    let deny_enter = ACL {
+        user_id: None,
+        group: Some("all".to_owned()),
+        apply_here: true,
+        apply_subs: false,
+        allow: enumflags2::BitFlags::empty(),
+        deny: ACLPermissions::Enter.into(),
+    };
+    chans
+        .set_acls(0, true, vec![deny_enter.clone()])
+        .await
+        .unwrap();
+    chans.set_acls(40, true, vec![deny_enter]).await.unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let alice_session = alice.session_id;
+
+    alice.move_to_channel(41).await;
+    let _ = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice_session) && us.channel_id == Some(41))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+
+    alice.remove_channel(41).await;
+
+    let moved = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice_session) && us.channel_id == Some(30))
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+    assert!(
+        moved.is_some(),
+        "Alice should be moved to the default channel when the deleted channel's parent and root deny Enter"
+    );
+
+    let moved_to_denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice_session)
+                        && (us.channel_id == Some(40) || us.channel_id == Some(0)))
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        moved_to_denied.is_none(),
+        "Alice should not be moved into the denied parent or root channel"
+    );
+}

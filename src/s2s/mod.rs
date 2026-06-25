@@ -790,11 +790,13 @@ impl S2SManager {
         if let Some(server) = server_handle.as_ref() {
             let channels = server.get_channels().clone();
             let manager = Arc::clone(&self);
+            let server_weak = server_handle.as_ref().map(Arc::downgrade);
             replications.set_strict_topic_resolver(Some(Arc::new(move |topic, parts| {
                 let server_id = server_id_from_channel_topic(topic)?;
                 let repo = Arc::new(ChannelReplicationAdapter::new(
                     server_id.clone(),
                     channels.clone(),
+                    server_weak.clone(),
                 ));
                 let runtime = parts.build_runtime(topic.to_owned(), repo);
                 runtime.start();
@@ -1072,6 +1074,7 @@ impl S2SManager {
                 let repo = Arc::new(ChannelReplicationAdapter::new(
                     server_id.to_owned(),
                     server.get_channels().clone(),
+                    Some(Arc::downgrade(server)),
                 ));
                 let runtime = replications
                     .strict_topic_parts()
@@ -1781,7 +1784,11 @@ pub fn install_channel_replication_resolver(
 ) {
     replications.set_strict_topic_resolver(Some(Arc::new(move |topic, parts| {
         let server_id = server_id_from_channel_topic(topic)?;
-        let repo = Arc::new(ChannelReplicationAdapter::new(server_id, channels.clone()));
+        let repo = Arc::new(ChannelReplicationAdapter::new(
+            server_id,
+            channels.clone(),
+            None,
+        ));
         let runtime = parts.build_runtime(topic.to_owned(), repo);
         runtime.start();
         Some(runtime)
@@ -1814,11 +1821,20 @@ fn now_ms() -> u64 {
 pub struct ChannelReplicationAdapter {
     server_id: String,
     repo: Arc<ChannelRepository>,
+    server: Option<Weak<Box<Server>>>,
 }
 
 impl ChannelReplicationAdapter {
-    pub fn new(server_id: String, repo: Arc<ChannelRepository>) -> Self {
-        Self { server_id, repo }
+    pub fn new(
+        server_id: String,
+        repo: Arc<ChannelRepository>,
+        server: Option<Weak<Box<Server>>>,
+    ) -> Self {
+        Self {
+            server_id,
+            repo,
+            server,
+        }
     }
 }
 
@@ -1892,8 +1908,49 @@ impl StrictReplicable for ChannelReplicationAdapter {
         if op.server_id.is_empty() || op.server_id == DEFAULT_SERVER_ID {
             op.server_id = self.server_id.clone();
         }
+        let evict_pending_delete = match &op.op {
+            ChannelOp::MarkPendingDelete {
+                id,
+                nonce,
+                evict_clients,
+            } if *evict_clients => {
+                let fallback = self
+                    .repo
+                    .get_channel_in_server(&op.server_id, *id)
+                    .await
+                    .and_then(|channel| channel.parent_id)
+                    .unwrap_or(0);
+                Some((*id, *nonce, fallback))
+            }
+            _ => None,
+        };
+        let op_server_id = op.server_id.clone();
         if let Err(e) = self.repo.apply_committed_operation(op).await {
             warn!(error = ?e, "s2s channel operation apply failed");
+            return;
+        }
+        if let (Some(server), Some((id, nonce, fallback))) = (
+            self.server.as_ref().and_then(Weak::upgrade),
+            evict_pending_delete,
+        ) {
+            let moved = crate::user_channel_cache::move_local_clients_out_of_pending_delete(
+                &server,
+                &op_server_id,
+                id,
+                nonce,
+                fallback,
+                version,
+            )
+            .await;
+            if moved > 0 {
+                trace!(
+                    server_id = %op_server_id,
+                    channel_id = id,
+                    nonce,
+                    moved,
+                    "moved local clients out of replicated pending-delete subtree"
+                );
+            }
         }
     }
 

@@ -355,6 +355,7 @@ fn register_strict_topics(
                 Arc::new(ChannelReplicationAdapter::new(
                     server_id,
                     repositories.channels.clone(),
+                    None,
                 )),
             )?;
         } else {

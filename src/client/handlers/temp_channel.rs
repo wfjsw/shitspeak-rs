@@ -25,10 +25,16 @@ pub async fn reap_if_empty_temporary(
     if !ch.is_temporary() {
         return false;
     }
+    if clients
+        .has_client_in_channel_in_server(server_id, channel_id)
+        .await
+    {
+        return false;
+    }
 
     let nonce = rand::random::<u64>();
     if channels
-        .mark_pending_delete_in_server(server_id, channel_id, nonce)
+        .mark_pending_delete_in_server_with_evict_clients(server_id, channel_id, nonce, false)
         .await
         .is_err()
     {
@@ -79,7 +85,14 @@ pub async fn reap_if_empty_temporary_on_server(
     let mark = ChannelOp::MarkPendingDelete {
         id: channel_id,
         nonce,
+        evict_clients: false,
     };
+    if clients
+        .has_client_in_channel_in_server(server_id, channel_id)
+        .await
+    {
+        return false;
+    }
     if channels
         .validate_s2s_op_in_server(server_id, &mark)
         .await
@@ -94,7 +107,7 @@ pub async fn reap_if_empty_temporary_on_server(
         .await;
     let marked_locally = if s2s_marked.should_apply_locally() {
         if channels
-            .mark_pending_delete_in_server(server_id, channel_id, nonce)
+            .mark_pending_delete_in_server_with_evict_clients(server_id, channel_id, nonce, false)
             .await
             .is_err()
         {
@@ -191,6 +204,7 @@ mod tests {
     use crate::{
         channel_repository::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig},
         channels::Channel,
+        client::{Client, client_session_identifier::ClientSessionIdentifier},
         client_repository::ClientRepository,
         types::DEFAULT_SERVER_ID,
     };
@@ -388,6 +402,56 @@ mod tests {
                 .await
                 .is_some(),
             "channel must still exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_does_not_delete_temporary_channel_with_remote_occupant() {
+        let channels = channel_repository();
+        let clients = Arc::new(ClientRepository::new(1, 128));
+        channels.set_client_repo(clients.clone()).await;
+
+        let temp_id = channels
+            .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
+            .await;
+        channels
+            .create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(temp_id, "Temp", 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
+
+        let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let remote = Arc::new(Client::new_remote_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            remote_session,
+            peer().ip(),
+            peer(),
+            None,
+            local(),
+            None,
+            chrono::Utc::now(),
+            99,
+        ));
+        {
+            let mut state = remote.write_global_state_direct();
+            state.set_current_channel_id(temp_id);
+        }
+        clients.add_remote_client(remote_session, remote).await;
+
+        let reaped = reap_if_empty_temporary(&channels, &clients, DEFAULT_SERVER_ID, temp_id).await;
+
+        assert!(
+            !reaped,
+            "temporary channel with a replicated remote occupant must not be reaped"
+        );
+        assert!(
+            channels
+                .get_channel_in_server(DEFAULT_SERVER_ID, temp_id)
+                .await
+                .is_some(),
+            "channel must remain while any node has an occupant"
         );
     }
 

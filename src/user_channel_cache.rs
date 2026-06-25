@@ -254,6 +254,108 @@ pub async fn resolve_login_channels(
     }
 }
 
+pub async fn resolve_forced_move_channel(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    first_candidate_channel_id: u32,
+) -> u32 {
+    let server_id = client.server_id();
+    let channel_candidates =
+        forced_move_candidates(server, &server_id, first_candidate_channel_id).await;
+
+    for channel_id in channel_candidates {
+        if can_enter_channel(server, client, channel_id).await {
+            return channel_id;
+        }
+    }
+
+    let default_channel = existing_default_channel(server, &server_id).await;
+    if default_channel != first_candidate_channel_id
+        && can_enter_channel(server, client, default_channel).await
+    {
+        return default_channel;
+    }
+
+    if default_channel != 0 && can_enter_channel(server, client, 0).await {
+        return 0;
+    }
+
+    default_channel
+}
+
+pub async fn move_local_client_to_forced_fallback(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    first_candidate_channel_id: u32,
+    channel_version: u64,
+) -> Option<u32> {
+    let target_channel =
+        resolve_forced_move_channel(server, client, first_candidate_channel_id).await;
+    if target_channel == client.get_current_channel_id() {
+        return None;
+    }
+
+    let repo = server.get_clients();
+    client.set_current_channel_id(target_channel, repo, channel_version);
+    Some(target_channel)
+}
+
+pub async fn move_local_clients_out_of_pending_delete(
+    server: &Arc<Box<Server>>,
+    server_id: &str,
+    channel_id: u32,
+    nonce: u64,
+    fallback_channel_id: u32,
+    channel_version: u64,
+) -> usize {
+    let subtree = server
+        .get_channels()
+        .pending_delete_subtree_set_in_server(server_id, channel_id, nonce)
+        .await;
+    if subtree.is_empty() {
+        return 0;
+    }
+
+    let mut moved = 0;
+    for client in server
+        .get_clients()
+        .get_local_clients_in_server(server_id)
+        .await
+    {
+        if !subtree.contains(&client.get_current_channel_id()) {
+            continue;
+        }
+
+        let channel_cache_key = cache_key_for_client(client.as_ref()).await;
+        let target_channel = move_local_client_to_forced_fallback(
+            server,
+            &client,
+            fallback_channel_id,
+            channel_version,
+        )
+        .await;
+
+        if let (Some(cache_key), Some(target_channel)) =
+            (channel_cache_key.as_deref(), target_channel)
+        {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_last_channel(cache_key, target_channel)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key,
+                    "failed to stage user last channel cache"
+                );
+            }
+        }
+        moved += 1;
+    }
+
+    moved
+}
+
 async fn resolve_current_channel(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -268,6 +370,62 @@ async fn resolve_current_channel(
         }
     }
 
+    existing_default_channel(server, server_id).await
+}
+
+async fn usable_cached_current_channel(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    server_id: &str,
+    channel_id: u32,
+) -> Option<u32> {
+    let channel_id = server
+        .get_channels()
+        .redirect_pending_delete_target_in_server(server_id, channel_id)
+        .await;
+    server
+        .get_channels()
+        .get_channel_in_server(server_id, channel_id)
+        .await?;
+    if can_enter_channel(server, client, channel_id).await {
+        Some(channel_id)
+    } else {
+        None
+    }
+}
+
+async fn forced_move_candidates(
+    server: &Arc<Box<Server>>,
+    server_id: &str,
+    first_candidate_channel_id: u32,
+) -> Vec<u32> {
+    let mut candidates = Vec::new();
+    let mut current = server
+        .get_channels()
+        .redirect_pending_delete_target_in_server(server_id, first_candidate_channel_id)
+        .await;
+
+    loop {
+        if !candidates.contains(&current) {
+            candidates.push(current);
+        }
+        let Some(channel) = server
+            .get_channels()
+            .get_channel_in_server(server_id, current)
+            .await
+        else {
+            break;
+        };
+        let Some(parent_id) = channel.parent_id else {
+            break;
+        };
+        current = parent_id;
+    }
+
+    candidates
+}
+
+async fn existing_default_channel(server: &Arc<Box<Server>>, server_id: &str) -> u32 {
     let default_channel = server.get_default_channel();
     let target_channel = if server
         .get_channels()
@@ -286,28 +444,14 @@ async fn resolve_current_channel(
         .await
 }
 
-async fn usable_cached_current_channel(
+async fn can_enter_channel(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    server_id: &str,
     channel_id: u32,
-) -> Option<u32> {
-    let channel_id = server
-        .get_channels()
-        .redirect_pending_delete_target_in_server(server_id, channel_id)
-        .await;
-    server
-        .get_channels()
-        .get_channel_in_server(server_id, channel_id)
-        .await?;
+) -> bool {
     let permissions =
         crate::client::acl::compute_permissions_for_client(server, client, channel_id).await;
-    if permissions.contains(ACLPermissions::Traverse) && permissions.contains(ACLPermissions::Enter)
-    {
-        Some(channel_id)
-    } else {
-        None
-    }
+    permissions.contains(ACLPermissions::Traverse) && permissions.contains(ACLPermissions::Enter)
 }
 
 async fn resolve_listening_channels(
