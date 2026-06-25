@@ -152,6 +152,62 @@ async fn self_priority_speaker_is_denied() {
 }
 
 #[tokio::test]
+async fn mute_deafen_user_can_set_own_priority_speaker() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![ACL {
+                user_id: None,
+                group: Some("all".to_owned()),
+                apply_here: true,
+                apply_subs: true,
+                allow: ACLPermissions::MuteDeafen.into(),
+                deny: enumflags2::BitFlags::empty(),
+            }],
+        )
+        .await
+        .unwrap();
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let mut state = UserState::default();
+    state.session = Some(alice.server_session);
+    state.priority_speaker = Some(true);
+    alice.send(state.into()).await;
+
+    let alice_session = alice.session_id;
+    let granted = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice_session)
+                        && us.priority_speaker == Some(true))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        granted.is_some(),
+        "MuteDeafen should allow setting own priority speaker"
+    );
+}
+
+#[tokio::test]
 async fn client_suppress_update_is_denied() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

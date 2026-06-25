@@ -614,11 +614,9 @@ pub async fn handle_user_state(
             }
         }
 
-        if !is_self {
-            if let Some(priority_speaker) = msg.priority_speaker {
-                if gs.is_priority_speaker() != priority_speaker {
-                    gs.set_priority_speaker(priority_speaker);
-                }
+        if let Some(priority_speaker) = msg.priority_speaker {
+            if gs.is_priority_speaker() != priority_speaker {
+                gs.set_priority_speaker(priority_speaker);
             }
         }
 
