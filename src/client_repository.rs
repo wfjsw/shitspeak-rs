@@ -696,6 +696,18 @@ impl ClientRepository {
         server_id: &str,
         id: ClientSessionIdentifier,
     ) -> Option<Arc<Box<Client>>> {
+        self.remove_client_in_server_with_metadata(server_id, id, None, None, false)
+            .await
+    }
+
+    pub(crate) async fn remove_client_in_server_with_metadata(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+        actor: Option<ClientSessionIdentifier>,
+        reason: Option<String>,
+        ban: bool,
+    ) -> Option<Arc<Box<Client>>> {
         let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
         let client = {
             let mut register = self.register.write().await;
@@ -759,6 +771,9 @@ impl ClientRepository {
                     server_id: server_id.to_owned(),
                     session_id: id,
                     client_instance_id: client.client_instance_id(),
+                    actor,
+                    reason,
+                    ban,
                 },
                 None,
             )
@@ -840,6 +855,9 @@ impl ClientRepository {
                         server_id: id.server_id().to_owned(),
                         session_id: id.session_id(),
                         client_instance_id,
+                        actor: None,
+                        reason: None,
+                        ban: false,
                     },
                 });
                 let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
@@ -1773,6 +1791,7 @@ impl ClientRepository {
                 server_id,
                 session_id,
                 client_instance_id,
+                ..
             } => {
                 // Remote clients are not in the channel/listener index, so
                 // no index cleanup is necessary here.
@@ -2390,6 +2409,9 @@ mod tests {
                 server_id: crate::types::default_server_id(),
                 session_id: remote_session,
                 client_instance_id: 11,
+                actor: None,
+                reason: None,
+                ban: false,
             },
         });
 
@@ -2498,6 +2520,9 @@ mod tests {
                 server_id: crate::types::default_server_id(),
                 session_id: remote_session,
                 client_instance_id: 22,
+                actor: None,
+                reason: None,
+                ban: false,
             },
         });
 

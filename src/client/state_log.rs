@@ -251,6 +251,12 @@ pub enum ClientStateOperation {
         session_id: ClientSessionIdentifier,
         #[serde(default)]
         client_instance_id: ClientInstanceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<ClientSessionIdentifier>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default)]
+        ban: bool,
     },
     UpdateGlobalState {
         #[serde(default = "default_server_id")]
@@ -388,6 +394,9 @@ impl ClientStateLogEntry {
             ClientStateOperation::RemoveClient {
                 server_id,
                 session_id,
+                actor,
+                reason,
+                ban,
                 ..
             } => {
                 if repo
@@ -400,9 +409,9 @@ impl ClientStateLogEntry {
                 Some(
                     crate::messages::encoder::UserRemove {
                         session: u32::from(*session_id),
-                        actor: None,
-                        reason: None,
-                        ban: Some(false),
+                        actor: actor.map(u32::from),
+                        reason: reason.clone(),
+                        ban: Some(*ban),
                     }
                     .into(),
                 )

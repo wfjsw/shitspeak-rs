@@ -7,6 +7,7 @@ package s2s_application;
 //   tag = 3 → VoiceFrame (broadcast / multicast / unicast per delivery mode)
 //   tag = 4 → UserStatsEnvelope (request/reply RPC)
 //   tag = 5 → PluginDataEnvelope (client-to-client plugin payload fanout)
+//   tag = 6 → TextMessageEnvelope (client text fanout)
 
 // ── Moderation ────────────────────────────────────────────────────────────
 
@@ -98,6 +99,23 @@ message PluginDataEnvelope {
   bytes data = 3;
   optional string data_id = 4;
   string server_id = 5;               // empty/absent means "default" for legacy peers
+}
+
+// ── Text Messages ─────────────────────────────────────────────────────────
+//
+// Client-visible TextMessage fanout. The originator evaluates ACLs and
+// visibility against the replicated client/channel view, groups the concrete
+// recipient sessions by owning node, and the destination node writes the
+// original TextMessage fields to locally-owned recipient sessions.
+
+message TextMessageEnvelope {
+  uint32 sender_session = 1;          // stamped by the originator
+  repeated uint32 receiver_sessions = 2;
+  repeated uint32 session = 3;        // original Mumble TextMessage.session
+  repeated uint32 channel_id = 4;     // original Mumble TextMessage.channel_id
+  repeated uint32 tree_id = 5;        // original Mumble TextMessage.tree_id
+  string message = 6;
+  string server_id = 7;               // empty/absent means "default" for legacy peers
 }
 
 // ── Voice ─────────────────────────────────────────────────────────────────

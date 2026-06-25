@@ -30,6 +30,7 @@ pub mod error;
 pub mod moderation;
 pub mod plugin_data;
 pub mod proto;
+pub mod text_message;
 pub mod user_stats;
 pub mod voice;
 
@@ -44,8 +45,10 @@ pub use error::ApplicationError;
 pub use moderation::ModerationService;
 pub use plugin_data::PluginDataService;
 pub use proto::{
-    MODERATION_SERVICE_TAG, PLUGIN_DATA_SERVICE_TAG, USER_STATS_SERVICE_TAG, VOICE_SERVICE_TAG,
+    MODERATION_SERVICE_TAG, PLUGIN_DATA_SERVICE_TAG, TEXT_MESSAGE_SERVICE_TAG,
+    USER_STATS_SERVICE_TAG, VOICE_SERVICE_TAG,
 };
+pub use text_message::TextMessageService;
 pub use user_stats::UserStatsService;
 pub use voice::VoiceService;
 
@@ -60,6 +63,7 @@ struct ApplicationInner {
     overlay: OverlayNetwork,
     moderation: Arc<ModerationService>,
     plugin_data: Arc<PluginDataService>,
+    text_message: Arc<TextMessageService>,
     user_stats: Arc<UserStatsService>,
     voice: Arc<VoiceService>,
     shutdown: CancellationToken,
@@ -72,11 +76,13 @@ impl ApplicationLayer {
         let shutdown = CancellationToken::new();
         let moderation = ModerationService::new(overlay.clone(), shutdown.child_token());
         let plugin_data = PluginDataService::new(overlay.clone(), shutdown.child_token());
+        let text_message = TextMessageService::new(overlay.clone(), shutdown.child_token());
         let user_stats = UserStatsService::new(overlay.clone(), shutdown.child_token());
         let voice = VoiceService::new(overlay.clone(), cfg.voice.clone(), shutdown.child_token());
 
         overlay.register_service(MODERATION_SERVICE_TAG, moderation.inbound_handler());
         overlay.register_service(PLUGIN_DATA_SERVICE_TAG, plugin_data.inbound_handler());
+        overlay.register_service(TEXT_MESSAGE_SERVICE_TAG, text_message.inbound_handler());
         overlay.register_service(USER_STATS_SERVICE_TAG, user_stats.inbound_handler());
         overlay.register_service(VOICE_SERVICE_TAG, voice.inbound_handler());
 
@@ -84,6 +90,7 @@ impl ApplicationLayer {
             overlay,
             moderation,
             plugin_data,
+            text_message,
             user_stats,
             voice,
             shutdown,
@@ -97,6 +104,10 @@ impl ApplicationLayer {
 
     pub fn plugin_data(&self) -> &Arc<PluginDataService> {
         &self.inner.plugin_data
+    }
+
+    pub fn text_message(&self) -> &Arc<TextMessageService> {
+        &self.inner.text_message
     }
 
     pub fn user_stats(&self) -> &Arc<UserStatsService> {
@@ -116,6 +127,9 @@ impl ApplicationLayer {
         self.inner
             .overlay
             .unregister_service(PLUGIN_DATA_SERVICE_TAG);
+        self.inner
+            .overlay
+            .unregister_service(TEXT_MESSAGE_SERVICE_TAG);
         self.inner
             .overlay
             .unregister_service(USER_STATS_SERVICE_TAG);

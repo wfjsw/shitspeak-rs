@@ -36,8 +36,8 @@ use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
 use self::application::error::ApplicationError;
 use self::application::moderation::ModerationApplier;
 use self::application::proto::{
-    ModerationCommand, ModerationEnvelope, PluginDataEnvelope, UserRemovePatch, UserStatePatch,
-    UserStatsReply, VoiceFrame, VoiceIntent,
+    ModerationCommand, ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope,
+    UserRemovePatch, UserStatePatch, UserStatsReply, VoiceFrame, VoiceIntent,
 };
 use self::application::voice::{AudioSink, RecipientIndex};
 use self::overlay::OverlayNetwork;
@@ -88,6 +88,10 @@ enum S2SNativeCommand {
         from: NodeIdentifier,
         envelope: PluginDataEnvelope,
     },
+    DeliverTextMessage {
+        from: NodeIdentifier,
+        envelope: TextMessageEnvelope,
+    },
     DeliverVoice {
         from_immediate: NodeIdentifier,
         frame: VoiceFrame,
@@ -109,6 +113,10 @@ enum NativeToS2SCommand {
     DispatchPluginData {
         owner: NodeIdentifier,
         envelope: PluginDataEnvelope,
+    },
+    DispatchTextMessage {
+        owner: NodeIdentifier,
+        envelope: TextMessageEnvelope,
     },
     DispatchModeration {
         owner: NodeIdentifier,
@@ -456,6 +464,17 @@ impl S2SManager {
         self.try_send_s2s_command(
             NativeToS2SCommand::DispatchPluginData { owner, envelope },
             "plugin_data",
+        )
+    }
+
+    pub fn dispatch_text_message(
+        &self,
+        owner: NodeIdentifier,
+        envelope: TextMessageEnvelope,
+    ) -> bool {
+        self.try_send_s2s_command(
+            NativeToS2SCommand::DispatchTextMessage { owner, envelope },
+            "text_message",
         )
     }
 
@@ -827,7 +846,8 @@ impl S2SManager {
         application
             .voice()
             .set_recipient_index(recipient_index.clone());
-        application.plugin_data().set_sink(native_sink);
+        application.plugin_data().set_sink(native_sink.clone());
+        application.text_message().set_sink(native_sink);
 
         let (
             channel_replications,
@@ -1238,6 +1258,11 @@ fn spawn_s2s_gateway_receiver(
                         warn!(error = %e, owner, "plugin data dispatch failed");
                     }
                 }
+                NativeToS2SCommand::DispatchTextMessage { owner, envelope } => {
+                    if let Err(e) = application.text_message().dispatch(owner, envelope).await {
+                        warn!(error = %e, owner, "text message dispatch failed");
+                    }
+                }
                 NativeToS2SCommand::DispatchModeration { owner, envelope } => {
                     if let Err(e) = application
                         .moderation()
@@ -1342,6 +1367,11 @@ async fn run_native_gateway(
                 application::plugin_data::runtime::deliver_to_local_recipients(&server, envelope)
                     .await;
             }
+            S2SNativeCommand::DeliverTextMessage { from, envelope } => {
+                trace!(from, "s2s text message handed to native gateway");
+                application::text_message::runtime::deliver_to_local_recipients(&server, envelope)
+                    .await;
+            }
             S2SNativeCommand::DeliverVoice {
                 from_immediate,
                 frame,
@@ -1403,6 +1433,16 @@ impl application::plugin_data::PluginDataSink for S2SNativeGatewaySink {
         self.try_send(
             S2SNativeCommand::DeliverPluginData { from, envelope },
             "plugin_data",
+        );
+    }
+}
+
+#[async_trait]
+impl application::text_message::TextMessageSink for S2SNativeGatewaySink {
+    async fn deliver(&self, from: NodeIdentifier, envelope: TextMessageEnvelope) {
+        self.try_send(
+            S2SNativeCommand::DeliverTextMessage { from, envelope },
+            "text_message",
         );
     }
 }
@@ -1649,10 +1689,37 @@ async fn apply_user_remove_patch(
         );
     }
 
+    let actor_for_target =
+        if crate::client::visibility::can_view_user(server, &target, &actor_client).await {
+            Some(actor_session)
+        } else {
+            None
+        };
+    let remove_notice: crate::messages::Message = crate::messages::encoder::UserRemove {
+        session: u32::from(target_id),
+        actor: actor_for_target,
+        reason: patch.reason.clone(),
+        ban: Some(patch.ban),
+    }
+    .into();
+    if let Err(e) = target.write_proto_message(&remove_notice).await {
+        trace!(
+            error = %e,
+            target = u32::from(target_id),
+            "s2s moderation failed to send kick notice to target before disconnect",
+        );
+    }
+
     let old_channel_id = target.get_current_channel_id();
     let removed = server
         .get_clients()
-        .remove_client_in_server(server_id, target_id)
+        .remove_client_in_server_with_metadata(
+            server_id,
+            target_id,
+            Some(actor),
+            patch.reason.clone(),
+            patch.ban,
+        )
         .await;
     let target = removed.as_ref().unwrap_or(&target);
     if let Err(e) = target.force_disconnect().await {

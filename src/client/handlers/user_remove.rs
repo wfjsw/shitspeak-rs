@@ -5,6 +5,7 @@ use crate::{
     ban_repository::BanOp,
     client::Client,
     errors::MessageHandlerError,
+    messages::Message,
     messages::encoder::{PermissionDenied, UserRemove},
     server::Server,
 };
@@ -136,10 +137,38 @@ pub async fn handle_user_remove(
     // drive the UserRemove broadcast to all per-client subscribers.
     // No need to broadcast manually.
 
+    let actor = sender.get_session_id();
+    let actor_for_target =
+        if crate::client::visibility::can_view_user(server, &target, sender).await {
+            Some(u32::from(actor))
+        } else {
+            None
+        };
+    let remove_notice: Message = UserRemove {
+        session: target_raw,
+        actor: actor_for_target,
+        reason: msg.reason.clone(),
+        ban: Some(is_ban),
+    }
+    .into();
+    if let Err(e) = target.write_proto_message(&remove_notice).await {
+        tracing::debug!(
+            error = %e,
+            target = target_raw,
+            "failed to send kick notice to target before disconnect",
+        );
+    }
+
     let old_channel_id = target.get_current_channel_id();
     let removed = server
         .get_clients()
-        .remove_client_in_server(&server_id, target_session)
+        .remove_client_in_server_with_metadata(
+            &server_id,
+            target_session,
+            Some(actor),
+            msg.reason.clone(),
+            is_ban,
+        )
         .await;
     let target = removed.as_ref().unwrap_or(&target);
     if let Err(e) = target.force_disconnect().await {

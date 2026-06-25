@@ -9,10 +9,11 @@ use prost::Message as _;
 use crate::s2s_application_proto as pb;
 
 pub use pb::{
-    ModerationEnvelope, PluginDataEnvelope, UserRemovePatch, UserStatePatch, UserStatsEnvelope,
-    UserStatsReply, UserStatsRequest, VoiceFrame, VoiceIntent, VoiceIntentNormal,
-    VoiceIntentTarget, VoiceTargetChannel, moderation_envelope::Command as ModerationCommand,
-    user_stats_envelope::Kind as UserStatsKind, voice_intent::Kind as VoiceIntentKind,
+    ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope, UserRemovePatch, UserStatePatch,
+    UserStatsEnvelope, UserStatsReply, UserStatsRequest, VoiceFrame, VoiceIntent,
+    VoiceIntentNormal, VoiceIntentTarget, VoiceTargetChannel,
+    moderation_envelope::Command as ModerationCommand, user_stats_envelope::Kind as UserStatsKind,
+    voice_intent::Kind as VoiceIntentKind,
 };
 
 /// Reserved overlay service tag for moderation envelopes.
@@ -26,6 +27,9 @@ pub const USER_STATS_SERVICE_TAG: u32 = 4;
 
 /// Reserved overlay service tag for plugin-data fanout.
 pub const PLUGIN_DATA_SERVICE_TAG: u32 = 5;
+
+/// Reserved overlay service tag for text-message fanout.
+pub const TEXT_MESSAGE_SERVICE_TAG: u32 = 6;
 
 pub fn encode_moderation(env: &ModerationEnvelope) -> Result<Bytes, prost::EncodeError> {
     let mut buf = BytesMut::with_capacity(env.encoded_len());
@@ -65,6 +69,16 @@ pub fn encode_plugin_data(env: &PluginDataEnvelope) -> Result<Bytes, prost::Enco
 
 pub fn decode_plugin_data(src: &[u8]) -> Result<PluginDataEnvelope, prost::DecodeError> {
     PluginDataEnvelope::decode(src)
+}
+
+pub fn encode_text_message(env: &TextMessageEnvelope) -> Result<Bytes, prost::EncodeError> {
+    let mut buf = BytesMut::with_capacity(env.encoded_len());
+    env.encode(&mut buf)?;
+    Ok(buf.freeze())
+}
+
+pub fn decode_text_message(src: &[u8]) -> Result<TextMessageEnvelope, prost::DecodeError> {
+    TextMessageEnvelope::decode(src)
 }
 
 #[cfg(test)]
@@ -144,6 +158,23 @@ mod tests {
 
         let bytes = encode_plugin_data(&env).unwrap();
         let decoded = decode_plugin_data(&bytes).unwrap();
+        assert_eq!(decoded, env);
+    }
+
+    #[test]
+    fn text_message_envelope_roundtrip() {
+        let env = TextMessageEnvelope {
+            sender_session: 0xABC_12345,
+            receiver_sessions: vec![0xDEF_67890],
+            session: vec![0xDEF_67890],
+            channel_id: vec![7],
+            tree_id: vec![0],
+            message: "hello".to_string(),
+            server_id: crate::types::default_server_id(),
+        };
+
+        let bytes = encode_text_message(&env).unwrap();
+        let decoded = decode_text_message(&bytes).unwrap();
         assert_eq!(decoded, env);
     }
 }

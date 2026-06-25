@@ -68,12 +68,36 @@ async fn mod_kicks_other() {
         .expect("bob");
 
     let bob_session = bob.session_id;
-    alice.kick(bob_session, "test").await;
+    let kick_reason = "test";
+    alice.kick(bob_session, kick_reason).await;
+
+    let bob_observed = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserRemove(ur)
+                    if ur.session == bob_session
+                        && ur.actor == Some(alice.session_id)
+                        && ur.reason.as_deref() == Some(kick_reason)
+                        && ur.ban == Some(false))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        bob_observed.is_some(),
+        "Bob should receive the kick reason before disconnect"
+    );
 
     // Alice should see UserRemove for Bob's session.
     let alice_observed = alice
         .recv_until(
-            |m| matches!(m, Message::UserRemove(ur) if ur.session == bob_session),
+            |m| {
+                matches!(m, Message::UserRemove(ur)
+                    if ur.session == bob_session
+                        && ur.actor == Some(alice.session_id)
+                        && ur.reason.as_deref() == Some(kick_reason)
+                        && ur.ban == Some(false))
+            },
             Duration::from_secs(2),
         )
         .await;

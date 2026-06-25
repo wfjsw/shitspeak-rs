@@ -18,7 +18,7 @@ use crate::integration_tests::harness::{
     spawn_s2s_test_server_with_config,
 };
 use crate::messages::Message;
-use crate::messages::encoder::{Ping, PluginDataTransmission, UserStats};
+use crate::messages::encoder::{Ping, PluginDataTransmission, TextMessage, UserStats};
 use crate::s2s::testing::{
     Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port, s2s_network_test_guard, wait_until,
 };
@@ -660,6 +660,69 @@ async fn s2s_cross_node_plugin_data_transmission_routes_to_remote_recipient() {
     assert!(
         msg.is_some(),
         "Bob should receive Alice's cross-node plugin data"
+    );
+}
+
+/// Checks cross-node text routing to explicitly targeted receiver sessions.
+/// Expected: Bob receives Alice's `TextMessage` with the sender stamped by
+/// server A and the original direct-session target preserved over S2S.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_cross_node_text_message_routes_to_remote_recipient() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    let bob_known_on_a = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(a.server.get_clients().get_client(bob.server_session.into()))
+                .is_some()
+        })
+    })
+    .await;
+    assert!(
+        bob_known_on_a,
+        "Server A should materialize Bob before dispatching TextMessage"
+    );
+
+    alice
+        .send(
+            TextMessage {
+                actor: Some(999),
+                session: vec![bob.session_id],
+                channel_id: Vec::new(),
+                tree_id: Vec::new(),
+                message: "hello across nodes".to_string(),
+            }
+            .into(),
+        )
+        .await;
+
+    let msg = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::TextMessage(t)
+                    if t.actor == Some(alice.session_id)
+                        && t.session == vec![bob.session_id]
+                        && t.channel_id.is_empty()
+                        && t.tree_id.is_empty()
+                        && t.message == "hello across nodes")
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+
+    assert!(
+        msg.is_some(),
+        "Bob should receive Alice's cross-node text message"
     );
 }
 
