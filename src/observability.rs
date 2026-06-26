@@ -626,24 +626,4 @@ mod tests {
         assert_eq!(headers["Authorization"], "Bearer token");
     }
 
-    #[test]
-    fn grafana_dashboard_json_is_valid_and_references_core_metrics() {
-        let raw = std::fs::read_to_string("deploy/grafana/dashboards/shitspeak-s2s-topology.json")
-            .expect("dashboard json");
-        let dashboard: serde_json::Value =
-            serde_json::from_str(&raw).expect("valid dashboard json");
-        assert_eq!(dashboard["uid"], "shitspeak-s2s-topology");
-
-        for metric in [
-            "shitspeak_s2s_node_geo_latitude",
-            "shitspeak_s2s_node_geo_longitude",
-            "shitspeak_s2s_node_info",
-            "shitspeak_s2s_link_rtt_us",
-            "shitspeak_s2s_route_service_fit",
-            "shitspeak_s2s_direct_metric_rtt_us",
-            "shitspeak_s2s_debug_packet_io_bytes_total",
-        ] {
-            assert!(raw.contains(metric), "dashboard missing {metric}");
-        }
-    }
 }

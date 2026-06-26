@@ -4,8 +4,8 @@ datasources:
   - name: Mimir
     type: prometheus
     access: proxy
-    uid: mimir
-    url: http://mimir:9009/prometheus
+    uid: ${SHITSPEAK_GRAFANA_DATASOURCE_UID:-mimir}
+    url: ${SHITSPEAK_GRAFANA_DATASOURCE_URL:-http://mimir:9009/prometheus}
     isDefault: true
     jsonData:
       timeInterval: 15s

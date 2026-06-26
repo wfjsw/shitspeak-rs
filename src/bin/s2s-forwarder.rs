@@ -17,8 +17,8 @@ use shitspeak_rs::s2s::transport::{ConnectionManager, TransportConfig};
 use shitspeak_rs::s2s::{
     BanReplicationAdapter, ChannelBlobReplicationAdapter, ChannelReplicationAdapter,
     channel_blob_topic, channel_topic, install_channel_blob_replication_resolver,
-    install_channel_replication_resolver, server_id_from_channel_blob_topic,
-    server_id_from_channel_topic,
+    install_channel_replication_resolver, resolve_observability_geo,
+    server_id_from_channel_blob_topic, server_id_from_channel_topic,
 };
 use shitspeak_rs::types::{DEFAULT_SERVER_ID, NodeIdentifier};
 use tokio::sync::watch;
@@ -223,13 +223,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
+    let local_geo = resolve_observability_geo(config.s2s.geo.manual_geo()).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let status_task = config.s2s.status_http_listen.and_then(|listen| {
         match status::spawn_status_server(
             listen,
             overlay.clone(),
             transport.clone(),
-            None,
+            local_geo.clone(),
             shutdown_rx,
         ) {
             Ok(task) => Some(task),
@@ -532,5 +533,36 @@ mod tests {
             transport.tcp_advertise(),
             &["127.0.0.1:64739".parse::<SocketAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn manual_geo_config_is_available_for_status_metrics() {
+        let config = parse_forwarder_config(
+            r#"
+            [s2s]
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+
+            [s2s.geo]
+            latitude = 32.7767
+            longitude = -96.7970
+            city = "Dallas"
+            region = "TX"
+            country = "US"
+            source = "operator"
+            "#,
+        );
+
+        let geo = config
+            .s2s
+            .geo
+            .manual_geo()
+            .expect("forwarder manual geo");
+        assert_eq!(geo.latitude(), 32.7767);
+        assert_eq!(geo.longitude(), -96.7970);
+        assert_eq!(geo.city(), Some("Dallas"));
     }
 }

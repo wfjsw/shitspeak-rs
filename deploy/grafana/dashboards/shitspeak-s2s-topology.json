@@ -25,7 +25,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -59,10 +59,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(max by (node) (shitspeak_s2s_node_status{status=\"alive\"}))",
+          "expr": "sum(max by (node) (shitspeak_s2s_node_status{job=~\"$job\",status=\"alive\"}))",
           "instant": true,
           "legendFormat": "alive nodes",
           "range": false,
@@ -75,7 +75,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -109,10 +109,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(max by (source, target, transport) (shitspeak_s2s_link_status{status=\"active\"}))",
+          "expr": "sum(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}))",
           "instant": true,
           "legendFormat": "active links",
           "range": false,
@@ -125,11 +125,11 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "us"
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -159,10 +159,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg(max by (source, target, transport) (shitspeak_s2s_link_rtt_us))",
+          "expr": "avg(max by (source, target, transport) (shitspeak_s2s_link_rtt_us{job=~\"$job\"})) / 1000",
           "instant": false,
           "legendFormat": "avg rtt",
           "range": true,
@@ -175,7 +175,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -209,10 +209,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg(max by (source, target, transport) (shitspeak_s2s_link_loss_ppm)) / 1000000",
+          "expr": "avg(max by (source, target, transport) (shitspeak_s2s_link_loss_ppm{job=~\"$job\"})) / 1000000",
           "instant": false,
           "legendFormat": "avg loss",
           "range": true,
@@ -225,7 +225,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -247,7 +247,116 @@
             ]
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "latency_ms"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Latency"
+              },
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "loss_ppm"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Loss (ppm)"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "throughput_bps"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Throughput"
+              },
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(latitude|longitude)$"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "conversational_best_effort_cost"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Conv BE cost"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 10
+                    },
+                    {
+                      "color": "orange",
+                      "value": 30
+                    },
+                    {
+                      "color": "red",
+                      "value": 60
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 11,
@@ -262,80 +371,162 @@
           "name": "Layer 0",
           "type": "default"
         },
-        "controls": {
-          "mouseWheelZoom": true,
-          "showAttribution": true,
-          "showDebug": false,
-          "showMeasure": false,
-          "showScale": false,
-          "showZoom": true
+        "common": {
+          "edgeRouting": "Splines",
+          "isAppAuth": false,
+          "isMeters": false,
+          "isShowEdgeLegend": false,
+          "isShowLegend": false,
+          "isShowSwitcher": true,
+          "jitterPoints": true,
+          "nsPrefix": "cmn"
         },
-        "layers": [
+        "dataLayers": [
           {
+            "bandNumber": 1000000,
             "config": {
-              "showLegend": true,
-              "style": {
+              "arcConfig": {
+                "capacity": {
+                  "fixed": 1
+                },
+                "height": 0.45,
+                "tiltIncrement": 12
+              },
+              "arcStyle": {
+                "sideA": {
+                  "arrow": 1,
+                  "color": {
+                    "field": "conversational_best_effort_cost",
+                    "fixed": "light-blue"
+                  },
+                  "size": {
+                    "fixed": 2,
+                    "max": 8,
+                    "min": 1
+                  }
+                },
+                "sideB": {
+                  "arrow": 0,
+                  "color": {
+                    "fixed": "#6ED0E0"
+                  },
+                  "size": {
+                    "fixed": 1,
+                    "max": 4,
+                    "min": 1
+                  }
+                }
+              },
+              "edgeStyle": {
+                "arrow": 1,
                 "color": {
-                  "fixed": "green"
+                  "field": "conversational_best_effort_cost",
+                  "fixed": "light-blue"
                 },
-                "opacity": 0.85,
-                "rotation": {
-                  "fixed": 0,
-                  "max": 360,
-                  "min": -360,
-                  "mode": "mod"
-                },
+                "opacity": 0.48,
                 "size": {
-                  "fixed": 8,
-                  "max": 15,
-                  "min": 2
+                  "fixed": 2,
+                  "max": 8,
+                  "min": 1
                 },
-                "symbol": {
-                  "fixed": "img/icons/marker/circle.svg",
-                  "mode": "fixed"
+                "text": {
+                  "field": "conversational_best_effort_cost",
+                  "fixed": "",
+                  "mode": "field"
                 },
                 "textConfig": {
-                  "fontSize": 12,
+                  "fontSize": 10,
+                  "offsetX": 0,
+                  "offsetY": -8,
+                  "textAlign": "center",
+                  "textBaseline": "middle"
+                }
+              },
+              "showStat2": true,
+              "style": {
+                "arcs": [],
+                "color": {
+                  "fixed": "#8AB8FF"
+                },
+                "opacity": 0.78,
+                "size": {
+                  "fixed": 10,
+                  "max": 16,
+                  "min": 6
+                },
+                "text": {
+                  "field": "node_label",
+                  "fixed": "",
+                  "mode": "field"
+                },
+                "textConfig": {
+                  "fontSize": 11,
                   "offsetX": 0,
                   "offsetY": 0,
                   "textAlign": "center",
                   "textBaseline": "middle"
-                }
+                },
+                "useGroups": false
               }
             },
-            "filterData": {
-              "id": "byRefId",
-              "options": "A"
-            },
+            "displayProperties": [
+              "source",
+              "node_label",
+              "target",
+              "transport",
+              "conversational_best_effort_cost",
+              "latency_ms",
+              "loss_ppm",
+              "throughput_bps",
+              "city",
+              "region",
+              "country"
+            ],
+            "edgeIdField": "edge_id",
+            "edgeLabelField": "conversational_best_effort_cost",
+            "isShowTooltip": true,
+            "locField": "source",
             "location": {
-              "latitude": "Value #A",
-              "longitude": "Value #B",
+              "latitude": "latitude",
+              "longitude": "longitude",
               "mode": "coords"
             },
-            "name": "Nodes",
-            "tooltip": true,
+            "metricField": "conversational_best_effort_cost",
+            "metricName": "conversational_best_effort_cost",
+            "name": "S2S topology",
+            "parField": "target",
+            "searchProperties": [
+              "source",
+              "node_label",
+              "target",
+              "transport",
+              "city",
+              "region",
+              "country"
+            ],
+            "throughputField": "throughput_bps",
             "type": "markers"
           }
         ],
-        "tooltip": {
-          "mode": "details"
-        },
+        "isEditable": false,
         "view": {
           "allLayers": true,
-          "id": "fit",
+          "id": "coords",
           "lat": 0,
           "lon": 0,
           "zoom": 2
-        }
+        },
+        "mapProjection": "${map_projection}",
+        "mapProjectionSupport": "vaduga-mapgl-panel currently renders geo basemaps through Deck MapView/MapLibre; this dashboard variable records the desired projection and can be consumed by a plugin version that exposes projection support."
       },
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (node, city, region, country, source) (shitspeak_s2s_node_geo_latitude)",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source) group_left(city, region, country, node_label) label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_latitude{job=~\"$job\"}), \"source\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{node}}",
@@ -345,15 +536,80 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (node, city, region, country, source) (shitspeak_s2s_node_geo_longitude)",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source) group_left(city, region, country, node_label) label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_longitude{job=~\"$job\"}), \"source\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{node}}",
           "range": false,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source, target, transport) group_left() (max by (source, target, transport) (shitspeak_s2s_link_rtt_us{job=~\"$job\"}) / 1000), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} -> {{target}} {{transport}}",
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source, target, transport) group_left() max by (source, target, transport) (shitspeak_s2s_link_loss_ppm{job=~\"$job\"}), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} -> {{target}} {{transport}}",
+          "range": false,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} -> {{target}} {{transport}}",
+          "range": false,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source, target, transport) group_left() max by (source, target, transport) (shitspeak_s2s_link_throughput_bps{job=~\"$job\"}), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} -> {{target}} {{transport}}",
+          "range": false,
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source, target, transport) group_left() min by (source, target, transport) (label_replace(max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, metric, level, transport) (max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"target\", \"$1\", \"next_hop\", \"(.*)\")), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} -> {{target}} conv best-effort link cost",
+          "range": false,
+          "refId": "G"
         }
       ],
       "title": "Node Geomap",
@@ -361,21 +617,67 @@
         {
           "id": "joinByField",
           "options": {
-            "byField": "node",
-            "mode": "outer"
+            "byField": "edge_id",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #A": "latitude",
+              "Value #B": "longitude",
+              "Value #C": "latency_ms",
+              "Value #D": "loss_ppm",
+              "Value #E": "active",
+              "Value #F": "throughput_bps",
+              "Value #G": "conversational_best_effort_cost"
+            }
           }
         }
       ],
-      "type": "geomap"
+      "type": "vaduga-mapgl-panel"
     },
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "alive"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "down",
+                        "color": "red",
+                        "index": 1
+                      },
+                      "1": {
+                        "text": "alive",
+                        "color": "green",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 11,
@@ -401,10 +703,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (node, transit_enabled, geo_source) (shitspeak_s2s_node_info)",
+          "expr": "max by (node, transit_enabled, geo_source) (shitspeak_s2s_node_info{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -413,10 +715,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (node) (shitspeak_s2s_node_status{status=\"alive\"})",
+          "expr": "max by (node) (shitspeak_s2s_node_status{job=~\"$job\",status=\"alive\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -450,11 +752,92 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rtt_ms"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "RTT"
+              },
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "loss_ppm"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Loss (ppm)"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(throughput_bps|observed_recv_bps|observed_sent_bps)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "active"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "inactive",
+                        "color": "red",
+                        "index": 1
+                      },
+                      "1": {
+                        "text": "active",
+                        "color": "green",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 10,
@@ -480,10 +863,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_rtt_us), \"link\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "max by (source, target, transport) (shitspeak_s2s_link_rtt_us{job=~\"$job\"}) / 1000",
           "format": "table",
           "instant": true,
           "range": false,
@@ -492,10 +875,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_loss_ppm), \"link\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "max by (source, target, transport) (shitspeak_s2s_link_loss_ppm{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -504,10 +887,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{status=\"active\"}), \"link\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -516,10 +899,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_throughput_bps), \"link\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "max by (source, target, transport) (shitspeak_s2s_link_throughput_bps{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -528,10 +911,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_observed_recv_bps), \"link\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "max by (source, target, transport) (shitspeak_s2s_link_observed_recv_bps{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -540,10 +923,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_observed_sent_bps), \"link\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "max by (source, target, transport) (shitspeak_s2s_link_observed_sent_bps{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -553,11 +936,8 @@
       "title": "Links",
       "transformations": [
         {
-          "id": "joinByField",
-          "options": {
-            "byField": "link",
-            "mode": "outer"
-          }
+          "id": "merge",
+          "options": {}
         },
         {
           "id": "organize",
@@ -566,7 +946,7 @@
               "Time": true
             },
             "renameByName": {
-              "Value #A": "rtt_us",
+              "Value #A": "rtt_ms",
               "Value #B": "loss_ppm",
               "Value #C": "active",
               "Value #D": "throughput_bps",
@@ -581,11 +961,52 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "chosen"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "candidate",
+                        "color": "gray",
+                        "index": 1
+                      },
+                      "1": {
+                        "text": "chosen",
+                        "color": "green",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(cost|transport_cost)$"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 10,
@@ -611,10 +1032,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, dst, next_hop, metric, level, transport, service_fit) (shitspeak_s2s_route_service_fit{service_fit=\"chosen\"}), \"route\", \"|\", \"source\", \"target\", \"next_hop\", \"metric\", \"level\", \"transport\")",
+          "expr": "max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -623,10 +1044,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_cost), \"route\", \"|\", \"source\", \"target\", \"next_hop\", \"metric\", \"level\", \"transport\")",
+          "expr": "max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_cost{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -635,10 +1056,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_transport_cost), \"route\", \"|\", \"source\", \"target\", \"next_hop\", \"metric\", \"level\", \"transport\")",
+          "expr": "max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -648,11 +1069,8 @@
       "title": "Routes",
       "transformations": [
         {
-          "id": "joinByField",
-          "options": {
-            "byField": "route",
-            "mode": "outer"
-          }
+          "id": "merge",
+          "options": {}
         },
         {
           "id": "organize",
@@ -673,11 +1091,96 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^jitter_us$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "us"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(recv_bps|sent_bps)$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "loss_ppm"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Loss (ppm)"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "compression_ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rtt_ms"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "RTT"
+              },
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 10,
@@ -703,10 +1206,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, peer, transport) (shitspeak_s2s_direct_metric_rtt_us), \"direct\", \"|\", \"source\", \"peer\", \"transport\")",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_rtt_us{job=~\"$job\"}) / 1000",
           "format": "table",
           "instant": true,
           "range": false,
@@ -715,10 +1218,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, peer, transport) (shitspeak_s2s_direct_metric_jitter_us), \"direct\", \"|\", \"source\", \"peer\", \"transport\")",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_jitter_us{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -727,10 +1230,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, peer, transport, direction) (shitspeak_s2s_direct_metric_traffic_bps{direction=\"recv\"}), \"direct\", \"|\", \"source\", \"peer\", \"transport\")",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_traffic_bps{job=~\"$job\",direction=\"recv\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -739,10 +1242,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, peer, transport, direction) (shitspeak_s2s_direct_metric_traffic_bps{direction=\"sent\"}), \"direct\", \"|\", \"source\", \"peer\", \"transport\")",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_traffic_bps{job=~\"$job\",direction=\"sent\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -751,10 +1254,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, peer, transport, kind) (shitspeak_s2s_direct_metric_loss_ppm{kind=\"effective\"}), \"direct\", \"|\", \"source\", \"peer\", \"transport\")",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_loss_ppm{job=~\"$job\",kind=\"effective\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -763,10 +1266,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, peer, transport, direction) (shitspeak_s2s_direct_metric_compression_ratio{direction=\"total\"}), \"direct\", \"|\", \"source\", \"peer\", \"transport\")",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_compression_ratio{job=~\"$job\",direction=\"total\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -776,11 +1279,8 @@
       "title": "Direct Metrics",
       "transformations": [
         {
-          "id": "joinByField",
-          "options": {
-            "byField": "direct",
-            "mode": "outer"
-          }
+          "id": "merge",
+          "options": {}
         },
         {
           "id": "organize",
@@ -789,7 +1289,7 @@
               "Time": true
             },
             "renameByName": {
-              "Value #A": "rtt_us",
+              "Value #A": "rtt_ms",
               "Value #B": "jitter_us",
               "Value #C": "recv_bps",
               "Value #D": "sent_bps",
@@ -804,11 +1304,56 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "mimir"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "bytes"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "packets"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "avg_bps"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 10,
@@ -834,10 +1379,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, packet_kind, direction) (shitspeak_s2s_debug_packet_io_bytes_total), \"packet_io\", \"|\", \"source\", \"packet_kind\", \"direction\")",
+          "expr": "max by (source, packet_kind, direction) (shitspeak_s2s_debug_packet_io_bytes_total{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -846,10 +1391,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, packet_kind, direction) (shitspeak_s2s_debug_packet_io_packets_total), \"packet_io\", \"|\", \"source\", \"packet_kind\", \"direction\")",
+          "expr": "max by (source, packet_kind, direction) (shitspeak_s2s_debug_packet_io_packets_total{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -858,10 +1403,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "mimir"
+            "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, packet_kind, direction) (shitspeak_s2s_debug_packet_io_avg_bps), \"packet_io\", \"|\", \"source\", \"packet_kind\", \"direction\")",
+          "expr": "max by (source, packet_kind, direction) (shitspeak_s2s_debug_packet_io_avg_bps{job=~\"$job\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -871,11 +1416,8 @@
       "title": "Packet IO",
       "transformations": [
         {
-          "id": "joinByField",
-          "options": {
-            "byField": "packet_io",
-            "mode": "outer"
-          }
+          "id": "merge",
+          "options": {}
         },
         {
           "id": "organize",
@@ -898,11 +1440,84 @@
   "schemaVersion": 39,
   "tags": [
     "shitspeak",
-    "s2s",
-    "mimir"
+    "s2s"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(shitspeak_s2s_node_info, job)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Job",
+        "multi": true,
+        "name": "job",
+        "options": [],
+        "query": {
+          "query": "label_values(shitspeak_s2s_node_info, job)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "Flat",
+          "value": "mercator"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Map projection",
+        "multi": false,
+        "name": "map_projection",
+        "options": [
+          {
+            "selected": true,
+            "text": "Flat",
+            "value": "mercator"
+          },
+          {
+            "selected": false,
+            "text": "Globe",
+            "value": "globe"
+          }
+        ],
+        "query": "mercator,globe",
+        "skipUrlSync": false,
+        "type": "custom"
+      }
+    ]
   },
   "time": {
     "from": "now-1h",

@@ -2,12 +2,15 @@
 //! includes self into the registered `ServiceInbound` for its tag.
 
 use bytes::Bytes;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
 use crate::s2s::transport::{MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
 use super::{OverlayInboundMessage, ServiceRegistry};
+
+static NO_SERVICE_REGISTERED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Resolve the handler for `tag` and invoke it. The handler runs
 /// synchronously on the inbound dispatcher; the convention is that it
@@ -27,7 +30,8 @@ pub fn deliver(
             class,
             body,
         });
-    } else {
+    } else if !NO_SERVICE_REGISTERED_WARNED.load(Ordering::Relaxed) {
         warn!(tag, %from, "no service registered; dropping inbound overlay data");
+        NO_SERVICE_REGISTERED_WARNED.store(true, Ordering::Relaxed);
     }
 }

@@ -1187,7 +1187,7 @@ impl S2SManager {
     }
 }
 
-async fn resolve_observability_geo(configured_geo: Option<NodeGeo>) -> Option<NodeGeo> {
+pub async fn resolve_observability_geo(configured_geo: Option<NodeGeo>) -> Option<NodeGeo> {
     if configured_geo.is_some() {
         return configured_geo;
     }
