@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tracing::{Level, debug, warn};
 
+use crate::geoip::NodeGeo;
 use crate::s2s::transport::PeerAddress;
 use crate::types::NodeIdentifier;
 
@@ -108,6 +109,7 @@ pub struct LsaEntry {
     pub max_users: u64,
     pub transit_disabled: bool,
     pub replication_services: ReplicationServices,
+    pub geo: Option<NodeGeo>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +174,9 @@ fn describe_lsa_entry_delta(previous: Option<&LsaEntry>, current: &LsaEntry) -> 
         previous.replication_services.owner(),
         current.replication_services.owner(),
     );
+    if previous.geo != current.geo {
+        changes.push("geo changed".to_string());
+    }
     describe_address_delta(&mut changes, &previous.addresses, &current.addresses);
     describe_link_delta(&mut changes, &previous.links, &current.links);
 
@@ -423,6 +428,7 @@ impl LsaEntry {
                 !pb.content_replication_disabled,
                 !pb.owner_replication_disabled,
             ),
+            geo: pb.geo.as_ref().and_then(node_geo_from_pb),
         })
     }
 
@@ -459,8 +465,40 @@ impl LsaEntry {
             strict_replication_disabled: !self.replication_services.strict(),
             content_replication_disabled: !self.replication_services.content(),
             owner_replication_disabled: !self.replication_services.owner(),
+            geo: self.geo.as_ref().map(node_geo_to_pb),
         }
     }
+}
+
+fn node_geo_from_pb(pb: &pb::NodeGeo) -> Option<NodeGeo> {
+    NodeGeo::new(
+        pb.latitude,
+        pb.longitude,
+        empty_string_to_none(&pb.city),
+        empty_string_to_none(&pb.region),
+        empty_string_to_none(&pb.country),
+        if pb.source.trim().is_empty() {
+            "lsa".to_owned()
+        } else {
+            pb.source.clone()
+        },
+    )
+}
+
+fn node_geo_to_pb(geo: &NodeGeo) -> pb::NodeGeo {
+    pb::NodeGeo {
+        latitude: geo.latitude(),
+        longitude: geo.longitude(),
+        city: geo.city().unwrap_or_default().to_owned(),
+        region: geo.region().unwrap_or_default().to_owned(),
+        country: geo.country().unwrap_or_default().to_owned(),
+        source: geo.source().to_owned(),
+    }
+}
+
+fn empty_string_to_none(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// Strictly-greater comparison on `(boot_epoch, seq)`.
@@ -933,6 +971,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            geo: None,
         }
     }
 
@@ -1016,6 +1055,30 @@ mod tests {
         assert_eq!(link.observed_recv_bps, 4_000);
         assert_eq!(link.observed_sent_bps, 10_000);
         assert_eq!(link.throughput_confidence_ppm, 750_000);
+    }
+
+    #[test]
+    fn lsa_roundtrips_geo() {
+        let mut lsa = entry(1, 100, 1, false);
+        lsa.geo = NodeGeo::new(
+            32.7767,
+            -96.7970,
+            Some("Dallas".to_owned()),
+            Some("TX".to_owned()),
+            Some("US".to_owned()),
+            "manual",
+        );
+
+        let pb = lsa.to_pb();
+        assert!(pb.geo.is_some());
+        let roundtrip = LsaEntry::from_pb(&pb).unwrap();
+        let geo = roundtrip.geo.unwrap();
+        assert_eq!(geo.latitude(), 32.7767);
+        assert_eq!(geo.longitude(), -96.7970);
+        assert_eq!(geo.city(), Some("Dallas"));
+        assert_eq!(geo.region(), Some("TX"));
+        assert_eq!(geo.country(), Some("US"));
+        assert_eq!(geo.source(), "manual");
     }
 
     #[test]

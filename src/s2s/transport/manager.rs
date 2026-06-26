@@ -1144,6 +1144,7 @@ mod tests {
             .record_rtt(TransportKind::Quic, Duration::from_millis(25));
         peer.metrics()
             .record_payload_sent(TransportKind::Quic, 1024 * 1024);
+        std::thread::sleep(Duration::from_millis(10));
 
         assert_eq!(
             pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::ReliableCost),

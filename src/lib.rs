@@ -29,6 +29,7 @@ pub mod http_client;
 pub mod localization;
 pub mod logging;
 pub mod messages;
+pub mod observability;
 pub mod privacy;
 pub mod protocol_version;
 pub mod proxy_protocol;

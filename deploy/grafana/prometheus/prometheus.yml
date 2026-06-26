@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: shitspeak-s2s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - shitspeak-node-a:64751
+          - shitspeak-node-b:64751
+          - shitspeak-node-c:64751
+
+remote_write:
+  - url: http://mimir:9009/api/v1/push
+    # headers:
+    #   X-Scope-OrgID: tenant

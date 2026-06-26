@@ -1970,6 +1970,8 @@ mod tests {
             min_client_version: 0,
             max_users: 100,
             authenticator: crate::config::AuthenticatorConfig::default(),
+            observability: crate::config::ObservabilityConfig::default(),
+            geoip: crate::config::GeoIpConfig::default(),
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,

@@ -1,0 +1,76 @@
+[Unit]
+Description=ShitSpeak Mumble-compatible voice server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/etc/shitspeak-rs
+ExecStart=/usr/local/bin/shitspeak-rs
+
+# The server watches config.toml and authenticator files itself.
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=60s
+
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/shitspeak-rs/shitspeak-rs.env
+
+# Make these directories available for absolute paths in config.toml, such as:
+# blob_storage_dir = "/var/lib/shitspeak-rs"
+StateDirectory=shitspeak-rs
+CacheDirectory=shitspeak-rs
+LogsDirectory=shitspeak-rs
+UMask=0077
+
+# If binding ports below 1024 is required, use a drop-in override with:
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=
+NoNewPrivileges=true
+
+# The service runs as uid 0 for compatibility with existing state ownership, but
+# has an empty capability bounding set. If authenticator.exec.uid/gid is used,
+# grant only the needed drop capabilities in a drop-in override:
+# CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+# RestrictSUIDSGID=false
+
+# Filesystem isolation. Keep config/certs/authenticator assets under
+# /etc/shitspeak-rs and state/cache/log data under the systemd directories above.
+# The service may read deployment assets under /root/winterco, but only
+# /root/winterco/state is writable.
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=/root/winterco
+BindPaths=/root/winterco/state
+ReadWritePaths=/var/lib/shitspeak-rs /var/cache/shitspeak-rs /var/log/shitspeak-rs /root/winterco/state
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Wasmtime uses JIT/executable memory for WASM authenticators, so do not enable
+# MemoryDenyWriteExecute unless WASM support is built/configured out.
+MemoryDenyWriteExecute=false
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

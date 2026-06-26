@@ -17,5 +17,7 @@ log/
 data/
 .claude/settings.local.json
 deploy/*
+!deploy/grafana/
+!deploy/grafana/**
 examples/docker-compose-16node/.transport-survey
 codex-target/

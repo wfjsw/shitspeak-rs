@@ -41,6 +41,7 @@ use std::sync::atomic::AtomicU64;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
+use crate::geoip::NodeGeo;
 use crate::s2s::transport::{ConnectionManager, Inbound, MessageClass, ServiceLevel};
 use crate::types::NodeIdentifier;
 
@@ -100,8 +101,34 @@ impl OverlayNetwork {
         max_users: Arc<AtomicU64>,
         replication_services: ReplicationServices,
     ) -> Result<Self, OverlayError> {
-        let inner =
-            runtime::start_inner(transport, inbound, cfg, max_users, replication_services).await?;
+        Self::start_with_local_geo(
+            transport,
+            inbound,
+            cfg,
+            max_users,
+            replication_services,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_with_local_geo(
+        transport: ConnectionManager,
+        inbound: Inbound,
+        cfg: OverlayConfig,
+        max_users: Arc<AtomicU64>,
+        replication_services: ReplicationServices,
+        local_geo: Option<NodeGeo>,
+    ) -> Result<Self, OverlayError> {
+        let inner = runtime::start_inner(
+            transport,
+            inbound,
+            cfg,
+            max_users,
+            replication_services,
+            local_geo,
+        )
+        .await?;
         Ok(Self { inner })
     }
 

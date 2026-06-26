@@ -98,6 +98,11 @@ async fn compute_permissions_for_client_inner(
     };
     let home_channel =
         crate::client::group::ChannelHierarchy::new(home_channel_id, &home_ancestors);
+    let ip_geo = server
+        .lookup_ip_geo_metadata(client.get_real_ip_address())
+        .await;
+    let ip_geo_asn = ip_geo.as_ref().and_then(|geo| geo.asn());
+    let ip_geo_country = ip_geo.as_ref().and_then(|geo| geo.country_code());
 
     let membership = crate::client::group::ClientMembershipQuery::new(
         &group_refs,
@@ -107,6 +112,7 @@ async fn compute_permissions_for_client_inner(
         client.is_verified(),
         Some(client.get_real_ip_address()),
     )
+    .with_ip_metadata(ip_geo_asn, ip_geo_country)
     .with_home_channel(home_channel);
 
     tracing::trace!(

@@ -30,6 +30,7 @@ use crate::channel_repository::{ChannelOp, ChannelOperation, ChannelRepository};
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
 use crate::client_repository::ClientRepository;
+use crate::geoip::NodeGeo;
 use crate::server::Server;
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
 
@@ -40,7 +41,7 @@ use self::application::proto::{
     UserRemovePatch, UserStatePatch, UserStatsReply, VoiceFrame, VoiceIntent,
 };
 use self::application::voice::{AudioSink, RecipientIndex};
-use self::overlay::OverlayNetwork;
+use self::overlay::{OverlayNetwork, ReplicationServices};
 use self::replications::{BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable};
 use self::transport::{ConnectionManager, TransportConfig};
 
@@ -58,6 +59,7 @@ pub struct S2SManager {
     overlay_tuning: overlay::OverlayTuning,
     replication_config: replications::ReplicationConfig,
     status_http_listen: Option<SocketAddr>,
+    local_geo: Option<NodeGeo>,
     max_users: Arc<AtomicU64>,
     state: RwLock<S2SRuntimeState>,
 }
@@ -223,6 +225,7 @@ impl S2SManager {
             overlay_tuning: config.s2s.overlay.clone(),
             replication_config: config.s2s.replications.clone().into(),
             status_http_listen: config.s2s.status_http_listen,
+            local_geo: config.s2s.geo.manual_geo(),
             max_users: Arc::new(AtomicU64::new(config.max_users)),
             state: RwLock::new(S2SRuntimeState::default()),
         }
@@ -256,6 +259,41 @@ impl S2SManager {
     /// [`replications::ReplicationManager::with_config`].
     pub fn replication_config(&self) -> &replications::ReplicationConfig {
         &self.replication_config
+    }
+
+    pub fn prometheus_metrics_text(&self) -> Option<String> {
+        let state = self.state.read();
+        let overlay = state.overlay.as_ref()?;
+        let transport = state.transport.as_ref()?;
+        Some(status::render_prometheus_metrics(overlay, transport))
+    }
+
+    pub fn prometheus_remote_write_requests(
+        &self,
+        batch_size: usize,
+        external_labels: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let state = self.state.read();
+        let overlay = state.overlay.as_ref()?;
+        let transport = state.transport.as_ref()?;
+        let samples = status::prometheus_samples(overlay, transport);
+        if samples.is_empty() {
+            return Some(Vec::new());
+        }
+        let timestamp_ms = crate::observability::now_unix_ms();
+        let batch_size = batch_size.max(1);
+        Some(
+            samples
+                .chunks(batch_size)
+                .map(|chunk| {
+                    crate::observability::remote_write_body_with_labels(
+                        chunk,
+                        timestamp_ms,
+                        external_labels,
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// Attach a fully-started overlay and spin up the `ReplicationManager`
@@ -762,11 +800,13 @@ impl S2SManager {
             }
         };
 
-        let overlay = match OverlayNetwork::start_with_max_users(
+        let overlay = match OverlayNetwork::start_with_local_geo(
             transport.clone(),
             inbound,
             self.overlay_config.clone(),
             self.max_users.clone(),
+            ReplicationServices::ALL,
+            self.local_geo.clone(),
         )
         .await
         {

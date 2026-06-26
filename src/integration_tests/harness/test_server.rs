@@ -190,6 +190,8 @@ async fn spawn_test_server_with_pki(
         min_client_version: 0,
         max_users: opts.max_users,
         authenticator: AuthenticatorConfig::default(),
+        observability: crate::config::ObservabilityConfig::default(),
+        geoip: crate::config::GeoIpConfig::default(),
         welcome_text: opts.welcome_text.clone(),
         max_bandwidth: 72_000,
         allow_html: true,

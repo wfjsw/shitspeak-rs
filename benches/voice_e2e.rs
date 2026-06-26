@@ -281,6 +281,8 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         min_client_version: 0,
         max_users: 128,
         authenticator: shitspeak_rs::config::AuthenticatorConfig::default(),
+        observability: shitspeak_rs::config::ObservabilityConfig::default(),
+        geoip: shitspeak_rs::config::GeoIpConfig::default(),
         welcome_text: None,
         max_bandwidth: 72_000,
         allow_html: true,

@@ -32,6 +32,7 @@ use crate::client::{
 };
 use crate::client_certificate_verifier::ClientCertificateVerifier;
 use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError};
+use crate::geoip::{GeoIpResolver, IpGeoMetadata};
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::consume_proxy_protocol_connection_info;
@@ -451,6 +452,8 @@ mod tests {
             min_client_version: 0,
             max_users: 100,
             authenticator: AuthenticatorConfig::default(),
+            observability: crate::config::ObservabilityConfig::default(),
+            geoip: crate::config::GeoIpConfig::default(),
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,
@@ -967,6 +970,7 @@ pub struct Server {
     context_actions: Arc<crate::context_action::ContextActionRegistry>,
 
     s2s_manager: Arc<S2SManager>,
+    geoip_resolver: ParkingRwLock<Arc<GeoIpResolver>>,
     shutdown_tx: tokio::sync::watch::Sender<()>,
 }
 
@@ -1262,9 +1266,12 @@ impl Server {
             bans,
             codec_info: Mutex::new(CodecInfo::default()),
             authenticator: Arc::new(authenticator),
-            config,
+            config: Arc::clone(&config),
             context_actions: Arc::new(crate::context_action::ContextActionRegistry::new()),
             s2s_manager,
+            geoip_resolver: ParkingRwLock::new(Arc::new(GeoIpResolver::new(
+                config.read().expect("Config RwLock poisoned").geoip.clone(),
+            ))),
             shutdown_tx,
         }));
 
@@ -1310,6 +1317,11 @@ impl Server {
 
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
+    }
+
+    pub async fn lookup_ip_geo_metadata(&self, ip: std::net::IpAddr) -> Option<IpGeoMetadata> {
+        let resolver = self.geoip_resolver.read().clone();
+        resolver.lookup_ip_metadata(ip).await
     }
 
     pub fn authenticator_watch_paths(&self) -> Vec<PathBuf> {
@@ -1432,6 +1444,44 @@ impl Server {
         }
         let s2s_task = Arc::clone(&self.s2s_manager)
             .spawn_runtime_task(Arc::downgrade(self), internal_rx.clone());
+        let observability_metrics_task = {
+            let metrics = self.read_config().observability.metrics.clone();
+            if metrics.enabled {
+                metrics.listen.and_then(|listen| {
+                    match crate::observability::spawn_metrics_server(
+                        listen,
+                        metrics.path.clone(),
+                        Arc::clone(&self.s2s_manager),
+                        internal_rx.clone(),
+                    ) {
+                        Ok(task) => Some(task),
+                        Err(error) => {
+                            tracing::warn!(
+                                %listen,
+                                %error,
+                                "observability metrics HTTP server startup failed"
+                            );
+                            None
+                        }
+                    }
+                })
+            } else {
+                None
+            }
+        };
+        let observability_remote_write_task = {
+            let config = self
+                .read_config()
+                .observability
+                .metrics
+                .remote_write
+                .clone();
+            crate::observability::spawn_remote_write(
+                config,
+                Arc::clone(&self.s2s_manager),
+                internal_rx.clone(),
+            )
+        };
 
         // Public server registration (periodic HTTP POST to registry).
         // This task is optional and may exit early when registration is disabled;
@@ -1459,6 +1509,12 @@ impl Server {
         let _ = pending_delete_watchdog.await;
         while web_tasks.join_next().await.is_some() {}
         s2s_task.join().await;
+        if let Some(task) = observability_metrics_task {
+            let _ = task.await;
+        }
+        if let Some(task) = observability_remote_write_task {
+            let _ = task.await;
+        }
         let _ = register_task.await;
 
         Ok(())
@@ -2827,6 +2883,12 @@ impl Server {
                 }
                 if current.required_groups != new_config.required_groups {
                     tracing::info!("config reload: required_groups changed");
+                }
+                if current.geoip != new_config.geoip {
+                    tracing::info!("config reload: geoip changed");
+                    *self.geoip_resolver.write() =
+                        Arc::new(GeoIpResolver::new(new_config.geoip.clone()));
+                    invalidate_acl_cache = true;
                 }
                 if current.send_permission_info != new_config.send_permission_info {
                     tracing::info!(

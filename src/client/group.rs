@@ -438,4 +438,24 @@ mod tests {
         assert!(!is_member_in_group("!sub", evaluation, None, &[], &client));
         assert!(is_member_in_group("!sub", home, None, &[], &client));
     }
+
+    #[test]
+    fn ip_metadata_masks_match_country_and_asn() {
+        let home = ChannelHierarchy::new(0, &[]);
+        let client = ClientMembershipQuery::new(
+            &[],
+            true,
+            &[],
+            None,
+            false,
+            Some("8.8.8.8".parse().unwrap()),
+        )
+        .with_ip_metadata(Some(15169), Some("US"))
+        .with_home_channel(home);
+
+        assert!(is_member_in_group("%#us", home, None, &[], &client));
+        assert!(is_member_in_group("%@15169", home, None, &[], &client));
+        assert!(!is_member_in_group("%#GB", home, None, &[], &client));
+        assert!(!is_member_in_group("%@13335", home, None, &[], &client));
+    }
 }

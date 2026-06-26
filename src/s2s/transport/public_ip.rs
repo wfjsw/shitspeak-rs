@@ -7,6 +7,7 @@ use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::timeout;
 use tracing::debug;
 
+use crate::geoip::{NodeGeo, valid_coordinates};
 use crate::http_client;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -43,6 +44,29 @@ pub(crate) async fn discover_public_ips() -> Vec<IpAddr> {
     extend_unique(&mut out, stun_ips);
     extend_unique(&mut out, https_ips);
     out
+}
+
+pub(crate) async fn discover_public_geo() -> Option<NodeGeo> {
+    let client = match http_client::build_with_webpki_fallback(PROBE_TIMEOUT, "public geo probe") {
+        Ok(client) => client,
+        Err(e) => {
+            debug!(error=%e, "failed to build public geo probe HTTP client");
+            return None;
+        }
+    };
+
+    let probes = IPV4_PROBE_URLS
+        .iter()
+        .copied()
+        .map(|url| probe_geo_url(&client, url, IpFamily::V4))
+        .chain(
+            IPV6_PROBE_URLS
+                .iter()
+                .copied()
+                .map(|url| probe_geo_url(&client, url, IpFamily::V6)),
+        );
+
+    join_all(probes).await.into_iter().flatten().next()
 }
 
 async fn discover_public_ips_via_stun() -> Vec<IpAddr> {
@@ -342,6 +366,34 @@ async fn probe_url(client: &reqwest::Client, url: &str, family: IpFamily) -> Opt
     })
 }
 
+async fn probe_geo_url(client: &reqwest::Client, url: &str, family: IpFamily) -> Option<NodeGeo> {
+    let response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            debug!(url, error=%e, "public geo probe request failed");
+            return None;
+        }
+    };
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(e) => {
+            debug!(url, error=%e, "public geo probe returned error status");
+            return None;
+        }
+    };
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            debug!(url, error=%e, "public geo probe body read failed");
+            return None;
+        }
+    };
+    parse_cloudflare_check_perf_geo(&body, family).or_else(|| {
+        debug!(url, body=%body.trim(), ?family, "public geo probe response was not usable");
+        None
+    })
+}
+
 fn parse_public_ip(value: &str, family: IpFamily) -> Option<IpAddr> {
     let ip =
         parse_public_ip_literal(value).or_else(|| parse_cloudflare_ip_check_response(value))?;
@@ -360,6 +412,56 @@ fn parse_public_ip_literal(value: &str) -> Option<IpAddr> {
 fn parse_cloudflare_ip_check_response(value: &str) -> Option<IpAddr> {
     let response = serde_json::from_str::<serde_json::Value>(value).ok()?;
     response.get("ip_address")?.as_str()?.parse::<IpAddr>().ok()
+}
+
+#[derive(serde::Deserialize)]
+struct CloudflareCheckPerfResponse {
+    city: Option<String>,
+    region: Option<String>,
+    country: Option<String>,
+    latitude: Option<String>,
+    longitude: Option<String>,
+    ip_address: Option<String>,
+    ip_version: Option<String>,
+}
+
+fn parse_cloudflare_check_perf_geo(value: &str, family: IpFamily) -> Option<NodeGeo> {
+    let response = serde_json::from_str::<CloudflareCheckPerfResponse>(value).ok()?;
+    let ip = response.ip_address.as_deref()?.parse::<IpAddr>().ok()?;
+    if !matches_probe_family(ip, family) || !is_publicly_routable_ip(ip) {
+        return None;
+    }
+    if !response_ip_version_matches(response.ip_version.as_deref(), family) {
+        return None;
+    }
+    let latitude = response.latitude.as_deref()?.parse::<f64>().ok()?;
+    let longitude = response.longitude.as_deref()?.parse::<f64>().ok()?;
+    if !valid_coordinates(latitude, longitude) {
+        return None;
+    }
+    NodeGeo::new(
+        latitude,
+        longitude,
+        response.city,
+        response.region,
+        response.country,
+        "cloudflare_check_perf",
+    )
+}
+
+fn matches_probe_family(ip: IpAddr, family: IpFamily) -> bool {
+    matches!(
+        (family, ip),
+        (IpFamily::V4, IpAddr::V4(_)) | (IpFamily::V6, IpAddr::V6(_))
+    )
+}
+
+fn response_ip_version_matches(ip_version: Option<&str>, family: IpFamily) -> bool {
+    match (ip_version.map(str::trim), family) {
+        (None, _) => true,
+        (Some("IPv4"), IpFamily::V4) | (Some("IPv6"), IpFamily::V6) => true,
+        _ => false,
+    }
 }
 
 fn is_publicly_routable_ip(ip: IpAddr) -> bool {
@@ -454,6 +556,52 @@ mod tests {
         assert_eq!(parse_public_ip("8.8.8.8", IpFamily::V6), None);
         assert_eq!(parse_public_ip("10.0.0.1", IpFamily::V4), None);
         assert_eq!(parse_public_ip("::1", IpFamily::V6), None);
+    }
+
+    #[test]
+    fn parse_cloudflare_check_perf_geo_accepts_location_payload() {
+        let geo = parse_cloudflare_check_perf_geo(
+            r#"{
+                "colo": "IAH",
+                "asn": 11427,
+                "continent": "NA",
+                "country": "US",
+                "region": "Texas",
+                "city": "Plano",
+                "latitude": "33.01984",
+                "longitude": "-96.69889",
+                "ip_address": "76.187.192.63",
+                "ip_version": "IPv4"
+            }"#,
+            IpFamily::V4,
+        )
+        .expect("geo");
+
+        assert_eq!(geo.latitude(), 33.01984);
+        assert_eq!(geo.longitude(), -96.69889);
+        assert_eq!(geo.city(), Some("Plano"));
+        assert_eq!(geo.region(), Some("Texas"));
+        assert_eq!(geo.country(), Some("US"));
+        assert_eq!(geo.source(), "cloudflare_check_perf");
+    }
+
+    #[test]
+    fn parse_cloudflare_check_perf_geo_rejects_wrong_family() {
+        assert_eq!(
+            parse_cloudflare_check_perf_geo(
+                r#"{
+                    "country": "US",
+                    "region": "Texas",
+                    "city": "Plano",
+                    "latitude": "33.01984",
+                    "longitude": "-96.69889",
+                    "ip_address": "2606:4700:4700::1111",
+                    "ip_version": "IPv6"
+                }"#,
+                IpFamily::V4,
+            ),
+            None
+        );
     }
 
     #[test]

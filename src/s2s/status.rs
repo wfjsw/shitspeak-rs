@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::geoip::NodeGeo;
 use crate::s2s::overlay::{MemberStatus, OverlayNetwork, RoutingMetric};
 use crate::s2s::transport::{ConnectionManager, MetricsSnapshot, TransportKind};
 use crate::s2s::transport::{MessageClass, ServiceLevel};
@@ -16,7 +17,7 @@ use crate::types::NodeIdentifier;
 const MAX_REQUEST_BYTES: usize = 8192;
 
 #[derive(Debug, Serialize)]
-struct TopologySnapshot {
+pub(crate) struct TopologySnapshot {
     local_node: NodeIdentifier,
     generated_at_unix_ms: u128,
     nodes: Vec<TopologyNode>,
@@ -28,25 +29,26 @@ struct TopologySnapshot {
 }
 
 #[derive(Debug, Serialize)]
-struct TopologyNode {
+pub(crate) struct TopologyNode {
     node_id: NodeIdentifier,
     status: &'static str,
     boot_epoch: u64,
     max_users: u64,
     addresses: Vec<TopologyAddress>,
+    geo: Option<NodeGeo>,
     transit_enabled: bool,
     lsa_seq: Option<u64>,
     lsa_age_ms: Option<u128>,
 }
 
 #[derive(Debug, Serialize)]
-struct TopologyAddress {
+pub(crate) struct TopologyAddress {
     transport: &'static str,
     addr: String,
 }
 
 #[derive(Debug, Serialize)]
-struct TopologyLink {
+pub(crate) struct TopologyLink {
     source: NodeIdentifier,
     target: NodeIdentifier,
     status: &'static str,
@@ -65,7 +67,7 @@ struct TopologyLink {
 }
 
 #[derive(Debug, Serialize)]
-struct TopologyRoute {
+pub(crate) struct TopologyRoute {
     dst: NodeIdentifier,
     metric: &'static str,
     level: &'static str,
@@ -77,7 +79,7 @@ struct TopologyRoute {
 }
 
 #[derive(Debug, Serialize)]
-struct TransportMetric {
+pub(crate) struct TransportMetric {
     peer: NodeIdentifier,
     transport: &'static str,
     rtt_us: f64,
@@ -194,6 +196,16 @@ async fn handle_connection(
                 .map_err(|error| io::Error::other(error.to_string()))?;
             write_response(&mut stream, "200 OK", "application/json", &body).await
         }
+        ("GET", "/metrics") | ("GET", "/s2s/metrics") => {
+            let body = render_prometheus_metrics(&overlay, &transport);
+            write_response(
+                &mut stream,
+                "200 OK",
+                "text/plain; version=0.0.4; charset=utf-8",
+                body.as_bytes(),
+            )
+            .await
+        }
         ("GET", "/health") | ("GET", "/s2s/health") => {
             write_response(
                 &mut stream,
@@ -230,7 +242,7 @@ async fn write_response(
     stream.shutdown().await
 }
 
-fn build_topology_snapshot(
+pub(crate) fn build_topology_snapshot(
     overlay: &OverlayNetwork,
     transport: &ConnectionManager,
 ) -> TopologySnapshot {
@@ -266,6 +278,7 @@ fn build_topology_snapshot(
                         addr: addr.addr().to_string(),
                     })
                     .collect(),
+                geo: lsa.and_then(|entry| entry.geo.clone()),
                 transit_enabled: match lsa {
                     Some(entry) => !entry.transit_disabled,
                     None => true,
@@ -387,6 +400,591 @@ fn build_topology_snapshot(
         local_metrics,
         #[cfg(debug_assertions)]
         debug_packet_io: crate::s2s::debug_io::snapshot(),
+    }
+}
+
+pub(crate) fn render_prometheus_metrics(
+    overlay: &OverlayNetwork,
+    transport: &ConnectionManager,
+) -> String {
+    let snapshot = build_topology_snapshot(overlay, transport);
+    let mut out = String::new();
+    let mut writer = PrometheusWriter::new(&mut out);
+    writer.render(&snapshot);
+    out
+}
+
+pub(crate) fn prometheus_samples(
+    overlay: &OverlayNetwork,
+    transport: &ConnectionManager,
+) -> Vec<PrometheusSample> {
+    let snapshot = build_topology_snapshot(overlay, transport);
+    samples_from_snapshot(&snapshot)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PrometheusSample {
+    name: String,
+    labels: Vec<(String, String)>,
+    value: f64,
+}
+
+impl PrometheusSample {
+    pub(crate) fn new(name: impl Into<String>, labels: Vec<(String, String)>, value: f64) -> Self {
+        Self {
+            name: name.into(),
+            labels,
+            value,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn labels(&self) -> &[(String, String)] {
+        &self.labels
+    }
+
+    pub(crate) fn value(&self) -> f64 {
+        self.value
+    }
+}
+
+struct PrometheusWriter<'a> {
+    out: &'a mut String,
+}
+
+impl<'a> PrometheusWriter<'a> {
+    fn new(out: &'a mut String) -> Self {
+        Self { out }
+    }
+
+    fn render(&mut self, snapshot: &TopologySnapshot) {
+        self.header("shitspeak_s2s_node_info", "S2S node metadata.", "gauge");
+        self.header(
+            "shitspeak_s2s_node_status",
+            "S2S node status by state.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_node_geo_latitude",
+            "S2S node latitude in degrees.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_node_geo_longitude",
+            "S2S node longitude in degrees.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_rtt_us",
+            "S2S advertised link RTT.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_jitter_us",
+            "S2S advertised link jitter.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_throughput_bps",
+            "S2S advertised link throughput.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_observed_recv_bps",
+            "S2S advertised observed receive throughput.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_observed_sent_bps",
+            "S2S advertised observed send throughput.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_loss_ppm",
+            "S2S advertised effective link loss.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_loss_breakdown_ppm",
+            "S2S advertised link loss by source.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_health_ppm",
+            "S2S advertised link health failure rates.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_loss_samples",
+            "S2S advertised link loss sample count.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_throughput_confidence_ppm",
+            "S2S advertised link throughput confidence.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_link_status",
+            "S2S advertised link status by state.",
+            "gauge",
+        );
+        self.header("shitspeak_s2s_route_cost", "S2S route cost.", "gauge");
+        self.header(
+            "shitspeak_s2s_route_transport_cost",
+            "S2S route transport cost.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_route_service_fit",
+            "S2S route service-fit state.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_direct_metric_rtt_us",
+            "Local direct peer RTT.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_direct_metric_jitter_us",
+            "Local direct peer jitter.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_direct_metric_traffic_bps",
+            "Local direct peer traffic by direction.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_direct_metric_loss_ppm",
+            "Local direct peer loss by kind.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_direct_metric_compression_ratio",
+            "Local direct peer compression ratio.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_direct_metric_last_update_age_ms",
+            "Local direct peer metric update age.",
+            "gauge",
+        );
+        #[cfg(debug_assertions)]
+        {
+            self.header(
+                "shitspeak_s2s_debug_packet_io_bytes_total",
+                "Debug S2S packet IO bytes by packet kind and direction.",
+                "counter",
+            );
+            self.header(
+                "shitspeak_s2s_debug_packet_io_packets_total",
+                "Debug S2S packet IO packets by packet kind and direction.",
+                "counter",
+            );
+            self.header(
+                "shitspeak_s2s_debug_packet_io_avg_bps",
+                "Debug S2S packet IO average bytes per second by packet kind and direction.",
+                "gauge",
+            );
+        }
+
+        for sample in samples_from_snapshot(snapshot) {
+            self.sample(sample);
+        }
+    }
+
+    fn header(&mut self, name: &str, help: &str, kind: &str) {
+        self.out.push_str("# HELP ");
+        self.out.push_str(name);
+        self.out.push(' ');
+        self.out.push_str(help);
+        self.out.push('\n');
+        self.out.push_str("# TYPE ");
+        self.out.push_str(name);
+        self.out.push(' ');
+        self.out.push_str(kind);
+        self.out.push('\n');
+    }
+
+    fn sample(&mut self, sample: PrometheusSample) {
+        self.out.push_str(&sample.name);
+        if !sample.labels.is_empty() {
+            self.out.push('{');
+            for (index, (key, value)) in sample.labels.iter().enumerate() {
+                if index > 0 {
+                    self.out.push(',');
+                }
+                self.out.push_str(key);
+                self.out.push_str("=\"");
+                escape_label_value(self.out, value);
+                self.out.push('"');
+            }
+            self.out.push('}');
+        }
+        self.out.push(' ');
+        self.out.push_str(&format_prometheus_value(sample.value));
+        self.out.push('\n');
+    }
+}
+
+fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
+    let mut out = Vec::new();
+    let local_node = snapshot.local_node.to_string();
+    for node in snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.node_id == snapshot.local_node)
+    {
+        let node_id = node.node_id.to_string();
+        out.push(sample(
+            "shitspeak_s2s_node_info",
+            vec![
+                ("node", node_id.as_str()),
+                ("transit_enabled", bool_label(node.transit_enabled)),
+                (
+                    "geo_source",
+                    node.geo.as_ref().map(NodeGeo::source).unwrap_or(""),
+                ),
+            ],
+            1.0,
+        ));
+        for state in ["alive", "failed", "left"] {
+            out.push(sample(
+                "shitspeak_s2s_node_status",
+                vec![("node", node_id.as_str()), ("status", state)],
+                if node.status == state { 1.0 } else { 0.0 },
+            ));
+        }
+        if let Some(geo) = &node.geo {
+            out.push(sample(
+                "shitspeak_s2s_node_geo_latitude",
+                vec![
+                    ("node", node_id.as_str()),
+                    ("city", geo.city().unwrap_or("")),
+                    ("region", geo.region().unwrap_or("")),
+                    ("country", geo.country().unwrap_or("")),
+                    ("source", geo.source()),
+                ],
+                geo.latitude(),
+            ));
+            out.push(sample(
+                "shitspeak_s2s_node_geo_longitude",
+                vec![
+                    ("node", node_id.as_str()),
+                    ("city", geo.city().unwrap_or("")),
+                    ("region", geo.region().unwrap_or("")),
+                    ("country", geo.country().unwrap_or("")),
+                    ("source", geo.source()),
+                ],
+                geo.longitude(),
+            ));
+        }
+    }
+
+    for link in snapshot
+        .links
+        .iter()
+        .filter(|link| link.source == snapshot.local_node)
+    {
+        let source = link.source.to_string();
+        let target = link.target.to_string();
+        let transport = if link.transports.is_empty() {
+            "unknown".to_owned()
+        } else {
+            link.transports.join(",")
+        };
+        let base = vec![
+            ("source", source.as_str()),
+            ("target", target.as_str()),
+            ("transport", transport.as_str()),
+        ];
+        out.push(sample_with_base(
+            "shitspeak_s2s_link_rtt_us",
+            &base,
+            link.rtt_us as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_link_jitter_us",
+            &base,
+            link.jitter_us as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_link_throughput_bps",
+            &base,
+            link.throughput_bps as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_link_observed_recv_bps",
+            &base,
+            link.observed_recv_bps as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_link_observed_sent_bps",
+            &base,
+            link.observed_sent_bps as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_link_loss_ppm",
+            &base,
+            link.loss_ppm as f64,
+        ));
+        for (metric, value) in [
+            ("effective", link.loss_ppm),
+            ("probe", link.probe_loss_ppm),
+            ("native", link.native_loss_ppm),
+        ] {
+            let mut labels = base.clone();
+            labels.push(("metric", metric));
+            out.push(sample(
+                "shitspeak_s2s_link_loss_breakdown_ppm",
+                labels,
+                value as f64,
+            ));
+        }
+        {
+            let mut labels = base.clone();
+            labels.push(("metric", "data_health"));
+            out.push(sample(
+                "shitspeak_s2s_link_health_ppm",
+                labels,
+                link.data_health_ppm as f64,
+            ));
+        }
+        out.push(sample_with_base(
+            "shitspeak_s2s_link_loss_samples",
+            &base,
+            link.loss_sample_count as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_link_throughput_confidence_ppm",
+            &base,
+            link.throughput_confidence_ppm as f64,
+        ));
+        for status in ["active", "stale"] {
+            let mut labels = base.clone();
+            labels.push(("status", status));
+            out.push(sample(
+                "shitspeak_s2s_link_status",
+                labels,
+                if link.status == status { 1.0 } else { 0.0 },
+            ));
+        }
+    }
+
+    for route in &snapshot.routes {
+        let source = local_node.clone();
+        let target = route.dst.to_string();
+        let next_hop = route.next_hop.to_string();
+        let base = vec![
+            ("source", source.as_str()),
+            ("target", target.as_str()),
+            ("dst", target.as_str()),
+            ("next_hop", next_hop.as_str()),
+            ("metric", route.metric),
+            ("level", route.level),
+            ("transport", route.transport),
+        ];
+        out.push(sample_with_base(
+            "shitspeak_s2s_route_cost",
+            &base,
+            route.cost as f64,
+        ));
+        if let Some(cost) = route.transport_cost {
+            out.push(sample_with_base(
+                "shitspeak_s2s_route_transport_cost",
+                &base,
+                cost as f64,
+            ));
+        }
+        for fit in ["chosen", "candidate", "ineligible"] {
+            let mut labels = base.clone();
+            labels.push(("service_fit", fit));
+            out.push(sample(
+                "shitspeak_s2s_route_service_fit",
+                labels,
+                if route.service_fit == fit { 1.0 } else { 0.0 },
+            ));
+        }
+    }
+
+    for metric in &snapshot.local_metrics {
+        let source = local_node.clone();
+        let peer = metric.peer.to_string();
+        let base = vec![
+            ("source", source.as_str()),
+            ("peer", peer.as_str()),
+            ("transport", metric.transport),
+        ];
+        out.push(sample_with_base(
+            "shitspeak_s2s_direct_metric_rtt_us",
+            &base,
+            metric.rtt_us,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_direct_metric_jitter_us",
+            &base,
+            metric.jitter_us,
+        ));
+        for (direction, value) in [
+            ("recv", metric.recv_bps),
+            ("sent", metric.sent_bps),
+            ("wire_recv", metric.wire_recv_bps),
+            ("wire_sent", metric.wire_sent_bps),
+        ] {
+            let mut labels = base.clone();
+            labels.push(("direction", direction));
+            out.push(sample(
+                "shitspeak_s2s_direct_metric_traffic_bps",
+                labels,
+                value,
+            ));
+        }
+        for (kind, value) in [
+            ("effective", metric.packet_loss_ppm),
+            ("probe", metric.probe_loss_ppm),
+            ("probe_ewma", metric.probe_loss_ewma_ppm),
+            ("native", metric.native_loss_ppm),
+            ("native_ewma", metric.native_loss_ewma_ppm),
+            ("data_health", metric.data_health_ppm),
+        ] {
+            let mut labels = base.clone();
+            labels.push(("kind", kind));
+            out.push(sample(
+                "shitspeak_s2s_direct_metric_loss_ppm",
+                labels,
+                value as f64,
+            ));
+        }
+        for (direction, value) in [
+            ("recv", metric.compression_recv_ratio),
+            ("sent", metric.compression_sent_ratio),
+            ("total", metric.compression_total_ratio),
+        ] {
+            if let Some(value) = value {
+                let mut labels = base.clone();
+                labels.push(("direction", direction));
+                out.push(sample(
+                    "shitspeak_s2s_direct_metric_compression_ratio",
+                    labels,
+                    value,
+                ));
+            }
+        }
+        if let Some(age) = metric.last_update_age_ms {
+            out.push(sample_with_base(
+                "shitspeak_s2s_direct_metric_last_update_age_ms",
+                &base,
+                age as f64,
+            ));
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    for packet in &snapshot.debug_packet_io {
+        add_debug_packet_samples(&mut out, local_node.as_str(), packet);
+    }
+
+    out
+}
+
+#[cfg(debug_assertions)]
+fn add_debug_packet_samples(
+    out: &mut Vec<PrometheusSample>,
+    source: &str,
+    packet: &crate::s2s::debug_io::PacketIoSnapshot,
+) {
+    #[derive(serde::Deserialize)]
+    struct PacketView {
+        kind: String,
+        sent_bytes: u64,
+        recv_bytes: u64,
+        sent_count: u64,
+        recv_count: u64,
+        avg_sent_bps: f64,
+        avg_recv_bps: f64,
+    }
+
+    let Ok(view) = serde_json::to_value(packet).and_then(serde_json::from_value::<PacketView>)
+    else {
+        return;
+    };
+    for (direction, bytes, count, avg_bps) in [
+        ("sent", view.sent_bytes, view.sent_count, view.avg_sent_bps),
+        ("recv", view.recv_bytes, view.recv_count, view.avg_recv_bps),
+    ] {
+        out.push(sample(
+            "shitspeak_s2s_debug_packet_io_bytes_total",
+            vec![
+                ("source", source),
+                ("packet_kind", view.kind.as_str()),
+                ("direction", direction),
+            ],
+            bytes as f64,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_debug_packet_io_packets_total",
+            vec![
+                ("source", source),
+                ("packet_kind", view.kind.as_str()),
+                ("direction", direction),
+            ],
+            count as f64,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_debug_packet_io_avg_bps",
+            vec![
+                ("source", source),
+                ("packet_kind", view.kind.as_str()),
+                ("direction", direction),
+            ],
+            avg_bps,
+        ));
+    }
+}
+
+fn sample(name: &str, labels: Vec<(&str, &str)>, value: f64) -> PrometheusSample {
+    PrometheusSample::new(
+        name,
+        labels
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect(),
+        value,
+    )
+}
+
+fn sample_with_base(name: &str, labels: &[(&str, &str)], value: f64) -> PrometheusSample {
+    sample(name, labels.to_vec(), value)
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+fn format_prometheus_value(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "+Inf".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Inf".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+fn escape_label_value(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
     }
 }
 
@@ -808,6 +1406,7 @@ setInterval(refresh, 2000);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geoip::NodeGeo;
 
     #[test]
     fn finds_http_header_end() {
@@ -820,6 +1419,154 @@ mod tests {
         let mask = crate::s2s::overlay::config::transport_bit(TransportKind::Tcp)
             | crate::s2s::overlay::config::transport_bit(TransportKind::Udp);
         assert_eq!(transport_names_from_mask(mask), vec!["tcp", "udp"]);
+    }
+
+    #[test]
+    fn prometheus_exposition_escapes_labels_and_renders_topology_samples() {
+        let snapshot = TopologySnapshot {
+            local_node: 1,
+            generated_at_unix_ms: 123,
+            nodes: vec![
+                TopologyNode {
+                    node_id: 1,
+                    status: "alive",
+                    boot_epoch: 7,
+                    max_users: 100,
+                    addresses: Vec::new(),
+                    geo: NodeGeo::new(
+                        32.7767,
+                        -96.7970,
+                        Some("Dallas \"North\"\nWest\\".to_owned()),
+                        Some("TX".to_owned()),
+                        Some("US".to_owned()),
+                        "manual",
+                    ),
+                    transit_enabled: true,
+                    lsa_seq: Some(9),
+                    lsa_age_ms: Some(10),
+                },
+                TopologyNode {
+                    node_id: 2,
+                    status: "alive",
+                    boot_epoch: 8,
+                    max_users: 100,
+                    addresses: Vec::new(),
+                    geo: NodeGeo::new(
+                        29.7604,
+                        -95.3698,
+                        Some("Houston".to_owned()),
+                        Some("TX".to_owned()),
+                        Some("US".to_owned()),
+                        "cloudflare",
+                    ),
+                    transit_enabled: true,
+                    lsa_seq: Some(10),
+                    lsa_age_ms: Some(20),
+                },
+            ],
+            links: vec![
+                TopologyLink {
+                    source: 1,
+                    target: 2,
+                    status: "active",
+                    rtt_us: 1_500,
+                    jitter_us: 250,
+                    throughput_bps: 50_000,
+                    observed_recv_bps: 40_000,
+                    observed_sent_bps: 45_000,
+                    throughput_confidence_ppm: 750_000,
+                    loss_ppm: 25_000,
+                    probe_loss_ppm: 10_000,
+                    native_loss_ppm: 40_000,
+                    data_health_ppm: 5_000,
+                    loss_sample_count: 12,
+                    transports: vec!["tcp", "quic"],
+                },
+                TopologyLink {
+                    source: 2,
+                    target: 1,
+                    status: "active",
+                    rtt_us: 2_500,
+                    jitter_us: 350,
+                    throughput_bps: 60_000,
+                    observed_recv_bps: 50_000,
+                    observed_sent_bps: 55_000,
+                    throughput_confidence_ppm: 650_000,
+                    loss_ppm: 35_000,
+                    probe_loss_ppm: 20_000,
+                    native_loss_ppm: 50_000,
+                    data_health_ppm: 6_000,
+                    loss_sample_count: 13,
+                    transports: vec!["tcp"],
+                },
+            ],
+            routes: vec![TopologyRoute {
+                dst: 3,
+                metric: "conversational",
+                level: "reliable",
+                next_hop: 2,
+                transport: "quic",
+                service_fit: "chosen",
+                cost: 42,
+                transport_cost: Some(21),
+            }],
+            local_metrics: vec![TransportMetric {
+                peer: 2,
+                transport: "quic",
+                rtt_us: 1_500.0,
+                jitter_us: 250.0,
+                recv_bps: 1_000.0,
+                sent_bps: 2_000.0,
+                wire_recv_bps: 1_100.0,
+                wire_sent_bps: 2_100.0,
+                compression_recv_ratio: Some(0.5),
+                compression_sent_ratio: Some(0.75),
+                compression_total_ratio: Some(0.6),
+                packet_loss_ppm: 25_000,
+                probe_loss_ppm: 10_000,
+                probe_loss_ewma_ppm: 11_000,
+                native_loss_ppm: 40_000,
+                native_loss_ewma_ppm: 41_000,
+                data_health_ppm: 5_000,
+                loss_sample_count: 12,
+                probe_packets: 100,
+                lost_probe_packets: 1,
+                native_loss_samples: 50,
+                native_lost_samples: 2,
+                data_health_samples: 40,
+                data_health_failures: 3,
+                estimated_throughput_bps: 50_000.0,
+                samples: 9,
+                last_update_age_ms: Some(1234),
+            }],
+            #[cfg(debug_assertions)]
+            debug_packet_io: Vec::new(),
+        };
+
+        let mut rendered = String::new();
+        PrometheusWriter::new(&mut rendered).render(&snapshot);
+
+        assert!(rendered.contains("# TYPE shitspeak_s2s_node_info gauge\n"));
+        assert!(rendered.contains(
+            "shitspeak_s2s_node_geo_latitude{node=\"1\",city=\"Dallas \\\"North\\\"\\nWest\\\\\",region=\"TX\",country=\"US\",source=\"manual\"} 32.7767"
+        ));
+        assert!(!rendered.contains("shitspeak_s2s_node_info{node=\"2\""));
+        assert!(!rendered.contains("shitspeak_s2s_node_geo_latitude{node=\"2\",city=\"Houston\""));
+        assert!(rendered.contains(
+            "shitspeak_s2s_link_loss_breakdown_ppm{source=\"1\",target=\"2\",transport=\"tcp,quic\",metric=\"probe\"} 10000"
+        ));
+        assert!(!rendered.contains(
+            "shitspeak_s2s_link_loss_breakdown_ppm{source=\"2\",target=\"1\",transport=\"tcp\",metric=\"probe\"}"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_link_health_ppm{source=\"1\",target=\"2\",transport=\"tcp,quic\",metric=\"data_health\"} 5000"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_route_service_fit{source=\"1\",target=\"3\",dst=\"3\",next_hop=\"2\",metric=\"conversational\",level=\"reliable\",transport=\"quic\",service_fit=\"chosen\"} 1"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_direct_metric_traffic_bps{source=\"1\",peer=\"2\",transport=\"quic\",direction=\"sent\"} 2000"
+        ));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use crate::constants::APP_PROTO_VER;
 use crate::protocol_version::ProtocolVersion;
@@ -8,6 +8,7 @@ use crate::types::NodeIdentifier;
 use config::{Config as ConfigCrate, Environment, File};
 use serde::{Deserialize, Deserializer};
 
+use crate::geoip::NodeGeo;
 use crate::s2s::application::ApplicationConfig;
 use crate::s2s::overlay::OverlayTuning;
 use crate::s2s::replications::ReplicationTuning;
@@ -63,6 +64,9 @@ pub struct S2sConfig {
     pub status_http_listen: Option<SocketAddr>,
 
     #[serde(default)]
+    pub geo: S2sGeoConfig,
+
+    #[serde(default)]
     pub persistence_dir: Option<PathBuf>,
 
     #[serde(default)]
@@ -106,6 +110,7 @@ impl Default for S2sConfig {
             quic_advertise: Vec::new(),
             udp_advertise: Vec::new(),
             status_http_listen: None,
+            geo: S2sGeoConfig::default(),
             persistence_dir: None,
             seed_addresses: Vec::new(),
             application: ApplicationConfig::default(),
@@ -249,6 +254,50 @@ impl S2sConfig {
             cfg = cfg.with_persistence_dir(dir);
         }
         self.overlay.apply(cfg)
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct S2sGeoConfig {
+    #[serde(default)]
+    latitude: Option<f64>,
+    #[serde(default)]
+    longitude: Option<f64>,
+    #[serde(default)]
+    city: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+impl Default for S2sGeoConfig {
+    fn default() -> Self {
+        Self {
+            latitude: None,
+            longitude: None,
+            city: None,
+            region: None,
+            country: None,
+            source: None,
+        }
+    }
+}
+
+impl S2sGeoConfig {
+    pub fn manual_geo(&self) -> Option<NodeGeo> {
+        let latitude = self.latitude?;
+        let longitude = self.longitude?;
+        NodeGeo::new(
+            latitude,
+            longitude,
+            self.city.clone(),
+            self.region.clone(),
+            self.country.clone(),
+            self.source.clone().unwrap_or_else(|| "manual".to_owned()),
+        )
     }
 }
 
@@ -1227,6 +1276,12 @@ pub struct Config {
     #[serde(default)]
     pub authenticator: AuthenticatorConfig,
 
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+
+    #[serde(default)]
+    pub geoip: GeoIpConfig,
+
     // ── Mumble standard server config ──────────────────────────────────────
     #[serde(default)]
     pub welcome_text: Option<String>,
@@ -1335,11 +1390,178 @@ pub struct Config {
     pub web: WebConfig,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GeoIpConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_geoip_maxmind_database_path")]
+    maxmind_database_path: Option<PathBuf>,
+    #[serde(default = "default_geoip_cache_ttl_secs")]
+    cache_ttl_secs: u64,
+    #[serde(default = "default_geoip_cache_capacity")]
+    cache_capacity: usize,
+}
+
+impl Default for GeoIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            maxmind_database_path: default_geoip_maxmind_database_path(),
+            cache_ttl_secs: default_geoip_cache_ttl_secs(),
+            cache_capacity: default_geoip_cache_capacity(),
+        }
+    }
+}
+
+impl GeoIpConfig {
+    pub fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn maxmind_database_path(&self) -> Option<&PathBuf> {
+        self.enabled()
+            .then_some(self.maxmind_database_path.as_ref())
+            .flatten()
+    }
+
+    pub fn cache_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.cache_ttl_secs.max(1))
+    }
+
+    pub fn cache_capacity(&self) -> usize {
+        self.cache_capacity
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+    #[serde(default)]
+    pub remote_write: RemoteWriteConfig,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: None,
+            path: default_metrics_path(),
+            remote_write: RemoteWriteConfig::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RemoteWriteConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    #[serde(default = "default_remote_write_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_remote_write_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_remote_write_retry_cache_capacity")]
+    pub retry_cache_capacity: usize,
+    #[serde(default = "default_remote_write_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "default_remote_write_retry_initial_interval_ms")]
+    pub retry_initial_interval_ms: u64,
+    #[serde(default = "default_remote_write_retry_max_interval_ms")]
+    pub retry_max_interval_ms: u64,
+}
+
+impl Default for RemoteWriteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            labels: HashMap::new(),
+            tenant_id: None,
+            username: None,
+            password: None,
+            bearer_token: None,
+            interval_ms: default_remote_write_interval_ms(),
+            batch_size: default_remote_write_batch_size(),
+            retry_cache_capacity: default_remote_write_retry_cache_capacity(),
+            request_timeout_ms: default_remote_write_request_timeout_ms(),
+            retry_initial_interval_ms: default_remote_write_retry_initial_interval_ms(),
+            retry_max_interval_ms: default_remote_write_retry_max_interval_ms(),
+        }
+    }
+}
+
 fn default_max_bandwidth() -> u32 {
     72_000
 }
 fn default_true() -> bool {
     true
+}
+
+fn default_geoip_maxmind_database_path() -> Option<PathBuf> {
+    Some(PathBuf::from("GeoLite2-City.mmdb"))
+}
+
+fn default_geoip_cache_ttl_secs() -> u64 {
+    86_400
+}
+
+fn default_geoip_cache_capacity() -> usize {
+    4096
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".to_owned()
+}
+
+fn default_remote_write_interval_ms() -> u64 {
+    15_000
+}
+
+fn default_remote_write_batch_size() -> usize {
+    4096
+}
+
+fn default_remote_write_retry_cache_capacity() -> usize {
+    16_384
+}
+
+fn default_remote_write_request_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_remote_write_retry_initial_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_remote_write_retry_max_interval_ms() -> u64 {
+    30_000
 }
 
 fn default_server_protocol_version() -> ProtocolVersion {
@@ -1499,6 +1721,153 @@ mod tests {
         assert!(cfg.acl.grant_temp_channel_creator_acl());
         assert_eq!(cfg.root_channel_name, "Root");
         assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Demo);
+        assert!(cfg.geoip.enabled());
+        assert_eq!(
+            cfg.geoip.maxmind_database_path(),
+            Some(&PathBuf::from("GeoLite2-City.mmdb"))
+        );
+        assert!(!cfg.observability.metrics.enabled);
+        assert_eq!(cfg.observability.metrics.path, "/metrics");
+        assert!(!cfg.observability.metrics.remote_write.enabled);
+    }
+
+    #[test]
+    fn s2s_geo_manual_coordinates_parse_and_validate_bounds() {
+        let cfg = parse_s2s(
+            r#"
+                [geo]
+                latitude = 32.7767
+                longitude = -96.7970
+                city = " Dallas "
+                region = "TX"
+                country = "US"
+                source = "operator"
+            "#,
+        )
+        .expect("s2s geo config parses");
+
+        let geo = cfg.geo.manual_geo().expect("manual geo");
+        assert_eq!(geo.latitude(), 32.7767);
+        assert_eq!(geo.longitude(), -96.7970);
+        assert_eq!(geo.city(), Some("Dallas"));
+        assert_eq!(geo.region(), Some("TX"));
+        assert_eq!(geo.country(), Some("US"));
+        assert_eq!(geo.source(), "operator");
+
+        let invalid = parse_s2s(
+            r#"
+                [geo]
+                latitude = 91.0
+                longitude = -96.7970
+            "#,
+        )
+        .expect("invalid coordinates still deserialize");
+        assert!(invalid.geo.manual_geo().is_none());
+    }
+
+    #[test]
+    fn global_geoip_config_parses_for_acl_shared_resolver() {
+        let cfg: GeoIpConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                enabled = true
+                maxmind_database_path = "GeoLite2-Country.mmdb"
+                cache_ttl_secs = 60
+                cache_capacity = 32
+            "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("geoip config parses");
+
+        assert!(cfg.enabled());
+        assert_eq!(
+            cfg.maxmind_database_path(),
+            Some(&PathBuf::from("GeoLite2-Country.mmdb"))
+        );
+        assert_eq!(cfg.cache_ttl(), Duration::from_secs(60));
+        assert_eq!(cfg.cache_capacity(), 32);
+    }
+
+    #[test]
+    fn global_geoip_disabled_hides_database_path() {
+        let cfg: GeoIpConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                enabled = false
+                maxmind_database_path = "GeoLite2-Country.mmdb"
+            "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("geoip config parses");
+
+        assert!(!cfg.enabled());
+        assert_eq!(cfg.maxmind_database_path(), None);
+    }
+
+    #[test]
+    fn observability_metrics_config_parses() {
+        let cfg: ObservabilityConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    [metrics]
+                    enabled = true
+                    listen = "127.0.0.1:9095"
+                    path = "custom-metrics"
+
+                    [metrics.remote_write]
+                    enabled = true
+                    url = "http://mimir.example/api/v1/push"
+                    labels = { environment = "prod", cluster = "core" }
+                    tenant_id = "tenant-a"
+                    username = "user"
+                    password = "secret"
+                    interval_ms = 5000
+                    batch_size = 128
+                    retry_cache_capacity = 8
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("observability deserialize");
+
+        assert!(cfg.metrics.enabled);
+        assert_eq!(cfg.metrics.listen, Some("127.0.0.1:9095".parse().unwrap()));
+        assert_eq!(cfg.metrics.path, "custom-metrics");
+        assert!(cfg.metrics.remote_write.enabled);
+        assert_eq!(
+            cfg.metrics.remote_write.url.as_deref(),
+            Some("http://mimir.example/api/v1/push")
+        );
+        assert_eq!(
+            cfg.metrics.remote_write.tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            cfg.metrics
+                .remote_write
+                .labels
+                .get("environment")
+                .map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(
+            cfg.metrics
+                .remote_write
+                .labels
+                .get("cluster")
+                .map(String::as_str),
+            Some("core")
+        );
+        assert_eq!(cfg.metrics.remote_write.batch_size, 128);
+        assert_eq!(cfg.metrics.remote_write.retry_cache_capacity, 8);
     }
 
     #[test]

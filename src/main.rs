@@ -30,6 +30,7 @@ mod http_client;
 mod localization;
 mod logging;
 mod messages;
+mod observability;
 mod privacy;
 mod protocol_version;
 mod proxy_protocol;

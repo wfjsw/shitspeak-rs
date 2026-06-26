@@ -364,6 +364,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            geo: None,
         }
     }
 

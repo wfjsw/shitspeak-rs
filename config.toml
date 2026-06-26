@@ -109,6 +109,15 @@ protect_certificate_hashes = false
 # privacy.certificate.hash.secret override.
 # certificate_hash_secret = "replace-with-a-long-random-cluster-secret"
 
+# Global GeoIP lookup for shared resolver use such as ACL IP masks. This is
+# MaxMind/GeoLite2-backed; S2S topology observability uses Cloudflare
+# check-perf endpoint probes unless manual [s2s.geo] coordinates are set.
+[geoip]
+enabled = true
+maxmind_database_path = "GeoLite2-City.mmdb"
+cache_ttl_secs = 86400
+cache_capacity = 4096
+
 # S2S (server-to-server)
 # [s2s]
 # Whether to advertise private RFC1918/ULA listen or advertise addresses into
@@ -120,6 +129,17 @@ protect_certificate_hashes = false
 # case-insensitively; on Windows the adapter name, friendly name, and
 # description are checked.
 # local_interface_advertise = ["tailscale0", "Tailscale"]
+
+# Optional node geo location for topology dashboards. Manual coordinates take
+# precedence; when omitted, the node probes Cloudflare check-perf endpoints to
+# use the egress IP's observed city/region/country and coordinates.
+[s2s.geo]
+# latitude = 32.7767
+# longitude = -96.7970
+# city = "Dallas"
+# region = "TX"
+# country = "US"
+# source = "manual"
 
 # ── L1 transport tunables ─────────────────────────────────────────────
 # Per-link metrics smoothing (EWMA coefficients) and ping-cap.
@@ -306,3 +326,26 @@ retry_cache_capacity = 4096
 retry_initial_interval_ms = 1000
 retry_max_interval_ms = 30000
 labels = { environment = "local" }
+
+# Optional Prometheus/Grafana Mimir metrics. When enabled, `/metrics` exposes
+# the same topology data used by the S2S debug view. `remote_write` is optional;
+# scraping this endpoint with Prometheus or Grafana Alloy is usually preferred.
+[observability.metrics]
+enabled = false
+# listen = "0.0.0.0:64751"
+path = "/metrics"
+
+[observability.metrics.remote_write]
+enabled = false
+# url = "http://localhost:9009/api/v1/push"
+# tenant_id = "tenant"
+# username = "grafana-cloud-user-or-org-id"
+# password = "grafana-cloud-token"
+# bearer_token = "token"
+labels = { environment = "local" }
+interval_ms = 15000
+batch_size = 4096
+retry_cache_capacity = 16384
+request_timeout_ms = 5000
+retry_initial_interval_ms = 1000
+retry_max_interval_ms = 30000

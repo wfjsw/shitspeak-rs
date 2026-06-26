@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::geoip::{NodeGeo, is_public_geoip_candidate};
 use crate::s2s::transport::{ConnectionManager, Inbound, PeerAddress};
 use crate::types::NodeIdentifier;
 
@@ -159,6 +160,7 @@ impl OverlayInner {
         max_users: Arc<AtomicU64>,
         replication_services: ReplicationServices,
         self_addresses: Vec<PeerAddress>,
+        self_geo: Option<NodeGeo>,
     ) -> Self {
         let self_id = transport.local_node_id();
         let boot_epoch = capture_monotonic_boot_epoch(self_id, cfg.persistence_dir());
@@ -187,6 +189,7 @@ impl OverlayInner {
             max_users,
             cfg.route_transit_messages(),
             replication_services,
+            self_geo,
         ));
         let flood_pacer = Arc::new(LsaFloodPacer::new(transport.clone()));
 
@@ -421,14 +424,17 @@ pub(crate) async fn start_inner(
     cfg: OverlayConfig,
     max_users: Arc<AtomicU64>,
     replication_services: ReplicationServices,
+    configured_geo: Option<NodeGeo>,
 ) -> Result<Arc<OverlayInner>, OverlayError> {
     let self_addresses = transport.listen_addresses_with_public_ip_probe().await;
+    let self_geo = resolve_self_geo(configured_geo, &self_addresses).await;
     let inner = Arc::new(OverlayInner::new(
         transport,
         cfg,
         max_users,
         replication_services,
         self_addresses,
+        self_geo,
     ));
 
     super::discovery::bootstrap(&inner.cfg, &inner.transport);
@@ -436,6 +442,22 @@ pub(crate) async fn start_inner(
     inner.spawn_tasks(inbound);
 
     Ok(inner)
+}
+
+async fn resolve_self_geo(
+    configured_geo: Option<NodeGeo>,
+    self_addresses: &[PeerAddress],
+) -> Option<NodeGeo> {
+    if configured_geo.is_some() {
+        return configured_geo;
+    }
+    if !self_addresses
+        .iter()
+        .any(|address| is_public_geoip_candidate(&address.addr().ip()))
+    {
+        return None;
+    }
+    crate::s2s::transport::public_ip::discover_public_geo().await
 }
 
 #[cfg(test)]
