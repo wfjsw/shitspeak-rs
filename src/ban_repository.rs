@@ -19,6 +19,8 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::broadcast;
 
+use crate::types::StrictReplicationMetadata;
+
 // ─── Ban entry ───────────────────────────────────────────────────────────────
 
 fn sql_i64_from_u64(value: u64) -> rusqlite::Result<i64> {
@@ -32,6 +34,14 @@ fn sql_i64_from_u64_io(value: u64) -> Result<i64, io::Error> {
 
 fn sql_u64_from_i64(value: i64) -> u64 {
     value.max(0) as u64
+}
+
+fn sql_text_from_u64(value: u64) -> String {
+    value.to_string()
+}
+
+fn sql_u64_from_text(value: Option<String>) -> Option<u64> {
+    value?.parse().ok()
 }
 
 /// A single ban entry.
@@ -97,6 +107,29 @@ pub struct BanOperation {
     pub timestamp: i64,
     #[serde(flatten)]
     pub op: BanOp,
+}
+
+#[derive(Clone, Debug)]
+pub struct BanLogEntry {
+    op: Arc<BanOperation>,
+    strict_metadata: Option<StrictReplicationMetadata>,
+}
+
+impl BanLogEntry {
+    fn new(op: Arc<BanOperation>, strict_metadata: Option<StrictReplicationMetadata>) -> Self {
+        Self {
+            op,
+            strict_metadata,
+        }
+    }
+
+    pub fn op(&self) -> Arc<BanOperation> {
+        self.op.clone()
+    }
+
+    pub fn strict_metadata(&self) -> Option<StrictReplicationMetadata> {
+        self.strict_metadata
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,13 +205,23 @@ impl BanRepository {
                 node_id INTEGER NOT NULL,
                 timestamp INTEGER NOT NULL,
                 op_type TEXT NOT NULL,
-                op_data TEXT NOT NULL
+                op_data TEXT NOT NULL,
+                strict_op_id_hi TEXT,
+                strict_op_id_lo TEXT,
+                strict_ts_final TEXT
             );
 
             -- Index for efficient IP lookups
             CREATE INDEX IF NOT EXISTS idx_bans_address ON bans(address);",
         )
         .expect("table creation should succeed");
+        for migration in [
+            "ALTER TABLE ban_operations ADD COLUMN strict_op_id_hi TEXT",
+            "ALTER TABLE ban_operations ADD COLUMN strict_op_id_lo TEXT",
+            "ALTER TABLE ban_operations ADD COLUMN strict_ts_final TEXT",
+        ] {
+            let _ = conn.execute(migration, []);
+        }
 
         // Determine current version from the operations table
         let max_version = conn
@@ -377,11 +420,22 @@ impl BanRepository {
 
     /// Return all log entries with `version > since_version`.
     pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<BanOperation>> {
+        self.get_log_entries_since(since_version)
+            .await
+            .into_iter()
+            .map(|entry| entry.op())
+            .collect()
+    }
+
+    pub async fn get_log_entries_since(&self, since_version: u64) -> Vec<BanLogEntry> {
         let since_version = i64::try_from(since_version).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT version, node_id, timestamp, op_type, op_data
+                "SELECT version, node_id, timestamp, op_type, op_data,
+                        CAST(strict_op_id_hi AS TEXT),
+                        CAST(strict_op_id_lo AS TEXT),
+                        CAST(strict_ts_final AS TEXT)
                  FROM ban_operations
                  WHERE version > ?1
                  ORDER BY version ASC",
@@ -395,25 +449,69 @@ impl BanRepository {
                 let timestamp: i64 = row.get(2)?;
                 let op_type: String = row.get(3)?;
                 let op_data: String = row.get(4)?;
-                Ok((version, node_id, timestamp, op_type, op_data))
+                let strict_op_id_hi = row.get::<_, Option<String>>(5)?;
+                let strict_op_id_lo = row.get::<_, Option<String>>(6)?;
+                let strict_ts_final = row.get::<_, Option<String>>(7)?;
+                Ok((
+                    version,
+                    node_id,
+                    timestamp,
+                    op_type,
+                    op_data,
+                    strict_op_id_hi,
+                    strict_op_id_lo,
+                    strict_ts_final,
+                ))
             })
             .expect("query should succeed");
 
         rows.filter_map(|r| r.ok())
-            .filter_map(|(version, node_id, timestamp, _op_type, op_data)| {
-                let op: BanOp = serde_json::from_str(&op_data).ok()?;
-                Some(Arc::new(BanOperation {
+            .filter_map(
+                |(
                     version,
                     node_id,
                     timestamp,
-                    op,
-                }))
-            })
+                    _op_type,
+                    op_data,
+                    strict_op_id_hi,
+                    strict_op_id_lo,
+                    strict_ts_final,
+                )| {
+                    let op: BanOp = serde_json::from_str(&op_data).ok()?;
+                    let metadata = match (
+                        sql_u64_from_text(strict_op_id_hi),
+                        sql_u64_from_text(strict_op_id_lo),
+                        sql_u64_from_text(strict_ts_final),
+                    ) {
+                        (Some(hi), Some(lo), Some(ts)) => {
+                            Some(StrictReplicationMetadata::new(hi, lo, ts))
+                        }
+                        _ => None,
+                    };
+                    Some(BanLogEntry::new(
+                        Arc::new(BanOperation {
+                            version,
+                            node_id,
+                            timestamp,
+                            op,
+                        }),
+                        metadata,
+                    ))
+                },
+            )
             .collect()
     }
 
     /// Apply an operation that arrived from a remote node.
     pub async fn apply_remote_operation(&self, op: Arc<BanOperation>) {
+        self.apply_remote_operation_with_metadata(op, None).await
+    }
+
+    pub async fn apply_remote_operation_with_metadata(
+        &self,
+        op: Arc<BanOperation>,
+        strict_metadata: Option<StrictReplicationMetadata>,
+    ) {
         if op.version <= self.version.load(Ordering::Acquire) {
             return;
         }
@@ -424,15 +522,29 @@ impl BanRepository {
         apply_op_to_db(&conn, &op.op).ok();
         // Record the operation in the log
         let op_data = serde_json::to_string(&op.op).expect("BanOp should be serializable");
+        let (strict_op_id_hi, strict_op_id_lo, strict_ts_final) = strict_metadata
+            .map(|metadata| {
+                (
+                    Some(sql_text_from_u64(metadata.op_id_hi())),
+                    Some(sql_text_from_u64(metadata.op_id_lo())),
+                    Some(sql_text_from_u64(metadata.ts_final())),
+                )
+            })
+            .unwrap_or((None, None, None));
         conn.execute(
-            "INSERT OR IGNORE INTO ban_operations (version, node_id, timestamp, op_type, op_data)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO ban_operations
+                (version, node_id, timestamp, op_type, op_data,
+                 strict_op_id_hi, strict_op_id_lo, strict_ts_final)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 sql_version,
                 op.node_id,
                 op.timestamp,
                 op_type_str(&op.op),
-                op_data
+                op_data,
+                strict_op_id_hi,
+                strict_op_id_lo,
+                strict_ts_final,
             ],
         )
         .ok();
@@ -479,7 +591,16 @@ impl BanRepository {
     fn commit_locked(
         &self,
         conn: &Connection,
+        op: BanOperation,
+    ) -> Result<Arc<BanOperation>, io::Error> {
+        self.commit_locked_with_metadata(conn, op, None)
+    }
+
+    fn commit_locked_with_metadata(
+        &self,
+        conn: &Connection,
         mut op: BanOperation,
+        strict_metadata: Option<StrictReplicationMetadata>,
     ) -> Result<Arc<BanOperation>, io::Error> {
         let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
         op.version = version;
@@ -491,16 +612,30 @@ impl BanRepository {
                 format!("op serialisation error: {e}"),
             )
         })?;
+        let (strict_op_id_hi, strict_op_id_lo, strict_ts_final) = strict_metadata
+            .map(|metadata| {
+                (
+                    Some(sql_text_from_u64(metadata.op_id_hi())),
+                    Some(sql_text_from_u64(metadata.op_id_lo())),
+                    Some(sql_text_from_u64(metadata.ts_final())),
+                )
+            })
+            .unwrap_or((None, None, None));
 
         conn.execute(
-            "INSERT INTO ban_operations (version, node_id, timestamp, op_type, op_data)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO ban_operations
+                (version, node_id, timestamp, op_type, op_data,
+                 strict_op_id_hi, strict_op_id_lo, strict_ts_final)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 sql_version,
                 op.node_id,
                 op.timestamp,
                 op_type_str(&op.op),
-                op_data
+                op_data,
+                strict_op_id_hi,
+                strict_op_id_lo,
+                strict_ts_final,
             ],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -628,5 +763,35 @@ mod tests {
             }
             other => panic!("expected AddBan, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn ban_operation_log_preserves_strict_metadata() {
+        let repo = BanRepository::new_in_memory(1);
+        let metadata = StrictReplicationMetadata::new(u64::MAX - 2, u64::MAX - 1, u64::MAX);
+        let op = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            op: BanOp::AddBan {
+                entry: BanEntry {
+                    address: "203.0.113.18".parse().unwrap(),
+                    mask: 32,
+                    name: Some("strict-ban".into()),
+                    hash: None,
+                    reason: Some("metadata test".into()),
+                    start: 123,
+                    duration: 0,
+                },
+            },
+        });
+
+        repo.apply_remote_operation_with_metadata(op, Some(metadata))
+            .await;
+
+        let entries = repo.get_log_entries_since(0).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op().version, 1);
+        assert_eq!(entries[0].strict_metadata(), Some(metadata));
     }
 }

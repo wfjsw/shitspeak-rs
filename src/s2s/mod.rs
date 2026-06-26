@@ -32,7 +32,7 @@ use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, Clie
 use crate::client_repository::ClientRepository;
 use crate::geoip::NodeGeo;
 use crate::server::Server;
-use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
+use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier, StrictReplicationMetadata};
 
 use self::application::error::ApplicationError;
 use self::application::moderation::ModerationApplier;
@@ -1901,6 +1901,22 @@ struct ChannelSnapshot {
     freshness: i64,
 }
 
+fn strict_log_metadata_from_repo(
+    metadata: StrictReplicationMetadata,
+) -> replications::strict::StrictLogMetadata {
+    replications::strict::StrictLogMetadata {
+        op_id_hi: metadata.op_id_hi(),
+        op_id_lo: metadata.op_id_lo(),
+        ts_final: metadata.ts_final(),
+    }
+}
+
+fn strict_log_metadata_to_repo(
+    metadata: replications::strict::StrictLogMetadata,
+) -> StrictReplicationMetadata {
+    StrictReplicationMetadata::new(metadata.op_id_hi, metadata.op_id_lo, metadata.ts_final)
+}
+
 #[async_trait]
 impl StrictReplicable for ChannelReplicationAdapter {
     type Op = ChannelOperation;
@@ -1941,17 +1957,23 @@ impl StrictReplicable for ChannelReplicationAdapter {
         let repo = self.repo.clone();
         let server_id = self.server_id.clone();
         let entries = block_in_place_or_current(|handle| {
-            handle.block_on(repo.get_log_since_in_server(&server_id, since))
+            handle.block_on(repo.get_log_entries_since_in_server(&server_id, since))
         });
         match entries {
             Some(entries) => replications::strict::LogSlice::Available(
                 entries
                     .into_iter()
-                    .map(|op| {
-                        (
-                            op.version,
-                            replications::strict::StrictLogEntry::new((*op).clone()),
-                        )
+                    .map(|entry| {
+                        let op = entry.op();
+                        let metadata = entry.strict_metadata().map(strict_log_metadata_from_repo);
+                        let log_entry = match metadata {
+                            Some(metadata) => replications::strict::StrictLogEntry::with_metadata(
+                                (*op).clone(),
+                                metadata,
+                            ),
+                            None => replications::strict::StrictLogEntry::new((*op).clone()),
+                        };
+                        (op.version, log_entry)
                     })
                     .collect(),
             ),
@@ -1982,6 +2004,68 @@ impl StrictReplicable for ChannelReplicationAdapter {
         };
         let op_server_id = op.server_id.clone();
         if let Err(e) = self.repo.apply_committed_operation(op).await {
+            warn!(error = ?e, "s2s channel operation apply failed");
+            return;
+        }
+        if let (Some(server), Some((id, nonce, fallback))) = (
+            self.server.as_ref().and_then(Weak::upgrade),
+            evict_pending_delete,
+        ) {
+            let moved = crate::user_channel_cache::move_local_clients_out_of_pending_delete(
+                &server,
+                &op_server_id,
+                id,
+                nonce,
+                fallback,
+                version,
+            )
+            .await;
+            if moved > 0 {
+                trace!(
+                    server_id = %op_server_id,
+                    channel_id = id,
+                    nonce,
+                    moved,
+                    "moved local clients out of replicated pending-delete subtree"
+                );
+            }
+        }
+    }
+
+    async fn apply_committed_with_metadata(
+        &self,
+        version: u64,
+        op: Self::Op,
+        metadata: Option<replications::strict::StrictLogMetadata>,
+    ) {
+        let mut op = op;
+        op.version = version;
+        if op.server_id.is_empty() || op.server_id == DEFAULT_SERVER_ID {
+            op.server_id = self.server_id.clone();
+        }
+        let evict_pending_delete = match &op.op {
+            ChannelOp::MarkPendingDelete {
+                id,
+                nonce,
+                evict_clients,
+            } if *evict_clients => {
+                let fallback = self
+                    .repo
+                    .get_channel_in_server(&op.server_id, *id)
+                    .await
+                    .and_then(|channel| channel.parent_id)
+                    .unwrap_or(0);
+                Some((*id, *nonce, fallback))
+            }
+            _ => None,
+        };
+        let op_server_id = op.server_id.clone();
+        let metadata = metadata.map(strict_log_metadata_to_repo);
+        if let Err(e) = self
+            .repo
+            .apply_committed_operation_with_metadata(op, metadata)
+            .await
+        {
             warn!(error = ?e, "s2s channel operation apply failed");
             return;
         }
@@ -2145,16 +2229,22 @@ impl StrictReplicable for BanReplicationAdapter {
     ) -> replications::strict::LogSlice<replications::strict::StrictLogEntry<Self::Op>> {
         let repo = self.repo.clone();
         let entries =
-            block_in_place_or_current(|handle| handle.block_on(repo.get_log_since(since)));
+            block_in_place_or_current(|handle| handle.block_on(repo.get_log_entries_since(since)));
         match entries {
             Some(entries) => replications::strict::LogSlice::Available(
                 entries
                     .into_iter()
-                    .map(|op| {
-                        (
-                            op.version,
-                            replications::strict::StrictLogEntry::new((*op).clone()),
-                        )
+                    .map(|entry| {
+                        let op = entry.op();
+                        let metadata = entry.strict_metadata().map(strict_log_metadata_from_repo);
+                        let log_entry = match metadata {
+                            Some(metadata) => replications::strict::StrictLogEntry::with_metadata(
+                                (*op).clone(),
+                                metadata,
+                            ),
+                            None => replications::strict::StrictLogEntry::new((*op).clone()),
+                        };
+                        (op.version, log_entry)
                     })
                     .collect(),
             ),
@@ -2165,6 +2255,21 @@ impl StrictReplicable for BanReplicationAdapter {
     async fn apply_committed(&self, version: u64, mut op: Self::Op) {
         op.version = version;
         self.repo.apply_remote_operation(Arc::new(op)).await;
+    }
+
+    async fn apply_committed_with_metadata(
+        &self,
+        version: u64,
+        mut op: Self::Op,
+        metadata: Option<replications::strict::StrictLogMetadata>,
+    ) {
+        op.version = version;
+        self.repo
+            .apply_remote_operation_with_metadata(
+                Arc::new(op),
+                metadata.map(strict_log_metadata_to_repo),
+            )
+            .await;
     }
 
     async fn install_snapshot(&self, version: u64, snapshot: Bytes) {

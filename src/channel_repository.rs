@@ -46,7 +46,7 @@ use crate::acl::ACLPermissions;
 use crate::channels::{Channel, ChannelPatch, PendingDeleteState};
 use crate::config::Config;
 use crate::errors::ChannelRepoError;
-use crate::types::{DEFAULT_SERVER_ID, default_server_id};
+use crate::types::{DEFAULT_SERVER_ID, StrictReplicationMetadata, default_server_id};
 
 const TEMPORARY_CHANNEL_ID_BIT: u32 = 0x8000_0000;
 
@@ -176,6 +176,46 @@ impl ChannelOperation {
                 None
             }
             ChannelOp::InstallSnapshot { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelLogEntry {
+    op: Arc<ChannelOperation>,
+    strict_metadata: Option<StrictReplicationMetadata>,
+}
+
+impl ChannelLogEntry {
+    fn new(op: Arc<ChannelOperation>, strict_metadata: Option<StrictReplicationMetadata>) -> Self {
+        Self {
+            op,
+            strict_metadata,
+        }
+    }
+
+    pub fn op(&self) -> Arc<ChannelOperation> {
+        self.op.clone()
+    }
+
+    pub fn strict_metadata(&self) -> Option<StrictReplicationMetadata> {
+        self.strict_metadata
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChannelWalRecord {
+    #[serde(flatten)]
+    op: ChannelOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strict_metadata: Option<StrictReplicationMetadata>,
+}
+
+impl ChannelWalRecord {
+    fn new(op: &ChannelOperation, strict_metadata: Option<StrictReplicationMetadata>) -> Self {
+        Self {
+            op: op.clone(),
+            strict_metadata,
         }
     }
 }
@@ -407,7 +447,7 @@ pub struct ChannelRepository {
     link_topologies: ParkingRwLock<HashMap<String, LinkTopology>>,
     versions: ParkingRwLock<HashMap<String, u64>>,
     /// In-memory log for `get_log_since` and future S2S queries.
-    log: ParkingRwLock<std::collections::VecDeque<Arc<ChannelOperation>>>,
+    log: ParkingRwLock<std::collections::VecDeque<ChannelLogEntry>>,
     log_max_entries: usize,
     /// Bumped whenever channel state can change effective ACL results.
     channel_acl_generation: AtomicU64,
@@ -536,8 +576,8 @@ impl ChannelRepository {
             if line.is_empty() {
                 continue;
             }
-            let op: ChannelOperation = match serde_json::from_str(line) {
-                Ok(op) => op,
+            let record: ChannelWalRecord = match serde_json::from_str(line) {
+                Ok(record) => record,
                 Err(e) => {
                     tracing::warn!(
                         "WAL corrupt at line {}: {} — stopping replay here",
@@ -547,6 +587,8 @@ impl ChannelRepository {
                     break;
                 }
             };
+            let op = record.op;
+            let strict_metadata = record.strict_metadata;
             wal_entry_count += 1;
             history_freshness
                 .entry(op.server_id.clone())
@@ -554,7 +596,7 @@ impl ChannelRepository {
                 .or_insert(op.timestamp);
 
             // Keep an in-memory bounded replay window for S2S catch-up.
-            log_entries.push_back(Arc::new(op.clone()));
+            log_entries.push_back(ChannelLogEntry::new(Arc::new(op.clone()), strict_metadata));
             while log_entries.len() > tuning.log_max_entries {
                 log_entries.pop_front();
             }
@@ -629,8 +671,8 @@ impl ChannelRepository {
             .log
             .read()
             .iter()
-            .filter(|op| op.server_id == server_id)
-            .map(|op| op.timestamp)
+            .filter(|entry| entry.op.server_id == server_id)
+            .map(|entry| entry.op.timestamp)
             .max()
             .unwrap_or(0);
         let snapshot = self
@@ -1870,7 +1912,19 @@ impl ChannelRepository {
 
     /// Return all log entries with `version > since_version`.
     pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<ChannelOperation>> {
-        self.get_log_since_in_server(DEFAULT_SERVER_ID, since_version)
+        self.get_log_entries_since(DEFAULT_SERVER_ID, since_version)
+            .await
+            .into_iter()
+            .map(|entry| entry.op())
+            .collect()
+    }
+
+    pub async fn get_log_entries_since(
+        &self,
+        server_id: &str,
+        since_version: u64,
+    ) -> Vec<ChannelLogEntry> {
+        self.get_log_entries_since_in_server(server_id, since_version)
             .await
     }
 
@@ -1879,10 +1933,22 @@ impl ChannelRepository {
         server_id: &str,
         since_version: u64,
     ) -> Vec<Arc<ChannelOperation>> {
+        self.get_log_entries_since_in_server(server_id, since_version)
+            .await
+            .into_iter()
+            .map(|entry| entry.op())
+            .collect()
+    }
+
+    pub async fn get_log_entries_since_in_server(
+        &self,
+        server_id: &str,
+        since_version: u64,
+    ) -> Vec<ChannelLogEntry> {
         self.log
             .read()
             .iter()
-            .filter(|op| op.server_id == server_id && op.version > since_version)
+            .filter(|entry| entry.op.server_id == server_id && entry.op.version > since_version)
             .cloned()
             .collect()
     }
@@ -1948,7 +2014,15 @@ impl ChannelRepository {
     /// repository's native WAL/snapshot pipeline.
     pub async fn apply_committed_operation(
         self: &Arc<Self>,
+        op: ChannelOperation,
+    ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
+        self.apply_committed_operation_with_metadata(op, None).await
+    }
+
+    pub async fn apply_committed_operation_with_metadata(
+        self: &Arc<Self>,
         mut op: ChannelOperation,
+        strict_metadata: Option<StrictReplicationMetadata>,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
         if op.server_id.is_empty() {
             op.server_id = default_server_id();
@@ -1997,7 +2071,7 @@ impl ChannelRepository {
             self.bump_channel_acl_generation();
         }
         self.invalidate_acl_cache_for_op(&op.op).await;
-        let committed = self.commit_assigned_operation(op).await?;
+        let committed = self.commit_assigned_operation(op, strict_metadata).await?;
 
         if let Some((id, nonce)) = evicting_pending_delete {
             let subtree = self
@@ -2065,7 +2139,9 @@ impl ChannelRepository {
                         .filter(|channel_id| *channel_id != 0),
                 );
                 self.versions.write().insert(server_id.to_owned(), version);
-                self.log.write().retain(|op| op.server_id != server_id);
+                self.log
+                    .write()
+                    .retain(|entry| entry.op.server_id != server_id);
             }
             (ids, notification_channels, removed_channel_ids)
         };
@@ -2246,6 +2322,7 @@ impl ChannelRepository {
     async fn commit_assigned_operation(
         &self,
         mut op: ChannelOperation,
+        strict_metadata: Option<StrictReplicationMetadata>,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
         let root_config = self.root_config.read().clone();
         op.op = normalize_op_for_root(&op.op, &root_config);
@@ -2257,7 +2334,7 @@ impl ChannelRepository {
                 .and_modify(|version| *version = (*version).max(op.version))
                 .or_insert(op.version);
             let op = Arc::new(op);
-            log.push_back(Arc::clone(&op));
+            log.push_back(ChannelLogEntry::new(Arc::clone(&op), strict_metadata));
             while log.len() > self.log_max_entries {
                 log.pop_front();
             }
@@ -2270,8 +2347,9 @@ impl ChannelRepository {
             .or_insert(op.timestamp);
 
         if let Some(ref wal_mutex) = self.wal_file {
+            let record = ChannelWalRecord::new(&op, strict_metadata);
             let mut line =
-                serde_json::to_string(&*op).map_err(|e| ChannelRepoError::WalCorrupt {
+                serde_json::to_string(&record).map_err(|e| ChannelRepoError::WalCorrupt {
                     line: 0,
                     reason: format!("WAL serialisation error: {e}"),
                 })?;
@@ -2320,7 +2398,7 @@ impl ChannelRepository {
             "ChannelRepository version counter approaching u64::MAX — likely a bug"
         );
         op.version = version;
-        let _ = self.commit_assigned_operation(op).await?;
+        let _ = self.commit_assigned_operation(op, None).await?;
         Ok(())
     }
 
@@ -3086,5 +3164,67 @@ mod tests {
             client_repo.get_local_listeners_for_channel(7).await.len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn committed_channel_operation_preserves_strict_metadata_in_replay_log() {
+        let repo = repo();
+        let metadata = StrictReplicationMetadata::new(11, 22, 33);
+        let op = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "strict", 0, 0, Some(0)),
+            },
+        };
+
+        repo.apply_committed_operation_with_metadata(op, Some(metadata))
+            .await
+            .unwrap();
+
+        let entries = repo
+            .get_log_entries_since_in_server(DEFAULT_SERVER_ID, 0)
+            .await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op().version, 1);
+        assert_eq!(entries[0].strict_metadata(), Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn persisted_channel_wal_preserves_strict_metadata_in_replay_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = StrictReplicationMetadata::new(u64::MAX - 2, u64::MAX - 1, u64::MAX);
+
+        {
+            let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            let op = ChannelOperation {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                version: 1,
+                node_id: 1,
+                timestamp: 123,
+                emits_client_message: true,
+                op: ChannelOp::CreateChannel {
+                    channel: Channel::new(9, "strict", 0, 0, Some(0)),
+                },
+            };
+            repo.apply_committed_operation_with_metadata(op, Some(metadata))
+                .await
+                .unwrap();
+        }
+
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        let entries = repo
+            .get_log_entries_since_in_server(DEFAULT_SERVER_ID, 0)
+            .await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op().version, 1);
+        assert_eq!(entries[0].strict_metadata(), Some(metadata));
     }
 }

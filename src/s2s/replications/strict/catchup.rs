@@ -1,10 +1,11 @@
 //! Strict-mode catchup: chunked snapshot + log replay over `OverlayData`.
 //!
 //! The wire chunking strategy is intentionally stateless on the server
-//! side: each request carries `since_version`; the server returns up to
+//! side: each request carries `since_version` plus a continuation
+//! `chunk_token`; the server returns up to
 //! [`crate::s2s::replications::ReplicationConfig::strict_max_catchup_ops`]
 //! ops with `has_more` set when more are available. The client iterates by
-//! re-issuing requests with `since_version = repo.current_version()` until
+//! re-issuing requests with the returned `next_chunk_token` until
 //! `has_more = false`.
 
 use bytes::Bytes;
@@ -16,6 +17,7 @@ use super::runtime::{
     HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryElectionCandidate, HistoryRank, StrictRuntime,
 };
 use super::{LogSlice, StrictLogMetadata, StrictReplicable};
+use crate::s2s::transport::ServiceLevel;
 use crate::types::NodeIdentifier;
 
 /// Build and send a `StrictCatchupResp` answering `req`.
@@ -29,6 +31,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     let mut too_old_use_snapshot = false;
 
     let force_snapshot = req.force_snapshot || req.chunk_token == HISTORY_ELECTION_SNAPSHOT_TOKEN;
+    let request_since = req.chunk_token.max(req.since_version);
     let (effective_ops, _effective_since) = if force_snapshot {
         too_old_use_snapshot = true;
         let (sv, snap) = rt.repo.snapshot();
@@ -36,8 +39,8 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         snapshot_msgpack = snap;
         (Vec::new(), sv)
     } else {
-        match rt.repo.log_since(req.since_version) {
-            LogSlice::Available(ops) => (ops, req.since_version),
+        match rt.repo.log_since(request_since) {
+            LogSlice::Available(ops) => (ops, request_since),
             LogSlice::TooOld => {
                 too_old_use_snapshot = true;
                 let (sv, snap) = rt.repo.snapshot();
@@ -52,7 +55,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     };
 
     let total = effective_ops.len();
-    let take = total.min(rt.cfg.strict_max_catchup_ops());
+    let take = total.min(rt.cfg.strict_max_catchup_ops().max(1));
     let mut catchup_ops: Vec<CatchupOp> = Vec::with_capacity(take);
     for (v, entry) in effective_ops.iter().take(take) {
         match rmp_serde::to_vec(&entry.op) {
@@ -72,7 +75,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     let next_chunk_token = catchup_ops
         .last()
         .map(|c| c.version)
-        .unwrap_or(req.since_version);
+        .unwrap_or(request_since);
 
     let rank = HistoryRank::local(rt);
     let resp = StrictCatchupResp {
@@ -196,8 +199,10 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     }
     if resp.has_more {
         let alive = rt.net.alive_members();
-        let mut peers: Vec<NodeIdentifier> =
-            alive.into_iter().filter(|n| *n != rt.self_id).collect();
+        let mut peers: Vec<NodeIdentifier> = alive
+            .into_iter()
+            .filter(|n| *n != rt.self_id && rt.net.has_route(*n, ServiceLevel::Reliable))
+            .collect();
         if peers.is_empty() {
             return;
         }
@@ -208,7 +213,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         };
         let req = StrictCatchupReq {
             src_node: rt.self_id as u32,
-            since_version: rt.repo.current_version(),
+            since_version: resp.next_chunk_token,
             chunk_token: resp.next_chunk_token,
             force_snapshot: false,
         };

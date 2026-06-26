@@ -2432,6 +2432,188 @@ mod tests {
         assert_eq!(rt.state.lock().history_alive_peers, HashSet::from([3]));
     }
 
+    #[tokio::test]
+    async fn strict_catchup_request_uses_chunk_token_as_continuation() {
+        let net = MockNet::new(2, vec![1, 2]);
+        let repo = CountingStrictRepo::new();
+        {
+            let mut state = repo.state.lock();
+            state.0 = 5;
+            state.1 = (1u64..=5)
+                .map(|version| {
+                    (
+                        version,
+                        100 + version,
+                        Some(StrictLogMetadata {
+                            op_id_hi: 7,
+                            op_id_lo: version,
+                            ts_final: version * 10,
+                        }),
+                    )
+                })
+                .collect();
+        }
+        let rt = StrictRuntime::new(
+            repo,
+            2,
+            0,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default().with_strict_max_catchup_ops(2)),
+        );
+
+        rt.recv_catchup_req(
+            1,
+            StrictCatchupReq {
+                src_node: 1,
+                since_version: 0,
+                chunk_token: 2,
+                force_snapshot: false,
+            },
+        )
+        .await;
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        match &captures[0] {
+            crate::s2s::replications::test_support::CapturedFrame::StrictUnicast {
+                dst,
+                body,
+                ..
+            } => {
+                assert_eq!(*dst, 1);
+                let StrictBody::CatchupResp(resp) = body else {
+                    panic!("expected catchup response, got {body:?}");
+                };
+                let versions: Vec<u64> = resp.ops.iter().map(|op| op.version).collect();
+                assert_eq!(versions, vec![3, 4]);
+                assert!(resp.has_more);
+                assert_eq!(resp.next_chunk_token, 4);
+            }
+            other => panic!("unexpected capture: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_catchup_followup_uses_response_token_when_repo_version_lags() {
+        let net = MockNet::new(1, vec![1, 2]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            0,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.state.lock().finish_history_election();
+
+        let ops: Vec<CatchupOp> = (1u64..=2)
+            .map(|version| CatchupOp {
+                version,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&(200 + version)).unwrap()),
+                strict_op_id_hi: 9,
+                strict_op_id_lo: version,
+                strict_ts_final: 100 + version,
+            })
+            .collect();
+
+        rt.recv_catchup_resp(
+            2,
+            StrictCatchupResp {
+                snapshot_version: 0,
+                snapshot_msgpack: Bytes::new(),
+                ops,
+                has_more: true,
+                next_chunk_token: 2,
+                too_old_use_snapshot: false,
+                history_version: 2,
+                history_freshness: 0,
+                runtime_started_at: 0,
+                history_node: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(repo.current_version(), 0);
+        assert_eq!(rt.state.lock().commit_buffer.len(), 2);
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        match &captures[0] {
+            crate::s2s::replications::test_support::CapturedFrame::StrictUnicast {
+                dst,
+                body,
+                ..
+            } => {
+                assert_eq!(*dst, 2);
+                let StrictBody::CatchupReq(req) = body else {
+                    panic!("expected catchup request, got {body:?}");
+                };
+                assert_eq!(req.since_version, 2);
+                assert_eq!(req.chunk_token, 2);
+                assert!(!req.force_snapshot);
+            }
+            other => panic!("unexpected capture: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_catchup_followup_targets_reliably_routable_peer() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_reliable_routes([3]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo,
+            1,
+            0,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.state.lock().finish_history_election();
+
+        rt.recv_catchup_resp(
+            2,
+            StrictCatchupResp {
+                snapshot_version: 0,
+                snapshot_msgpack: Bytes::new(),
+                ops: vec![CatchupOp {
+                    version: 1,
+                    op_msgpack: Bytes::from(rmp_serde::to_vec(&201u64).unwrap()),
+                    strict_op_id_hi: 9,
+                    strict_op_id_lo: 1,
+                    strict_ts_final: 101,
+                }],
+                has_more: true,
+                next_chunk_token: 1,
+                too_old_use_snapshot: false,
+                history_version: 1,
+                history_freshness: 0,
+                runtime_started_at: 0,
+                history_node: 2,
+            },
+        )
+        .await;
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        match &captures[0] {
+            crate::s2s::replications::test_support::CapturedFrame::StrictUnicast {
+                dst,
+                body,
+                ..
+            } => {
+                assert_eq!(*dst, 3);
+                assert!(matches!(body, StrictBody::CatchupReq(_)));
+            }
+            other => panic!("unexpected capture: {other:?}"),
+        }
+    }
+
     #[test]
     fn history_rank_orders_by_version_freshness_runtime_then_node() {
         let base = HistoryRank {
