@@ -470,17 +470,16 @@
               }
             },
             "displayProperties": [
-              "source",
               "node_label",
-              "target",
-              "transport",
+              "city",
+              "region",
+              "country",
               "conversational_best_effort_cost",
               "latency_ms",
               "loss_ppm",
               "throughput_bps",
-              "city",
-              "region",
-              "country"
+              "target",
+              "transport"
             ],
             "edgeIdField": "edge_id",
             "edgeLabelField": "conversational_best_effort_cost",
@@ -496,13 +495,10 @@
             "name": "S2S topology",
             "parField": "target",
             "searchProperties": [
-              "source",
-              "node_label",
-              "target",
-              "transport",
               "city",
               "region",
-              "country"
+              "country",
+              "node_label"
             ],
             "throughputField": "throughput_bps",
             "type": "markers"
@@ -625,7 +621,49 @@
           "id": "organize",
           "options": {
             "excludeByName": {
-              "Time": true
+              "Time": true,
+              "source 2": true,
+              "source 3": true,
+              "source 4": true,
+              "source 5": true,
+              "source 6": true,
+              "source 7": true,
+              "target 2": true,
+              "target 3": true,
+              "target 4": true,
+              "target 5": true,
+              "target 6": true,
+              "target 7": true,
+              "transport 2": true,
+              "transport 3": true,
+              "transport 4": true,
+              "transport 5": true,
+              "transport 6": true,
+              "transport 7": true,
+              "city 2": true,
+              "city 3": true,
+              "city 4": true,
+              "city 5": true,
+              "city 6": true,
+              "city 7": true,
+              "region 2": true,
+              "region 3": true,
+              "region 4": true,
+              "region 5": true,
+              "region 6": true,
+              "region 7": true,
+              "country 2": true,
+              "country 3": true,
+              "country 4": true,
+              "country 5": true,
+              "country 6": true,
+              "country 7": true,
+              "node_label 2": true,
+              "node_label 3": true,
+              "node_label 4": true,
+              "node_label 5": true,
+              "node_label 6": true,
+              "node_label 7": true
             },
             "renameByName": {
               "Value #A": "latitude",
@@ -634,7 +672,14 @@
               "Value #D": "loss_ppm",
               "Value #E": "active",
               "Value #F": "throughput_bps",
-              "Value #G": "conversational_best_effort_cost"
+              "Value #G": "conversational_best_effort_cost",
+              "source 1": "source",
+              "target 1": "target",
+              "transport 1": "transport",
+              "city 1": "city",
+              "region 1": "region",
+              "country 1": "country",
+              "node_label 1": "node_label"
             }
           }
         }
@@ -1434,6 +1479,118 @@
         }
       ],
       "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "orange",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "mainStat"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Cost"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "id": 11,
+      "options": {
+        "nodes": {},
+        "edges": {}
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(label_replace(label_replace(max by (node) (shitspeak_s2s_node_status{job=~\"$job\",status=\"alive\"}), \"id\", \"$1\", \"node\", \"(.*)\"), \"title\", \"$1\", \"node\", \"(.*)\"), \"title\", \"$1\", \"node\", \"([^.]*)\\\\..*\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{node}}",
+          "range": false,
+          "refId": "nodes"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(label_replace(max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, metric, level, transport) (max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"target\", \"$1\", \"next_hop\", \"(.*)\"), \"id\", \"|\", \"source\", \"dst\", \"next_hop\", \"transport\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}} -> {{next_hop}} for {{dst}} via {{transport}}",
+          "range": false,
+          "refId": "edges"
+        }
+      ],
+      "title": "Optimal Conversational Best-Effort Routes",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "node": true,
+              "metric": true,
+              "level": true
+            },
+            "renameByName": {
+              "Value": "mainStat",
+              "dst": "Destination",
+              "next_hop": "Next hop",
+              "transport": "Transport"
+            }
+          }
+        }
+      ],
+      "type": "nodeGraph"
     }
   ],
   "refresh": "15s",

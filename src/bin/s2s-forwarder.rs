@@ -8,8 +8,9 @@ use serde::de::Error as _;
 use shitspeak_rs::ban_repository::BanRepository;
 use shitspeak_rs::blob_store::ChannelBlobStore;
 use shitspeak_rs::channel_repository::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
-use shitspeak_rs::config::S2sConfig;
+use shitspeak_rs::config::{ObservabilityConfig, S2sConfig};
 use shitspeak_rs::logging;
+use shitspeak_rs::observability::{self, S2sMetricsSource, S2sTopologyMetricsSource};
 use shitspeak_rs::s2s::overlay::{OverlayNetwork, ReplicationServices};
 use shitspeak_rs::s2s::replications::{ReplicationConfig, ReplicationManager};
 use shitspeak_rs::s2s::status;
@@ -30,6 +31,8 @@ struct ForwarderConfig {
     register_hostname: Option<String>,
     #[serde(default)]
     s2s: S2sConfig,
+    #[serde(default)]
+    observability: ObservabilityConfig,
     #[serde(default)]
     replication: ForwarderReplicationConfig,
 }
@@ -225,13 +228,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let local_geo = resolve_observability_geo(config.s2s.geo.manual_geo()).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let metrics_source: Arc<dyn S2sMetricsSource> = Arc::new(S2sTopologyMetricsSource::new(
+        overlay.clone(),
+        transport.clone(),
+        local_geo.clone(),
+    ));
     let status_task = config.s2s.status_http_listen.and_then(|listen| {
         match status::spawn_status_server(
             listen,
             overlay.clone(),
             transport.clone(),
             local_geo.clone(),
-            shutdown_rx,
+            shutdown_rx.clone(),
         ) {
             Ok(task) => Some(task),
             Err(error) => {
@@ -240,6 +248,36 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
         }
     });
+    let observability_metrics_task = {
+        let metrics = config.observability.metrics.clone();
+        if metrics.enabled {
+            metrics.listen.and_then(|listen| {
+                match observability::spawn_metrics_server(
+                    listen,
+                    metrics.path.clone(),
+                    metrics_source.clone(),
+                    shutdown_rx.clone(),
+                ) {
+                    Ok(task) => Some(task),
+                    Err(error) => {
+                        warn!(
+                            %listen,
+                            %error,
+                            "observability metrics HTTP server startup failed"
+                        );
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        }
+    };
+    let observability_remote_write_task = observability::spawn_remote_write(
+        config.observability.metrics.remote_write.clone(),
+        metrics_source,
+        shutdown_rx.clone(),
+    );
 
     info!(
         node = overlay.local_node_id(),
@@ -253,6 +291,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let _ = shutdown_tx.send(());
     if let Some(task) = status_task {
+        let _ = task.await;
+    }
+    if let Some(task) = observability_metrics_task {
+        let _ = task.await;
+    }
+    if let Some(task) = observability_remote_write_task {
         let _ = task.await;
     }
     if let Some(manager) = replication_manager {
@@ -556,13 +600,52 @@ mod tests {
             "#,
         );
 
-        let geo = config
-            .s2s
-            .geo
-            .manual_geo()
-            .expect("forwarder manual geo");
+        let geo = config.s2s.geo.manual_geo().expect("forwarder manual geo");
         assert_eq!(geo.latitude(), 32.7767);
         assert_eq!(geo.longitude(), -96.7970);
         assert_eq!(geo.city(), Some("Dallas"));
+    }
+
+    #[test]
+    fn observability_remote_write_config_is_available() {
+        let config = parse_forwarder_config(
+            r#"
+            [s2s]
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+
+            [observability.metrics]
+            enabled = true
+            listen = "127.0.0.1:64751"
+            path = "/s2s/metrics"
+
+            [observability.metrics.remote_write]
+            enabled = true
+            url = "http://127.0.0.1:9009/api/v1/push"
+            tenant_id = "tenant-a"
+            labels = { role = "forwarder" }
+            "#,
+        );
+
+        assert!(config.observability.metrics.enabled);
+        assert_eq!(config.observability.metrics.path, "/s2s/metrics");
+        assert!(config.observability.metrics.remote_write.enabled);
+        assert_eq!(
+            config.observability.metrics.remote_write.url.as_deref(),
+            Some("http://127.0.0.1:9009/api/v1/push")
+        );
+        assert_eq!(
+            config
+                .observability
+                .metrics
+                .remote_write
+                .labels
+                .get("role")
+                .map(String::as_str),
+            Some("forwarder")
+        );
     }
 }

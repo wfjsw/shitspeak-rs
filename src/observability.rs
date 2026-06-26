@@ -13,15 +13,89 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{MetricsConfig, RemoteWriteConfig};
+use crate::geoip::NodeGeo;
 use crate::http_client;
-use crate::s2s::{S2SManager, status::PrometheusSample};
+use crate::s2s::overlay::OverlayNetwork;
+use crate::s2s::status::PrometheusSample;
+use crate::s2s::transport::ConnectionManager;
+use crate::s2s::{S2SManager, status};
+
+pub trait S2sMetricsSource: Send + Sync + 'static {
+    fn prometheus_metrics_text(&self) -> Option<String>;
+
+    fn prometheus_remote_write_requests(
+        &self,
+        batch_size: usize,
+        external_labels: &HashMap<String, String>,
+    ) -> Option<Vec<Vec<u8>>>;
+}
+
+impl S2sMetricsSource for S2SManager {
+    fn prometheus_metrics_text(&self) -> Option<String> {
+        S2SManager::prometheus_metrics_text(self)
+    }
+
+    fn prometheus_remote_write_requests(
+        &self,
+        batch_size: usize,
+        external_labels: &HashMap<String, String>,
+    ) -> Option<Vec<Vec<u8>>> {
+        S2SManager::prometheus_remote_write_requests(self, batch_size, external_labels)
+    }
+}
+
+pub struct S2sTopologyMetricsSource {
+    overlay: OverlayNetwork,
+    transport: ConnectionManager,
+    local_geo: Option<NodeGeo>,
+}
+
+impl S2sTopologyMetricsSource {
+    pub fn new(
+        overlay: OverlayNetwork,
+        transport: ConnectionManager,
+        local_geo: Option<NodeGeo>,
+    ) -> Self {
+        Self {
+            overlay,
+            transport,
+            local_geo,
+        }
+    }
+}
+
+impl S2sMetricsSource for S2sTopologyMetricsSource {
+    fn prometheus_metrics_text(&self) -> Option<String> {
+        Some(status::render_prometheus_metrics(
+            &self.overlay,
+            &self.transport,
+            self.local_geo.clone(),
+        ))
+    }
+
+    fn prometheus_remote_write_requests(
+        &self,
+        batch_size: usize,
+        external_labels: &HashMap<String, String>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let samples =
+            status::prometheus_samples(&self.overlay, &self.transport, self.local_geo.clone());
+        let timestamp_ms = now_unix_ms();
+        Some(remote_write_bodies(
+            &samples,
+            timestamp_ms,
+            batch_size,
+            external_labels,
+        ))
+    }
+}
 
 const MAX_REQUEST_BYTES: usize = 8192;
 
 pub fn spawn_metrics_server(
     listen: SocketAddr,
     path: String,
-    s2s: std::sync::Arc<S2SManager>,
+    source: std::sync::Arc<dyn S2sMetricsSource>,
     mut shutdown: watch::Receiver<()>,
 ) -> io::Result<JoinHandle<()>> {
     let listener = std::net::TcpListener::bind(listen)?;
@@ -43,10 +117,10 @@ pub fn spawn_metrics_server(
                 _ = shutdown.changed() => break,
             };
 
-            let s2s = s2s.clone();
+            let source = source.clone();
             let path = path.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle_metrics_connection(stream, path, s2s).await {
+                if let Err(error) = handle_metrics_connection(stream, path, source).await {
                     tracing::trace!(%peer, %error, "observability metrics HTTP connection failed");
                 }
             });
@@ -56,7 +130,7 @@ pub fn spawn_metrics_server(
 
 pub fn spawn_remote_write(
     config: RemoteWriteConfig,
-    s2s: std::sync::Arc<S2SManager>,
+    source: std::sync::Arc<dyn S2sMetricsSource>,
     mut shutdown: watch::Receiver<()>,
 ) -> Option<JoinHandle<()>> {
     if !config.enabled {
@@ -89,7 +163,7 @@ pub fn spawn_remote_write(
             }
 
             if let Some(bodies) =
-                s2s.prometheus_remote_write_requests(config.batch_size.max(1), &external_labels)
+                source.prometheus_remote_write_requests(config.batch_size.max(1), &external_labels)
             {
                 for bytes in bodies {
                     retry_cache.push_back(bytes);
@@ -161,7 +235,7 @@ pub(crate) fn remote_write_bodies(
 async fn handle_metrics_connection(
     mut stream: tokio::net::TcpStream,
     path: String,
-    s2s: std::sync::Arc<S2SManager>,
+    source: std::sync::Arc<dyn S2sMetricsSource>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     let mut scratch = [0u8; 1024];
@@ -195,7 +269,7 @@ async fn handle_metrics_connection(
     let request_path = raw_path.split('?').next().unwrap_or(raw_path);
 
     match (method, request_path) {
-        ("GET", p) if p == path => match s2s.prometheus_metrics_text() {
+        ("GET", p) if p == path => match source.prometheus_metrics_text() {
             Some(body) => {
                 write_response(
                     &mut stream,
@@ -625,5 +699,4 @@ mod tests {
         let headers = remote_write_headers(&config).expect("headers");
         assert_eq!(headers["Authorization"], "Bearer token");
     }
-
 }

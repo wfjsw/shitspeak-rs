@@ -1444,6 +1444,8 @@ impl Server {
         }
         let s2s_task = Arc::clone(&self.s2s_manager)
             .spawn_runtime_task(Arc::downgrade(self), internal_rx.clone());
+        let s2s_metrics_source: Arc<dyn crate::observability::S2sMetricsSource> =
+            self.s2s_manager.clone();
         let observability_metrics_task = {
             let metrics = self.read_config().observability.metrics.clone();
             if metrics.enabled {
@@ -1451,7 +1453,7 @@ impl Server {
                     match crate::observability::spawn_metrics_server(
                         listen,
                         metrics.path.clone(),
-                        Arc::clone(&self.s2s_manager),
+                        s2s_metrics_source.clone(),
                         internal_rx.clone(),
                     ) {
                         Ok(task) => Some(task),
@@ -1478,7 +1480,7 @@ impl Server {
                 .clone();
             crate::observability::spawn_remote_write(
                 config,
-                Arc::clone(&self.s2s_manager),
+                s2s_metrics_source,
                 internal_rx.clone(),
             )
         };
