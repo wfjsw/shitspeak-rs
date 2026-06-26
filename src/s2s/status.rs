@@ -113,6 +113,7 @@ pub fn spawn_status_server(
     listen: SocketAddr,
     overlay: OverlayNetwork,
     transport: ConnectionManager,
+    local_geo: Option<NodeGeo>,
     mut shutdown: watch::Receiver<()>,
 ) -> io::Result<JoinHandle<()>> {
     let listener = std::net::TcpListener::bind(listen)?;
@@ -135,8 +136,9 @@ pub fn spawn_status_server(
 
             let overlay = overlay.clone();
             let transport = transport.clone();
+            let local_geo = local_geo.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle_connection(stream, overlay, transport).await {
+                if let Err(error) = handle_connection(stream, overlay, transport, local_geo).await {
                     tracing::trace!(%peer, %error, "S2S topology HTTP connection failed");
                 }
             });
@@ -148,6 +150,7 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     overlay: OverlayNetwork,
     transport: ConnectionManager,
+    local_geo: Option<NodeGeo>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     let mut scratch = [0u8; 1024];
@@ -191,13 +194,13 @@ async fn handle_connection(
             .await
         }
         ("GET", "/topology.json") | ("GET", "/s2s/topology.json") => {
-            let snapshot = build_topology_snapshot(&overlay, &transport);
+            let snapshot = build_topology_snapshot(&overlay, &transport, local_geo.clone());
             let body = serde_json::to_vec_pretty(&snapshot)
                 .map_err(|error| io::Error::other(error.to_string()))?;
             write_response(&mut stream, "200 OK", "application/json", &body).await
         }
         ("GET", "/metrics") | ("GET", "/s2s/metrics") => {
-            let body = render_prometheus_metrics(&overlay, &transport);
+            let body = render_prometheus_metrics(&overlay, &transport, local_geo.clone());
             write_response(
                 &mut stream,
                 "200 OK",
@@ -245,6 +248,7 @@ async fn write_response(
 pub(crate) fn build_topology_snapshot(
     overlay: &OverlayNetwork,
     transport: &ConnectionManager,
+    local_geo: Option<NodeGeo>,
 ) -> TopologySnapshot {
     let now = Instant::now();
     let generated_at_unix_ms = SystemTime::now()
@@ -278,7 +282,9 @@ pub(crate) fn build_topology_snapshot(
                         addr: addr.addr().to_string(),
                     })
                     .collect(),
-                geo: lsa.and_then(|entry| entry.geo.clone()),
+                geo: (member.node_id() == overlay.local_node_id())
+                    .then(|| local_geo.clone())
+                    .flatten(),
                 transit_enabled: match lsa {
                     Some(entry) => !entry.transit_disabled,
                     None => true,
@@ -406,8 +412,9 @@ pub(crate) fn build_topology_snapshot(
 pub(crate) fn render_prometheus_metrics(
     overlay: &OverlayNetwork,
     transport: &ConnectionManager,
+    local_geo: Option<NodeGeo>,
 ) -> String {
-    let snapshot = build_topology_snapshot(overlay, transport);
+    let snapshot = build_topology_snapshot(overlay, transport, local_geo);
     let mut out = String::new();
     let mut writer = PrometheusWriter::new(&mut out);
     writer.render(&snapshot);
@@ -417,8 +424,9 @@ pub(crate) fn render_prometheus_metrics(
 pub(crate) fn prometheus_samples(
     overlay: &OverlayNetwork,
     transport: &ConnectionManager,
+    local_geo: Option<NodeGeo>,
 ) -> Vec<PrometheusSample> {
-    let snapshot = build_topology_snapshot(overlay, transport);
+    let snapshot = build_topology_snapshot(overlay, transport, local_geo);
     samples_from_snapshot(&snapshot)
 }
 

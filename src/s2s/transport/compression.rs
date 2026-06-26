@@ -1176,7 +1176,6 @@ mod tests {
                     strict_replication_disabled: false,
                     content_replication_disabled: false,
                     owner_replication_disabled: false,
-                    geo: None,
                 })
                 .collect(),
         };

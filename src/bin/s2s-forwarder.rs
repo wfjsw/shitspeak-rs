@@ -225,7 +225,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let status_task = config.s2s.status_http_listen.and_then(|listen| {
-        match status::spawn_status_server(listen, overlay.clone(), transport.clone(), shutdown_rx) {
+        match status::spawn_status_server(
+            listen,
+            overlay.clone(),
+            transport.clone(),
+            None,
+            shutdown_rx,
+        ) {
             Ok(task) => Some(task),
             Err(error) => {
                 warn!(%listen, %error, "s2s topology HTTP server startup failed");

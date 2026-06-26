@@ -29,7 +29,6 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use crate::geoip::NodeGeo;
 use crate::s2s::transport::{ConnectionManager, MessageClass, SendOptions, ServiceLevel};
 use crate::s2s_overlay_proto as pb;
 use crate::types::NodeIdentifier;
@@ -64,7 +63,6 @@ pub struct LsaEmitter {
     last_published: parking_lot::Mutex<HashMap<NodeIdentifier, LinkGate>>,
     /// Local listen addresses. Captured at construction.
     self_addresses: Vec<crate::s2s::transport::PeerAddress>,
-    self_geo: Option<NodeGeo>,
     /// Notify to wake the emitter task on neighbor change.
     pub trigger: Notify,
     last_emitted_content: parking_lot::Mutex<Option<(ContentFingerprint, Instant)>>,
@@ -78,7 +76,6 @@ impl LsaEmitter {
         max_users: Arc<AtomicU64>,
         route_transit_messages: bool,
         replication_services: ReplicationServices,
-        self_geo: Option<NodeGeo>,
     ) -> Self {
         Self {
             self_id,
@@ -92,7 +89,6 @@ impl LsaEmitter {
             next_seq: AtomicU64::new(1),
             last_published: parking_lot::Mutex::new(HashMap::new()),
             self_addresses,
-            self_geo,
             trigger: Notify::new(),
             last_emitted_content: parking_lot::Mutex::new(None),
         }
@@ -149,7 +145,6 @@ struct LsaContent {
     max_users: u64,
     transit_disabled: bool,
     replication_services: ReplicationServices,
-    geo: Option<NodeGeo>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,11 +202,6 @@ fn build_local_lsa_content(
         } else {
             emitter.replication_services()
         },
-        geo: if tombstone {
-            None
-        } else {
-            emitter.self_geo.clone()
-        },
     }
 }
 
@@ -227,7 +217,6 @@ fn stamp_local_lsa(emitter: &LsaEmitter, content: LsaContent) -> LsaEntry {
         max_users: content.max_users,
         transit_disabled: content.transit_disabled,
         replication_services: content.replication_services,
-        geo: content.geo,
     }
 }
 
@@ -367,7 +356,6 @@ fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     content.replication_services.strict().hash(&mut hasher);
     content.replication_services.content().hash(&mut hasher);
     content.replication_services.owner().hash(&mut hasher);
-    hash_geo(&mut hasher, content.geo.as_ref());
     hasher.finish()
 }
 
@@ -386,23 +374,7 @@ fn content_identity_fingerprint(content: &LsaContent) -> u64 {
     content.replication_services.strict().hash(&mut hasher);
     content.replication_services.content().hash(&mut hasher);
     content.replication_services.owner().hash(&mut hasher);
-    hash_geo(&mut hasher, content.geo.as_ref());
     hasher.finish()
-}
-
-fn hash_geo(hasher: &mut impl Hasher, geo: Option<&NodeGeo>) {
-    match geo {
-        Some(geo) => {
-            true.hash(hasher);
-            geo.latitude().to_bits().hash(hasher);
-            geo.longitude().to_bits().hash(hasher);
-            geo.city().hash(hasher);
-            geo.region().hash(hasher);
-            geo.country().hash(hasher);
-            geo.source().hash(hasher);
-        }
-        None => false.hash(hasher),
-    }
 }
 
 fn content_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> ContentFingerprint {
@@ -1033,7 +1005,6 @@ mod tests {
             Arc::new(AtomicU64::new(10)),
             true,
             ReplicationServices::ALL,
-            None,
         )
     }
 
@@ -1314,7 +1285,6 @@ mod tests {
             max_users.clone(),
             true,
             ReplicationServices::ALL,
-            None,
         );
         let cfg = OverlayConfig::new(vec![])
             .with_lsa_max_age(Duration::from_secs(120))

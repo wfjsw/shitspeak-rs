@@ -41,7 +41,7 @@ use self::application::proto::{
     UserRemovePatch, UserStatePatch, UserStatsReply, VoiceFrame, VoiceIntent,
 };
 use self::application::voice::{AudioSink, RecipientIndex};
-use self::overlay::{OverlayNetwork, ReplicationServices};
+use self::overlay::OverlayNetwork;
 use self::replications::{BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable};
 use self::transport::{ConnectionManager, TransportConfig};
 
@@ -68,6 +68,7 @@ pub struct S2SManager {
 struct S2SRuntimeState {
     transport: Option<ConnectionManager>,
     overlay: Option<OverlayNetwork>,
+    local_geo: Option<NodeGeo>,
     replications: Option<Arc<ReplicationManager>>,
     application: Option<Arc<application::ApplicationLayer>>,
     recipient_index: Option<Arc<RecipientIndex>>,
@@ -265,7 +266,11 @@ impl S2SManager {
         let state = self.state.read();
         let overlay = state.overlay.as_ref()?;
         let transport = state.transport.as_ref()?;
-        Some(status::render_prometheus_metrics(overlay, transport))
+        Some(status::render_prometheus_metrics(
+            overlay,
+            transport,
+            state.local_geo.clone(),
+        ))
     }
 
     pub fn prometheus_remote_write_requests(
@@ -276,7 +281,7 @@ impl S2SManager {
         let state = self.state.read();
         let overlay = state.overlay.as_ref()?;
         let transport = state.transport.as_ref()?;
-        let samples = status::prometheus_samples(overlay, transport);
+        let samples = status::prometheus_samples(overlay, transport, state.local_geo.clone());
         if samples.is_empty() {
             return Some(Vec::new());
         }
@@ -307,6 +312,7 @@ impl S2SManager {
             application::ApplicationLayer::new(overlay.clone(), self.application_config.clone());
         let mut state = self.state.write();
         state.overlay = Some(overlay);
+        state.local_geo = self.local_geo.clone();
         state.replications = Some(repl);
         state.application = Some(app);
     }
@@ -800,13 +806,13 @@ impl S2SManager {
             }
         };
 
-        let overlay = match OverlayNetwork::start_with_local_geo(
+        let local_geo = resolve_observability_geo(self.local_geo.clone()).await;
+
+        let overlay = match OverlayNetwork::start_with_max_users(
             transport.clone(),
             inbound,
             self.overlay_config.clone(),
             self.max_users.clone(),
-            ReplicationServices::ALL,
-            self.local_geo.clone(),
         )
         .await
         {
@@ -922,6 +928,7 @@ impl S2SManager {
             let mut state = self.state.write();
             state.transport = Some(transport.clone());
             state.overlay = Some(overlay.clone());
+            state.local_geo = local_geo.clone();
             state.replications = Some(replications.clone());
             state.application = Some(application.clone());
             state.recipient_index = Some(recipient_index);
@@ -938,6 +945,7 @@ impl S2SManager {
                 listen,
                 overlay.clone(),
                 transport.clone(),
+                local_geo.clone(),
                 shutdown.clone(),
             ) {
                 Ok(task) => Some(task),
@@ -963,6 +971,7 @@ impl S2SManager {
             state.recipient_index = None;
             state.application = None;
             state.replications = None;
+            state.local_geo = None;
             state.overlay = None;
             state.transport = None;
             state.gateway_tx = None;
@@ -1176,6 +1185,13 @@ impl S2SManager {
             }
         }
     }
+}
+
+async fn resolve_observability_geo(configured_geo: Option<NodeGeo>) -> Option<NodeGeo> {
+    if configured_geo.is_some() {
+        return configured_geo;
+    }
+    crate::s2s::transport::public_ip::discover_public_geo().await
 }
 
 fn spawn_native_client_replication_bridge(
