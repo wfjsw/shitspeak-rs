@@ -385,6 +385,56 @@
           {
             "bandNumber": 1000000,
             "config": {
+              "style": {
+                "color": {
+                  "fixed": "#8AB8FF"
+                },
+                "opacity": 0.78,
+                "size": {
+                  "fixed": 10,
+                  "max": 16,
+                  "min": 6
+                },
+                "text": {
+                  "field": "target_label",
+                  "fixed": "",
+                  "mode": "field"
+                },
+                "textConfig": {
+                  "fontSize": 11,
+                  "offsetX": 0,
+                  "offsetY": 0,
+                  "textAlign": "center",
+                  "textBaseline": "middle"
+                },
+                "useGroups": false
+              }
+            },
+            "displayProperties": [
+              "target_label",
+              "target_city",
+              "target_region",
+              "target_country"
+            ],
+            "isShowTooltip": true,
+            "locField": "target",
+            "location": {
+              "latitude": "target_latitude",
+              "longitude": "target_longitude",
+              "mode": "coords"
+            },
+            "name": "S2S link endpoints",
+            "searchProperties": [
+              "target_city",
+              "target_region",
+              "target_country",
+              "target_label"
+            ],
+            "type": "markers"
+          },
+          {
+            "bandNumber": 1000000,
+            "config": {
               "arcConfig": {
                 "capacity": {
                   "fixed": 1
@@ -403,17 +453,42 @@
                     "fixed": 2,
                     "max": 8,
                     "min": 1
+                  },
+                  "text": {
+                    "field": "conversational_best_effort_cost",
+                    "fixed": "",
+                    "mode": "field"
+                  },
+                  "textConfig": {
+                    "fontSize": 10,
+                    "offsetX": 0,
+                    "offsetY": -8,
+                    "textAlign": "center",
+                    "textBaseline": "middle"
                   }
                 },
                 "sideB": {
                   "arrow": 0,
                   "color": {
+                    "field": "conversational_best_effort_cost",
                     "fixed": "#6ED0E0"
                   },
                   "size": {
                     "fixed": 1,
                     "max": 4,
                     "min": 1
+                  },
+                  "text": {
+                    "field": "conversational_best_effort_cost",
+                    "fixed": "",
+                    "mode": "field"
+                  },
+                  "textConfig": {
+                    "fontSize": 10,
+                    "offsetX": 0,
+                    "offsetY": -8,
+                    "textAlign": "center",
+                    "textBaseline": "middle"
                   }
                 }
               },
@@ -606,6 +681,32 @@
           "legendFormat": "{{source}} -> {{target}} conv best-effort link cost",
           "range": false,
           "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (target) group_left(target_city, target_region, target_country, target_label) label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_latitude{job=~\"$job\"}), \"target\", \"$1\", \"node\", \"(.*)\"), \"target_city\", \"$1\", \"city\", \"(.*)\"), \"target_region\", \"$1\", \"region\", \"(.*)\"), \"target_country\", \"$1\", \"country\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{target}} target latitude",
+          "range": false,
+          "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (target) group_left(target_city, target_region, target_country, target_label) label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_longitude{job=~\"$job\"}), \"target\", \"$1\", \"node\", \"(.*)\"), \"target_city\", \"$1\", \"city\", \"(.*)\"), \"target_region\", \"$1\", \"region\", \"(.*)\"), \"target_country\", \"$1\", \"country\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{target}} target longitude",
+          "range": false,
+          "refId": "I"
         }
       ],
       "title": "Node Geomap",
@@ -628,18 +729,24 @@
               "source 5": true,
               "source 6": true,
               "source 7": true,
+              "source 8": true,
+              "source 9": true,
               "target 2": true,
               "target 3": true,
               "target 4": true,
               "target 5": true,
               "target 6": true,
               "target 7": true,
+              "target 8": true,
+              "target 9": true,
               "transport 2": true,
               "transport 3": true,
               "transport 4": true,
               "transport 5": true,
               "transport 6": true,
               "transport 7": true,
+              "transport 8": true,
+              "transport 9": true,
               "city 2": true,
               "city 3": true,
               "city 4": true,
@@ -663,7 +770,11 @@
               "node_label 4": true,
               "node_label 5": true,
               "node_label 6": true,
-              "node_label 7": true
+              "node_label 7": true,
+              "target_city 9": true,
+              "target_region 9": true,
+              "target_country 9": true,
+              "target_label 9": true
             },
             "renameByName": {
               "Value #A": "latitude",
@@ -673,13 +784,19 @@
               "Value #E": "active",
               "Value #F": "throughput_bps",
               "Value #G": "conversational_best_effort_cost",
+              "Value #H": "target_latitude",
+              "Value #I": "target_longitude",
               "source 1": "source",
               "target 1": "target",
               "transport 1": "transport",
               "city 1": "city",
               "region 1": "region",
               "country 1": "country",
-              "node_label 1": "node_label"
+              "node_label 1": "node_label",
+              "target_city 8": "target_city",
+              "target_region 8": "target_region",
+              "target_country 8": "target_country",
+              "target_label 8": "target_label"
             }
           }
         }
