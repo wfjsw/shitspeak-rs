@@ -15,7 +15,7 @@ cross build --target=x86_64-unknown-linux-musl
 Generate or refresh the Compose material:
 
 ```powershell
-pwsh deploy/docker-compose-16node/generate-compose-16node.ps1 -Force
+pwsh examples/docker-compose-16node/generate-compose-16node.ps1 -Force
 ```
 
 The generator writes:
@@ -33,20 +33,20 @@ When re-run with `-Force`, generated config and certificate material is replaced
 Start the local cluster:
 
 ```powershell
-docker compose -f deploy/docker-compose-16node/compose.yaml up -d --build
+docker compose -f examples/docker-compose-16node/compose.yaml up -d --build
 ```
 
 Check containers and logs:
 
 ```powershell
-docker compose -f deploy/docker-compose-16node/compose.yaml ps
-docker compose -f deploy/docker-compose-16node/compose.yaml logs -f node-01
+docker compose -f examples/docker-compose-16node/compose.yaml ps
+docker compose -f examples/docker-compose-16node/compose.yaml logs -f node-01
 ```
 
 Stop the demo containers and network:
 
 ```powershell
-docker compose -f deploy/docker-compose-16node/compose.yaml down
+docker compose -f examples/docker-compose-16node/compose.yaml down
 ```
 
 Runtime state is bind-mounted into each per-node folder. For example, node 1 stores server data in `nodes/node-01/data` and S2S state in `nodes/node-01/s2s-state`.

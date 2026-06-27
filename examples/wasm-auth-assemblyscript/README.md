@@ -1,6 +1,6 @@
 # AssemblyScript WASM Authenticator Example
 
-This package builds an AssemblyScript module compatible with `authenticator_wasm_path`.
+This package builds an AssemblyScript module compatible with the ShitSpeak WASM authenticator backend.
 
 ```powershell
 cd examples/wasm-auth-assemblyscript
@@ -8,10 +8,14 @@ npm install
 npm run build
 ```
 
-Then point the server at:
+Then point the server at the generated module:
 
 ```toml
-authenticator_wasm_path = "examples/wasm-auth-assemblyscript/build/auth.wasm"
+[authenticator]
+backend = "wasm"
+
+[authenticator.wasm]
+path = "examples/wasm-auth-assemblyscript/build/auth.wasm"
 ```
 
 Local demo behavior:
@@ -25,3 +29,5 @@ The host runs authenticator calls on Wasmtime's async engine. AssemblyScript sti
 Responses may include `max_bandwidth` to override the configured bandwidth limit for that authenticated client.
 
 The example uses a tiny hand-rolled JSON reader to keep the AssemblyScript sample dependency-free. Use a real JSON library for production policy code.
+
+See the full contract in [Authentication](../../docs/authentication.md#wasm-authenticator-contract).

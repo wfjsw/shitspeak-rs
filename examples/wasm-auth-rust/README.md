@@ -1,16 +1,20 @@
 # Rust WASM Authenticator Example
 
-This crate builds a `wasm32-unknown-unknown` module compatible with `authenticator_wasm_path`.
+This crate builds a `wasm32-unknown-unknown` module compatible with the ShitSpeak WASM authenticator backend.
 
 ```powershell
 rustup target add wasm32-unknown-unknown
 cargo build --manifest-path examples/wasm-auth-rust/Cargo.toml --target wasm32-unknown-unknown --release
 ```
 
-Then point the server at:
+Then point the server at the generated module:
 
 ```toml
-authenticator_wasm_path = "examples/wasm-auth-rust/target/wasm32-unknown-unknown/release/shitspeak_wasm_auth_rust_example.wasm"
+[authenticator]
+backend = "wasm"
+
+[authenticator.wasm]
+path = "examples/wasm-auth-rust/target/wasm32-unknown-unknown/release/shitspeak_wasm_auth_rust_example.wasm"
 ```
 
 Local demo behavior:
@@ -22,3 +26,5 @@ Local demo behavior:
 The host runs authenticator calls on Wasmtime's async engine. The Rust export functions keep the required pointer/length ABI, while the example policy and fetch helpers are async internally.
 
 Responses may include `max_bandwidth` to override the configured bandwidth limit for that authenticated client.
+
+See the full contract in [Authentication](../../docs/authentication.md#wasm-authenticator-contract).
