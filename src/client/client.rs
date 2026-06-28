@@ -156,6 +156,7 @@ pub struct Client {
     /// This is toggled when tunneled voice is received and reset once
     /// a valid UDP voice packet is seen again.
     prefer_tcp_tunnel: AtomicBool,
+    can_receive_voice: AtomicBool,
 
     /// Negotiated client protocol version, populated once during the
     /// `Version` handshake (~immediately after `Authenticate`) and never
@@ -330,6 +331,7 @@ impl Client {
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
+            can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
             last_client_version: ParkingMutex::new(HashMap::new()),
             last_channel_version: ParkingMutex::new(0),
@@ -490,6 +492,7 @@ impl Client {
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
+            can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
             last_client_version: ParkingMutex::new(HashMap::new()),
             last_channel_version: ParkingMutex::new(0),
@@ -574,6 +577,7 @@ impl Client {
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
+            can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
             last_client_version: ParkingMutex::new(HashMap::new()),
             last_channel_version: ParkingMutex::new(0),
@@ -622,6 +626,18 @@ impl Client {
 
     pub fn prefers_tcp_tunnel(&self) -> bool {
         self.prefer_tcp_tunnel.load(Ordering::Acquire)
+    }
+
+    pub fn can_receive_voice(&self) -> bool {
+        self.can_receive_voice.load(Ordering::Acquire)
+    }
+
+    pub fn set_can_receive_voice(&self, value: bool) {
+        self.can_receive_voice.store(value, Ordering::Release);
+    }
+
+    pub fn refresh_can_receive_voice(&self) {
+        self.set_can_receive_voice(self.global_state.read().can_receive_voice());
     }
 
     /// Get a clone of the full per-node last-seen version map.

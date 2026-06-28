@@ -227,6 +227,9 @@ fn push_unique_target(
     if !client.read_local_state().is_some() {
         return;
     }
+    if !client.can_receive_voice() {
+        return;
+    }
     if seen.insert((u32::from(client.get_session_id()), context)) {
         targets.push((client, context));
     }

@@ -669,6 +669,13 @@ impl TestClient {
         self.send(us.into()).await;
     }
 
+    pub async fn deaf_other(&self, target_session: u32, deaf: bool) {
+        let mut us = UserState::default();
+        us.session = Some(ClientSessionIdentifier::from(target_session));
+        us.deaf = Some(deaf);
+        self.send(us.into()).await;
+    }
+
     pub async fn move_other(&self, target_session: u32, channel_id: u32) {
         let mut us = UserState::default();
         us.session = Some(ClientSessionIdentifier::from(target_session));

@@ -1283,6 +1283,9 @@ impl ClientRepository {
             if id.server_id() != DEFAULT_SERVER_ID {
                 continue;
             }
+            if !client.can_receive_voice() {
+                continue;
+            }
             snapshot
                 .entry(client.get_current_channel_id())
                 .or_default()
@@ -1802,6 +1805,7 @@ impl ClientRepository {
                     {
                         let mut gs = client.write_global_state_direct();
                         apply_delta_to_global_state(&mut gs, initial_state);
+                        client.set_can_receive_voice(gs.can_receive_voice());
                     }
                     register
                         .remote_clients
@@ -1860,6 +1864,7 @@ impl ClientRepository {
                     {
                         let mut gs = client.write_global_state_direct();
                         apply_delta_to_global_state(&mut gs, delta);
+                        client.set_can_receive_voice(gs.can_receive_voice());
                     } else {
                         tracing::trace!(
                             remote_node,

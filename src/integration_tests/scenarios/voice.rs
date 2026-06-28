@@ -12,6 +12,7 @@ use bytes::Bytes;
 use crate::channels::Channel;
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::messages::Message;
 use crate::messages::encoder::VoiceTarget;
 use crate::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use crate::protocol_version::ProtocolVersion;
@@ -189,6 +190,48 @@ async fn voice_tcp_self_mute_silences_sender() {
     );
 }
 
+/// Checks that self-deafened users do not receive voice.
+/// Expected: Bob receives no audio from Alice while Bob has `self_deaf`.
+#[tokio::test]
+async fn voice_tcp_self_deaf_silences_recipient() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    bob.set_self_deaf(true).await;
+    let bob_session = bob.session_id;
+    let observed = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob_session) && us.self_deaf == Some(true))
+            },
+            VOICE_DEADLINE,
+        )
+        .await;
+    assert!(
+        observed.is_some(),
+        "Alice should observe Bob becoming self-deafened before voice is sent"
+    );
+
+    alice
+        .send_voice_tcp(0, 6, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_no_voice(&bob, "Bob should NOT receive voice while self-deafened").await;
+}
+
 /// Checks that server-muted users cannot send voice.
 /// Expected: Alice receives no audio from Bob after Alice sets Bob's server
 /// mute. Mumble's `processMsg` returns for `bMute`, and shitspeak's voice path
@@ -222,6 +265,49 @@ async fn voice_tcp_server_mute_silences_sender() {
         received.is_none(),
         "Alice should NOT receive voice from server-muted Bob"
     );
+}
+
+/// Checks that server-deafened users do not receive voice.
+/// Expected: Bob receives no audio from Alice after Alice sets Bob's server
+/// deaf state.
+#[tokio::test]
+async fn voice_tcp_server_deaf_silences_recipient() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let bob_session = bob.session_id;
+    alice.deaf_other(bob_session, true).await;
+    let observed = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob_session) && us.deaf == Some(true))
+            },
+            VOICE_DEADLINE,
+        )
+        .await;
+    assert!(
+        observed.is_some(),
+        "Bob should observe being server-deafened before voice is sent"
+    );
+
+    alice
+        .send_voice_tcp(0, 7, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_no_voice(&bob, "Bob should NOT receive voice while server-deafened").await;
 }
 
 /// Checks that regular speech crosses effective linked-channel groups.

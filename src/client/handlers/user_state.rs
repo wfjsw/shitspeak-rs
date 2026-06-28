@@ -44,8 +44,12 @@ fn handle_pre_auth_user_state(
     msg: &UserState,
 ) {
     let repo = server.get_clients();
-    let mut gs = sender.write_global_state_as(repo, Some(sender.get_session_id()), None);
-    apply_self_mute_deaf(&mut gs, msg.self_mute, msg.self_deaf);
+    let can_receive_voice = {
+        let mut gs = sender.write_global_state_as(repo, Some(sender.get_session_id()), None);
+        apply_self_mute_deaf(&mut gs, msg.self_mute, msg.self_deaf);
+        gs.can_receive_voice()
+    };
+    sender.set_can_receive_voice(can_receive_voice);
 }
 
 pub(crate) async fn send_enter_permission_queries(
@@ -575,6 +579,7 @@ pub async fn handle_user_state(
     let mut entered_channel_id = None;
     let mut cache_last_channel_id = None;
     let mut cache_listening_channel_ids = None;
+    let can_receive_voice;
     {
         let mut gs = target.write_global_state_as(repo, Some(sender_id), channel_version_dep);
 
@@ -619,6 +624,8 @@ pub async fn handle_user_state(
                 gs.set_priority_speaker(priority_speaker);
             }
         }
+
+        can_receive_voice = gs.can_receive_voice();
 
         // ── Recording (self only) ─────────────────────────────────────────────
         if is_self {
@@ -693,6 +700,7 @@ pub async fn handle_user_state(
             }
         }
     }
+    target.set_can_receive_voice(can_receive_voice);
 
     if let Some(cache_key) = channel_cache_key.as_deref() {
         if let Some(channel_id) = cache_last_channel_id {

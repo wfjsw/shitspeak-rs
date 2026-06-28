@@ -1597,6 +1597,7 @@ async fn apply_user_state_patch(
         None
     };
     let mut cache_listening_channel_ids = None;
+    let can_receive_voice;
     {
         let mut gs =
             target.write_global_state_as(server.get_clients(), Some(actor), channel_version_dep);
@@ -1647,7 +1648,9 @@ async fn apply_user_state_patch(
                     .collect::<Vec<_>>(),
             );
         }
+        can_receive_voice = gs.can_receive_voice();
     }
+    target.set_can_receive_voice(can_receive_voice);
 
     if let Some(cache_key) = channel_cache_key.as_deref() {
         if let Some(channel_id) = patch.channel_id {

@@ -739,9 +739,9 @@ fn push_unique_socket_addr(out: &mut Vec<SocketAddr>, addr: SocketAddr) {
 }
 
 /// TOML-deserializable shadow of the per-link metrics smoothing, ping-cap,
-/// and connection-selection knobs. Only these tunables are surfaced here; other [`TransportConfig`]
-/// fields (listen addrs, PKI paths, queue sizes, etc.) stay Rust-builder-
-/// only for now.
+/// queue-size, and connection-selection knobs. Listener, advertise, PKI, and
+/// seed fields stay on the higher-level S2S config because they need custom
+/// parsing and validation.
 #[derive(Deserialize, Debug, Clone)]
 pub struct TransportTuning {
     #[serde(default = "default_latency_ewma_alpha")]
@@ -779,6 +779,14 @@ pub struct TransportTuning {
     pub unselected_link_probe_interval_secs: u64,
     #[serde(default = "default_max_outgoing_connections")]
     pub max_outgoing_connections: usize,
+    #[serde(default = "default_inbound_control_capacity")]
+    inbound_control_capacity: usize,
+    #[serde(default = "default_inbound_high_capacity")]
+    inbound_high_capacity: usize,
+    #[serde(default = "default_inbound_regular_capacity")]
+    inbound_regular_capacity: usize,
+    #[serde(default = "default_outbound_capacity")]
+    outbound_capacity: usize,
     #[serde(default = "default_compression_enabled")]
     compression_enabled: bool,
     #[serde(default = "default_compression_min_bytes")]
@@ -816,6 +824,10 @@ impl Default for TransportTuning {
             dial_attempt_timeout_secs: default_dial_attempt_timeout_secs(),
             unselected_link_probe_interval_secs: default_unselected_link_probe_interval_secs(),
             max_outgoing_connections: default_max_outgoing_connections(),
+            inbound_control_capacity: default_inbound_control_capacity(),
+            inbound_high_capacity: default_inbound_high_capacity(),
+            inbound_regular_capacity: default_inbound_regular_capacity(),
+            outbound_capacity: default_outbound_capacity(),
             compression_enabled: default_compression_enabled(),
             compression_min_bytes: default_compression_min_bytes(),
             compression_min_savings_percent: default_compression_min_savings_percent(),
@@ -853,6 +865,10 @@ impl TransportTuning {
                 self.unselected_link_probe_interval_secs,
             ))
             .with_max_outgoing_connections(self.max_outgoing_connections)
+            .with_inbound_control_capacity(self.inbound_control_capacity.max(1))
+            .with_inbound_high_capacity(self.inbound_high_capacity.max(1))
+            .with_inbound_regular_capacity(self.inbound_regular_capacity.max(1))
+            .with_outbound_capacity(self.outbound_capacity.max(1))
             .with_compression_enabled(self.compression_enabled)
             .with_compression_min_bytes(self.compression_min_bytes)
             .with_compression_min_savings_percent(self.compression_min_savings_percent)
@@ -936,6 +952,18 @@ fn default_unselected_link_probe_interval_secs() -> u64 {
 fn default_max_outgoing_connections() -> usize {
     1024
 }
+fn default_inbound_control_capacity() -> usize {
+    1024
+}
+fn default_inbound_high_capacity() -> usize {
+    1024
+}
+fn default_inbound_regular_capacity() -> usize {
+    1024
+}
+fn default_outbound_capacity() -> usize {
+    256
+}
 
 #[cfg(test)]
 mod tests {
@@ -977,5 +1005,29 @@ mod tests {
         assert_eq!(cfg.bandwidth_probe_interval(), Duration::ZERO);
         assert_eq!(cfg.bandwidth_probe_size(), 0);
         assert_eq!(cfg.throughput_ewma_alpha(), 0.75);
+    }
+
+    #[test]
+    fn transport_tuning_applies_queue_capacities() {
+        let tuning: TransportTuning = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    inbound_control_capacity = 2048
+                    inbound_high_capacity = 4096
+                    inbound_regular_capacity = 65536
+                    outbound_capacity = 8192
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("transport tuning parses");
+        let cfg = tuning.apply(base_config());
+
+        assert_eq!(cfg.inbound_control_capacity(), 2048);
+        assert_eq!(cfg.inbound_high_capacity(), 4096);
+        assert_eq!(cfg.inbound_regular_capacity(), 65_536);
+        assert_eq!(cfg.outbound_capacity(), 8192);
     }
 }

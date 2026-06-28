@@ -234,6 +234,9 @@ impl ClientGlobalState {
     pub fn is_deafened(&self) -> bool {
         self.deaf
     }
+    pub fn can_receive_voice(&self) -> bool {
+        !self.deaf && !self.self_deaf
+    }
     pub fn set_deaf(&mut self, v: bool) {
         if self.deaf == v {
             return;
