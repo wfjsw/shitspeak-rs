@@ -14,3 +14,10 @@ pub async fn recv_optional<T: Clone>(
         None => std::future::pending().await,
     }
 }
+
+pub async fn recv_mpsc_optional<T>(rx: Option<&mut tokio::sync::mpsc::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}

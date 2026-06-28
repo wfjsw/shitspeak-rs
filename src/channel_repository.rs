@@ -1247,40 +1247,40 @@ impl ChannelRepository {
     ) -> Result<Channel, ChannelRepoError> {
         let parent_changed = patch.parent_id.is_some();
         let patch = self.normalize_patch_for_channel(id, patch);
-        let mut all_channels = self.channels.write();
-        let channels = all_channels.entry(server_id.to_owned()).or_default();
-        let root_config = self.root_config.read().clone();
-        ensure_root_channel(channels, &root_config);
-
-        if !channels.contains_key(&id) {
-            return Err(ChannelRepoError::NotFound(id));
-        }
-
-        // Validate new parent, if changing
-        if let Some(new_parent) = patch.parent_id {
-            if let Some(pid) = new_parent {
-                if !channels.contains_key(&pid) {
-                    return Err(ChannelRepoError::ParentNotFound(pid));
-                }
-                // Ensure we aren't moving into a descendant
-                if is_descendant(&channels, pid, id) {
-                    return Err(ChannelRepoError::CannotMoveIntoDescendant);
-                }
-            }
-        }
-
-        // Validate new name uniqueness
-        if let Some(ref new_name) = patch.name {
-            let target_parent = patch.parent_id.unwrap_or_else(|| channels[&id].parent_id);
-            if channels
-                .values()
-                .any(|c| c.parent_id == target_parent && &c.name == new_name && c.id != id)
-            {
-                return Err(ChannelRepoError::NameConflict(new_name.clone()));
-            }
-        }
-
         let (op, updated) = {
+            let mut all_channels = self.channels.write();
+            let channels = all_channels.entry(server_id.to_owned()).or_default();
+            let root_config = self.root_config.read().clone();
+            ensure_root_channel(channels, &root_config);
+
+            if !channels.contains_key(&id) {
+                return Err(ChannelRepoError::NotFound(id));
+            }
+
+            // Validate new parent, if changing
+            if let Some(new_parent) = patch.parent_id {
+                if let Some(pid) = new_parent {
+                    if !channels.contains_key(&pid) {
+                        return Err(ChannelRepoError::ParentNotFound(pid));
+                    }
+                    // Ensure we aren't moving into a descendant
+                    if is_descendant(&channels, pid, id) {
+                        return Err(ChannelRepoError::CannotMoveIntoDescendant);
+                    }
+                }
+            }
+
+            // Validate new name uniqueness
+            if let Some(ref new_name) = patch.name {
+                let target_parent = patch.parent_id.unwrap_or_else(|| channels[&id].parent_id);
+                if channels
+                    .values()
+                    .any(|c| c.parent_id == target_parent && &c.name == new_name && c.id != id)
+                {
+                    return Err(ChannelRepoError::NameConflict(new_name.clone()));
+                }
+            }
+
             let op = self.make_op_in_server(
                 server_id,
                 ChannelOp::UpdateChannel {
@@ -2993,6 +2993,57 @@ mod tests {
         assert_eq!(updated.name, "Configured Root");
         assert_eq!(updated.position, 7);
         assert_eq!(repo.get_channel(0).await.unwrap().name, "Configured Root");
+    }
+
+    #[tokio::test]
+    async fn update_channel_does_not_hold_channels_lock_while_committing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(7, "old", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        let wal_guard = repo
+            .wal_file
+            .as_ref()
+            .expect("persisted repository has a WAL")
+            .lock()
+            .await;
+        let mut update = tokio::spawn({
+            let repo = Arc::clone(&repo);
+            async move {
+                repo.update_channel(
+                    7,
+                    ChannelPatch {
+                        name: Some("new".to_owned()),
+                        position: None,
+                        max_users: None,
+                        description_hash: None,
+                        parent_id: None,
+                    },
+                )
+                .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut update)
+                .await
+                .is_err(),
+            "precondition: channel update should be waiting for the WAL commit"
+        );
+
+        let channel =
+            tokio::time::timeout(std::time::Duration::from_millis(50), repo.get_channel(7))
+                .await
+                .expect("channel reads should not wait behind a blocked commit")
+                .expect("channel exists");
+        assert_eq!(channel.name, "new");
+
+        drop(wal_guard);
+        update.await.unwrap().unwrap();
     }
 
     #[tokio::test]

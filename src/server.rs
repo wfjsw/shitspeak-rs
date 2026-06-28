@@ -2532,6 +2532,7 @@ impl Server {
         // Subscriptions start as None — they're activated after auth.
         let mut client_log_rx: Option<ClientLogReceiver> = None;
         let mut channel_log_rx: Option<ChannelLogReceiver> = None;
+        let mut outbound_message_rx = client.take_outbound_message_rx();
         let mut channel_tree_shadow = ChannelTreeShadow::default();
         let mut session_channel_shadow: SessionChannelShadow = HashMap::new();
         let mut user_visibility = UserVisibilityState::default();
@@ -2584,6 +2585,15 @@ impl Server {
                         )
                         .await?;
                         client.touch_activity();
+                    }
+
+                    // ── Outbound messages owned by this client connection ───
+                    result = recv_mpsc_optional(outbound_message_rx.as_mut()), if outbound_message_rx.is_some() => {
+                        let Some(message) = result else {
+                            return Ok(());
+                        };
+                        client.write_outbound_message(message).await
+                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                     }
 
                     // ── Incoming message from this client ────────────────────
@@ -2918,175 +2928,178 @@ impl Server {
 
                 self.apply_entrypoint_config(&new_config).await?;
 
-                let mut invalidate_acl_cache = false;
-                let mut root_channel_config_update = None;
-                let mut current = self.config.write().expect("Config RwLock poisoned");
-                // Log notable changes
-                if current.welcome_text != new_config.welcome_text {
-                    tracing::info!("config reload: welcome_text changed");
-                }
-                if current.root_channel_name != new_config.root_channel_name {
-                    tracing::info!(
-                        "config reload: root_channel_name {:?} -> {:?}",
-                        current.root_channel_name,
-                        new_config.root_channel_name
-                    );
-                    root_channel_config_update = Some(ChannelRootConfig::from(&new_config));
-                }
-                if current.max_bandwidth != new_config.max_bandwidth {
-                    tracing::info!(
-                        "config reload: max_bandwidth {} -> {}",
-                        current.max_bandwidth,
-                        new_config.max_bandwidth
-                    );
-                }
-                if current.max_users != new_config.max_users {
-                    tracing::info!(
-                        "config reload: max_users {} -> {}",
-                        current.max_users,
-                        new_config.max_users
-                    );
-                    self.s2s_manager.update_max_users(new_config.max_users);
-                }
-                if current.authenticator != new_config.authenticator {
-                    tracing::info!(
-                        "config reload: authenticator {:?} -> {:?}",
-                        current.authenticator,
-                        new_config.authenticator
-                    );
-                }
-                if current.cert_path != new_config.cert_path
-                    || current.key_path != new_config.key_path
-                {
-                    tracing::info!(
-                        "config reload: C2S TLS identity paths {:?}/{:?} -> {:?}/{:?}",
-                        current.cert_path,
-                        current.key_path,
-                        new_config.cert_path,
-                        new_config.key_path
-                    );
-                }
-                if current.s2s.overlay.route_transit_messages
-                    != new_config.s2s.overlay.route_transit_messages
-                {
-                    tracing::info!(
-                        "config reload: s2s.overlay.route_transit_messages {} -> {}",
-                        current.s2s.overlay.route_transit_messages,
-                        new_config.s2s.overlay.route_transit_messages
-                    );
-                    self.s2s_manager.update_route_transit_messages(
-                        new_config.s2s.overlay.route_transit_messages,
-                    );
-                }
-                if current.udp_voice_enabled != new_config.udp_voice_enabled {
-                    tracing::info!(
-                        "config reload: udp_voice_enabled {} -> {}",
-                        current.udp_voice_enabled,
-                        new_config.udp_voice_enabled
-                    );
-                }
-                if current.udp_ping_enabled != new_config.udp_ping_enabled {
-                    tracing::info!(
-                        "config reload: udp_ping_enabled {} -> {}",
-                        current.udp_ping_enabled,
-                        new_config.udp_ping_enabled
-                    );
-                }
-                if current.udp_ping_user_count_scope != new_config.udp_ping_user_count_scope {
-                    tracing::info!(
-                        "config reload: udp_ping_user_count_scope {:?} -> {:?}",
-                        current.udp_ping_user_count_scope,
-                        new_config.udp_ping_user_count_scope
-                    );
-                }
-                if current.client_idle_timeout_secs != new_config.client_idle_timeout_secs {
-                    tracing::info!(
-                        "config reload: client_idle_timeout_secs {} -> {}",
-                        current.client_idle_timeout_secs,
-                        new_config.client_idle_timeout_secs
-                    );
-                }
-                if current.required_groups != new_config.required_groups {
-                    tracing::info!("config reload: required_groups changed");
-                }
-                if current.geoip != new_config.geoip {
-                    tracing::info!("config reload: geoip changed");
-                    *self.geoip_resolver.write() =
-                        Arc::new(GeoIpResolver::new(new_config.geoip.clone()));
-                    invalidate_acl_cache = true;
-                }
-                if current.send_permission_info != new_config.send_permission_info {
-                    tracing::info!(
-                        "config reload: send_permission_info {} -> {}",
-                        current.send_permission_info,
-                        new_config.send_permission_info
-                    );
-                }
-                if current.hide_users_without_traverse != new_config.hide_users_without_traverse {
-                    tracing::info!(
-                        "config reload: hide_users_without_traverse {} -> {}",
-                        current.hide_users_without_traverse,
-                        new_config.hide_users_without_traverse
-                    );
-                }
-                if current.acl.debug_acl_enter() != new_config.acl.debug_acl_enter() {
-                    tracing::info!(
-                        "config reload: acl.debug_acl_enter {} -> {}",
-                        current.acl.debug_acl_enter(),
-                        new_config.acl.debug_acl_enter()
-                    );
-                }
-                if current.acl.explicit_enter_deny_overrides_write()
-                    != new_config.acl.explicit_enter_deny_overrides_write()
-                {
-                    tracing::info!(
-                        "config reload: acl.explicit_enter_deny_overrides_write {} -> {}",
-                        current.acl.explicit_enter_deny_overrides_write(),
-                        new_config.acl.explicit_enter_deny_overrides_write()
-                    );
-                    invalidate_acl_cache = true;
-                }
-                if current.acl.preserve_write_acl_on_edit()
-                    != new_config.acl.preserve_write_acl_on_edit()
-                {
-                    tracing::info!(
-                        "config reload: acl.preserve_write_acl_on_edit {} -> {}",
-                        current.acl.preserve_write_acl_on_edit(),
-                        new_config.acl.preserve_write_acl_on_edit()
-                    );
-                }
-                if current.acl.grant_temp_channel_creator_acl()
-                    != new_config.acl.grant_temp_channel_creator_acl()
-                {
-                    tracing::info!(
-                        "config reload: acl.grant_temp_channel_creator_acl {} -> {}",
-                        current.acl.grant_temp_channel_creator_acl(),
-                        new_config.acl.grant_temp_channel_creator_acl()
-                    );
-                }
-                if current.privacy.certificate_hash_protection()
-                    != new_config.privacy.certificate_hash_protection()
-                {
-                    tracing::info!(
-                        "config reload: privacy.protect_certificate_hashes {} -> {}",
-                        current.privacy.certificate_hash_protection(),
-                        new_config.privacy.certificate_hash_protection()
-                    );
-                }
-                if current.privacy.certificate_hash_secret().is_some()
-                    != new_config.privacy.certificate_hash_secret().is_some()
-                {
-                    tracing::info!(
-                        "config reload: privacy.certificate_hash_secret presence changed"
-                    );
-                }
-                if current.server_entrypoints != new_config.server_entrypoints {
-                    tracing::info!("config reload: server_entrypoints changed");
-                }
-                self.replace_c2s_tls_acceptor(next_tls_acceptor);
-                tracing::info!("config reload: C2S TLS identity refreshed");
-                *current = new_config;
-                drop(current);
+                let (root_channel_config_update, invalidate_acl_cache) = {
+                    let mut invalidate_acl_cache = false;
+                    let mut root_channel_config_update = None;
+                    let mut current = self.config.write().expect("Config RwLock poisoned");
+                    // Log notable changes
+                    if current.welcome_text != new_config.welcome_text {
+                        tracing::info!("config reload: welcome_text changed");
+                    }
+                    if current.root_channel_name != new_config.root_channel_name {
+                        tracing::info!(
+                            "config reload: root_channel_name {:?} -> {:?}",
+                            current.root_channel_name,
+                            new_config.root_channel_name
+                        );
+                        root_channel_config_update = Some(ChannelRootConfig::from(&new_config));
+                    }
+                    if current.max_bandwidth != new_config.max_bandwidth {
+                        tracing::info!(
+                            "config reload: max_bandwidth {} -> {}",
+                            current.max_bandwidth,
+                            new_config.max_bandwidth
+                        );
+                    }
+                    if current.max_users != new_config.max_users {
+                        tracing::info!(
+                            "config reload: max_users {} -> {}",
+                            current.max_users,
+                            new_config.max_users
+                        );
+                        self.s2s_manager.update_max_users(new_config.max_users);
+                    }
+                    if current.authenticator != new_config.authenticator {
+                        tracing::info!(
+                            "config reload: authenticator {:?} -> {:?}",
+                            current.authenticator,
+                            new_config.authenticator
+                        );
+                    }
+                    if current.cert_path != new_config.cert_path
+                        || current.key_path != new_config.key_path
+                    {
+                        tracing::info!(
+                            "config reload: C2S TLS identity paths {:?}/{:?} -> {:?}/{:?}",
+                            current.cert_path,
+                            current.key_path,
+                            new_config.cert_path,
+                            new_config.key_path
+                        );
+                    }
+                    if current.s2s.overlay.route_transit_messages
+                        != new_config.s2s.overlay.route_transit_messages
+                    {
+                        tracing::info!(
+                            "config reload: s2s.overlay.route_transit_messages {} -> {}",
+                            current.s2s.overlay.route_transit_messages,
+                            new_config.s2s.overlay.route_transit_messages
+                        );
+                        self.s2s_manager.update_route_transit_messages(
+                            new_config.s2s.overlay.route_transit_messages,
+                        );
+                    }
+                    if current.udp_voice_enabled != new_config.udp_voice_enabled {
+                        tracing::info!(
+                            "config reload: udp_voice_enabled {} -> {}",
+                            current.udp_voice_enabled,
+                            new_config.udp_voice_enabled
+                        );
+                    }
+                    if current.udp_ping_enabled != new_config.udp_ping_enabled {
+                        tracing::info!(
+                            "config reload: udp_ping_enabled {} -> {}",
+                            current.udp_ping_enabled,
+                            new_config.udp_ping_enabled
+                        );
+                    }
+                    if current.udp_ping_user_count_scope != new_config.udp_ping_user_count_scope {
+                        tracing::info!(
+                            "config reload: udp_ping_user_count_scope {:?} -> {:?}",
+                            current.udp_ping_user_count_scope,
+                            new_config.udp_ping_user_count_scope
+                        );
+                    }
+                    if current.client_idle_timeout_secs != new_config.client_idle_timeout_secs {
+                        tracing::info!(
+                            "config reload: client_idle_timeout_secs {} -> {}",
+                            current.client_idle_timeout_secs,
+                            new_config.client_idle_timeout_secs
+                        );
+                    }
+                    if current.required_groups != new_config.required_groups {
+                        tracing::info!("config reload: required_groups changed");
+                    }
+                    if current.geoip != new_config.geoip {
+                        tracing::info!("config reload: geoip changed");
+                        *self.geoip_resolver.write() =
+                            Arc::new(GeoIpResolver::new(new_config.geoip.clone()));
+                        invalidate_acl_cache = true;
+                    }
+                    if current.send_permission_info != new_config.send_permission_info {
+                        tracing::info!(
+                            "config reload: send_permission_info {} -> {}",
+                            current.send_permission_info,
+                            new_config.send_permission_info
+                        );
+                    }
+                    if current.hide_users_without_traverse != new_config.hide_users_without_traverse
+                    {
+                        tracing::info!(
+                            "config reload: hide_users_without_traverse {} -> {}",
+                            current.hide_users_without_traverse,
+                            new_config.hide_users_without_traverse
+                        );
+                    }
+                    if current.acl.debug_acl_enter() != new_config.acl.debug_acl_enter() {
+                        tracing::info!(
+                            "config reload: acl.debug_acl_enter {} -> {}",
+                            current.acl.debug_acl_enter(),
+                            new_config.acl.debug_acl_enter()
+                        );
+                    }
+                    if current.acl.explicit_enter_deny_overrides_write()
+                        != new_config.acl.explicit_enter_deny_overrides_write()
+                    {
+                        tracing::info!(
+                            "config reload: acl.explicit_enter_deny_overrides_write {} -> {}",
+                            current.acl.explicit_enter_deny_overrides_write(),
+                            new_config.acl.explicit_enter_deny_overrides_write()
+                        );
+                        invalidate_acl_cache = true;
+                    }
+                    if current.acl.preserve_write_acl_on_edit()
+                        != new_config.acl.preserve_write_acl_on_edit()
+                    {
+                        tracing::info!(
+                            "config reload: acl.preserve_write_acl_on_edit {} -> {}",
+                            current.acl.preserve_write_acl_on_edit(),
+                            new_config.acl.preserve_write_acl_on_edit()
+                        );
+                    }
+                    if current.acl.grant_temp_channel_creator_acl()
+                        != new_config.acl.grant_temp_channel_creator_acl()
+                    {
+                        tracing::info!(
+                            "config reload: acl.grant_temp_channel_creator_acl {} -> {}",
+                            current.acl.grant_temp_channel_creator_acl(),
+                            new_config.acl.grant_temp_channel_creator_acl()
+                        );
+                    }
+                    if current.privacy.certificate_hash_protection()
+                        != new_config.privacy.certificate_hash_protection()
+                    {
+                        tracing::info!(
+                            "config reload: privacy.protect_certificate_hashes {} -> {}",
+                            current.privacy.certificate_hash_protection(),
+                            new_config.privacy.certificate_hash_protection()
+                        );
+                    }
+                    if current.privacy.certificate_hash_secret().is_some()
+                        != new_config.privacy.certificate_hash_secret().is_some()
+                    {
+                        tracing::info!(
+                            "config reload: privacy.certificate_hash_secret presence changed"
+                        );
+                    }
+                    if current.server_entrypoints != new_config.server_entrypoints {
+                        tracing::info!("config reload: server_entrypoints changed");
+                    }
+                    self.replace_c2s_tls_acceptor(next_tls_acceptor);
+                    tracing::info!("config reload: C2S TLS identity refreshed");
+                    *current = new_config;
+                    (root_channel_config_update, invalidate_acl_cache)
+                };
                 if let Some(root_channel_config) = root_channel_config_update {
                     self.channels
                         .update_root_channel_config(root_channel_config)
@@ -3343,7 +3356,7 @@ impl Server {
 }
 
 use crate::channel_handler::replay_channel_log_gap;
-use crate::utils::recv_optional;
+use crate::utils::{recv_mpsc_optional, recv_optional};
 
 // ─── Log gap replay helpers ─────────────────────────────────────────────────
 

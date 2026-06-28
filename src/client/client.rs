@@ -40,6 +40,7 @@ use crate::{
 
 const VOICE_ROUTING_QUEUE_CAPACITY: usize = 256;
 const VOICE_TCP_QUEUE_CAPACITY: usize = 256;
+const OUTBOUND_MESSAGE_QUEUE_CAPACITY: usize = 1024;
 const GRACEFUL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sentinel bit on the packed `protocol_version` atomic indicating that
@@ -54,6 +55,11 @@ pub(crate) type ClientStateSubscription = tokio::sync::broadcast::Receiver<
 >;
 pub(crate) type StagedChannelStateSubscription =
     (u64, crate::channel_repository::ChannelStateSubscription);
+
+pub(crate) enum ClientOutboundMessage {
+    Single(Message),
+    Batch(Vec<Message>),
+}
 
 pub(crate) fn random_client_instance_id() -> ClientInstanceId {
     loop {
@@ -136,6 +142,8 @@ pub struct Client {
     /// TCP backpressure.
     voice_tcp_tx: mpsc::Sender<Bytes>,
     voice_tcp_rx: ParkingMutex<Option<mpsc::Receiver<Bytes>>>,
+    outbound_message_tx: mpsc::Sender<ClientOutboundMessage>,
+    outbound_message_rx: ParkingMutex<Option<mpsc::Receiver<ClientOutboundMessage>>>,
 
     /// Whether this client has been published to the log (i.e. `AddClient`
     /// has been emitted).  Only published clients generate `RemoveClient`
@@ -272,6 +280,8 @@ impl Client {
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
         let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
+        let (outbound_message_tx, outbound_message_rx) =
+            mpsc::channel::<ClientOutboundMessage>(OUTBOUND_MESSAGE_QUEUE_CAPACITY);
 
         let socket = socket2::SockRef::from(connection.get_ref().0)
             .try_clone()
@@ -314,6 +324,8 @@ impl Client {
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx,
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
+            outbound_message_tx,
+            outbound_message_rx: ParkingMutex::new(Some(outbound_message_rx)),
             published: AtomicBool::new(false),
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
@@ -437,6 +449,8 @@ impl Client {
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
         let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
+        let (outbound_message_tx, outbound_message_rx) =
+            mpsc::channel::<ClientOutboundMessage>(OUTBOUND_MESSAGE_QUEUE_CAPACITY);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
@@ -470,6 +484,8 @@ impl Client {
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx,
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
+            outbound_message_tx,
+            outbound_message_rx: ParkingMutex::new(Some(outbound_message_rx)),
             published: AtomicBool::new(false),
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
@@ -517,6 +533,8 @@ impl Client {
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
         let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
+        let (outbound_message_tx, outbound_message_rx) =
+            mpsc::channel::<ClientOutboundMessage>(OUTBOUND_MESSAGE_QUEUE_CAPACITY);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
@@ -550,6 +568,8 @@ impl Client {
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx,
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
+            outbound_message_tx,
+            outbound_message_rx: ParkingMutex::new(Some(outbound_message_rx)),
             published: AtomicBool::new(true),
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
@@ -870,6 +890,94 @@ impl Client {
 
     pub fn transport_kind(&self) -> ClientTransportKind {
         self.transport.kind()
+    }
+
+    pub async fn enqueue_proto_message(
+        &self,
+        message: &Message,
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.enqueue_proto_message_inner(message))
+            .await
+    }
+
+    async fn enqueue_proto_message_inner(
+        &self,
+        message: &Message,
+    ) -> Result<(), WriteProtoMessageError> {
+        match &self.transport {
+            ClientTransport::NativeTls { .. } => {
+                self.outbound_message_tx
+                    .send(ClientOutboundMessage::Single(message.clone()))
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+            }
+            ClientTransport::WebGateway { outbound_tx, .. } => {
+                outbound_tx
+                    .send(message.clone())
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+                self.record_tcp_packets(1, 6 + message.encoded_len()).await;
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
+        Ok(())
+    }
+
+    pub async fn enqueue_proto_message_batch(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.enqueue_proto_message_batch_inner(messages))
+            .await
+    }
+
+    async fn enqueue_proto_message_batch_inner(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        match &self.transport {
+            ClientTransport::NativeTls { .. } => {
+                self.outbound_message_tx
+                    .send(ClientOutboundMessage::Batch(messages.to_vec()))
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+            }
+            ClientTransport::WebGateway { outbound_tx, .. } => {
+                for message in messages {
+                    outbound_tx
+                        .send(message.clone())
+                        .await
+                        .map_err(|_| transport_closed_error())?;
+                }
+                let bytes = messages
+                    .iter()
+                    .map(|message| 6 + message.encoded_len())
+                    .sum();
+                self.record_tcp_packets(messages.len(), bytes).await;
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_outbound_message_rx(&self) -> Option<mpsc::Receiver<ClientOutboundMessage>> {
+        self.outbound_message_rx.lock().take()
+    }
+
+    pub(crate) async fn write_outbound_message(
+        &self,
+        message: ClientOutboundMessage,
+    ) -> Result<(), WriteProtoMessageError> {
+        match message {
+            ClientOutboundMessage::Single(message) => self.write_proto_message(&message).await,
+            ClientOutboundMessage::Batch(messages) => {
+                self.write_proto_message_batch(&messages).await
+            }
+        }
     }
 
     pub async fn write_proto_message(

@@ -1038,8 +1038,8 @@ impl ClientRepository {
         };
 
         for client in clients {
-            if let Err(e) = client.write_proto_message(message).await {
-                client.in_tracing_scope(|| tracing::warn!("broadcast_all write error: {e}"));
+            if let Err(e) = client.enqueue_proto_message(message).await {
+                client.in_tracing_scope(|| tracing::warn!("broadcast_all enqueue error: {e}"));
             }
         }
     }
@@ -1072,8 +1072,8 @@ impl ClientRepository {
         };
 
         for client in clients {
-            if let Err(e) = client.write_proto_message(message).await {
-                client.in_tracing_scope(|| tracing::warn!("broadcast_except write error: {e}"));
+            if let Err(e) = client.enqueue_proto_message(message).await {
+                client.in_tracing_scope(|| tracing::warn!("broadcast_except enqueue error: {e}"));
             }
         }
     }
@@ -1107,9 +1107,10 @@ impl ClientRepository {
         };
 
         for client in clients {
-            if let Err(e) = client.write_proto_message_batch(messages).await {
-                client
-                    .in_tracing_scope(|| tracing::warn!("broadcast_batch_except write error: {e}"));
+            if let Err(e) = client.enqueue_proto_message_batch(messages).await {
+                client.in_tracing_scope(|| {
+                    tracing::warn!("broadcast_batch_except enqueue error: {e}")
+                });
             }
         }
     }
@@ -2036,7 +2037,10 @@ mod tests {
         )
     }
 
-    async fn assert_register_read_completes_while_write_is_queued(repo: &Arc<ClientRepository>) {
+    async fn assert_register_read_completes_while_write_is_queued(
+        repo: &Arc<ClientRepository>,
+        expected_local_count: usize,
+    ) {
         let writer = tokio::spawn({
             let repo = Arc::clone(repo);
             async move {
@@ -2049,7 +2053,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), repo.local_len_in_server("alpha"))
                 .await
                 .expect("repository readers should not be blocked by unrelated async work");
-        assert_eq!(count, 1);
+        assert_eq!(count, expected_local_count);
 
         writer.abort();
         let _ = writer.await;
@@ -2306,7 +2310,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        assert_register_read_completes_while_write_is_queued(&repo).await;
+        assert_register_read_completes_while_write_is_queued(&repo, 1).await;
 
         broadcast.abort();
         let _ = broadcast.await;
@@ -2343,7 +2347,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        assert_register_read_completes_while_write_is_queued(&repo).await;
+        assert_register_read_completes_while_write_is_queued(&repo, 2).await;
 
         broadcast.abort();
         let _ = broadcast.await;
@@ -2380,7 +2384,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        assert_register_read_completes_while_write_is_queued(&repo).await;
+        assert_register_read_completes_while_write_is_queued(&repo, 2).await;
 
         broadcast.abort();
         let _ = broadcast.await;
@@ -2411,7 +2415,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        assert_register_read_completes_while_write_is_queued(&repo).await;
+        assert_register_read_completes_while_write_is_queued(&repo, 1).await;
 
         replay.await.unwrap();
     }
