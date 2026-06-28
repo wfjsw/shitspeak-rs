@@ -394,11 +394,14 @@ fn entrypoint_config_routes(
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
     use crate::api::{
         AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     };
     use crate::localization::Language;
+    use crate::messages::encoder::TextMessage;
     use crate::voice::codec::PacketFormat;
     use crate::voice::ping::PingRequest;
     use rustls::pki_types::ServerName;
