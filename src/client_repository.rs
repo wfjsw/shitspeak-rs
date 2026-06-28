@@ -1028,11 +1028,16 @@ impl ClientRepository {
         server_id: &str,
         message: &crate::messages::Message,
     ) {
-        let register = self.register.read().await;
-        for client in register.local_clients() {
-            if client.server_id() != server_id {
-                continue;
-            }
+        let clients: Vec<_> = {
+            let register = self.register.read().await;
+            register
+                .local_clients()
+                .filter(|client| client.server_id() == server_id)
+                .cloned()
+                .collect()
+        };
+
+        for client in clients {
             if let Err(e) = client.write_proto_message(message).await {
                 client.in_tracing_scope(|| tracing::warn!("broadcast_all write error: {e}"));
             }
@@ -1055,12 +1060,18 @@ impl ClientRepository {
         exclude: ClientSessionIdentifier,
         message: &crate::messages::Message,
     ) {
-        let register = self.register.read().await;
         let exclude_key = ScopedSessionId::new(server_id.to_owned(), exclude);
-        for (id, client) in &register.local_clients {
-            if *id == exclude_key || id.server_id() != server_id {
-                continue;
-            }
+        let clients: Vec<_> = {
+            let register = self.register.read().await;
+            register
+                .local_clients
+                .iter()
+                .filter(|(id, _)| **id != exclude_key && id.server_id() == server_id)
+                .map(|(_, client)| Arc::clone(client))
+                .collect()
+        };
+
+        for client in clients {
             if let Err(e) = client.write_proto_message(message).await {
                 client.in_tracing_scope(|| tracing::warn!("broadcast_except write error: {e}"));
             }
@@ -1084,12 +1095,18 @@ impl ClientRepository {
         exclude: ClientSessionIdentifier,
         messages: &[crate::messages::Message],
     ) {
-        let register = self.register.read().await;
         let exclude_key = ScopedSessionId::new(server_id.to_owned(), exclude);
-        for (id, client) in &register.local_clients {
-            if *id == exclude_key || id.server_id() != server_id {
-                continue;
-            }
+        let clients: Vec<_> = {
+            let register = self.register.read().await;
+            register
+                .local_clients
+                .iter()
+                .filter(|(id, _)| **id != exclude_key && id.server_id() == server_id)
+                .map(|(_, client)| Arc::clone(client))
+                .collect()
+        };
+
+        for client in clients {
             if let Err(e) = client.write_proto_message_batch(messages).await {
                 client
                     .in_tracing_scope(|| tracing::warn!("broadcast_batch_except write error: {e}"));
@@ -1437,57 +1454,62 @@ impl ClientRepository {
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: Option<ClientSessionIdentifier>,
     ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
-        let register = self.register.read().await;
-
-        // Check that no log has been pruned past the requested version
         let local_since = last_seen.get(&self.local_node_id).copied().unwrap_or(0);
-        if local_since > 0 {
-            match register.local_log.front() {
-                Some(oldest) if oldest.version > local_since => {
-                    tracing::error!(
-                        "Local log pruned past requested version: oldest={} requested={}",
-                        oldest.version,
-                        local_since,
-                    );
-                    return Err(());
-                }
-                _ => {}
-            }
-        }
-        for (node_id, log) in &register.remote_logs {
-            let since = last_seen.get(node_id).copied().unwrap_or(0);
-            if since > 0 {
-                if let Some(oldest) = log.front() {
-                    if oldest.version > since {
+        let mut entries: Vec<Arc<ClientStateLogEntry>> = {
+            let register = self.register.read().await;
+
+            // Check that no log has been pruned past the requested version.
+            if local_since > 0 {
+                match register.local_log.front() {
+                    Some(oldest) if oldest.version > local_since => {
                         tracing::error!(
-                            "Remote log for node {} pruned past requested version: oldest={} requested={}",
-                            node_id,
+                            "Local log pruned past requested version: oldest={} requested={}",
                             oldest.version,
-                            since,
+                            local_since,
                         );
                         return Err(());
                     }
+                    _ => {}
                 }
             }
-        }
-
-        // Collect all qualifying entries from every log
-        let mut entries: Vec<&Arc<ClientStateLogEntry>> = Vec::new();
-
-        for entry in &register.local_log {
-            if entry.version > local_since && entry.op.server_id() == server_id {
-                entries.push(entry);
-            }
-        }
-
-        for (node_id, log) in &register.remote_logs {
-            let since = last_seen.get(node_id).copied().unwrap_or(0);
-            for entry in log {
-                if entry.version > since && entry.op.server_id() == server_id {
-                    entries.push(entry);
+            for (node_id, log) in &register.remote_logs {
+                let since = last_seen.get(node_id).copied().unwrap_or(0);
+                if since > 0 {
+                    if let Some(oldest) = log.front() {
+                        if oldest.version > since {
+                            tracing::error!(
+                                "Remote log for node {} pruned past requested version: oldest={} requested={}",
+                                node_id,
+                                oldest.version,
+                                since,
+                            );
+                            return Err(());
+                        }
+                    }
                 }
             }
-        }
+
+            // Collect owned entry handles so async message conversion happens
+            // after the register lock is released.
+            let mut entries = Vec::new();
+
+            for entry in &register.local_log {
+                if entry.version > local_since && entry.op.server_id() == server_id {
+                    entries.push(Arc::clone(entry));
+                }
+            }
+
+            for (node_id, log) in &register.remote_logs {
+                let since = last_seen.get(node_id).copied().unwrap_or(0);
+                for entry in log {
+                    if entry.version > since && entry.op.server_id() == server_id {
+                        entries.push(Arc::clone(entry));
+                    }
+                }
+            }
+
+            entries
+        };
 
         // Sort by timestamp, then version for deterministic ordering
         entries.sort_by(|a, b| {
@@ -2001,6 +2023,65 @@ mod tests {
 
     use super::*;
 
+    fn text_message(message: &str) -> Message {
+        Message::TextMessage(
+            TextMessage {
+                actor: Some(12),
+                session: Vec::new(),
+                channel_id: Vec::new(),
+                tree_id: Vec::new(),
+                message: message.to_string(),
+            }
+            .into(),
+        )
+    }
+
+    async fn assert_register_read_completes_while_write_is_queued(repo: &Arc<ClientRepository>) {
+        let writer = tokio::spawn({
+            let repo = Arc::clone(repo);
+            async move {
+                let _guard = repo.register.write().await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let count =
+            tokio::time::timeout(Duration::from_millis(50), repo.local_len_in_server("alpha"))
+                .await
+                .expect("repository readers should not be blocked by unrelated async work");
+        assert_eq!(count, 1);
+
+        writer.abort();
+        let _ = writer.await;
+    }
+
+    async fn commit_alpha_add_client(
+        repo: &ClientRepository,
+        session: ClientSessionIdentifier,
+        client_instance_id: ClientInstanceId,
+    ) {
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+
+        repo.commit_operation(
+            ClientStateOperation::AddClient {
+                server_id: "alpha".to_string(),
+                session_id: session,
+                client_instance_id,
+                real_ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+            None,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn web_client_allocation_produces_local_writable_client() {
         let repo = ClientRepository::new(1, 128);
@@ -2012,16 +2093,7 @@ mod tests {
         assert_eq!(client.get_node_id(), 1);
         assert_eq!(repo.local_len().await, 1);
 
-        let message = Message::TextMessage(
-            TextMessage {
-                actor: Some(12),
-                session: Vec::new(),
-                channel_id: Vec::new(),
-                tree_id: Vec::new(),
-                message: "hello".to_string(),
-            }
-            .into(),
-        );
+        let message = text_message("hello");
         client.write_proto_message(&message).await.unwrap();
 
         let queued = rx.recv().await.unwrap();
@@ -2208,6 +2280,140 @@ mod tests {
 
         commit.await.unwrap();
         assert_eq!(repo.current_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn broadcast_all_does_not_hold_register_lock_while_writing() {
+        let repo = Arc::new(ClientRepository::new(1, 128));
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let client = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, tx)
+            .await;
+        client
+            .write_proto_message(&text_message("prefill"))
+            .await
+            .unwrap();
+        let message = text_message("blocked broadcast");
+
+        let broadcast = tokio::spawn({
+            let repo = Arc::clone(&repo);
+            let message = message.clone();
+            async move {
+                repo.broadcast_all_in_server("alpha", &message).await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert_register_read_completes_while_write_is_queued(&repo).await;
+
+        broadcast.abort();
+        let _ = broadcast.await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_except_does_not_hold_register_lock_while_writing() {
+        let repo = Arc::new(ClientRepository::new(1, 128));
+        let peer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30002);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        let excluded = repo
+            .allocate_web_client_in_server("alpha", peer_a.ip(), peer_a, local, tx_a)
+            .await;
+        let target = repo
+            .allocate_web_client_in_server("alpha", peer_b.ip(), peer_b, local, tx_b)
+            .await;
+        target
+            .write_proto_message(&text_message("prefill"))
+            .await
+            .unwrap();
+        let message = text_message("blocked broadcast except");
+
+        let broadcast = tokio::spawn({
+            let repo = Arc::clone(&repo);
+            let message = message.clone();
+            let excluded = excluded.get_session_id();
+            async move {
+                repo.broadcast_except_in_server("alpha", excluded, &message)
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert_register_read_completes_while_write_is_queued(&repo).await;
+
+        broadcast.abort();
+        let _ = broadcast.await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_batch_except_does_not_hold_register_lock_while_writing() {
+        let repo = Arc::new(ClientRepository::new(1, 128));
+        let peer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30002);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        let excluded = repo
+            .allocate_web_client_in_server("alpha", peer_a.ip(), peer_a, local, tx_a)
+            .await;
+        let target = repo
+            .allocate_web_client_in_server("alpha", peer_b.ip(), peer_b, local, tx_b)
+            .await;
+        target
+            .write_proto_message(&text_message("prefill"))
+            .await
+            .unwrap();
+        let messages = vec![text_message("blocked batch broadcast")];
+
+        let broadcast = tokio::spawn({
+            let repo = Arc::clone(&repo);
+            let messages = messages.clone();
+            let excluded = excluded.get_session_id();
+            async move {
+                repo.broadcast_batch_except_in_server("alpha", excluded, &messages)
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert_register_read_completes_while_write_is_queued(&repo).await;
+
+        broadcast.abort();
+        let _ = broadcast.await;
+    }
+
+    #[tokio::test]
+    async fn replay_since_does_not_hold_register_lock_while_building_messages() {
+        let repo = Arc::new(ClientRepository::new(1, 128));
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, tx)
+            .await;
+        client.set_published(true);
+        commit_alpha_add_client(&repo, client.get_session_id(), client.client_instance_id()).await;
+
+        let replay = tokio::spawn({
+            let repo = Arc::clone(&repo);
+            async move {
+                let (messages, versions) = repo
+                    .replay_since_in_server("alpha", &HashMap::new())
+                    .await
+                    .expect("replay succeeds");
+                assert_eq!(messages.len(), 1);
+                assert_eq!(versions.get(&1), Some(&1));
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert_register_read_completes_while_write_is_queued(&repo).await;
+
+        replay.await.unwrap();
     }
 
     #[tokio::test]

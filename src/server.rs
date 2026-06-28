@@ -399,6 +399,8 @@ mod tests {
         AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     };
     use crate::localization::Language;
+    use crate::voice::codec::PacketFormat;
+    use crate::voice::ping::PingRequest;
     use rustls::pki_types::ServerName;
     use tokio_rustls::TlsConnector;
 
@@ -568,6 +570,37 @@ mod tests {
 
     async fn connect_tls_leaf_der(server: &Arc<Box<Server>>) -> Vec<u8> {
         connect_tls(server).await.leaf_der
+    }
+
+    async fn assert_config_read_completes_during_root_channel_reload(
+        server: &Arc<Box<Server>>,
+        next_root_name: &str,
+    ) {
+        let next_root = ChannelRootConfig::new(next_root_name);
+        let root_update = {
+            let current = server.config.write().expect("Config RwLock poisoned");
+            assert_ne!(current.root_channel_name, next_root.name());
+            Some(next_root)
+        };
+
+        let root_update = tokio::spawn({
+            let channels = Arc::clone(&server.channels);
+            async move {
+                if let Some(root_update) = root_update {
+                    channels.update_root_channel_config(root_update).await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(Duration::from_millis(50), async {
+            let config = server.read_config();
+            assert_eq!(config.root_channel_name, "Root");
+        })
+        .await
+        .expect("config read should not wait for async channel reload work");
+
+        root_update.await.expect("root channel update task joins");
     }
 
     #[derive(Debug)]
@@ -939,6 +972,94 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn udp_ping_response_does_not_wait_for_blocked_client_broadcast() {
+        install_default_provider();
+        let mut config = test_config(Vec::new());
+        config.udp_ping_user_count_scope = UdpPingUserCountScope::Local;
+        let server = Server::new(config, TestAuthenticator)
+            .await
+            .expect("server");
+
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let client = server
+            .clients
+            .allocate_web_client_in_server(DEFAULT_SERVER_ID, peer.ip(), peer, local, tx)
+            .await;
+        let prefill = Message::TextMessage(
+            TextMessage {
+                actor: Some(12),
+                session: Vec::new(),
+                channel_id: Vec::new(),
+                tree_id: Vec::new(),
+                message: "prefill".to_string(),
+            }
+            .into(),
+        );
+        client.write_proto_message(&prefill).await.unwrap();
+
+        let broadcast_message = Message::TextMessage(
+            TextMessage {
+                actor: Some(12),
+                session: Vec::new(),
+                channel_id: Vec::new(),
+                tree_id: Vec::new(),
+                message: "blocked broadcast".to_string(),
+            }
+            .into(),
+        );
+        let broadcast = tokio::spawn({
+            let clients = Arc::clone(&server.clients);
+            async move {
+                clients
+                    .broadcast_all_in_server(DEFAULT_SERVER_ID, &broadcast_message)
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let writer = tokio::spawn({
+            let clients = Arc::clone(&server.clients);
+            async move {
+                clients
+                    .remove_client_in_server(DEFAULT_SERVER_ID, client.get_session_id())
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let ping = PingRequest {
+            timestamp: 42,
+            request_extended_information: false,
+            format: PacketFormat::Legacy,
+        };
+        let reply = tokio::time::timeout(
+            Duration::from_millis(50),
+            Server::build_ping_response(&server, &ping, DEFAULT_SERVER_ID),
+        )
+        .await
+        .expect("UDP status ping should not wait behind a blocked broadcast")
+        .expect("ping response encodes");
+        assert!(!reply.is_empty());
+
+        writer.abort();
+        let _ = writer.await;
+        broadcast.abort();
+        let _ = broadcast.await;
+    }
+
+    #[tokio::test]
+    async fn reload_root_channel_work_does_not_hold_config_write_lock() {
+        install_default_provider();
+        let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+            .await
+            .expect("server");
+
+        assert_config_read_completes_during_root_channel_reload(&server, "Renamed Root").await;
     }
 }
 
@@ -2795,6 +2916,7 @@ impl Server {
                 self.apply_entrypoint_config(&new_config).await?;
 
                 let mut invalidate_acl_cache = false;
+                let mut root_channel_config_update = None;
                 let mut current = self.config.write().expect("Config RwLock poisoned");
                 // Log notable changes
                 if current.welcome_text != new_config.welcome_text {
@@ -2806,9 +2928,7 @@ impl Server {
                         current.root_channel_name,
                         new_config.root_channel_name
                     );
-                    self.channels
-                        .update_root_channel_config(ChannelRootConfig::from(&new_config))
-                        .await;
+                    root_channel_config_update = Some(ChannelRootConfig::from(&new_config));
                 }
                 if current.max_bandwidth != new_config.max_bandwidth {
                     tracing::info!(
@@ -2964,6 +3084,11 @@ impl Server {
                 tracing::info!("config reload: C2S TLS identity refreshed");
                 *current = new_config;
                 drop(current);
+                if let Some(root_channel_config) = root_channel_config_update {
+                    self.channels
+                        .update_root_channel_config(root_channel_config)
+                        .await;
+                }
                 if invalidate_acl_cache {
                     self.channels.invalidate_acl_cache_for_channel(0).await;
                 }
