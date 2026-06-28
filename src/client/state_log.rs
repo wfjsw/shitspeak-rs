@@ -267,6 +267,10 @@ pub enum ClientStateOperation {
         sender_session_id: Option<ClientSessionIdentifier>,
         delta: ClientGlobalStateDelta,
     },
+    ResetNode {
+        #[serde(default = "default_server_id")]
+        server_id: String,
+    },
 }
 
 impl ClientStateOperation {
@@ -276,6 +280,7 @@ impl ClientStateOperation {
             ClientStateOperation::AddClient { session_id, .. } => Some(*session_id),
             ClientStateOperation::RemoveClient { session_id, .. } => Some(*session_id),
             ClientStateOperation::UpdateGlobalState { session_id, .. } => Some(*session_id),
+            ClientStateOperation::ResetNode { .. } => None,
         }
     }
 
@@ -290,6 +295,7 @@ impl ClientStateOperation {
             | ClientStateOperation::UpdateGlobalState {
                 client_instance_id, ..
             } => *client_instance_id,
+            ClientStateOperation::ResetNode { .. } => 0,
         }
     }
 
@@ -298,6 +304,7 @@ impl ClientStateOperation {
             ClientStateOperation::AddClient { server_id, .. } => server_id,
             ClientStateOperation::RemoveClient { server_id, .. } => server_id,
             ClientStateOperation::UpdateGlobalState { server_id, .. } => server_id,
+            ClientStateOperation::ResetNode { server_id } => server_id,
         }
     }
 }
@@ -323,7 +330,9 @@ pub struct ClientStateLogEntry {
 #[derive(Debug, Clone)]
 pub struct ClientStateBroadcastPayload {
     pub entry: Arc<ClientStateLogEntry>,
-    /// Current version for every known node (local + remote).
+    /// Current version for known nodes touched by this broadcast. A value of
+    /// `0` means the node's old epoch was cleared and subscribers should
+    /// forget their last-seen version for that node.
     pub versions: HashMap<u16, u64>,
 }
 
@@ -521,6 +530,7 @@ impl ClientStateLogEntry {
 
                 Some(us.into())
             }
+            ClientStateOperation::ResetNode { .. } => None,
         }
     }
 }

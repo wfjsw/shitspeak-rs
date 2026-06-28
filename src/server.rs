@@ -27,11 +27,15 @@ use crate::channel_repository::{
     ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
 };
 use crate::client::{
-    AsyncMessageHandlerExt, Client, client_session_identifier::ClientSessionIdentifier,
-    state_log::ClientStateBroadcastPayload, visibility::UserVisibilityState,
+    AsyncMessageHandlerExt, Client, ClientOutboundMessage,
+    client_session_identifier::ClientSessionIdentifier, state_log::ClientStateBroadcastPayload,
+    visibility::UserVisibilityState,
 };
 use crate::client_certificate_verifier::ClientCertificateVerifier;
-use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError};
+use crate::errors::{
+    HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError,
+    WriteProtoMessageError,
+};
 use crate::geoip::{GeoIpResolver, IpGeoMetadata};
 use crate::messages::encoder::Version;
 use crate::messages::{Message, WriteMessageExt};
@@ -52,6 +56,7 @@ use crate::{
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
 type UdpPacket = (Bytes, std::net::SocketAddr, std::net::SocketAddr);
+const CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT: usize = 64;
 #[cfg(feature = "web")]
 const ALPN_HTTP_1_1: &[u8] = b"http/1.1";
 const ALPN_MUMBLE: &[u8] = b"mumble";
@@ -1260,7 +1265,7 @@ async fn write_projected_client_log_message_with_acl_refresh(
     server_id: &str,
     message: &Message,
 ) -> Result<(), HandleIncomingConnectionError> {
-    for msg in crate::client::visibility::project_message_with_shadow(
+    let mut out = crate::client::visibility::project_message_with_shadow(
         server,
         client,
         user_visibility,
@@ -1268,13 +1273,7 @@ async fn write_projected_client_log_message_with_acl_refresh(
         server_id,
         message,
     )
-    .await
-    {
-        client
-            .write_proto_message(&msg)
-            .await
-            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-    }
+    .await;
 
     if is_acl_cache_flush_message(message) {
         for refresh in crate::channel_handler::build_channel_permission_info_refresh_messages(
@@ -1284,24 +1283,375 @@ async fn write_projected_client_log_message_with_acl_refresh(
         )
         .await
         {
-            for msg in crate::client::visibility::project_message_with_shadow(
+            out.extend(
+                crate::client::visibility::project_message_with_shadow(
+                    server,
+                    client,
+                    user_visibility,
+                    session_channel_shadow,
+                    server_id,
+                    &refresh,
+                )
+                .await,
+            );
+        }
+    }
+
+    client
+        .write_proto_message_batch(&out)
+        .await
+        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+
+    Ok(())
+}
+
+async fn projected_client_log_messages_with_acl_refresh(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: &Message,
+) -> Vec<Message> {
+    let mut out = crate::client::visibility::project_message_with_shadow(
+        server,
+        client,
+        user_visibility,
+        session_channel_shadow,
+        server_id,
+        message,
+    )
+    .await;
+
+    if is_acl_cache_flush_message(message) {
+        for refresh in crate::channel_handler::build_channel_permission_info_refresh_messages(
+            server,
+            client,
+            server.get_channels(),
+        )
+        .await
+        {
+            out.extend(
+                crate::client::visibility::project_message_with_shadow(
+                    server,
+                    client,
+                    user_visibility,
+                    session_channel_shadow,
+                    server_id,
+                    &refresh,
+                )
+                .await,
+            );
+        }
+    }
+
+    out
+}
+
+async fn collect_reconcile_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+) -> Vec<Message> {
+    let reconcile = crate::client::visibility::reconcile_all(server, client, user_visibility).await;
+    let mut out = Vec::new();
+    for msg in reconcile {
+        out.extend(
+            crate::client::visibility::sync_projected_message_with_shadow(
                 server,
                 client,
                 user_visibility,
                 session_channel_shadow,
                 server_id,
-                &refresh,
+                msg,
             )
-            .await
-            {
-                client
-                    .write_proto_message(&msg)
-                    .await
-                    .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+            .await,
+        );
+    }
+    out
+}
+
+async fn drain_outbound_message_queue(
+    client: &Arc<Box<Client>>,
+    first: ClientOutboundMessage,
+    rx: &mut tokio::sync::mpsc::Receiver<ClientOutboundMessage>,
+) -> Result<(), WriteProtoMessageError> {
+    let mut messages = Vec::new();
+    push_outbound_message(first, &mut messages);
+    for _ in 1..CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT {
+        match rx.try_recv() {
+            Ok(message) => push_outbound_message(message, &mut messages),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    client.write_proto_message_batch_direct(&messages).await
+}
+
+fn push_outbound_message(message: ClientOutboundMessage, out: &mut Vec<Message>) {
+    match message {
+        ClientOutboundMessage::Single(message) => out.push(message),
+        ClientOutboundMessage::Batch(messages) => out.extend(messages),
+    }
+}
+
+fn spawn_native_client_writer_task(
+    client: &Arc<Box<Client>>,
+) -> Option<tokio::task::JoinHandle<Result<(), WriteProtoMessageError>>> {
+    let span = client.tracing_span();
+    let mut rx = match client.take_outbound_message_rx() {
+        Some(rx) => rx,
+        None => {
+            span.in_scope(|| {
+                tracing::warn!(
+                    session = u32::from(client.get_session_id()),
+                    "native client writer task already spawned"
+                );
+            });
+            return None;
+        }
+    };
+    let weak_client = Arc::downgrade(client);
+    Some(tokio::spawn(
+        async move {
+            while let Some(message) = rx.recv().await {
+                let Some(client) = weak_client.upgrade() else {
+                    break;
+                };
+                drain_outbound_message_queue(&client, message, &mut rx).await?;
+            }
+            Ok(())
+        }
+        .instrument(span),
+    ))
+}
+
+async fn process_client_log_broadcasts(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_session_id: ClientSessionIdentifier,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    first: Arc<ClientStateBroadcastPayload>,
+    rx: &mut ClientLogReceiver,
+) -> Result<(), HandleIncomingConnectionError> {
+    let mut broadcasts = Vec::with_capacity(CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT);
+    broadcasts.push(first);
+    for _ in 1..CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT {
+        match rx.try_recv() {
+            Ok(broadcast) => broadcasts.push(broadcast),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                replay_client_log_subscription_gap(
+                    server,
+                    client,
+                    session_channel_shadow,
+                    user_visibility,
+                )
+                .await?;
+                return Ok(());
             }
         }
     }
 
+    let client_server_id = client.server_id();
+    let mut out = Vec::new();
+    for broadcast in broadcasts {
+        append_client_log_broadcast_messages(
+            server,
+            client,
+            client_session_id,
+            channel_tree_shadow,
+            session_channel_shadow,
+            user_visibility,
+            &client_server_id,
+            broadcast,
+            &mut out,
+        )
+        .await?;
+    }
+
+    client
+        .write_proto_message_batch(&out)
+        .await
+        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+    Ok(())
+}
+
+async fn append_client_log_broadcast_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_session_id: ClientSessionIdentifier,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    client_server_id: &str,
+    broadcast: Arc<ClientStateBroadcastPayload>,
+    out: &mut Vec<Message>,
+) -> Result<(), HandleIncomingConnectionError> {
+    tracing::trace!("Received client log broadcast: {:?}", broadcast);
+
+    let entry = &broadcast.entry;
+    if entry.op.server_id() != client_server_id {
+        return Ok(());
+    }
+    let mut last_seen = client.get_last_client_versions().await;
+    let mut last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
+    match broadcast.versions.get(&entry.node_id).copied() {
+        Some(0) => {
+            client.remove_last_client_version(entry.node_id).await;
+            last_seen.remove(&entry.node_id);
+            last_for_node = entry.version.saturating_sub(1);
+        }
+        Some(current) if current < last_for_node => {
+            client.remove_last_client_version(entry.node_id).await;
+            last_seen.remove(&entry.node_id);
+            last_for_node = 0;
+        }
+        _ => {}
+    }
+    if entry.version <= last_for_node {
+        return Ok(());
+    }
+    if entry.version > last_for_node + 1 {
+        let (missed, new_versions) = server
+            .clients
+            .replay_since_in_server_for_client(
+                client_server_id,
+                &last_seen,
+                client.get_session_id(),
+            )
+            .await
+            .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+        for msg in &missed {
+            out.extend(
+                projected_client_log_messages_with_acl_refresh(
+                    server,
+                    client,
+                    user_visibility,
+                    session_channel_shadow,
+                    client_server_id,
+                    msg,
+                )
+                .await,
+            );
+        }
+        out.extend(
+            collect_reconcile_messages(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                client_server_id,
+            )
+            .await,
+        );
+        client.update_last_client_versions(&new_versions).await;
+    }
+
+    if let Some(dep) = entry.channel_version_dep {
+        let last_ch = client.get_last_channel_version().await;
+        if last_ch < dep {
+            client
+                .write_proto_message_batch(out)
+                .await
+                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+            out.clear();
+            replay_channel_log_gap(
+                server,
+                client,
+                &server.channels,
+                channel_tree_shadow,
+                session_channel_shadow,
+                user_visibility,
+                client_session_id,
+                last_ch,
+                dep + 1,
+            )
+            .await
+            .map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
+        }
+    }
+
+    for msg in entry
+        .messages_for_client(&server.clients, client.get_session_id())
+        .await
+    {
+        out.extend(
+            projected_client_log_messages_with_acl_refresh(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                client_server_id,
+                &msg,
+            )
+            .await,
+        );
+    }
+    out.extend(
+        collect_reconcile_messages(
+            server,
+            client,
+            user_visibility,
+            session_channel_shadow,
+            client_server_id,
+        )
+        .await,
+    );
+    client
+        .update_last_client_versions(&broadcast.versions)
+        .await;
+    Ok(())
+}
+
+async fn replay_client_log_subscription_gap(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+) -> Result<(), HandleIncomingConnectionError> {
+    let last_seen = client.get_last_client_versions().await;
+    let server_id = client.server_id();
+    let (missed, new_versions) = server
+        .clients
+        .replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id())
+        .await
+        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+    let mut out = Vec::new();
+    for msg in &missed {
+        out.extend(
+            projected_client_log_messages_with_acl_refresh(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                &server_id,
+                msg,
+            )
+            .await,
+        );
+    }
+    out.extend(
+        collect_reconcile_messages(
+            server,
+            client,
+            user_visibility,
+            session_channel_shadow,
+            &server_id,
+        )
+        .await,
+    );
+    client
+        .write_proto_message_batch(&out)
+        .await
+        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+    client.update_last_client_versions(&new_versions).await;
     Ok(())
 }
 
@@ -2532,7 +2882,7 @@ impl Server {
         // Subscriptions start as None — they're activated after auth.
         let mut client_log_rx: Option<ClientLogReceiver> = None;
         let mut channel_log_rx: Option<ChannelLogReceiver> = None;
-        let mut outbound_message_rx = client.take_outbound_message_rx();
+        let mut writer_task = spawn_native_client_writer_task(&client);
         let mut channel_tree_shadow = ChannelTreeShadow::default();
         let mut session_channel_shadow: SessionChannelShadow = HashMap::new();
         let mut user_visibility = UserVisibilityState::default();
@@ -2587,13 +2937,19 @@ impl Server {
                         client.touch_activity();
                     }
 
-                    // ── Outbound messages owned by this client connection ───
-                    result = recv_mpsc_optional(outbound_message_rx.as_mut()), if outbound_message_rx.is_some() => {
-                        let Some(message) = result else {
-                            return Ok(());
-                        };
-                        client.write_outbound_message(message).await
-                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                    // ── Dedicated writer task completion ─────────────────────
+                    result = async {
+                        match writer_task.as_mut() {
+                            Some(task) => task.await,
+                            None => std::future::pending().await,
+                        }
+                    }, if writer_task.is_some() => {
+                        writer_task = None;
+                        match result {
+                            Ok(Ok(())) => return Ok(()),
+                            Ok(Err(err)) => return Err(HandleIncomingConnectionError::ClientWriteFailed(err)),
+                            Err(err) => return Err(HandleIncomingConnectionError::ClientWriterTaskFailed(err)),
+                        }
                     }
 
                     // ── Incoming message from this client ────────────────────
@@ -2730,147 +3086,28 @@ impl Server {
                     result = recv_optional(client_log_rx.as_mut()), if client_log_rx.is_some() => {
                         match result {
                             Some(Ok(broadcast)) => {
-                                tracing::trace!("Received client log broadcast: {:?}", broadcast);
-
-                                let entry = &broadcast.entry;
-                                if entry.op.server_id() != client.server_id() {
-                                    continue;
-                                }
-                                let mut last_seen = client.get_last_client_versions().await;
-                                let mut last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
-                                // Owner-scoped S2S logs restart from version 1 after a node
-                                // reboot, so connected clients must forget the old incarnation.
-                                if broadcast
-                                    .versions
-                                    .get(&entry.node_id)
-                                    .is_some_and(|current| *current < last_for_node)
-                                {
-                                    client.remove_last_client_version(entry.node_id).await;
-                                    last_seen.remove(&entry.node_id);
-                                    last_for_node = 0;
-                                }
-                                if entry.version <= last_for_node {
-                                    continue;
-                                }
-                                if entry.version > last_for_node + 1 {
-                                    let server_id = client.server_id();
-                                    let (missed, new_versions) = self.clients.replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id()).await
-                                        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
-                                    for msg in &missed {
-                                        write_projected_client_log_message_with_acl_refresh(
-                                            self,
-                                            &client,
-                                            &mut user_visibility,
-                                            &mut session_channel_shadow,
-                                            &server_id,
-                                            msg,
-                                        )
-                                        .await?;
-                                    }
-                                    let reconcile = crate::client::visibility::reconcile_all(
+                                if let Some(rx) = client_log_rx.as_mut() {
+                                    process_client_log_broadcasts(
                                         self,
                                         &client,
-                                        &mut user_visibility,
-                                    ).await;
-                                    for msg in reconcile {
-                                        let projected = crate::client::visibility::sync_projected_message_with_shadow(
-                                            self,
-                                            &client,
-                                            &mut user_visibility,
-                                            &mut session_channel_shadow,
-                                            &server_id,
-                                            msg,
-                                        ).await;
-                                        for msg in projected {
-                                            client.write_proto_message(&msg).await
-                                                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                        }
-                                    }
-                                    client.update_last_client_versions(&new_versions).await;
-                                }
-
-                                // If this entry has a channel version dependency,
-                                // catch up the client's channel view to that dep first.
-                                if let Some(dep) = entry.channel_version_dep {
-                                    let last_ch = client.get_last_channel_version().await;
-                                    if last_ch < dep {
-                                        replay_channel_log_gap(
-                                            self, &client, &self.channels, &mut channel_tree_shadow, &mut session_channel_shadow, &mut user_visibility, client_session_id, last_ch, dep + 1,
-                                        ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
-                                    }
-                                }
-
-                                for msg in entry
-                                    .messages_for_client(&self.clients, client.get_session_id())
-                                    .await
-                                {
-                                    write_projected_client_log_message_with_acl_refresh(
-                                        self,
-                                        &client,
-                                        &mut user_visibility,
+                                        client_session_id,
+                                        &mut channel_tree_shadow,
                                         &mut session_channel_shadow,
-                                        &client.server_id(),
-                                        &msg,
+                                        &mut user_visibility,
+                                        broadcast,
+                                        rx,
                                     )
                                     .await?;
                                 }
-                                let reconcile = crate::client::visibility::reconcile_all(
-                                    self,
-                                    &client,
-                                    &mut user_visibility,
-                                ).await;
-                                for msg in reconcile {
-                                    let projected = crate::client::visibility::sync_projected_message_with_shadow(
-                                        self,
-                                        &client,
-                                        &mut user_visibility,
-                                        &mut session_channel_shadow,
-                                        &client.server_id(),
-                                        msg,
-                                    ).await;
-                                    for msg in projected {
-                                        client.write_proto_message(&msg).await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    }
-                                }
-                                client.update_last_client_versions(&broadcast.versions).await;
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-                                let last_seen = client.get_last_client_versions().await;
-                                let server_id = client.server_id();
-                                let (missed, new_versions) = self.clients.replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id()).await
-                                    .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
-                                for msg in &missed {
-                                    write_projected_client_log_message_with_acl_refresh(
-                                        self,
-                                        &client,
-                                        &mut user_visibility,
-                                        &mut session_channel_shadow,
-                                        &server_id,
-                                        msg,
-                                    )
-                                    .await?;
-                                }
-                                let reconcile = crate::client::visibility::reconcile_all(
+                                replay_client_log_subscription_gap(
                                     self,
                                     &client,
+                                    &mut session_channel_shadow,
                                     &mut user_visibility,
-                                ).await;
-                                for msg in reconcile {
-                                    let projected = crate::client::visibility::sync_projected_message_with_shadow(
-                                        self,
-                                        &client,
-                                        &mut user_visibility,
-                                        &mut session_channel_shadow,
-                                        &server_id,
-                                        msg,
-                                    ).await;
-                                    for msg in projected {
-                                        client.write_proto_message(&msg).await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    }
-                                }
-                                client.update_last_client_versions(&new_versions).await;
+                                )
+                                .await?;
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                                 return Ok(());

@@ -1590,7 +1590,16 @@ async fn send_web_client_log_update(
         return Ok(());
     }
     let last_seen = client.get_last_client_versions().await;
-    let last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
+    let mut last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
+    match payload.versions.get(&entry.node_id).copied() {
+        Some(0) => {
+            last_for_node = entry.version.saturating_sub(1);
+        }
+        Some(current) if current < last_for_node => {
+            last_for_node = 0;
+        }
+        _ => {}
+    }
     if entry.version <= last_for_node {
         return Ok(());
     }

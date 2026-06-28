@@ -1338,6 +1338,7 @@ fn client_entry_affects_voice_recipient_index(entry: &ClientStateLogEntry) -> bo
                     .as_ref()
                     .is_some_and(|channels| !channels.is_empty())
         }
+        ClientStateOperation::ResetNode { .. } => true,
     }
 }
 
@@ -1910,7 +1911,7 @@ async fn apply_user_remove_patch(
         ban: Some(patch.ban),
     }
     .into();
-    if let Err(e) = target.write_proto_message(&remove_notice).await {
+    if let Err(e) = target.write_proto_message_direct(&remove_notice).await {
         trace!(
             error = %e,
             target = u32::from(target_id),
@@ -2481,6 +2482,7 @@ impl ClientReplicationAdapter {
                 sanitize_update_client_channels(delta, &valid_channels);
             }
             ClientStateOperation::RemoveClient { .. } => {}
+            ClientStateOperation::ResetNode { .. } => {}
         }
     }
 }

@@ -151,7 +151,7 @@ pub async fn handle_user_remove(
         ban: Some(is_ban),
     }
     .into();
-    if let Err(e) = target.write_proto_message(&remove_notice).await {
+    if let Err(e) = target.write_proto_message_direct(&remove_notice).await {
         tracing::debug!(
             error = %e,
             target = target_raw,

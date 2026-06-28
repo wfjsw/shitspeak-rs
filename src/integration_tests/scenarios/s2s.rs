@@ -370,6 +370,7 @@ async fn add_synthetic_published_users(server: &TestServer, node_id: u16) -> Vec
             gs.set_current_channel_id(0);
         }
         let session = client.get_session_id();
+        client.set_authenticated(true);
         server.server.get_clients().publish_client(session).await;
         sessions.push(u32::from(session));
     }
@@ -399,6 +400,7 @@ async fn add_synthetic_published_user_count(
             gs.set_current_channel_id(0);
         }
         let session = client.get_session_id();
+        client.set_authenticated(true);
         server.server.get_clients().publish_client(session).await;
         sessions.push(u32::from(session));
     }
@@ -431,6 +433,39 @@ async fn wait_for_observer_to_know_users(
         }
     }
     remaining.is_empty()
+}
+
+async fn wait_for_observer_sessions_in_channel(
+    observer: &TestClient,
+    sessions: &[u32],
+    channel_id: u32,
+    deadline: Duration,
+) -> Option<Duration> {
+    let started = Instant::now();
+    let mut remaining = sessions
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    for state in &observer.initial_user_states {
+        if state.channel_id == Some(channel_id) {
+            if let Some(session) = state.session {
+                remaining.remove(&session);
+            }
+        }
+    }
+    while !remaining.is_empty() && started.elapsed() < deadline {
+        let Some(message) = observer.recv(Duration::from_millis(250)).await else {
+            continue;
+        };
+        if let Message::UserState(state) = message {
+            if state.channel_id == Some(channel_id) {
+                if let Some(session) = state.session {
+                    remaining.remove(&session);
+                }
+            }
+        }
+    }
+    remaining.is_empty().then(|| started.elapsed())
 }
 
 async fn wait_for_servers_to_track_users(
@@ -1684,6 +1719,9 @@ async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
         "lag-diagnostic setup: spawned {} S2S runtimes",
         cluster.servers.len()
     );
+    cluster.servers[0]
+        .authenticator
+        .register_user("observer", None, Some(990_001), vec![]);
 
     cluster.connect_full_mesh().await;
     wait_for_convergence_cluster(&cluster).await;
@@ -1743,6 +1781,15 @@ async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
         "lag-diagnostic setup: all nodes materialized {} node-1 synthetic users",
         sessions.len()
     );
+    let observer = TestClient::connect_and_authenticate(&cluster.servers[0], "observer", None)
+        .await
+        .expect("observer");
+    assert!(
+        wait_for_observer_to_know_users(&observer, &sessions, Duration::from_secs(10)).await,
+        "node 1 observer should receive initial synthetic user states before measured move"
+    );
+    observer.drain_now().await;
+    println!("lag-diagnostic setup: node 1 observer is caught up");
 
     apply_uniform_s2s_latency(
         &cluster,
@@ -1783,6 +1830,24 @@ async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
     assert!(
         local_visible.is_some(),
         "node 1 should apply synthetic moves locally immediately"
+    );
+    let local_observer_elapsed = wait_for_observer_sessions_in_channel(
+        &observer,
+        &sessions,
+        S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "node 1 observer did not receive all {} local channel moves within 5s",
+            sessions.len()
+        )
+    });
+    println!(
+        "lag-diagnostic local-observer: node 1 observer received all {} channel moves after {:?}",
+        sessions.len(),
+        local_observer_elapsed
     );
 
     let mut slowest = Duration::ZERO;

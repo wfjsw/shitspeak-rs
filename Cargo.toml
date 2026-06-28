@@ -115,6 +115,10 @@ harness = false
 name = "s2s_compression"
 harness = false
 
+[[bench]]
+name = "fanout_vs_broadcast"
+harness = false
+
 [profile.dev]
 incremental = false
 

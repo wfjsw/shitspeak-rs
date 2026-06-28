@@ -17,6 +17,8 @@ pub enum HandleIncomingConnectionError {
     AuthenticateTimeout(std::time::Duration),
     /// Failed to write a message to the client (connection lost).
     ClientWriteFailed(WriteProtoMessageError),
+    /// The per-client writer task panicked or was cancelled.
+    ClientWriterTaskFailed(tokio::task::JoinError),
     /// Authentication was rejected after the server sent a Reject message.
     AuthRejected(AuthRejection),
     /// The client's message handler returned an error.
@@ -77,6 +79,9 @@ impl std::fmt::Display for HandleIncomingConnectionError {
             }
             HandleIncomingConnectionError::ClientWriteFailed(err) => {
                 write!(f, "Client write failed: {}", err)
+            }
+            HandleIncomingConnectionError::ClientWriterTaskFailed(err) => {
+                write!(f, "Client writer task failed: {}", err)
             }
             HandleIncomingConnectionError::AuthRejected(err) => {
                 write!(f, "Client authentication rejected: {}", err)

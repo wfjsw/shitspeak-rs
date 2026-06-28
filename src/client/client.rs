@@ -653,10 +653,15 @@ impl Client {
     }
 
     /// Merge the given per-node version map into the client's last-seen
-    /// trackers.  Each entry is updated to `max(existing, new)`.
+    /// trackers.  Each entry is updated to `max(existing, new)`, except
+    /// version `0`, which marks a remote-origin reset and clears that node.
     pub async fn update_last_client_versions(&self, versions: &HashMap<u16, u64>) {
         let mut map = self.last_client_version.lock();
         for (&node_id, &version) in versions {
+            if version == 0 {
+                map.remove(&node_id);
+                continue;
+            }
             let entry = map.entry(node_id).or_insert(0);
             *entry = (*entry).max(version);
         }
@@ -991,18 +996,6 @@ impl Client {
         self.outbound_message_rx.lock().take()
     }
 
-    pub(crate) async fn write_outbound_message(
-        &self,
-        message: ClientOutboundMessage,
-    ) -> Result<(), WriteProtoMessageError> {
-        match message {
-            ClientOutboundMessage::Single(message) => self.write_proto_message(&message).await,
-            ClientOutboundMessage::Batch(messages) => {
-                self.write_proto_message_batch(&messages).await
-            }
-        }
-    }
-
     pub async fn write_proto_message(
         &self,
         message: &Message,
@@ -1012,6 +1005,37 @@ impl Client {
     }
 
     async fn write_proto_message_inner(
+        &self,
+        message: &Message,
+    ) -> Result<(), WriteProtoMessageError> {
+        match &self.transport {
+            ClientTransport::NativeTls { .. } => {
+                self.outbound_message_tx
+                    .send(ClientOutboundMessage::Single(message.clone()))
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+            }
+            ClientTransport::WebGateway { outbound_tx, .. } => {
+                outbound_tx
+                    .send(message.clone())
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+                self.record_tcp_packets(1, 6 + message.encoded_len()).await;
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn write_proto_message_direct(
+        &self,
+        message: &Message,
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.write_proto_message_direct_inner(message))
+            .await
+    }
+
+    async fn write_proto_message_direct_inner(
         &self,
         message: &Message,
     ) -> Result<(), WriteProtoMessageError> {
@@ -1042,6 +1066,47 @@ impl Client {
     }
 
     async fn write_proto_message_batch_inner(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        match &self.transport {
+            ClientTransport::NativeTls { .. } => {
+                self.outbound_message_tx
+                    .send(ClientOutboundMessage::Batch(messages.to_vec()))
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+            }
+            ClientTransport::WebGateway { outbound_tx, .. } => {
+                for message in messages {
+                    outbound_tx
+                        .send(message.clone())
+                        .await
+                        .map_err(|_| transport_closed_error())?;
+                }
+                let bytes = messages
+                    .iter()
+                    .map(|message| 6 + message.encoded_len())
+                    .sum();
+                self.record_tcp_packets(messages.len(), bytes).await;
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn write_proto_message_batch_direct(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.write_proto_message_batch_direct_inner(messages))
+            .await
+    }
+
+    async fn write_proto_message_batch_direct_inner(
         &self,
         messages: &[Message],
     ) -> Result<(), WriteProtoMessageError> {
