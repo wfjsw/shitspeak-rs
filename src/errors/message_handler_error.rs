@@ -69,6 +69,14 @@ impl MessageHandlerError {
     pub fn protocol_violation(reason: impl Into<Cow<'static, str>>) -> Self {
         MessageHandlerError::ProtocolViolation(reason.into())
     }
+
+    pub fn is_peer_disconnect(&self) -> bool {
+        match self {
+            MessageHandlerError::WriteProtoMessageError(err) => err.is_peer_disconnect(),
+            MessageHandlerError::ReadProtoMessageError(err) => err.is_peer_disconnect(),
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for MessageHandlerError {

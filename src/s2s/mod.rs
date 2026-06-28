@@ -48,6 +48,16 @@ use self::transport::{ConnectionManager, TransportConfig};
 const NATIVE_GATEWAY_CAPACITY: usize = 4096;
 const S2S_GATEWAY_CAPACITY: usize = 4096;
 const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const STRICT_PROPOSAL_GATEWAY_SLACK_TICKS: u32 = 4;
+const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
+fn strict_proposal_gateway_response_timeout(cfg: &replications::ReplicationConfig) -> Duration {
+    let slack = cfg
+        .delivery_tick_interval()
+        .checked_mul(STRICT_PROPOSAL_GATEWAY_SLACK_TICKS)
+        .unwrap_or_else(|| cfg.max_clock_tick());
+    S2S_GATEWAY_RESPONSE_TIMEOUT.max(cfg.propose_ttl().saturating_add(slack))
+}
 
 pub struct S2SManager {
     enabled: bool,
@@ -399,7 +409,12 @@ impl S2SManager {
             op,
             respond,
         }) {
-            Ok(()) => match tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx).await {
+            Ok(()) => match tokio::time::timeout(
+                strict_proposal_gateway_response_timeout(&self.replication_config),
+                rx,
+            )
+            .await
+            {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => {
                     warn!("s2s gateway dropped channel proposal response");
@@ -450,11 +465,14 @@ impl S2SManager {
         };
         let (respond, rx) = oneshot::channel();
         match tx.try_send(NativeToS2SCommand::ProposeBan { op, respond }) {
-            Ok(()) => tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(false),
+            Ok(()) => tokio::time::timeout(
+                strict_proposal_gateway_response_timeout(&self.replication_config),
+                rx,
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!("s2s gateway full; dropping ban proposal");
                 false
@@ -1053,6 +1071,7 @@ impl S2SManager {
         };
 
         let mut bridge_tasks = Vec::new();
+        let voice_delivery_strategy = application.voice().delivery_strategy();
         if let Some(handle) = client_handle.clone() {
             bridge_tasks.push(spawn_native_client_replication_bridge(
                 native_runtime,
@@ -1076,12 +1095,14 @@ impl S2SManager {
                 recipient_index.clone(),
             ));
         }
-        bridge_tasks.push(spawn_native_voice_recipient_index_bridge(
-            native_runtime,
-            server.get_clients().clone(),
-            s2s_tx.clone(),
-            shutdown,
-        ));
+        if voice_delivery_strategy == application::DeliveryStrategy::Targeted {
+            bridge_tasks.push(spawn_native_voice_recipient_index_bridge(
+                native_runtime,
+                server.get_clients().clone(),
+                s2s_tx.clone(),
+                shutdown,
+            ));
+        }
 
         (
             channel_handles,
@@ -1244,23 +1265,55 @@ fn spawn_native_voice_recipient_index_bridge(
     let mut rx = repo.subscribe();
     runtime.spawn(async move {
         enqueue_voice_recipient_index_snapshot(&repo, &tx).await;
+        let mut dirty = false;
+        let mut refresh = tokio::time::interval(VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        refresh.tick().await;
         loop {
-            let payload = tokio::select! {
+            tokio::select! {
                 _ = shutdown.changed() => return,
-                next = rx.recv() => next,
-            };
-            match payload {
-                Ok(_) => {
+                _ = refresh.tick(), if dirty => {
+                    dirty = false;
                     enqueue_voice_recipient_index_snapshot(&repo, &tx).await;
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "s2s voice recipient index bridge lagged");
-                    enqueue_voice_recipient_index_snapshot(&repo, &tx).await;
+                payload = rx.recv() => {
+                    match payload {
+                        Ok(payload) => {
+                            if client_entry_affects_voice_recipient_index(&payload.entry) {
+                                dirty = true;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(skipped, "s2s voice recipient index bridge lagged");
+                            dirty = true;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     })
+}
+
+fn client_entry_affects_voice_recipient_index(entry: &ClientStateLogEntry) -> bool {
+    if entry.op.server_id() != DEFAULT_SERVER_ID {
+        return false;
+    }
+
+    match &entry.op {
+        ClientStateOperation::AddClient { .. } | ClientStateOperation::RemoveClient { .. } => true,
+        ClientStateOperation::UpdateGlobalState { delta, .. } => {
+            delta.current_channel_id.is_some()
+                || delta
+                    .listening_channel_add
+                    .as_ref()
+                    .is_some_and(|channels| !channels.is_empty())
+                || delta
+                    .listening_channel_remove
+                    .as_ref()
+                    .is_some_and(|channels| !channels.is_empty())
+        }
+    }
 }
 
 async fn enqueue_voice_recipient_index_snapshot(
@@ -2514,4 +2567,98 @@ impl OwnerReplicable for ClientReplicationAdapter {
 fn block_in_place_or_current<T>(f: impl FnOnce(&tokio::runtime::Handle) -> T) -> Option<T> {
     let handle = tokio::runtime::Handle::try_current().ok()?;
     Some(tokio::task::block_in_place(|| f(&handle)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn strict_proposal_gateway_timeout_tracks_replication_ttl() {
+        let timeout =
+            strict_proposal_gateway_response_timeout(&replications::ReplicationConfig::default());
+
+        assert!(timeout > replications::ReplicationConfig::default().propose_ttl());
+        assert_eq!(timeout, Duration::from_millis(10_200));
+    }
+
+    #[test]
+    fn strict_proposal_gateway_timeout_keeps_generic_floor() {
+        let cfg = replications::ReplicationConfig::default()
+            .with_propose_ttl(Duration::from_millis(100))
+            .with_delivery_tick_interval(Duration::from_millis(50));
+
+        assert_eq!(
+            strict_proposal_gateway_response_timeout(&cfg),
+            S2S_GATEWAY_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn voice_recipient_index_filter_ignores_unrelated_client_updates() {
+        let entry = ClientStateLogEntry {
+            version: 1,
+            node_id: 1,
+            timestamp: 0,
+            channel_version_dep: None,
+            op: ClientStateOperation::UpdateGlobalState {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                session_id: ClientSessionIdentifier::new(1, 1).unwrap(),
+                client_instance_id: 1,
+                sender_session_id: None,
+                delta: ClientGlobalStateDelta {
+                    self_mute: Some(true),
+                    ..Default::default()
+                },
+            },
+        };
+
+        assert!(!client_entry_affects_voice_recipient_index(&entry));
+    }
+
+    #[test]
+    fn voice_recipient_index_filter_detects_channel_updates() {
+        let entry = ClientStateLogEntry {
+            version: 1,
+            node_id: 1,
+            timestamp: 0,
+            channel_version_dep: None,
+            op: ClientStateOperation::UpdateGlobalState {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                session_id: ClientSessionIdentifier::new(1, 1).unwrap(),
+                client_instance_id: 1,
+                sender_session_id: None,
+                delta: ClientGlobalStateDelta {
+                    current_channel_id: Some(42),
+                    ..Default::default()
+                },
+            },
+        };
+
+        assert!(client_entry_affects_voice_recipient_index(&entry));
+    }
+
+    #[test]
+    fn voice_recipient_index_filter_ignores_non_default_server_scopes() {
+        let entry = ClientStateLogEntry {
+            version: 1,
+            node_id: 1,
+            timestamp: 0,
+            channel_version_dep: None,
+            op: ClientStateOperation::UpdateGlobalState {
+                server_id: "other".to_owned(),
+                session_id: ClientSessionIdentifier::new(1, 1).unwrap(),
+                client_instance_id: 1,
+                sender_session_id: None,
+                delta: ClientGlobalStateDelta {
+                    current_channel_id: Some(42),
+                    ..Default::default()
+                },
+            },
+        };
+
+        assert!(!client_entry_affects_voice_recipient_index(&entry));
+    }
 }

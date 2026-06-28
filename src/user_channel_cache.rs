@@ -1,12 +1,15 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::acl::ACLPermissions;
 use crate::client::{Client, ClientTransportKind};
@@ -42,7 +45,14 @@ struct UserChannelCacheEntry {
 
 pub struct UserChannelCache {
     path: Option<PathBuf>,
-    entries: Mutex<HashMap<String, UserChannelCacheEntry>>,
+    entries: Arc<Mutex<HashMap<String, UserChannelCacheEntry>>>,
+    saver: Option<BackgroundSaver>,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundSaver {
+    dirty: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl UserChannelCache {
@@ -70,16 +80,21 @@ impl UserChannelCache {
             Err(error) => return Err(error),
         };
 
+        let entries = Arc::new(Mutex::new(entries));
+        let saver = BackgroundSaver::spawn(path.clone(), Arc::clone(&entries));
+
         Ok(Arc::new(Self {
             path: Some(path),
-            entries: Mutex::new(entries),
+            entries,
+            saver: Some(saver),
         }))
     }
 
     pub fn new_in_memory() -> Arc<Self> {
         Arc::new(Self {
             path: None,
-            entries: Mutex::new(HashMap::new()),
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            saver: None,
         })
     }
 
@@ -92,12 +107,15 @@ impl UserChannelCache {
 
     pub async fn remember_last_channel(&self, key: &str, channel_id: u32) -> io::Result<()> {
         let now = Utc::now();
-        let mut entries = self.entries.lock().await;
-        let entry = entries.entry(key.to_owned()).or_default();
-        entry.last_channel_id = Some(channel_id);
-        entry.last_channel_expires_at = Some(now + Duration::days(LAST_CHANNEL_TTL_DAYS));
-        prune_entries_at(&mut entries, now);
-        self.save_locked(&entries).await
+        {
+            let mut entries = self.entries.lock().await;
+            let entry = entries.entry(key.to_owned()).or_default();
+            entry.last_channel_id = Some(channel_id);
+            entry.last_channel_expires_at = Some(now + Duration::days(LAST_CHANNEL_TTL_DAYS));
+            prune_entries_at(&mut entries, now);
+        }
+        self.stage_save();
+        Ok(())
     }
 
     pub async fn remember_listening_channels<I>(&self, key: &str, channels: I) -> io::Result<()>
@@ -119,45 +137,95 @@ impl UserChannelCache {
             Some(now + Duration::hours(LISTENING_CHANNEL_TTL_HOURS))
         };
         prune_entries_at(&mut entries, now);
-        self.save_locked(&entries).await
+        drop(entries);
+        self.stage_save();
+        Ok(())
     }
 
-    async fn save_locked(
-        &self,
-        entries: &HashMap<String, UserChannelCacheEntry>,
-    ) -> io::Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
+    fn stage_save(&self) {
+        if self.path.is_none() {
+            return;
+        }
+        let Some(saver) = &self.saver else {
+            return;
         };
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
 
-        let tmp_path = path.with_file_name(format!(
-            "{}.tmp",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(CACHE_FILE_NAME)
-        ));
-        let json = serde_json::to_vec_pretty(entries).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("serialize user channel cache: {error}"),
-            )
-        })?;
-
-        {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp_path)
-                .await?;
-            file.write_all(&json).await?;
-            file.sync_data().await?;
-        }
-        tokio::fs::rename(&tmp_path, path).await
+        saver.mark_dirty();
     }
+}
+
+impl BackgroundSaver {
+    fn spawn(path: PathBuf, entries: Arc<Mutex<HashMap<String, UserChannelCacheEntry>>>) -> Self {
+        let dirty = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        tokio::spawn(cache_save_loop(
+            path,
+            Arc::clone(&entries),
+            Arc::clone(&dirty),
+            Arc::clone(&notify),
+        ));
+        Self { dirty, notify }
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+}
+
+async fn cache_save_loop(
+    path: PathBuf,
+    entries: Arc<Mutex<HashMap<String, UserChannelCacheEntry>>>,
+    dirty: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+) {
+    loop {
+        notify.notified().await;
+        while dirty.swap(false, Ordering::AcqRel) {
+            let snapshot = entries.lock().await.clone();
+            if let Err(error) = save_snapshot(&path, &snapshot).await {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to save user channel cache"
+                );
+            }
+        }
+    }
+}
+
+async fn save_snapshot(
+    path: &Path,
+    entries: &HashMap<String, UserChannelCacheEntry>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let tmp_path = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(CACHE_FILE_NAME)
+    ));
+    let json = serde_json::to_vec_pretty(entries).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("serialize user channel cache: {error}"),
+        )
+    })?;
+
+    {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .await?;
+        file.write_all(&json).await?;
+        file.sync_data().await?;
+    }
+    tokio::fs::rename(&tmp_path, path).await
 }
 
 impl UserChannelCacheEntry {
@@ -542,11 +610,43 @@ mod tests {
             .await
             .unwrap();
 
+        wait_for_cache_file(dir.path(), "alice", Some(5), &[5, 9]).await;
+
         let loaded = UserChannelCache::open(dir.path()).await.unwrap();
         let cached = loaded.get("alice").await.expect("cache entry");
 
         assert_eq!(cached.last_channel_id, Some(5));
         assert_eq!(cached.listening_channel_ids, vec![5, 9]);
         assert!(dir.path().join(CACHE_FILE_NAME).exists());
+    }
+
+    async fn wait_for_cache_file(
+        dir: &Path,
+        key: &str,
+        expected_last_channel: Option<u32>,
+        expected_listening_channels: &[u32],
+    ) {
+        let path = dir.join(CACHE_FILE_NAME);
+        for _ in 0..100 {
+            if let Ok(bytes) = tokio::fs::read(&path).await {
+                if let Ok(entries) =
+                    serde_json::from_slice::<HashMap<String, UserChannelCacheEntry>>(&bytes)
+                {
+                    let cached = entries
+                        .get(key)
+                        .and_then(|entry| entry.cached_channels_at(Utc::now()));
+                    if let Some(cached) = cached {
+                        if cached.last_channel_id == expected_last_channel
+                            && cached.listening_channel_ids == expected_listening_channels
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("cache file was not persisted");
     }
 }

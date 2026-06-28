@@ -16,6 +16,12 @@ impl From<prost::EncodeError> for WriteProtoMessageError {
     }
 }
 
+impl WriteProtoMessageError {
+    pub fn is_peer_disconnect(&self) -> bool {
+        matches!(self, WriteProtoMessageError::IOError(err) if write_io_error_is_peer_disconnect(err))
+    }
+}
+
 impl std::fmt::Display for WriteProtoMessageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -28,3 +34,13 @@ impl std::fmt::Display for WriteProtoMessageError {
 }
 
 impl std::error::Error for WriteProtoMessageError {}
+
+fn write_io_error_is_peer_disconnect(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}

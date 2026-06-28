@@ -629,7 +629,14 @@ impl Client {
     }
 
     pub fn can_receive_voice(&self) -> bool {
-        self.can_receive_voice.load(Ordering::Acquire)
+        if self.can_receive_voice.load(Ordering::Acquire) {
+            return true;
+        }
+        let current = self.global_state.read().can_receive_voice();
+        if current {
+            self.can_receive_voice.store(true, Ordering::Release);
+        }
+        current
     }
 
     pub fn set_can_receive_voice(&self, value: bool) {

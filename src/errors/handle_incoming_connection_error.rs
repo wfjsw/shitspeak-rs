@@ -93,18 +93,74 @@ impl std::fmt::Display for HandleIncomingConnectionError {
 
 impl HandleIncomingConnectionError {
     /// Returns `true` when the error represents a peer that closed the
-    /// connection without sending TLS `close_notify` — a normal occurrence
-    /// with many Mumble clients and should not be logged as a warning.
+    /// connection without sending TLS `close_notify`, or before the server
+    /// could finish a pending write. This is a normal occurrence with many
+    /// Mumble clients and should not be logged as a warning.
     pub fn is_clean_disconnect(&self) -> bool {
-        let io_err = match self {
-            HandleIncomingConnectionError::IOError(e) => e,
-            HandleIncomingConnectionError::ReadProtoMessageError(
-                ReadProtoMessageError::IOError(e),
-            ) => e,
-            _ => return false,
-        };
-        io_err.kind() == std::io::ErrorKind::UnexpectedEof
+        match self {
+            HandleIncomingConnectionError::IOError(err) => raw_io_error_is_peer_disconnect(err),
+            HandleIncomingConnectionError::ReadProtoMessageError(err) => err.is_peer_disconnect(),
+            HandleIncomingConnectionError::WriteProtoMessageError(err)
+            | HandleIncomingConnectionError::ClientWriteFailed(err) => err.is_peer_disconnect(),
+            HandleIncomingConnectionError::MessageHandlerFailed(err) => err.is_peer_disconnect(),
+            _ => false,
+        }
     }
 }
 
 impl std::error::Error for HandleIncomingConnectionError {}
+
+fn raw_io_error_is_peer_disconnect(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io_error(kind: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::new(kind, "test peer disconnect")
+    }
+
+    #[test]
+    fn clean_disconnect_includes_write_side_peer_close_errors() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let err = HandleIncomingConnectionError::ClientWriteFailed(
+                WriteProtoMessageError::from(io_error(kind)),
+            );
+            assert!(
+                err.is_clean_disconnect(),
+                "{kind:?} should be treated as a clean peer disconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_disconnect_includes_handler_write_peer_close_errors() {
+        let err = HandleIncomingConnectionError::MessageHandlerFailed(
+            MessageHandlerError::WriteProtoMessageError(WriteProtoMessageError::from(io_error(
+                std::io::ErrorKind::BrokenPipe,
+            ))),
+        );
+        assert!(err.is_clean_disconnect());
+    }
+
+    #[test]
+    fn clean_disconnect_excludes_non_disconnect_write_errors() {
+        let err = HandleIncomingConnectionError::ClientWriteFailed(WriteProtoMessageError::from(
+            io_error(std::io::ErrorKind::PermissionDenied),
+        ));
+        assert!(!err.is_clean_disconnect());
+    }
+}

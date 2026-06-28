@@ -1283,9 +1283,6 @@ impl ClientRepository {
             if id.server_id() != DEFAULT_SERVER_ID {
                 continue;
             }
-            if !client.can_receive_voice() {
-                continue;
-            }
             snapshot
                 .entry(client.get_current_channel_id())
                 .or_default()

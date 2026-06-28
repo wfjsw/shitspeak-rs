@@ -48,6 +48,12 @@ impl From<FromProtoToMessageError> for ReadProtoMessageError {
     }
 }
 
+impl ReadProtoMessageError {
+    pub fn is_peer_disconnect(&self) -> bool {
+        matches!(self, ReadProtoMessageError::IOError(err) if read_io_error_is_peer_disconnect(err))
+    }
+}
+
 impl std::fmt::Display for ReadProtoMessageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -62,3 +68,13 @@ impl std::fmt::Display for ReadProtoMessageError {
 }
 
 impl std::error::Error for ReadProtoMessageError {}
+
+fn read_io_error_is_peer_disconnect(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
