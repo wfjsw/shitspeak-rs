@@ -721,7 +721,7 @@ async fn send_lsa_flood(
     #[cfg(debug_assertions)]
     let payload_len = payload.len();
     match transport
-        .send_with_options(
+        .try_send_with_options(
             dst,
             ServiceLevel::Reliable,
             None,

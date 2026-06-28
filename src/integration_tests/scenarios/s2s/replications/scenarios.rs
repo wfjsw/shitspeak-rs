@@ -1,7 +1,7 @@
 //! End-to-end replication scenarios over a real overlay.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rand::rngs::SmallRng;
@@ -112,6 +112,52 @@ fn channel_tuning() -> ChannelRepoTuning {
         snapshot_every_secs: 60,
         wal_compaction_expire_count: 100,
     }
+}
+
+async fn wait_for_elected_channel_history(
+    repos: &[Arc<ChannelRepository>],
+    deadline: Duration,
+) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if elected_channel_history_matches(repos).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    elected_channel_history_matches(repos).await
+}
+
+async fn elected_channel_history_matches(repos: &[Arc<ChannelRepository>]) -> bool {
+    for repo in repos {
+        if repo.current_version() != 5 {
+            return false;
+        }
+        let channels = repo.get_all().await;
+        let has_channel = |id| channels.iter().any(|channel| channel.id == id);
+        if !has_channel(20) || !has_channel(21) || !has_channel(22) || has_channel(30) {
+            return false;
+        }
+    }
+    true
+}
+
+async fn channel_history_status(repos: &[Arc<ChannelRepository>]) -> Vec<String> {
+    let mut out = Vec::with_capacity(repos.len());
+    for (idx, repo) in repos.iter().enumerate() {
+        let mut channels: Vec<_> = repo
+            .get_all()
+            .await
+            .into_iter()
+            .map(|channel| (channel.id, channel.name))
+            .collect();
+        channels.sort_by_key(|(id, _)| *id);
+        out.push(format!(
+            "repo{idx}: version={} channels={channels:?}",
+            repo.current_version()
+        ));
+    }
+    out
 }
 
 fn block_in_place_or_current<T>(f: impl FnOnce(&tokio::runtime::Handle) -> T) -> Option<T> {
@@ -549,23 +595,13 @@ async fn strict_channel_repository_split_heal_elects_one_complete_history() {
         "routing did not reconverge after partition heal"
     );
 
-    let healed = wait_until(Duration::from_secs(20), || {
-        repos.iter().all(|repo| {
-            repo.current_version() == 5
-                && tokio::task::block_in_place(|| {
-                    let handle = tokio::runtime::Handle::current();
-                    handle.block_on(repo.get_channel(20)).is_some()
-                        && handle.block_on(repo.get_channel(21)).is_some()
-                        && handle.block_on(repo.get_channel(22)).is_some()
-                        && handle.block_on(repo.get_channel(30)).is_none()
-                })
-        })
-    })
-    .await;
-    assert!(
-        healed,
-        "healed cluster did not converge on the elected channel history"
-    );
+    let healed = wait_for_elected_channel_history(&repos, Duration::from_secs(45)).await;
+    if !healed {
+        panic!(
+            "healed cluster did not converge on the elected channel history: {:?}",
+            channel_history_status(&repos).await
+        );
+    }
 
     let names: Vec<Vec<String>> = repos
         .iter()

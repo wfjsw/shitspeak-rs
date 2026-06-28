@@ -83,7 +83,7 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
     let payload_len = payload.len();
     match ctx
         .transport
-        .send(
+        .try_send(
             dst,
             ServiceLevel::Reliable,
             None,

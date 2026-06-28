@@ -1711,7 +1711,6 @@ async fn s2s_client_replication_propagates_add_update_remove() {
 /// Run with:
 /// `cargo test s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "expensive diagnostic: 8-node S2S latency/channel-move load"]
 async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
     let _guard = s2s_network_test_guard().await;
     let cluster = spawn_s2s_lag_diagnostic_cluster().await;

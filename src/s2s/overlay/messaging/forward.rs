@@ -642,29 +642,16 @@ async fn forward_pb_as(
         let payload_len = payload.len();
         let transport = transport.clone();
         sends.push(async move {
-            let result = if is_originator {
-                transport
-                    .send_with_options(
-                        next_hop,
-                        level,
-                        Some(routing_metric),
-                        transport_class,
-                        payload,
-                        send_options,
-                    )
-                    .await
-            } else {
-                transport
-                    .try_send_with_options(
-                        next_hop,
-                        level,
-                        Some(routing_metric),
-                        transport_class,
-                        payload,
-                        send_options,
-                    )
-                    .await
-            };
+            let result = transport
+                .try_send_with_options(
+                    next_hop,
+                    level,
+                    Some(routing_metric),
+                    transport_class,
+                    payload,
+                    send_options,
+                )
+                .await;
             #[cfg(debug_assertions)]
             if result.is_ok() {
                 crate::s2s::debug_io::record_sent(packet_kind, payload_len);
@@ -799,7 +786,7 @@ async fn send_encoded_to_target(
     };
     if is_originator {
         transport
-            .send(entry.next_hop, level, Some(routing_metric), class, payload)
+            .try_send(entry.next_hop, level, Some(routing_metric), class, payload)
             .await?;
     } else {
         transport
@@ -814,7 +801,7 @@ mod tests {
     use super::super::super::proto::decode_message;
     use super::super::super::routing::{RouteEntry, new_handle};
     use super::*;
-    use crate::s2s::transport::TransportKind;
+    use crate::s2s::transport::{SendError, TransportKind};
     use tokio::time::timeout;
 
     fn test_overlay_data(allow_l1_compression: bool) -> pb::OverlayData {
@@ -847,6 +834,34 @@ mod tests {
         }
         routing.store(Arc::new(tables));
         routing
+    }
+
+    fn routing_with_routes(routes: &[(NodeIdentifier, NodeIdentifier)]) -> RoutingHandle {
+        let routing = new_handle();
+        let mut tables = RoutingTables::empty();
+        let table: HashMap<_, _> = routes
+            .iter()
+            .map(|(dst, next_hop)| {
+                (
+                    *dst,
+                    RouteEntry {
+                        next_hop: *next_hop,
+                        cost: 1,
+                    },
+                )
+            })
+            .collect();
+        for level in ServiceLevel::ALL {
+            tables.insert_table(RoutingMetric::ReliableCost, level, table.clone());
+        }
+        routing.store(Arc::new(tables));
+        routing
+    }
+
+    fn overlay_data_for_dsts(dsts: &[NodeIdentifier]) -> pb::OverlayData {
+        let mut data = test_overlay_data(false);
+        data.dsts = dsts.iter().map(|dst| node_to_wire(*dst)).collect();
+        data
     }
 
     #[test]
@@ -1015,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn originated_overlay_forward_still_reports_backpressure_under_outbound_saturation() {
+    async fn originated_overlay_forward_returns_backpressure_when_peer_outbound_queue_is_full() {
         let (transport, _receivers) =
             ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
         transport
@@ -1030,7 +1045,7 @@ mod tests {
             .unwrap();
         let routing = routing_with_route(4, 4);
 
-        let result = timeout(
+        let err = timeout(
             Duration::from_millis(50),
             forward_pb_as(
                 &transport,
@@ -1041,11 +1056,68 @@ mod tests {
                 true,
             ),
         )
-        .await;
+        .await
+        .expect("originated forward should not wait for outbound queue space")
+        .unwrap_err();
 
-        assert!(
-            result.is_err(),
-            "originated overlay forward should keep the existing awaited backpressure behavior"
-        );
+        assert!(matches!(
+            err,
+            OverlayError::Send(SendError::Backpressure {
+                node: 4,
+                transport: TransportKind::Tcp,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn originated_overlay_forward_still_reaches_healthy_peer_when_another_queue_is_full() {
+        let (transport_to_stuck, _stuck_rx) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        transport_to_stuck
+            .try_send(
+                4,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fill"),
+            )
+            .await
+            .unwrap();
+
+        let transport = transport_to_stuck;
+        let mut healthy_rx = transport.test_install_live_stream(5, TransportKind::Tcp);
+        let routing = routing_with_routes(&[(4, 4), (5, 5)]);
+
+        let err = timeout(
+            Duration::from_millis(50),
+            forward_pb_as(
+                &transport,
+                &routing,
+                1,
+                overlay_data_for_dsts(&[4, 5]),
+                MessageClass::Regular,
+                true,
+            ),
+        )
+        .await
+        .expect("stuck peer should not block sending to healthy peer")
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            OverlayError::Send(SendError::Backpressure {
+                node: 4,
+                transport: TransportKind::Tcp,
+            })
+        ));
+        let forwarded = healthy_rx
+            .try_recv()
+            .expect("healthy peer should receive its frame");
+        assert_eq!(forwarded.class(), MessageClass::Regular);
+        let decoded = decode_message(forwarded.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(data.dsts, vec![node_to_wire(5)]);
     }
 }

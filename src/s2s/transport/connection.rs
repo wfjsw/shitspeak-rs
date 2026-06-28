@@ -24,6 +24,7 @@ use super::service_level::{MessageClass, PeerAddress, TransportKind};
 
 const MAX_OBSERVED_REMOTE_IPS: usize = 8;
 const BACKOFF_JITTER_DIVISOR: u64 = 5;
+const OUTBOUND_QUEUE_WATERMARK_LOG_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
 /// One outbound frame, addressed to a specific stream.
 #[derive(Debug, Clone)]
@@ -88,6 +89,76 @@ pub(crate) struct ActiveStream {
     closed: CancellationToken,
     is_dialer: bool,
     installed_at: Instant,
+}
+
+#[derive(Debug)]
+struct OutboundQueueWatermark {
+    high_depth: usize,
+    last_depth: usize,
+    capacity: usize,
+    samples: u64,
+    full_samples: u64,
+    last_report: Instant,
+}
+
+#[derive(Debug)]
+struct OutboundQueueWatermarkReport {
+    high_depth: usize,
+    last_depth: usize,
+    capacity: usize,
+    samples: u64,
+    full_samples: u64,
+    interval: Duration,
+}
+
+impl OutboundQueueWatermark {
+    fn new(now: Instant) -> Self {
+        Self {
+            high_depth: 0,
+            last_depth: 0,
+            capacity: 0,
+            samples: 0,
+            full_samples: 0,
+            last_report: now,
+        }
+    }
+
+    fn record(
+        &mut self,
+        now: Instant,
+        depth: usize,
+        capacity: usize,
+        is_full: bool,
+    ) -> Option<OutboundQueueWatermarkReport> {
+        self.high_depth = self.high_depth.max(depth);
+        self.last_depth = depth;
+        self.capacity = capacity;
+        self.samples = self.samples.saturating_add(1);
+        if is_full {
+            self.full_samples = self.full_samples.saturating_add(1);
+        }
+
+        let interval = now.duration_since(self.last_report);
+        if interval < OUTBOUND_QUEUE_WATERMARK_LOG_INTERVAL {
+            return None;
+        }
+
+        let report = OutboundQueueWatermarkReport {
+            high_depth: self.high_depth,
+            last_depth: self.last_depth,
+            capacity: self.capacity,
+            samples: self.samples,
+            full_samples: self.full_samples,
+            interval,
+        };
+        self.high_depth = 0;
+        self.last_depth = 0;
+        self.capacity = capacity;
+        self.samples = 0;
+        self.full_samples = 0;
+        self.last_report = now;
+        Some(report)
+    }
 }
 
 impl ActiveStream {
@@ -342,6 +413,7 @@ pub(crate) struct PeerState {
     metrics: Arc<PeerMetrics>,
     backoff_initial: Duration,
     address_backoffs: Mutex<HashMap<PeerAddress, BackoffState>>,
+    outbound_queue_watermarks: Mutex<HashMap<TransportKind, OutboundQueueWatermark>>,
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
     connecting: AtomicBool,
@@ -366,6 +438,7 @@ impl PeerState {
             metrics: Arc::new(PeerMetrics::new(bandwidth_window, metrics_tuning)),
             backoff_initial,
             address_backoffs: Mutex::new(HashMap::new()),
+            outbound_queue_watermarks: Mutex::new(HashMap::new()),
             connecting: AtomicBool::new(false),
         })
     }
@@ -736,6 +809,38 @@ impl PeerState {
             .map(|s| s.sender.clone())
     }
 
+    pub fn record_outbound_queue_sample(
+        &self,
+        transport: TransportKind,
+        class: MessageClass,
+        depth: usize,
+        capacity: usize,
+        is_full: bool,
+    ) {
+        let report = {
+            let now = Instant::now();
+            let mut watermarks = self.outbound_queue_watermarks.lock();
+            watermarks
+                .entry(transport)
+                .or_insert_with(|| OutboundQueueWatermark::new(now))
+                .record(now, depth, capacity, is_full)
+        };
+        if let Some(report) = report {
+            tracing::debug!(
+                peer = %self.node_id,
+                ?transport,
+                ?class,
+                queue_capacity = report.capacity,
+                queue_depth = report.last_depth,
+                queue_high_watermark = report.high_depth,
+                queue_samples = report.samples,
+                queue_full_samples = report.full_samples,
+                interval_secs = report.interval.as_secs(),
+                "s2s outbound queue watermark"
+            );
+        }
+    }
+
     pub fn has_any_live_stream(&self) -> bool {
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
@@ -884,6 +989,55 @@ mod tests {
         b.record_success();
         assert_eq!(b.next_delay, Duration::from_millis(250));
         assert_eq!(b.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn outbound_queue_watermark_reports_and_resets_window() {
+        let start = Instant::now();
+        let mut watermark = OutboundQueueWatermark::new(start);
+
+        assert!(
+            watermark
+                .record(start + Duration::from_secs(30), 2, 8, false)
+                .is_none()
+        );
+        assert!(
+            watermark
+                .record(start + Duration::from_secs(60), 6, 8, true)
+                .is_none()
+        );
+
+        let report = watermark
+            .record(start + OUTBOUND_QUEUE_WATERMARK_LOG_INTERVAL, 4, 8, false)
+            .expect("watermark interval elapsed");
+
+        assert_eq!(report.high_depth, 6);
+        assert_eq!(report.last_depth, 4);
+        assert_eq!(report.capacity, 8);
+        assert_eq!(report.samples, 3);
+        assert_eq!(report.full_samples, 1);
+
+        assert!(
+            watermark
+                .record(
+                    start + OUTBOUND_QUEUE_WATERMARK_LOG_INTERVAL + Duration::from_secs(30),
+                    1,
+                    8,
+                    false,
+                )
+                .is_none()
+        );
+        let report = watermark
+            .record(
+                start + OUTBOUND_QUEUE_WATERMARK_LOG_INTERVAL * 2,
+                3,
+                8,
+                false,
+            )
+            .expect("second watermark interval elapsed");
+        assert_eq!(report.high_depth, 3);
+        assert_eq!(report.samples, 2);
+        assert_eq!(report.full_samples, 0);
     }
 
     #[test]

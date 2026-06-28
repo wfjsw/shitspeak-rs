@@ -421,6 +421,24 @@ impl ConnectionManager {
         (Self { inner }, receivers)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install_live_stream(
+        &self,
+        peer_node: NodeIdentifier,
+        kind: TransportKind,
+    ) -> mpsc::Receiver<OutboundFrame> {
+        let peer = self.inner.get_or_create_peer(peer_node);
+        let (tx, rx) = mpsc::channel(1);
+        peer.install_stream(super::connection::ActiveStream::new(
+            kind,
+            None,
+            tx,
+            CancellationToken::new(),
+            false,
+        ));
+        rx
+    }
+
     pub fn local_node_id(&self) -> NodeIdentifier {
         self.inner.self_id
     }
@@ -779,19 +797,31 @@ impl ConnectionManager {
             transport: kind,
         })?;
         let frame = OutboundFrame::with_options(class, payload, options);
+        record_outbound_queue_sample(peer, kind, class, &sender, false);
         match sender.try_send(frame) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(frame)) if wait_for_space => sender
-                .send(frame)
-                .await
-                .map_err(|_| SendError::StreamClosed {
+            Ok(()) => {
+                record_outbound_queue_sample(peer, kind, class, &sender, false);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(frame)) if wait_for_space => {
+                record_outbound_queue_sample(peer, kind, class, &sender, true);
+                sender
+                    .send(frame)
+                    .await
+                    .map_err(|_| SendError::StreamClosed {
+                        node: peer.node_id(),
+                        transport: kind,
+                    })?;
+                record_outbound_queue_sample(peer, kind, class, &sender, false);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                record_outbound_queue_sample(peer, kind, class, &sender, true);
+                Err(SendError::Backpressure {
                     node: peer.node_id(),
                     transport: kind,
-                }),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(SendError::Backpressure {
-                node: peer.node_id(),
-                transport: kind,
-            }),
+                })
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(SendError::StreamClosed {
                 node: peer.node_id(),
                 transport: kind,
@@ -1065,6 +1095,19 @@ fn is_private_ip(ip: IpAddr) -> bool {
         }
         IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00) == 0xfc00,
     }
+}
+
+fn record_outbound_queue_sample(
+    peer: &PeerState,
+    transport: TransportKind,
+    class: MessageClass,
+    sender: &mpsc::Sender<OutboundFrame>,
+    is_full: bool,
+) {
+    let remaining = sender.capacity();
+    let max_capacity = sender.max_capacity();
+    let depth = max_capacity.saturating_sub(remaining);
+    peer.record_outbound_queue_sample(transport, class, depth, max_capacity, is_full);
 }
 
 /// Build every endpoint for which the corresponding `<kind>_listen` is set.

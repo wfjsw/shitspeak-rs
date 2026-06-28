@@ -61,7 +61,7 @@ pub async fn send_request(
             #[cfg(debug_assertions)]
             let payload_len = payload.len();
             match transport
-                .send_with_options(
+                .try_send_with_options(
                     dst,
                     ServiceLevel::Reliable,
                     None,
@@ -186,7 +186,7 @@ pub async fn push_snapshot(
     if entries.is_empty() {
         return;
     }
-    send_response_chunks(transport, dst, &entries, max_response_lsas, false).await;
+    send_response_chunks(transport, dst, &entries, max_response_lsas, true).await;
 }
 
 /// Handle an inbound `LsdbSyncResp`. Each LSA goes through the normal
