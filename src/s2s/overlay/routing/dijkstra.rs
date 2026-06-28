@@ -302,7 +302,7 @@ fn compute_cost(link: &LinkAdvertised, metric: RoutingMetric, cfg: &OverlayConfi
             link.jitter_us as f64,
             route_throughput_bps as f64,
             link.loss_ppm,
-        ) * 1_000.0)
+        ) * 10_000_000.0)
             .ceil()
             .max(1.0) as u64,
     };

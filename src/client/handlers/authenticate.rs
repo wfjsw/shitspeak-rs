@@ -324,8 +324,10 @@ pub async fn handle_authenticate(
             repo,
             server.get_channels().current_version_in_server(&server_id),
         );
-        let initial_perms =
-            crate::client::acl::compute_permissions_for_client(server, sender, target_ch).await;
+        let initial_perms = crate::client::acl::compute_permissions_for_client_as_if_in_channel(
+            server, sender, target_ch,
+        )
+        .await;
         {
             let mut gs = sender.write_global_state(repo);
             for channel_id in &restored_channels.listening_channel_ids {

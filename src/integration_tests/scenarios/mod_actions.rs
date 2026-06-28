@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::acl::ACLPermissions;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
+use crate::messages::encoder::UserState;
 
 /// Checks that a moderator mute is applied to another user.
 /// Expected: Bob receives `UserState { mute: true }` for his session. Mumble
@@ -43,6 +44,69 @@ async fn mod_mutes_other() {
         )
         .await;
     assert!(msg.is_some(), "Bob should have received mute=true");
+}
+
+#[tokio::test]
+async fn superuser_can_unsuppress_other() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let live_bob = server
+        .server
+        .get_clients()
+        .get_client(bob.server_session)
+        .await
+        .expect("live bob");
+    {
+        let mut gs = live_bob.write_global_state_direct();
+        gs.set_suppress(true);
+    }
+
+    let mut state = UserState::default();
+    state.session = Some(bob.server_session);
+    state.suppress = Some(false);
+    alice.send(state.into()).await;
+
+    let cleared = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id)
+                        && us.suppress == Some(false))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        cleared.is_some(),
+        "superuser should be able to unsuppress Bob"
+    );
+
+    let denied = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionDenied(pd)
+                    if pd.permission == Some(ACLPermissions::MuteDeafen as u32))
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        denied.is_none(),
+        "unsuppress should not report missing MuteDeafen to a superuser"
+    );
 }
 
 /// Checks that a moderator kick removes the target from the server.

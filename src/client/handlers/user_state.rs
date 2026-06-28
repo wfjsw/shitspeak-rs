@@ -274,7 +274,7 @@ pub async fn handle_user_state(
         None
     };
 
-    if msg.suppress.is_some() && (!is_self || msg.suppress == Some(true)) {
+    if msg.suppress == Some(true) {
         return Err(MessageHandlerError::PermissionDenied(
             PermissionDenied::for_permission(
                 u32::from(sender_id),
@@ -538,7 +538,8 @@ pub async fn handle_user_state(
                 mute: msg.mute,
                 deaf: msg.deaf,
                 suppress: post_move_destination_perms
-                    .map(|perms| !perms.contains(ACLPermissions::Speak)),
+                    .map(|perms| !perms.contains(ACLPermissions::Speak))
+                    .or(msg.suppress),
                 priority_speaker: msg.priority_speaker,
                 listening_channel_add: msg.listening_channel_add.clone(),
                 listening_channel_remove: msg.listening_channel_remove.clone(),

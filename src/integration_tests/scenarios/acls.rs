@@ -1741,7 +1741,165 @@ async fn in_group_speak_allow_clears_suppress_after_entering_channel() {
         .await;
     assert!(
         moved.is_some(),
-        "@in +Speak should clear suppression after Bob enters the channel"
+        "in +Speak should clear suppression after Bob enters the channel"
+    );
+}
+
+#[tokio::test]
+async fn cached_login_into_in_group_speak_channel_starts_unsuppressed() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .set_acls(
+            0,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Speak.into(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(75, "Fleet 04".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(
+            76,
+            "Fleet 04 Ready".to_owned(),
+            0,
+            0,
+            Some(75),
+        ))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            76,
+            true,
+            vec![acl_for_group(
+                "in",
+                ACLPermissions::Speak.into(),
+                enumflags2::BitFlags::empty(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+    server
+        .server
+        .get_user_channel_cache()
+        .remember_last_channel("2", 76)
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let self_state = bob
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob.session_id))
+        .expect("Bob self state");
+
+    assert_eq!(self_state.channel_id, Some(76));
+    assert_ne!(
+        self_state.suppress,
+        Some(true),
+        "in +Speak should keep Bob unsuppressed when login restores him into the channel"
+    );
+}
+
+#[tokio::test]
+async fn acl_cache_does_not_cross_reused_local_session_ids() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .set_acls(
+            0,
+            true,
+            vec![
+                acl_for_group(
+                    "all",
+                    enumflags2::BitFlags::empty(),
+                    ACLPermissions::Speak.into(),
+                    true,
+                ),
+                ACL {
+                    user_id: Some(2),
+                    group: None,
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: ACLPermissions::Speak.into(),
+                    deny: enumflags2::BitFlags::empty(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(77, "Fleet 04".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    server
+        .server
+        .get_user_channel_cache()
+        .remember_last_channel("1", 77)
+        .await
+        .unwrap();
+    server
+        .server
+        .get_user_channel_cache()
+        .remember_last_channel("2", 77)
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let alice_perms = cached_permissions(&server, &alice, 77).await;
+    assert!(
+        !alice_perms.contains(ACLPermissions::Speak),
+        "Alice should prime a no-Speak cache entry for channel 77"
+    );
+    let alice_session_id = alice.session_id;
+    drop(alice);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let self_state = bob
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob.session_id))
+        .expect("Bob self state");
+
+    assert_eq!(
+        bob.session_id, alice_session_id,
+        "the test needs local session id reuse to reproduce the stale-cache shape"
+    );
+    assert_eq!(self_state.channel_id, Some(77));
+    assert_ne!(
+        self_state.suppress,
+        Some(true),
+        "Bob must not inherit Alice's cached no-Speak permission after session id reuse"
     );
 }
 

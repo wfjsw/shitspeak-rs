@@ -23,10 +23,11 @@
 //!
 //! # ACL cache
 //!
-//! Effective permissions are cached per `(session_id_u64, channel_id)` after
-//! first computation.  The cache is invalidated when ACLs change or when a
-//! user changes channels.  The actual ACL evaluation logic lives in `acl.rs`;
-//! the repository only drives invalidation and cache storage.
+//! Effective permissions are cached per `(session_id_u64, client_instance_id,
+//! channel_id)` after first computation.  The cache is invalidated when ACLs
+//! change or when a user changes channels.  The actual ACL evaluation logic
+//! lives in `acl.rs`; the repository only drives invalidation and cache
+//! storage.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -451,9 +452,10 @@ pub struct ChannelRepository {
     log_max_entries: usize,
     /// Bumped whenever channel state can change effective ACL results.
     channel_acl_generation: AtomicU64,
-    /// Cached effective permissions: (server_id, session_id_u64, channel_id) -> entry.
+    /// Cached effective permissions:
+    /// (server_id, session_id_u64, client_instance_id, channel_id) -> entry.
     /// Lock-free concurrent cache using scc::HashCache.
-    acl_cache: HashCache<(String, u64, u32), CachedAclPermissions>,
+    acl_cache: HashCache<(String, u64, u64, u32), CachedAclPermissions>,
     /// Optional storage directory.
     storage_dir: Option<PathBuf>,
     /// Append-only WAL file handle; `None` when running in-memory.
@@ -1697,6 +1699,7 @@ impl ChannelRepository {
     pub(crate) async fn get_cached_permissions(
         &self,
         session_id: u64,
+        client_instance_id: u64,
         channel_id: u32,
         channel_acl_generation: u64,
         client_acl_generation: u64,
@@ -1704,6 +1707,7 @@ impl ChannelRepository {
         self.get_cached_permissions_in_server(
             DEFAULT_SERVER_ID,
             session_id,
+            client_instance_id,
             channel_id,
             channel_acl_generation,
             client_acl_generation,
@@ -1716,13 +1720,19 @@ impl ChannelRepository {
         &self,
         server_id: &str,
         session_id: u64,
+        client_instance_id: u64,
         channel_id: u32,
         channel_acl_generation: u64,
         client_acl_generation: u64,
         explicit_enter_deny_overrides_write: bool,
     ) -> Option<BitFlags<ACLPermissions>> {
         self.acl_cache
-            .get_sync(&(server_id.to_owned(), session_id, channel_id))
+            .get_sync(&(
+                server_id.to_owned(),
+                session_id,
+                client_instance_id,
+                channel_id,
+            ))
             .and_then(|entry| {
                 let cache_key_matches = entry.channel_acl_generation == channel_acl_generation
                     && entry.client_acl_generation == client_acl_generation
@@ -1735,6 +1745,7 @@ impl ChannelRepository {
     pub(crate) async fn cache_permissions(
         &self,
         session_id: u64,
+        client_instance_id: u64,
         channel_id: u32,
         channel_acl_generation: u64,
         client_acl_generation: u64,
@@ -1743,6 +1754,7 @@ impl ChannelRepository {
         self.cache_permissions_in_server(
             DEFAULT_SERVER_ID,
             session_id,
+            client_instance_id,
             channel_id,
             channel_acl_generation,
             client_acl_generation,
@@ -1756,6 +1768,7 @@ impl ChannelRepository {
         &self,
         server_id: &str,
         session_id: u64,
+        client_instance_id: u64,
         channel_id: u32,
         channel_acl_generation: u64,
         client_acl_generation: u64,
@@ -1763,7 +1776,12 @@ impl ChannelRepository {
         permissions: BitFlags<ACLPermissions>,
     ) {
         let _ = self.acl_cache.put_sync(
-            (server_id.to_owned(), session_id, channel_id),
+            (
+                server_id.to_owned(),
+                session_id,
+                client_instance_id,
+                channel_id,
+            ),
             CachedAclPermissions {
                 channel_acl_generation,
                 client_acl_generation,
