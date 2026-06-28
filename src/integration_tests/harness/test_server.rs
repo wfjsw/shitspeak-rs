@@ -19,6 +19,7 @@ use crate::config::{
 use crate::constants::APP_PROTO_VER;
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
 use crate::protocol_version::ProtocolVersion;
+use crate::s2s::testing::LinkChaos;
 use crate::s2s::testing::pki::{Pki, install_provider_once, mint_pki};
 use crate::server::Server;
 
@@ -40,6 +41,7 @@ pub struct TestServerOpts {
     pub server_protocol_version: ProtocolVersion,
     pub channel_log_max_entries: usize,
     pub authenticate_timeout_ms: u64,
+    pub s2s_inbound_chaos: Option<LinkChaos>,
 }
 
 impl Default for TestServerOpts {
@@ -61,6 +63,7 @@ impl Default for TestServerOpts {
             server_protocol_version: APP_PROTO_VER,
             channel_log_max_entries: 10_000,
             authenticate_timeout_ms: 30_000,
+            s2s_inbound_chaos: None,
         }
     }
 }
@@ -81,6 +84,10 @@ impl TestServer {
         if let Some(h) = self.run_handle.take() {
             let _ = h.await;
         }
+    }
+
+    pub fn s2s_inbound_chaos(&self) -> Option<LinkChaos> {
+        self.server.s2s_manager().test_inbound_chaos()
     }
 }
 
@@ -233,6 +240,9 @@ async fn spawn_test_server_with_pki(
     let server = Server::new(config, adapter)
         .await
         .expect("Server::new failed");
+    if let Some(chaos) = opts.s2s_inbound_chaos {
+        server.s2s_manager().install_test_inbound_chaos(chaos);
+    }
 
     let addr = server.local_addr().expect("local_addr");
     let udp_addr = server.local_udp_addr().expect("local_udp_addr");

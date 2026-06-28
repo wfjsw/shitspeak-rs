@@ -146,7 +146,7 @@ struct ChaosState {
 }
 
 /// Public handle. Cloning is cheap; clones share the same chaos rules.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LinkChaos {
     state: Arc<Mutex<ChaosState>>,
 }

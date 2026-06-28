@@ -6,7 +6,7 @@ use std::{
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use tokio::net::TcpStream;
-use tokio::sync::{RwLock as AsyncRwLock, broadcast};
+use tokio::sync::{RwLock as AsyncRwLock, broadcast, mpsc};
 use tokio_rustls::server::TlsStream;
 
 use crate::{
@@ -53,7 +53,7 @@ pub struct ClientRepository {
     /// are protected by a single `RwLock` so that reads (lookups, log
     /// queries) don't contend with each other, but mutations are
     /// serialised.
-    register: AsyncRwLock<ClientRegister>,
+    register: Arc<AsyncRwLock<ClientRegister>>,
 
     clients_by_host: ParkingRwLock<HashMap<IpAddr, HashSet<ScopedSessionId>>>,
     clients_by_udp_address: ParkingRwLock<HashMap<UdpBindingKey, ScopedSessionId>>,
@@ -64,6 +64,12 @@ pub struct ClientRepository {
 
     /// Broadcast channel for per-client subscribers and future S2S peers.
     tx: broadcast::Sender<Arc<ClientStateBroadcastPayload>>,
+    deferred_commit_tx: Option<mpsc::UnboundedSender<DeferredClientCommit>>,
+}
+
+struct DeferredClientCommit {
+    op: ClientStateOperation,
+    channel_version_dep: Option<u64>,
 }
 
 pub struct ClientRegister {
@@ -214,27 +220,53 @@ impl ClientRegister {
 impl ClientRepository {
     pub fn new(local_node_id: u16, log_max_entries: usize) -> Self {
         let (tx, _) = broadcast::channel(1024);
+        let log_max_entries = log_max_entries.max(1);
+        let register = Arc::new(AsyncRwLock::new(ClientRegister {
+            local_clients: HashMap::new(),
+            local_log: VecDeque::new(),
+            remote_clients: HashMap::new(),
+            remote_logs: HashMap::new(),
+            versions: HashMap::new(),
+            pending_remote_ops: VecDeque::new(),
+            last_pending_effective_dep_by_server: HashMap::new(),
+            pending_channel_versions: HashMap::new(),
+            clients_by_channel: HashMap::new(),
+            client_channel: HashMap::new(),
+            listeners_by_channel: HashMap::new(),
+        }));
+        let deferred_commit_tx = tokio::runtime::Handle::try_current().ok().map(|handle| {
+            let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel::<DeferredClientCommit>();
+            let register = Arc::clone(&register);
+            let tx = tx.clone();
+            handle.spawn(async move {
+                while let Some(commit) = deferred_rx.recv().await {
+                    let broadcast = {
+                        let mut register = register.write().await;
+                        Self::commit_operation_inner(
+                            &mut register,
+                            local_node_id,
+                            log_max_entries,
+                            commit.op,
+                            commit.channel_version_dep,
+                        )
+                    };
+                    if let Some(broadcast) = broadcast {
+                        let _ = tx.send(broadcast);
+                    }
+                }
+            });
+            deferred_tx
+        });
         ClientRepository {
             local_node_id,
-            log_max_entries: log_max_entries.max(1),
-            register: AsyncRwLock::new(ClientRegister {
-                local_clients: HashMap::new(),
-                local_log: VecDeque::new(),
-                remote_clients: HashMap::new(),
-                remote_logs: HashMap::new(),
-                versions: HashMap::new(),
-                pending_remote_ops: VecDeque::new(),
-                last_pending_effective_dep_by_server: HashMap::new(),
-                pending_channel_versions: HashMap::new(),
-                clients_by_channel: HashMap::new(),
-                client_channel: HashMap::new(),
-                listeners_by_channel: HashMap::new(),
-            }),
+            log_max_entries,
+            register,
             clients_by_host: ParkingRwLock::new(HashMap::new()),
             clients_by_udp_address: ParkingRwLock::new(HashMap::new()),
             allocation_pointers: ParkingMutex::new(HashMap::new()),
             free_ids: ParkingMutex::new(HashMap::new()),
             tx,
+            deferred_commit_tx,
         }
     }
 
@@ -1651,6 +1683,7 @@ impl ClientRepository {
             if op.version <= pending_max_ver {
                 return Ok(());
             }
+            let expected_next_version = current_ver + 1;
             let must_wait_for_pending = !register.pending_remote_ops.is_empty();
 
             register
@@ -1667,13 +1700,18 @@ impl ClientRepository {
             let own_dep = op.channel_version_dep.unwrap_or(0);
             let effective_dep = own_dep.max(previous_effective_dep);
 
-            if must_wait_for_pending || effective_dep > current_channel_version {
+            if must_wait_for_pending
+                || op.version > expected_next_version
+                || effective_dep > current_channel_version
+            {
                 tracing::debug!(
                     server_id = %server_id,
                     waiting_for_pending = must_wait_for_pending,
-                    "Buffering remote client op v{} (node {}) — waiting for channel v{} (have v{})",
+                    expected_next_version,
+                    "Buffering remote client op v{} (node {}) — waiting for version {} / channel v{} (have v{})",
                     op.version,
                     remote_node,
+                    expected_next_version,
                     effective_dep,
                     current_channel_version,
                 );
@@ -1684,6 +1722,9 @@ impl ClientRepository {
                 return Ok(());
             }
 
+            if op.version < expected_next_version {
+                return Ok(());
+            }
             Self::apply_op_inner(&mut register, &op, self.local_node_id, remote_node);
             Some(Arc::new(ClientStateBroadcastPayload {
                 entry: Arc::clone(&op),
@@ -1723,7 +1764,16 @@ impl ClientRepository {
                     break;
                 }
 
+                let expected_next_version =
+                    register.versions.get(&op.node_id).copied().unwrap_or(0) + 1;
+                if op.version > expected_next_version {
+                    break;
+                }
+
                 let (op, _) = register.pending_remote_ops.pop_front().unwrap();
+                if op.version < expected_next_version {
+                    continue;
+                }
                 let remote_node = op.node_id;
                 tracing::debug!(
                     server_id = %op_server_id,
@@ -1912,24 +1962,33 @@ impl ClientRepository {
         op: ClientStateOperation,
         channel_version_dep: Option<u64>,
     ) {
-        let Some(broadcast) = ({
-            let mut register = match self.register.try_write() {
-                Ok(r) => r,
-                Err(_) => return, // deadlock avoidance in Drop contexts
-            };
-            Self::commit_operation_inner(
-                &mut register,
-                self.local_node_id,
-                self.log_max_entries,
-                op,
-                channel_version_dep,
-            )
-        }) else {
-            return;
-        };
-
-        // Broadcast to subscribers (ignore NoSubscribers / Full errors)
-        let _ = self.tx.send(broadcast);
+        match self.register.try_write() {
+            Ok(mut register) => {
+                let Some(broadcast) = Self::commit_operation_inner(
+                    &mut register,
+                    self.local_node_id,
+                    self.log_max_entries,
+                    op,
+                    channel_version_dep,
+                ) else {
+                    return;
+                };
+                // Broadcast to subscribers (ignore NoSubscribers / Full errors)
+                let _ = self.tx.send(broadcast);
+            }
+            Err(_) => {
+                if self.deferred_commit_tx.as_ref().is_some_and(|tx| {
+                    tx.send(DeferredClientCommit {
+                        op,
+                        channel_version_dep,
+                    })
+                    .is_ok()
+                }) {
+                    return;
+                }
+                tracing::warn!("client state commit dropped: repository lock contended");
+            }
+        }
     }
 
     fn commit_operation_inner(

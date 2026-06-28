@@ -178,7 +178,13 @@ impl OwnerState {
 
     /// Record a successful apply, advance `known.version`.
     pub fn record_applied(&mut self, origin: NodeIdentifier, epoch: u64, version: u64) {
-        self.known.insert(origin, (epoch, version));
+        match self.known.get(&origin).copied() {
+            Some((known_epoch, known_version))
+                if known_epoch > epoch || (known_epoch == epoch && known_version >= version) => {}
+            _ => {
+                self.known.insert(origin, (epoch, version));
+            }
+        }
     }
 
     /// Insert a buffered out-of-order op. Returns `true` if the buffer was
@@ -379,7 +385,24 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
     /// the trait doc for why.
     pub async fn propose_local(self: Arc<Self>, op: R::Op) -> Result<u64, ReplicationError> {
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&op)?);
-        let version = self.local_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let version = match self.repo.local_version_hint(&op) {
+            Some(version) => {
+                let mut current = self.local_counter.load(Ordering::Relaxed);
+                while current < version {
+                    match self.local_counter.compare_exchange_weak(
+                        current,
+                        version,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(next) => current = next,
+                    }
+                }
+                version
+            }
+            None => self.local_counter.fetch_add(1, Ordering::Relaxed) + 1,
+        };
 
         let body = OwnerBody::Op(OwnerOp {
             origin_node: self.self_id as u32,
@@ -394,9 +417,11 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         }
         // Now apply locally. This anchors the chosen ordering: the network
         // commit precedes the local apply.
-        self.repo
-            .apply_remote(self.self_id, self.self_epoch, version, op)
-            .await;
+        if !self.repo.local_op_already_applied(&op) {
+            self.repo
+                .apply_remote(self.self_id, self.self_epoch, version, op)
+                .await;
+        }
         let mut s = self.state.lock();
         s.record_applied(self.self_id, self.self_epoch, version);
         Ok(version)

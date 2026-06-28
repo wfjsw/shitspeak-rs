@@ -840,6 +840,11 @@ impl Default for TransportTuning {
 }
 
 impl TransportTuning {
+    #[cfg(test)]
+    pub(crate) fn set_outbound_capacity_for_test(&mut self, n: usize) {
+        self.outbound_capacity = n.max(1);
+    }
+
     /// Apply the tunables on top of an existing `TransportConfig`.
     pub fn apply(&self, cfg: TransportConfig) -> TransportConfig {
         cfg.with_latency_ewma_alpha(self.latency_ewma_alpha)

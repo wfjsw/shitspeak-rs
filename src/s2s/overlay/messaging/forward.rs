@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::future::join_all;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -592,7 +593,7 @@ async fn forward_pb_as(
     if !new_trace.contains(&self_wire) {
         new_trace.push(self_wire);
     }
-    let mut first_err: Option<OverlayError> = None;
+    let mut sends = Vec::with_capacity(buckets.len());
     for (next_hop, bucket_dsts) in buckets {
         let pb_msg = reconstruct_forwarded_data(&data, bucket_dsts, new_trace.clone());
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -639,20 +640,30 @@ async fn forward_pb_as(
         };
         #[cfg(debug_assertions)]
         let payload_len = payload.len();
-        match transport
-            .send_with_options(
-                next_hop,
-                level,
-                Some(routing_metric),
-                transport_class,
-                payload,
-                send_options,
-            )
-            .await
-        {
-            Ok(()) => {
-                #[cfg(debug_assertions)]
+        let transport = transport.clone();
+        sends.push(async move {
+            let result = transport
+                .send_with_options(
+                    next_hop,
+                    level,
+                    Some(routing_metric),
+                    transport_class,
+                    payload,
+                    send_options,
+                )
+                .await;
+            #[cfg(debug_assertions)]
+            if result.is_ok() {
                 crate::s2s::debug_io::record_sent(packet_kind, payload_len);
+            }
+            (next_hop, result)
+        });
+    }
+
+    let mut first_err: Option<OverlayError> = None;
+    for (next_hop, result) in join_all(sends).await {
+        match result {
+            Ok(()) => {
                 trace!(%next_hop, ?level, "forwarded");
             }
             Err(e) => {

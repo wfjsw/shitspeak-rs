@@ -84,6 +84,20 @@ pub trait OwnerReplicable: Send + Sync + 'static {
     /// replacement epoch. Transient implementations can remove visible state;
     /// durable implementations may keep their data and leave this as a no-op.
     async fn remove_origin(&self, _origin: NodeIdentifier) {}
+
+    /// Return `true` when this locally-originated op is already reflected in
+    /// the repository and should not be applied again after broadcast.
+    fn local_op_already_applied(&self, _op: &Self::Op) -> bool {
+        false
+    }
+
+    /// Optional local version already assigned by the repository. Owner
+    /// runtimes normally allocate versions themselves; adapters whose ops are
+    /// already versioned can return a hint so S2S wire ordering matches the
+    /// repository log exactly.
+    fn local_version_hint(&self, _op: &Self::Op) -> Option<u64> {
+        None
+    }
 }
 
 /// Caller-facing handle for an owner-scoped topic.

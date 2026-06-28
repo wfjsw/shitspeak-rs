@@ -20,7 +20,8 @@ use crate::integration_tests::harness::{
 use crate::messages::Message;
 use crate::messages::encoder::{Ping, PluginDataTransmission, TextMessage, UserStats};
 use crate::s2s::testing::{
-    Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port, s2s_network_test_guard, wait_until,
+    LinkChaos, Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port, s2s_network_test_guard,
+    wait_until,
 };
 use crate::s2s::transport::{PeerAddress, ServiceLevel, TransportKind};
 use crate::voice::codec::AudioPayload;
@@ -34,6 +35,15 @@ const CONVERGENCE_LIGHT_USERS_PER_NODE: usize = 20;
 const CONVERGENCE_HELLO_INTERVAL_MS: u64 = 200;
 const CONVERGENCE_HELLO_DEAD_INTERVAL_MS: u64 = 800;
 const CONVERGENCE_LSA_MAX_AGE_MS: u64 = 5_000;
+const S2S_LAG_DIAGNOSTIC_NODE_COUNT: u16 = 8;
+const S2S_LAG_DIAGNOSTIC_CLIENTS_ON_NODE: usize = 150;
+const S2S_LAG_DIAGNOSTIC_CHANNEL_ID: u32 = 42;
+const S2S_LAG_DIAGNOSTIC_BASE_LATENCY_MS: u64 = 400;
+const S2S_LAG_DIAGNOSTIC_SLOW_LINK_LATENCY_MS: u64 = 16_000;
+const S2S_LAG_DIAGNOSTIC_HELLO_DEAD_MS: u64 = 45_000;
+const S2S_LAG_DIAGNOSTIC_LSA_MAX_AGE_MS: u64 = 90_000;
+const S2S_LAG_DIAGNOSTIC_OUTBOUND_CAPACITY: usize = 8;
+const S2S_LAG_DIAGNOSTIC_REMOTE_WAIT_SECS: u64 = 35;
 
 async fn spawn_s2s_pair() -> (TestServer, TestServer) {
     let pki = Arc::new(mint_pki(&[1, 2]));
@@ -255,6 +265,46 @@ async fn spawn_s2s_convergence_cluster() -> ConvergenceCluster {
     }
 }
 
+async fn spawn_s2s_lag_diagnostic_cluster() -> ConvergenceCluster {
+    let node_ids: Vec<u16> = (1..=S2S_LAG_DIAGNOSTIC_NODE_COUNT).collect();
+    let pki = Arc::new(mint_pki(&node_ids));
+    let mut ports = Vec::with_capacity(node_ids.len());
+    for _ in &node_ids {
+        ports.push(pick_free_port().await);
+    }
+
+    let mut servers = Vec::with_capacity(node_ids.len());
+    for (idx, &node_id) in node_ids.iter().enumerate() {
+        let chaos = LinkChaos::new();
+        let mut opts = TestServerOpts::default();
+        opts.max_users = (S2S_LAG_DIAGNOSTIC_CLIENTS_ON_NODE + 32) as u64;
+        opts.s2s_inbound_chaos = Some(chaos);
+        let mut s2s = S2sConfig {
+            enabled: true,
+            tcp_listen: vec![loopback(ports[idx])],
+            seed_addresses: Vec::new(),
+            ..S2sConfig::default()
+        };
+        s2s.overlay.hello_interval_ms = CONVERGENCE_HELLO_INTERVAL_MS;
+        s2s.overlay.hello_dead_interval_ms = S2S_LAG_DIAGNOSTIC_HELLO_DEAD_MS;
+        s2s.overlay.lsa_max_age_ms = S2S_LAG_DIAGNOSTIC_LSA_MAX_AGE_MS;
+        s2s.overlay.lsa_flood_pacing_interval_ms = 50;
+        s2s.overlay.cost_rerun_min_interval_ms = 50;
+        s2s.transport
+            .set_outbound_capacity_for_test(S2S_LAG_DIAGNOSTIC_OUTBOUND_CAPACITY);
+        servers.push(
+            spawn_s2s_test_server_with_config(opts, Arc::clone(&pki), node_id, idx, s2s).await,
+        );
+    }
+    for server in &servers {
+        wait_for_s2s_runtime(server).await;
+    }
+    ConvergenceCluster {
+        servers,
+        s2s_ports: ports,
+    }
+}
+
 async fn wait_for_convergence_cluster(cluster: &ConvergenceCluster) {
     let refs = cluster
         .servers
@@ -326,6 +376,35 @@ async fn add_synthetic_published_users(server: &TestServer, node_id: u16) -> Vec
     sessions
 }
 
+async fn add_synthetic_published_user_count(
+    server: &TestServer,
+    node_id: u16,
+    user_count: usize,
+) -> Vec<u32> {
+    let mut sessions = Vec::with_capacity(user_count);
+    for idx in 0..user_count {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let octet = ((idx % 250) + 1) as u8;
+        let peer = std::net::SocketAddr::from(([10, node_id as u8, 1, octet], 21_000 + idx as u16));
+        let local = std::net::SocketAddr::from(([127, 0, 0, 1], 31_000 + idx as u16));
+        let client = server
+            .server
+            .get_clients()
+            .allocate_web_client(peer.ip(), peer, local, tx)
+            .await;
+        {
+            let mut gs = client.write_global_state_direct();
+            gs.set_user_id(Some(u32::from(node_id) * 200_000 + idx as u32));
+            gs.set_display_name(Some(format!("lag-node{node_id}-user{idx:03}")));
+            gs.set_current_channel_id(0);
+        }
+        let session = client.get_session_id();
+        server.server.get_clients().publish_client(session).await;
+        sessions.push(u32::from(session));
+    }
+    sessions
+}
+
 async fn wait_for_observer_to_know_users(
     observer: &TestClient,
     sessions: &[u32],
@@ -377,6 +456,121 @@ async fn wait_for_servers_to_track_users(
         })
     })
     .await
+}
+
+async fn wait_for_server_sessions_in_channel(
+    server: &TestServer,
+    sessions: &[u32],
+    channel_id: u32,
+    deadline: Duration,
+) -> Option<Duration> {
+    let started = Instant::now();
+    let reached = wait_until(deadline, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            sessions.iter().copied().all(|session| {
+                handle
+                    .block_on(
+                        server
+                            .server
+                            .get_clients()
+                            .get_client(ClientSessionIdentifier::from(session)),
+                    )
+                    .is_some_and(|client| client.get_current_channel_id() == channel_id)
+            })
+        })
+    })
+    .await;
+    reached.then(|| started.elapsed())
+}
+
+async fn server_session_channel_summary(
+    server: &TestServer,
+    sessions: &[u32],
+    channel_id: u32,
+) -> (
+    usize,
+    usize,
+    Vec<u32>,
+    Option<u64>,
+    std::collections::HashMap<u16, u64>,
+) {
+    let mut known = 0usize;
+    let mut moved = 0usize;
+    let mut not_moved = Vec::new();
+    for &session in sessions {
+        if let Some(client) = server
+            .server
+            .get_clients()
+            .get_client(ClientSessionIdentifier::from(session))
+            .await
+        {
+            known += 1;
+            if client.get_current_channel_id() == channel_id {
+                moved += 1;
+            } else {
+                not_moved.push(session);
+            }
+        }
+    }
+    let (_, versions) = server.server.get_clients().snapshot_with_versions().await;
+    let node1_version = versions.get(&1).copied();
+    (known, moved, not_moved, node1_version, versions)
+}
+
+async fn move_synthetic_clients_to_channel(
+    server: &TestServer,
+    sessions: &[u32],
+    channel_id: u32,
+) -> Duration {
+    let started = Instant::now();
+    let channel_version = server.server.get_channels().current_version();
+    for &session in sessions {
+        let session_id = ClientSessionIdentifier::from(session);
+        let client = server
+            .server
+            .get_clients()
+            .get_client(session_id)
+            .await
+            .expect("synthetic local client");
+        client.set_current_channel_id(
+            channel_id,
+            server.server.get_clients().as_ref(),
+            channel_version,
+        );
+    }
+    started.elapsed()
+}
+
+fn apply_uniform_s2s_latency(cluster: &ConvergenceCluster, latency: Duration) {
+    for (node_idx, server) in cluster.servers.iter().enumerate() {
+        let Some(chaos) = server.s2s_inbound_chaos() else {
+            continue;
+        };
+        let inbound_node = (node_idx + 1) as u16;
+        for peer in 1..=cluster.servers.len() as u16 {
+            if peer == inbound_node {
+                continue;
+            }
+            chaos.add_latency(peer, latency);
+        }
+    }
+}
+
+fn apply_slow_s2s_links_from_node(
+    cluster: &ConvergenceCluster,
+    sender_node: u16,
+    slow_receivers: &[u16],
+    latency: Duration,
+) {
+    for &receiver in slow_receivers {
+        let Some(server) = cluster.servers.get(usize::from(receiver - 1)) else {
+            continue;
+        };
+        if let Some(chaos) = server.s2s_inbound_chaos() {
+            chaos.add_latency(sender_node, latency);
+        }
+    }
 }
 
 async fn wait_for_user_removes(
@@ -1468,6 +1662,168 @@ async fn s2s_client_replication_propagates_add_update_remove() {
     assert!(
         removed,
         "Server B should remove Alice from its remote index"
+    );
+}
+
+/// Diagnostic reproduction for channel-move lag under a large S2S cluster.
+///
+/// Scenario:
+/// - 8 S2S nodes, full mesh.
+/// - 150 synthetic clients published on node 1.
+/// - 400ms added inbound latency on every S2S link.
+/// - Optional pathological links from node 1 to nodes 7/8 at >15s.
+///
+/// Run with:
+/// `cargo test s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "expensive diagnostic: 8-node S2S latency/channel-move load"]
+async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
+    let _guard = s2s_network_test_guard().await;
+    let cluster = spawn_s2s_lag_diagnostic_cluster().await;
+    println!(
+        "lag-diagnostic setup: spawned {} S2S runtimes",
+        cluster.servers.len()
+    );
+
+    cluster.connect_full_mesh().await;
+    wait_for_convergence_cluster(&cluster).await;
+    println!("lag-diagnostic setup: full mesh converged without injected latency");
+
+    cluster.servers[0]
+        .server
+        .get_channels()
+        .create_channel(crate::channels::Channel::new(
+            S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
+            "Lag Diagnostic",
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create diagnostic channel");
+    let channel_ready = wait_until(Duration::from_secs(30), || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            cluster.servers.iter().all(|server| {
+                handle
+                    .block_on(
+                        server
+                            .server
+                            .get_channels()
+                            .get_channel(S2S_LAG_DIAGNOSTIC_CHANNEL_ID),
+                    )
+                    .is_some()
+            })
+        })
+    })
+    .await;
+    assert!(
+        channel_ready,
+        "all nodes should know diagnostic channel before client moves"
+    );
+    println!("lag-diagnostic setup: diagnostic channel replicated");
+
+    let sessions = add_synthetic_published_user_count(
+        &cluster.servers[0],
+        1,
+        S2S_LAG_DIAGNOSTIC_CLIENTS_ON_NODE,
+    )
+    .await;
+    let sessions_by_node = vec![sessions.clone()];
+    assert!(
+        wait_for_servers_to_track_users(
+            &cluster.servers,
+            &sessions_by_node,
+            Duration::from_secs(45),
+        )
+        .await,
+        "all nodes should track node 1 synthetic clients before measured move"
+    );
+    println!(
+        "lag-diagnostic setup: all nodes materialized {} node-1 synthetic users",
+        sessions.len()
+    );
+
+    apply_uniform_s2s_latency(
+        &cluster,
+        Duration::from_millis(S2S_LAG_DIAGNOSTIC_BASE_LATENCY_MS),
+    );
+    apply_slow_s2s_links_from_node(
+        &cluster,
+        1,
+        &[7, 8],
+        Duration::from_millis(S2S_LAG_DIAGNOSTIC_SLOW_LINK_LATENCY_MS),
+    );
+    println!(
+        "lag-diagnostic setup: applied {}ms latency to all links and {}ms node1->{{7,8}} slow links; hello_dead={}ms",
+        S2S_LAG_DIAGNOSTIC_BASE_LATENCY_MS,
+        S2S_LAG_DIAGNOSTIC_SLOW_LINK_LATENCY_MS,
+        S2S_LAG_DIAGNOSTIC_HELLO_DEAD_MS
+    );
+
+    let local_move_elapsed = move_synthetic_clients_to_channel(
+        &cluster.servers[0],
+        &sessions,
+        S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
+    )
+    .await;
+    println!(
+        "lag-diagnostic move: node 1 committed {} local channel moves in {:?}",
+        sessions.len(),
+        local_move_elapsed
+    );
+
+    let local_visible = wait_for_server_sessions_in_channel(
+        &cluster.servers[0],
+        &sessions,
+        S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(
+        local_visible.is_some(),
+        "node 1 should apply synthetic moves locally immediately"
+    );
+
+    let mut slowest = Duration::ZERO;
+    for (idx, server) in cluster.servers.iter().enumerate().skip(1) {
+        let node_id = idx + 1;
+        let elapsed = wait_for_server_sessions_in_channel(
+            server,
+            &sessions,
+            S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
+            Duration::from_secs(S2S_LAG_DIAGNOSTIC_REMOTE_WAIT_SECS),
+        )
+        .await;
+        match elapsed {
+            Some(elapsed) => {
+                slowest = slowest.max(elapsed);
+                println!(
+                    "lag-diagnostic remote: node {node_id} saw all {} moves after {:?}",
+                    sessions.len(),
+                    elapsed
+                );
+            }
+            None => {
+                let (known, moved, not_moved, node1_version, versions) =
+                    server_session_channel_summary(
+                        server,
+                        &sessions,
+                        S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
+                    )
+                    .await;
+                panic!(
+                    "node {node_id} did not materialize all {} channel moves within {}s; known={known}, moved={moved}, not_moved={not_moved:?}, node1_version={node1_version:?}, versions={versions:?}",
+                    sessions.len(),
+                    S2S_LAG_DIAGNOSTIC_REMOTE_WAIT_SECS,
+                );
+            }
+        }
+    }
+
+    println!(
+        "lag-diagnostic summary: slowest remote materialization {:?}; slow links above 15s are expected to dominate if client replication proposals or next-hop sends are serialized",
+        slowest
     );
 }
 

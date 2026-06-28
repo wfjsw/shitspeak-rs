@@ -14,13 +14,13 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, trace, warn};
 
@@ -47,9 +47,13 @@ use self::transport::{ConnectionManager, TransportConfig};
 
 const NATIVE_GATEWAY_CAPACITY: usize = 4096;
 const S2S_GATEWAY_CAPACITY: usize = 4096;
+const S2S_CLIENT_REPLICATION_WORKER_CAPACITY: usize = 4096;
+const S2S_CLIENT_REPLICATION_MAX_IN_FLIGHT: usize = 256;
 const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const STRICT_PROPOSAL_GATEWAY_SLACK_TICKS: u32 = 4;
 const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const S2S_CLIENT_REPLICATION_SLOW_PROPOSE: Duration = Duration::from_secs(1);
+const S2S_CLIENT_REPLICATION_SLOW_QUEUE_WAIT: Duration = Duration::from_millis(250);
 
 fn strict_proposal_gateway_response_timeout(cfg: &replications::ReplicationConfig) -> Duration {
     let slack = cfg
@@ -90,6 +94,8 @@ struct S2SRuntimeState {
         HashMap<String, replications::BlobHandle<ChannelBlobReplicationAdapter>>,
     bridge_tasks: Vec<JoinHandle<()>>,
     gateway_tx: Option<mpsc::Sender<NativeToS2SCommand>>,
+    #[cfg(test)]
+    inbound_chaos: Option<testing::LinkChaos>,
 }
 
 enum S2SNativeCommand {
@@ -784,6 +790,16 @@ impl S2SManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_test_inbound_chaos(&self, chaos: testing::LinkChaos) {
+        self.state.write().inbound_chaos = Some(chaos);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_inbound_chaos(&self) -> Option<testing::LinkChaos> {
+        self.state.read().inbound_chaos.clone()
+    }
+
     async fn run_runtime(
         self: Arc<Self>,
         server: Weak<Box<Server>>,
@@ -821,6 +837,15 @@ impl S2SManager {
                 drop(gateways);
                 let _ = shutdown.changed().await;
                 return;
+            }
+        };
+        #[cfg(test)]
+        let inbound = {
+            let chaos = self.state.read().inbound_chaos.clone();
+            if let Some(chaos) = chaos {
+                chaos.install(inbound)
+            } else {
+                inbound
             }
         };
 
@@ -1338,6 +1363,10 @@ fn spawn_s2s_gateway_receiver(
     recipient_index: Arc<RecipientIndex>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let client_proposal_tx = spawn_client_replication_proposal_worker(
+            client_handle,
+            S2S_CLIENT_REPLICATION_WORKER_CAPACITY,
+        );
         while let Some(command) = rx.recv().await {
             match command {
                 NativeToS2SCommand::ProposeChannel {
@@ -1351,15 +1380,23 @@ fn spawn_s2s_gateway_receiver(
                     let _ = respond.send(manager.propose_ban_op_direct(op).await);
                 }
                 NativeToS2SCommand::ProposeClientReplication(entry) => {
-                    let Some(handle) = client_handle.as_ref() else {
-                        warn!(
-                            version = entry.version,
-                            "s2s client replication gateway has no owner handle; dropping proposal"
-                        );
-                        continue;
-                    };
-                    if let Err(e) = handle.propose(entry).await {
-                        warn!(error = %e, "s2s client replication propose failed");
+                    match client_proposal_tx.try_send(QueuedClientReplicationProposal {
+                        entry,
+                        enqueued_at: Instant::now(),
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(proposal)) => {
+                            warn!(
+                                version = proposal.entry.version,
+                                "s2s client replication worker full; dropping proposal"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(proposal)) => {
+                            warn!(
+                                version = proposal.entry.version,
+                                "s2s client replication worker stopped; dropping proposal"
+                            );
+                        }
                     }
                 }
                 NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot) => {
@@ -1452,6 +1489,62 @@ fn spawn_s2s_gateway_receiver(
             }
         }
     })
+}
+
+struct QueuedClientReplicationProposal {
+    entry: ClientStateLogEntry,
+    enqueued_at: Instant,
+}
+
+fn spawn_client_replication_proposal_worker(
+    client_handle: Option<replications::OwnerHandle<ClientReplicationAdapter>>,
+    capacity: usize,
+) -> mpsc::Sender<QueuedClientReplicationProposal> {
+    let (tx, mut rx) = mpsc::channel::<QueuedClientReplicationProposal>(capacity.max(1));
+    tokio::spawn(async move {
+        let permits = Arc::new(Semaphore::new(S2S_CLIENT_REPLICATION_MAX_IN_FLIGHT));
+        while let Some(proposal) = rx.recv().await {
+            let queue_wait = proposal.enqueued_at.elapsed();
+            if queue_wait >= S2S_CLIENT_REPLICATION_SLOW_QUEUE_WAIT {
+                warn!(
+                    version = proposal.entry.version,
+                    queue_wait_ms = queue_wait.as_millis(),
+                    "s2s client replication proposal waited in worker queue"
+                );
+            }
+            let Some(handle) = client_handle.clone() else {
+                warn!(
+                    version = proposal.entry.version,
+                    "s2s client replication gateway has no owner handle; dropping proposal"
+                );
+                continue;
+            };
+            let permits = Arc::clone(&permits);
+            tokio::spawn(async move {
+                let Ok(_permit) = permits.acquire_owned().await else {
+                    return;
+                };
+                let started = Instant::now();
+                let version = proposal.entry.version;
+                match handle.propose(proposal.entry).await {
+                    Ok(_) => {
+                        let elapsed = started.elapsed();
+                        if elapsed >= S2S_CLIENT_REPLICATION_SLOW_PROPOSE {
+                            warn!(
+                                version,
+                                elapsed_ms = elapsed.as_millis(),
+                                "s2s client replication propose was slow"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(version, error = %e, "s2s client replication propose failed");
+                    }
+                }
+            });
+        }
+    });
+    tx
 }
 
 async fn run_native_gateway(
@@ -2561,6 +2654,14 @@ impl OwnerReplicable for ClientReplicationAdapter {
         if origin != self.clients.local_node_id() {
             self.clients.clear_clients_from_node(origin).await;
         }
+    }
+
+    fn local_op_already_applied(&self, op: &Self::Op) -> bool {
+        op.node_id == self.clients.local_node_id() && op.version <= self.clients.current_version()
+    }
+
+    fn local_version_hint(&self, op: &Self::Op) -> Option<u64> {
+        (op.node_id == self.clients.local_node_id()).then_some(op.version)
     }
 }
 
