@@ -175,7 +175,7 @@ pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: p
     let payload_len = payload.len();
     match ctx
         .transport
-        .send(
+        .try_send(
             from,
             ServiceLevel::Reliable,
             None,

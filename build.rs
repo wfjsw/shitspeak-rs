@@ -8,6 +8,10 @@ use std::{
 
 use serde::Deserialize;
 
+const NON_RELEASE_COMMIT_HASH: &str = "unknown";
+const NON_RELEASE_COMMIT_DATE: &str = "unknown";
+const NON_RELEASE_BUILD_DATE: &str = "1970-01-01T00:00:00+00:00";
+
 fn main() -> Result<(), Box<dyn Error>> {
     generate_localization_catalog()?;
     let mut config = prost_build::Config::new();
@@ -48,8 +52,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     config.compile_protos(&proto_files, &["src/"])?;
 
-    emit_git_metadata_rerun_hints();
+    if is_release_profile() {
+        emit_release_build_metadata();
+    } else {
+        emit_non_release_build_metadata();
+    }
 
+    Ok(())
+}
+
+fn emit_release_build_metadata() {
+    emit_git_metadata_rerun_hints();
     let commit_hash = resolve_commit_hash();
     println!("cargo:rustc-env=COMMIT_HASH={commit_hash}");
 
@@ -58,8 +71,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let current_date = chrono::Utc::now().to_rfc3339();
     println!("cargo:rustc-env=BUILD_DATE={}", current_date);
+}
 
-    Ok(())
+fn emit_non_release_build_metadata() {
+    println!("cargo:rustc-env=COMMIT_HASH={NON_RELEASE_COMMIT_HASH}");
+    println!("cargo:rustc-env=COMMIT_DATE={NON_RELEASE_COMMIT_DATE}");
+    println!("cargo:rustc-env=BUILD_DATE={NON_RELEASE_BUILD_DATE}");
+}
+
+fn is_release_profile() -> bool {
+    env::var("PROFILE").is_ok_and(|profile| profile == "release")
 }
 
 fn resolve_commit_hash() -> String {

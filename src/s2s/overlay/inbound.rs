@@ -27,6 +27,7 @@
 //!   * `OverlayData`   → deliver locally if applicable, forward the rest.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -82,15 +83,20 @@ async fn run_queue(
                     tracing::trace!(queue = label, "inbound queue closed");
                     return;
                 };
-                handle(&ctx, m).await;
+                handle(&ctx, label, m).await;
             }
         }
     }
 }
 
-async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage) {
+async fn handle(
+    ctx: &DispatcherCtx,
+    queue: &'static str,
+    msg: crate::s2s::transport::InboundMessage,
+) {
     let from = msg.from();
     let kind = msg.transport();
+    let class = msg.class();
     let raw = msg.payload().clone();
     let decoded = match decode_message(&raw) {
         Ok(d) => d,
@@ -102,11 +108,13 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
     let Some(body) = decoded.body else {
         return;
     };
+    let body_kind = body_kind(&body);
     #[cfg(debug_assertions)]
     {
         let packet_kind = crate::s2s::debug_io::classify_overlay_body(&body);
         crate::s2s::debug_io::record_received(packet_kind, raw.len());
     }
+    let started = Instant::now();
     match body {
         OverlayBody::Hello(h) => respond_to_hello(&ctx.hello, from, h).await,
         OverlayBody::HelloAck(a) => handle_hello_ack(&ctx.hello, from, a, kind),
@@ -164,5 +172,29 @@ async fn handle(ctx: &DispatcherCtx, msg: crate::s2s::transport::InboundMessage)
             )
             .await
         }
+    }
+    let elapsed = started.elapsed();
+    if elapsed > Duration::from_secs(1) {
+        warn!(
+            queue,
+            body_kind,
+            source = %from,
+            transport = ?kind,
+            class = ?class,
+            elapsed_ms = elapsed.as_millis(),
+            "slow inbound overlay handler"
+        );
+    }
+}
+
+fn body_kind(body: &OverlayBody) -> &'static str {
+    match body {
+        OverlayBody::Hello(_) => "Hello",
+        OverlayBody::HelloAck(_) => "HelloAck",
+        OverlayBody::LsaFlood(_) => "LsaFlood",
+        OverlayBody::LsdbSync(_) => "LsdbSync",
+        OverlayBody::LsdbSyncResp(_) => "LsdbSyncResp",
+        OverlayBody::Control(_) => "Control",
+        OverlayBody::Data(_) => "OverlayData",
     }
 }

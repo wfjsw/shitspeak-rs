@@ -108,7 +108,7 @@ pub async fn handle_request(
         trace!(peer=%sender, "lsdb sync: nothing to send");
         return;
     }
-    send_response_chunks(transport, sender, &delta, max_response_lsas).await;
+    send_response_chunks(transport, sender, &delta, max_response_lsas, true).await;
 }
 
 async fn send_response_chunks(
@@ -116,6 +116,7 @@ async fn send_response_chunks(
     dst: NodeIdentifier,
     entries: &[LsaEntry],
     max_response_lsas: usize,
+    nonblocking: bool,
 ) {
     for chunk in entries.chunks(max_response_lsas.max(1)) {
         let body = OverlayBody::LsdbSyncResp(pb::LsdbSyncResp {
@@ -132,17 +133,30 @@ async fn send_response_chunks(
         };
         #[cfg(debug_assertions)]
         let payload_len = payload.len();
-        match transport
-            .send_with_options(
-                dst,
-                ServiceLevel::Reliable,
-                None,
-                MessageClass::Regular,
-                payload,
-                SendOptions::default().allow_l1_compression(),
-            )
-            .await
-        {
+        let result = if nonblocking {
+            transport
+                .try_send_with_options(
+                    dst,
+                    ServiceLevel::Reliable,
+                    None,
+                    MessageClass::Regular,
+                    payload,
+                    SendOptions::default().allow_l1_compression(),
+                )
+                .await
+        } else {
+            transport
+                .send_with_options(
+                    dst,
+                    ServiceLevel::Reliable,
+                    None,
+                    MessageClass::Regular,
+                    payload,
+                    SendOptions::default().allow_l1_compression(),
+                )
+                .await
+        };
+        match result {
             Ok(()) => {
                 #[cfg(debug_assertions)]
                 crate::s2s::debug_io::record_sent(packet_kind, payload_len);
@@ -172,7 +186,7 @@ pub async fn push_snapshot(
     if entries.is_empty() {
         return;
     }
-    send_response_chunks(transport, dst, &entries, max_response_lsas).await;
+    send_response_chunks(transport, dst, &entries, max_response_lsas, false).await;
 }
 
 /// Handle an inbound `LsdbSyncResp`. Each LSA goes through the normal
@@ -202,6 +216,65 @@ pub fn handle_response(
         trace!(accepted, "lsdb sync resp processed");
         let snap = monitor.snapshot();
         pacer.enqueue_reflood_to_neighbors(&snap, accepted_lsas, Some(sender));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::time::timeout;
+
+    use super::super::store::LsaFloor;
+    use crate::s2s::transport::TransportKind;
+
+    fn entry(origin: NodeIdentifier, boot_epoch: u64, seq: u64) -> LsaEntry {
+        LsaEntry {
+            origin,
+            boot_epoch,
+            seq,
+            ts_local_received: Instant::now(),
+            tombstone: false,
+            addresses: vec![],
+            links: vec![],
+            max_users: 0,
+            transit_disabled: false,
+            replication_services: super::super::store::ReplicationServices::ALL,
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_lsdb_sync_returns_promptly_when_peer_outbound_queue_is_full() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        transport
+            .try_send(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fill"),
+            )
+            .await
+            .unwrap();
+
+        let lsdb = LinkStateDb::new(Arc::new(LsaFloor::new(1, None)));
+        assert!(matches!(
+            lsdb.admit(entry(1, 11, 1)),
+            AdmissionResult::Accepted
+        ));
+        let req = pb::LsdbSync {
+            src_node: node_to_wire(2),
+            have: vec![],
+        };
+
+        timeout(
+            Duration::from_millis(50),
+            handle_request(&lsdb, &transport, 2, req, 1),
+        )
+        .await
+        .expect("inbound LSDB sync handler should not wait for outbound queue space");
     }
 }
 

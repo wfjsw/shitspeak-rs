@@ -382,6 +382,45 @@ impl ConnectionManager {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_with_live_streams(
+        self_id: NodeIdentifier,
+        peer_node: NodeIdentifier,
+        kinds: &[TransportKind],
+    ) -> (Self, Vec<mpsc::Receiver<OutboundFrame>>) {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (high_tx, _high_rx) = mpsc::channel(1);
+        let (regular_tx, _regular_rx) = mpsc::channel(1);
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into());
+        let inner = Arc::new(ManagerInner {
+            self_id,
+            peers: Arc::new(SccMap::new()),
+            seed_backoff: Arc::new(SccMap::new()),
+            successful_seeds: Arc::new(SccMap::new()),
+            required_outgoing: Arc::new(RwLock::new(HashSet::new())),
+            inbound: InboundDispatch::new(control_tx, high_tx, regular_tx),
+            shutdown: CancellationToken::new(),
+            endpoints: EndpointRegistry::empty(),
+            cfg,
+        });
+
+        let peer = inner.get_or_create_peer(peer_node);
+        let mut receivers = Vec::new();
+        for kind in kinds {
+            let (tx, rx) = mpsc::channel(1);
+            peer.install_stream(super::connection::ActiveStream::new(
+                *kind,
+                None,
+                tx,
+                CancellationToken::new(),
+                false,
+            ));
+            receivers.push(rx);
+        }
+
+        (Self { inner }, receivers)
+    }
+
     pub fn local_node_id(&self) -> NodeIdentifier {
         self.inner.self_id
     }
@@ -612,6 +651,52 @@ impl ConnectionManager {
         payload: Bytes,
         options: SendOptions,
     ) -> Result<(), SendError> {
+        self.send_ranked(node, level, routing_metric, class, payload, options, true)
+            .await
+    }
+
+    pub(crate) async fn try_send(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: Option<RoutingMetric>,
+        class: MessageClass,
+        payload: Bytes,
+    ) -> Result<(), SendError> {
+        self.try_send_with_options(
+            node,
+            level,
+            routing_metric,
+            class,
+            payload,
+            SendOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn try_send_with_options(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: Option<RoutingMetric>,
+        class: MessageClass,
+        payload: Bytes,
+        options: SendOptions,
+    ) -> Result<(), SendError> {
+        self.send_ranked(node, level, routing_metric, class, payload, options, false)
+            .await
+    }
+
+    async fn send_ranked(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: Option<RoutingMetric>,
+        class: MessageClass,
+        payload: Bytes,
+        options: SendOptions,
+        wait_on_final_transport: bool,
+    ) -> Result<(), SendError> {
         let routing_metric =
             routing_metric.unwrap_or_else(|| RoutingMetric::default_for_level(level));
         let peer = self
@@ -627,7 +712,7 @@ impl ConnectionManager {
         let mut first_err = None;
         let choice_count = choices.len();
         for (idx, chosen) in choices.into_iter().enumerate() {
-            let wait_for_space = idx + 1 == choice_count;
+            let wait_for_space = wait_on_final_transport && idx + 1 == choice_count;
             match self
                 .send_stream(
                     &peer,
@@ -1119,6 +1204,123 @@ mod tests {
         assert_eq!(&msg.payload()[..], b"control");
         assert!(high_rx.try_recv().is_err());
         assert!(regular_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn try_send_with_options_returns_backpressure_when_all_eligible_streams_full() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+
+        transport
+            .try_send_with_options(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fill"),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            transport.try_send_with_options(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"dropped"),
+                SendOptions::default(),
+            ),
+        )
+        .await
+        .expect("try_send_with_options should not wait for queue space");
+
+        assert!(matches!(
+            result,
+            Err(SendError::Backpressure {
+                node: 2,
+                transport: TransportKind::Tcp
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_send_with_options_falls_back_when_earlier_stream_is_full() {
+        let (transport, mut receivers) = ConnectionManager::test_with_live_streams(
+            1,
+            2,
+            &[TransportKind::Tcp, TransportKind::Quic],
+        );
+
+        transport
+            .send_via(
+                2,
+                TransportKind::Tcp,
+                MessageClass::Regular,
+                Bytes::from_static(b"fill-tcp"),
+            )
+            .await
+            .unwrap();
+
+        transport
+            .try_send_with_options(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fallback"),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(&receivers[0].try_recv().unwrap().payload()[..], b"fill-tcp");
+        assert_eq!(&receivers[1].try_recv().unwrap().payload()[..], b"fallback");
+    }
+
+    #[tokio::test]
+    async fn send_with_options_still_waits_for_space_on_final_stream() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+
+        transport
+            .try_send_with_options(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fill"),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let transport_for_task = transport.clone();
+        let mut send_task = tokio::spawn(async move {
+            transport_for_task
+                .send_with_options(
+                    2,
+                    ServiceLevel::Reliable,
+                    None,
+                    MessageClass::Regular,
+                    Bytes::from_static(b"waited"),
+                    SendOptions::default(),
+                )
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut send_task)
+                .await
+                .is_err(),
+            "send_with_options should still wait on the final stream"
+        );
+
+        assert_eq!(&receivers[0].recv().await.unwrap().payload()[..], b"fill");
+        send_task.await.unwrap().unwrap();
+        assert_eq!(&receivers[0].recv().await.unwrap().payload()[..], b"waited");
     }
 
     #[test]

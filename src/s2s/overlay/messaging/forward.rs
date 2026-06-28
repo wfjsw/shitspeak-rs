@@ -501,7 +501,7 @@ async fn send_control_to(
         CONTROL_METRIC,
         MessageClass::Control,
         payload,
-        true,
+        false,
     )
     .await;
     #[cfg(debug_assertions)]
@@ -642,16 +642,29 @@ async fn forward_pb_as(
         let payload_len = payload.len();
         let transport = transport.clone();
         sends.push(async move {
-            let result = transport
-                .send_with_options(
-                    next_hop,
-                    level,
-                    Some(routing_metric),
-                    transport_class,
-                    payload,
-                    send_options,
-                )
-                .await;
+            let result = if is_originator {
+                transport
+                    .send_with_options(
+                        next_hop,
+                        level,
+                        Some(routing_metric),
+                        transport_class,
+                        payload,
+                        send_options,
+                    )
+                    .await
+            } else {
+                transport
+                    .try_send_with_options(
+                        next_hop,
+                        level,
+                        Some(routing_metric),
+                        transport_class,
+                        payload,
+                        send_options,
+                    )
+                    .await
+            };
             #[cfg(debug_assertions)]
             if result.is_ok() {
                 crate::s2s::debug_io::record_sent(packet_kind, payload_len);
@@ -784,17 +797,25 @@ async fn send_encoded_to_target(
         }
         return Ok(());
     };
-    transport
-        .send(entry.next_hop, level, Some(routing_metric), class, payload)
-        .await?;
+    if is_originator {
+        transport
+            .send(entry.next_hop, level, Some(routing_metric), class, payload)
+            .await?;
+    } else {
+        transport
+            .try_send(entry.next_hop, level, Some(routing_metric), class, payload)
+            .await?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::super::proto::decode_message;
-    use super::super::super::routing::RouteEntry;
+    use super::super::super::routing::{RouteEntry, new_handle};
     use super::*;
+    use crate::s2s::transport::TransportKind;
+    use tokio::time::timeout;
 
     fn test_overlay_data(allow_l1_compression: bool) -> pb::OverlayData {
         pb::OverlayData {
@@ -815,6 +836,17 @@ mod tests {
             origin_message_id: 22,
             allow_l1_compression,
         }
+    }
+
+    fn routing_with_route(dst: NodeIdentifier, next_hop: NodeIdentifier) -> RoutingHandle {
+        let routing = new_handle();
+        let mut tables = RoutingTables::empty();
+        let table = HashMap::from([(dst, RouteEntry { next_hop, cost: 1 })]);
+        for level in ServiceLevel::ALL {
+            tables.insert_table(RoutingMetric::ReliableCost, level, table.clone());
+        }
+        routing.store(Arc::new(tables));
+        routing
     }
 
     #[test]
@@ -948,5 +980,72 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected, ForwardNextHop::DropAlreadyVisited);
+    }
+
+    #[tokio::test]
+    async fn transit_overlay_forward_returns_promptly_when_peer_outbound_queue_is_full() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
+        transport
+            .try_send(
+                4,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fill"),
+            )
+            .await
+            .unwrap();
+        let routing = routing_with_route(4, 4);
+
+        timeout(
+            Duration::from_millis(50),
+            forward_pb_as(
+                &transport,
+                &routing,
+                2,
+                test_overlay_data(false),
+                MessageClass::Regular,
+                false,
+            ),
+        )
+        .await
+        .expect("transit forward should not wait for outbound queue space")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn originated_overlay_forward_still_reports_backpressure_under_outbound_saturation() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        transport
+            .try_send(
+                4,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fill"),
+            )
+            .await
+            .unwrap();
+        let routing = routing_with_route(4, 4);
+
+        let result = timeout(
+            Duration::from_millis(50),
+            forward_pb_as(
+                &transport,
+                &routing,
+                1,
+                test_overlay_data(false),
+                MessageClass::Regular,
+                true,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "originated overlay forward should keep the existing awaited backpressure behavior"
+        );
     }
 }
