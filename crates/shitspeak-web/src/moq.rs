@@ -1401,13 +1401,14 @@ async fn client_log_entry_events(
             .await,
         );
     }
-    let scope = shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
-        server,
-        client,
-        entry,
-        old_viewer_channel_id,
-    )
-    .await;
+    let scope =
+        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
+            server,
+            client,
+            entry,
+            old_viewer_channel_id,
+        )
+        .await;
     events.extend(
         visibility_refresh_events(
             server,

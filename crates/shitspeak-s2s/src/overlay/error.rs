@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use shitspeak_s2s_transport::{SendError, TransportError};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{SendError, TransportError};
 
 #[derive(Debug, Error)]
 pub enum OverlayError {

@@ -21,8 +21,8 @@ use parking_lot::Mutex;
 use tokio::sync::{Notify, broadcast};
 use tracing::debug;
 
-use shitspeak_s2s_transport::{ConnectionManager, TransportKind};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{ConnectionManager, TransportKind};
 
 use super::super::config::OverlayConfig;
 use super::super::membership::MembershipEvent;

@@ -41,8 +41,8 @@ use std::sync::atomic::AtomicU64;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use shitspeak_s2s_transport::{ConnectionManager, Inbound, MessageClass, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{ConnectionManager, Inbound, MessageClass, ServiceLevel};
 
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use error::OverlayError;

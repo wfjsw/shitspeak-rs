@@ -5,8 +5,8 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 use super::{OverlayInboundMessage, ServiceRegistry};
 

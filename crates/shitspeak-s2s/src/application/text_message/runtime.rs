@@ -8,11 +8,9 @@ use tracing::trace;
 
 use crate::application::error::ApplicationError;
 use crate::application::proto::{self, TEXT_MESSAGE_SERVICE_TAG, TextMessageEnvelope};
-use crate::overlay::{
-    OverlayInboundMessage, OverlayNetwork, OverlaySendOptions, ServiceInbound,
-};
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
+use crate::overlay::{OverlayInboundMessage, OverlayNetwork, OverlaySendOptions, ServiceInbound};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 pub const TEXT_MESSAGE_LEVEL: ServiceLevel = ServiceLevel::Reliable;
 pub const TEXT_MESSAGE_CLASS: MessageClass = MessageClass::Regular;

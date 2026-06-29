@@ -19,12 +19,12 @@ use crate::integration_tests::harness::{
 };
 use crate::messages::Message;
 use crate::messages::encoder::{Ping, PluginDataTransmission, TextMessage, UserStats};
+use crate::voice::codec::AudioPayload;
 use shitspeak_s2s::testing::{
     LinkChaos, Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port, s2s_network_test_guard,
     wait_until,
 };
 use shitspeak_s2s_transport::{PeerAddress, ServiceLevel, TransportKind};
-use crate::voice::codec::AudioPayload;
 
 const S2S_DEADLINE: Duration = Duration::from_secs(10);
 const CLIENT_DEADLINE: Duration = Duration::from_secs(4);

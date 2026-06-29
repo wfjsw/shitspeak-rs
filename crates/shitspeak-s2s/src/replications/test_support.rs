@@ -19,8 +19,8 @@ use super::error::ReplicationError;
 use super::owner::runtime::OwnerNet;
 use super::proto::{OwnerBody, StrictBody};
 use super::strict::runtime::StrictNet;
-use shitspeak_s2s_transport::ServiceLevel;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::ServiceLevel;
 
 #[derive(Debug, Clone)]
 pub enum CapturedFrame {

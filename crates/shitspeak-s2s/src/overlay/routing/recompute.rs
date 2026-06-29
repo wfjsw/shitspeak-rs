@@ -12,8 +12,8 @@ use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
-use shitspeak_s2s_transport::{ConnectionManager, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{ConnectionManager, ServiceLevel};
 
 use super::super::config::OverlayConfig;
 use super::super::lsdb::LinkStateDb;

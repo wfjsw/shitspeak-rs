@@ -7,8 +7,8 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use shitspeak_s2s_transport::ServiceLevel;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::ServiceLevel;
 
 use super::super::config::OverlayConfig;
 use super::super::lsdb::LinkStateDb;

@@ -24,8 +24,8 @@ use super::super::proto::{
 use super::super::topic::ErasedOwnerRuntime;
 use super::OwnerReplicable;
 use crate::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 #[async_trait]
 pub(crate) trait OwnerNet: Send + Sync + 'static {

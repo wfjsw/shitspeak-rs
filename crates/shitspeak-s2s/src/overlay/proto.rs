@@ -11,8 +11,8 @@ use prost::Message as _;
 use shitspeak_s2s_transport::{MessageClass, PeerAddress, ServiceLevel, TransportKind};
 
 use super::routing::RoutingMetric;
-use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_proto::s2s_overlay_proto as pb;
 
 pub use shitspeak_proto::s2s_overlay_proto::{
     OverlayData, OverlayMessage, overlay_control::Body as OverlayControlBody,

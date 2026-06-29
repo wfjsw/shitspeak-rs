@@ -8,11 +8,9 @@ use tracing::trace;
 
 use crate::application::error::ApplicationError;
 use crate::application::proto::{self, PLUGIN_DATA_SERVICE_TAG, PluginDataEnvelope};
-use crate::overlay::{
-    OverlayInboundMessage, OverlayNetwork, OverlaySendOptions, ServiceInbound,
-};
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
+use crate::overlay::{OverlayInboundMessage, OverlayNetwork, OverlaySendOptions, ServiceInbound};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 pub const PLUGIN_DATA_LEVEL: ServiceLevel = ServiceLevel::Reliable;
 pub const PLUGIN_DATA_CLASS: MessageClass = MessageClass::Regular;

@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use shitspeak_s2s_transport::{ConnectionManager, Inbound, PeerAddress};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{ConnectionManager, Inbound, PeerAddress};
 
 use super::config::OverlayConfig;
 use super::error::OverlayError;

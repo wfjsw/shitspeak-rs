@@ -1676,7 +1676,9 @@ impl ClientRepository {
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: ClientSessionIdentifier,
     ) -> Result<(Vec<Arc<ClientStateLogEntry>>, HashMap<u16, u64>), ()> {
-        let entries = self.replay_entries_since_in_server(server_id, last_seen).await?;
+        let entries = self
+            .replay_entries_since_in_server(server_id, last_seen)
+            .await?;
         let mut new_versions: HashMap<u16, u64> = HashMap::new();
 
         let mut filtered = Vec::with_capacity(entries.len());
@@ -1700,7 +1702,9 @@ impl ClientRepository {
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: Option<ClientSessionIdentifier>,
     ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
-        let entries = self.replay_entries_since_in_server(server_id, last_seen).await?;
+        let entries = self
+            .replay_entries_since_in_server(server_id, last_seen)
+            .await?;
 
         // Track the max version seen per node
         let mut new_versions: HashMap<u16, u64> = HashMap::new();

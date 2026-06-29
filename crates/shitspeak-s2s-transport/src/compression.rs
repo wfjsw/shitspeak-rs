@@ -838,8 +838,8 @@ fn decode_zstd_bounded(
 mod tests {
     use super::*;
     use crate::frame::{FrameType, build_frame};
-    use crate::{MessageClass, ServiceLevel};
     use crate::s2s_overlay_proto as overlay_pb;
+    use crate::{MessageClass, ServiceLevel};
     use prost::Message as _;
 
     fn data_frame(payload: Bytes) -> pb::Frame {

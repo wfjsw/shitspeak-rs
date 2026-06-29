@@ -19,11 +19,11 @@ use crate::client_repository::ClientRepository;
 use crate::config::{MetricsConfig, RemoteWriteConfig};
 use crate::geoip::NodeGeo;
 use crate::http_client;
+use crate::s2s::S2SManager;
+use crate::types::DEFAULT_SERVER_ID;
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::status::{self, PrometheusSample};
 use shitspeak_s2s_transport::ConnectionManager;
-use crate::s2s::S2SManager;
-use crate::types::DEFAULT_SERVER_ID;
 
 #[async_trait]
 pub trait S2sMetricsSource: Send + Sync + 'static {

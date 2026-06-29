@@ -19,8 +19,8 @@ use crate::application::proto::{
     UserStatsRequest,
 };
 use crate::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 /// UserStats RPC traffic is reliable + low-latency (a moderator UI is
 /// waiting on the reply) but not realtime — same level as moderation.

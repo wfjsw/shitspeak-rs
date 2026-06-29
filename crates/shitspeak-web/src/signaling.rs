@@ -1703,11 +1703,7 @@ async fn send_web_client_log_gap(
     let server_id = client.server_id();
     let (missed, versions) = match server
         .get_clients()
-        .replay_entries_since_in_server_for_client(
-            &server_id,
-            &last_seen,
-            client.get_session_id(),
-        )
+        .replay_entries_since_in_server_for_client(&server_id, &last_seen, client.get_session_id())
         .await
     {
         Ok(replay) => replay,
@@ -1853,21 +1849,19 @@ async fn send_web_client_log_entry(
     entry: &ClientStateLogEntry,
 ) -> io::Result<()> {
     let old_viewer_channel_id = channel_shadow.get(&client.get_session_id()).copied();
-    let permission_refresh_scope = permission_info_refresh_scope_for_entry(
-        entry,
-        client.get_session_id(),
-    )
-    .map(|scope| match scope {
-        PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id: _,
-            new_channel_id,
-        } => PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id: old_viewer_channel_id,
-            new_channel_id,
-        },
-        scope => scope,
-    })
-    .unwrap_or(PermissionInfoRefreshScope::All);
+    let permission_refresh_scope =
+        permission_info_refresh_scope_for_entry(entry, client.get_session_id())
+            .map(|scope| match scope {
+                PermissionInfoRefreshScope::HomeChannelDependent {
+                    old_channel_id: _,
+                    new_channel_id,
+                } => PermissionInfoRefreshScope::HomeChannelDependent {
+                    old_channel_id: old_viewer_channel_id,
+                    new_channel_id,
+                },
+                scope => scope,
+            })
+            .unwrap_or(PermissionInfoRefreshScope::All);
 
     for message in entry
         .messages_for_client(server.get_clients(), client.get_session_id())

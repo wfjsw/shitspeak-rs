@@ -19,9 +19,9 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use shitspeak_s2s_transport::{ConnectionManager, MessageClass, ServiceLevel};
-use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_proto::s2s_overlay_proto as pb;
+use shitspeak_s2s_transport::{ConnectionManager, MessageClass, ServiceLevel};
 
 use super::super::config::OverlayConfig;
 use super::super::lsdb::{LinkStateDb, full_pull, push_snapshot};

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use scc::HashMap as SccMap;
 
-use shitspeak_s2s_transport::{ConnectionManager, MessageClass, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{ConnectionManager, MessageClass, ServiceLevel};
 
 use self::ordering::OverlayOrdering;
 use super::LaneId;

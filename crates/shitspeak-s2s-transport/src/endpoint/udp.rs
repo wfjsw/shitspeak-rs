@@ -855,10 +855,7 @@ async fn handle_udp_datagram(
     let frame = pb::Frame::decode(&plaintext[..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     #[cfg(debug_assertions)]
-    crate::debug_io::record_named_received(
-        udp_frame_kind_name(frame.frame_type),
-        packet.len(),
-    );
+    crate::debug_io::record_named_received(udp_frame_kind_name(frame.frame_type), packet.len());
     if frame.src_node != u32::from(header.src) || frame.dst_node != u32::from(inner.self_id()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

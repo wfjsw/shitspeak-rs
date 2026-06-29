@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use shitspeak_s2s_transport::{AddressBackoffSnapshot, PeerAddress, TransportKind};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{AddressBackoffSnapshot, PeerAddress, TransportKind};
 
 use super::super::error::OverlayError;
 

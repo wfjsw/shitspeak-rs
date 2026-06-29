@@ -29,8 +29,8 @@ use super::super::proto::{
 use super::super::topic::ErasedStrictRuntime;
 use super::{HistoryMetadata, StrictLogMetadata, StrictReplicable};
 use crate::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
-use shitspeak_s2s_transport::{MessageClass, RoutingMetric, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, RoutingMetric, ServiceLevel};
 
 // ---------- Tunables ----------
 
@@ -2415,9 +2415,7 @@ mod tests {
         let captures = net.captures();
         assert_eq!(captures.len(), 1);
         match &captures[0] {
-            crate::replications::test_support::CapturedFrame::StrictUnicast {
-                dst, ..
-            } => {
+            crate::replications::test_support::CapturedFrame::StrictUnicast { dst, .. } => {
                 assert_eq!(*dst, 3);
             }
             other => panic!("unexpected capture: {other:?}"),
@@ -2471,9 +2469,7 @@ mod tests {
         assert_eq!(captures.len(), 1);
         match &captures[0] {
             crate::replications::test_support::CapturedFrame::StrictUnicast {
-                dst,
-                body,
-                ..
+                dst, body, ..
             } => {
                 assert_eq!(*dst, 1);
                 let StrictBody::CatchupResp(resp) = body else {
@@ -2537,9 +2533,7 @@ mod tests {
         assert_eq!(captures.len(), 1);
         match &captures[0] {
             crate::replications::test_support::CapturedFrame::StrictUnicast {
-                dst,
-                body,
-                ..
+                dst, body, ..
             } => {
                 assert_eq!(*dst, 2);
                 let StrictBody::CatchupReq(req) = body else {
@@ -2596,9 +2590,7 @@ mod tests {
         assert_eq!(captures.len(), 1);
         match &captures[0] {
             crate::replications::test_support::CapturedFrame::StrictUnicast {
-                dst,
-                body,
-                ..
+                dst, body, ..
             } => {
                 assert_eq!(*dst, 3);
                 assert!(matches!(body, StrictBody::CatchupReq(_)));

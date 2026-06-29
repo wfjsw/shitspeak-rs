@@ -21,8 +21,8 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use shitspeak_s2s_transport::PeerAddress;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::PeerAddress;
 
 use super::lsdb::{LinkStateDb, ReplicationServices};
 pub use view::MemberStatus;

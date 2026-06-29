@@ -521,8 +521,10 @@ pub async fn replay_channel_log_gap(
             }
         }
         let refresh_scope =
-            crate::client::visibility::visibility_refresh_scope_for_channel_operation(server, entry)
-                .await;
+            crate::client::visibility::visibility_refresh_scope_for_channel_operation(
+                server, entry,
+            )
+            .await;
         let projected = crate::client::visibility::visibility_refresh_messages_with_shadow(
             server,
             client,

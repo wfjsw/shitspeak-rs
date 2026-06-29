@@ -28,15 +28,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
-use shitspeak_core::ClientSessionIdentifier;
 use crate::application::error::ApplicationError;
 use crate::application::proto::{
     self, MODERATION_SERVICE_TAG, ModerationCommand, ModerationEnvelope, UserRemovePatch,
     UserStatePatch,
 };
 use crate::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
+use shitspeak_core::ClientSessionIdentifier;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 /// Moderation envelopes are reliable + low-latency at the transport
 /// layer (KCP/QUIC preferred, plain TCP acceptable as a fallback per

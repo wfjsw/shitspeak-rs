@@ -11,8 +11,8 @@ use bytes::Bytes;
 use crate::application::error::ApplicationError;
 use crate::application::proto::{self, VOICE_SERVICE_TAG, VoiceIntent};
 use crate::overlay::{OverlayNetwork, RoutingMetric};
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 /// Voice frames are best-effort by design (drop tolerated, latency
 /// critical) and run on the high-priority receiver queue.

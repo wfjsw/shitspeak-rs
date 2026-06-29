@@ -10,9 +10,9 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use crate::overlay::LaneId;
 use crate::overlay::config::OverlayConfig;
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
-use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_proto::s2s_overlay_proto as pb;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 const TRANSIT_DEDUPE_CAP: usize = 4096;
 

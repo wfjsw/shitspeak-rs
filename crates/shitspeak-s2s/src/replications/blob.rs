@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
+use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 use rand::{RngExt, rng};
@@ -19,8 +19,8 @@ use super::proto::{
 };
 use super::topic::ErasedBlobRuntime;
 use crate::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 #[async_trait]
 pub(crate) trait BlobNet: Send + Sync + 'static {

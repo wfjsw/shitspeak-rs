@@ -1542,11 +1542,7 @@ async fn replay_client_log_entries_since(
 ) -> Result<(), HandleIncomingConnectionError> {
     let (missed, new_versions) = server
         .clients
-        .replay_entries_since_in_server_for_client(
-            server_id,
-            &last_seen,
-            client.get_session_id(),
-        )
+        .replay_entries_since_in_server_for_client(server_id, &last_seen, client.get_session_id())
         .await
         .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
 
@@ -1849,18 +1845,19 @@ async fn append_client_log_entry_messages(
     let old_viewer_channel_id = session_channel_shadow
         .get(&client.get_session_id())
         .copied();
-    let permission_refresh_scope = permission_info_refresh_scope_for_entry(entry, client.get_session_id())
-        .map(|scope| match scope {
-            PermissionInfoRefreshScope::HomeChannelDependent {
-                old_channel_id: _,
-                new_channel_id,
-            } => PermissionInfoRefreshScope::HomeChannelDependent {
-                old_channel_id: old_viewer_channel_id,
-                new_channel_id,
-            },
-            scope => scope,
-        })
-        .unwrap_or(PermissionInfoRefreshScope::All);
+    let permission_refresh_scope =
+        permission_info_refresh_scope_for_entry(entry, client.get_session_id())
+            .map(|scope| match scope {
+                PermissionInfoRefreshScope::HomeChannelDependent {
+                    old_channel_id: _,
+                    new_channel_id,
+                } => PermissionInfoRefreshScope::HomeChannelDependent {
+                    old_channel_id: old_viewer_channel_id,
+                    new_channel_id,
+                },
+                scope => scope,
+            })
+            .unwrap_or(PermissionInfoRefreshScope::All);
 
     for msg in entry
         .messages_for_client(&server.clients, client.get_session_id())

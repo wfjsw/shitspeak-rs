@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
-use shitspeak_s2s_transport::ServiceLevel;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::ServiceLevel;
 
-pub use shitspeak_s2s_transport::RoutingMetric;
 pub use dijkstra::RouteEntry;
 pub use recompute::spawn_recomputer;
+pub use shitspeak_s2s_transport::RoutingMetric;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RoutingTableKey {

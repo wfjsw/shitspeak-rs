@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use shitspeak_s2s_transport::{PeerAddress, TransportKind};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{PeerAddress, TransportKind};
 
 /// Bitmask over `TransportKind` values (1 << TransportKind::Tcp etc).
 /// Used as an admission filter on routing edges per service-level.

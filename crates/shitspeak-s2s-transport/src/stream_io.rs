@@ -824,10 +824,7 @@ where
     }
     peer.metrics().record_sent(transport, len);
     #[cfg(debug_assertions)]
-    crate::debug_io::record_named_sent(
-        stream_frame_kind_name(transport, frame.frame_type),
-        len,
-    );
+    crate::debug_io::record_named_sent(stream_frame_kind_name(transport, frame.frame_type), len);
     peer.metrics().record_data_health_success(transport);
     Ok(len)
 }

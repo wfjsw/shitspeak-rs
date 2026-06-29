@@ -12,11 +12,11 @@ use tracing::{debug, trace, warn};
 
 use crate::overlay::LaneId;
 use crate::overlay::config::OverlayConfig;
+use shitspeak_core::NodeIdentifier;
+use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{
     ConnectionManager, MessageClass, SendOptions as TransportSendOptions, ServiceLevel,
 };
-use shitspeak_proto::s2s_overlay_proto as pb;
-use shitspeak_core::NodeIdentifier;
 
 use super::super::error::OverlayError;
 use super::super::proto::{

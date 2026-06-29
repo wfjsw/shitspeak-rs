@@ -30,8 +30,8 @@ use tokio::sync::mpsc;
 use tracing::trace;
 
 use crate::overlay::proto::{OverlayBody, decode_message};
-use shitspeak_s2s_transport::{Inbound, InboundMessage, MessageClass};
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::{Inbound, InboundMessage, MessageClass};
 
 /// Variants of `OverlayMessage.body`. Used by per-type drop/filter rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,9 +63,9 @@ impl MessageType {
                             repl.body,
                             Some(crate::replications::proto::ReplBody::Strict(
                                 crate::replications::proto::StrictMessage {
-                                    body: Some(
-                                        crate::replications::proto::StrictBody::ProposeAck(_)
-                                    ),
+                                    body: Some(crate::replications::proto::StrictBody::ProposeAck(
+                                        _
+                                    )),
                                 },
                             ))
                         ) {

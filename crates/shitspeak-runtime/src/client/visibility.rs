@@ -398,7 +398,8 @@ pub async fn visibility_refresh_messages(
             .await
         {
             Some(target) if target.is_authenticated() => {
-                messages.extend(refresh_target_visibility(server, viewer, visibility, &target).await);
+                messages
+                    .extend(refresh_target_visibility(server, viewer, visibility, &target).await);
             }
             _ if visibility.remove(session) => messages.push(hidden_user_remove(session)),
             _ => {}
@@ -444,13 +445,15 @@ pub async fn visibility_refresh_scope_for_client_log_entry(
         ClientStateOperation::UpdateGlobalState {
             session_id, delta, ..
         } if *session_id == viewer.get_session_id() => {
-            scope.merge(visibility_refresh_scope_for_viewer_delta(
-                server,
-                viewer,
-                delta,
-                old_viewer_channel_id,
-            )
-            .await);
+            scope.merge(
+                visibility_refresh_scope_for_viewer_delta(
+                    server,
+                    viewer,
+                    delta,
+                    old_viewer_channel_id,
+                )
+                .await,
+            );
         }
         ClientStateOperation::ResetNode { .. } => {
             scope.include_known_users();

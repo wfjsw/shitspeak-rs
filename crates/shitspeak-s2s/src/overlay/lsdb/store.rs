@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tracing::{Level, debug, warn};
 
-use shitspeak_s2s_transport::PeerAddress;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::PeerAddress;
 
 use super::super::proto::{address_from_pb, address_to_pb};
 use shitspeak_proto::s2s_overlay_proto as pb;

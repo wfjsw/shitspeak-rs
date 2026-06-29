@@ -17,8 +17,8 @@ use super::runtime::{
     HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryElectionCandidate, HistoryRank, StrictRuntime,
 };
 use super::{LogSlice, StrictLogMetadata, StrictReplicable};
-use shitspeak_s2s_transport::ServiceLevel;
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::ServiceLevel;
 
 /// Build and send a `StrictCatchupResp` answering `req`.
 pub(crate) async fn respond_to_request<R: StrictReplicable>(
