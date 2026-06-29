@@ -98,6 +98,9 @@ struct RemoteClientRegister {
     clients: HashMap<ScopedSessionId, Arc<Box<Client>>>,
     log: VecDeque<Arc<ClientStateLogEntry>>,
     version: u64,
+    clients_by_channel: HashMap<ScopedChannelId, HashSet<ScopedSessionId>>,
+    client_channel: HashMap<ScopedSessionId, ScopedChannelId>,
+    listeners_by_channel: HashMap<ScopedChannelId, HashSet<ScopedSessionId>>,
     /// Remote client log entries waiting for channel state to catch up.
     /// Entries remain in this remote node's version order.
     pending_ops: VecDeque<(Arc<ClientStateLogEntry>, u64)>,
@@ -201,10 +204,80 @@ impl RemoteClientRegister {
             clients: HashMap::new(),
             log: VecDeque::new(),
             version: 0,
+            clients_by_channel: HashMap::new(),
+            client_channel: HashMap::new(),
+            listeners_by_channel: HashMap::new(),
             pending_ops: VecDeque::new(),
             last_pending_effective_dep_by_server: HashMap::new(),
             pending_channel_versions: HashMap::new(),
         }
+    }
+
+    fn channel_index_insert(&mut self, id: ScopedSessionId, channel_id: u32) {
+        let channel_key = ScopedChannelId::new(id.server_id().to_owned(), channel_id);
+        self.client_channel.insert(id.clone(), channel_key.clone());
+        self.clients_by_channel
+            .entry(channel_key)
+            .or_default()
+            .insert(id);
+    }
+
+    fn channel_index_move(&mut self, id: ScopedSessionId, new_channel: u32) {
+        let new_channel_key = ScopedChannelId::new(id.server_id().to_owned(), new_channel);
+        let old = self.client_channel.get(&id).cloned();
+        if old.as_ref() == Some(&new_channel_key) {
+            return;
+        }
+        if let Some(old_ch) = old {
+            if let Some(set) = self.clients_by_channel.get_mut(&old_ch) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.clients_by_channel.remove(&old_ch);
+                }
+            }
+        }
+        self.client_channel
+            .insert(id.clone(), new_channel_key.clone());
+        self.clients_by_channel
+            .entry(new_channel_key)
+            .or_default()
+            .insert(id);
+    }
+
+    fn channel_index_remove(&mut self, id: &ScopedSessionId) {
+        if let Some(old_ch) = self.client_channel.remove(id) {
+            if let Some(set) = self.clients_by_channel.get_mut(&old_ch) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.clients_by_channel.remove(&old_ch);
+                }
+            }
+        }
+    }
+
+    fn listener_index_add(&mut self, id: ScopedSessionId, channel_id: u32) {
+        let channel_key = ScopedChannelId::new(id.server_id().to_owned(), channel_id);
+        self.listeners_by_channel
+            .entry(channel_key)
+            .or_default()
+            .insert(id);
+    }
+
+    fn listener_index_remove_channel(&mut self, id: &ScopedSessionId, channel_id: u32) {
+        let channel_key = ScopedChannelId::new(id.server_id().to_owned(), channel_id);
+        if let Some(set) = self.listeners_by_channel.get_mut(&channel_key) {
+            set.remove(id);
+            if set.is_empty() {
+                self.listeners_by_channel.remove(&channel_key);
+            }
+        }
+    }
+
+    fn listener_index_remove_all(&mut self, id: &ScopedSessionId) {
+        self.listeners_by_channel.retain(|_, set| {
+            set.remove(id);
+            !set.is_empty()
+        });
     }
 
     fn log_version_in_server(&self, server_id: &str) -> Option<u64> {
@@ -697,12 +770,15 @@ impl ClientRepository {
         }
         let server_id = client.server_id();
         let scoped_id = ScopedSessionId::new(server_id.clone(), id);
-        self.get_or_create_remote_register(node_id)
-            .await
-            .write()
-            .await
-            .clients
-            .insert(scoped_id, client);
+        let remote_register = self.get_or_create_remote_register(node_id).await;
+        let mut register = remote_register.write().await;
+        let channel_id = client.get_current_channel_id();
+        let listener_channels = client.get_listening_channel_ids();
+        register.clients.insert(scoped_id.clone(), client);
+        register.channel_index_insert(scoped_id.clone(), channel_id);
+        for channel_id in listener_channels {
+            register.listener_index_add(scoped_id.clone(), channel_id);
+        }
         // NOTE: remote clients are intentionally NOT added to the local
         // channel index — voice routing only targets local clients (remote
         // clients receive audio via S2S from their owning node).
@@ -773,6 +849,8 @@ impl ClientRepository {
             let (removed, should_remove_register) = {
                 let mut register = remote_register.write().await;
                 let removed = register.clients.remove(&scoped_id);
+                register.channel_index_remove(&scoped_id);
+                register.listener_index_remove_all(&scoped_id);
                 let should_remove_register = removed.is_some()
                     && register.clients.is_empty()
                     && register.log.is_empty()
@@ -844,6 +922,9 @@ impl ClientRepository {
                 .collect();
             let base_version = register.version;
             register.clients.clear();
+            register.clients_by_channel.clear();
+            register.client_channel.clear();
+            register.listeners_by_channel.clear();
             register.log.clear();
             register.version = 0;
             register.pending_ops.clear();
@@ -1202,6 +1283,45 @@ impl ClientRepository {
         clients
     }
 
+    pub async fn get_clients_in_channels_or_listeners_in_server(
+        &self,
+        server_id: &str,
+        channel_ids: &HashSet<u32>,
+    ) -> Vec<Arc<Box<Client>>> {
+        if channel_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut clients = Vec::new();
+        let mut seen = HashSet::new();
+        {
+            let register = self.register.read().await;
+            append_indexed_clients(
+                &register.local_clients,
+                &register.clients_by_channel,
+                &register.listeners_by_channel,
+                server_id,
+                channel_ids,
+                &mut seen,
+                &mut clients,
+            );
+        }
+        for (_, register) in self.remote_register_snapshots().await {
+            let register = register.read().await;
+            append_indexed_clients(
+                &register.clients,
+                &register.clients_by_channel,
+                &register.listeners_by_channel,
+                server_id,
+                channel_ids,
+                &mut seen,
+                &mut clients,
+            );
+        }
+
+        clients
+    }
+
     /// Return a snapshot of locally connected clients.
     pub async fn get_local_clients(&self) -> Vec<Arc<Box<Client>>> {
         self.register
@@ -1550,12 +1670,61 @@ impl ClientRepository {
             .await
     }
 
+    pub async fn replay_entries_since_in_server_for_client(
+        &self,
+        server_id: &str,
+        last_seen: &HashMap<u16, u64>,
+        viewer_session_id: ClientSessionIdentifier,
+    ) -> Result<(Vec<Arc<ClientStateLogEntry>>, HashMap<u16, u64>), ()> {
+        let entries = self.replay_entries_since_in_server(server_id, last_seen).await?;
+        let mut new_versions: HashMap<u16, u64> = HashMap::new();
+
+        let mut filtered = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if is_own_replayed_add_client(&entry.op, viewer_session_id) {
+                let cur = new_versions.entry(entry.node_id).or_insert(0);
+                *cur = (*cur).max(entry.version);
+                continue;
+            }
+            let cur = new_versions.entry(entry.node_id).or_insert(0);
+            *cur = (*cur).max(entry.version);
+            filtered.push(entry);
+        }
+
+        Ok((filtered, new_versions))
+    }
+
     async fn replay_since_in_server_filtered(
         &self,
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: Option<ClientSessionIdentifier>,
     ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
+        let entries = self.replay_entries_since_in_server(server_id, last_seen).await?;
+
+        // Track the max version seen per node
+        let mut new_versions: HashMap<u16, u64> = HashMap::new();
+
+        // Convert to messages
+        let mut messages = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(viewer_session_id) = viewer_session_id {
+                messages.extend(entry.messages_for_client(self, viewer_session_id).await);
+            } else if let Some(msg) = entry.to_message(self).await {
+                messages.push(msg);
+            }
+            let cur = new_versions.entry(entry.node_id).or_insert(0);
+            *cur = (*cur).max(entry.version);
+        }
+
+        Ok((messages, new_versions))
+    }
+
+    async fn replay_entries_since_in_server(
+        &self,
+        server_id: &str,
+        last_seen: &HashMap<u16, u64>,
+    ) -> Result<Vec<Arc<ClientStateLogEntry>>, ()> {
         let local_since = last_seen.get(&self.local_node_id).copied().unwrap_or(0);
         let mut entries: Vec<Arc<ClientStateLogEntry>> = Vec::new();
         {
@@ -1613,22 +1782,7 @@ impl ClientRepository {
                 .then_with(|| a.version.cmp(&b.version))
         });
 
-        // Track the max version seen per node
-        let mut new_versions: HashMap<u16, u64> = HashMap::new();
-
-        // Convert to messages
-        let mut messages = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if let Some(viewer_session_id) = viewer_session_id {
-                messages.extend(entry.messages_for_client(self, viewer_session_id).await);
-            } else if let Some(msg) = entry.to_message(self).await {
-                messages.push(msg);
-            }
-            let cur = new_versions.entry(entry.node_id).or_insert(0);
-            *cur = (*cur).max(entry.version);
-        }
-
-        Ok((messages, new_versions))
+        Ok(entries)
     }
 
     /// Send `message` to a single client identified by `id`.
@@ -1930,7 +2084,13 @@ impl ClientRepository {
                         apply_delta_to_global_state(&mut gs, initial_state);
                         client.set_can_receive_voice(gs.can_receive_voice());
                     }
-                    register.clients.insert(scoped_id, client);
+                    let channel_id = client.get_current_channel_id();
+                    let listener_channels = client.get_listening_channel_ids();
+                    register.clients.insert(scoped_id.clone(), client);
+                    register.channel_index_insert(scoped_id.clone(), channel_id);
+                    for channel_id in listener_channels {
+                        register.listener_index_add(scoped_id.clone(), channel_id);
+                    }
                 }
             }
             ClientStateOperation::RemoveClient {
@@ -1952,6 +2112,8 @@ impl ClientRepository {
                     .unwrap_or(false);
                 if should_remove {
                     register.clients.remove(&scoped_id);
+                    register.channel_index_remove(&scoped_id);
+                    register.listener_index_remove_all(&scoped_id);
                 } else {
                     tracing::trace!(
                         remote_node,
@@ -1974,6 +2136,19 @@ impl ClientRepository {
                     if *client_instance_id == 0
                         || client.client_instance_id() == *client_instance_id
                     {
+                        if let Some(new_ch) = delta.current_channel_id {
+                            register.channel_index_move(scoped_id.clone(), new_ch);
+                        }
+                        if let Some(ref adds) = delta.listening_channel_add {
+                            for &ch in adds {
+                                register.listener_index_add(scoped_id.clone(), ch);
+                            }
+                        }
+                        if let Some(ref removes) = delta.listening_channel_remove {
+                            for &ch in removes {
+                                register.listener_index_remove_channel(&scoped_id, ch);
+                            }
+                        }
                         let mut gs = client.write_global_state_direct();
                         apply_delta_to_global_state(&mut gs, delta);
                         client.set_can_receive_voice(gs.can_receive_voice());
@@ -3155,4 +3330,40 @@ pub(crate) fn apply_delta_to_global_state(
     if let Some(ref v) = delta.display_name {
         gs.set_display_name(v.clone());
     }
+}
+
+fn append_indexed_clients(
+    clients_by_id: &HashMap<ScopedSessionId, Arc<Box<Client>>>,
+    clients_by_channel: &HashMap<ScopedChannelId, HashSet<ScopedSessionId>>,
+    listeners_by_channel: &HashMap<ScopedChannelId, HashSet<ScopedSessionId>>,
+    server_id: &str,
+    channel_ids: &HashSet<u32>,
+    seen: &mut HashSet<ScopedSessionId>,
+    out: &mut Vec<Arc<Box<Client>>>,
+) {
+    for &channel_id in channel_ids {
+        let channel_key = ScopedChannelId::new(server_id.to_owned(), channel_id);
+        for ids in [
+            clients_by_channel.get(&channel_key),
+            listeners_by_channel.get(&channel_key),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for id in ids {
+                if seen.insert(id.clone()) {
+                    if let Some(client) = clients_by_id.get(id) {
+                        out.push(Arc::clone(client));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_own_replayed_add_client(
+    op: &ClientStateOperation,
+    session_id: ClientSessionIdentifier,
+) -> bool {
+    matches!(op, ClientStateOperation::AddClient { session_id: id, .. } if *id == session_id)
 }

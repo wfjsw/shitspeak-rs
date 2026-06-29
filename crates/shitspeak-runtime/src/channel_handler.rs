@@ -520,23 +520,22 @@ pub async fn replay_channel_log_gap(
                 }
             }
         }
-        let reconcile =
-            crate::client::visibility::reconcile_all(server, client, user_visibility).await;
-        for msg in reconcile {
-            let projected = crate::client::visibility::sync_projected_message_with_shadow(
-                server,
-                client,
-                user_visibility,
-                session_channel_shadow,
-                &server_id,
-                msg,
-            )
-            .await;
-            for msg in projected {
-                sync_channel_tree_shadow(channel_tree_shadow, &msg);
-                if client.write_proto_message(&msg).await.is_err() {
-                    return Err(());
-                }
+        let refresh_scope =
+            crate::client::visibility::visibility_refresh_scope_for_channel_operation(server, entry)
+                .await;
+        let projected = crate::client::visibility::visibility_refresh_messages_with_shadow(
+            server,
+            client,
+            user_visibility,
+            session_channel_shadow,
+            &server_id,
+            refresh_scope,
+        )
+        .await;
+        for msg in projected {
+            sync_channel_tree_shadow(channel_tree_shadow, &msg);
+            if client.write_proto_message(&msg).await.is_err() {
+                return Err(());
             }
         }
         client.set_last_channel_version(entry.version).await;
@@ -598,7 +597,7 @@ async fn replay_channel_snapshot(
     Ok(())
 }
 
-fn ordered_snapshot_channels(
+pub(crate) fn ordered_snapshot_channels(
     channels: &[crate::channels::Channel],
 ) -> Vec<crate::channels::Channel> {
     let by_id: HashMap<u32, &crate::channels::Channel> = channels
@@ -649,6 +648,37 @@ fn ordered_snapshot_channels(
     remaining.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
     out.extend(remaining);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::channels::Channel;
+
+    use super::ordered_snapshot_channels;
+
+    fn channel(id: u32, parent_id: Option<u32>, position: i32) -> Channel {
+        Channel::new(id, format!("channel-{id}"), position, 100, parent_id)
+    }
+
+    #[test]
+    fn ordered_snapshot_channels_is_root_first_position_ordered_with_orphans_last() {
+        let channels = vec![
+            channel(7, Some(99), 0),
+            channel(3, Some(0), 1),
+            channel(0, None, 0),
+            channel(2, Some(0), 0),
+            channel(5, Some(2), 0),
+            channel(4, Some(3), 0),
+            channel(6, Some(99), -1),
+        ];
+
+        let ordered_ids = ordered_snapshot_channels(&channels)
+            .into_iter()
+            .map(|channel| channel.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered_ids, vec![0, 2, 3, 5, 4, 6, 7]);
+    }
 }
 
 /// Build a ChannelState encoder message, optionally with permission info.
@@ -725,6 +755,23 @@ pub async fn build_home_channel_permission_info_refresh_messages(
         None => channels_with_home_channel_dependent_acls(all_channels),
     };
     build_scoped_permission_info_refresh_messages_for_channels(server, client, channels).await
+}
+
+pub async fn home_channel_dependent_channel_ids(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    old_channel_id: Option<u32>,
+    new_channel_id: u32,
+) -> Vec<u32> {
+    let server_id = client.server_id();
+    let all_channels = server.get_channels().get_all_in_server(&server_id).await;
+    let channels = match old_channel_id {
+        Some(old_channel_id) => {
+            channels_affected_by_home_channel_move(all_channels, old_channel_id, new_channel_id)
+        }
+        None => channels_with_home_channel_dependent_acls(all_channels),
+    };
+    channels.into_iter().map(|channel| channel.id).collect()
 }
 
 async fn build_channel_permission_info_refresh_messages_for_channels(

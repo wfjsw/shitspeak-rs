@@ -18,7 +18,7 @@ use crate::session::{
 use crate::voice::{InboundVoiceMetadata, SsrcAllocator, VoiceTargetKind};
 use shitspeak_runtime::api::Authenticator;
 use shitspeak_runtime::channel_handler::SessionChannelShadow;
-use shitspeak_runtime::client::state_log::ClientStateOperation;
+use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOperation};
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{Client, client_session_identifier::ClientSessionIdentifier};
 use shitspeak_runtime::config::{WebConfig, WebMoqConfig};
@@ -920,27 +920,22 @@ impl MoqSessionRuntime {
                 .await,
             );
         }
-        let reconcile = shitspeak_runtime::client::visibility::reconcile_all(
-            &server,
-            &client,
-            &mut self.user_visibility,
-        )
-        .await;
-        for message in reconcile {
-            events.extend(
-                shitspeak_runtime::client::visibility::sync_projected_message_with_shadow(
-                    &server,
-                    &client,
-                    &mut self.user_visibility,
-                    &mut self.channel_shadow,
-                    &server_id,
-                    message,
-                )
-                .await
-                .into_iter()
-                .filter_map(server_event_from_message),
-            );
-        }
+        let refresh_scope =
+            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation(
+                &server, &op,
+            )
+            .await;
+        events.extend(
+            visibility_refresh_events(
+                &server,
+                &client,
+                &mut self.channel_shadow,
+                &mut self.user_visibility,
+                &server_id,
+                refresh_scope,
+            )
+            .await,
+        );
         client.set_last_channel_version(op.version).await;
         Ok(events)
     }
@@ -986,27 +981,22 @@ impl MoqSessionRuntime {
                     .await,
                 );
             }
-            let reconcile = shitspeak_runtime::client::visibility::reconcile_all(
-                &server,
-                &client,
-                &mut self.user_visibility,
-            )
-            .await;
-            for message in reconcile {
-                events.extend(
-                    shitspeak_runtime::client::visibility::sync_projected_message_with_shadow(
-                        &server,
-                        &client,
-                        &mut self.user_visibility,
-                        &mut self.channel_shadow,
-                        &server_id,
-                        message,
-                    )
-                    .await
-                    .into_iter()
-                    .filter_map(server_event_from_message),
-                );
-            }
+            let refresh_scope =
+                shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation(
+                    &server, &op,
+                )
+                .await;
+            events.extend(
+                visibility_refresh_events(
+                    &server,
+                    &client,
+                    &mut self.channel_shadow,
+                    &mut self.user_visibility,
+                    &server_id,
+                    refresh_scope,
+                )
+                .await,
+            );
             client.set_last_channel_version(op.version).await;
         }
         Ok(events)
@@ -1049,44 +1039,15 @@ impl MoqSessionRuntime {
             client.update_last_client_versions(&payload.versions).await;
             return Ok(Vec::new());
         }
-        let mut events = Vec::new();
-        for message in entry
-            .messages_for_client(server.get_clients(), client.get_session_id())
-            .await
-        {
-            events.extend(
-                client_log_message_events_with_acl_refresh(
-                    &server,
-                    &client,
-                    &mut self.channel_shadow,
-                    &mut self.user_visibility,
-                    &server_id,
-                    &message,
-                )
-                .await,
-            );
-        }
-        let reconcile = shitspeak_runtime::client::visibility::reconcile_all(
+        let events = client_log_entry_events(
             &server,
             &client,
+            &mut self.channel_shadow,
             &mut self.user_visibility,
+            &server_id,
+            entry,
         )
         .await;
-        for message in reconcile {
-            events.extend(
-                shitspeak_runtime::client::visibility::sync_projected_message_with_shadow(
-                    &server,
-                    &client,
-                    &mut self.user_visibility,
-                    &mut self.channel_shadow,
-                    &server_id,
-                    message,
-                )
-                .await
-                .into_iter()
-                .filter_map(server_event_from_message),
-            );
-        }
         client.update_last_client_versions(&payload.versions).await;
         Ok(events)
     }
@@ -1103,42 +1064,25 @@ impl MoqSessionRuntime {
         let server_id = client.server_id();
         let (missed, versions) = server
             .get_clients()
-            .replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id())
+            .replay_entries_since_in_server_for_client(
+                &server_id,
+                &last_seen,
+                client.get_session_id(),
+            )
             .await
             .map_err(|()| "MoQ client update gap is unrecoverable".to_string())?;
         let mut events = Vec::new();
-        for message in missed {
+        for entry in missed {
             events.extend(
-                client_log_message_events_with_acl_refresh(
+                client_log_entry_events(
                     &server,
                     &client,
                     &mut self.channel_shadow,
                     &mut self.user_visibility,
                     &server_id,
-                    &message,
+                    &entry,
                 )
                 .await,
-            );
-        }
-        let reconcile = shitspeak_runtime::client::visibility::reconcile_all(
-            &server,
-            &client,
-            &mut self.user_visibility,
-        )
-        .await;
-        for message in reconcile {
-            events.extend(
-                shitspeak_runtime::client::visibility::sync_projected_message_with_shadow(
-                    &server,
-                    &client,
-                    &mut self.user_visibility,
-                    &mut self.channel_shadow,
-                    &server_id,
-                    message,
-                )
-                .await
-                .into_iter()
-                .filter_map(server_event_from_message),
             );
         }
         client.update_last_client_versions(&versions).await;
@@ -1404,6 +1348,77 @@ async fn client_log_message_events_with_acl_refresh(
         }
     }
 
+    events
+}
+
+#[cfg(feature = "moq")]
+async fn visibility_refresh_events(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    scope: shitspeak_runtime::client::visibility::VisibilityRefreshScope,
+) -> Vec<ServerEvent> {
+    shitspeak_runtime::client::visibility::visibility_refresh_messages_with_shadow(
+        server,
+        client,
+        user_visibility,
+        channel_shadow,
+        server_id,
+        scope,
+    )
+    .await
+    .into_iter()
+    .filter_map(server_event_from_message)
+    .collect()
+}
+
+#[cfg(feature = "moq")]
+async fn client_log_entry_events(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    entry: &ClientStateLogEntry,
+) -> Vec<ServerEvent> {
+    let old_viewer_channel_id = channel_shadow.get(&client.get_session_id()).copied();
+    let mut events = Vec::new();
+    for message in entry
+        .messages_for_client(server.get_clients(), client.get_session_id())
+        .await
+    {
+        events.extend(
+            client_log_message_events_with_acl_refresh(
+                server,
+                client,
+                channel_shadow,
+                user_visibility,
+                server_id,
+                &message,
+            )
+            .await,
+        );
+    }
+    let scope = shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
+        server,
+        client,
+        entry,
+        old_viewer_channel_id,
+    )
+    .await;
+    events.extend(
+        visibility_refresh_events(
+            server,
+            client,
+            channel_shadow,
+            user_visibility,
+            server_id,
+            scope,
+        )
+        .await,
+    );
     events
 }
 

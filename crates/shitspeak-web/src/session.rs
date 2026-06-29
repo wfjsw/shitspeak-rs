@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -494,40 +493,16 @@ pub async fn initial_server_events(
     user_visibility: &mut UserVisibilityState,
 ) -> Vec<ServerEvent> {
     let server_id = client.server_id();
-    let channels = server.get_channels().get_all_in_server(&server_id).await;
-    let channels_by_id = channels
-        .into_iter()
-        .map(|channel| (channel.id, channel))
-        .collect::<HashMap<_, _>>();
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back(0u32);
-    let mut visited = std::collections::HashSet::new();
     let mut events = Vec::new();
 
-    while let Some(channel_id) = queue.pop_front() {
-        if !visited.insert(channel_id) {
-            continue;
-        }
-
-        let Some(channel) = channels_by_id.get(&channel_id) else {
-            continue;
-        };
+    let channels = server.get_channels().get_all_in_server(&server_id).await;
+    for channel in shitspeak_runtime::channel_handler::ordered_snapshot_channels(&channels) {
         let channel_state = shitspeak_runtime::channel_handler::build_channel_state_message(
-            server, client, channel,
+            server, client, &channel,
         )
         .await;
         if let Some(event) = server_event_from_message(channel_state.into()) {
             events.push(event);
-        }
-
-        let mut children = channels_by_id
-            .values()
-            .filter(|candidate| candidate.parent_id == Some(channel_id))
-            .map(|candidate| candidate.id)
-            .collect::<Vec<_>>();
-        children.sort_unstable();
-        for child in children {
-            queue.push_back(child);
         }
     }
 

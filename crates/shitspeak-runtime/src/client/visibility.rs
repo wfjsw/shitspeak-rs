@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use crate::acl::ACLPermissions;
 use crate::channel_handler::SessionChannelShadow;
+use crate::channel_repository::{ChannelOp, ChannelOperation};
 use crate::client::Client;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
+use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
 use crate::messages::Message;
 use crate::messages::encoder::{UserRemove, UserState};
 use crate::server::Server;
@@ -18,6 +20,60 @@ pub struct UserVisibilityState {
 struct KnownUserVisibility {
     channel_id: u32,
     listener_channels: HashSet<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VisibilityRefreshScope {
+    sessions: HashSet<ClientSessionIdentifier>,
+    channels: HashSet<u32>,
+    include_all_channels: bool,
+    include_known_users: bool,
+}
+
+impl VisibilityRefreshScope {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn for_session(session: ClientSessionIdentifier) -> Self {
+        let mut scope = Self::new();
+        scope.include_session(session);
+        scope
+    }
+
+    pub fn include_session(&mut self, session: ClientSessionIdentifier) {
+        self.sessions.insert(session);
+    }
+
+    pub fn include_channel(&mut self, channel_id: u32) {
+        self.channels.insert(channel_id);
+    }
+
+    pub fn include_channels(&mut self, channel_ids: impl IntoIterator<Item = u32>) {
+        self.channels.extend(channel_ids);
+    }
+
+    pub fn include_all_channels(&mut self) {
+        self.include_all_channels = true;
+    }
+
+    pub fn include_known_users(&mut self) {
+        self.include_known_users = true;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+            && self.channels.is_empty()
+            && !self.include_all_channels
+            && !self.include_known_users
+    }
+
+    pub fn merge(&mut self, other: VisibilityRefreshScope) {
+        self.sessions.extend(other.sessions);
+        self.channels.extend(other.channels);
+        self.include_all_channels |= other.include_all_channels;
+        self.include_known_users |= other.include_known_users;
+    }
 }
 
 impl UserVisibilityState {
@@ -50,6 +106,24 @@ impl UserVisibilityState {
 
     fn remove(&mut self, session: ClientSessionIdentifier) -> bool {
         self.known.remove(&session).is_some()
+    }
+
+    fn known_sessions(&self) -> impl Iterator<Item = ClientSessionIdentifier> + '_ {
+        self.known.keys().copied()
+    }
+
+    fn known_sessions_in_channels<'a>(
+        &'a self,
+        channel_ids: &'a HashSet<u32>,
+    ) -> impl Iterator<Item = ClientSessionIdentifier> + 'a {
+        self.known.iter().filter_map(|(session, known)| {
+            (channel_ids.contains(&known.channel_id)
+                || known
+                    .listener_channels
+                    .iter()
+                    .any(|channel_id| channel_ids.contains(channel_id)))
+            .then_some(*session)
+        })
     }
 }
 
@@ -271,46 +345,185 @@ pub async fn sync_projected_message_with_shadow(
     out
 }
 
-pub async fn reconcile_all(
+pub async fn visibility_refresh_messages(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,
     visibility: &mut UserVisibilityState,
+    scope: VisibilityRefreshScope,
 ) -> Vec<Message> {
-    if !server.get_hide_users_without_traverse() {
+    if !server.get_hide_users_without_traverse() || scope.is_empty() {
         return Vec::new();
     }
 
     let server_id = viewer.server_id();
-    let mut messages = Vec::new();
-    let clients = server
-        .get_clients()
-        .get_all_clients_in_server(&server_id)
-        .await;
-    let mut seen = HashSet::new();
-    for target in clients {
-        if !target.is_authenticated() {
-            continue;
-        }
-        let session = target.get_session_id();
-        seen.insert(session);
-        messages.extend(reconcile_target(server, viewer, visibility, &target).await);
+    let mut sessions = scope.sessions;
+    if scope.include_known_users {
+        sessions.extend(visibility.known_sessions());
     }
 
-    let known_sessions = visibility.known.keys().copied().collect::<Vec<_>>();
-    for session in known_sessions {
-        if !seen.contains(&session) && visibility.remove(session) {
-            messages.push(
-                UserRemove {
-                    session: u32::from(session),
-                    actor: None,
-                    reason: None,
-                    ban: Some(false),
-                }
-                .into(),
-            );
+    let mut channels = scope.channels;
+    if scope.include_all_channels {
+        channels.extend(
+            server
+                .get_channels()
+                .get_all_in_server(&server_id)
+                .await
+                .into_iter()
+                .map(|channel| channel.id),
+        );
+    }
+
+    if !channels.is_empty() {
+        sessions.extend(visibility.known_sessions_in_channels(&channels));
+        sessions.extend(
+            server
+                .get_clients()
+                .get_clients_in_channels_or_listeners_in_server(&server_id, &channels)
+                .await
+                .into_iter()
+                .filter(|target| target.is_authenticated())
+                .map(|target| target.get_session_id()),
+        );
+    }
+
+    let mut sessions = sessions.into_iter().collect::<Vec<_>>();
+    sessions.sort_by_key(|session| u32::from(*session));
+    sessions.dedup();
+
+    let mut messages = Vec::new();
+    for session in sessions {
+        match server
+            .get_clients()
+            .get_client_in_server(&server_id, session)
+            .await
+        {
+            Some(target) if target.is_authenticated() => {
+                messages.extend(refresh_target_visibility(server, viewer, visibility, &target).await);
+            }
+            _ if visibility.remove(session) => messages.push(hidden_user_remove(session)),
+            _ => {}
         }
     }
     messages
+}
+
+pub async fn visibility_refresh_messages_with_shadow(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
+    channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    scope: VisibilityRefreshScope,
+) -> Vec<Message> {
+    let refresh = visibility_refresh_messages(server, viewer, visibility, scope).await;
+    let mut out = Vec::new();
+    for message in refresh {
+        out.extend(
+            sync_projected_message_with_shadow(
+                server,
+                viewer,
+                visibility,
+                channel_shadow,
+                server_id,
+                message,
+            )
+            .await,
+        );
+    }
+    out
+}
+
+pub async fn visibility_refresh_scope_for_client_log_entry(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    entry: &ClientStateLogEntry,
+    old_viewer_channel_id: Option<u32>,
+) -> VisibilityRefreshScope {
+    let mut scope = VisibilityRefreshScope::new();
+    match &entry.op {
+        ClientStateOperation::UpdateGlobalState {
+            session_id, delta, ..
+        } if *session_id == viewer.get_session_id() => {
+            scope.merge(visibility_refresh_scope_for_viewer_delta(
+                server,
+                viewer,
+                delta,
+                old_viewer_channel_id,
+            )
+            .await);
+        }
+        ClientStateOperation::ResetNode { .. } => {
+            scope.include_known_users();
+        }
+        _ => {}
+    }
+    scope
+}
+
+pub async fn visibility_refresh_scope_for_channel_operation(
+    server: &Arc<Box<Server>>,
+    op: &ChannelOperation,
+) -> VisibilityRefreshScope {
+    let mut scope = VisibilityRefreshScope::new();
+    let channels = server.get_channels();
+    match &op.op {
+        ChannelOp::CreateChannel { channel } => {
+            scope.include_channel(channel.id);
+        }
+        ChannelOp::UpdateChannel { id, patch } | ChannelOp::EditChannel { id, patch, .. } => {
+            if patch.parent_id.is_some() {
+                scope.include_channels(channels.subtree_ids_in_server(&op.server_id, *id).await);
+            }
+        }
+        ChannelOp::SetAcls { channel_id, .. } => {
+            scope.include_channels(
+                channels
+                    .subtree_ids_in_server(&op.server_id, *channel_id)
+                    .await,
+            );
+        }
+        ChannelOp::DeleteChannel { id, .. } => {
+            scope.include_channel(*id);
+            scope.include_known_users();
+        }
+        ChannelOp::InstallSnapshot { channels, .. } => {
+            scope.include_channels(channels.iter().map(|channel| channel.id));
+            scope.include_known_users();
+        }
+        ChannelOp::MarkPendingDelete { .. }
+        | ChannelOp::CancelPendingDelete { .. }
+        | ChannelOp::AddLink { .. }
+        | ChannelOp::RemoveLink { .. } => {}
+    }
+    scope
+}
+
+async fn visibility_refresh_scope_for_viewer_delta(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    delta: &ClientGlobalStateDelta,
+    old_viewer_channel_id: Option<u32>,
+) -> VisibilityRefreshScope {
+    let mut scope = VisibilityRefreshScope::new();
+    if delta.user_id.is_some()
+        || delta.groups.is_some()
+        || delta.is_superuser.is_some()
+        || delta.tokens.is_some()
+    {
+        scope.include_all_channels();
+        scope.include_known_users();
+    } else if let Some(new_channel_id) = delta.current_channel_id {
+        scope.include_channels(
+            crate::channel_handler::home_channel_dependent_channel_ids(
+                server,
+                viewer,
+                old_viewer_channel_id,
+                new_channel_id,
+            )
+            .await,
+        );
+    }
+    scope
 }
 
 async fn project_user_state(
@@ -369,7 +582,7 @@ async fn project_user_state(
     }
 }
 
-async fn reconcile_target(
+async fn refresh_target_visibility(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,
     visibility: &mut UserVisibilityState,

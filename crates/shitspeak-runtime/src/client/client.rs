@@ -56,6 +56,52 @@ pub type ClientStateSubscription = tokio::sync::broadcast::Receiver<
 pub type StagedChannelStateSubscription =
     (u64, crate::channel_repository::ChannelStateSubscription);
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PostAuthBaseline {
+    session_channel_shadow: crate::channel_handler::SessionChannelShadow,
+    channel_tree_shadow: crate::channel_handler::ChannelTreeShadow,
+    user_visibility: crate::client::visibility::UserVisibilityState,
+}
+
+impl PostAuthBaseline {
+    pub(crate) fn new(
+        session_channel_shadow: crate::channel_handler::SessionChannelShadow,
+        channel_tree_shadow: crate::channel_handler::ChannelTreeShadow,
+    ) -> Self {
+        Self {
+            session_channel_shadow,
+            channel_tree_shadow,
+            user_visibility: crate::client::visibility::UserVisibilityState::default(),
+        }
+    }
+
+    pub(crate) fn with_user_visibility(
+        session_channel_shadow: crate::channel_handler::SessionChannelShadow,
+        channel_tree_shadow: crate::channel_handler::ChannelTreeShadow,
+        user_visibility: crate::client::visibility::UserVisibilityState,
+    ) -> Self {
+        Self {
+            session_channel_shadow,
+            channel_tree_shadow,
+            user_visibility,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::channel_handler::SessionChannelShadow,
+        crate::channel_handler::ChannelTreeShadow,
+        crate::client::visibility::UserVisibilityState,
+    ) {
+        (
+            self.session_channel_shadow,
+            self.channel_tree_shadow,
+            self.user_visibility,
+        )
+    }
+}
+
 pub enum ClientOutboundMessage {
     Single(Message),
     Batch(Vec<Message>),
@@ -151,6 +197,7 @@ pub struct Client {
     published: AtomicBool,
     pending_client_state_subscription: ParkingMutex<Option<ClientStateSubscription>>,
     pending_channel_state_subscription: ParkingMutex<Option<StagedChannelStateSubscription>>,
+    pending_post_auth_baseline: ParkingMutex<Option<PostAuthBaseline>>,
 
     /// If true, send voice through TCP `UDPTunnel` instead of UDP.
     /// This is toggled when tunneled voice is received and reset once
@@ -330,6 +377,7 @@ impl Client {
             published: AtomicBool::new(false),
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
+            pending_post_auth_baseline: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
@@ -491,6 +539,7 @@ impl Client {
             published: AtomicBool::new(false),
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
+            pending_post_auth_baseline: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
@@ -576,6 +625,7 @@ impl Client {
             published: AtomicBool::new(true),
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
+            pending_post_auth_baseline: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
@@ -618,6 +668,14 @@ impl Client {
 
     pub fn take_channel_state_subscription(&self) -> Option<StagedChannelStateSubscription> {
         self.pending_channel_state_subscription.lock().take()
+    }
+
+    pub(crate) fn stage_post_auth_baseline(&self, baseline: PostAuthBaseline) {
+        *self.pending_post_auth_baseline.lock() = Some(baseline);
+    }
+
+    pub(crate) fn take_post_auth_baseline(&self) -> Option<PostAuthBaseline> {
+        self.pending_post_auth_baseline.lock().take()
     }
 
     pub fn set_prefer_tcp_tunnel(&self, value: bool) {

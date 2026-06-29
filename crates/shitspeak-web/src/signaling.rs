@@ -20,7 +20,7 @@ use shitspeak_runtime::api::{
 };
 use shitspeak_runtime::channel_handler::SessionChannelShadow;
 use shitspeak_runtime::client::client_session_identifier::ClientSessionIdentifier;
-use shitspeak_runtime::client::state_log::ClientStateOperation;
+use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOperation};
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
 use shitspeak_runtime::config::{WebAuthMode, WebConfig};
@@ -1316,37 +1316,12 @@ async fn send_initial_server_state(
 ) -> io::Result<()> {
     let server_id = client.server_id();
     let channels = server.get_channels().get_all_in_server(&server_id).await;
-    let channels_by_id = channels
-        .into_iter()
-        .map(|channel| (channel.id, channel))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back(0u32);
-    let mut visited = std::collections::HashSet::new();
-
-    while let Some(channel_id) = queue.pop_front() {
-        if !visited.insert(channel_id) {
-            continue;
-        }
-
-        let Some(channel) = channels_by_id.get(&channel_id) else {
-            continue;
-        };
+    for channel in shitspeak_runtime::channel_handler::ordered_snapshot_channels(&channels) {
         let channel_state = shitspeak_runtime::channel_handler::build_channel_state_message(
-            server, client, channel,
+            server, client, &channel,
         )
         .await;
         send_web_outbound_message(stream, None, channel_state.into()).await?;
-
-        let mut children = channels_by_id
-            .values()
-            .filter(|candidate| candidate.parent_id == Some(channel_id))
-            .map(|candidate| candidate.id)
-            .collect::<Vec<_>>();
-        children.sort_unstable();
-        for child in children {
-            queue.push_back(child);
-        }
     }
 
     let session_id = client.get_session_id();
@@ -1485,26 +1460,22 @@ async fn send_web_channel_log_update(
         )
         .await?;
     }
-    let reconcile = shitspeak_runtime::client::visibility::reconcile_all(
+    let refresh_scope =
+        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation(
+            &server, &op,
+        )
+        .await;
+    send_web_visibility_refresh(
+        stream,
         &server,
         &client,
+        session.peer.as_ref(),
+        &mut session.channel_shadow,
         &mut session.user_visibility,
+        &server_id,
+        refresh_scope,
     )
-    .await;
-    for message in reconcile {
-        for projected in shitspeak_runtime::client::visibility::sync_projected_message_with_shadow(
-            &server,
-            &client,
-            &mut session.user_visibility,
-            &mut session.channel_shadow,
-            &server_id,
-            message,
-        )
-        .await
-        {
-            send_web_outbound_message(stream, session.peer.as_ref(), projected).await?;
-        }
-    }
+    .await?;
     client.set_last_channel_version(op.version).await;
     Ok(())
 }
@@ -1555,27 +1526,22 @@ async fn send_web_channel_log_gap(
             )
             .await?;
         }
-        let reconcile = shitspeak_runtime::client::visibility::reconcile_all(
+        let refresh_scope =
+            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation(
+                &server, &op,
+            )
+            .await;
+        send_web_visibility_refresh(
+            stream,
             &server,
             &client,
+            session.peer.as_ref(),
+            &mut session.channel_shadow,
             &mut session.user_visibility,
+            &server_id,
+            refresh_scope,
         )
-        .await;
-        for message in reconcile {
-            for projected in
-                shitspeak_runtime::client::visibility::sync_projected_message_with_shadow(
-                    &server,
-                    &client,
-                    &mut session.user_visibility,
-                    &mut session.channel_shadow,
-                    &server_id,
-                    message,
-                )
-                .await
-            {
-                send_web_outbound_message(stream, session.peer.as_ref(), projected).await?;
-            }
-        }
+        .await?;
         client.set_last_channel_version(op.version).await;
     }
     Ok(())
@@ -1626,48 +1592,99 @@ async fn send_web_client_log_update(
         return Ok(());
     }
 
-    for message in entry
-        .messages_for_client(server.get_clients(), client.get_session_id())
-        .await
-    {
-        send_web_client_log_message_with_acl_refresh(
-            stream,
-            &server,
-            &client,
-            session.peer.as_ref(),
-            &mut session.channel_shadow,
-            &mut session.user_visibility,
-            &server_id,
-            &message,
-        )
-        .await?;
-    }
-    let reconcile = shitspeak_runtime::client::visibility::reconcile_all(
+    send_web_client_log_entry(
+        stream,
         &server,
         &client,
+        session.peer.as_ref(),
+        &mut session.channel_shadow,
         &mut session.user_visibility,
+        &server_id,
+        entry,
     )
-    .await;
-    for message in reconcile {
-        for projected in shitspeak_runtime::client::visibility::sync_projected_message_with_shadow(
-            &server,
-            &client,
-            &mut session.user_visibility,
-            &mut session.channel_shadow,
-            &server_id,
-            message,
-        )
-        .await
-        {
-            send_web_outbound_message(stream, session.peer.as_ref(), projected).await?;
-        }
-    }
+    .await?;
     client.update_last_client_versions(&payload.versions).await;
     Ok(())
 }
 
 fn is_own_add_client(op: &ClientStateOperation, session_id: ClientSessionIdentifier) -> bool {
     matches!(op, ClientStateOperation::AddClient { session_id: id, .. } if *id == session_id)
+}
+
+#[derive(Clone, Copy)]
+enum PermissionInfoRefreshScope {
+    All,
+    HomeChannelDependent {
+        old_channel_id: Option<u32>,
+        new_channel_id: u32,
+    },
+}
+
+impl PermissionInfoRefreshScope {
+    fn forwards_flush_message(self) -> bool {
+        matches!(self, PermissionInfoRefreshScope::All)
+    }
+}
+
+fn permission_info_refresh_scope_for_delta(
+    delta: &shitspeak_runtime::client::state_log::ClientGlobalStateDelta,
+) -> Option<PermissionInfoRefreshScope> {
+    if delta.user_id.is_some()
+        || delta.groups.is_some()
+        || delta.is_superuser.is_some()
+        || delta.tokens.is_some()
+    {
+        Some(PermissionInfoRefreshScope::All)
+    } else if let Some(new_channel_id) = delta.current_channel_id {
+        Some(PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id: None,
+            new_channel_id,
+        })
+    } else {
+        None
+    }
+}
+
+fn permission_info_refresh_scope_for_entry(
+    entry: &ClientStateLogEntry,
+    viewer_session_id: ClientSessionIdentifier,
+) -> Option<PermissionInfoRefreshScope> {
+    match &entry.op {
+        ClientStateOperation::UpdateGlobalState {
+            session_id, delta, ..
+        } if *session_id == viewer_session_id => permission_info_refresh_scope_for_delta(delta),
+        _ => None,
+    }
+}
+
+async fn permission_info_refresh_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    scope: PermissionInfoRefreshScope,
+) -> Vec<Message> {
+    match scope {
+        PermissionInfoRefreshScope::All => {
+            shitspeak_runtime::channel_handler::build_channel_permission_info_refresh_messages(
+                server,
+                client,
+                server.get_channels(),
+            )
+            .await
+        }
+        PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id,
+            new_channel_id,
+        } => {
+            shitspeak_runtime::channel_handler::build_home_channel_permission_info_refresh_messages(
+                server,
+                client,
+                server.get_channels(),
+                old_channel_id,
+                new_channel_id,
+            )
+            .await
+        }
+    }
 }
 
 async fn send_web_client_log_gap(
@@ -1686,7 +1703,11 @@ async fn send_web_client_log_gap(
     let server_id = client.server_id();
     let (missed, versions) = match server
         .get_clients()
-        .replay_since_in_server_for_client(&server_id, &last_seen, client.get_session_id())
+        .replay_entries_since_in_server_for_client(
+            &server_id,
+            &last_seen,
+            client.get_session_id(),
+        )
         .await
     {
         Ok(replay) => replay,
@@ -1695,8 +1716,8 @@ async fn send_web_client_log_gap(
             return Ok(());
         }
     };
-    for message in missed {
-        send_web_client_log_message_with_acl_refresh(
+    for entry in missed {
+        send_web_client_log_entry(
             stream,
             &server,
             &client,
@@ -1704,29 +1725,9 @@ async fn send_web_client_log_gap(
             &mut session.channel_shadow,
             &mut session.user_visibility,
             &server_id,
-            &message,
+            &entry,
         )
         .await?;
-    }
-    let reconcile = shitspeak_runtime::client::visibility::reconcile_all(
-        &server,
-        &client,
-        &mut session.user_visibility,
-    )
-    .await;
-    for message in reconcile {
-        for projected in shitspeak_runtime::client::visibility::sync_projected_message_with_shadow(
-            &server,
-            &client,
-            &mut session.user_visibility,
-            &mut session.channel_shadow,
-            &server_id,
-            message,
-        )
-        .await
-        {
-            send_web_outbound_message(stream, session.peer.as_ref(), projected).await?;
-        }
     }
     client.update_last_client_versions(&versions).await;
     Ok(())
@@ -1746,6 +1747,31 @@ async fn send_web_client_log_message_with_acl_refresh(
     server_id: &str,
     message: &Message,
 ) -> io::Result<()> {
+    send_web_client_log_message_with_acl_refresh_scope(
+        stream,
+        server,
+        client,
+        peer,
+        channel_shadow,
+        user_visibility,
+        server_id,
+        message,
+        PermissionInfoRefreshScope::All,
+    )
+    .await
+}
+
+async fn send_web_client_log_message_with_acl_refresh_scope(
+    stream: &mut (impl AsyncWrite + Unpin),
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    peer: Option<&WebRtcPeer>,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    message: &Message,
+    refresh_scope: PermissionInfoRefreshScope,
+) -> io::Result<()> {
     send_web_outbound_message_with_synthetic(
         stream,
         server,
@@ -1759,14 +1785,20 @@ async fn send_web_client_log_message_with_acl_refresh(
     .await?;
 
     if is_acl_cache_flush_message(message) {
-        for refresh in
-            shitspeak_runtime::channel_handler::build_channel_permission_info_refresh_messages(
+        if !refresh_scope.forwards_flush_message() {
+            return send_scoped_web_permission_refresh(
+                stream,
                 server,
                 client,
-                server.get_channels(),
+                peer,
+                channel_shadow,
+                user_visibility,
+                server_id,
+                refresh_scope,
             )
-            .await
-        {
+            .await;
+        }
+        for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
             send_web_outbound_message_with_synthetic(
                 stream,
                 server,
@@ -1782,6 +1814,98 @@ async fn send_web_client_log_message_with_acl_refresh(
     }
 
     Ok(())
+}
+
+async fn send_scoped_web_permission_refresh(
+    stream: &mut (impl AsyncWrite + Unpin),
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    peer: Option<&WebRtcPeer>,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    refresh_scope: PermissionInfoRefreshScope,
+) -> io::Result<()> {
+    for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
+        send_web_outbound_message_with_synthetic(
+            stream,
+            server,
+            client,
+            peer,
+            channel_shadow,
+            user_visibility,
+            server_id,
+            &refresh,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_web_client_log_entry(
+    stream: &mut (impl AsyncWrite + Unpin),
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    peer: Option<&WebRtcPeer>,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    entry: &ClientStateLogEntry,
+) -> io::Result<()> {
+    let old_viewer_channel_id = channel_shadow.get(&client.get_session_id()).copied();
+    let permission_refresh_scope = permission_info_refresh_scope_for_entry(
+        entry,
+        client.get_session_id(),
+    )
+    .map(|scope| match scope {
+        PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id: _,
+            new_channel_id,
+        } => PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id: old_viewer_channel_id,
+            new_channel_id,
+        },
+        scope => scope,
+    })
+    .unwrap_or(PermissionInfoRefreshScope::All);
+
+    for message in entry
+        .messages_for_client(server.get_clients(), client.get_session_id())
+        .await
+    {
+        send_web_client_log_message_with_acl_refresh_scope(
+            stream,
+            server,
+            client,
+            peer,
+            channel_shadow,
+            user_visibility,
+            server_id,
+            &message,
+            permission_refresh_scope,
+        )
+        .await?;
+    }
+
+    let visibility_refresh_scope =
+        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
+            server,
+            client,
+            entry,
+            old_viewer_channel_id,
+        )
+        .await;
+    send_web_visibility_refresh(
+        stream,
+        server,
+        client,
+        peer,
+        channel_shadow,
+        user_visibility,
+        server_id,
+        visibility_refresh_scope,
+    )
+    .await
 }
 
 async fn send_web_outbound_message_with_synthetic(
@@ -1801,6 +1925,31 @@ async fn send_web_outbound_message_with_synthetic(
         channel_shadow,
         server_id,
         message,
+    )
+    .await
+    {
+        send_web_outbound_message(stream, peer, message).await?;
+    }
+    Ok(())
+}
+
+async fn send_web_visibility_refresh(
+    stream: &mut (impl AsyncWrite + Unpin),
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    peer: Option<&WebRtcPeer>,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    scope: shitspeak_runtime::client::visibility::VisibilityRefreshScope,
+) -> io::Result<()> {
+    for message in shitspeak_runtime::client::visibility::visibility_refresh_messages_with_shadow(
+        server,
+        client,
+        user_visibility,
+        channel_shadow,
+        server_id,
+        scope,
     )
     .await
     {

@@ -4,7 +4,9 @@ use bytes::Bytes;
 
 use crate::{
     api::{AuthenticateAuxiliaryData, AuthenticationRejection, canonical_authenticator_ip},
-    channel_handler::build_channel_state_message,
+    channel_handler::{
+        SessionChannelShadow, build_channel_state_message, ordered_snapshot_channels,
+    },
     client::{Client, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
     localization::{TextKey, text},
@@ -391,6 +393,11 @@ pub async fn handle_authenticate(
         .snapshot_with_version_and_subscription_in_server(&server_id);
     sender.stage_channel_state_subscription(channel_version, channel_state_rx);
 
+    let channel_tree_shadow = all_channels.iter().map(|channel| channel.id).collect();
+    let ordered_channels = ordered_snapshot_channels(&all_channels);
+    let mut session_channel_shadow = SessionChannelShadow::new();
+    let mut user_visibility = crate::client::visibility::UserVisibilityState::default();
+
     let mut burst: Vec<Message> = Vec::new();
     let mut push_burst = |message: Message| {
         tracing::trace!(session = u32::from(session_id), message = %message, "Authenticate built outbound message");
@@ -402,25 +409,9 @@ pub async fn handle_authenticate(
 
     // 2. Channel tree — BFS from root
     {
-        // BFS ordering: root first, then children in order
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(0u32); // root channel id
-        // Map id -> channel for quick lookup
-        let ch_map: std::collections::HashMap<u32, _> =
-            all_channels.into_iter().map(|c| (c.id, c)).collect();
-
-        let mut visited = std::collections::HashSet::new();
-        while let Some(id) = queue.pop_front() {
-            if !visited.insert(id) {
-                continue;
-            }
-            let Some(ch) = ch_map.get(&id) else { continue };
-            let cs = build_channel_state_message(server, sender, ch).await;
+        for channel in &ordered_channels {
+            let cs = build_channel_state_message(server, sender, channel).await;
             push_burst(cs.into());
-            // Enqueue children
-            for child in ch_map.values().filter(|c| c.parent_id == Some(id)) {
-                queue.push_back(child.id);
-            }
         }
     }
 
@@ -436,14 +427,23 @@ pub async fn handle_authenticate(
             if !client.is_authenticated() {
                 continue;
             }
-            if !crate::client::visibility::can_view_user(server, sender, client).await {
-                continue;
-            }
+            session_channel_shadow.insert(client.get_session_id(), client.get_current_channel_id());
             let us: Message =
                 crate::client::visibility::build_visible_user_state(server, sender, client)
                     .await
                     .into();
-            push_burst(us);
+            let projected = crate::client::visibility::project_message_with_shadow(
+                server,
+                sender,
+                &mut user_visibility,
+                &mut session_channel_shadow,
+                &server_id,
+                &us,
+            )
+            .await;
+            for message in projected {
+                push_burst(message);
+            }
         }
     }
 
@@ -453,8 +453,26 @@ pub async fn handle_authenticate(
             crate::client::visibility::build_visible_user_state(server, sender, sender)
                 .await
                 .into();
-        push_burst(self_us);
+        session_channel_shadow.insert(session_id, sender.get_current_channel_id());
+        let projected = crate::client::visibility::project_message_with_shadow(
+            server,
+            sender,
+            &mut user_visibility,
+            &mut session_channel_shadow,
+            &server_id,
+            &self_us,
+        )
+        .await;
+        for message in projected {
+            push_burst(message);
+        }
     }
+
+    sender.stage_post_auth_baseline(crate::client::PostAuthBaseline::with_user_visibility(
+        session_channel_shadow,
+        channel_tree_shadow,
+        user_visibility,
+    ));
 
     // 5. ServerSync
     {

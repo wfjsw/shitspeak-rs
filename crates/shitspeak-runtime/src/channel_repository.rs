@@ -764,6 +764,14 @@ impl ChannelRepository {
             .or_else(|| (id == 0).then(|| self.root_channel()))
     }
 
+    pub async fn subtree_ids_in_server(&self, server_id: &str, root_id: u32) -> Vec<u32> {
+        let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return (root_id == 0).then_some(0).into_iter().collect();
+        };
+        collect_subtree(channels, root_id)
+    }
+
     /// Return the effective linked-channel group for `channel_id`.
     ///
     /// The stored channel links are direct protocol edges. This derived view is
