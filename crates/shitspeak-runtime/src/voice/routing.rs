@@ -183,7 +183,7 @@ async fn client_matches_voice_target_group(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     server_id: &str,
-    target_channel: u32,
+    evaluation_channel: u32,
     group: &str,
 ) -> bool {
     let group = group.trim();
@@ -194,14 +194,28 @@ async fn client_matches_voice_target_group(
     let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
     let tokens: Vec<String> = client.get_tokens_clone().into_iter().collect();
     let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-    let ancestors: Vec<u32> = server
+    let home_channel_id = client.get_current_channel_id();
+    let eval_ancestors: Vec<u32> = server
         .get_channels()
-        .get_ancestors_in_server(server_id, target_channel)
+        .get_ancestors_in_server(server_id, evaluation_channel)
         .await
         .into_iter()
         .map(|ancestor| ancestor.id)
         .collect();
-    let channel = crate::client::group::ChannelHierarchy::new(target_channel, &ancestors);
+    let home_ancestors: Vec<u32> = if home_channel_id == evaluation_channel {
+        eval_ancestors.clone()
+    } else {
+        server
+            .get_channels()
+            .get_ancestors_in_server(server_id, home_channel_id)
+            .await
+            .into_iter()
+            .map(|ancestor| ancestor.id)
+            .collect()
+    };
+    let evaluation =
+        crate::client::group::ChannelHierarchy::new(evaluation_channel, &eval_ancestors);
+    let home = crate::client::group::ChannelHierarchy::new(home_channel_id, &home_ancestors);
     let membership = crate::client::group::ClientMembershipQuery::new(
         &group_refs,
         client.get_user_id().is_some(),
@@ -210,8 +224,8 @@ async fn client_matches_voice_target_group(
         client.is_verified(),
         Some(client.get_real_ip_address()),
     )
-    .with_home_channel(channel);
-    crate::client::group::is_member_in_group(group, channel, Some(channel), &[], &membership)
+    .with_home_channel(home);
+    crate::client::group::is_member_in_group(group, evaluation, Some(evaluation), &[], &membership)
 }
 
 fn push_unique_target(
@@ -394,12 +408,22 @@ async fn resolve_voice_intent(
                 if let Some(sender) = sender {
                     let mut allowed_channels = Vec::new();
                     let mut allowed_channel_set = HashSet::new();
+                    let source_channel = target.source_channel;
+                    let current_channel_talk = ch_target.id == source_channel
+                        && !ch_target.children
+                        && !ch_target.links
+                        && ch_target.group.trim().is_empty();
                     for channel_id in channel_ids {
                         let perms = crate::client::acl::compute_permissions_for_client(
                             server, sender, channel_id,
                         )
                         .await;
-                        if perms.contains(crate::acl::ACLPermissions::Whisper) {
+                        let allowed = if current_channel_talk && channel_id == source_channel {
+                            perms.contains(crate::acl::ACLPermissions::Speak)
+                        } else {
+                            perms.contains(crate::acl::ACLPermissions::Whisper)
+                        };
+                        if allowed {
                             if allowed_channel_set.insert(channel_id) {
                                 allowed_channels.push(channel_id);
                             }
@@ -447,24 +471,38 @@ async fn resolve_voice_intent(
                     );
                 }
 
-                let channel_listeners = server
-                    .get_clients()
-                    .get_local_listeners_for_channels_in_server(server_id, &channel_ids)
-                    .await;
-                for client in channel_listeners {
-                    if let Some(sender) = sender {
-                        if !crate::client::visibility::can_view_user(server, &client, sender).await
+                for channel_id in &channel_ids {
+                    let channel_listeners = server
+                        .get_clients()
+                        .get_local_listeners_for_channel_in_server(server_id, *channel_id)
+                        .await;
+                    for client in channel_listeners {
+                        if !client_matches_voice_target_group(
+                            server,
+                            &client,
+                            server_id,
+                            *channel_id,
+                            &ch_target.group,
+                        )
+                        .await
                         {
                             continue;
                         }
+                        if let Some(sender) = sender {
+                            if !crate::client::visibility::can_view_user(server, &client, sender)
+                                .await
+                            {
+                                continue;
+                            }
+                        }
+                        push_unique_target(
+                            &mut targets,
+                            &mut seen,
+                            sender_id,
+                            client,
+                            AudioContext::Listen,
+                        );
                     }
-                    push_unique_target(
-                        &mut targets,
-                        &mut seen,
-                        sender_id,
-                        client,
-                        AudioContext::Listen,
-                    );
                 }
             }
         }

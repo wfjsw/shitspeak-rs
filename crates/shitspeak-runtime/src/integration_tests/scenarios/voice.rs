@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
+use crate::acl::ACLPermissions;
 use crate::channels::Channel;
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
-use crate::messages::encoder::VoiceTarget;
+use crate::messages::encoder::{ChanAcl, UserState, VoiceTarget};
 use crate::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{AudioPayload, PacketFormat};
@@ -75,6 +76,44 @@ async fn expect_no_voice(recipient: &TestClient, reason: &str) {
         recipient.recv_voice_tcp(NEGATIVE_WINDOW).await.is_none(),
         "{reason}"
     );
+}
+
+async fn expect_user_channel(client: &TestClient, channel_id: u32, reason: &str) {
+    client
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(client.session_id) && us.channel_id == Some(channel_id))
+            },
+            VOICE_DEADLINE,
+        )
+        .await
+        .expect(reason);
+}
+
+async fn listen_to_channel(listener: &TestClient, channel_id: u32, reason: &str) {
+    listener
+        .send(
+            UserState {
+                session: Some(listener.server_session),
+                listening_channel_add: vec![channel_id],
+                ..Default::default()
+            }
+            .into(),
+        )
+        .await;
+    listener
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(listener.session_id)
+                        && us.listening_channel_add.contains(&channel_id))
+            },
+            VOICE_DEADLINE,
+        )
+        .await
+        .expect(reason);
+    listener.drain_now().await;
 }
 
 // ── TCP-tunneled tests ──────────────────────────────────────────────────────
@@ -467,6 +506,202 @@ async fn voice_target_to_channel_shouts_only_to_that_channel() {
     .await;
 }
 
+/// Checks that a plain channel voice target to the sender's current channel is
+/// allowed by Speak permission and does not require Whisper.
+#[tokio::test]
+async fn voice_target_plain_current_channel_uses_speak_permission() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("admin", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("alice", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(105, "CurrentTarget".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let admin = TestClient::connect_and_authenticate(&server, "admin", None)
+        .await
+        .expect("admin");
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    admin
+        .set_acls(
+            105,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: true,
+                inherited: false,
+                user_id: None,
+                group: Some("all".into()),
+                grant: 0,
+                deny: ACLPermissions::Whisper as u32,
+            }],
+            true,
+        )
+        .await;
+
+    alice.move_to_channel(105).await;
+    bob.move_to_channel(105).await;
+    alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice.session_id) && us.channel_id == Some(105))
+            },
+            VOICE_DEADLINE,
+        )
+        .await
+        .expect("Alice enters current target channel");
+    bob.recv_until(
+        |m| {
+            matches!(m, Message::UserState(us)
+                if us.session == Some(bob.session_id) && us.channel_id == Some(105))
+        },
+        VOICE_DEADLINE,
+    )
+    .await
+    .expect("Bob enters current target channel");
+    bob.drain_now().await;
+
+    let alice_server = server
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("Alice is still connected");
+    let perms =
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 105)
+            .await;
+    assert!(perms.contains(ACLPermissions::Speak));
+    assert!(!perms.contains(ACLPermissions::Whisper));
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(105, false, false, None)],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 36, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should hear a plain current-channel VoiceTarget when Alice can Speak",
+    )
+    .await;
+}
+
+/// Checks that the plain-current-channel Speak exception does not leak into
+/// recursive child-channel targets.
+#[tokio::test]
+async fn voice_target_to_current_channel_children_still_requires_whisper() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("admin", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("alice", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(106, "CurrentParent".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(
+            107,
+            "CurrentChild".to_owned(),
+            0,
+            0,
+            Some(106),
+        ))
+        .await
+        .unwrap();
+
+    let admin = TestClient::connect_and_authenticate(&server, "admin", None)
+        .await
+        .expect("admin");
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    admin
+        .set_acls(
+            106,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: true,
+                inherited: false,
+                user_id: None,
+                group: Some("all".into()),
+                grant: 0,
+                deny: ACLPermissions::Whisper as u32,
+            }],
+            true,
+        )
+        .await;
+
+    alice.move_to_channel(106).await;
+    bob.move_to_channel(107).await;
+    expect_user_channel(&alice, 106, "Alice enters current parent channel").await;
+    expect_user_channel(&bob, 107, "Bob enters current child channel").await;
+    bob.drain_now().await;
+
+    let alice_server = server
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("Alice is still connected");
+    let parent_perms =
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 106)
+            .await;
+    let child_perms =
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 107)
+            .await;
+    assert!(parent_perms.contains(ACLPermissions::Speak));
+    assert!(!parent_perms.contains(ACLPermissions::Whisper));
+    assert!(!child_perms.contains(ACLPermissions::Whisper));
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(106, true, false, None)],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 38, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_no_voice(
+        &bob,
+        "Bob should not hear recursive current-channel VoiceTarget without Whisper",
+    )
+    .await;
+}
+
 /// Checks child-channel expansion for channel voice targets.
 /// Expected: users in descendant channels receive shout audio when
 /// `children` is enabled.
@@ -602,6 +837,105 @@ async fn voice_target_to_linked_channels_shouts_across_links() {
     .await;
 }
 
+/// Checks that the plain-current-channel Speak exception does not leak into
+/// linked-channel targets.
+#[tokio::test]
+async fn voice_target_to_current_channel_links_still_requires_whisper() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("admin", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("alice", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(
+            123,
+            "CurrentLinkSource".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(124, "CurrentLinked".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans.add_link(123, 124).await.unwrap();
+
+    let admin = TestClient::connect_and_authenticate(&server, "admin", None)
+        .await
+        .expect("admin");
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    for channel_id in [123, 124] {
+        admin
+            .set_acls(
+                channel_id,
+                vec![ChanAcl {
+                    apply_here: true,
+                    apply_subs: true,
+                    inherited: false,
+                    user_id: None,
+                    group: Some("all".into()),
+                    grant: 0,
+                    deny: ACLPermissions::Whisper as u32,
+                }],
+                true,
+            )
+            .await;
+    }
+
+    alice.move_to_channel(123).await;
+    bob.move_to_channel(124).await;
+    expect_user_channel(&alice, 123, "Alice enters current linked source channel").await;
+    expect_user_channel(&bob, 124, "Bob enters linked channel").await;
+    bob.drain_now().await;
+
+    let alice_server = server
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("Alice is still connected");
+    let source_perms =
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 123)
+            .await;
+    let linked_perms =
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 124)
+            .await;
+    assert!(source_perms.contains(ACLPermissions::Speak));
+    assert!(!source_perms.contains(ACLPermissions::Whisper));
+    assert!(!linked_perms.contains(ACLPermissions::Whisper));
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(123, false, true, None)],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 39, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_no_voice(
+        &bob,
+        "Bob should not hear linked current-channel VoiceTarget without Whisper",
+    )
+    .await;
+}
+
 /// Checks group filtering for channel voice targets.
 /// Expected: only recipients whose authenticated groups match the target's
 /// `group` field receive shout audio.
@@ -657,6 +991,230 @@ async fn voice_target_to_specific_group_filters_recipients() {
     expect_no_voice(
         &carol,
         "Carol should not receive voice target audio for a group she is not in",
+    )
+    .await;
+}
+
+/// Checks group filtering for channel listeners.
+/// Expected: a listener subscribed to the target channel is still excluded
+/// when the channel VoiceTarget has a simple group they do not belong to.
+#[tokio::test]
+async fn voice_target_group_filter_excludes_non_member_listeners() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["casters".into()]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(
+            131,
+            "GroupedListener".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(131).await;
+    listen_to_channel(
+        &carol,
+        131,
+        "Carol starts listening to the grouped target channel",
+    )
+    .await;
+    expect_user_channel(&bob, 131, "Bob enters grouped target channel").await;
+    bob.drain_now().await;
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(131, false, false, Some("casters"))],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 37, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive group-filtered voice target audio",
+    )
+    .await;
+    expect_no_voice(
+        &carol,
+        "Carol should not receive listener audio for a group she is not in",
+    )
+    .await;
+}
+
+/// Checks group filtering for listeners reached via child-channel expansion.
+#[tokio::test]
+async fn voice_target_group_filter_applies_to_child_channel_listeners() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["casters".into()]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(132, "GroupedParent".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(
+            133,
+            "GroupedChild".to_owned(),
+            0,
+            0,
+            Some(132),
+        ))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    listen_to_channel(
+        &bob,
+        133,
+        "Bob starts listening to the grouped child channel",
+    )
+    .await;
+    listen_to_channel(
+        &carol,
+        133,
+        "Carol starts listening to the grouped child channel",
+    )
+    .await;
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(132, true, false, Some("casters"))],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 40, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive group-filtered child listener audio",
+    )
+    .await;
+    expect_no_voice(
+        &carol,
+        "Carol should not receive child listener audio for a group she is not in",
+    )
+    .await;
+}
+
+/// Checks group filtering for listeners reached via linked-channel expansion.
+#[tokio::test]
+async fn voice_target_group_filter_applies_to_linked_channel_listeners() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["casters".into()]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(
+            134,
+            "GroupedLinkSource".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(135, "GroupedLinked".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans.add_link(134, 135).await.unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    listen_to_channel(
+        &bob,
+        135,
+        "Bob starts listening to the grouped linked channel",
+    )
+    .await;
+    listen_to_channel(
+        &carol,
+        135,
+        "Carol starts listening to the grouped linked channel",
+    )
+    .await;
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(134, false, true, Some("casters"))],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 41, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive group-filtered linked listener audio",
+    )
+    .await;
+    expect_no_voice(
+        &carol,
+        "Carol should not receive linked listener audio for a group she is not in",
     )
     .await;
 }
