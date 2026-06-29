@@ -95,11 +95,11 @@ fn emit_git_metadata_rerun_hints() {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
-    let manifest_dir = workspace_dir();
-    let dot_git = manifest_dir.join(".git");
+    let workspace_dir = workspace_dir();
+    let dot_git = workspace_dir.join(".git");
     println!("cargo:rerun-if-changed={}", dot_git.display());
 
-    let Ok(git_dir) = git_dir(&manifest_dir) else {
+    let Ok(git_dir) = workspace_git_dir() else {
         return;
     };
 
@@ -140,7 +140,7 @@ fn emit_git_metadata_rerun_hints() {
 }
 
 fn git_head_from_filesystem() -> Result<String, String> {
-    let git_dir = git_dir(&manifest_dir())?;
+    let git_dir = workspace_git_dir()?;
     let head_path = git_dir.join("HEAD");
     let head = fs::read_to_string(&head_path)
         .map_err(|error| format!("failed to read {}: {error}", head_path.display()))?;
@@ -196,7 +196,7 @@ fn git_head_from_filesystem() -> Result<String, String> {
 }
 
 fn git_commit_date_from_filesystem(commit_hash: &str) -> Result<String, String> {
-    let git_dir = git_dir(&manifest_dir())?;
+    let git_dir = workspace_git_dir()?;
     let commit = read_git_object(&git_dir, commit_hash)?;
     let body = parse_git_object(&commit, "commit")?;
     let timestamp = committer_timestamp_from_commit_body(body)?;
@@ -558,6 +558,10 @@ fn git_dir(manifest_dir: &Path) -> Result<PathBuf, String> {
     } else {
         Ok(manifest_dir.join(git_dir))
     }
+}
+
+fn workspace_git_dir() -> Result<PathBuf, String> {
+    git_dir(&workspace_dir())
 }
 
 fn git_ref_path(git_dir: &Path, ref_name: &str) -> PathBuf {
