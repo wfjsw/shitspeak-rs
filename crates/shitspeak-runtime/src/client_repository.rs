@@ -422,14 +422,34 @@ impl ClientRepository {
     }
 
     fn allocate_client_instance_id(register: &ClientRegister) -> ClientInstanceId {
+        let occupied = Self::occupied_client_instance_ids(register);
         for _ in 0..1024 {
             let candidate = random_client_instance_id();
-            if !Self::client_instance_id_collides(register, candidate) {
+            if !occupied.contains(&candidate) {
                 return candidate;
             }
         }
 
         panic!("failed to allocate unique client instance id after repeated collisions");
+    }
+
+    fn occupied_client_instance_ids(register: &ClientRegister) -> HashSet<ClientInstanceId> {
+        let mut occupied =
+            HashSet::with_capacity(register.local_clients.len() + register.local_log.len() + 1);
+        occupied.insert(0);
+        occupied.extend(
+            register
+                .local_clients
+                .values()
+                .map(|client| client.client_instance_id()),
+        );
+        occupied.extend(
+            register
+                .local_log
+                .iter()
+                .map(|entry| entry.op.client_instance_id()),
+        );
+        occupied
     }
 
     fn client_instance_id_collides(register: &ClientRegister, candidate: ClientInstanceId) -> bool {

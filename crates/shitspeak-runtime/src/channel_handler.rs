@@ -14,7 +14,14 @@ use crate::{
         ChannelOp, ChannelOperation, ChannelRepository, channel_op_affects_acl_generation,
     },
     channels::Channel,
-    client::{Client, client_session_identifier::ClientSessionIdentifier, group::ChannelHierarchy},
+    client::{
+        Client,
+        client_session_identifier::ClientSessionIdentifier,
+        group::{
+            ChannelHierarchy, ClientMembershipQuery, group_depends_on_home_channel,
+            is_member_in_group,
+        },
+    },
     messages::{Message, encoder::ChannelState},
     server::Server,
 };
@@ -599,7 +606,7 @@ async fn replay_channel_snapshot(
     Ok(())
 }
 
-pub(crate) fn ordered_snapshot_channels(
+pub fn ordered_snapshot_channels(
     channels: &[crate::channels::Channel],
 ) -> Vec<crate::channels::Channel> {
     let by_id: HashMap<u32, &crate::channels::Channel> = channels
@@ -654,12 +661,107 @@ pub(crate) fn ordered_snapshot_channels(
 
 #[cfg(test)]
 mod tests {
-    use crate::channels::Channel;
+    use std::collections::HashMap;
 
-    use super::ordered_snapshot_channels;
+    use crate::acl::ACL;
+    use crate::channels::Channel;
+    use crate::client::group::ChannelHierarchy;
+
+    use super::{
+        channels_affected_by_home_channel_move, channels_with_home_channel_dependent_acls,
+        ordered_snapshot_channels,
+    };
 
     fn channel(id: u32, parent_id: Option<u32>, position: i32) -> Channel {
         Channel::new(id, format!("channel-{id}"), position, 100, parent_id)
+    }
+
+    fn home_acl(group: &str, apply_here: bool, apply_subs: bool) -> ACL {
+        ACL {
+            user_id: None,
+            group: Some(group.to_owned()),
+            apply_here,
+            apply_subs,
+            allow: enumflags2::BitFlags::empty(),
+            deny: enumflags2::BitFlags::empty(),
+        }
+    }
+
+    fn ids(channels: Vec<Channel>) -> Vec<u32> {
+        channels.into_iter().map(|channel| channel.id).collect()
+    }
+
+    fn ancestors_for_channel(
+        channel_id: u32,
+        by_id: &HashMap<u32, Channel>,
+    ) -> Option<Vec<Channel>> {
+        let mut ancestors = Vec::new();
+        let mut current = by_id.get(&channel_id)?;
+        while let Some(parent_id) = current.parent_id {
+            let Some(parent) = by_id.get(&parent_id) else {
+                break;
+            };
+            ancestors.push(parent.clone());
+            current = parent;
+        }
+        Some(ancestors)
+    }
+
+    fn ancestor_ids_for_channel(
+        channel_id: u32,
+        by_id: &HashMap<u32, Channel>,
+    ) -> Option<Vec<u32>> {
+        ancestors_for_channel(channel_id, by_id)
+            .map(|ancestors| ancestors.into_iter().map(|ancestor| ancestor.id).collect())
+    }
+
+    fn baseline_home_channel_dependent_ids(channels: &[Channel]) -> Vec<u32> {
+        let by_id: HashMap<u32, Channel> = channels
+            .iter()
+            .map(|channel| (channel.id, channel.clone()))
+            .collect();
+
+        channels
+            .iter()
+            .filter(|channel| {
+                let ancestors = ancestors_for_channel(channel.id, &by_id).unwrap_or_default();
+                crate::acl::effective_acl_chain_has_home_channel_dependent_group(
+                    channel, &ancestors,
+                )
+            })
+            .map(|channel| channel.id)
+            .collect()
+    }
+
+    fn baseline_home_channel_move_affected_ids(
+        channels: &[Channel],
+        old_channel_id: u32,
+        new_channel_id: u32,
+    ) -> Vec<u32> {
+        let by_id: HashMap<u32, Channel> = channels
+            .iter()
+            .map(|channel| (channel.id, channel.clone()))
+            .collect();
+        let Some(old_ancestors) = ancestor_ids_for_channel(old_channel_id, &by_id) else {
+            return baseline_home_channel_dependent_ids(channels);
+        };
+        let Some(new_ancestors) = ancestor_ids_for_channel(new_channel_id, &by_id) else {
+            return baseline_home_channel_dependent_ids(channels);
+        };
+
+        channels
+            .iter()
+            .filter(|channel| {
+                let ancestors = ancestors_for_channel(channel.id, &by_id).unwrap_or_default();
+                crate::acl::effective_acl_chain_home_channel_match_changes(
+                    channel,
+                    &ancestors,
+                    ChannelHierarchy::new(old_channel_id, &old_ancestors),
+                    ChannelHierarchy::new(new_channel_id, &new_ancestors),
+                )
+            })
+            .map(|channel| channel.id)
+            .collect()
     }
 
     #[test]
@@ -680,6 +782,73 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ordered_ids, vec![0, 2, 3, 5, 4, 6, 7]);
+    }
+
+    #[test]
+    fn home_channel_dependent_acl_scan_matches_effective_chain_inheritance() {
+        let mut root = channel(0, None, 0);
+        root.acls = vec![home_acl("in", false, true)];
+        let inherited_child = channel(1, Some(0), 0);
+        let mut inheritance_break = channel(2, Some(0), 1);
+        inheritance_break.inherit_acl = false;
+        inheritance_break.acls = vec![home_acl("out", false, true)];
+        let local_inherited_child = channel(3, Some(2), 0);
+        let mut second_break = channel(4, Some(3), 0);
+        second_break.inherit_acl = false;
+
+        let channels = vec![
+            root,
+            inherited_child,
+            inheritance_break,
+            local_inherited_child,
+            second_break,
+        ];
+
+        let optimized = ids(channels_with_home_channel_dependent_acls(channels.clone()));
+        let baseline = baseline_home_channel_dependent_ids(&channels);
+
+        assert_eq!(optimized, baseline);
+        assert_eq!(optimized, vec![1, 3]);
+    }
+
+    #[test]
+    fn home_channel_move_scan_matches_effective_chain_inheritance() {
+        let root = channel(0, None, 0);
+        let mut parent = channel(10, Some(0), 0);
+        parent.acls = vec![home_acl("~sub", false, true)];
+        let first_child = channel(11, Some(10), 0);
+        let second_child = channel(12, Some(10), 1);
+        let mut inheritance_break = channel(13, Some(10), 2);
+        inheritance_break.inherit_acl = false;
+        inheritance_break.acls = vec![home_acl("~sub", false, true)];
+        let local_child = channel(14, Some(13), 0);
+
+        let channels = vec![
+            root,
+            parent,
+            first_child,
+            second_child,
+            inheritance_break,
+            local_child,
+        ];
+
+        let optimized_parent_scope = ids(channels_affected_by_home_channel_move(
+            channels.clone(),
+            11,
+            0,
+        ));
+        let baseline_parent_scope = baseline_home_channel_move_affected_ids(&channels, 11, 0);
+        assert_eq!(optimized_parent_scope, baseline_parent_scope);
+        assert_eq!(optimized_parent_scope, vec![11, 12]);
+
+        let optimized_local_scope = ids(channels_affected_by_home_channel_move(
+            channels.clone(),
+            14,
+            11,
+        ));
+        let baseline_local_scope = baseline_home_channel_move_affected_ids(&channels, 14, 11);
+        assert_eq!(optimized_local_scope, baseline_local_scope);
+        assert_eq!(optimized_local_scope, vec![14]);
     }
 }
 
@@ -831,17 +1000,12 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
 }
 
 fn channels_with_home_channel_dependent_acls(channels: Vec<Channel>) -> Vec<Channel> {
-    let by_id: HashMap<u32, Channel> = channels
-        .iter()
-        .map(|channel| (channel.id, channel.clone()))
-        .collect();
+    let tree = ChannelTree::new(&channels);
+    let affected = tree.home_channel_dependent_acl_channel_ids();
 
     channels
         .into_iter()
-        .filter(|channel| {
-            let ancestors = ancestors_for_channel(channel.id, &by_id).unwrap_or_default();
-            crate::acl::effective_acl_chain_has_home_channel_dependent_group(channel, &ancestors)
-        })
+        .filter(|channel| affected.contains(&channel.id))
         .collect()
 }
 
@@ -850,45 +1014,349 @@ fn channels_affected_by_home_channel_move(
     old_channel_id: u32,
     new_channel_id: u32,
 ) -> Vec<Channel> {
-    let by_id: HashMap<u32, Channel> = channels
-        .iter()
-        .map(|channel| (channel.id, channel.clone()))
-        .collect();
-    let Some(old_ancestors) = ancestor_ids_for_channel(old_channel_id, &by_id) else {
+    let tree = ChannelTree::new(&channels);
+    let Some(old_ancestors) = tree.ancestor_ids_for_channel(old_channel_id) else {
         return channels_with_home_channel_dependent_acls(channels);
     };
-    let Some(new_ancestors) = ancestor_ids_for_channel(new_channel_id, &by_id) else {
+    let Some(new_ancestors) = tree.ancestor_ids_for_channel(new_channel_id) else {
         return channels_with_home_channel_dependent_acls(channels);
     };
+    let old_home = ChannelHierarchy::new(old_channel_id, &old_ancestors);
+    let new_home = ChannelHierarchy::new(new_channel_id, &new_ancestors);
+    let affected = tree.home_channel_move_affected_channel_ids(old_home, new_home);
 
     channels
         .into_iter()
-        .filter(|channel| {
-            let ancestors = ancestors_for_channel(channel.id, &by_id).unwrap_or_default();
-            crate::acl::effective_acl_chain_home_channel_match_changes(
-                channel,
-                &ancestors,
-                ChannelHierarchy::new(old_channel_id, &old_ancestors),
-                ChannelHierarchy::new(new_channel_id, &new_ancestors),
-            )
-        })
+        .filter(|channel| affected.contains(&channel.id))
         .collect()
 }
 
-fn ancestor_ids_for_channel(channel_id: u32, by_id: &HashMap<u32, Channel>) -> Option<Vec<u32>> {
-    ancestors_for_channel(channel_id, by_id)
-        .map(|ancestors| ancestors.into_iter().map(|ancestor| ancestor.id).collect())
+struct ChannelTree<'a> {
+    by_id: HashMap<u32, &'a Channel>,
+    children_by_parent_id: HashMap<Option<u32>, Vec<u32>>,
 }
 
-fn ancestors_for_channel(channel_id: u32, by_id: &HashMap<u32, Channel>) -> Option<Vec<Channel>> {
-    let mut ancestors = Vec::new();
-    let mut current = by_id.get(&channel_id)?;
-    while let Some(parent_id) = current.parent_id {
-        let Some(parent) = by_id.get(&parent_id) else {
-            break;
-        };
-        ancestors.push(parent.clone());
-        current = parent;
+struct HomeChannelAcl<'a> {
+    group: &'a str,
+    channel_id: u32,
+    ancestor_ids: Vec<u32>,
+}
+
+impl HomeChannelAcl<'_> {
+    fn match_changes(
+        &self,
+        evaluation_channel: ChannelHierarchy<'_>,
+        old_home: ChannelHierarchy<'_>,
+        new_home: ChannelHierarchy<'_>,
+    ) -> bool {
+        let acl_channel = ChannelHierarchy::new(self.channel_id, &self.ancestor_ids);
+        group_match_changes(
+            self.group,
+            evaluation_channel,
+            acl_channel,
+            old_home,
+            new_home,
+        )
     }
-    Some(ancestors)
+}
+
+#[derive(Clone, Copy)]
+enum AclApplication {
+    Here,
+    Subs,
+}
+
+impl<'a> ChannelTree<'a> {
+    fn new(channels: &'a [Channel]) -> Self {
+        let by_id: HashMap<u32, &Channel> = channels
+            .iter()
+            .map(|channel| (channel.id, channel))
+            .collect();
+        let mut children_by_parent_id: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
+        for channel in channels {
+            children_by_parent_id
+                .entry(channel.parent_id)
+                .or_default()
+                .push(channel.id);
+        }
+        for child_ids in children_by_parent_id.values_mut() {
+            child_ids.sort_by_key(|id| {
+                by_id
+                    .get(id)
+                    .map(|channel| (channel.position, channel.id))
+                    .unwrap_or((0, *id))
+            });
+        }
+
+        Self {
+            by_id,
+            children_by_parent_id,
+        }
+    }
+
+    fn ancestor_ids_for_channel(&self, channel_id: u32) -> Option<Vec<u32>> {
+        self.ancestors_for_channel(channel_id)
+            .map(|ancestors| ancestors.iter().map(|ancestor| ancestor.id).collect())
+    }
+
+    fn ancestors_for_channel(&self, channel_id: u32) -> Option<Vec<&'a Channel>> {
+        let mut ancestors = Vec::new();
+        let mut current = *self.by_id.get(&channel_id)?;
+        while let Some(parent_id) = current.parent_id {
+            let Some(parent) = self.by_id.get(&parent_id).copied() else {
+                break;
+            };
+            ancestors.push(parent);
+            current = parent;
+        }
+        Some(ancestors)
+    }
+
+    fn home_channel_dependent_acl_channel_ids(&self) -> HashSet<u32> {
+        let mut affected = HashSet::new();
+        for root_id in self.root_ids() {
+            self.collect_home_channel_dependent_acl_channel_ids(root_id, false, &mut affected);
+        }
+        affected
+    }
+
+    fn collect_home_channel_dependent_acl_channel_ids(
+        &self,
+        channel_id: u32,
+        inherited_home_channel_dependent_acl: bool,
+        affected: &mut HashSet<u32>,
+    ) {
+        let Some(channel) = self.by_id.get(&channel_id).copied() else {
+            return;
+        };
+        let inherited_home_channel_dependent_acl =
+            channel.inherit_acl && inherited_home_channel_dependent_acl;
+        let applies_here = inherited_home_channel_dependent_acl
+            || has_home_channel_dependent_acl(channel, AclApplication::Here);
+        let applies_to_subs = has_home_channel_dependent_acl(channel, AclApplication::Subs);
+
+        if applies_here {
+            affected.insert(channel_id);
+        }
+
+        let descendant_inherited = inherited_home_channel_dependent_acl || applies_to_subs;
+        self.for_each_child(channel_id, |child_id| {
+            self.collect_home_channel_dependent_acl_channel_ids(
+                child_id,
+                descendant_inherited,
+                affected,
+            );
+        });
+    }
+
+    fn home_channel_move_affected_channel_ids(
+        &self,
+        old_home: ChannelHierarchy<'_>,
+        new_home: ChannelHierarchy<'_>,
+    ) -> HashSet<u32> {
+        let mut affected = HashSet::new();
+        let mut actual_ancestor_ids = Vec::new();
+        let mut effective_ancestor_ids = Vec::new();
+        let mut inherited_acls = Vec::new();
+        for root_id in self.root_ids() {
+            self.collect_home_channel_move_affected_channel_ids(
+                root_id,
+                &mut actual_ancestor_ids,
+                &mut effective_ancestor_ids,
+                &mut inherited_acls,
+                0,
+                0,
+                old_home,
+                new_home,
+                &mut affected,
+            );
+        }
+        affected
+    }
+
+    fn collect_home_channel_move_affected_channel_ids(
+        &self,
+        channel_id: u32,
+        actual_ancestor_ids: &mut Vec<u32>,
+        effective_ancestor_ids: &mut Vec<u32>,
+        inherited_acls: &mut Vec<HomeChannelAcl<'a>>,
+        active_effective_start: usize,
+        active_acl_start: usize,
+        old_home: ChannelHierarchy<'_>,
+        new_home: ChannelHierarchy<'_>,
+        affected: &mut HashSet<u32>,
+    ) {
+        let Some(channel) = self.by_id.get(&channel_id).copied() else {
+            return;
+        };
+        let target_ancestor_ids: Vec<u32> = actual_ancestor_ids.iter().rev().copied().collect();
+        let effective_start = if channel.inherit_acl {
+            active_effective_start
+        } else {
+            effective_ancestor_ids.len()
+        };
+        let effective_acl_start = if channel.inherit_acl {
+            active_acl_start
+        } else {
+            inherited_acls.len()
+        };
+        let acl_ancestor_ids: Vec<u32> = effective_ancestor_ids[effective_start..]
+            .iter()
+            .rev()
+            .copied()
+            .collect();
+        let evaluation_channel = ChannelHierarchy::new(channel.id, &target_ancestor_ids);
+        let local_acl_channel = ChannelHierarchy::new(channel.id, &acl_ancestor_ids);
+
+        let inherited_changes = inherited_acls[effective_acl_start..]
+            .iter()
+            .any(|acl| acl.match_changes(evaluation_channel, old_home, new_home));
+        let local_here_changes = home_channel_match_changes_in_acls(
+            channel,
+            evaluation_channel,
+            local_acl_channel,
+            AclApplication::Here,
+            old_home,
+            new_home,
+        );
+
+        if inherited_changes || local_here_changes {
+            affected.insert(channel_id);
+        }
+
+        let inherited_len = inherited_acls.len();
+        for acl in channel.acls.iter().filter(|acl| {
+            acl.apply_subs
+                && acl
+                    .group
+                    .as_deref()
+                    .is_some_and(group_depends_on_home_channel)
+        }) {
+            inherited_acls.push(HomeChannelAcl {
+                group: acl.group.as_deref().unwrap_or_default(),
+                channel_id: channel.id,
+                ancestor_ids: acl_ancestor_ids.clone(),
+            });
+        }
+
+        actual_ancestor_ids.push(channel.id);
+        effective_ancestor_ids.push(channel.id);
+        self.for_each_child(channel_id, |child_id| {
+            self.collect_home_channel_move_affected_channel_ids(
+                child_id,
+                actual_ancestor_ids,
+                effective_ancestor_ids,
+                inherited_acls,
+                effective_start,
+                effective_acl_start,
+                old_home,
+                new_home,
+                affected,
+            );
+        });
+        effective_ancestor_ids.pop();
+        actual_ancestor_ids.pop();
+        inherited_acls.truncate(inherited_len);
+    }
+
+    fn root_ids(&self) -> Vec<u32> {
+        let mut roots: Vec<u32> = self
+            .by_id
+            .values()
+            .filter(|channel| {
+                channel
+                    .parent_id
+                    .is_none_or(|parent_id| !self.by_id.contains_key(&parent_id))
+            })
+            .map(|channel| channel.id)
+            .collect();
+        roots.sort_by_key(|id| {
+            self.by_id
+                .get(id)
+                .map(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id))
+                .unwrap_or((0, 0, *id))
+        });
+        roots
+    }
+
+    fn for_each_child(&self, channel_id: u32, mut f: impl FnMut(u32)) {
+        if let Some(child_ids) = self.children_by_parent_id.get(&Some(channel_id)) {
+            for child_id in child_ids {
+                f(*child_id);
+            }
+        }
+    }
+}
+
+fn home_channel_match_changes_in_acls(
+    channel: &Channel,
+    evaluation_channel: ChannelHierarchy<'_>,
+    acl_channel: ChannelHierarchy<'_>,
+    application: AclApplication,
+    old_home: ChannelHierarchy<'_>,
+    new_home: ChannelHierarchy<'_>,
+) -> bool {
+    for acl in &channel.acls {
+        if !acl_applies(acl, application) {
+            continue;
+        }
+
+        let Some(group) = acl.group.as_deref() else {
+            continue;
+        };
+        if !group_depends_on_home_channel(group) {
+            continue;
+        }
+
+        if group_match_changes(group, evaluation_channel, acl_channel, old_home, new_home) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_home_channel_dependent_acl(channel: &Channel, application: AclApplication) -> bool {
+    channel.acls.iter().any(|acl| {
+        acl_applies(acl, application)
+            && acl
+                .group
+                .as_deref()
+                .is_some_and(group_depends_on_home_channel)
+    })
+}
+
+fn acl_applies(acl: &crate::acl::ACL, application: AclApplication) -> bool {
+    match application {
+        AclApplication::Here => acl.apply_here,
+        AclApplication::Subs => acl.apply_subs,
+    }
+}
+
+fn group_match_changes(
+    group: &str,
+    evaluation_channel: ChannelHierarchy<'_>,
+    acl_channel: ChannelHierarchy<'_>,
+    old_home: ChannelHierarchy<'_>,
+    new_home: ChannelHierarchy<'_>,
+) -> bool {
+    let old_query =
+        ClientMembershipQuery::new(&[], true, &[], None, false, None).with_home_channel(old_home);
+    let new_query =
+        ClientMembershipQuery::new(&[], true, &[], None, false, None).with_home_channel(new_home);
+    let old_match = is_member_in_group(
+        group,
+        evaluation_channel,
+        Some(acl_channel),
+        &[],
+        &old_query,
+    );
+    let new_match = is_member_in_group(
+        group,
+        evaluation_channel,
+        Some(acl_channel),
+        &[],
+        &new_query,
+    );
+    old_match != new_match
 }

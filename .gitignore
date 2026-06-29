@@ -21,3 +21,4 @@ deploy/*
 !deploy/grafana/**
 examples/docker-compose-16node/.transport-survey
 codex-target/
+/target-*/

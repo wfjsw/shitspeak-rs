@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     client::Client,
@@ -31,8 +31,12 @@ pub async fn handle_query_users(
     if !msg.ids.is_empty() {
         // Look up by ID — query all registered users and filter
         let all_users = authenticator.get_registered_users("").await;
+        let mut users_by_id = HashMap::with_capacity(all_users.len());
+        for user in &all_users {
+            users_by_id.entry(user.user_id).or_insert(user);
+        }
         for id in &msg.ids {
-            if let Some(user) = all_users.iter().find(|u| u.user_id == *id) {
+            if let Some(user) = users_by_id.get(id) {
                 ids.push(user.user_id);
                 names.push(user.name.clone());
             }

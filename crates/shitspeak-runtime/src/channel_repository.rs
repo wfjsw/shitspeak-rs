@@ -2803,13 +2803,25 @@ pub(crate) fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
 
 /// Collect `root_id` and all of its descendants (BFS), returning their IDs.
 fn collect_subtree(channels: &HashMap<u32, Channel>, root_id: u32) -> Vec<u32> {
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for channel in channels.values() {
+        if let Some(parent_id) = channel.parent_id {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(channel.id);
+        }
+    }
+
     let mut result = vec![root_id];
-    let mut queue = std::collections::VecDeque::new();
+    let mut queue = VecDeque::new();
     queue.push_back(root_id);
     while let Some(id) = queue.pop_front() {
-        for ch in channels.values().filter(|c| c.parent_id == Some(id)) {
-            result.push(ch.id);
-            queue.push_back(ch.id);
+        if let Some(children) = children_by_parent.get(&id) {
+            for &child_id in children {
+                result.push(child_id);
+                queue.push_back(child_id);
+            }
         }
     }
     result

@@ -149,52 +149,60 @@ pub async fn handle_text_message(
         }
     }
 
-    let all_clients = server
-        .get_clients()
-        .get_all_clients_in_server(&server_id)
-        .await;
-
-    for target_channel in channel_ids {
-        for client in &all_clients {
+    let target_channel_ids: std::collections::HashSet<_> = channel_ids.iter().copied().collect();
+    if !target_channel_ids.is_empty() {
+        let channel_clients = server
+            .get_clients()
+            .get_clients_in_channels_or_listeners_in_server(&server_id, &target_channel_ids)
+            .await;
+        for client in &channel_clients {
             if client.get_session_id() == sender.get_session_id() {
                 continue;
             }
-            if client.get_current_channel_id() == target_channel && client.is_authenticated() {
-                if !crate::client::visibility::can_view_user(server, client, sender).await {
-                    continue;
-                }
-                deliver_or_queue_text_recipient(
-                    &relay,
-                    client,
-                    local_node_id,
-                    &mut delivered_sessions,
-                    &mut remote_by_node,
-                )
-                .await;
+            if !client.is_authenticated()
+                || !target_channel_ids.contains(&client.get_current_channel_id())
+            {
+                continue;
             }
+            if !crate::client::visibility::can_view_user(server, client, sender).await {
+                continue;
+            }
+            deliver_or_queue_text_recipient(
+                &relay,
+                client,
+                local_node_id,
+                &mut delivered_sessions,
+                &mut remote_by_node,
+            )
+            .await;
         }
     }
 
     if !tree_deliverable_channels.is_empty() {
-        for client in &all_clients {
+        let tree_clients = server
+            .get_clients()
+            .get_clients_in_channels_or_listeners_in_server(&server_id, &tree_deliverable_channels)
+            .await;
+        for client in &tree_clients {
             if client.get_session_id() == sender.get_session_id() {
                 continue;
             }
-            if tree_deliverable_channels.contains(&client.get_current_channel_id())
-                && client.is_authenticated()
+            if !client.is_authenticated()
+                || !tree_deliverable_channels.contains(&client.get_current_channel_id())
             {
-                if !crate::client::visibility::can_view_user(server, client, sender).await {
-                    continue;
-                }
-                deliver_or_queue_text_recipient(
-                    &relay,
-                    client,
-                    local_node_id,
-                    &mut delivered_sessions,
-                    &mut remote_by_node,
-                )
-                .await;
+                continue;
             }
+            if !crate::client::visibility::can_view_user(server, client, sender).await {
+                continue;
+            }
+            deliver_or_queue_text_recipient(
+                &relay,
+                client,
+                local_node_id,
+                &mut delivered_sessions,
+                &mut remote_by_node,
+            )
+            .await;
         }
     }
 
@@ -255,13 +263,22 @@ async fn collect_subtree_ids(
     root_id: u32,
 ) -> std::collections::HashSet<u32> {
     let all_channels = server.get_channels().get_all_in_server(server_id).await;
+    let mut children_by_parent = std::collections::HashMap::<u32, Vec<u32>>::new();
+    for ch in all_channels {
+        if let Some(parent_id) = ch.parent_id {
+            children_by_parent.entry(parent_id).or_default().push(ch.id);
+        }
+    }
+
     let mut result = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(root_id);
     while let Some(id) = queue.pop_front() {
         if result.insert(id) {
-            for ch in all_channels.iter().filter(|c| c.parent_id == Some(id)) {
-                queue.push_back(ch.id);
+            if let Some(children) = children_by_parent.get(&id) {
+                for &child_id in children {
+                    queue.push_back(child_id);
+                }
             }
         }
     }

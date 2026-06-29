@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeakerAssignment {
@@ -44,8 +44,9 @@ impl SsrcAllocator {
 
     pub fn from_ssrcs(ssrcs: impl IntoIterator<Item = u32>) -> Self {
         let mut free = VecDeque::new();
+        let mut seen = HashSet::new();
         for ssrc in ssrcs {
-            if !free.contains(&ssrc) {
+            if seen.insert(ssrc) {
                 free.push_back(ssrc);
             }
         }

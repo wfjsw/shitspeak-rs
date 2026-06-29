@@ -200,15 +200,18 @@ fn describe_address_delta(
         return;
     }
 
+    let previous_set = previous.iter().copied().collect::<HashSet<_>>();
+    let current_set = current.iter().copied().collect::<HashSet<_>>();
+
     let added = current
         .iter()
         .copied()
-        .filter(|addr| !previous.contains(addr))
+        .filter(|addr| !previous_set.contains(addr))
         .collect::<Vec<_>>();
     let removed = previous
         .iter()
         .copied()
-        .filter(|addr| !current.contains(addr))
+        .filter(|addr| !current_set.contains(addr))
         .collect::<Vec<_>>();
 
     if added.is_empty() && removed.is_empty() {

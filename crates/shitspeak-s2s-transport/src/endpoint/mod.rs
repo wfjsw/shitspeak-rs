@@ -394,8 +394,9 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
             }
         }
 
+        let mut registered_addresses = None;
         for addr in inner.cfg().seed_targets() {
-            if seed_address_registered(&inner, &addr) {
+            if seed_address_registered_in_snapshot(&inner, &mut registered_addresses, &addr) {
                 continue;
             }
             let inner_c = inner.clone();
@@ -710,13 +711,34 @@ fn kind_sort_order(key: StreamKey) -> u8 {
 }
 
 fn seed_address_registered(inner: &ManagerInner, addr: &SeedAddress) -> bool {
-    if let Some(peer_addr) = inner.successful_seed_address(addr) {
-        return peer_address_registered(inner, peer_addr);
-    }
-    let Some(peer_addr) = addr.as_static_peer_address() else {
-        return false;
-    };
-    peer_address_registered(inner, peer_addr)
+    seed_address_peer_addr(inner, addr)
+        .is_some_and(|peer_addr| peer_address_registered(inner, peer_addr))
+}
+
+fn seed_address_registered_in_snapshot(
+    inner: &ManagerInner,
+    registered_addresses: &mut Option<HashSet<PeerAddress>>,
+    addr: &SeedAddress,
+) -> bool {
+    seed_address_peer_addr(inner, addr).is_some_and(|peer_addr| {
+        registered_addresses
+            .get_or_insert_with(|| registered_peer_addresses(inner))
+            .contains(&peer_addr)
+    })
+}
+
+fn seed_address_peer_addr(inner: &ManagerInner, addr: &SeedAddress) -> Option<PeerAddress> {
+    inner
+        .successful_seed_address(addr)
+        .or_else(|| addr.as_static_peer_address())
+}
+
+fn registered_peer_addresses(inner: &ManagerInner) -> HashSet<PeerAddress> {
+    inner
+        .iter_peers()
+        .into_iter()
+        .flat_map(|(_, peer)| peer.snapshot_addresses())
+        .collect()
 }
 
 fn peer_address_registered(inner: &ManagerInner, addr: PeerAddress) -> bool {
@@ -970,6 +992,7 @@ fn resolve_seed_address_with_capability(
     local_ip_capability: LocalIpCapability,
 ) -> io::Result<Vec<PeerAddress>> {
     let mut addrs = Vec::new();
+    let mut seen = HashSet::new();
     for addr in seed.addr().to_socket_addrs()? {
         if !local_ip_capability.supports_remote(addr.ip()) {
             debug!(
@@ -980,7 +1003,7 @@ fn resolve_seed_address_with_capability(
             continue;
         }
         let peer_addr = PeerAddress::new(addr, seed.transport());
-        if peer_addr.is_dialable() && !addrs.contains(&peer_addr) {
+        if peer_addr.is_dialable() && seen.insert(peer_addr) {
             addrs.push(peer_addr);
         }
     }

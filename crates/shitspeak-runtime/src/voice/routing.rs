@@ -372,38 +372,41 @@ async fn resolve_voice_intent(
                 } else {
                     vec![ch_target.id]
                 };
+                let mut channel_id_set: HashSet<u32> = channel_ids.iter().copied().collect();
 
                 if ch_target.links {
-                    let mut linked_ids = Vec::new();
-                    for &ch_id in &channel_ids {
+                    let initial_channel_len = channel_ids.len();
+                    for index in 0..initial_channel_len {
+                        let ch_id = channel_ids[index];
                         if let Some(group) = server
                             .get_channels()
                             .effective_link_group_in_server(server_id, ch_id)
                         {
                             for &linked_id in group.iter() {
-                                if !channel_ids.contains(&linked_id)
-                                    && !linked_ids.contains(&linked_id)
-                                {
-                                    linked_ids.push(linked_id);
+                                if channel_id_set.insert(linked_id) {
+                                    channel_ids.push(linked_id);
                                 }
                             }
                         }
                     }
-                    channel_ids.extend(linked_ids);
                 }
 
                 if let Some(sender) = sender {
                     let mut allowed_channels = Vec::new();
+                    let mut allowed_channel_set = HashSet::new();
                     for channel_id in channel_ids {
                         let perms = crate::client::acl::compute_permissions_for_client(
                             server, sender, channel_id,
                         )
                         .await;
                         if perms.contains(crate::acl::ACLPermissions::Whisper) {
-                            allowed_channels.push(channel_id);
+                            if allowed_channel_set.insert(channel_id) {
+                                allowed_channels.push(channel_id);
+                            }
                         }
                     }
                     channel_ids = allowed_channels;
+                    channel_id_set = allowed_channel_set;
                 }
                 if channel_ids.is_empty() {
                     continue;
@@ -415,7 +418,7 @@ async fn resolve_voice_intent(
                     .await;
                 for client in channel_clients {
                     let client_channel = client.get_current_channel_id();
-                    if !channel_ids.contains(&client_channel) {
+                    if !channel_id_set.contains(&client_channel) {
                         continue;
                     }
                     if !client_matches_voice_target_group(
@@ -926,13 +929,22 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
 /// Collect all channel IDs in the subtree rooted at `root_id`.
 async fn collect_subtree_ids(server: &Arc<Box<Server>>, server_id: &str, root_id: u32) -> Vec<u32> {
     let all_channels = server.get_channels().get_all_in_server(server_id).await;
+    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    for ch in all_channels {
+        if let Some(parent_id) = ch.parent_id {
+            children_by_parent.entry(parent_id).or_default().push(ch.id);
+        }
+    }
+
     let mut result = Vec::new();
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(root_id);
     while let Some(id) = queue.pop_front() {
         result.push(id);
-        for ch in all_channels.iter().filter(|c| c.parent_id == Some(id)) {
-            queue.push_back(ch.id);
+        if let Some(children) = children_by_parent.get(&id) {
+            for &child_id in children {
+                queue.push_back(child_id);
+            }
         }
     }
     result

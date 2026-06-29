@@ -129,16 +129,13 @@ pub(crate) fn evaluate_permission_with_behavior(
     let chain = effective_acl_chain(channel, ancestors);
     let target_ancestor_ids: Vec<u32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
     let evaluation_channel = ChannelHierarchy::new(target_id, &target_ancestor_ids);
+    let chain_ancestor_ids: Vec<u32> = chain.iter().rev().map(|ch| ch.id).collect();
+    let chain_len = chain.len();
 
-    for index in 0..chain.len() {
-        let ch = chain[index];
+    for (index, ch) in chain.iter().enumerate() {
         let is_target_channel = ch.id == target_id;
-        let acl_ancestor_ids: Vec<u32> = chain[..index]
-            .iter()
-            .rev()
-            .map(|ancestor| ancestor.id)
-            .collect();
-        let acl_channel = ChannelHierarchy::new(ch.id, &acl_ancestor_ids);
+        let acl_ancestor_ids = &chain_ancestor_ids[chain_len - index..];
+        let acl_channel = ChannelHierarchy::new(ch.id, acl_ancestor_ids);
 
         for acl in &ch.acls {
             let applies = if is_target_channel {
@@ -222,16 +219,13 @@ fn any_applicable_effective_acl(
     let chain = effective_acl_chain(channel, ancestors);
     let target_ancestor_ids: Vec<u32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
     let evaluation_channel = ChannelHierarchy::new(target_id, &target_ancestor_ids);
+    let chain_ancestor_ids: Vec<u32> = chain.iter().rev().map(|ch| ch.id).collect();
+    let chain_len = chain.len();
 
-    for index in 0..chain.len() {
-        let ch = chain[index];
+    for (index, ch) in chain.iter().enumerate() {
         let is_target_channel = ch.id == target_id;
-        let acl_ancestor_ids: Vec<u32> = chain[..index]
-            .iter()
-            .rev()
-            .map(|ancestor| ancestor.id)
-            .collect();
-        let acl_channel = ChannelHierarchy::new(ch.id, &acl_ancestor_ids);
+        let acl_ancestor_ids = &chain_ancestor_ids[chain_len - index..];
+        let acl_channel = ChannelHierarchy::new(ch.id, acl_ancestor_ids);
 
         for acl in &ch.acls {
             let applies = if is_target_channel {

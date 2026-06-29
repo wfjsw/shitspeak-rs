@@ -18,10 +18,34 @@ impl<'a> ChannelHierarchy<'a> {
         }
     }
 
-    fn root_to_current(&self) -> Vec<u32> {
-        let mut hierarchy: Vec<u32> = self.ancestors.iter().rev().copied().collect();
-        hierarchy.push(self.current_channel_id);
-        hierarchy
+    fn root_to_current_len(&self) -> usize {
+        self.ancestors.len() + 1
+    }
+
+    fn root_to_current_position(&self, channel_id: u32) -> Option<usize> {
+        self.ancestors
+            .iter()
+            .rev()
+            .position(|id| *id == channel_id)
+            .or_else(|| (self.current_channel_id == channel_id).then_some(self.ancestors.len()))
+    }
+
+    fn root_to_current_channel_at(&self, index: usize) -> Option<u32> {
+        if index == self.ancestors.len() {
+            return Some(self.current_channel_id);
+        }
+
+        if index >= self.ancestors.len() {
+            return None;
+        }
+
+        self.ancestors
+            .get(self.ancestors.len() - index - 1)
+            .copied()
+    }
+
+    fn contains_channel(&self, channel_id: u32) -> bool {
+        self.current_channel_id == channel_id || self.ancestors.contains(&channel_id)
     }
 }
 
@@ -343,31 +367,30 @@ fn matches_subtree(
     context_channel: ChannelHierarchy<'_>,
     subtree: &SubtreeMatch,
 ) -> bool {
-    let home_hierarchy = home_channel.root_to_current();
-    let evaluation_hierarchy = evaluation_channel.root_to_current();
-
-    let Some(context_index) = evaluation_hierarchy
-        .iter()
-        .position(|id| *id == context_channel.current_channel_id)
+    let Some(context_index) =
+        evaluation_channel.root_to_current_position(context_channel.current_channel_id)
     else {
         return false;
     };
 
     let mut required_index = context_index as i32 + subtree.channel_offset;
-    if required_index >= evaluation_hierarchy.len() as i32 {
+    if required_index >= evaluation_channel.root_to_current_len() as i32 {
         return false;
     }
     if required_index < 0 {
         required_index = 0;
     }
     let required_index = required_index as usize;
-    let required_channel = evaluation_hierarchy[required_index];
+    let Some(required_channel) = evaluation_channel.root_to_current_channel_at(required_index)
+    else {
+        return false;
+    };
 
-    if !home_hierarchy.contains(&required_channel) {
+    if !home_channel.contains_channel(required_channel) {
         return false;
     }
 
-    let total_depth = home_hierarchy.len() as i32 - 1;
+    let total_depth = home_channel.root_to_current_len() as i32 - 1;
     let min_depth = required_index as i32 + subtree.min_descendant_level;
     let max_depth = required_index as i32 + subtree.max_descendant_level;
 
