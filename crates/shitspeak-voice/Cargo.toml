@@ -1,0 +1,14 @@
+[package]
+name = "shitspeak-voice"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+libc = { workspace = true }
+prost = { workspace = true }
+shitspeak-core = { workspace = true }
+shitspeak-messages = { workspace = true }
+shitspeak-proto = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

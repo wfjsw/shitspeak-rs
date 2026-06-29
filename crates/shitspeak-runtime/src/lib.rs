@@ -1,0 +1,138 @@
+#![allow(warnings)]
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_imports,
+    unused_must_use,
+    unused_assignments
+)]
+
+pub mod mumble_proto {
+    pub use shitspeak_proto::mumble_proto::*;
+}
+
+pub mod mumble_udp {
+    pub use shitspeak_proto::mumble_udp::*;
+}
+
+pub mod s2s_transport_proto {
+    pub use shitspeak_proto::s2s_transport_proto::*;
+}
+
+pub mod s2s_overlay_proto {
+    pub use shitspeak_proto::s2s_overlay_proto::*;
+}
+
+pub mod s2s_replication_proto {
+    pub use shitspeak_proto::s2s_replication_proto::*;
+}
+
+pub mod s2s_application_proto {
+    pub use shitspeak_proto::s2s_application_proto::*;
+}
+
+pub mod acl;
+pub mod api {
+    pub use shitspeak_auth::*;
+}
+pub mod ban_repository;
+pub mod blob_store;
+pub mod channel_handler;
+pub mod channel_repository;
+pub mod channels;
+pub mod client;
+pub mod client_certificate_verifier;
+pub mod client_repository;
+pub mod codec_info;
+pub mod config;
+pub mod config_watcher;
+pub mod constants;
+pub mod context_action;
+pub mod errors;
+pub mod forwarder;
+pub mod geoip;
+pub mod http_client;
+pub mod localization;
+pub mod logging;
+pub mod messages {
+    pub use shitspeak_messages::messages::*;
+}
+pub mod observability;
+pub mod privacy;
+pub mod protocol_version;
+pub mod proxy_protocol;
+pub mod register;
+pub mod s2s;
+pub mod server;
+pub mod tls_fingerprint;
+pub mod types;
+pub mod user_channel_cache;
+pub mod utils;
+pub mod voice;
+
+#[cfg(test)]
+mod integration_tests;
+
+pub async fn run_server_with_extensions(
+    extensions: server::ServerExtensions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{api::ReloadableAuthenticator, config::Config, server::Server};
+
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
+    let logging_guard = logging::init("shitspeak-rs")?;
+
+    crate::client::crypt::probe_aes_backend();
+    crate::client::crypt::probe_gf128_backend();
+
+    let config = Config::load();
+    let authenticator = ReloadableAuthenticator::from_config(&config)?;
+    let server =
+        Server::new_with_reloadable_authenticator_and_extensions(config, authenticator, extensions)
+            .await?;
+
+    let _watcher = config_watcher::spawn_config_watcher(server.clone(), server.shutdown_receiver());
+
+    let server_run = server.run();
+    tokio::pin!(server_run);
+
+    tokio::select! {
+        result = &mut server_run => {
+            if let Err(e) = result {
+                tracing::error!("Server exited with error: {e}");
+            }
+            return Ok(());
+        }
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => tracing::info!("Received Ctrl-C, shutting down."),
+                Err(e) => tracing::error!("Failed to listen for Ctrl-C: {e}"),
+            }
+            server.shutdown();
+        }
+    }
+
+    tokio::select! {
+        result = &mut server_run => {
+            if let Err(e) = result {
+                tracing::error!("Server exited with error: {e}");
+            }
+        }
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => tracing::warn!("Received Ctrl-C again, forcing shutdown."),
+                Err(e) => tracing::error!("Failed to listen for additional Ctrl-C: {e}"),
+            }
+            logging_guard.flush();
+            std::process::exit(130);
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+    run_server_with_extensions(server::ServerExtensions::default()).await
+}

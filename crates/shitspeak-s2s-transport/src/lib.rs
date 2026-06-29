@@ -1,0 +1,111 @@
+pub mod geoip {
+    pub use shitspeak_core::{NodeGeo, valid_coordinates};
+}
+
+pub mod http_client {
+    use std::time::Duration;
+
+    use reqwest::Client;
+
+    pub fn build_with_webpki_fallback(
+        timeout: Duration,
+        label: &str,
+    ) -> Result<Client, reqwest::Error> {
+        match Client::builder().timeout(timeout).build() {
+            Ok(client) => Ok(client),
+            Err(system_error) => {
+                tracing::warn!(
+                    "{label}: failed to build HTTP client with platform certificate verifier: \
+                     {system_error}; falling back to bundled WebPKI roots"
+                );
+                Client::builder()
+                    .timeout(timeout)
+                    .tls_backend_preconfigured(webpki_rustls_config())
+                    .build()
+            }
+        }
+    }
+
+    fn webpki_rustls_config() -> rustls::ClientConfig {
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config
+    }
+}
+
+pub mod s2s {
+    pub mod debug_io {
+        #[inline]
+        pub fn record_named_sent(_kind: &'static str, _bytes: usize) {}
+
+        #[inline]
+        pub fn record_named_received(_kind: &'static str, _bytes: usize) {}
+    }
+
+    pub mod transport {
+        pub use crate::*;
+
+        pub mod frame {
+            pub use crate::frame::*;
+        }
+
+        pub mod service_level {
+            pub use crate::service_level::*;
+        }
+    }
+}
+
+pub mod s2s_transport_proto {
+    pub use shitspeak_proto::s2s_transport_proto::*;
+}
+
+pub mod s2s_overlay_proto {
+    pub use shitspeak_proto::s2s_overlay_proto::*;
+}
+
+pub mod types {
+    pub use shitspeak_core::{NodeIdentifier, default_server_id};
+}
+
+mod compression;
+mod config;
+mod connection;
+mod endpoint;
+mod error;
+mod frame;
+mod identity;
+mod local_ip;
+mod manager;
+mod metrics;
+mod native_stats;
+mod public_ip;
+mod service_level;
+mod stream_io;
+mod tls;
+
+pub use compression::SendOptions;
+pub use config::{TransportConfig, TransportTuning};
+pub use connection::AddressBackoffSnapshot;
+pub use error::{ConfigError, SendError, TransportError};
+pub use identity::node_id_from_cert_file;
+pub use manager::PeerAddressSnapshot;
+pub use manager::{ConnectionManager, Inbound, InboundMessage};
+pub use metrics::{
+    InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot, OutboundQueueStatusSnapshot,
+    QueueStatusSnapshot,
+};
+pub use metrics::{
+    apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,
+    conversational_quality_score,
+};
+pub use public_ip::discover_public_geo;
+pub use service_level::{
+    MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, ServiceShape,
+    TransportKind,
+};

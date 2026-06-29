@@ -1,0 +1,16 @@
+[package]
+name = "shitspeak-messages"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+enumflags2 = { workspace = true }
+message_macro = { workspace = true }
+os_info = { workspace = true }
+prost = { workspace = true }
+rustls = { workspace = true }
+shitspeak-core = { workspace = true }
+shitspeak-proto = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

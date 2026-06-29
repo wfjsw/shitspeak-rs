@@ -276,6 +276,7 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         send_version: false,
         send_build_info: false,
         send_os_info: false,
+        authenticate_timeout_ms: 1_000,
         server_protocol_version,
         allowed_proxies: Vec::new(),
         min_client_version: 0,

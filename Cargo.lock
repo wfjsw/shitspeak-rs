@@ -661,15 +661,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "conducer"
-version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f9672892d7f6c58e974dd6e5d59da0ae6b472ac133764ea9323038a1f0a2bb9"
-dependencies = [
- "kio",
-]
-
-[[package]]
 name = "config"
 version = "0.15.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2479,24 +2470,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "moq-lite"
-version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbf9a1647116baba22cb0435fd56debb071b9e54e43ec0a72f2e6a44011cd520"
-dependencies = [
- "bytes",
- "conducer",
- "futures",
- "num_enum",
- "rand 0.9.4",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "web-async",
- "web-transport-trait",
 ]
 
 [[package]]
@@ -4386,7 +4359,89 @@ dependencies = [
 ]
 
 [[package]]
+name = "shitspeak-auth"
+version = "3.0.0"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64",
+ "bytes",
+ "hex",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "shitspeak-core",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wasmtime",
+ "webpki-roots",
+]
+
+[[package]]
+name = "shitspeak-core"
+version = "3.0.0"
+dependencies = [
+ "enumflags2",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "shitspeak-messages"
+version = "3.0.0"
+dependencies = [
+ "bytes",
+ "enumflags2",
+ "message_macro",
+ "os_info",
+ "prost",
+ "rustls",
+ "shitspeak-core",
+ "shitspeak-proto",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "shitspeak-proto"
+version = "3.0.0"
+dependencies = [
+ "bytes",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protoc-bin-vendored",
+ "serde",
+]
+
+[[package]]
 name = "shitspeak-rs"
+version = "3.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "config",
+ "criterion",
+ "enumflags2",
+ "parking_lot",
+ "prost",
+ "rayon",
+ "rcgen 0.13.2",
+ "rustls",
+ "serde",
+ "shitspeak-runtime",
+ "shitspeak-web",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "shitspeak-runtime"
 version = "3.0.0"
 dependencies = [
  "arc-swap",
@@ -4400,14 +4455,11 @@ dependencies = [
  "criterion",
  "enumflags2",
  "futures-util",
- "hang",
  "hex",
  "libc",
  "maxminddb",
  "message_macro",
  "miniz_oxide",
- "moq-lite",
- "moq-native",
  "notify",
  "num_enum",
  "os_info",
@@ -4415,9 +4467,7 @@ dependencies = [
  "paste",
  "ppp",
  "prost",
- "prost-build",
  "prost-types",
- "protoc-bin-vendored",
  "quinn",
  "rand 0.10.1",
  "rayon",
@@ -4431,6 +4481,12 @@ dependencies = [
  "scc",
  "serde",
  "serde_json",
+ "shitspeak-auth",
+ "shitspeak-core",
+ "shitspeak-messages",
+ "shitspeak-proto",
+ "shitspeak-s2s-transport",
+ "shitspeak-voice",
  "socket2 0.6.4",
  "tempfile",
  "thiserror 2.0.18",
@@ -4442,12 +4498,87 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tracing-test",
- "wasmtime",
  "webpki-roots",
- "webrtc",
  "windows-sys 0.61.2",
  "x509-parser 0.18.1",
  "zstd",
+]
+
+[[package]]
+name = "shitspeak-s2s-transport"
+version = "3.0.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "aws-lc-rs",
+ "bytes",
+ "chrono",
+ "config",
+ "futures-util",
+ "libc",
+ "parking_lot",
+ "prost",
+ "quinn",
+ "rand 0.10.1",
+ "rcgen 0.13.2",
+ "reqwest 0.13.4",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "scc",
+ "serde",
+ "serde_json",
+ "shitspeak-core",
+ "shitspeak-proto",
+ "socket2 0.5.10",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tokio_kcp",
+ "tracing",
+ "webpki-roots",
+ "windows-sys 0.61.2",
+ "x509-parser 0.16.0",
+ "zstd",
+]
+
+[[package]]
+name = "shitspeak-voice"
+version = "3.0.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "prost",
+ "shitspeak-core",
+ "shitspeak-messages",
+ "shitspeak-proto",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "shitspeak-web"
+version = "3.0.0"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64",
+ "bytes",
+ "hang",
+ "moq-native",
+ "rand 0.10.1",
+ "rcgen 0.13.2",
+ "rustls",
+ "serde",
+ "serde_json",
+ "shitspeak-runtime",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webrtc",
 ]
 
 [[package]]

@@ -1,0 +1,77 @@
+[package]
+name = "shitspeak-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+cidr = { workspace = true }
+config = { workspace = true }
+enumflags2 = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+maxminddb = { workspace = true }
+message_macro = { workspace = true }
+notify = { workspace = true }
+num_enum = { workspace = true }
+os_info = { workspace = true }
+parking_lot = { workspace = true }
+paste = { workspace = true }
+ppp = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+quinn = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+rmp-serde = { workspace = true }
+rusqlite = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+scc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shitspeak-auth = { workspace = true }
+shitspeak-core = { workspace = true }
+shitspeak-messages = { workspace = true }
+shitspeak-proto = { workspace = true }
+shitspeak-s2s-transport = { workspace = true, features = ["test-support"] }
+shitspeak-voice = { workspace = true }
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+tokio_kcp = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+webpki-roots = { workspace = true }
+x509-parser = { workspace = true }
+zstd = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+
+[build-dependencies]
+chrono = { workspace = true }
+miniz_oxide = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rcgen = { workspace = true }
+tempfile = { workspace = true }
+tracing-test = { workspace = true }
+
+[features]
+default = []

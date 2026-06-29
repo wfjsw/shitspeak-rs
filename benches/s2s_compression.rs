@@ -54,7 +54,6 @@ fn link_ads(count: u32, links_per_ad: u32) -> Vec<overlay_pb::LinkStateAdvert> {
             strict_replication_disabled: false,
             content_replication_disabled: false,
             owner_replication_disabled: false,
-            geo: None,
         })
         .collect()
 }
@@ -110,6 +109,9 @@ fn strict_catchup_resp_payload() -> Bytes {
             .map(|version| repl_pb::CatchupOp {
                 version,
                 op_msgpack: Bytes::from(vec![0x55; 512]),
+                strict_op_id_hi: 0,
+                strict_op_id_lo: 0,
+                strict_ts_final: 0,
             })
             .collect(),
         has_more: true,
@@ -141,6 +143,9 @@ fn owner_catchup_resp_payload() -> Bytes {
             .map(|version| repl_pb::CatchupOp {
                 version,
                 op_msgpack: Bytes::from(vec![0x77; 512]),
+                strict_op_id_hi: 0,
+                strict_op_id_lo: 0,
+                strict_ts_final: 0,
             })
             .collect(),
         has_more: true,

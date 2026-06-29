@@ -1,75 +1,127 @@
-[package]
-name = "shitspeak-rs"
+[workspace]
+members = [
+    ".",
+    "crates/shitspeak-auth",
+    "crates/shitspeak-core",
+    "crates/shitspeak-messages",
+    "crates/shitspeak-proto",
+    "crates/shitspeak-runtime",
+    "crates/shitspeak-s2s-transport",
+    "crates/shitspeak-voice",
+    "crates/shitspeak-web",
+    "crates/message_macro",
+]
+resolver = "3"
+
+[workspace.package]
 version = "3.0.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+arc-swap = "1"
+async-trait = "0"
 aws-lc-rs = "1"
 base64 = "0"
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0", features = ["serde"] }
 cidr = "0"
 config = "0"
-notify = "8"
+criterion = { version = "0.8.2", features = ["html_reports"] }
 enumflags2 = { version = "0", features = ["serde"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+hang = "0.16"
 hex = "0"
 libc = "0"
 maxminddb = { version = "0", features = ["mmap", "simdutf8"] }
+message_macro = { path = "crates/message_macro" }
+miniz_oxide = "0.8.9"
+moq-lite = "0.16"
+moq-native = { version = "0.14", default-features = false, features = ["quinn", "aws-lc-rs"] }
+notify = "8"
 num_enum = "0"
+os_info = "3"
+parking_lot = { version = "0", features = ["arc_lock", "hardware-lock-elision", "owning_ref", "serde"] }
 paste = "1"
 ppp = "2"
 prost = "0"
+prost-build = "0.14.3"
 prost-types = "0"
+protoc-bin-vendored = "3"
+quinn = { version = "0", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
+rand = "0.10"
+rayon = "1"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "rustls", "stream"] }
+rmp-serde = "1"
+rusqlite = { version = "0", features = ["bundled"] }
 rustls = "0"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+scc = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "rustls", "stream"] }
 socket2 = { version = "0", features = ["all"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0"
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio_kcp = "0"
 tracing = "0.1"
-wasmtime = { version = "45", default-features = false, features = ["async", "cranelift", "parallel-compilation", "runtime"] }
-webpki-roots = "1"
 tracing-appender = { version = "0", features = ["parking_lot"] }
 tracing-subscriber = { version = "0", features = ["parking_lot", "serde", "env-filter", "registry"] }
+tracing-test = "0.2"
+wasmtime = { version = "45", default-features = false, features = ["async", "cranelift", "parallel-compilation", "runtime"] }
+webrtc = "0.17"
+webpki-roots = "1"
 x509-parser = "0"
 zstd = "0"
+shitspeak-proto = { path = "crates/shitspeak-proto" }
+shitspeak-auth = { path = "crates/shitspeak-auth" }
+shitspeak-core = { path = "crates/shitspeak-core" }
+shitspeak-messages = { path = "crates/shitspeak-messages" }
+shitspeak-runtime = { path = "crates/shitspeak-runtime" }
+shitspeak-s2s-transport = { path = "crates/shitspeak-s2s-transport" }
+shitspeak-voice = { path = "crates/shitspeak-voice" }
+shitspeak-web = { path = "crates/shitspeak-web" }
 
-# local proc-macro to derive message helpers
-message_macro = { path = "src/messages/macros" }
-os_info = "3"
-async-trait = "0"
-rusqlite = { version = "0", features = ["bundled"] }
-parking_lot = { version = "0", features = ["arc_lock", "hardware-lock-elision", "owning_ref", "serde"] }
-scc = "3"
-quinn = { version = "0", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
-tokio_kcp = "0"
-rustls-pemfile = "2"
-rustls-pki-types = "1"
-tokio-util = { version = "0.7", features = ["codec"] }
-futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
-rand = "0.10"
-arc-swap = "1"
-rmp-serde = "1"
-rayon = "1"
-webrtc = { version = "0.17", optional = true }
-moq-lite = { version = "0.16", optional = true }
-moq-native = { version = "0.14", default-features = false, features = ["quinn", "aws-lc-rs"], optional = true }
-hang = { version = "0.16", optional = true }
+[package]
+name = "shitspeak-rs"
+version.workspace = true
+edition.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+[dependencies]
+shitspeak-runtime = { workspace = true }
+shitspeak-web = { workspace = true, optional = true }
+config = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+criterion = { workspace = true }
+enumflags2 = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+rayon = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+zstd = { workspace = true }
+
+[features]
+default = []
+web = ["dep:shitspeak-web"]
+moq = ["web", "shitspeak-web/moq"]
 
 [patch.crates-io]
 kcp = { path = "vendor/kcp" }
 tokio_kcp = { path = "vendor/tokio_kcp" }
-
-[features]
-default = []
-web = ["dep:webrtc"]
-moq = ["web", "dep:moq-lite", "dep:moq-native", "dep:hang"]
 
 [[bin]]
 name = "shitspeak-rs"
@@ -80,20 +132,6 @@ test = false
 name = "s2s-forwarder"
 path = "src/bin/s2s-forwarder.rs"
 test = false
-
-[build-dependencies]
-chrono = "0.4.41"
-prost-build = "0.14.3"
-protoc-bin-vendored = "3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1"
-miniz_oxide = "0.8.9"
-
-[dev-dependencies]
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
-criterion = { version = "0.8.2", features = ["html_reports"] }
-tempfile = "3"
-tracing-test = "0.2"
 
 [[bench]]
 name = "acl"

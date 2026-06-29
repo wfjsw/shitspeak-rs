@@ -52,6 +52,14 @@ cargo test
 cargo bench
 ```
 
+Workspace checks for cached PR compilation:
+
+```powershell
+cargo check --workspace --all-targets --locked
+cargo check --workspace --all-targets --features web --locked
+cargo check --workspace --all-targets --features moq --locked
+```
+
 Optional feature builds:
 
 ```powershell

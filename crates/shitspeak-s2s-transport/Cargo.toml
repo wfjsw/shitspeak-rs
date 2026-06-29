@@ -1,0 +1,48 @@
+[package]
+name = "shitspeak-s2s-transport"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+aws-lc-rs = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+config = { workspace = true }
+futures-util = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+quinn = { workspace = true }
+rand = { workspace = true }
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+scc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shitspeak-core = { workspace = true }
+shitspeak-proto = { workspace = true }
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+tokio_kcp = { workspace = true }
+tracing = { workspace = true }
+webpki-roots = { workspace = true }
+x509-parser = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
