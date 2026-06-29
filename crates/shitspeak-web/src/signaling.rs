@@ -2474,7 +2474,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         })
-        .with_authenticator(Arc::new(TestAuthenticator));
+        .with_authenticator(Arc::new(TestAuthenticator::default_session()));
         let handle = tokio::spawn(async move { signaling.handle_stream(server).await });
 
         let payload = r#"{"type":"authenticate","auth":{"password":{"username":"alice","password":"secret"}}}"#;
@@ -2509,7 +2509,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         })
-        .with_authenticator(Arc::new(TestAuthenticator));
+        .with_authenticator(Arc::new(TestAuthenticator::default_session()));
         let handle = tokio::spawn(async move { signaling.handle_stream(server).await });
 
         let payload =
@@ -2540,13 +2540,13 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_password_auth_allocates_server_client() {
-        let server = test_server_with_authenticator(TestAuthenticator).await;
+        let server = test_server_with_authenticator(TestAuthenticator::default_session()).await;
         let (mut client, server_stream) = tokio::io::duplex(4096);
         let signaling = SignalingServer::new(WebConfig {
             enabled: true,
             ..Default::default()
         })
-        .with_authenticator(Arc::new(TestAuthenticator))
+        .with_authenticator(Arc::new(TestAuthenticator::allocated_session()))
         .with_server(Arc::clone(&server));
         let handle = tokio::spawn(async move { signaling.handle_stream(server_stream).await });
 
@@ -2627,7 +2627,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_join_channel_command_uses_server_handlers() {
-        let server = test_server_with_authenticator(TestAuthenticator).await;
+        let server = test_server_with_authenticator(TestAuthenticator::default_session()).await;
         server
             .get_channels()
             .create_channel(shitspeak_runtime::channels::Channel::new(
@@ -2645,7 +2645,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         })
-        .with_authenticator(Arc::new(TestAuthenticator))
+        .with_authenticator(Arc::new(TestAuthenticator::allocated_session()))
         .with_server(Arc::clone(&server));
         let handle = tokio::spawn(async move { signaling.handle_stream(server_stream).await });
 
@@ -2817,7 +2817,29 @@ mod tests {
         );
     }
 
-    struct TestAuthenticator;
+    struct TestAuthenticator {
+        expected_session: ExpectedAuthSession,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedAuthSession {
+        Default,
+        Allocated,
+    }
+
+    impl TestAuthenticator {
+        fn default_session() -> Self {
+            Self {
+                expected_session: ExpectedAuthSession::Default,
+            }
+        }
+
+        fn allocated_session() -> Self {
+            Self {
+                expected_session: ExpectedAuthSession::Allocated,
+            }
+        }
+    }
 
     #[async_trait]
     impl Authenticator for TestAuthenticator {
@@ -2827,7 +2849,14 @@ mod tests {
             password: Option<&str>,
             auxiliary_data: &AuthenticateAuxiliaryData,
         ) -> Result<AuthenticateResult, AuthenticationRejection> {
-            assert_eq!(auxiliary_data.session_id, DEFAULT_WEB_SESSION_ID);
+            match self.expected_session {
+                ExpectedAuthSession::Default => {
+                    assert_eq!(auxiliary_data.session_id, DEFAULT_WEB_SESSION_ID)
+                }
+                ExpectedAuthSession::Allocated => {
+                    assert_ne!(auxiliary_data.session_id, DEFAULT_WEB_SESSION_ID)
+                }
+            }
             assert_eq!(auxiliary_data.ip_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
             if username != "alice" {
                 return Err(AuthenticationRejection::NoSuchUser);
