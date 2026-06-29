@@ -188,7 +188,7 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
     assert_eq!(text.session.len(), 1);
     assert!(
         text.message
-            .contains("Authentication queue: position 1 of 1"),
+            .contains("You're in the login queue. There are 0 users ahead of you."),
         "unexpected queue notice text: {}",
         text.message
     );
@@ -223,9 +223,7 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
                 saw_server_sync = true;
                 break;
             }
-            Message::TextMessage(text)
-                if text.message.contains("Authentication queue: position") =>
-            {
+            Message::TextMessage(text) if text.message.contains("You're in the login queue.") => {
                 saw_queue_notice_after_sync = true;
             }
             _ => {}
@@ -246,7 +244,7 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
             !matches!(
                 message,
                 Message::TextMessage(text)
-                    if text.message.contains("Authentication queue: position")
+                    if text.message.contains("You're in the login queue.")
             )
         }),
         "queue notices must not be cached and replayed after ServerSync"

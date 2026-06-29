@@ -1343,6 +1343,29 @@ mod tests {
         assert_eq!(user_visibility.known_channel(target_session), None);
     }
 
+    #[test]
+    fn auth_finalization_queue_notice_is_sent_only_when_position_changes() {
+        let mut last_announced_position = None;
+
+        assert!(should_send_auth_finalization_queue_notice(
+            &mut last_announced_position,
+            2
+        ));
+        assert_eq!(last_announced_position, Some(2));
+
+        assert!(!should_send_auth_finalization_queue_notice(
+            &mut last_announced_position,
+            2
+        ));
+        assert_eq!(last_announced_position, Some(2));
+
+        assert!(should_send_auth_finalization_queue_notice(
+            &mut last_announced_position,
+            1
+        ));
+        assert_eq!(last_announced_position, Some(1));
+    }
+
     #[tokio::test]
     async fn reload_root_channel_work_does_not_hold_config_write_lock() {
         install_default_provider();
@@ -1502,7 +1525,9 @@ impl AuthFinalizationQueue {
             queue: Arc::clone(self),
             ticket,
         };
-        self.send_queue_notice(client, ticket).await?;
+        let mut last_announced_position = None;
+        self.send_queue_notice(client, ticket, &mut last_announced_position)
+            .await?;
 
         let mut notice_interval = tokio::time::interval_at(
             tokio::time::Instant::now() + AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL,
@@ -1516,7 +1541,7 @@ impl AuthFinalizationQueue {
                     break permit.expect("auth finalization semaphore should not be closed");
                 }
                 _ = notice_interval.tick() => {
-                    self.send_queue_notice(client, ticket).await?;
+                    self.send_queue_notice(client, ticket, &mut last_announced_position).await?;
                 }
             }
         };
@@ -1534,9 +1559,12 @@ impl AuthFinalizationQueue {
         &self,
         client: &Arc<Box<Client>>,
         ticket: u64,
+        last_announced_position: &mut Option<usize>,
     ) -> Result<(), MessageHandlerError> {
-        if let Some((position, total)) = self.position_and_total(ticket) {
-            let message = auth_finalization_queue_message(client.get_session_id(), position, total);
+        if let Some(position) = self.position(ticket)
+            && should_send_auth_finalization_queue_notice(last_announced_position, position)
+        {
+            let message = auth_finalization_queue_message(client.get_session_id(), position);
             client.write_proto_message(&message).await?;
         }
         Ok(())
@@ -1548,13 +1576,12 @@ impl AuthFinalizationQueue {
         }
     }
 
-    fn position_and_total(&self, ticket: u64) -> Option<(usize, usize)> {
+    fn position(&self, ticket: u64) -> Option<usize> {
         let waiters = self.waiters.lock();
-        let total = waiters.len();
         waiters
             .iter()
             .position(|waiter| waiter.ticket == ticket)
-            .map(|index| (index + 1, total))
+            .map(|index| index + 1)
     }
 
     #[cfg(test)]
@@ -1618,18 +1645,33 @@ impl Drop for AuthFinalizationPermit {
 fn auth_finalization_queue_message(
     session_id: ClientSessionIdentifier,
     position: usize,
-    total: usize,
 ) -> Message {
+    let users_ahead = position.saturating_sub(1);
+
     Message::TextMessage(
         TextMessage {
             actor: None,
             session: vec![u32::from(session_id)],
             channel_id: Vec::new(),
             tree_id: Vec::new(),
-            message: format!("Authentication queue: position {position} of {total}."),
+            message: format!(
+                "You're in the login queue. There are {users_ahead} users ahead of you."
+            ),
         }
         .into(),
     )
+}
+
+fn should_send_auth_finalization_queue_notice(
+    last_announced_position: &mut Option<usize>,
+    position: usize,
+) -> bool {
+    if *last_announced_position == Some(position) {
+        return false;
+    }
+
+    *last_announced_position = Some(position);
+    true
 }
 
 fn is_pre_auth_passthrough_message(message: &Message) -> bool {
