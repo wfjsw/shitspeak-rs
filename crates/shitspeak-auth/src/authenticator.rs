@@ -103,17 +103,6 @@ pub trait Authenticator: Send + Sync + 'static {
         })
     }
 
-    /// Select the language for server-generated text sent to this connection.
-    /// Called before `authenticate`, so implementations can localize reject
-    /// messages for known users even when authentication fails.
-    async fn language(
-        &self,
-        _username: Option<&str>,
-        _auxiliary_data: &AuthenticateAuxiliaryData,
-    ) -> Language {
-        Language::default()
-    }
-
     // ── Optional blob helpers (default: no-op) ────────────────────────────
 
     /// Retrieve the raw texture bytes for a registered user.

@@ -203,6 +203,10 @@ pub async fn build_visible_user_state(
     state
 }
 
+pub fn user_state_projection_is_viewer_independent(server: &Arc<Box<Server>>) -> bool {
+    !server.get_hide_users_without_traverse() && server.get_certificate_hash_privacy().is_none()
+}
+
 pub async fn initialize(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,

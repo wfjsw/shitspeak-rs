@@ -36,11 +36,6 @@ class AuthenticateRequest {
 }
 
 @json
-class LanguageRequest {
-  username: string | null = null;
-}
-
-@json
 class AuthenticateResponse {
   accepted: bool = true;
   @omitnull()
@@ -62,11 +57,6 @@ class AuthenticateResponse {
   texture_url: string | null = null;
   @omitnull()
   comment_url: string | null = null;
-}
-
-@json
-class LanguageResponse {
-  language: string = "en";
 }
 
 @json
@@ -109,6 +99,7 @@ export function authenticate(ptr: i32, len: i32): u64 {
   if (request.username == "guest") {
     const resp = new AuthenticateResponse();
     resp.display_name = "guest";
+    setLanguage(resp, request.username);
     return writeResponse(resp);
   }
 
@@ -117,16 +108,6 @@ export function authenticate(ptr: i32, len: i32): u64 {
   }
 
   return writeResponse(mkReject("no_such_user"));
-}
-
-export function language(ptr: i32, len: i32): u64 {
-  const request = JSON.parse<LanguageRequest>(readString(ptr, len));
-  const resp = new LanguageResponse();
-  const uname = request.username;
-  if (uname != null && uname.endsWith(".es")) {
-    resp.language = "es";
-  }
-  return writeString(JSON.stringify(resp));
 }
 
 // ── Fetch-backed authentication ───────────────────────────────────────────────
@@ -148,6 +129,7 @@ function authenticateWithFetch(username: string): u64 {
 
   const resp = new AuthenticateResponse();
   resp.display_name = username;
+  setLanguage(resp, username);
   return writeResponse(resp);
 }
 
@@ -187,6 +169,12 @@ function mkReject(reason: string): AuthenticateResponse {
   resp.accepted = false;
   resp.rejection = reason;
   return resp;
+}
+
+function setLanguage(resp: AuthenticateResponse, username: string): void {
+  if (username.endsWith(".es")) {
+    resp.language = "es";
+  }
 }
 
 function writeResponse(resp: AuthenticateResponse): u64 {

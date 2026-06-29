@@ -9,7 +9,7 @@ use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -92,6 +92,8 @@ async fn auth_two_clients_succeeds() {
 
     assert_eq!(alice.user_id, Some(1));
     assert_eq!(bob.user_id, Some(2));
+    assert_eq!(server.authenticator.authenticate_call_count("alice"), 1);
+    assert_eq!(server.authenticator.authenticate_call_count("bob"), 1);
 
     // Both clients receive the welcome text we configured.
     assert_eq!(alice.welcome_text.as_deref(), Some("test-welcome"));
@@ -341,33 +343,136 @@ async fn auth_concurrent_clients_see_each_other() {
     let alice = alice.expect("alice auth");
     let bob = bob.expect("bob auth");
 
-    let alice_saw_bob_initial = alice
+    assert_peer_seen_exactly_once(&alice, bob.session_id, "Alice", "Bob").await;
+    assert_peer_seen_exactly_once(&bob, alice.session_id, "Bob", "Alice").await;
+}
+
+async fn assert_peer_seen_exactly_once(
+    viewer: &TestClient,
+    peer_session_id: u32,
+    viewer_name: &str,
+    peer_name: &str,
+) {
+    let mut seen = viewer
         .initial_user_states
         .iter()
-        .any(|state| state.session == Some(bob.session_id));
-    if !alice_saw_bob_initial {
-        let saw_bob = alice
+        .filter(|state| is_join_snapshot_for_session(state, peer_session_id))
+        .count();
+
+    if seen == 0 {
+        let saw_peer = viewer
             .recv_until(
-                |message| matches!(message, Message::UserState(state) if state.session == Some(bob.session_id)),
+                |message| {
+                    matches!(message, Message::UserState(state) if is_join_snapshot_for_session(state, peer_session_id))
+                },
                 std::time::Duration::from_secs(2),
             )
             .await;
-        assert!(saw_bob.is_some(), "Alice should receive Bob's UserState");
+        assert!(
+            saw_peer.is_some(),
+            "{viewer_name} should receive {peer_name}'s UserState"
+        );
+        seen += 1;
     }
 
-    let bob_saw_alice_initial = bob
-        .initial_user_states
-        .iter()
-        .any(|state| state.session == Some(alice.session_id));
-    if !bob_saw_alice_initial {
-        let saw_alice = bob
-            .recv_until(
-                |message| matches!(message, Message::UserState(state) if state.session == Some(alice.session_id)),
-                std::time::Duration::from_secs(2),
-            )
-            .await;
-        assert!(saw_alice.is_some(), "Bob should receive Alice's UserState");
+    let duplicate = viewer
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state) if is_join_snapshot_for_session(state, peer_session_id))
+            },
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+    assert!(
+        duplicate.is_none(),
+        "{viewer_name} should not receive duplicate {peer_name} UserState during concurrent auth"
+    );
+    assert_eq!(
+        seen, 1,
+        "{viewer_name} should see exactly one initial/live {peer_name} UserState"
+    );
+}
+
+fn is_join_snapshot_for_session(state: &crate::mumble_proto::UserState, session_id: u32) -> bool {
+    state.session == Some(session_id) && state.name.is_some() && state.channel_id.is_some()
+}
+
+#[tokio::test]
+async fn auth_initial_snapshot_ignores_authenticated_unpublished_clients() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("observer", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("late", None, Some(2), vec![]);
+
+    let (web_tx, _web_rx) = tokio::sync::mpsc::channel(1);
+    let pending = server
+        .server
+        .get_clients()
+        .allocate_web_client(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 30_001)),
+            server.addr,
+            web_tx,
+        )
+        .await;
+    {
+        let mut state = pending.write_global_state_direct();
+        state.set_user_id(Some(99));
+        state.set_display_name(Some("pending".to_owned()));
+        state.set_current_channel_id(0);
     }
+    pending.set_authenticated(true);
+    pending.set_published(false);
+
+    assert!(
+        pending.is_authenticated(),
+        "fixture must model post-auth state"
+    );
+    assert!(
+        !pending.is_published(),
+        "fixture must model the pre-AddClient publish window"
+    );
+    let pending_session = pending.get_session_id();
+
+    let observer = TestClient::connect_and_authenticate(&server, "observer", None)
+        .await
+        .expect("observer auth");
+    assert!(
+        observer
+            .initial_user_states
+            .iter()
+            .all(|state| state.session != Some(u32::from(pending_session))),
+        "initial auth snapshot must not include authenticated clients before AddClient publish"
+    );
+
+    server
+        .server
+        .get_clients()
+        .publish_client(pending_session)
+        .await;
+    let published_state = observer
+        .recv_until(
+            |message| matches!(message, Message::UserState(state) if state.session == Some(u32::from(pending_session))),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        published_state.is_some(),
+        "published client should still arrive through AddClient replay/broadcast"
+    );
+
+    let late = TestClient::connect_and_authenticate(&server, "late", None)
+        .await
+        .expect("late auth");
+    assert!(
+        late.initial_user_states
+            .iter()
+            .any(|state| state.session == Some(u32::from(pending_session))),
+        "clients that authenticate after AddClient publish should include the peer in their initial snapshot"
+    );
 }
 
 #[tokio::test]
@@ -516,10 +621,11 @@ async fn auth_wrong_password_rejected() {
         Err(other) => panic!("expected Rejected, got {other:?}"),
         Ok(_) => panic!("auth should have failed"),
     }
+    assert_eq!(server.authenticator.authenticate_call_count("alice"), 1);
 }
 
 #[tokio::test]
-async fn auth_wrong_password_uses_authenticator_language() {
+async fn auth_wrong_password_uses_default_unauthenticated_language() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server.authenticator.register_user_with_language(
         "alice",
@@ -532,10 +638,7 @@ async fn auth_wrong_password_uses_authenticator_language() {
     match TestClient::connect_and_authenticate(&server, "alice", Some("nope")).await {
         Err(crate::integration_tests::harness::test_client::ConnectError::Rejected(r)) => {
             assert_eq!(r.r#type, Some(RejectType::WrongUserPw as i32));
-            assert_eq!(
-                r.reason.as_deref(),
-                Some("Usuario o contraseña incorrectos")
-            );
+            assert_eq!(r.reason.as_deref(), Some("Incorrect username or password"));
         }
         Err(other) => panic!("expected Rejected, got {other:?}"),
         Ok(_) => panic!("auth should have failed"),

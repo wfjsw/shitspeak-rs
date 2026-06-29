@@ -859,6 +859,29 @@ pub async fn build_channel_state_message(
     client: &Arc<Box<Client>>,
     channel: &crate::channels::Channel,
 ) -> ChannelState {
+    build_channel_state_message_with_options(
+        server,
+        client,
+        channel,
+        server.get_send_permission_info(),
+    )
+    .await
+}
+
+pub async fn build_channel_state_message_without_permission_info(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel: &crate::channels::Channel,
+) -> ChannelState {
+    build_channel_state_message_with_options(server, client, channel, false).await
+}
+
+async fn build_channel_state_message_with_options(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel: &crate::channels::Channel,
+    include_permission_info: bool,
+) -> ChannelState {
     let links: Vec<u32> = channel.links.iter().copied().collect();
     let mut cs = ChannelState {
         channel_id: Some(channel.id),
@@ -880,7 +903,7 @@ pub async fn build_channel_state_message(
     };
 
     // Add permission info if configured
-    if server.get_send_permission_info() {
+    if include_permission_info {
         let (is_enter_restricted, perms) =
             permission_info_for_channel(server, client, channel.id).await;
         cs = cs.with_permission_info(is_enter_restricted, perms);

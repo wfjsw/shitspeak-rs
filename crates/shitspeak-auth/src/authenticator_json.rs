@@ -52,24 +52,6 @@ impl AuthenticatorJsonExternalAuthenticateRequest {
 }
 
 #[derive(Serialize)]
-pub(crate) struct AuthenticatorJsonLanguageRequest {
-    username: Option<String>,
-    auxiliary_data: AuthenticatorJsonAuxiliaryData,
-}
-
-impl AuthenticatorJsonLanguageRequest {
-    pub(crate) fn new(
-        username: Option<String>,
-        auxiliary_data: &AuthenticateAuxiliaryData,
-    ) -> Self {
-        Self {
-            username,
-            auxiliary_data: AuthenticatorJsonAuxiliaryData::from(auxiliary_data),
-        }
-    }
-}
-
-#[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ExecAuthenticatorJsonRequest {
     Authenticate {
@@ -79,10 +61,6 @@ pub(crate) enum ExecAuthenticatorJsonRequest {
     },
     AuthenticateExternal {
         claims: AuthenticatorJsonExternalAuthClaims,
-        auxiliary_data: AuthenticatorJsonAuxiliaryData,
-    },
-    Language {
-        username: Option<String>,
         auxiliary_data: AuthenticatorJsonAuxiliaryData,
     },
 }
@@ -106,16 +84,6 @@ impl ExecAuthenticatorJsonRequest {
     ) -> Self {
         Self::AuthenticateExternal {
             claims: AuthenticatorJsonExternalAuthClaims::from(claims),
-            auxiliary_data: AuthenticatorJsonAuxiliaryData::from(auxiliary_data),
-        }
-    }
-
-    pub(crate) fn language(
-        username: Option<&str>,
-        auxiliary_data: &AuthenticateAuxiliaryData,
-    ) -> Self {
-        Self::Language {
-            username: username.map(ToOwned::to_owned),
             auxiliary_data: AuthenticatorJsonAuxiliaryData::from(auxiliary_data),
         }
     }
@@ -226,17 +194,6 @@ impl AuthenticatorJsonAuthenticateResponse {
             texture_url: self.texture_url,
             comment_url: self.comment_url,
         })
-    }
-}
-
-#[derive(Deserialize)]
-pub(crate) struct AuthenticatorJsonLanguageResponse {
-    language: String,
-}
-
-impl AuthenticatorJsonLanguageResponse {
-    pub(crate) fn language(&self) -> Language {
-        Language::from_code(&self.language)
     }
 }
 

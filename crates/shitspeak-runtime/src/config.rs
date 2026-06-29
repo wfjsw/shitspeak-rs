@@ -1131,6 +1131,11 @@ pub struct Config {
     /// Default: 30000.
     #[serde(default = "default_authenticate_timeout_ms")]
     pub authenticate_timeout_ms: u64,
+    /// Maximum number of clients concurrently running post-authentication
+    /// finalization (initial channel/user sync and publish). Authenticator
+    /// calls still run independently. Default: 4.
+    #[serde(default = "default_auth_finalization_concurrency")]
+    pub auth_finalization_concurrency: usize,
     /// Milliseconds before a pending two-phase channel delete is rolled back.
     /// Default: 5000.
     #[serde(default = "default_pending_delete_timeout_ms")]
@@ -1377,6 +1382,9 @@ fn default_idle_timeout() -> u64 {
 }
 fn default_authenticate_timeout_ms() -> u64 {
     30_000
+}
+fn default_auth_finalization_concurrency() -> usize {
+    4
 }
 fn default_pending_delete_timeout_ms() -> u64 {
     5_000

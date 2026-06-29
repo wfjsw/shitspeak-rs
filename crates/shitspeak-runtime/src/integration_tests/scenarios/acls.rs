@@ -2048,11 +2048,9 @@ async fn channel_state_initial_sync_includes_permission_info_when_enabled() {
         .await
         .expect("bob");
 
-    let private = bob
-        .initial_channel_states
-        .iter()
-        .find(|channel| channel.channel_id == Some(68))
-        .expect("private channel state");
+    let private = channel_permission_info(&bob, 68)
+        .await
+        .expect("private permission info");
     assert_eq!(private.is_enter_restricted, Some(true));
     assert_eq!(private.can_enter, Some(false));
 }
@@ -2091,13 +2089,45 @@ async fn channel_state_permission_info_includes_inherited_restrictions() {
         .await
         .expect("bob");
 
-    let child = bob
-        .initial_channel_states
-        .iter()
-        .find(|channel| channel.channel_id == Some(71))
-        .expect("child channel state");
+    let child = channel_permission_info(&bob, 71)
+        .await
+        .expect("child permission info");
     assert_eq!(child.is_enter_restricted, Some(true));
     assert_eq!(child.can_enter, Some(false));
+}
+
+async fn channel_permission_info(
+    client: &TestClient,
+    channel_id: u32,
+) -> Option<crate::mumble_proto::ChannelState> {
+    if let Some(channel) = client
+        .initial_channel_states
+        .iter()
+        .find(|channel| {
+            channel.channel_id == Some(channel_id) && channel.is_enter_restricted.is_some()
+        })
+        .cloned()
+    {
+        return Some(channel);
+    }
+
+    client
+        .recv_until(
+            |message| {
+                matches!(
+                    message,
+                    Message::ChannelState(channel)
+                        if channel.channel_id == Some(channel_id)
+                            && channel.is_enter_restricted.is_some()
+                )
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .and_then(|message| match message {
+            Message::ChannelState(channel) => Some(channel),
+            _ => None,
+        })
 }
 
 #[tokio::test]

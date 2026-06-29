@@ -175,6 +175,41 @@ impl WebSessionContext {
             display_name,
         ))
     }
+
+    pub async fn allocate_unauthenticated_client(
+        &self,
+        outbound_tx: mpsc::Sender<Message>,
+        transport: WebSessionTransport,
+    ) -> Option<(Arc<Box<Server>>, Arc<Box<Client>>)> {
+        let server = Arc::clone(self.server.as_ref()?);
+        let client = match transport {
+            WebSessionTransport::WebRtc => {
+                server
+                    .get_clients()
+                    .allocate_web_client_in_server(
+                        self.provisional_server_id.clone(),
+                        self.real_ip,
+                        self.peer_addr,
+                        self.local_addr,
+                        outbound_tx,
+                    )
+                    .await
+            }
+            WebSessionTransport::Moq => {
+                server
+                    .get_clients()
+                    .allocate_moq_client_in_server(
+                        self.provisional_server_id.clone(),
+                        self.real_ip,
+                        self.peer_addr,
+                        self.local_addr,
+                        outbound_tx,
+                    )
+                    .await
+            }
+        };
+        Some((server, client))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,13 +244,35 @@ async fn configure_authenticated_client_inner(
         result.user_id,
         cache_username,
     );
+    if let Some(auth_server_id) = result.virtual_server_id.as_deref() {
+        let provisional_server_id = client.server_id();
+        if auth_server_id != provisional_server_id {
+            if server
+                .get_clients()
+                .move_local_client_to_server(
+                    &provisional_server_id,
+                    client.get_session_id(),
+                    auth_server_id,
+                )
+                .await
+                .is_none()
+            {
+                tracing::warn!(
+                    provisional_server_id,
+                    auth_server_id,
+                    session = u32::from(client.get_session_id()),
+                    "failed to move authenticated web client to authenticator-selected server"
+                );
+            }
+        }
+    }
     client.set_language(result.language);
     client.set_max_bandwidth(result.max_bandwidth);
     client.set_protocol_version(Some(
         shitspeak_runtime::protocol_version::ProtocolVersion::new(1, 5, 0),
     ));
     {
-        let mut gs = client.write_global_state(server.get_clients());
+        let mut gs = client.write_global_state_direct();
         gs.set_user_id(result.user_id);
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
@@ -234,13 +291,23 @@ async fn configure_authenticated_client_inner(
     )
     .await;
     let target_ch = restored_channels.current_channel_id;
-    client.set_current_channel_id(
-        target_ch,
-        server.get_clients(),
-        server.get_channels().current_version_in_server(&server_id),
-    );
+    {
+        let previous_channel_id = client.get_current_channel_id();
+        let mut gs = client.write_global_state_direct();
+        if gs.set_current_channel_id(target_ch) {
+            tracing::info!(
+                server_id = %client.server_id(),
+                session = u32::from(client.get_session_id()),
+                user_id = ?gs.get_user_id(),
+                display_name = ?gs.get_display_name_opt(),
+                previous_channel_id,
+                channel_id = target_ch,
+                "client entered channel"
+            );
+        }
+    }
     if !restored_channels.listening_channel_ids.is_empty() {
-        let mut gs = client.write_global_state(server.get_clients());
+        let mut gs = client.write_global_state_direct();
         for channel_id in &restored_channels.listening_channel_ids {
             gs.listen_channel(*channel_id);
         }
@@ -512,7 +579,7 @@ pub async fn initial_server_events(
         .get_all_clients_in_server(&server_id)
         .await
     {
-        if !visible.is_authenticated() {
+        if !visible.is_authenticated() || !visible.is_published() {
             continue;
         }
         if visible.get_session_id() == session_id {

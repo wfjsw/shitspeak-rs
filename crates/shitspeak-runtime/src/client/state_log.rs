@@ -159,6 +159,58 @@ impl ClientGlobalStateDelta {
             || self.is_superuser.is_some()
             || self.tokens.is_some()
     }
+
+    pub fn to_initial_user_state(
+        &self,
+        session_id: ClientSessionIdentifier,
+        cert_hash: Option<&Bytes>,
+    ) -> crate::messages::encoder::UserState {
+        crate::messages::encoder::UserState {
+            session: Some(session_id),
+            actor: None,
+            name: self.display_name.clone().flatten(),
+            user_id: self.user_id.flatten(),
+            channel_id: self.current_channel_id,
+            mute: self.mute.filter(|value| *value),
+            deaf: self.deaf.filter(|value| *value),
+            suppress: self.suppress.filter(|value| *value),
+            self_mute: self.self_mute.filter(|value| *value),
+            self_deaf: self.self_deaf.filter(|value| *value),
+            texture: None,
+            plugin_context: self
+                .plugin_context
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .cloned(),
+            plugin_identity: self
+                .plugin_identity
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .cloned(),
+            comment: None,
+            hash: cert_hash.map(|hash| hex::encode(hash)),
+            comment_hash: self
+                .comment_hash
+                .as_ref()
+                .and_then(|hash| hash.as_ref())
+                .and_then(|hash| hex::decode(hash).ok().map(Bytes::from)),
+            texture_hash: self
+                .texture_hash
+                .as_ref()
+                .and_then(|hash| hash.as_ref())
+                .and_then(|hash| hex::decode(hash).ok().map(Bytes::from)),
+            priority_speaker: self.priority_speaker.filter(|value| *value),
+            recording: self.recording.filter(|value| *value),
+            temporary_access_tokens: Vec::new(),
+            listening_channel_add: self
+                .listening_channel_add
+                .as_ref()
+                .map(|channels| channels.iter().copied().collect())
+                .unwrap_or_default(),
+            listening_channel_remove: Vec::new(),
+            listening_volume_adjustment: Vec::new(),
+        }
+    }
 }
 
 // ─── ClientStateOperation ────────────────────────────────────────────────────
@@ -341,6 +393,7 @@ impl ClientStateLogEntry {
         &self,
         repo: &ClientRepository,
         viewer_session_id: ClientSessionIdentifier,
+        viewer_client_instance_id: ClientInstanceId,
     ) -> Option<crate::messages::Message> {
         match &self.op {
             ClientStateOperation::UpdateGlobalState {
@@ -350,6 +403,9 @@ impl ClientStateLogEntry {
                 delta,
                 ..
             } if *session_id == viewer_session_id && delta.affects_acl_generation() => {
+                if *client_instance_id != viewer_client_instance_id {
+                    return None;
+                }
                 let client = repo.get_client_in_server(server_id, *session_id).await?;
                 if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
                     return None;
@@ -364,10 +420,17 @@ impl ClientStateLogEntry {
         &self,
         repo: &ClientRepository,
         viewer_session_id: ClientSessionIdentifier,
+        viewer_client_instance_id: ClientInstanceId,
     ) -> Vec<crate::messages::Message> {
         let mut messages = Vec::new();
+        if matches!(
+            &self.op,
+            ClientStateOperation::AddClient { session_id, .. } if *session_id == viewer_session_id
+        ) {
+            return messages;
+        }
         if let Some(message) = self
-            .acl_cache_flush_message_for(repo, viewer_session_id)
+            .acl_cache_flush_message_for(repo, viewer_session_id, viewer_client_instance_id)
             .await
         {
             messages.push(message);
@@ -390,14 +453,17 @@ impl ClientStateLogEntry {
                 server_id,
                 session_id,
                 client_instance_id,
+                cert_hash,
+                initial_state,
                 ..
             } => {
-                let client = repo.get_client_in_server(server_id, *session_id).await?;
-                if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
+                if let Some(client) = repo.get_client_in_server(server_id, *session_id).await
+                    && *client_instance_id != 0
+                    && client.client_instance_id() != *client_instance_id
+                {
                     return None;
                 }
-                let us: crate::messages::encoder::UserState =
-                    client.build_user_state_for_broadcast();
+                let us = initial_state.to_initial_user_state(*session_id, cert_hash.as_ref());
                 Some(crate::messages::Message::UserState(us.into()))
             }
             ClientStateOperation::RemoveClient {

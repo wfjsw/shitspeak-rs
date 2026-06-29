@@ -105,24 +105,6 @@ async fn authenticate_async(ptr: i32, len: i32) -> u64 {
     write_json(&AuthenticateResponse::reject("no_such_user"))
 }
 
-#[no_mangle]
-pub extern "C" fn language(ptr: i32, len: i32) -> u64 {
-    poll_wasm_future(language_async(ptr, len)).unwrap_or_else(|| {
-        log(2, "language future yielded unexpectedly");
-        write_json(&LanguageResponse { language: "en" })
-    })
-}
-
-async fn language_async(ptr: i32, len: i32) -> u64 {
-    let language = read_json::<LanguageRequest>(ptr, len)
-        .ok()
-        .and_then(|request| request.username)
-        .filter(|username| username.ends_with(".es"))
-        .map(|_| "es")
-        .unwrap_or("en");
-    write_json(&LanguageResponse { language })
-}
-
 async fn authenticate_with_fetch(username: &str, password: Option<&str>) -> AuthenticateResponse {
     let request_body = serde_json::json!({
         "username": username,
@@ -265,16 +247,6 @@ struct AuthenticateRequest {
     password: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct LanguageRequest {
-    username: Option<String>,
-}
-
-#[derive(Serialize)]
-struct LanguageResponse<'a> {
-    language: &'a str,
-}
-
 #[derive(Deserialize, Serialize)]
 struct AuthenticateResponse {
     accepted: bool,
@@ -306,7 +278,11 @@ impl AuthenticateResponse {
             groups,
             is_superuser,
             virtual_server_id: None,
-            language: "en".to_owned(),
+            language: if display_name.ends_with(".es") {
+                "es".to_owned()
+            } else {
+                "en".to_owned()
+            },
             max_bandwidth: None,
             texture_url: None,
             comment_url: None,

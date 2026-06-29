@@ -29,7 +29,7 @@ use crate::channel_repository::{
     ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
 };
 use crate::client::{
-    AsyncMessageHandlerExt, Client, ClientOutboundMessage,
+    AsyncMessageHandlerExt, Client, ClientInstanceId, ClientOutboundMessage,
     client_session_identifier::ClientSessionIdentifier,
     state_log::{
         ClientGlobalStateDelta, ClientStateBroadcastPayload, ClientStateLogEntry,
@@ -651,6 +651,7 @@ mod tests {
             udp_channel_size: 2_048,
             client_idle_timeout_secs: 30,
             authenticate_timeout_ms: 30_000,
+            auth_finalization_concurrency: 4,
             pending_delete_timeout_ms: 5_000,
             required_groups: Vec::new(),
             send_permission_info: false,
@@ -1366,6 +1367,7 @@ pub struct Server {
 
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
+    auth_finalization_semaphore: Arc<tokio::sync::Semaphore>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
     user_channel_cache: Arc<UserChannelCache>,
@@ -1478,7 +1480,7 @@ async fn activate_client_subscriptions(
                 .get_all_clients_in_server(&server_id)
                 .await
                 .into_iter()
-                .filter(|client| client.is_authenticated())
+                .filter(|client| client.is_authenticated() && client.is_published())
                 .map(|client| (client.get_session_id(), client.get_current_channel_id())),
         );
         channel_tree_shadow.extend(
@@ -1542,7 +1544,12 @@ async fn replay_client_log_entries_since(
 ) -> Result<(), HandleIncomingConnectionError> {
     let (missed, new_versions) = server
         .clients
-        .replay_entries_since_in_server_for_client(server_id, &last_seen, client.get_session_id())
+        .replay_entries_since_in_server_for_client(
+            server_id,
+            &last_seen,
+            client.get_session_id(),
+            client.client_instance_id(),
+        )
         .await
         .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
 
@@ -1642,6 +1649,14 @@ fn permission_info_refresh_scope_for_entry(
         } if *session_id == viewer_session_id => permission_info_refresh_scope_for_delta(delta),
         _ => None,
     }
+}
+
+fn is_own_client_log_entry(
+    op: &ClientStateOperation,
+    session_id: ClientSessionIdentifier,
+    client_instance_id: ClientInstanceId,
+) -> bool {
+    op.session_id() == Some(session_id) && op.client_instance_id() == client_instance_id
 }
 
 async fn permission_info_refresh_messages(
@@ -1860,7 +1875,11 @@ async fn append_client_log_entry_messages(
             .unwrap_or(PermissionInfoRefreshScope::All);
 
     for msg in entry
-        .messages_for_client(&server.clients, client.get_session_id())
+        .messages_for_client(
+            &server.clients,
+            client.get_session_id(),
+            client.client_instance_id(),
+        )
         .await
     {
         out.extend(
@@ -2064,6 +2083,12 @@ async fn append_client_log_broadcast_messages(
         .await?;
         return Ok(());
     }
+    if is_known_add_client(&entry.op, session_channel_shadow) {
+        client
+            .update_last_client_versions(&broadcast.versions)
+            .await;
+        return Ok(());
+    }
 
     append_client_log_entry_messages(
         server,
@@ -2081,6 +2106,17 @@ async fn append_client_log_broadcast_messages(
         .update_last_client_versions(&broadcast.versions)
         .await;
     Ok(())
+}
+
+fn is_known_add_client(
+    op: &ClientStateOperation,
+    session_channel_shadow: &SessionChannelShadow,
+) -> bool {
+    matches!(
+        op,
+        ClientStateOperation::AddClient { session_id, .. }
+            if session_channel_shadow.contains_key(session_id)
+    )
 }
 
 async fn replay_client_log_subscription_gap(
@@ -2160,6 +2196,7 @@ impl Server {
         // ── Channel repository & blob stores ─────────────────────────────
         let node_id = config.local_node_id().map_err(std::io::Error::other)?;
         let client_log_max_entries = config.client_log_max_entries;
+        let auth_finalization_concurrency = config.auth_finalization_concurrency.max(1);
         let channel_repo_tuning = ChannelRepoTuning::from(&config);
         let channel_root_config = ChannelRootConfig::from(&config);
         let (channels, channel_blobs, session_blobs, user_channel_cache, bans) = match &config
@@ -2208,6 +2245,9 @@ impl Server {
             entrypoint_reload_lock: tokio::sync::Mutex::new(()),
             clients: Arc::new(ClientRepository::new(node_id, client_log_max_entries)),
             channels,
+            auth_finalization_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                auth_finalization_concurrency,
+            )),
             channel_blobs,
             session_blobs,
             user_channel_cache,
@@ -3706,6 +3746,15 @@ impl Server {
                             new_config.client_idle_timeout_secs
                         );
                     }
+                    if current.auth_finalization_concurrency
+                        != new_config.auth_finalization_concurrency
+                    {
+                        tracing::info!(
+                            "config reload: auth_finalization_concurrency {} -> {} (takes effect after restart)",
+                            current.auth_finalization_concurrency,
+                            new_config.auth_finalization_concurrency
+                        );
+                    }
                     if current.required_groups != new_config.required_groups {
                         tracing::info!("config reload: required_groups changed");
                     }
@@ -3870,6 +3919,15 @@ impl Server {
 
     pub fn get_required_groups(&self) -> Vec<String> {
         self.read_config().required_groups.clone()
+    }
+
+    pub async fn acquire_auth_finalization_permit(
+        self: &Arc<Box<Self>>,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.auth_finalization_semaphore)
+            .acquire_owned()
+            .await
+            .expect("auth finalization semaphore should not be closed")
     }
 
     pub fn get_send_permission_info(&self) -> bool {
@@ -4089,7 +4147,7 @@ async fn replay_client_log_gap(
         if entry.version >= current {
             break;
         }
-        if entry.op.session_id() == Some(session_id) {
+        if is_own_client_log_entry(&entry.op, session_id, client.client_instance_id()) {
             continue;
         }
         if let Some(msg) = entry.to_message(repo).await {

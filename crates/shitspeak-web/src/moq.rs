@@ -629,23 +629,40 @@ impl MoqSessionRuntime {
             crate::protocol::AuthRequest::Sso { .. } => None,
         };
         let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(256);
-        let result = self
+        let preallocated = self
             .context
-            .authenticate(0, auth)
-            .await
-            .map_err(authentication_rejection_reason)?;
-        let Some((server, client, session, display_name)) = self
-            .context
-            .allocate_authenticated_client(
-                result,
-                outbound_tx,
-                WebSessionTransport::Moq,
-                cache_username.as_deref(),
-            )
-            .await
-        else {
+            .allocate_unauthenticated_client(outbound_tx, WebSessionTransport::Moq)
+            .await;
+        let auth_session_id = preallocated
+            .as_ref()
+            .map(|(_, client)| u32::from(client.get_session_id()))
+            .unwrap_or(0);
+        let result = self.context.authenticate(auth_session_id, auth).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(rejection) => {
+                if let Some((server, client)) = preallocated.as_ref() {
+                    let server_id = client.server_id();
+                    server
+                        .get_clients()
+                        .remove_client_in_server(&server_id, client.get_session_id())
+                        .await;
+                }
+                return Err(authentication_rejection_reason(rejection));
+            }
+        };
+        let Some((server, client)) = preallocated else {
             return Err("MoQ authentication is not wired to this server".to_string());
         };
+        let display_name = result.display_name.clone();
+        crate::session::configure_authenticated_client(
+            &server,
+            &client,
+            result,
+            cache_username.as_deref(),
+        )
+        .await;
+        let session = u32::from(client.get_session_id());
 
         self.outbound_rx = Some(outbound_rx);
         self.voice_rx = client.take_voice_tcp_rx();
@@ -1039,6 +1056,10 @@ impl MoqSessionRuntime {
             client.update_last_client_versions(&payload.versions).await;
             return Ok(Vec::new());
         }
+        if is_known_add_client(&entry.op, &self.channel_shadow) {
+            client.update_last_client_versions(&payload.versions).await;
+            return Ok(Vec::new());
+        }
         let events = client_log_entry_events(
             &server,
             &client,
@@ -1068,6 +1089,7 @@ impl MoqSessionRuntime {
                 &server_id,
                 &last_seen,
                 client.get_session_id(),
+                client.client_instance_id(),
             )
             .await
             .map_err(|()| "MoQ client update gap is unrecoverable".to_string())?;
@@ -1386,7 +1408,11 @@ async fn client_log_entry_events(
     let old_viewer_channel_id = channel_shadow.get(&client.get_session_id()).copied();
     let mut events = Vec::new();
     for message in entry
-        .messages_for_client(server.get_clients(), client.get_session_id())
+        .messages_for_client(
+            server.get_clients(),
+            client.get_session_id(),
+            client.client_instance_id(),
+        )
         .await
     {
         events.extend(
@@ -1464,6 +1490,13 @@ fn voice_target_kind(target: VoiceTarget) -> VoiceTargetKind {
 
 fn is_own_add_client(op: &ClientStateOperation, session_id: ClientSessionIdentifier) -> bool {
     matches!(op, ClientStateOperation::AddClient { session_id: id, .. } if *id == session_id)
+}
+
+fn is_known_add_client(op: &ClientStateOperation, shadow: &SessionChannelShadow) -> bool {
+    matches!(
+        op,
+        ClientStateOperation::AddClient { session_id, .. } if shadow.contains_key(session_id)
+    )
 }
 
 fn audio_target(target: VoiceTargetKind) -> shitspeak_runtime::messages::encoder::AudioTarget {
@@ -2052,6 +2085,7 @@ mod tests {
             udp_channel_size: 2_048,
             client_idle_timeout_secs: 30,
             authenticate_timeout_ms: 30_000,
+            auth_finalization_concurrency: 4,
             pending_delete_timeout_ms: 5_000,
             required_groups: Vec::new(),
             send_permission_info: false,

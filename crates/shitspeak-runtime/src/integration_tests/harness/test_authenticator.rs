@@ -31,6 +31,7 @@ struct ScriptedUser {
 pub struct TestAuthenticator {
     users: Mutex<HashMap<String, ScriptedUser>>,
     auxiliary_data: Mutex<Vec<TestAuthenticateAuxiliaryData>>,
+    authenticate_calls: Mutex<HashMap<String, usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +82,15 @@ impl TestAuthenticator {
 
     pub fn authenticated_auxiliary_data(&self) -> Vec<TestAuthenticateAuxiliaryData> {
         self.auxiliary_data.lock().unwrap().clone()
+    }
+
+    pub fn authenticate_call_count(&self, username: &str) -> usize {
+        self.authenticate_calls
+            .lock()
+            .unwrap()
+            .get(username)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Register (or overwrite) a user. `password = None` means the user logs in
@@ -204,6 +214,13 @@ impl Authenticator for AuthenticatorAdapter {
         password: Option<&str>,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Result<AuthenticateResult, AuthenticationRejection> {
+        *self
+            .0
+            .authenticate_calls
+            .lock()
+            .unwrap()
+            .entry(username.to_owned())
+            .or_insert(0) += 1;
         self.0
             .auxiliary_data
             .lock()
@@ -240,22 +257,5 @@ impl Authenticator for AuthenticatorAdapter {
             texture_url: None,
             comment_url: None,
         })
-    }
-
-    async fn language(
-        &self,
-        username: Option<&str>,
-        _auxiliary_data: &AuthenticateAuxiliaryData,
-    ) -> Language {
-        let Some(username) = username else {
-            return Language::default();
-        };
-        self.0
-            .users
-            .lock()
-            .unwrap()
-            .get(username)
-            .map(|entry| entry.language)
-            .unwrap_or_default()
     }
 }

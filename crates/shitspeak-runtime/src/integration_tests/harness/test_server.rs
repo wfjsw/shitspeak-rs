@@ -41,6 +41,7 @@ pub struct TestServerOpts {
     pub server_protocol_version: ProtocolVersion,
     pub channel_log_max_entries: usize,
     pub authenticate_timeout_ms: u64,
+    pub auth_finalization_concurrency: usize,
     pub s2s_inbound_chaos: Option<LinkChaos>,
 }
 
@@ -63,6 +64,7 @@ impl Default for TestServerOpts {
             server_protocol_version: APP_PROTO_VER,
             channel_log_max_entries: 10_000,
             authenticate_timeout_ms: 30_000,
+            auth_finalization_concurrency: 4,
             s2s_inbound_chaos: None,
         }
     }
@@ -219,6 +221,7 @@ async fn spawn_test_server_with_pki(
         udp_channel_size: 2_048,
         client_idle_timeout_secs: 30,
         authenticate_timeout_ms: opts.authenticate_timeout_ms,
+        auth_finalization_concurrency: opts.auth_finalization_concurrency,
         pending_delete_timeout_ms: 5_000,
         required_groups: Vec::new(),
         send_permission_info: opts.send_permission_info,

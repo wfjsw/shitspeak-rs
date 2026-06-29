@@ -16,8 +16,8 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time;
 use wasmtime::{
-    Caller, Config as WasmConfig, Engine as WasmEngine, Extern, Instance, Linker, Memory, Module,
-    Store,
+    Caller, Config as WasmConfig, Engine as WasmEngine, Extern, ExternType, Instance, Linker,
+    Memory, Module, Store,
 };
 
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
@@ -29,8 +29,7 @@ use crate::http_client;
 use super::ExecAuthenticator;
 use super::authenticator_json::{
     AuthenticatorJsonAuthenticateRequest, AuthenticatorJsonAuthenticateResponse,
-    AuthenticatorJsonExternalAuthenticateRequest, AuthenticatorJsonLanguageRequest,
-    AuthenticatorJsonLanguageResponse, authenticate_result_from_external_claims,
+    AuthenticatorJsonExternalAuthenticateRequest, authenticate_result_from_external_claims,
 };
 use super::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
@@ -188,14 +187,6 @@ impl Authenticator for ReloadableAuthenticator {
         self.load_inner()
             .authenticate_external(claims, auxiliary_data)
             .await
-    }
-
-    async fn language(
-        &self,
-        username: Option<&str>,
-        auxiliary_data: &AuthenticateAuxiliaryData,
-    ) -> Language {
-        self.load_inner().language(username, auxiliary_data).await
     }
 
     async fn get_user_texture(&self, user_id: u32) -> Option<bytes::Bytes> {
@@ -357,8 +348,13 @@ impl WasmAuthenticator {
         let http_client =
             http_client::build_with_webpki_fallback(MAX_FETCH_TIMEOUT, "WASM authenticator fetch")
                 .map_err(|source| WasmAuthenticatorError::HttpClient { source })?;
+        let exports = WasmAuthenticatorExports::from_module(&module);
         Ok(Self {
-            module: Arc::new(CompiledWasmAuthenticator { engine, module }),
+            module: Arc::new(CompiledWasmAuthenticator {
+                engine,
+                module,
+                exports,
+            }),
             http_client,
             cache: Arc::new(WasmAuthCache::default()),
             state: Arc::new(WasmAuthState::new(
@@ -393,6 +389,13 @@ impl WasmAuthenticator {
         Request: Serialize + Send + 'static,
         Response: for<'de> Deserialize<'de> + Send + 'static,
     {
+        if self
+            .module
+            .optional_func_export_available(export_name)
+            .is_some_and(|available| !available)
+        {
+            return Ok(None);
+        }
         let Some(bytes) = self.invoke_json(export_name, request).await? else {
             return Ok(None);
         };
@@ -467,34 +470,39 @@ impl Authenticator for WasmAuthenticator {
             }
         }
     }
-
-    async fn language(
-        &self,
-        username: Option<&str>,
-        auxiliary_data: &AuthenticateAuxiliaryData,
-    ) -> Language {
-        let request =
-            AuthenticatorJsonLanguageRequest::new(username.map(ToOwned::to_owned), auxiliary_data);
-        match self
-            .invoke_optional::<_, AuthenticatorJsonLanguageResponse>("language", request)
-            .await
-        {
-            Ok(Some(response)) => response.language(),
-            Ok(None) => Language::default(),
-            Err(error) => {
-                tracing::warn!(error = %error, "WASM authenticator language lookup failed");
-                Language::default()
-            }
-        }
-    }
 }
 
 struct CompiledWasmAuthenticator {
     engine: WasmEngine,
     module: Module,
+    exports: WasmAuthenticatorExports,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WasmAuthenticatorExports {
+    authenticate_external: bool,
+}
+
+impl WasmAuthenticatorExports {
+    fn from_module(module: &Module) -> Self {
+        Self {
+            authenticate_external: module_has_func_export(module, "authenticate_external"),
+        }
+    }
+
+    fn optional_func_export_available(&self, export_name: &str) -> Option<bool> {
+        match export_name {
+            "authenticate_external" => Some(self.authenticate_external),
+            _ => None,
+        }
+    }
 }
 
 impl CompiledWasmAuthenticator {
+    fn optional_func_export_available(&self, export_name: &str) -> Option<bool> {
+        self.exports.optional_func_export_available(export_name)
+    }
+
     async fn invoke_json_export(
         &self,
         export_name: &'static str,
@@ -579,6 +587,10 @@ impl CompiledWasmAuthenticator {
 
         Ok(Some(response))
     }
+}
+
+fn module_has_func_export(module: &Module, export_name: &str) -> bool {
+    matches!(module.get_export(export_name), Some(ExternType::Func(_)))
 }
 
 fn build_linker(engine: &WasmEngine) -> Result<Linker<HostState>, WasmAuthenticatorError> {

@@ -11,12 +11,10 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time;
 
-use crate::Language;
 use crate::config::ExecAuthenticatorConfig;
 
 use super::authenticator_json::{
-    AuthenticatorJsonAuthenticateResponse, AuthenticatorJsonLanguageResponse,
-    ExecAuthenticatorJsonRequest,
+    AuthenticatorJsonAuthenticateResponse, ExecAuthenticatorJsonRequest,
 };
 use super::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
@@ -147,24 +145,6 @@ impl Authenticator for ExecAuthenticator {
             Err(error) => {
                 tracing::warn!(error = %error, "exec external authenticator failed");
                 Err(AuthenticationRejection::RetryLater)
-            }
-        }
-    }
-
-    async fn language(
-        &self,
-        username: Option<&str>,
-        auxiliary_data: &AuthenticateAuxiliaryData,
-    ) -> Language {
-        let request = ExecAuthenticatorJsonRequest::language(username, auxiliary_data);
-        match self
-            .invoke::<AuthenticatorJsonLanguageResponse>(request)
-            .await
-        {
-            Ok(response) => response.language(),
-            Err(error) => {
-                tracing::warn!(error = %error, "exec authenticator language lookup failed");
-                Language::default()
             }
         }
     }
@@ -592,11 +572,7 @@ mod tests {
 $ErrorActionPreference = 'Stop'
 while (($line = [Console]::In.ReadLine()) -ne $null) {
     $request = $line | ConvertFrom-Json
-    if ($request.kind -eq 'language') {
-        '{"language":"en"}'
-    } else {
-        '{"accepted":true,"display_name":"' + $request.username + '","groups":["exec"]}'
-    }
+    '{"accepted":true,"display_name":"' + $request.username + '","groups":["exec"]}'
 }
 "#
         } else {
@@ -604,11 +580,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
 $ErrorActionPreference = 'Stop'
 $line = [Console]::In.ReadLine()
 $request = $line | ConvertFrom-Json
-if ($request.kind -eq 'language') {
-    '{"language":"en"}'
-} else {
-    '{"accepted":true,"display_name":"' + $request.username + '","groups":["exec"]}'
-}
+'{"accepted":true,"display_name":"' + $request.username + '","groups":["exec"]}'
 "#
         };
         let config = ExecAuthenticatorConfig::new("powershell")
@@ -627,24 +599,14 @@ if ($request.kind -eq 'language') {
             r#"
 while IFS= read -r line; do
     username=$(printf '%s' "$line" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
-    kind=$(printf '%s' "$line" | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')
-    if [ "$kind" = "language" ]; then
-        printf '{"language":"en"}\n'
-    else
-        printf '{"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$username"
-    fi
+    printf '{"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$username"
 done
 "#
         } else {
             r#"
 IFS= read -r line
 username=$(printf '%s' "$line" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
-kind=$(printf '%s' "$line" | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')
-if [ "$kind" = "language" ]; then
-    printf '{"language":"en"}\n'
-else
-    printf '{"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$username"
-fi
+printf '{"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$username"
 "#
         };
         let config = ExecAuthenticatorConfig::new("sh")

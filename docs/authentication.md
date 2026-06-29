@@ -134,7 +134,6 @@ authenticate(ptr: i32, len: i32) -> i64
 Optional exports:
 
 ```text
-language(ptr: i32, len: i32) -> i64
 authenticate_external(ptr: i32, len: i32) -> i64
 ```
 

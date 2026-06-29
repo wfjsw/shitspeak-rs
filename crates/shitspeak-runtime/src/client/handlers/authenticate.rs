@@ -5,7 +5,8 @@ use bytes::Bytes;
 use crate::{
     api::{AuthenticateAuxiliaryData, AuthenticationRejection, canonical_authenticator_ip},
     channel_handler::{
-        SessionChannelShadow, build_channel_state_message, ordered_snapshot_channels,
+        SessionChannelShadow, build_channel_permission_info_refresh_messages,
+        build_channel_state_message_without_permission_info, ordered_snapshot_channels,
     },
     client::{Client, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
@@ -58,7 +59,7 @@ pub async fn handle_authenticate(
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
     let password = msg.password;
 
-    // ── Authentication context and language ───────────────────────────────
+    // ── Authentication context ────────────────────────────────────────────
     let certificate_hash = sender.get_certificate_hash().map(Bytes::copy_from_slice);
     let mut session_id = sender.get_session_id();
     let ip_address = canonical_authenticator_ip(sender.get_real_ip_address());
@@ -86,12 +87,6 @@ pub async fn handle_authenticate(
         os_name,
         os_version,
     };
-    let pre_auth_language = server
-        .get_authenticator()
-        .language(Some(username.as_str()), &auth_auxiliary)
-        .await;
-    sender.set_language(pre_auth_language);
-
     // ── Certificate required ──────────────────────────────────────────────
     if server.get_cert_required() && !sender.has_certificate() {
         return Err(
@@ -129,6 +124,7 @@ pub async fn handle_authenticate(
             .into());
         }
     };
+    sender.set_language(result.language);
     let channel_cache_key =
         crate::user_channel_cache::user_channel_cache_key(result.user_id, Some(username.as_str()));
 
@@ -258,11 +254,10 @@ pub async fn handle_authenticate(
         },
     };
 
-    // ── Store identity on client (single transaction) ─────────────────────
+    // ── Store identity on client ─────────────────────────────────────────
     {
-        sender.set_language(result.language);
         sender.set_max_bandwidth(result.max_bandwidth);
-        let mut gs = sender.write_global_state(repo);
+        let mut gs = sender.write_global_state_direct();
         gs.set_user_id(result.user_id);
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
@@ -312,6 +307,9 @@ pub async fn handle_authenticate(
         .into()
     };
 
+    sender.set_authenticated(true);
+    let _auth_finalization_permit = server.acquire_auth_finalization_permit().await;
+
     // ── Place user in cached/default channel ─────────────────────────────
     {
         let restored_channels = crate::user_channel_cache::resolve_login_channels(
@@ -321,17 +319,27 @@ pub async fn handle_authenticate(
         )
         .await;
         let target_ch = restored_channels.current_channel_id;
-        sender.set_current_channel_id(
-            target_ch,
-            repo,
-            server.get_channels().current_version_in_server(&server_id),
-        );
+        {
+            let previous_channel_id = sender.get_current_channel_id();
+            let mut gs = sender.write_global_state_direct();
+            if gs.set_current_channel_id(target_ch) {
+                tracing::info!(
+                    server_id = %sender.server_id(),
+                    session = u32::from(sender.get_session_id()),
+                    user_id = ?gs.get_user_id(),
+                    display_name = ?gs.get_display_name_opt(),
+                    previous_channel_id,
+                    channel_id = target_ch,
+                    "client entered channel"
+                );
+            }
+        }
         let initial_perms = crate::client::acl::compute_permissions_for_client_as_if_in_channel(
             server, sender, target_ch,
         )
         .await;
         {
-            let mut gs = sender.write_global_state(repo);
+            let mut gs = sender.write_global_state_direct();
             for channel_id in &restored_channels.listening_channel_ids {
                 gs.listen_channel(*channel_id);
             }
@@ -385,7 +393,7 @@ pub async fn handle_authenticate(
 
     let (all_clients, all_versions, client_state_rx) = server
         .get_clients()
-        .snapshot_with_versions_and_subscription_in_server(&server_id)
+        .published_snapshot_with_versions_and_subscription_in_server(&server_id)
         .await;
     sender.stage_client_state_subscription(client_state_rx);
     let (all_channels, channel_version, channel_state_rx) = server
@@ -397,6 +405,8 @@ pub async fn handle_authenticate(
     let ordered_channels = ordered_snapshot_channels(&all_channels);
     let mut session_channel_shadow = SessionChannelShadow::new();
     let mut user_visibility = crate::client::visibility::UserVisibilityState::default();
+    let viewer_independent_user_state =
+        crate::client::visibility::user_state_projection_is_viewer_independent(server);
 
     let mut burst: Vec<Message> = Vec::new();
     let mut push_burst = |message: Message| {
@@ -410,12 +420,13 @@ pub async fn handle_authenticate(
     // 2. Channel tree — BFS from root
     {
         for channel in &ordered_channels {
-            let cs = build_channel_state_message(server, sender, channel).await;
+            let cs =
+                build_channel_state_message_without_permission_info(server, sender, channel).await;
             push_burst(cs.into());
         }
     }
 
-    // 3. UserState for every currently authenticated client (excluding self)
+    // 3. UserState for every published authenticated client (excluding self)
     {
         for client in &all_clients {
             if client.get_session_id() == session_id {
@@ -428,8 +439,37 @@ pub async fn handle_authenticate(
                 continue;
             }
             session_channel_shadow.insert(client.get_session_id(), client.get_current_channel_id());
-            let us: Message =
-                crate::client::visibility::build_visible_user_state(server, sender, client)
+            if viewer_independent_user_state {
+                push_burst(client.build_user_state_for_broadcast().into());
+            } else {
+                let us: Message =
+                    crate::client::visibility::build_visible_user_state(server, sender, client)
+                        .await
+                        .into();
+                let projected = crate::client::visibility::project_message_with_shadow(
+                    server,
+                    sender,
+                    &mut user_visibility,
+                    &mut session_channel_shadow,
+                    &server_id,
+                    &us,
+                )
+                .await;
+                for message in projected {
+                    push_burst(message);
+                }
+            }
+        }
+    }
+
+    // 4. UserState for self
+    {
+        session_channel_shadow.insert(session_id, sender.get_current_channel_id());
+        if viewer_independent_user_state {
+            push_burst(sender.build_user_state_for_broadcast().into());
+        } else {
+            let self_us: Message =
+                crate::client::visibility::build_visible_user_state(server, sender, sender)
                     .await
                     .into();
             let projected = crate::client::visibility::project_message_with_shadow(
@@ -438,33 +478,12 @@ pub async fn handle_authenticate(
                 &mut user_visibility,
                 &mut session_channel_shadow,
                 &server_id,
-                &us,
+                &self_us,
             )
             .await;
             for message in projected {
                 push_burst(message);
             }
-        }
-    }
-
-    // 4. UserState for self
-    {
-        let self_us: Message =
-            crate::client::visibility::build_visible_user_state(server, sender, sender)
-                .await
-                .into();
-        session_channel_shadow.insert(session_id, sender.get_current_channel_id());
-        let projected = crate::client::visibility::project_message_with_shadow(
-            server,
-            sender,
-            &mut user_visibility,
-            &mut session_channel_shadow,
-            &server_id,
-            &self_us,
-        )
-        .await;
-        for message in projected {
-            push_burst(message);
         }
     }
 
@@ -519,8 +538,6 @@ pub async fn handle_authenticate(
     // ── Send the burst to the joining client in one shot ──────────────────
     sender.write_proto_message_batch(&burst).await?;
 
-    // ── Mark as authenticated ─────────────────────────────────────────────
-    sender.set_authenticated(true);
     tracing::info!(
         server_id = %sender.server_id(),
         session = u32::from(session_id),
@@ -547,9 +564,35 @@ pub async fn handle_authenticate(
         }
     }
 
+    spawn_permission_info_refresh(server, sender);
+
     // The AddClient log entry (emitted by allocate_local_client) will drive
     // the UserState broadcast to all existing per-client subscribers.
     // No need to broadcast manually here.
 
     Ok(())
+}
+
+fn spawn_permission_info_refresh(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>) {
+    if !server.get_send_permission_info() {
+        return;
+    }
+
+    let server = Arc::clone(server);
+    let sender = Arc::clone(sender);
+    tokio::spawn(async move {
+        let permission_refresh =
+            build_channel_permission_info_refresh_messages(&server, &sender, server.get_channels())
+                .await;
+        if permission_refresh.is_empty() {
+            return;
+        }
+        if let Err(error) = sender.write_proto_message_batch(&permission_refresh).await {
+            tracing::debug!(
+                session = u32::from(sender.get_session_id()),
+                %error,
+                "failed to send deferred channel permission info refresh"
+            );
+        }
+    });
 }

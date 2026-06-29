@@ -1125,7 +1125,28 @@ async fn handle_signaling_authenticate(
                 return Ok(());
             }
 
-            let auxiliary = context.auxiliary_data(session.session_id);
+            let preallocated = if let Some(server) = context.server.as_ref() {
+                let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<Message>(256);
+                let client = server
+                    .get_clients()
+                    .allocate_web_client_in_server(
+                        context.provisional_server_id.clone(),
+                        context.real_ip,
+                        context.peer_addr,
+                        context.local_addr,
+                        outbound_tx,
+                    )
+                    .await;
+                session.session_id = u32::from(client.get_session_id());
+                Some((Arc::clone(server), client, outbound_rx))
+            } else {
+                None
+            };
+            let auth_session_id = preallocated
+                .as_ref()
+                .map(|(_, client, _)| u32::from(client.get_session_id()))
+                .unwrap_or(session.session_id);
+            let auxiliary = context.auxiliary_data(auth_session_id);
             match authenticator
                 .authenticate(&username, Some(password.as_str()), &auxiliary)
                 .await
@@ -1135,12 +1156,23 @@ async fn handle_signaling_authenticate(
                         stream,
                         context,
                         session,
+                        preallocated,
                         result,
                         Some(username.as_str()),
                     )
                     .await
                 }
-                Err(rejection) => send_authentication_rejection(stream, rejection).await,
+                Err(rejection) => {
+                    if let Some((server, client, _)) = preallocated {
+                        let server_id = client.server_id();
+                        server
+                            .get_clients()
+                            .remove_client_in_server(&server_id, client.get_session_id())
+                            .await;
+                        session.session_id = DEFAULT_WEB_SESSION_ID;
+                    }
+                    send_authentication_rejection(stream, rejection).await
+                }
             }
         }
         AuthRequest::Sso { token } => {
@@ -1250,30 +1282,39 @@ async fn handle_successful_password_auth(
     stream: &mut (impl AsyncWrite + Unpin),
     context: &SignalingContext,
     session: &mut SignalingSession,
+    preallocated: Option<(
+        Arc<Box<Server>>,
+        Arc<Box<Client>>,
+        tokio::sync::mpsc::Receiver<Message>,
+    )>,
     result: AuthenticateResult,
     cache_username: Option<&str>,
 ) -> io::Result<()> {
     let display_name = result.display_name.clone();
     let mut initial_state_client = None;
-    if let Some(server) = context.server.as_ref() {
+    if let Some((server, client, outbound_rx)) = preallocated {
+        session.outbound_rx = Some(outbound_rx);
+        crate::session::configure_authenticated_client(&server, &client, result, cache_username)
+            .await;
+        session.session_id = u32::from(client.get_session_id());
+        initial_state_client = Some((Arc::clone(&server), Arc::clone(&client)));
+        session.client = Some(client);
+    } else if let Some(server) = context.server.as_ref() {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<Message>(256);
         let client = server
             .get_clients()
             .allocate_web_client_in_server(
-                result
-                    .virtual_server_id
-                    .clone()
-                    .unwrap_or_else(|| context.provisional_server_id.clone()),
+                context.provisional_server_id.clone(),
                 context.real_ip,
                 context.peer_addr,
                 context.local_addr,
                 outbound_tx,
             )
             .await;
-        session.session_id = u32::from(client.get_session_id());
         session.outbound_rx = Some(outbound_rx);
         crate::session::configure_authenticated_client(server, &client, result, cache_username)
             .await;
+        session.session_id = u32::from(client.get_session_id());
         initial_state_client = Some((Arc::clone(server), Arc::clone(&client)));
         session.client = Some(client);
     }
@@ -1330,7 +1371,7 @@ async fn send_initial_server_state(
         .get_all_clients_in_server(&server_id)
         .await
     {
-        if !visible.is_authenticated() {
+        if !visible.is_authenticated() || !visible.is_published() {
             continue;
         }
         if visible.get_session_id() == session_id {
@@ -1591,6 +1632,10 @@ async fn send_web_client_log_update(
         client.update_last_client_versions(&payload.versions).await;
         return Ok(());
     }
+    if is_known_add_client(&entry.op, &session.channel_shadow) {
+        client.update_last_client_versions(&payload.versions).await;
+        return Ok(());
+    }
 
     send_web_client_log_entry(
         stream,
@@ -1609,6 +1654,13 @@ async fn send_web_client_log_update(
 
 fn is_own_add_client(op: &ClientStateOperation, session_id: ClientSessionIdentifier) -> bool {
     matches!(op, ClientStateOperation::AddClient { session_id: id, .. } if *id == session_id)
+}
+
+fn is_known_add_client(op: &ClientStateOperation, shadow: &SessionChannelShadow) -> bool {
+    matches!(
+        op,
+        ClientStateOperation::AddClient { session_id, .. } if shadow.contains_key(session_id)
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1703,7 +1755,12 @@ async fn send_web_client_log_gap(
     let server_id = client.server_id();
     let (missed, versions) = match server
         .get_clients()
-        .replay_entries_since_in_server_for_client(&server_id, &last_seen, client.get_session_id())
+        .replay_entries_since_in_server_for_client(
+            &server_id,
+            &last_seen,
+            client.get_session_id(),
+            client.client_instance_id(),
+        )
         .await
     {
         Ok(replay) => replay,
@@ -1731,30 +1788,6 @@ async fn send_web_client_log_gap(
 
 fn is_acl_cache_flush_message(message: &Message) -> bool {
     matches!(message, Message::PermissionQuery(pq) if pq.flush == Some(true))
-}
-
-async fn send_web_client_log_message_with_acl_refresh(
-    stream: &mut (impl AsyncWrite + Unpin),
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    peer: Option<&WebRtcPeer>,
-    channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-    server_id: &str,
-    message: &Message,
-) -> io::Result<()> {
-    send_web_client_log_message_with_acl_refresh_scope(
-        stream,
-        server,
-        client,
-        peer,
-        channel_shadow,
-        user_visibility,
-        server_id,
-        message,
-        PermissionInfoRefreshScope::All,
-    )
-    .await
 }
 
 async fn send_web_client_log_message_with_acl_refresh_scope(
@@ -1864,7 +1897,11 @@ async fn send_web_client_log_entry(
             .unwrap_or(PermissionInfoRefreshScope::All);
 
     for message in entry
-        .messages_for_client(server.get_clients(), client.get_session_id())
+        .messages_for_client(
+            server.get_clients(),
+            client.get_session_id(),
+            client.client_instance_id(),
+        )
         .await
     {
         send_web_client_log_message_with_acl_refresh_scope(
@@ -2867,6 +2904,7 @@ mod tests {
             udp_channel_size: 2_048,
             client_idle_timeout_secs: 30,
             authenticate_timeout_ms: 30_000,
+            auth_finalization_concurrency: 4,
             pending_delete_timeout_ms: 5_000,
             required_groups: Vec::new(),
             send_permission_info: false,

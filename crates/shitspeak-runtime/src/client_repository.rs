@@ -69,6 +69,17 @@ pub struct ClientRepository {
     deferred_commit_tx: Option<mpsc::UnboundedSender<DeferredClientCommit>>,
 }
 
+pub(crate) struct ClientSnapshotWithVersions {
+    clients: Vec<Arc<Box<Client>>>,
+    versions: HashMap<u16, u64>,
+}
+
+impl ClientSnapshotWithVersions {
+    pub(crate) fn into_parts(self) -> (Vec<Arc<Box<Client>>>, HashMap<u16, u64>) {
+        (self.clients, self.versions)
+    }
+}
+
 struct DeferredClientCommit {
     op: ClientStateOperation,
     channel_version_dep: Option<u64>,
@@ -187,6 +198,14 @@ impl ClientRegister {
             set.remove(id);
             !set.is_empty()
         });
+    }
+
+    fn sync_local_client_indexes(&mut self, scoped_id: &ScopedSessionId, client: &Client) {
+        self.channel_index_move(scoped_id.clone(), client.get_current_channel_id());
+        self.listener_index_remove_all(scoped_id);
+        for channel_id in client.get_listening_channel_ids() {
+            self.listener_index_add(scoped_id.clone(), channel_id);
+        }
     }
 
     fn log_version_in_server(&self, server_id: &str) -> Option<u64> {
@@ -748,39 +767,43 @@ impl ClientRepository {
 
     pub async fn publish_client_in_server(&self, server_id: &str, id: ClientSessionIdentifier) {
         let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
-        let client = match self
-            .register
-            .read()
-            .await
-            .local_clients
-            .get(&scoped_id)
-            .cloned()
-        {
-            Some(c) => c,
-            None => return,
+        let broadcast = {
+            let mut register = self.register.write().await;
+            let Some(client) = register.local_clients.get(&scoped_id).cloned() else {
+                return;
+            };
+            if client.is_published() {
+                return;
+            }
+            register.sync_local_client_indexes(&scoped_id, &client);
+            let initial_state =
+                ClientGlobalStateDelta::from_global_state(&client.read_global_state());
+            let broadcast = Self::commit_operation_inner(
+                &mut register,
+                self.local_node_id,
+                self.log_max_entries,
+                ClientStateOperation::AddClient {
+                    server_id: server_id.to_owned(),
+                    session_id: id,
+                    client_instance_id: client.client_instance_id(),
+                    real_ip: client.get_real_ip_address(),
+                    tcp_addr: client.get_tcp_address(),
+                    udp_addr: client.get_udp_address(),
+                    local_addr: client.get_tcp_address(),
+                    cert_hash: client
+                        .get_certificate_hash()
+                        .map(bytes::Bytes::copy_from_slice),
+                    login_time: client.get_login_time(),
+                    initial_state,
+                },
+                None,
+            );
+            client.set_published(true);
+            broadcast
         };
-
-        client.set_published(true);
-
-        let initial_state = ClientGlobalStateDelta::from_global_state(&client.read_global_state());
-        self.commit_operation(
-            ClientStateOperation::AddClient {
-                server_id: server_id.to_owned(),
-                session_id: id,
-                client_instance_id: client.client_instance_id(),
-                real_ip: client.get_real_ip_address(),
-                tcp_addr: client.get_tcp_address(),
-                udp_addr: client.get_udp_address(),
-                local_addr: client.get_tcp_address(),
-                cert_hash: client
-                    .get_certificate_hash()
-                    .map(bytes::Bytes::copy_from_slice),
-                login_time: client.get_login_time(),
-                initial_state,
-            },
-            None,
-        )
-        .await;
+        if let Some(broadcast) = broadcast {
+            let _ = self.tx.send(broadcast);
+        }
     }
 
     pub async fn add_remote_client(&self, id: ClientSessionIdentifier, client: Arc<Box<Client>>) {
@@ -1637,6 +1660,41 @@ impl ClientRepository {
         (clients, versions)
     }
 
+    pub(crate) async fn published_snapshot_with_versions_in_server(
+        &self,
+        server_id: &str,
+    ) -> ClientSnapshotWithVersions {
+        let mut clients = Vec::new();
+        let mut versions = HashMap::new();
+        {
+            let register = self.register.read().await;
+            clients.extend(
+                register
+                    .local_clients()
+                    .filter(|client| client.server_id() == server_id)
+                    .filter(|client| client.is_published())
+                    .cloned(),
+            );
+            if let Some(version) = register.log_version_in_server(server_id) {
+                versions.insert(self.local_node_id, version);
+            }
+        }
+        for (node_id, register) in self.remote_register_snapshots().await {
+            let register = register.read().await;
+            clients.extend(
+                register
+                    .clients
+                    .values()
+                    .filter(|client| client.server_id() == server_id)
+                    .cloned(),
+            );
+            if let Some(version) = register.log_version_in_server(server_id) {
+                versions.insert(node_id, version);
+            }
+        }
+        ClientSnapshotWithVersions { clients, versions }
+    }
+
     pub(crate) async fn snapshot_with_versions_and_subscription_in_server(
         &self,
         server_id: &str,
@@ -1647,6 +1705,22 @@ impl ClientRepository {
     ) {
         let rx = self.tx.subscribe();
         let (clients, versions) = self.snapshot_with_versions_in_server(server_id).await;
+        (clients, versions, rx)
+    }
+
+    pub(crate) async fn published_snapshot_with_versions_and_subscription_in_server(
+        &self,
+        server_id: &str,
+    ) -> (
+        Vec<Arc<Box<Client>>>,
+        HashMap<u16, u64>,
+        ClientStateSubscription,
+    ) {
+        let rx = self.tx.subscribe();
+        let (clients, versions) = self
+            .published_snapshot_with_versions_in_server(server_id)
+            .await
+            .into_parts();
         (clients, versions, rx)
     }
 
@@ -1685,9 +1759,14 @@ impl ClientRepository {
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: ClientSessionIdentifier,
+        viewer_client_instance_id: ClientInstanceId,
     ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
-        self.replay_since_in_server_filtered(server_id, last_seen, Some(viewer_session_id))
-            .await
+        self.replay_since_in_server_filtered(
+            server_id,
+            last_seen,
+            Some((viewer_session_id, viewer_client_instance_id)),
+        )
+        .await
     }
 
     pub async fn replay_entries_since_in_server_for_client(
@@ -1695,6 +1774,7 @@ impl ClientRepository {
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: ClientSessionIdentifier,
+        viewer_client_instance_id: ClientInstanceId,
     ) -> Result<(Vec<Arc<ClientStateLogEntry>>, HashMap<u16, u64>), ()> {
         let entries = self
             .replay_entries_since_in_server(server_id, last_seen)
@@ -1703,7 +1783,7 @@ impl ClientRepository {
 
         let mut filtered = Vec::with_capacity(entries.len());
         for entry in entries {
-            if is_own_replayed_add_client(&entry.op, viewer_session_id) {
+            if is_own_replayed_add_client(&entry.op, viewer_session_id, viewer_client_instance_id) {
                 let cur = new_versions.entry(entry.node_id).or_insert(0);
                 *cur = (*cur).max(entry.version);
                 continue;
@@ -1720,7 +1800,7 @@ impl ClientRepository {
         &self,
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
-        viewer_session_id: Option<ClientSessionIdentifier>,
+        viewer: Option<(ClientSessionIdentifier, ClientInstanceId)>,
     ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
         let entries = self
             .replay_entries_since_in_server(server_id, last_seen)
@@ -1732,8 +1812,12 @@ impl ClientRepository {
         // Convert to messages
         let mut messages = Vec::with_capacity(entries.len());
         for entry in entries {
-            if let Some(viewer_session_id) = viewer_session_id {
-                messages.extend(entry.messages_for_client(self, viewer_session_id).await);
+            if let Some((viewer_session_id, viewer_client_instance_id)) = viewer {
+                messages.extend(
+                    entry
+                        .messages_for_client(self, viewer_session_id, viewer_client_instance_id)
+                        .await,
+                );
             } else if let Some(msg) = entry.to_message(self).await {
                 messages.push(msg);
             }
@@ -2600,6 +2684,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn published_snapshot_excludes_authenticated_unpublished_local_clients() {
+        let repo = ClientRepository::new(1, 128);
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+        let (pending_tx, _pending_rx) = tokio::sync::mpsc::channel(8);
+        let pending = repo
+            .allocate_web_client_in_server(
+                "alpha",
+                real_ip,
+                SocketAddr::new(real_ip, 30001),
+                local_addr,
+                pending_tx,
+            )
+            .await;
+        pending.set_authenticated(true);
+
+        let (clients, versions, mut rx) = repo
+            .published_snapshot_with_versions_and_subscription_in_server("alpha")
+            .await;
+        assert!(clients.is_empty());
+        assert!(versions.is_empty());
+
+        repo.publish_client_in_server("alpha", pending.get_session_id())
+            .await;
+        let broadcast = rx.recv().await.expect("published AddClient broadcast");
+        assert_eq!(broadcast.entry.version, 1);
+        assert!(matches!(
+            broadcast.entry.op,
+            ClientStateOperation::AddClient { .. }
+        ));
+
+        let (clients, versions) = repo
+            .published_snapshot_with_versions_in_server("alpha")
+            .await
+            .into_parts();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].get_session_id(), pending.get_session_id());
+        assert_eq!(versions.get(&1), Some(&1));
+    }
+
+    #[tokio::test]
     async fn async_commit_waits_for_transient_register_contention() {
         let repo = Arc::new(ClientRepository::new(1, 128));
         let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -3259,6 +3384,188 @@ mod tests {
             .expect("available non-colliding client instance id");
         assert_ne!(non_colliding, 0);
     }
+
+    #[tokio::test]
+    async fn unpublished_global_state_update_is_not_deferred_past_publish() {
+        let repo = Arc::new(ClientRepository::new(1, 128));
+        let mut rx = repo.subscribe();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30004);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+
+        let client = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, tx)
+            .await;
+        let session = client.get_session_id();
+
+        let write_guard = repo.register.write().await;
+        {
+            let mut gs = client.write_global_state(&repo);
+            gs.set_display_name(Some("alice".to_string()));
+            gs.set_user_id(Some(7));
+        }
+        drop(write_guard);
+        tokio::task::yield_now().await;
+
+        assert_eq!(repo.current_version(), 0);
+        assert!(rx.try_recv().is_err());
+
+        repo.publish_client_in_server("alpha", session).await;
+        let payload = rx.recv().await.expect("AddClient broadcast");
+        match &payload.entry.op {
+            ClientStateOperation::AddClient {
+                session_id,
+                initial_state,
+                ..
+            } => {
+                assert_eq!(*session_id, session);
+                assert_eq!(initial_state.display_name, Some(Some("alice".to_string())));
+                assert_eq!(initial_state.user_id, Some(Some(7)));
+            }
+            other => panic!("expected AddClient, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+
+        let log = repo.get_log_since(0).await;
+        assert_eq!(log.len(), 1);
+        assert!(matches!(log[0].op, ClientStateOperation::AddClient { .. }));
+    }
+
+    #[tokio::test]
+    async fn reused_session_does_not_replay_stale_state_as_current_self() {
+        let repo = ClientRepository::new(1, 128);
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30005);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+
+        let old = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, old_tx)
+            .await;
+        let session = old.get_session_id();
+        let old_instance = old.client_instance_id();
+        {
+            let mut gs = old.write_global_state_direct();
+            gs.set_display_name(Some("old-user".to_string()));
+            gs.set_user_id(Some(101));
+        }
+        repo.publish_client_in_server("alpha", session).await;
+        {
+            let mut gs = old.write_global_state(&repo);
+            gs.set_display_name(Some("old-user-renamed".to_string()));
+            gs.set_user_id(Some(102));
+        }
+        repo.remove_client_in_server("alpha", session).await;
+
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
+        let new_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30006);
+        let new_client = repo
+            .allocate_web_client_in_server("alpha", new_peer.ip(), new_peer, local, new_tx)
+            .await;
+        assert_eq!(new_client.get_session_id(), session);
+        assert_ne!(new_client.client_instance_id(), old_instance);
+        {
+            let mut gs = new_client.write_global_state_direct();
+            gs.set_display_name(Some("new-user".to_string()));
+            gs.set_user_id(Some(202));
+        }
+
+        let last_seen = HashMap::new();
+        let (messages, versions) = repo
+            .replay_since_in_server_for_client(
+                "alpha",
+                &last_seen,
+                session,
+                new_client.client_instance_id(),
+            )
+            .await
+            .expect("message replay succeeds");
+        assert!(
+            messages.iter().all(|message| {
+                !matches!(
+                    message,
+                    crate::messages::Message::UserState(state)
+                        if state.session == Some(u32::from(session))
+                            && matches!(
+                                (state.name.as_deref(), state.user_id),
+                                (Some("old-user"), Some(101))
+                                    | (Some("old-user-renamed"), Some(102))
+                            )
+                )
+            }),
+            "stale identity state for the previous occupant must not replay as the new client's self UserState"
+        );
+        assert_eq!(versions.get(&1), Some(&3));
+
+        let (entries, entry_versions) = repo
+            .replay_entries_since_in_server_for_client(
+                "alpha",
+                &last_seen,
+                session,
+                new_client.client_instance_id(),
+            )
+            .await
+            .expect("replay succeeds");
+        for entry in &entries {
+            let entry_messages = entry
+                .messages_for_client(&repo, session, new_client.client_instance_id())
+                .await;
+            assert!(
+                entry_messages.iter().all(|message| {
+                    !matches!(
+                        message,
+                        crate::messages::Message::UserState(state)
+                            if state.session == Some(u32::from(session))
+                                && matches!(
+                                    (state.name.as_deref(), state.user_id),
+                                    (Some("old-user"), Some(101))
+                                        | (Some("old-user-renamed"), Some(102))
+                                )
+                    )
+                }),
+                "stale retained log entry must not produce a self UserState for the new session occupant"
+            );
+        }
+        assert_eq!(entry_versions.get(&1), Some(&3));
+
+        let stale_add = repo
+            .get_log_since(0)
+            .await
+            .into_iter()
+            .find(|entry| {
+                matches!(
+                    &entry.op,
+                    ClientStateOperation::AddClient {
+                        session_id,
+                        client_instance_id,
+                        ..
+                    } if *session_id == session && *client_instance_id == old_instance
+                )
+            })
+            .expect("old AddClient retained in local log");
+        assert!(
+            stale_add.to_message(&repo).await.is_none(),
+            "stale AddClient with a reused session must not convert to UserState"
+        );
+        let stale_update = repo
+            .get_log_since(0)
+            .await
+            .into_iter()
+            .find(|entry| {
+                matches!(
+                    &entry.op,
+                    ClientStateOperation::UpdateGlobalState {
+                        session_id,
+                        client_instance_id,
+                        ..
+                    } if *session_id == session && *client_instance_id == old_instance
+                )
+            })
+            .expect("old UpdateGlobalState retained in local log");
+        assert!(
+            stale_update.to_message(&repo).await.is_none(),
+            "stale UpdateGlobalState with a reused session must not convert to UserState"
+        );
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -3388,6 +3695,14 @@ fn append_indexed_clients(
 fn is_own_replayed_add_client(
     op: &ClientStateOperation,
     session_id: ClientSessionIdentifier,
+    client_instance_id: ClientInstanceId,
 ) -> bool {
-    matches!(op, ClientStateOperation::AddClient { session_id: id, .. } if *id == session_id)
+    matches!(
+        op,
+        ClientStateOperation::AddClient {
+            session_id: id,
+            client_instance_id: instance_id,
+            ..
+        } if *id == session_id && *instance_id == client_instance_id
+    )
 }

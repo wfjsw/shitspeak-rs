@@ -304,6 +304,7 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         udp_channel_size: 2_048,
         client_idle_timeout_secs: 30,
         pending_delete_timeout_ms: 5_000,
+        auth_finalization_concurrency: 4,
         required_groups: Vec::new(),
         send_permission_info: false,
         hide_users_without_traverse: false,
