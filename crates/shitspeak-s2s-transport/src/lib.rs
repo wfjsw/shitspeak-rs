@@ -39,26 +39,12 @@ pub mod http_client {
     }
 }
 
-pub mod s2s {
-    pub mod debug_io {
-        #[inline]
-        pub fn record_named_sent(_kind: &'static str, _bytes: usize) {}
+pub mod debug_io {
+    #[inline]
+    pub fn record_named_sent(_kind: &'static str, _bytes: usize) {}
 
-        #[inline]
-        pub fn record_named_received(_kind: &'static str, _bytes: usize) {}
-    }
-
-    pub mod transport {
-        pub use crate::*;
-
-        pub mod frame {
-            pub use crate::frame::*;
-        }
-
-        pub mod service_level {
-            pub use crate::service_level::*;
-        }
-    }
+    #[inline]
+    pub fn record_named_received(_kind: &'static str, _bytes: usize) {}
 }
 
 pub mod s2s_transport_proto {
@@ -93,6 +79,7 @@ pub use compression::SendOptions;
 pub use config::{TransportConfig, TransportTuning};
 pub use connection::AddressBackoffSnapshot;
 pub use error::{ConfigError, SendError, TransportError};
+pub use frame::{Frame, FrameType, build_frame, decode_frame, encode_frame, encode_frame_to_bytes};
 pub use identity::node_id_from_cert_file;
 pub use manager::PeerAddressSnapshot;
 pub use manager::{ConnectionManager, Inbound, InboundMessage};

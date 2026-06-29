@@ -339,7 +339,6 @@ impl ManagerInner {
             MetricsTuning {
                 latency_alpha: self.cfg.latency_ewma_alpha(),
                 jitter_alpha: self.cfg.jitter_ewma_alpha(),
-                throughput_alpha: self.cfg.throughput_ewma_alpha(),
                 packet_loss_alpha: self.cfg.packet_loss_ewma_alpha(),
             },
         );
@@ -1043,7 +1042,7 @@ impl ConnectionManager {
 }
 
 /// Pick a transport kind for `level`. Acceptance rules mirror the
-/// overlay routing fallback (`crate::s2s::overlay::routing`):
+/// overlay routing fallback (`shitspeak_s2s::overlay::routing`):
 ///
 /// * `BestEffort` accepts anything.
 /// * `Reliable` accepts any reliable transport (TCP, KCP, QUIC) — not

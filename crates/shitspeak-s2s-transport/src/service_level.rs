@@ -1,7 +1,5 @@
 use std::net::SocketAddr;
 
-use crate::types::NodeIdentifier;
-
 /// Reliability tier requested by the caller (or provided by a transport).
 ///
 /// Numerically lower = stronger guarantees. KCP/QUIC are reliable *and*
@@ -221,21 +219,6 @@ impl SeedAddress {
             .parse::<SocketAddr>()
             .ok()
             .map(|addr| PeerAddress::new(addr, self.transport))
-    }
-}
-
-/// Lookup convenience: who is asking? Used by the supervisor when iterating
-/// peers waiting on a reconnect attempt.
-#[derive(Debug, Clone, Copy)]
-pub struct PeerKey(NodeIdentifier);
-
-impl PeerKey {
-    pub fn new(node_id: NodeIdentifier) -> Self {
-        Self(node_id)
-    }
-
-    pub fn node_id(&self) -> NodeIdentifier {
-        self.0
     }
 }
 

@@ -1,11 +1,12 @@
 use crate::{errors::WriteProtoMessageError, messages::Message};
 use bytes::BytesMut;
+use std::future::Future;
 
 pub trait WriteMessageExt {
-    async fn write_proto_message(
-        &mut self,
-        message: &Message,
-    ) -> Result<(), WriteProtoMessageError>;
+    fn write_proto_message<'a>(
+        &'a mut self,
+        message: &'a Message,
+    ) -> impl Future<Output = Result<(), WriteProtoMessageError>> + Send + 'a;
 
     /// Encode all `messages` into a single flat buffer and issue one `write_all`.
     ///
@@ -15,48 +16,52 @@ pub trait WriteMessageExt {
     /// write_all).  This helper collapses the entire burst into a single
     /// contiguous allocation and a single `write_all`, matching the spirit of
     /// `sendmmsg` on the UDP path.
-    async fn write_proto_message_batch(
-        &mut self,
-        messages: &[Message],
-    ) -> Result<(), WriteProtoMessageError>;
+    fn write_proto_message_batch<'a>(
+        &'a mut self,
+        messages: &'a [Message],
+    ) -> impl Future<Output = Result<(), WriteProtoMessageError>> + Send + 'a;
 }
 
-impl<T: tokio::io::AsyncWriteExt + Unpin> WriteMessageExt for T {
-    async fn write_proto_message(
-        &mut self,
-        message: &Message,
-    ) -> Result<(), WriteProtoMessageError> {
-        let proto_tag = message.proto_tag();
-        let length = message.encoded_len();
-        // Encode header + payload into one buffer to minimise syscalls.
-        let mut buf = BytesMut::with_capacity(6 + length);
-        buf.extend_from_slice(&proto_tag.to_be_bytes());
-        buf.extend_from_slice(&(length as u32).to_be_bytes());
-        message.to_proto(&mut buf)?;
-        self.write_all(&buf).await?;
-        Ok(())
+impl<T: tokio::io::AsyncWriteExt + Unpin + Send> WriteMessageExt for T {
+    fn write_proto_message<'a>(
+        &'a mut self,
+        message: &'a Message,
+    ) -> impl Future<Output = Result<(), WriteProtoMessageError>> + Send + 'a {
+        async move {
+            let proto_tag = message.proto_tag();
+            let length = message.encoded_len();
+            // Encode header + payload into one buffer to minimise syscalls.
+            let mut buf = BytesMut::with_capacity(6 + length);
+            buf.extend_from_slice(&proto_tag.to_be_bytes());
+            buf.extend_from_slice(&(length as u32).to_be_bytes());
+            message.to_proto(&mut buf)?;
+            self.write_all(&buf).await?;
+            Ok(())
+        }
     }
 
-    async fn write_proto_message_batch(
-        &mut self,
-        messages: &[Message],
-    ) -> Result<(), WriteProtoMessageError> {
-        if messages.is_empty() {
-            return Ok(());
+    fn write_proto_message_batch<'a>(
+        &'a mut self,
+        messages: &'a [Message],
+    ) -> impl Future<Output = Result<(), WriteProtoMessageError>> + Send + 'a {
+        async move {
+            if messages.is_empty() {
+                return Ok(());
+            }
+
+            // Pre-calculate total capacity: 6 bytes header + payload per message.
+            let total = messages.iter().map(|m| 6 + m.encoded_len()).sum();
+
+            let mut buf = BytesMut::with_capacity(total);
+
+            for msg in messages {
+                buf.extend_from_slice(&msg.proto_tag().to_be_bytes());
+                buf.extend_from_slice(&(msg.encoded_len() as u32).to_be_bytes());
+                msg.to_proto(&mut buf)?;
+            }
+
+            self.write_all(&buf).await?;
+            Ok(())
         }
-
-        // Pre-calculate total capacity: 6 bytes header + payload per message.
-        let total = messages.iter().map(|m| 6 + m.encoded_len()).sum();
-
-        let mut buf = BytesMut::with_capacity(total);
-
-        for msg in messages {
-            buf.extend_from_slice(&msg.proto_tag().to_be_bytes());
-            buf.extend_from_slice(&(msg.encoded_len() as u32).to_be_bytes());
-            msg.to_proto(&mut buf)?;
-        }
-
-        self.write_all(&buf).await?;
-        Ok(())
     }
 }

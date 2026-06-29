@@ -9,10 +9,10 @@ use crate::channel_repository::{ChannelRepoTuning, ChannelRepository, ChannelRoo
 use crate::config::{ObservabilityConfig, S2sConfig};
 use crate::logging;
 use crate::observability::{self, S2sMetricsSource, S2sTopologyMetricsSource};
-use crate::s2s::overlay::{OverlayNetwork, ReplicationServices};
-use crate::s2s::replications::{ReplicationConfig, ReplicationManager};
-use crate::s2s::status;
-use crate::s2s::transport::{ConnectionManager, TransportConfig};
+use shitspeak_s2s::overlay::{OverlayNetwork, ReplicationServices};
+use shitspeak_s2s::replications::{ReplicationConfig, ReplicationManager};
+use shitspeak_s2s::status;
+use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
 use crate::s2s::{
     BanReplicationAdapter, ChannelBlobReplicationAdapter, ChannelReplicationAdapter,
     channel_blob_topic, channel_topic, install_channel_blob_replication_resolver,

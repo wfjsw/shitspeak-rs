@@ -30,7 +30,8 @@ use crate::channel_repository::{
 };
 use crate::client::{
     AsyncMessageHandlerExt, Client, ClientOutboundMessage,
-    client_session_identifier::ClientSessionIdentifier, state_log::ClientStateBroadcastPayload,
+    client_session_identifier::ClientSessionIdentifier,
+    state_log::{ClientGlobalStateDelta, ClientStateBroadcastPayload, ClientStateOperation},
     visibility::UserVisibilityState,
 };
 use crate::client_certificate_verifier::ClientCertificateVerifier;
@@ -571,6 +572,7 @@ mod tests {
     use crate::voice::codec::PacketFormat;
     use crate::voice::ping::PingRequest;
     use rustls::pki_types::ServerName;
+    use std::sync::OnceLock;
     use tokio_rustls::TlsConnector;
 
     struct TestAuthenticator;
@@ -605,6 +607,7 @@ mod tests {
     }
 
     fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
+        let identity = default_test_identity();
         Config {
             listen: "127.0.0.1:0".to_owned(),
             server_entrypoints: entrypoints,
@@ -613,8 +616,8 @@ mod tests {
             register_url: None,
             register_hostname: None,
             register_location: None,
-            cert_path: "cert.pem".to_owned(),
-            key_path: "key.pem".to_owned(),
+            cert_path: identity.cert_path.clone(),
+            key_path: identity.key_path.clone(),
             send_version: false,
             send_build_info: false,
             send_os_info: false,
@@ -654,6 +657,25 @@ mod tests {
             web: crate::config::WebConfig::default(),
             privacy: crate::config::PrivacyConfig::default(),
         }
+    }
+
+    struct TestIdentityFixture {
+        _dir: tempfile::TempDir,
+        cert_path: String,
+        key_path: String,
+    }
+
+    fn default_test_identity() -> &'static TestIdentityFixture {
+        static IDENTITY: OnceLock<TestIdentityFixture> = OnceLock::new();
+        IDENTITY.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("test identity tempdir");
+            let (cert_path, key_path, _) = write_test_cert(dir.path(), "default");
+            TestIdentityFixture {
+                _dir: dir,
+                cert_path,
+                key_path,
+            }
+        })
     }
 
     fn write_test_cert(dir: &std::path::Path, name: &str) -> (String, String, Vec<u8>) {
@@ -1420,6 +1442,95 @@ fn is_acl_cache_flush_message(message: &Message) -> bool {
     matches!(message, Message::PermissionQuery(pq) if pq.flush == Some(true))
 }
 
+#[derive(Clone, Copy)]
+enum PermissionInfoRefreshScope {
+    All,
+    HomeChannelDependent {
+        old_channel_id: Option<u32>,
+        new_channel_id: u32,
+    },
+}
+
+impl PermissionInfoRefreshScope {
+    fn forwards_flush_message(self) -> bool {
+        matches!(self, PermissionInfoRefreshScope::All)
+    }
+}
+
+fn permission_info_refresh_scope_for_delta(
+    delta: &ClientGlobalStateDelta,
+) -> Option<PermissionInfoRefreshScope> {
+    if delta.user_id.is_some()
+        || delta.groups.is_some()
+        || delta.is_superuser.is_some()
+        || delta.tokens.is_some()
+    {
+        Some(PermissionInfoRefreshScope::All)
+    } else if let Some(new_channel_id) = delta.current_channel_id {
+        Some(PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id: None,
+            new_channel_id,
+        })
+    } else {
+        None
+    }
+}
+
+fn permission_info_refresh_scope_for_entry(
+    entry: &crate::client::state_log::ClientStateLogEntry,
+    viewer_session_id: ClientSessionIdentifier,
+) -> Option<PermissionInfoRefreshScope> {
+    match &entry.op {
+        ClientStateOperation::UpdateGlobalState {
+            session_id, delta, ..
+        } if *session_id == viewer_session_id => permission_info_refresh_scope_for_delta(delta),
+        _ => None,
+    }
+}
+
+fn client_log_entry_requires_visibility_reconcile(
+    entry: &crate::client::state_log::ClientStateLogEntry,
+    viewer_session_id: ClientSessionIdentifier,
+) -> bool {
+    match &entry.op {
+        ClientStateOperation::UpdateGlobalState {
+            session_id, delta, ..
+        } if *session_id == viewer_session_id => delta.affects_acl_generation(),
+        ClientStateOperation::ResetNode { .. } => true,
+        _ => false,
+    }
+}
+
+async fn permission_info_refresh_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    scope: PermissionInfoRefreshScope,
+) -> Vec<Message> {
+    match scope {
+        PermissionInfoRefreshScope::All => {
+            crate::channel_handler::build_channel_permission_info_refresh_messages(
+                server,
+                client,
+                server.get_channels(),
+            )
+            .await
+        }
+        PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id,
+            new_channel_id,
+        } => {
+            crate::channel_handler::build_home_channel_permission_info_refresh_messages(
+                server,
+                client,
+                server.get_channels(),
+                old_channel_id,
+                new_channel_id,
+            )
+            .await
+        }
+    }
+}
+
 async fn write_projected_client_log_message_with_acl_refresh(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -1427,6 +1538,27 @@ async fn write_projected_client_log_message_with_acl_refresh(
     session_channel_shadow: &mut SessionChannelShadow,
     server_id: &str,
     message: &Message,
+) -> Result<(), HandleIncomingConnectionError> {
+    write_projected_client_log_message_with_acl_refresh_scope(
+        server,
+        client,
+        user_visibility,
+        session_channel_shadow,
+        server_id,
+        message,
+        PermissionInfoRefreshScope::All,
+    )
+    .await
+}
+
+async fn write_projected_client_log_message_with_acl_refresh_scope(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: &Message,
+    refresh_scope: PermissionInfoRefreshScope,
 ) -> Result<(), HandleIncomingConnectionError> {
     let mut out = crate::client::visibility::project_message_with_shadow(
         server,
@@ -1438,14 +1570,13 @@ async fn write_projected_client_log_message_with_acl_refresh(
     )
     .await;
 
-    if is_acl_cache_flush_message(message) {
-        for refresh in crate::channel_handler::build_channel_permission_info_refresh_messages(
-            server,
-            client,
-            server.get_channels(),
-        )
-        .await
-        {
+    let should_refresh_permissions = is_acl_cache_flush_message(message);
+    if should_refresh_permissions && !refresh_scope.forwards_flush_message() {
+        out.clear();
+    }
+
+    if should_refresh_permissions {
+        for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
             out.extend(
                 crate::client::visibility::project_message_with_shadow(
                     server,
@@ -1476,6 +1607,27 @@ async fn projected_client_log_messages_with_acl_refresh(
     server_id: &str,
     message: &Message,
 ) -> Vec<Message> {
+    projected_client_log_messages_with_acl_refresh_scope(
+        server,
+        client,
+        user_visibility,
+        session_channel_shadow,
+        server_id,
+        message,
+        PermissionInfoRefreshScope::All,
+    )
+    .await
+}
+
+async fn projected_client_log_messages_with_acl_refresh_scope(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: &Message,
+    refresh_scope: PermissionInfoRefreshScope,
+) -> Vec<Message> {
     let mut out = crate::client::visibility::project_message_with_shadow(
         server,
         client,
@@ -1486,14 +1638,13 @@ async fn projected_client_log_messages_with_acl_refresh(
     )
     .await;
 
-    if is_acl_cache_flush_message(message) {
-        for refresh in crate::channel_handler::build_channel_permission_info_refresh_messages(
-            server,
-            client,
-            server.get_channels(),
-        )
-        .await
-        {
+    let should_refresh_permissions = is_acl_cache_flush_message(message);
+    if should_refresh_permissions && !refresh_scope.forwards_flush_message() {
+        out.clear();
+    }
+
+    if should_refresh_permissions {
+        for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
             out.extend(
                 crate::client::visibility::project_message_with_shadow(
                     server,
@@ -1741,32 +1892,49 @@ async fn append_client_log_broadcast_messages(
         }
     }
 
+    let refresh_scope = permission_info_refresh_scope_for_entry(entry, client.get_session_id())
+        .map(|scope| match scope {
+            PermissionInfoRefreshScope::HomeChannelDependent {
+                old_channel_id: _,
+                new_channel_id,
+            } => PermissionInfoRefreshScope::HomeChannelDependent {
+                old_channel_id: session_channel_shadow
+                    .get(&client.get_session_id())
+                    .copied(),
+                new_channel_id,
+            },
+            scope => scope,
+        })
+        .unwrap_or(PermissionInfoRefreshScope::All);
     for msg in entry
         .messages_for_client(&server.clients, client.get_session_id())
         .await
     {
         out.extend(
-            projected_client_log_messages_with_acl_refresh(
+            projected_client_log_messages_with_acl_refresh_scope(
                 server,
                 client,
                 user_visibility,
                 session_channel_shadow,
                 client_server_id,
                 &msg,
+                refresh_scope,
             )
             .await,
         );
     }
-    out.extend(
-        collect_reconcile_messages(
-            server,
-            client,
-            user_visibility,
-            session_channel_shadow,
-            client_server_id,
-        )
-        .await,
-    );
+    if client_log_entry_requires_visibility_reconcile(entry, client.get_session_id()) {
+        out.extend(
+            collect_reconcile_messages(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                client_server_id,
+            )
+            .await,
+        );
+    }
     client
         .update_last_client_versions(&broadcast.versions)
         .await;

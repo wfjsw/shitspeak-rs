@@ -856,10 +856,6 @@ impl PeerState {
         *self.udp_addr.lock() = Some(addr);
         self.note_observed_remote_addr(TransportKind::Udp, addr);
     }
-
-    pub fn udp_addr(&self) -> Option<std::net::SocketAddr> {
-        *self.udp_addr.lock()
-    }
 }
 
 fn prune_dead_streams(streams: &mut HashMap<StreamKey, ActiveStream>) {

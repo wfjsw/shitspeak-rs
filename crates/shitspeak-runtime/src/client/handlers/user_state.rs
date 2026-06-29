@@ -533,7 +533,7 @@ pub async fn handle_user_state(
 
     if let Some(target_session_id) = msg.session {
         if target_session_id != sender_id && target_session_id.get_node_id() != local_node_id {
-            let patch = crate::s2s::application::proto::UserStatePatch {
+            let patch = shitspeak_s2s::application::proto::UserStatePatch {
                 channel_id: requested_channel_change,
                 mute: msg.mute,
                 deaf: msg.deaf,

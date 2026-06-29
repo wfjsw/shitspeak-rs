@@ -76,7 +76,7 @@ pub async fn handle_user_remove(
     // RemoveClient log entry, in turn, broadcasts UserRemove to all
     // subscribers via owner-scoped replication.
     if target_session.get_node_id() != local_node_id {
-        let patch = crate::s2s::application::proto::UserRemovePatch {
+        let patch = shitspeak_s2s::application::proto::UserRemovePatch {
             reason: msg.reason.clone().map(Into::into),
             ban: is_ban,
         };

@@ -8,11 +8,11 @@ use crate::{
     client::Client,
     errors::MessageHandlerError,
     messages::{Message, WriteMessageExt, encoder::UserStats},
-    s2s::application::proto::UserStatsRequest,
-    s2s::application::user_stats::{UserStatsApplyOutcome, UserStatsResponder},
     server::Server,
     types::NodeIdentifier,
 };
+use shitspeak_s2s::application::proto::UserStatsRequest;
+use shitspeak_s2s::application::user_stats::{UserStatsApplyOutcome, UserStatsResponder};
 
 pub async fn handle_user_stats(
     server: &Arc<Box<Server>>,

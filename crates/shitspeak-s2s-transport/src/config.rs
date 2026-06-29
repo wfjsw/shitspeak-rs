@@ -73,8 +73,6 @@ pub struct TransportConfig {
     latency_ewma_alpha: f64,
     /// EWMA coefficient for the jitter estimate (RFC 3550 uses 1/16).
     jitter_ewma_alpha: f64,
-    /// Deprecated no-op retained for compatibility with old configs.
-    throughput_ewma_alpha: f64,
     /// EWMA coefficient for the long-term packet-loss estimate.
     packet_loss_ewma_alpha: f64,
     /// How often stream transports sample native transport loss counters.
@@ -143,7 +141,6 @@ impl TransportConfig {
             compression: CompressionConfig::default(),
             latency_ewma_alpha: 0.2,
             jitter_ewma_alpha: 1.0 / 16.0,
-            throughput_ewma_alpha: 0.3,
             packet_loss_ewma_alpha: 0.02,
             native_stats_interval: Duration::from_secs(1),
             max_pending_pings: 64,
@@ -359,6 +356,13 @@ impl TransportConfig {
         self.compression.dictionary_len()
     }
 
+    pub fn compression_cached_adaptive_dictionary_len(&self) -> Option<usize> {
+        self.compression
+            .cached_adaptive_dictionary()
+            .as_ref()
+            .map(|dict| dict.len())
+    }
+
     pub fn compression_dictionary_id(&self) -> Option<u32> {
         self.compression.dictionary_id()
     }
@@ -373,10 +377,6 @@ impl TransportConfig {
 
     pub fn jitter_ewma_alpha(&self) -> f64 {
         self.jitter_ewma_alpha
-    }
-
-    pub fn throughput_ewma_alpha(&self) -> f64 {
-        self.throughput_ewma_alpha
     }
 
     pub fn packet_loss_ewma_alpha(&self) -> f64 {
@@ -682,11 +682,6 @@ impl TransportConfig {
         self
     }
 
-    pub fn with_throughput_ewma_alpha(mut self, v: f64) -> Self {
-        self.throughput_ewma_alpha = v;
-        self
-    }
-
     pub fn with_packet_loss_ewma_alpha(mut self, v: f64) -> Self {
         self.packet_loss_ewma_alpha = v;
         self
@@ -748,8 +743,6 @@ pub struct TransportTuning {
     pub latency_ewma_alpha: f64,
     #[serde(default = "default_jitter_ewma_alpha")]
     pub jitter_ewma_alpha: f64,
-    #[serde(default = "default_throughput_ewma_alpha")]
-    pub throughput_ewma_alpha: f64,
     #[serde(default = "default_packet_loss_ewma_alpha")]
     pub packet_loss_ewma_alpha: f64,
     #[serde(default = "default_ping_interval_secs")]
@@ -809,7 +802,6 @@ impl Default for TransportTuning {
         Self {
             latency_ewma_alpha: default_latency_ewma_alpha(),
             jitter_ewma_alpha: default_jitter_ewma_alpha(),
-            throughput_ewma_alpha: default_throughput_ewma_alpha(),
             packet_loss_ewma_alpha: default_packet_loss_ewma_alpha(),
             ping_interval_secs: default_ping_interval_secs(),
             idle_ping_interval_secs: default_idle_ping_interval_secs(),
@@ -849,7 +841,6 @@ impl TransportTuning {
     pub fn apply(&self, cfg: TransportConfig) -> TransportConfig {
         cfg.with_latency_ewma_alpha(self.latency_ewma_alpha)
             .with_jitter_ewma_alpha(self.jitter_ewma_alpha)
-            .with_throughput_ewma_alpha(self.throughput_ewma_alpha)
             .with_packet_loss_ewma_alpha(self.packet_loss_ewma_alpha)
             .with_ping_interval(Duration::from_secs(self.ping_interval_secs))
             .with_idle_ping_interval(Duration::from_secs(self.idle_ping_interval_secs))
@@ -911,9 +902,6 @@ fn default_latency_ewma_alpha() -> f64 {
 }
 fn default_jitter_ewma_alpha() -> f64 {
     1.0 / 16.0
-}
-fn default_throughput_ewma_alpha() -> f64 {
-    0.3
 }
 fn default_packet_loss_ewma_alpha() -> f64 {
     0.02
@@ -982,16 +970,14 @@ mod tests {
     fn deprecated_bandwidth_probe_builders_are_noops() {
         let cfg = base_config()
             .with_bandwidth_probe_interval(Duration::from_secs(5))
-            .with_bandwidth_probe_size(65_536)
-            .with_throughput_ewma_alpha(0.75);
+            .with_bandwidth_probe_size(65_536);
 
         assert_eq!(cfg.bandwidth_probe_interval(), Duration::ZERO);
         assert_eq!(cfg.bandwidth_probe_size(), 0);
-        assert_eq!(cfg.throughput_ewma_alpha(), 0.75);
     }
 
     #[test]
-    fn deprecated_bandwidth_probe_tuning_keys_parse_without_enabling_probes() {
+    fn deprecated_noop_tuning_keys_parse_without_enabling_probes() {
         let tuning: TransportTuning = ::config::Config::builder()
             .add_source(::config::File::from_str(
                 r#"
@@ -1009,7 +995,6 @@ mod tests {
 
         assert_eq!(cfg.bandwidth_probe_interval(), Duration::ZERO);
         assert_eq!(cfg.bandwidth_probe_size(), 0);
-        assert_eq!(cfg.throughput_ewma_alpha(), 0.75);
     }
 
     #[test]

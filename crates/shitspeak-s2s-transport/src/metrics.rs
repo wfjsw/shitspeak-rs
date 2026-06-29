@@ -250,8 +250,6 @@ pub struct MetricsTuning {
     pub latency_alpha: f64,
     /// Smoothing coefficient for the jitter EWMA (RFC 3550 uses 1/16).
     pub jitter_alpha: f64,
-    /// Deprecated no-op retained for compatibility with old configs.
-    pub throughput_alpha: f64,
     /// Smoothing coefficient for the long-term packet-loss EWMA.
     pub packet_loss_alpha: f64,
 }
@@ -261,7 +259,6 @@ impl Default for MetricsTuning {
         Self {
             latency_alpha: 0.2,
             jitter_alpha: 1.0 / 16.0,
-            throughput_alpha: 0.3,
             packet_loss_alpha: DEFAULT_PACKET_LOSS_EWMA_ALPHA,
         }
     }
@@ -1228,6 +1225,7 @@ impl PeerMetrics {
 
     /// For a requested service level, pick the best measured candidate using
     /// the sender-selected route metric.
+    #[allow(dead_code)]
     pub fn best_transport_for(
         &self,
         requested: ServiceLevel,

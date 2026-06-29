@@ -37,7 +37,6 @@
 use std::{fmt::Display, io::Cursor};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use prost::Message as _;
 
 use crate::{
     client::client_session_identifier::ClientSessionIdentifier,
@@ -671,7 +670,7 @@ impl Audio {
         buf.freeze()
     }
 
-    fn encode_legacy(&self, context: AudioContext) -> Bytes {
+    fn encode_legacy(&self, _context: AudioContext) -> Bytes {
         let message_type: u8 = LegacyUdpMessageType::from(&self.audio_payload).into();
         let target: u8 = self.target.into();
         let header = (message_type << 5) | (target & 0x1f);

@@ -1,7 +1,9 @@
 use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
 
-use crate::client::group::{ChannelHierarchy, ClientMembershipQuery, is_member_in_group};
+use crate::client::group::{
+    ChannelHierarchy, ClientMembershipQuery, group_depends_on_home_channel, is_member_in_group,
+};
 
 pub use shitspeak_core::ACLPermissions;
 
@@ -211,6 +213,92 @@ fn effective_acl_chain<'a>(
     inherited
 }
 
+fn any_applicable_effective_acl(
+    channel: &crate::channels::Channel,
+    ancestors: &[crate::channels::Channel],
+    mut predicate: impl FnMut(&ACL, ChannelHierarchy<'_>, ChannelHierarchy<'_>) -> bool,
+) -> bool {
+    let target_id = channel.id;
+    let chain = effective_acl_chain(channel, ancestors);
+    let target_ancestor_ids: Vec<u32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
+    let evaluation_channel = ChannelHierarchy::new(target_id, &target_ancestor_ids);
+
+    for index in 0..chain.len() {
+        let ch = chain[index];
+        let is_target_channel = ch.id == target_id;
+        let acl_ancestor_ids: Vec<u32> = chain[..index]
+            .iter()
+            .rev()
+            .map(|ancestor| ancestor.id)
+            .collect();
+        let acl_channel = ChannelHierarchy::new(ch.id, &acl_ancestor_ids);
+
+        for acl in &ch.acls {
+            let applies = if is_target_channel {
+                acl.apply_here
+            } else {
+                acl.apply_subs
+            };
+            if applies && predicate(acl, evaluation_channel, acl_channel) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub(crate) fn effective_acl_chain_has_home_channel_dependent_group(
+    channel: &crate::channels::Channel,
+    ancestors: &[crate::channels::Channel],
+) -> bool {
+    any_applicable_effective_acl(channel, ancestors, |acl, _, _| {
+        acl.group
+            .as_deref()
+            .is_some_and(group_depends_on_home_channel)
+    })
+}
+
+pub(crate) fn effective_acl_chain_home_channel_match_changes(
+    channel: &crate::channels::Channel,
+    ancestors: &[crate::channels::Channel],
+    old_home: ChannelHierarchy<'_>,
+    new_home: ChannelHierarchy<'_>,
+) -> bool {
+    any_applicable_effective_acl(
+        channel,
+        ancestors,
+        |acl, evaluation_channel, acl_channel| {
+            let Some(group) = acl.group.as_deref() else {
+                return false;
+            };
+            if !group_depends_on_home_channel(group) {
+                return false;
+            }
+
+            let old_query = ClientMembershipQuery::new(&[], true, &[], None, false, None)
+                .with_home_channel(old_home);
+            let new_query = ClientMembershipQuery::new(&[], true, &[], None, false, None)
+                .with_home_channel(new_home);
+            let old_match = is_member_in_group(
+                group,
+                evaluation_channel,
+                Some(acl_channel),
+                &[],
+                &old_query,
+            );
+            let new_match = is_member_in_group(
+                group,
+                evaluation_channel,
+                Some(acl_channel),
+                &[],
+                &new_query,
+            );
+            old_match != new_match
+        },
+    )
+}
+
 /// Check whether the effective ACL chain has any deny rules on the given permission.
 /// Used to compute `is_enter_restricted` for `ChannelState` messages.
 pub fn channel_has_effective_restriction(
@@ -218,20 +306,9 @@ pub fn channel_has_effective_restriction(
     ancestors: &[crate::channels::Channel],
     perm: ACLPermissions,
 ) -> bool {
-    let target_id = channel.id;
-    effective_acl_chain(channel, ancestors)
-        .into_iter()
-        .any(|ch| {
-            let is_target_channel = ch.id == target_id;
-            ch.acls.iter().any(|acl| {
-                let applies = if is_target_channel {
-                    acl.apply_here
-                } else {
-                    acl.apply_subs
-                };
-                applies && (acl.deny.contains(perm) || acl.deny.contains(ACLPermissions::Traverse))
-            })
-        })
+    any_applicable_effective_acl(channel, ancestors, |acl, _, _| {
+        acl.deny.contains(perm) || acl.deny.contains(ACLPermissions::Traverse)
+    })
 }
 
 #[cfg(test)]

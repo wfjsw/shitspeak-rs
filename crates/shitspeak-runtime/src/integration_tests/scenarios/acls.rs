@@ -2240,6 +2240,196 @@ async fn channel_state_permission_info_refreshes_only_affected_user_after_token_
 }
 
 #[tokio::test]
+async fn channel_move_permission_info_refreshes_only_home_channel_dependent_acls() {
+    let server = spawn_test_server(TestServerOpts {
+        send_permission_info: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(73, "Lobby".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(
+            74,
+            "Current Sensitive".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(75, "Static".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            74,
+            true,
+            vec![acl_for_group(
+                "in",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Enter.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            75,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Enter.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    bob.drain_now().await;
+
+    bob.move_to_channel(74).await;
+
+    let mut sensitive_refresh = false;
+    let mut static_refresh = false;
+    let mut global_flush = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && !sensitive_refresh {
+        let Some(message) = bob.recv(Duration::from_millis(100)).await else {
+            continue;
+        };
+        global_flush |= matches!(&message, Message::PermissionQuery(pq) if pq.flush == Some(true));
+        sensitive_refresh |= matches!(&message, Message::ChannelState(cs)
+            if cs.channel_id == Some(74)
+                && cs.is_enter_restricted == Some(true)
+                && cs.can_enter == Some(false));
+        static_refresh |= matches!(&message, Message::ChannelState(cs)
+            if cs.channel_id == Some(75)
+                && cs.is_enter_restricted.is_some()
+                && cs.can_enter.is_some());
+    }
+    assert!(
+        sensitive_refresh,
+        "Bob should receive a permission-info refresh for the channel with an `in` ACL"
+    );
+    assert!(
+        !global_flush,
+        "Bob should not receive a global permission flush for a pure channel move"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while tokio::time::Instant::now() < deadline {
+        let Some(message) = bob.recv(Duration::from_millis(25)).await else {
+            continue;
+        };
+        global_flush |= matches!(&message, Message::PermissionQuery(pq) if pq.flush == Some(true));
+        static_refresh |= matches!(&message, Message::ChannelState(cs)
+            if cs.channel_id == Some(75)
+                && cs.is_enter_restricted.is_some()
+                && cs.can_enter.is_some());
+    }
+    assert!(
+        !global_flush,
+        "Bob should not receive a delayed global permission flush for a pure channel move"
+    );
+    assert!(
+        !static_refresh,
+        "Bob should not receive a permission-info refresh for static ACLs on a channel move"
+    );
+}
+
+#[tokio::test]
+async fn channel_move_permission_info_refresh_scope_includes_inherited_sub_acls() {
+    let server = spawn_test_server(TestServerOpts {
+        send_permission_info: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(76, "Fleet".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(77, "Squad".to_owned(), 0, 0, Some(76)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(78, "Command".to_owned(), 0, 0, Some(76)))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            76,
+            true,
+            vec![acl_for_group(
+                "~sub",
+                ACLPermissions::Enter.into(),
+                enumflags2::BitFlags::empty(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    bob.drain_now().await;
+
+    bob.move_to_channel(77).await;
+
+    let scoped_permission_refresh = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionQuery(pq)
+                    if pq.channel_id == Some(78)
+                        && pq.permissions.is_some()
+                        && pq.flush == Some(false))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        scoped_permission_refresh.is_some(),
+        "Bob should receive a channel-scoped permission refresh for a non-entered affected channel"
+    );
+
+    let command_refresh = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::ChannelState(cs)
+                    if cs.channel_id == Some(78)
+                        && cs.is_enter_restricted.is_some()
+                        && cs.can_enter.is_some())
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        command_refresh.is_some(),
+        "Bob should receive refreshes for descendants whose inherited ACL chain contains `sub`"
+    );
+}
+
+#[tokio::test]
 async fn superuser_speak_and_whisper_follow_acl_evaluation() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

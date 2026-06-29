@@ -43,6 +43,7 @@ shitspeak-auth = { workspace = true }
 shitspeak-core = { workspace = true }
 shitspeak-messages = { workspace = true }
 shitspeak-proto = { workspace = true }
+shitspeak-s2s = { workspace = true }
 shitspeak-s2s-transport = { workspace = true, features = ["test-support"] }
 shitspeak-voice = { workspace = true }
 socket2 = { workspace = true }
@@ -70,6 +71,7 @@ serde_json = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 rcgen = { workspace = true }
+shitspeak-s2s = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 tracing-test = { workspace = true }
 

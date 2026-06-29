@@ -299,6 +299,14 @@ fn evaluate_group_string_match_type(group: &str) -> (Option<MatchType<'_>>, bool
     (match_type, invert, use_target_channel)
 }
 
+pub(crate) fn group_depends_on_home_channel(group: &str) -> bool {
+    let (match_type, _, _) = evaluate_group_string_match_type(group);
+    matches!(
+        match_type,
+        Some(MatchType::InChannel | MatchType::OutOfChannel | MatchType::Subtree(_))
+    )
+}
+
 impl Default for SubtreeMatch {
     fn default() -> Self {
         Self {
@@ -437,6 +445,20 @@ mod tests {
 
         assert!(!is_member_in_group("!sub", evaluation, None, &[], &client));
         assert!(is_member_in_group("!sub", home, None, &[], &client));
+    }
+
+    #[test]
+    fn home_channel_dependency_detection_follows_special_groups() {
+        assert!(group_depends_on_home_channel("in"));
+        assert!(group_depends_on_home_channel("out"));
+        assert!(group_depends_on_home_channel("sub"));
+        assert!(group_depends_on_home_channel("~sub,-1,0"));
+        assert!(group_depends_on_home_channel("!~in"));
+
+        assert!(!group_depends_on_home_channel("all"));
+        assert!(!group_depends_on_home_channel("admin"));
+        assert!(!group_depends_on_home_channel("#@door"));
+        assert!(!group_depends_on_home_channel("%#US"));
     }
 
     #[test]

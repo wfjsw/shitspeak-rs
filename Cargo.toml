@@ -6,6 +6,7 @@ members = [
     "crates/shitspeak-messages",
     "crates/shitspeak-proto",
     "crates/shitspeak-runtime",
+    "crates/shitspeak-s2s",
     "crates/shitspeak-s2s-transport",
     "crates/shitspeak-voice",
     "crates/shitspeak-web",
@@ -81,6 +82,7 @@ shitspeak-auth = { path = "crates/shitspeak-auth" }
 shitspeak-core = { path = "crates/shitspeak-core" }
 shitspeak-messages = { path = "crates/shitspeak-messages" }
 shitspeak-runtime = { path = "crates/shitspeak-runtime" }
+shitspeak-s2s = { path = "crates/shitspeak-s2s" }
 shitspeak-s2s-transport = { path = "crates/shitspeak-s2s-transport" }
 shitspeak-voice = { path = "crates/shitspeak-voice" }
 shitspeak-web = { path = "crates/shitspeak-web" }

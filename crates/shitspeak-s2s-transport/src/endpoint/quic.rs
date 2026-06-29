@@ -231,8 +231,6 @@ fn missing_client_socket(addr: SocketAddr) -> io::Error {
 }
 
 impl Endpoint for QuicEndpoint {
-    const KIND: TransportKind = TransportKind::Quic;
-
     fn start(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,

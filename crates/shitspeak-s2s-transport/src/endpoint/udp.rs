@@ -150,8 +150,6 @@ impl UdpEndpoint {
 }
 
 impl Endpoint for UdpEndpoint {
-    const KIND: TransportKind = TransportKind::Udp;
-
     fn start(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,
@@ -512,7 +510,7 @@ impl UdpCryptoSession {
             .map_err(|e| io::Error::other(format!("udp send: {e}")))?;
         peer.metrics().record_sent(TransportKind::Udp, n);
         #[cfg(debug_assertions)]
-        crate::s2s::debug_io::record_named_sent(udp_frame_kind_name(frame.frame_type), n);
+        crate::debug_io::record_named_sent(udp_frame_kind_name(frame.frame_type), n);
         Ok(n)
     }
 
@@ -789,7 +787,7 @@ async fn handle_udp_datagram(
     let header = match UdpPacketHeader::decode(packet) {
         Ok(header) => {
             #[cfg(debug_assertions)]
-            crate::s2s::debug_io::record_named_received(
+            crate::debug_io::record_named_received(
                 udp_datagram_kind_name(header.kind),
                 packet.len(),
             );
@@ -797,7 +795,7 @@ async fn handle_udp_datagram(
         }
         Err(error) => {
             #[cfg(debug_assertions)]
-            crate::s2s::debug_io::record_named_received(
+            crate::debug_io::record_named_received(
                 "transport.udp.datagram.decode_error",
                 packet.len(),
             );
@@ -857,7 +855,7 @@ async fn handle_udp_datagram(
     let frame = pb::Frame::decode(&plaintext[..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     #[cfg(debug_assertions)]
-    crate::s2s::debug_io::record_named_received(
+    crate::debug_io::record_named_received(
         udp_frame_kind_name(frame.frame_type),
         packet.len(),
     );
@@ -1035,7 +1033,7 @@ async fn begin_symmetric_exchange(
     identity: &NodeIdentity,
     state: &Arc<UdpSocketState>,
     peer_node: NodeIdentifier,
-    peer_addr: SocketAddr,
+    _peer_addr: SocketAddr,
     waiter: oneshot::Sender<io::Result<()>>,
 ) -> io::Result<Vec<Vec<u8>>> {
     let mut exchanges = state.exchanges.lock().await;
@@ -1355,10 +1353,10 @@ async fn send_exchange_packets(
         #[cfg(debug_assertions)]
         match UdpPacketHeader::decode(&packet) {
             Ok(header) => {
-                crate::s2s::debug_io::record_named_sent(udp_datagram_kind_name(header.kind), n);
+                crate::debug_io::record_named_sent(udp_datagram_kind_name(header.kind), n);
             }
             Err(_) => {
-                crate::s2s::debug_io::record_named_sent("transport.udp.datagram.encode_error", n);
+                crate::debug_io::record_named_sent("transport.udp.datagram.encode_error", n);
             }
         }
     }
@@ -2138,7 +2136,7 @@ async fn handle_frame(
             if now > frame.ts_us {
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(TransportKind::Udp, rtt);
-                if let Some(pending) = session.pending.lock().take(frame.ts_us) {
+                if session.pending.lock().take(frame.ts_us).is_some() {
                     session
                         .consecutive_keepalive_misses
                         .store(0, Ordering::Relaxed);

@@ -48,8 +48,6 @@ impl KcpEndpoint {
 }
 
 impl Endpoint for KcpEndpoint {
-    const KIND: TransportKind = TransportKind::Kcp;
-
     fn start(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,

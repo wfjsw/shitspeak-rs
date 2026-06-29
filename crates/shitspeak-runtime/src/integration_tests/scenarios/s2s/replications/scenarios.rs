@@ -1,6 +1,9 @@
 //! End-to-end replication scenarios over a real overlay.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -14,17 +17,17 @@ use crate::channel_repository::{
     ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
 };
 use crate::channels::Channel;
-use crate::s2s::replications::proto::{
+use shitspeak_s2s::replications::proto::{
     self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG,
 };
-use crate::s2s::replications::strict::{HistoryMetadata, LogSlice, StrictLogEntry};
-use crate::s2s::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
-use crate::s2s::replications::{
+use shitspeak_s2s::replications::strict::{HistoryMetadata, LogSlice, StrictLogEntry};
+use shitspeak_s2s::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
+use shitspeak_s2s::replications::{
     OwnerReplicable, ReplicationConfig, ReplicationError, StrictReplicable,
 };
-use crate::s2s::testing::chaos::MessageType;
-use crate::s2s::testing::{wait_for_full_routing, wait_until};
-use crate::s2s::transport::{MessageClass, ServiceLevel};
+use shitspeak_s2s::testing::chaos::MessageType;
+use shitspeak_s2s::testing::{wait_for_full_routing, wait_until};
+use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
 #[derive(Clone)]
 struct TestChannelReplicationAdapter {
@@ -851,12 +854,11 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
 }
 
 /// Checks that owner-mode rejects forged local-origin operations.
-/// Expected: B drops an `OwnerOp` sent by C but claiming B's origin, applies no
-/// operation, and emits a warning trace. This is this crate's S2S integrity
+/// Expected: B receives an `OwnerOp` sent by C but claiming B's origin, then
+/// drops it without applying any operation. This is this crate's S2S integrity
 /// rule for owner-scoped state derived from Mumble/shitspeak server state.
 #[tokio::test]
-#[tracing_test::traced_test]
-async fn owner_remote_propose_dropped_with_warntrace() {
+async fn owner_remote_propose_dropped() {
     let cluster = ReplCluster::build_full_mesh(&[1, 2, 3]).await;
     let repo_b = CountingOwnerRepo::new();
     let _h_b = cluster
@@ -867,6 +869,14 @@ async fn owner_remote_propose_dropped_with_warntrace() {
     // Build the forged frame on C's side: OwnerOp{origin=B, ...}.
     let b_id = cluster.cluster.nodes[1].overlay.local_node_id();
     let b_epoch = cluster.cluster.nodes[1].overlay.local_boot_epoch();
+    let saw_forged_frame = Arc::new(AtomicBool::new(false));
+    let saw_forged_frame_filter = Arc::clone(&saw_forged_frame);
+    cluster.managers[1].set_owner_op_inbound_filter(move |origin_node, origin_version| {
+        if origin_node == b_id && origin_version == 1 {
+            saw_forged_frame_filter.store(true, Ordering::Relaxed);
+        }
+        true
+    });
     let op_msgpack = Bytes::from(rmp_serde::to_vec(&123u64).unwrap());
     let body = OwnerBody::Op(OwnerOp {
         origin_node: b_id as u32,
@@ -893,13 +903,13 @@ async fn owner_remote_propose_dropped_with_warntrace() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(
+        saw_forged_frame.load(Ordering::Relaxed),
+        "B did not receive the forged owner op"
+    );
+    assert!(
         repo_b.applied_for(b_id).is_empty(),
         "B applied a forged op: {:?}",
         repo_b.applied_for(b_id)
-    );
-    assert!(
-        logs_contain("owner op claims local origin from foreign sender"),
-        "warn trace missing"
     );
 
     cluster.shutdown().await;

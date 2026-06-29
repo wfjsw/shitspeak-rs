@@ -1,0 +1,44 @@
+[package]
+name = "shitspeak-s2s"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+test-support = [
+    "dep:rcgen",
+    "dep:rustls",
+    "dep:tempfile",
+    "shitspeak-s2s-transport/test-support",
+]
+
+[dependencies]
+async-trait = { workspace = true }
+arc-swap = { workspace = true }
+aws-lc-rs = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+rcgen = { workspace = true, optional = true }
+rmp-serde = { workspace = true }
+rustls = { workspace = true, optional = true }
+scc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shitspeak-core = { workspace = true }
+shitspeak-proto = { workspace = true }
+shitspeak-s2s-transport = { workspace = true }
+tempfile = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }

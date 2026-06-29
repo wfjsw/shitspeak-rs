@@ -4,19 +4,19 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
-use crate::s2s::application::ApplicationLayer;
-use crate::s2s::application::config::ApplicationConfig;
-use crate::s2s::application::moderation::runtime::testing::RecordingApplier;
-use crate::s2s::application::proto::{
+use shitspeak_s2s::application::ApplicationLayer;
+use shitspeak_s2s::application::config::ApplicationConfig;
+use shitspeak_s2s::application::moderation::runtime::testing::RecordingApplier;
+use shitspeak_s2s::application::proto::{
     ModerationCommand, UserStatePatch, VoiceIntent, VoiceIntentKind, VoiceIntentNormal,
 };
-use crate::s2s::application::voice::sink::testing::RecordingSink;
-use crate::s2s::overlay::{RoutingMetric, SeedPeer};
-use crate::s2s::testing::{
+use shitspeak_s2s::application::voice::sink::testing::RecordingSink;
+use shitspeak_s2s::overlay::{RoutingMetric, SeedPeer};
+use shitspeak_s2s::testing::{
     Cluster, full_mesh_seeds, line_seeds, wait_for_full_alive_mesh, wait_for_full_routing,
     wait_until,
 };
-use crate::s2s::transport::{PeerAddress, ServiceLevel, TransportKind};
+use shitspeak_s2s_transport::{PeerAddress, ServiceLevel, TransportKind};
 
 fn normal_voice_intent(channel_id: u32) -> VoiceIntent {
     VoiceIntent {
@@ -32,7 +32,7 @@ fn seed_pair(idx: usize, _ids: &[u16], ports: &[u16]) -> Vec<SeedPeer> {
     vec![SeedPeer::new(
         if other == 0 { 1 } else { 2 },
         vec![PeerAddress::new(
-            crate::s2s::testing::loopback(ports[other]),
+            shitspeak_s2s::testing::loopback(ports[other]),
             TransportKind::Tcp,
         )],
     )]

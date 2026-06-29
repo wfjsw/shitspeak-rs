@@ -18,7 +18,7 @@ use shitspeak_rs::api::{
 use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_rs::client::crypt::CryptState;
 use shitspeak_rs::config::{Config, S2sConfig, UdpPingUserCountScope};
-use shitspeak_rs::constants::{APP_PROTO_VER, PROTOBUF_INTRODUCED_VERSION};
+use shitspeak_rs::constants::PROTOBUF_INTRODUCED_VERSION;
 use shitspeak_rs::messages::encoder::{
     Audio as AudioWire, AudioHeader, AudioTarget, Authenticate, ClientType, Version,
 };
@@ -687,14 +687,22 @@ async fn wait_for_udp_binding(server: &BenchServer, session: ClientSessionIdenti
 const VOICE_CASES: &[VoiceCase] = &[
     VoiceCase {
         name: "server_1_4_all_legacy",
-        server_protocol_version: APP_PROTO_VER,
+        server_protocol_version: ProtocolVersion {
+            major: 1,
+            minor: 4,
+            patch: 0,
+        },
         recipient_protocol_version: PROTOBUF_INTRODUCED_VERSION,
         expected_format: PacketFormat::Legacy,
     },
     VoiceCase {
         name: "server_1_5_client_1_4_legacy",
         server_protocol_version: PROTOBUF_INTRODUCED_VERSION,
-        recipient_protocol_version: APP_PROTO_VER,
+        recipient_protocol_version: ProtocolVersion {
+            major: 1,
+            minor: 4,
+            patch: 0,
+        },
         expected_format: PacketFormat::Legacy,
     },
     VoiceCase {

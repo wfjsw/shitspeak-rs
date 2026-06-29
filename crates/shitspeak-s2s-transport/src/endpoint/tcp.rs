@@ -41,8 +41,6 @@ impl TcpEndpoint {
 }
 
 impl Endpoint for TcpEndpoint {
-    const KIND: TransportKind = TransportKind::Tcp;
-
     fn start(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,

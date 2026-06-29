@@ -419,15 +419,6 @@ impl CompressionConfig {
         Ok(self)
     }
 
-    fn with_adaptive_dictionary_bytes(mut self, dictionary: Vec<u8>) -> io::Result<Self> {
-        self.dictionary = Some(Arc::new(CompressionDictionary::new(
-            dictionary,
-            self.level,
-            CompressionDictionaryKind::Adaptive,
-        )?));
-        Ok(self)
-    }
-
     pub(crate) fn without_dictionary(mut self) -> Self {
         self.dictionary = None;
         self
@@ -476,12 +467,6 @@ impl CompressionConfig {
         self.dictionary.as_ref().and_then(|dict| {
             (dict.kind() == CompressionDictionaryKind::Configured).then(|| dict.fingerprint())
         })
-    }
-
-    pub(crate) fn has_adaptive_dictionary(&self) -> bool {
-        self.dictionary
-            .as_ref()
-            .is_some_and(|dict| dict.kind() == CompressionDictionaryKind::Adaptive)
     }
 
     pub(crate) fn dictionary(&self) -> Option<&CompressionDictionary> {
@@ -852,8 +837,8 @@ fn decode_zstd_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s2s::transport::frame::{FrameType, build_frame};
-    use crate::s2s::transport::{MessageClass, ServiceLevel};
+    use crate::frame::{FrameType, build_frame};
+    use crate::{MessageClass, ServiceLevel};
     use crate::s2s_overlay_proto as overlay_pb;
     use prost::Message as _;
 

@@ -11,11 +11,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::time::timeout;
 
-use crate::s2s::testing::{
+use shitspeak_s2s::testing::{
     Pki, install_provider_once, loopback, mint_pki, pick_free_port, pick_free_udp_port,
     s2s_network_test_guard,
 };
-use crate::s2s::transport::{
+use shitspeak_s2s_transport::{
     ConnectionManager, Inbound, LinkMetrics, MessageClass, PeerAddress, SendOptions, ServiceLevel,
     TransportConfig, TransportKind,
 };

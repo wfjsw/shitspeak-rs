@@ -13,11 +13,11 @@ use crate::{
     client::{Client, crypt::CryptState},
     constants::PROTOBUF_INTRODUCED_VERSION,
     messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget},
-    s2s::application::proto::{
-        VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal, VoiceIntentTarget,
-        VoiceTargetChannel as S2SVoiceTargetChannel,
-    },
     server::Server,
+};
+use shitspeak_s2s::application::proto::{
+    VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal, VoiceIntentTarget,
+    VoiceTargetChannel as S2SVoiceTargetChannel,
 };
 
 /// Recipient count above which the encrypt fan-out is dispatched to rayon

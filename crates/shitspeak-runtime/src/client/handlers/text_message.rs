@@ -6,9 +6,9 @@ use crate::{
     client::client_session_identifier::ClientSessionIdentifier,
     errors::MessageHandlerError,
     messages::{Message, WriteMessageExt, encoder::TextMessage},
-    s2s::application::proto::TextMessageEnvelope,
     server::Server,
 };
+use shitspeak_s2s::application::proto::TextMessageEnvelope;
 
 pub async fn handle_text_message(
     server: &Arc<Box<Server>>,

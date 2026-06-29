@@ -154,10 +154,6 @@ pub(crate) async fn bind_ephemeral_udp_dial_socket(
 /// [`EndpointRegistry`]. Both required methods take `self: Arc<Self>` so
 /// they can move clones into spawned tasks.
 pub(crate) trait Endpoint: Send + Sync + 'static {
-    /// Which `TransportKind` this endpoint provides. There is exactly one
-    /// `Endpoint` impl per `TransportKind`.
-    const KIND: TransportKind;
-
     /// Bind any listeners and spawn accept tasks. Called once after every
     /// endpoint has been registered. Returns once listeners are bound;
     /// accept tasks run in the background until `inner.shutdown` fires.
@@ -169,8 +165,8 @@ pub(crate) trait Endpoint: Send + Sync + 'static {
     ) -> impl Future<Output = io::Result<()>> + Send;
 
     /// Dial a peer at `addr`. On success the impl must have installed an
-    /// `ActiveStream` of `KIND` into `peer.install_stream(...)`, typically
-    /// via [`install_stream_session`] (for stream transports) or its own
+    /// `ActiveStream` into `peer.install_stream(...)`, typically via
+    /// [`install_stream_session`] (for stream transports) or its own
     /// datagram-pump installer (for UDP packet encryption).
     fn dial(
         self: Arc<Self>,

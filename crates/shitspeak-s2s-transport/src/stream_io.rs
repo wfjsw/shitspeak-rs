@@ -44,6 +44,7 @@ use super::native_stats::BoxedNativeLossSampler;
 use super::service_level::{MessageClass, ServiceLevel, TransportKind};
 
 const DICTIONARY_COMPRESSION_HELLO_CAPABILITY: &[u8] = b"shitspeak-s2s-l1-zstd-dict-v1";
+#[cfg(test)]
 const DICTIONARY_COMPRESSION_LEGACY_ADAPTIVE_FLAG: u8 = 0x01;
 const DICTIONARY_COMPRESSION_CONFIGURED_FLAG: u8 = 0x02;
 const DICTIONARY_COMPRESSION_ADAPTIVE_ADVERTISEMENT_FLAG: u8 = 0x04;
@@ -392,7 +393,7 @@ async fn run_pump<S>(
                 match pb::Frame::decode(buf.as_ref()) {
                     Ok(frame) => {
                         #[cfg(debug_assertions)]
-                        crate::s2s::debug_io::record_named_received(
+                        crate::debug_io::record_named_received(
                             stream_frame_kind_name(cfg.transport, frame.frame_type),
                             recv_size,
                         );
@@ -823,7 +824,7 @@ where
     }
     peer.metrics().record_sent(transport, len);
     #[cfg(debug_assertions)]
-    crate::s2s::debug_io::record_named_sent(
+    crate::debug_io::record_named_sent(
         stream_frame_kind_name(transport, frame.frame_type),
         len,
     );
@@ -963,7 +964,7 @@ where
             if now > frame.ts_us {
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(cfg.transport, rtt);
-                if let Some(pending) = pending.take(frame.ts_us) {
+                if pending.take(frame.ts_us).is_some() {
                     peer.metrics().record_probe_delivered(cfg.transport);
                     transport_link_stable = true;
                 }

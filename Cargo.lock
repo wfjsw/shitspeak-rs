@@ -4485,6 +4485,7 @@ dependencies = [
  "shitspeak-core",
  "shitspeak-messages",
  "shitspeak-proto",
+ "shitspeak-s2s",
  "shitspeak-s2s-transport",
  "shitspeak-voice",
  "socket2 0.6.4",
@@ -4502,6 +4503,36 @@ dependencies = [
  "windows-sys 0.61.2",
  "x509-parser 0.18.1",
  "zstd",
+]
+
+[[package]]
+name = "shitspeak-s2s"
+version = "3.0.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "aws-lc-rs",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "parking_lot",
+ "prost",
+ "rand 0.10.1",
+ "rcgen 0.13.2",
+ "rmp-serde",
+ "rustls",
+ "scc",
+ "serde",
+ "serde_json",
+ "shitspeak-core",
+ "shitspeak-proto",
+ "shitspeak-s2s-transport",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

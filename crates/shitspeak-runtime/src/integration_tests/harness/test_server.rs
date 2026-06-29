@@ -19,8 +19,8 @@ use crate::config::{
 use crate::constants::APP_PROTO_VER;
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
 use crate::protocol_version::ProtocolVersion;
-use crate::s2s::testing::LinkChaos;
-use crate::s2s::testing::pki::{Pki, install_provider_once, mint_pki};
+use shitspeak_s2s::testing::LinkChaos;
+use shitspeak_s2s::testing::pki::{Pki, install_provider_once, mint_pki};
 use crate::server::Server;
 
 #[derive(Debug, Clone)]

@@ -218,6 +218,7 @@ fn discover_interface_ips_inner(_allowlist: Option<&[String]>) -> std::io::Resul
     Ok(Vec::new())
 }
 
+#[cfg(unix)]
 fn interface_allowed(name: &str, allowlist: Option<&[String]>) -> bool {
     match allowlist {
         Some(allowlist) => interface_name_allowed(name, allowlist),

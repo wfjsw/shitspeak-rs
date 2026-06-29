@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 use super::{
     bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
 };
-use crate::s2s::transport::service_level::TransportKind;
+use crate::service_level::TransportKind;
 
 pub(crate) const DISCRIMINATOR_LEN: usize = 1;
 
@@ -212,12 +212,6 @@ impl UdpMuxSet {
         Self {
             sockets: Arc::new(sockets),
         }
-    }
-
-    pub(crate) fn is_muxed(&self, addr: SocketAddr, kind: TransportKind) -> bool {
-        self.sockets
-            .iter()
-            .any(|socket| socket.addr == addr && socket.has_protocol(kind))
     }
 
     pub(crate) async fn take_handle(
@@ -478,7 +472,7 @@ impl SocketWritablePoller {
 }
 
 impl quinn::UdpPoller for SocketWritablePoller {
-    fn poll_writable(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.socket.poll_send_ready(cx)
     }
 }

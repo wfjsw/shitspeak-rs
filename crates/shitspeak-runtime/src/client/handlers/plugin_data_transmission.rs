@@ -6,9 +6,9 @@ use crate::{
     client::Client,
     errors::MessageHandlerError,
     messages::{Message, encoder::PluginDataTransmission},
-    s2s::application::proto::PluginDataEnvelope,
     server::Server,
 };
+use shitspeak_s2s::application::proto::PluginDataEnvelope;
 
 pub async fn handle_plugin_data_transmission(
     server: &Arc<Box<Server>>,

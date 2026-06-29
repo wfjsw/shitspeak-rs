@@ -1,10 +1,10 @@
 //! Integration test scenarios.
 //!
-//! Each test brings up a [`Cluster`](crate::s2s::testing::Cluster) of two
+//! Each test brings up a [`Cluster`](shitspeak_s2s::testing::Cluster) of two
 //! or more `OverlayNetwork` instances on real `ConnectionManager`s, applies
-//! optional [`LinkChaos`](crate::s2s::testing::LinkChaos), and asserts a
+//! optional [`LinkChaos`](shitspeak_s2s::testing::LinkChaos), and asserts a
 //! single end-to-end behavior. Common helpers (PKI, ports, wait predicates)
-//! live in [`crate::s2s::testing`].
+//! live in [`shitspeak_s2s::testing`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,16 +13,16 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::s2s::testing::{
+use shitspeak_s2s::testing::{
     Capture, Cluster, MessageType, full_mesh_seeds, install_provider_once, line_seeds, loopback,
     mint_pki, overlay_cfg, pick_free_port, s2s_network_test_guard, transport_cfg,
     wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
 };
-use crate::s2s::transport::{
+use shitspeak_s2s_transport::{
     ConnectionManager, MessageClass, PeerAddress, ServiceLevel, TransportKind,
 };
 
-use crate::s2s::overlay::{MembershipEvent, OverlayNetwork, SeedPeer};
+use shitspeak_s2s::overlay::{MembershipEvent, OverlayNetwork, SeedPeer};
 
 // ---------------------------------------------------------------------------
 // Phase-2 baseline tests (5)
@@ -476,7 +476,7 @@ async fn transit_routing_disabled_nodes_are_not_route_intermediates() {
                 .unwrap_err();
             assert!(matches!(
                 err,
-                crate::s2s::overlay::OverlayError::NoRoute { dst: 3, .. }
+                shitspeak_s2s::overlay::OverlayError::NoRoute { dst: 3, .. }
             ));
             assert!(
                 timeout(Duration::from_millis(500), rx_c.recv())

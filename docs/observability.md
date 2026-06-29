@@ -47,9 +47,12 @@ When clustering config includes:
 status_http_listen = "0.0.0.0:64750"
 ```
 
-the node exposes a local status page with topology, route, link, packet IO, and compression views.
+the node exposes a local status page with topology, route, link, S2S queue,
+packet IO, and compression views.
 
-The same listener serves Prometheus metrics on `/metrics` and `/s2s/metrics`.
+The same listener serves Prometheus metrics on `/metrics` and `/s2s/metrics`,
+including `shitspeak_s2s_queue_status` for incoming and outgoing queue depth,
+capacity, high watermark, samples, and full samples.
 
 ## Metrics Server
 
@@ -97,4 +100,4 @@ Grafana and Prometheus examples live under `deploy/grafana`:
 - `provisioning/datasources/mimir.yaml`
 - `prometheus/prometheus.yml`
 
-The topology map uses the `vaduga-mapgl-panel` Grafana plugin. See the [Grafana provisioning notes](../deploy/grafana/README.md).
+The topology globe uses the `volkovlabs-echarts-panel` Grafana plugin, also published as Business Charts. See the [Grafana provisioning notes](../deploy/grafana/README.md).

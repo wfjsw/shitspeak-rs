@@ -1,15 +1,3 @@
-pub mod application;
-#[cfg(debug_assertions)]
-pub(crate) mod debug_io;
-pub mod overlay;
-pub mod replications;
-pub mod status;
-pub mod transport {
-    pub use shitspeak_s2s_transport::*;
-}
-
-#[cfg(test)]
-pub(crate) mod testing;
 
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::net::SocketAddr;
@@ -36,16 +24,23 @@ use crate::geoip::NodeGeo;
 use crate::server::Server;
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier, StrictReplicationMetadata};
 
-use self::application::error::ApplicationError;
-use self::application::moderation::ModerationApplier;
-use self::application::proto::{
+use shitspeak_s2s::application as s2s_application;
+use shitspeak_s2s::application::error::ApplicationError;
+use shitspeak_s2s::application::moderation::ModerationApplier;
+use shitspeak_s2s::application::proto::{
     ModerationCommand, ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope,
     UserRemovePatch, UserStatePatch, UserStatsReply, VoiceFrame, VoiceIntent,
 };
-use self::application::voice::{AudioSink, RecipientIndex};
-use self::overlay::OverlayNetwork;
-use self::replications::{BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable};
-use self::transport::{ConnectionManager, TransportConfig};
+use shitspeak_s2s::application::voice::{AudioSink, RecipientIndex};
+use shitspeak_s2s::overlay as s2s_overlay;
+use shitspeak_s2s::overlay::OverlayNetwork;
+use shitspeak_s2s::replications as s2s_replications;
+use shitspeak_s2s::replications::{BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable};
+use shitspeak_s2s::status as s2s_status;
+#[cfg(test)]
+use shitspeak_s2s::testing as s2s_testing;
+use shitspeak_s2s_transport as s2s_transport;
+use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
 
 const NATIVE_GATEWAY_CAPACITY: usize = 4096;
 const S2S_GATEWAY_CAPACITY: usize = 4096;
@@ -57,7 +52,7 @@ const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(1
 const S2S_CLIENT_REPLICATION_SLOW_PROPOSE: Duration = Duration::from_secs(1);
 const S2S_CLIENT_REPLICATION_SLOW_QUEUE_WAIT: Duration = Duration::from_millis(250);
 
-fn strict_proposal_gateway_response_timeout(cfg: &replications::ReplicationConfig) -> Duration {
+fn strict_proposal_gateway_response_timeout(cfg: &s2s_replications::ReplicationConfig) -> Duration {
     let slack = cfg
         .delivery_tick_interval()
         .checked_mul(STRICT_PROPOSAL_GATEWAY_SLACK_TICKS)
@@ -69,11 +64,11 @@ pub struct S2SManager {
     enabled: bool,
     config_error: Option<String>,
     transport_config: Option<TransportConfig>,
-    overlay_config: overlay::OverlayConfig,
-    application_config: application::ApplicationConfig,
-    transport_tuning: transport::TransportTuning,
-    overlay_tuning: overlay::OverlayTuning,
-    replication_config: replications::ReplicationConfig,
+    overlay_config: s2s_overlay::OverlayConfig,
+    application_config: s2s_application::ApplicationConfig,
+    transport_tuning: s2s_transport::TransportTuning,
+    overlay_tuning: s2s_overlay::OverlayTuning,
+    replication_config: s2s_replications::ReplicationConfig,
     status_http_listen: Option<SocketAddr>,
     local_geo: Option<NodeGeo>,
     max_users: Arc<AtomicU64>,
@@ -86,18 +81,18 @@ struct S2SRuntimeState {
     overlay: Option<OverlayNetwork>,
     local_geo: Option<NodeGeo>,
     replications: Option<Arc<ReplicationManager>>,
-    application: Option<Arc<application::ApplicationLayer>>,
+    application: Option<Arc<s2s_application::ApplicationLayer>>,
     recipient_index: Option<Arc<RecipientIndex>>,
     server: Option<Weak<Box<Server>>>,
-    channel_replications: HashMap<String, replications::StrictHandle<ChannelReplicationAdapter>>,
-    ban_replication: Option<replications::StrictHandle<BanReplicationAdapter>>,
-    client_replication: Option<replications::OwnerHandle<ClientReplicationAdapter>>,
+    channel_replications: HashMap<String, s2s_replications::StrictHandle<ChannelReplicationAdapter>>,
+    ban_replication: Option<s2s_replications::StrictHandle<BanReplicationAdapter>>,
+    client_replication: Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
     channel_blob_replications:
-        HashMap<String, replications::BlobHandle<ChannelBlobReplicationAdapter>>,
+        HashMap<String, s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>>,
     bridge_tasks: Vec<JoinHandle<()>>,
     gateway_tx: Option<mpsc::Sender<NativeToS2SCommand>>,
     #[cfg(test)]
-    inbound_chaos: Option<testing::LinkChaos>,
+    inbound_chaos: Option<s2s_testing::LinkChaos>,
 }
 
 enum S2SNativeCommand {
@@ -251,32 +246,32 @@ impl S2SManager {
     }
 
     /// Apply the operator-configured transport tunables on top of a
-    /// caller-built [`transport::TransportConfig`] (which still owns
+    /// caller-built [`s2s_transport::TransportConfig`] (which still owns
     /// PKI paths, listeners, and the rest).
     pub fn apply_transport_tuning(
         &self,
-        cfg: transport::TransportConfig,
-    ) -> transport::TransportConfig {
+        cfg: s2s_transport::TransportConfig,
+    ) -> s2s_transport::TransportConfig {
         self.transport_tuning.apply(cfg)
     }
 
     /// Fallible variant that also loads any configured compression dictionary.
     pub fn try_apply_transport_tuning(
         &self,
-        cfg: transport::TransportConfig,
-    ) -> Result<transport::TransportConfig, String> {
+        cfg: s2s_transport::TransportConfig,
+    ) -> Result<s2s_transport::TransportConfig, String> {
         self.transport_tuning.try_apply(cfg)
     }
 
     /// Apply the operator-configured overlay tunables on top of a
-    /// caller-built [`overlay::OverlayConfig`].
-    pub fn apply_overlay_tuning(&self, cfg: overlay::OverlayConfig) -> overlay::OverlayConfig {
+    /// caller-built [`s2s_overlay::OverlayConfig`].
+    pub fn apply_overlay_tuning(&self, cfg: s2s_overlay::OverlayConfig) -> s2s_overlay::OverlayConfig {
         self.overlay_tuning.apply(cfg)
     }
 
     /// Resolved replication tunables, ready to hand to
-    /// [`replications::ReplicationManager::with_config`].
-    pub fn replication_config(&self) -> &replications::ReplicationConfig {
+    /// [`s2s_replications::ReplicationManager::with_config`].
+    pub fn replication_config(&self) -> &s2s_replications::ReplicationConfig {
         &self.replication_config
     }
 
@@ -284,18 +279,18 @@ impl S2SManager {
         let state = self.state.read();
         let overlay = state.overlay.as_ref()?;
         let transport = state.transport.as_ref()?;
-        Some(status::render_prometheus_metrics(
+        Some(s2s_status::render_prometheus_metrics(
             overlay,
             transport,
             state.local_geo.clone(),
         ))
     }
 
-    pub(crate) fn prometheus_samples(&self) -> Option<Vec<status::PrometheusSample>> {
+    pub(crate) fn prometheus_samples(&self) -> Option<Vec<s2s_status::PrometheusSample>> {
         let state = self.state.read();
         let overlay = state.overlay.as_ref()?;
         let transport = state.transport.as_ref()?;
-        Some(status::prometheus_samples(
+        Some(s2s_status::prometheus_samples(
             overlay,
             transport,
             state.local_geo.clone(),
@@ -335,7 +330,7 @@ impl S2SManager {
         let repl =
             ReplicationManager::with_config(overlay.clone(), self.replication_config.clone());
         let app =
-            application::ApplicationLayer::new(overlay.clone(), self.application_config.clone());
+            s2s_application::ApplicationLayer::new(overlay.clone(), self.application_config.clone());
         let mut state = self.state.write();
         state.overlay = Some(overlay);
         state.local_geo = self.local_geo.clone();
@@ -374,7 +369,7 @@ impl S2SManager {
                 .into_iter()
                 .filter(|member| {
                     member.node_id() != local_node_id
-                        && member.status() == overlay::MemberStatus::Alive
+                        && member.status() == s2s_overlay::MemberStatus::Alive
                 })
                 .map(|member| member.max_users())
                 .fold(local_max_users, u64::saturating_add)
@@ -385,7 +380,7 @@ impl S2SManager {
         self.state.read().replications.clone()
     }
 
-    pub fn application(&self) -> Option<Arc<application::ApplicationLayer>> {
+    pub fn application(&self) -> Option<Arc<s2s_application::ApplicationLayer>> {
         self.state.read().application.clone()
     }
 
@@ -688,7 +683,7 @@ impl S2SManager {
     fn channel_replication_handle(
         &self,
         server_id: &str,
-    ) -> Option<replications::StrictHandle<ChannelReplicationAdapter>> {
+    ) -> Option<s2s_replications::StrictHandle<ChannelReplicationAdapter>> {
         {
             let state = self.state.read();
             if let Some(handle) = state.channel_replications.get(server_id).cloned() {
@@ -715,7 +710,7 @@ impl S2SManager {
     fn channel_blob_replication_handle(
         &self,
         server_id: &str,
-    ) -> Option<replications::BlobHandle<ChannelBlobReplicationAdapter>> {
+    ) -> Option<s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>> {
         {
             let state = self.state.read();
             if let Some(handle) = state.channel_blob_replications.get(server_id).cloned() {
@@ -801,12 +796,12 @@ impl S2SManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn install_test_inbound_chaos(&self, chaos: testing::LinkChaos) {
+    pub(crate) fn install_test_inbound_chaos(&self, chaos: s2s_testing::LinkChaos) {
         self.state.write().inbound_chaos = Some(chaos);
     }
 
     #[cfg(test)]
-    pub(crate) fn test_inbound_chaos(&self) -> Option<testing::LinkChaos> {
+    pub(crate) fn test_inbound_chaos(&self) -> Option<s2s_testing::LinkChaos> {
         self.state.read().inbound_chaos.clone()
     }
 
@@ -883,7 +878,7 @@ impl S2SManager {
         let replications =
             ReplicationManager::with_config(overlay.clone(), self.replication_config.clone());
         let application =
-            application::ApplicationLayer::new(overlay.clone(), self.application_config.clone());
+            s2s_application::ApplicationLayer::new(overlay.clone(), self.application_config.clone());
         let recipient_index = RecipientIndex::new();
         let server_handle = server.upgrade();
         if let Some(server) = server_handle.as_ref() {
@@ -899,7 +894,7 @@ impl S2SManager {
                 ));
                 let runtime = parts.build_runtime(topic.to_owned(), repo);
                 runtime.start();
-                let handle = replications::StrictHandle::with_runtime(runtime.clone());
+                let handle = s2s_replications::StrictHandle::with_runtime(runtime.clone());
                 manager
                     .state
                     .write()
@@ -921,7 +916,7 @@ impl S2SManager {
                 ));
                 let runtime = parts.build_runtime(topic.to_owned(), repo);
                 runtime.start();
-                let handle = replications::BlobHandle::with_runtime(runtime.clone());
+                let handle = s2s_replications::BlobHandle::with_runtime(runtime.clone());
                 manager
                     .state
                     .write()
@@ -994,7 +989,7 @@ impl S2SManager {
         }
 
         let status_task = self.status_http_listen.and_then(|listen| {
-            match status::spawn_status_server(
+            match s2s_status::spawn_status_server(
                 listen,
                 overlay.clone(),
                 transport.clone(),
@@ -1051,7 +1046,7 @@ impl S2SManager {
         &self,
         manager: Arc<S2SManager>,
         replications: &Arc<ReplicationManager>,
-        application: Arc<application::ApplicationLayer>,
+        application: Arc<s2s_application::ApplicationLayer>,
         server: &Arc<Box<Server>>,
         recipient_index: Arc<RecipientIndex>,
         native_runtime: &tokio::runtime::Handle,
@@ -1059,10 +1054,10 @@ impl S2SManager {
         s2s_rx: mpsc::Receiver<NativeToS2SCommand>,
         shutdown: watch::Receiver<()>,
     ) -> (
-        HashMap<String, replications::StrictHandle<ChannelReplicationAdapter>>,
-        Option<replications::StrictHandle<BanReplicationAdapter>>,
-        Option<replications::OwnerHandle<ClientReplicationAdapter>>,
-        HashMap<String, replications::BlobHandle<ChannelBlobReplicationAdapter>>,
+        HashMap<String, s2s_replications::StrictHandle<ChannelReplicationAdapter>>,
+        Option<s2s_replications::StrictHandle<BanReplicationAdapter>>,
+        Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
+        HashMap<String, s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>>,
         Vec<JoinHandle<()>>,
     ) {
         let bans = Arc::new(BanReplicationAdapter::new(server.get_bans().clone()));
@@ -1130,7 +1125,7 @@ impl S2SManager {
                 recipient_index.clone(),
             ));
         }
-        if voice_delivery_strategy == application::DeliveryStrategy::Targeted {
+        if voice_delivery_strategy == s2s_application::DeliveryStrategy::Targeted {
             bridge_tasks.push(spawn_native_voice_recipient_index_bridge(
                 native_runtime,
                 server.get_clients().clone(),
@@ -1153,7 +1148,7 @@ impl S2SManager {
         replications: &Arc<ReplicationManager>,
         server: &Arc<Box<Server>>,
         server_id: &str,
-    ) -> Result<replications::StrictHandle<ChannelReplicationAdapter>, replications::ReplicationError>
+    ) -> Result<s2s_replications::StrictHandle<ChannelReplicationAdapter>, s2s_replications::ReplicationError>
     {
         let mut state = self.state.write();
         self.register_channel_replication_scope_into(
@@ -1169,8 +1164,8 @@ impl S2SManager {
         replications: &Arc<ReplicationManager>,
         server: &Arc<Box<Server>>,
         server_id: &str,
-        handles: &mut HashMap<String, replications::StrictHandle<ChannelReplicationAdapter>>,
-    ) -> Result<replications::StrictHandle<ChannelReplicationAdapter>, replications::ReplicationError>
+        handles: &mut HashMap<String, s2s_replications::StrictHandle<ChannelReplicationAdapter>>,
+    ) -> Result<s2s_replications::StrictHandle<ChannelReplicationAdapter>, s2s_replications::ReplicationError>
     {
         match handles.entry(server_id.to_owned()) {
             Entry::Occupied(entry) => Ok(entry.get().clone()),
@@ -1186,7 +1181,7 @@ impl S2SManager {
                     .build_runtime(topic.clone(), repo);
                 runtime.start();
                 replications.install_strict_runtime(topic, runtime.clone())?;
-                let handle = replications::StrictHandle::with_runtime(runtime);
+                let handle = s2s_replications::StrictHandle::with_runtime(runtime);
                 entry.insert(handle.clone());
                 Ok(handle)
             }
@@ -1199,8 +1194,8 @@ impl S2SManager {
         server: &Arc<Box<Server>>,
         server_id: &str,
     ) -> Result<
-        replications::BlobHandle<ChannelBlobReplicationAdapter>,
-        replications::ReplicationError,
+        s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>,
+        s2s_replications::ReplicationError,
     > {
         let mut state = self.state.write();
         self.register_channel_blob_replication_scope_into(
@@ -1216,10 +1211,10 @@ impl S2SManager {
         replications: &Arc<ReplicationManager>,
         server: &Arc<Box<Server>>,
         server_id: &str,
-        handles: &mut HashMap<String, replications::BlobHandle<ChannelBlobReplicationAdapter>>,
+        handles: &mut HashMap<String, s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>>,
     ) -> Result<
-        replications::BlobHandle<ChannelBlobReplicationAdapter>,
-        replications::ReplicationError,
+        s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>,
+        s2s_replications::ReplicationError,
     > {
         match handles.entry(server_id.to_owned()) {
             Entry::Occupied(entry) => Ok(entry.get().clone()),
@@ -1235,7 +1230,7 @@ impl S2SManager {
                     .build_runtime(topic.clone(), repo);
                 runtime.start();
                 replications.install_blob_runtime(topic, runtime.clone())?;
-                let handle = replications::BlobHandle::with_runtime(runtime);
+                let handle = s2s_replications::BlobHandle::with_runtime(runtime);
                 entry.insert(handle.clone());
                 Ok(handle)
             }
@@ -1247,7 +1242,7 @@ pub async fn resolve_observability_geo(configured_geo: Option<NodeGeo>) -> Optio
     if configured_geo.is_some() {
         return configured_geo;
     }
-    crate::s2s::transport::discover_public_geo().await
+    shitspeak_s2s_transport::discover_public_geo().await
 }
 
 fn spawn_native_client_replication_bridge(
@@ -1369,8 +1364,8 @@ async fn enqueue_voice_recipient_index_snapshot(
 fn spawn_s2s_gateway_receiver(
     mut rx: mpsc::Receiver<NativeToS2SCommand>,
     manager: Arc<S2SManager>,
-    application: Arc<application::ApplicationLayer>,
-    client_handle: Option<replications::OwnerHandle<ClientReplicationAdapter>>,
+    application: Arc<s2s_application::ApplicationLayer>,
+    client_handle: Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
     recipient_index: Arc<RecipientIndex>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1508,7 +1503,7 @@ struct QueuedClientReplicationProposal {
 }
 
 fn spawn_client_replication_proposal_worker(
-    client_handle: Option<replications::OwnerHandle<ClientReplicationAdapter>>,
+    client_handle: Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
     capacity: usize,
 ) -> mpsc::Sender<QueuedClientReplicationProposal> {
     let (tx, mut rx) = mpsc::channel::<QueuedClientReplicationProposal>(capacity.max(1));
@@ -1580,13 +1575,11 @@ async fn run_native_gateway(
             }
             S2SNativeCommand::DeliverPluginData { from, envelope } => {
                 trace!(from, "s2s plugin data handed to native gateway");
-                application::plugin_data::runtime::deliver_to_local_recipients(&server, envelope)
-                    .await;
+                deliver_plugin_data_to_local_recipients(&server, envelope).await;
             }
             S2SNativeCommand::DeliverTextMessage { from, envelope } => {
                 trace!(from, "s2s text message handed to native gateway");
-                application::text_message::runtime::deliver_to_local_recipients(&server, envelope)
-                    .await;
+                deliver_text_message_to_local_recipients(&server, envelope).await;
             }
             S2SNativeCommand::DeliverVoice {
                 from_immediate,
@@ -1644,7 +1637,7 @@ impl AudioSink for S2SNativeGatewaySink {
 }
 
 #[async_trait]
-impl application::plugin_data::PluginDataSink for S2SNativeGatewaySink {
+impl s2s_application::plugin_data::PluginDataSink for S2SNativeGatewaySink {
     async fn deliver(&self, from: NodeIdentifier, envelope: PluginDataEnvelope) {
         self.try_send(
             S2SNativeCommand::DeliverPluginData { from, envelope },
@@ -1654,12 +1647,126 @@ impl application::plugin_data::PluginDataSink for S2SNativeGatewaySink {
 }
 
 #[async_trait]
-impl application::text_message::TextMessageSink for S2SNativeGatewaySink {
+impl s2s_application::text_message::TextMessageSink for S2SNativeGatewaySink {
     async fn deliver(&self, from: NodeIdentifier, envelope: TextMessageEnvelope) {
         self.try_send(
             S2SNativeCommand::DeliverTextMessage { from, envelope },
             "text_message",
         );
+    }
+}
+
+async fn deliver_plugin_data_to_local_recipients(
+    server: &Arc<Box<Server>>,
+    envelope: PluginDataEnvelope,
+) {
+    if envelope.receiver_sessions.is_empty() {
+        return;
+    }
+
+    let server_id = if envelope.server_id.is_empty() {
+        crate::types::default_server_id()
+    } else {
+        envelope.server_id
+    };
+    let sender_id = ClientSessionIdentifier::from(envelope.sender_session);
+    let sender = server
+        .get_clients()
+        .get_client_in_server(&server_id, sender_id)
+        .await;
+    if server.get_hide_users_without_traverse() && sender.is_none() {
+        return;
+    }
+    for receiver in envelope.receiver_sessions {
+        let id = ClientSessionIdentifier::from(receiver);
+        if id.get_node_id() == server.get_clients().local_node_id() {
+            let Some(target) = server
+                .get_clients()
+                .get_client_in_server(&server_id, id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(sender) = sender.as_ref() {
+                if !crate::client::visibility::can_view_user(server, sender, &target).await {
+                    continue;
+                }
+                if !crate::client::visibility::can_view_user(server, &target, sender).await {
+                    continue;
+                }
+            }
+            let message: crate::messages::Message =
+                crate::messages::encoder::PluginDataTransmission {
+                    sender_session: Some(envelope.sender_session),
+                    receiver_sessions: vec![receiver],
+                    data: Some(envelope.data.clone()),
+                    data_id: envelope.data_id.clone(),
+                }
+                .into();
+            server
+                .get_clients()
+                .send_to_in_server(&server_id, id, &message)
+                .await;
+        }
+    }
+}
+
+async fn deliver_text_message_to_local_recipients(
+    server: &Arc<Box<Server>>,
+    envelope: TextMessageEnvelope,
+) {
+    if envelope.receiver_sessions.is_empty() {
+        return;
+    }
+
+    let server_id = if envelope.server_id.is_empty() {
+        crate::types::default_server_id()
+    } else {
+        envelope.server_id
+    };
+    let sender_id = ClientSessionIdentifier::from(envelope.sender_session);
+    let sender = server
+        .get_clients()
+        .get_client_in_server(&server_id, sender_id)
+        .await;
+    if server.get_hide_users_without_traverse() && sender.is_none() {
+        return;
+    }
+    for receiver in envelope.receiver_sessions {
+        let id = ClientSessionIdentifier::from(receiver);
+        if id.get_node_id() != server.get_clients().local_node_id() {
+            continue;
+        }
+        let Some(target) = server
+            .get_clients()
+            .get_client_in_server(&server_id, id)
+            .await
+        else {
+            continue;
+        };
+        if !target.is_authenticated() {
+            continue;
+        }
+        if let Some(sender) = sender.as_ref() {
+            if !crate::client::visibility::can_view_user(server, sender, &target).await {
+                continue;
+            }
+            if !crate::client::visibility::can_view_user(server, &target, sender).await {
+                continue;
+            }
+        }
+        let message: crate::messages::Message = crate::messages::encoder::TextMessage {
+            actor: Some(envelope.sender_session),
+            session: envelope.session.clone(),
+            channel_id: envelope.channel_id.clone(),
+            tree_id: envelope.tree_id.clone(),
+            message: envelope.message.clone(),
+        }
+        .into();
+        server
+            .get_clients()
+            .send_to_in_server(&server_id, id, &message)
+            .await;
     }
 }
 
@@ -2063,8 +2170,8 @@ struct ChannelSnapshot {
 
 fn strict_log_metadata_from_repo(
     metadata: StrictReplicationMetadata,
-) -> replications::strict::StrictLogMetadata {
-    replications::strict::StrictLogMetadata {
+) -> s2s_replications::strict::StrictLogMetadata {
+    s2s_replications::strict::StrictLogMetadata {
         op_id_hi: metadata.op_id_hi(),
         op_id_lo: metadata.op_id_lo(),
         ts_final: metadata.ts_final(),
@@ -2072,7 +2179,7 @@ fn strict_log_metadata_from_repo(
 }
 
 fn strict_log_metadata_to_repo(
-    metadata: replications::strict::StrictLogMetadata,
+    metadata: s2s_replications::strict::StrictLogMetadata,
 ) -> StrictReplicationMetadata {
     StrictReplicationMetadata::new(metadata.op_id_hi, metadata.op_id_lo, metadata.ts_final)
 }
@@ -2085,8 +2192,8 @@ impl StrictReplicable for ChannelReplicationAdapter {
         self.repo.current_version_in_server(&self.server_id)
     }
 
-    fn history_metadata(&self) -> replications::strict::HistoryMetadata {
-        replications::strict::HistoryMetadata {
+    fn history_metadata(&self) -> s2s_replications::strict::HistoryMetadata {
+        s2s_replications::strict::HistoryMetadata {
             version: self.repo.current_version_in_server(&self.server_id),
             freshness: self.repo.latest_timestamp_in_server(&self.server_id),
         }
@@ -2113,31 +2220,31 @@ impl StrictReplicable for ChannelReplicationAdapter {
     fn log_since(
         &self,
         since: u64,
-    ) -> replications::strict::LogSlice<replications::strict::StrictLogEntry<Self::Op>> {
+    ) -> s2s_replications::strict::LogSlice<s2s_replications::strict::StrictLogEntry<Self::Op>> {
         let repo = self.repo.clone();
         let server_id = self.server_id.clone();
         let entries = block_in_place_or_current(|handle| {
             handle.block_on(repo.get_log_entries_since_in_server(&server_id, since))
         });
         match entries {
-            Some(entries) => replications::strict::LogSlice::Available(
+            Some(entries) => s2s_replications::strict::LogSlice::Available(
                 entries
                     .into_iter()
                     .map(|entry| {
                         let op = entry.op();
                         let metadata = entry.strict_metadata().map(strict_log_metadata_from_repo);
                         let log_entry = match metadata {
-                            Some(metadata) => replications::strict::StrictLogEntry::with_metadata(
+                            Some(metadata) => s2s_replications::strict::StrictLogEntry::with_metadata(
                                 (*op).clone(),
                                 metadata,
                             ),
-                            None => replications::strict::StrictLogEntry::new((*op).clone()),
+                            None => s2s_replications::strict::StrictLogEntry::new((*op).clone()),
                         };
                         (op.version, log_entry)
                     })
                     .collect(),
             ),
-            None => replications::strict::LogSlice::TooOld,
+            None => s2s_replications::strict::LogSlice::TooOld,
         }
     }
 
@@ -2196,7 +2303,7 @@ impl StrictReplicable for ChannelReplicationAdapter {
         &self,
         version: u64,
         op: Self::Op,
-        metadata: Option<replications::strict::StrictLogMetadata>,
+        metadata: Option<s2s_replications::strict::StrictLogMetadata>,
     ) {
         let mut op = op;
         op.version = version;
@@ -2304,24 +2411,24 @@ impl BlobReplicable for ChannelBlobReplicationAdapter {
         self.blobs.get(key).await.ok().flatten()
     }
 
-    async fn put_blob(&self, key: &str, data: Bytes) -> Result<(), replications::ReplicationError> {
+    async fn put_blob(&self, key: &str, data: Bytes) -> Result<(), s2s_replications::ReplicationError> {
         let written = self.blobs.put(&data).await.map_err(|_| {
-            replications::ReplicationError::Malformed("channel blob store write failed")
+            s2s_replications::ReplicationError::Malformed("channel blob store write failed")
         })?;
         if written == key {
             Ok(())
         } else {
-            Err(replications::ReplicationError::Malformed(
+            Err(s2s_replications::ReplicationError::Malformed(
                 "channel blob key does not match content",
             ))
         }
     }
 
-    async fn delete_blob(&self, key: &str) -> Result<(), replications::ReplicationError> {
+    async fn delete_blob(&self, key: &str) -> Result<(), s2s_replications::ReplicationError> {
         self.blobs
             .delete(key)
             .await
-            .map_err(|_| replications::ReplicationError::Malformed("channel blob delete failed"))
+            .map_err(|_| s2s_replications::ReplicationError::Malformed("channel blob delete failed"))
     }
 
     async fn stored_keys(&self) -> HashSet<String> {
@@ -2365,8 +2472,8 @@ impl StrictReplicable for BanReplicationAdapter {
         self.repo.current_version()
     }
 
-    fn history_metadata(&self) -> replications::strict::HistoryMetadata {
-        replications::strict::HistoryMetadata {
+    fn history_metadata(&self) -> s2s_replications::strict::HistoryMetadata {
+        s2s_replications::strict::HistoryMetadata {
             version: self.repo.current_version(),
             freshness: self.repo.latest_timestamp(),
         }
@@ -2386,29 +2493,29 @@ impl StrictReplicable for BanReplicationAdapter {
     fn log_since(
         &self,
         since: u64,
-    ) -> replications::strict::LogSlice<replications::strict::StrictLogEntry<Self::Op>> {
+    ) -> s2s_replications::strict::LogSlice<s2s_replications::strict::StrictLogEntry<Self::Op>> {
         let repo = self.repo.clone();
         let entries =
             block_in_place_or_current(|handle| handle.block_on(repo.get_log_entries_since(since)));
         match entries {
-            Some(entries) => replications::strict::LogSlice::Available(
+            Some(entries) => s2s_replications::strict::LogSlice::Available(
                 entries
                     .into_iter()
                     .map(|entry| {
                         let op = entry.op();
                         let metadata = entry.strict_metadata().map(strict_log_metadata_from_repo);
                         let log_entry = match metadata {
-                            Some(metadata) => replications::strict::StrictLogEntry::with_metadata(
+                            Some(metadata) => s2s_replications::strict::StrictLogEntry::with_metadata(
                                 (*op).clone(),
                                 metadata,
                             ),
-                            None => replications::strict::StrictLogEntry::new((*op).clone()),
+                            None => s2s_replications::strict::StrictLogEntry::new((*op).clone()),
                         };
                         (op.version, log_entry)
                     })
                     .collect(),
             ),
-            None => replications::strict::LogSlice::TooOld,
+            None => s2s_replications::strict::LogSlice::TooOld,
         }
     }
 
@@ -2421,7 +2528,7 @@ impl StrictReplicable for BanReplicationAdapter {
         &self,
         version: u64,
         mut op: Self::Op,
-        metadata: Option<replications::strict::StrictLogMetadata>,
+        metadata: Option<s2s_replications::strict::StrictLogMetadata>,
     ) {
         op.version = version;
         self.repo
@@ -2587,19 +2694,19 @@ impl OwnerReplicable for ClientReplicationAdapter {
         &self,
         origin: NodeIdentifier,
         since: u64,
-    ) -> replications::owner::LogSlice<Self::Op> {
+    ) -> s2s_replications::owner::LogSlice<Self::Op> {
         let clients = self.clients.clone();
         let entries = block_in_place_or_current(|handle| {
             handle.block_on(clients.get_log_since_for_node(origin, since))
         });
         match entries {
-            Some(entries) => replications::owner::LogSlice::Available(
+            Some(entries) => s2s_replications::owner::LogSlice::Available(
                 entries
                     .into_iter()
                     .map(|entry| (entry.version, (*entry).clone()))
                     .collect(),
             ),
-            None => replications::owner::LogSlice::TooOld,
+            None => s2s_replications::owner::LogSlice::TooOld,
         }
     }
 
@@ -2691,15 +2798,15 @@ mod tests {
     #[test]
     fn strict_proposal_gateway_timeout_tracks_replication_ttl() {
         let timeout =
-            strict_proposal_gateway_response_timeout(&replications::ReplicationConfig::default());
+            strict_proposal_gateway_response_timeout(&s2s_replications::ReplicationConfig::default());
 
-        assert!(timeout > replications::ReplicationConfig::default().propose_ttl());
+        assert!(timeout > s2s_replications::ReplicationConfig::default().propose_ttl());
         assert_eq!(timeout, Duration::from_millis(10_200));
     }
 
     #[test]
     fn strict_proposal_gateway_timeout_keeps_generic_floor() {
-        let cfg = replications::ReplicationConfig::default()
+        let cfg = s2s_replications::ReplicationConfig::default()
             .with_propose_ttl(Duration::from_millis(100))
             .with_delivery_tick_interval(Duration::from_millis(50));
 

@@ -12,10 +12,10 @@ use config::{Config as ConfigCrate, Environment, File};
 use serde::{Deserialize, Deserializer};
 
 use crate::geoip::NodeGeo;
-use crate::s2s::application::ApplicationConfig;
-use crate::s2s::overlay::OverlayTuning;
-use crate::s2s::replications::ReplicationTuning;
-use crate::s2s::transport::{
+use shitspeak_s2s::application::ApplicationConfig;
+use shitspeak_s2s::overlay::OverlayTuning;
+use shitspeak_s2s::replications::ReplicationTuning;
+use shitspeak_s2s_transport::{
     PeerAddress, SeedAddress, TransportConfig, TransportKind, TransportTuning,
 };
 
@@ -143,9 +143,9 @@ impl S2sConfig {
             return Ok(DEFAULT_LOCAL_NODE_ID);
         };
 
-        match crate::s2s::transport::node_id_from_cert_file(cert_path) {
+        match shitspeak_s2s_transport::node_id_from_cert_file(cert_path) {
             Ok(node_id) => Ok(node_id),
-            Err(crate::s2s::transport::ConfigError::CertRead { source, .. })
+            Err(shitspeak_s2s_transport::ConfigError::CertRead { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 Ok(DEFAULT_LOCAL_NODE_ID)
@@ -256,8 +256,8 @@ impl S2sConfig {
         Ok(Some(cfg))
     }
 
-    pub fn overlay_config(&self) -> crate::s2s::overlay::OverlayConfig {
-        let mut cfg = crate::s2s::overlay::OverlayConfig::new(Vec::new());
+    pub fn overlay_config(&self) -> shitspeak_s2s::overlay::OverlayConfig {
+        let mut cfg = shitspeak_s2s::overlay::OverlayConfig::new(Vec::new());
         if let Some(dir) = self.persistence_dir.clone() {
             cfg = cfg.with_persistence_dir(dir);
         }
@@ -1477,7 +1477,12 @@ mod tests {
     /// `[s2s.replications]` sections.
     #[test]
     fn live_config_toml_parses() {
-        let raw = std::fs::read_to_string("config.toml").expect("config.toml missing");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .join("config.toml");
+        let raw = std::fs::read_to_string(&path).expect("config.toml missing");
         let cfg: Config = ::config::Config::builder()
             .add_source(::config::File::from_str(&raw, ::config::FileFormat::Toml))
             .build()
@@ -2353,7 +2358,7 @@ mod tests {
             .expect("valid transport config")
             .expect("s2s enabled");
         assert_eq!(
-            transport.compression_dictionary_len(),
+            transport.compression_cached_adaptive_dictionary_len(),
             Some(dictionary.len())
         );
     }

@@ -13,7 +13,8 @@ use crate::{
     channel_repository::{
         ChannelOp, ChannelOperation, ChannelRepository, channel_op_affects_acl_generation,
     },
-    client::{Client, client_session_identifier::ClientSessionIdentifier},
+    channels::Channel,
+    client::{Client, client_session_identifier::ClientSessionIdentifier, group::ChannelHierarchy},
     messages::{Message, encoder::ChannelState},
     server::Server,
 };
@@ -698,7 +699,39 @@ pub async fn build_channel_permission_info_refresh_messages(
     }
 
     let server_id = client.server_id();
-    let mut channels = channels.get_all_in_server(&server_id).await;
+    let channels = channels.get_all_in_server(&server_id).await;
+    build_channel_permission_info_refresh_messages_for_channels(server, client, channels).await
+}
+
+/// Build permission-only `ChannelState` deltas for channels whose permissions
+/// may depend on the viewer's current channel.
+pub async fn build_home_channel_permission_info_refresh_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+    old_channel_id: Option<u32>,
+    new_channel_id: u32,
+) -> Vec<Message> {
+    if !server.get_send_permission_info() {
+        return Vec::new();
+    }
+
+    let server_id = client.server_id();
+    let all_channels = channels.get_all_in_server(&server_id).await;
+    let channels = match old_channel_id {
+        Some(old_channel_id) => {
+            channels_affected_by_home_channel_move(all_channels, old_channel_id, new_channel_id)
+        }
+        None => channels_with_home_channel_dependent_acls(all_channels),
+    };
+    build_scoped_permission_info_refresh_messages_for_channels(server, client, channels).await
+}
+
+async fn build_channel_permission_info_refresh_messages_for_channels(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    mut channels: Vec<Channel>,
+) -> Vec<Message> {
     channels.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
 
     let mut messages = Vec::with_capacity(channels.len());
@@ -715,4 +748,98 @@ pub async fn build_channel_permission_info_refresh_messages(
         );
     }
     messages
+}
+
+async fn build_scoped_permission_info_refresh_messages_for_channels(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    mut channels: Vec<Channel>,
+) -> Vec<Message> {
+    channels.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
+
+    let mut messages = Vec::with_capacity(channels.len() * 2);
+    for channel in channels {
+        let (is_enter_restricted, perms) =
+            permission_info_for_channel(server, client, channel.id).await;
+        messages.push(
+            crate::messages::encoder::PermissionQuery {
+                channel_id: Some(channel.id),
+                permissions: Some(perms.bits()),
+                flush: Some(false),
+            }
+            .into(),
+        );
+        messages.push(
+            ChannelState {
+                channel_id: Some(channel.id),
+                ..Default::default()
+            }
+            .with_permission_info(is_enter_restricted, perms)
+            .into(),
+        );
+    }
+    messages
+}
+
+fn channels_with_home_channel_dependent_acls(channels: Vec<Channel>) -> Vec<Channel> {
+    let by_id: HashMap<u32, Channel> = channels
+        .iter()
+        .map(|channel| (channel.id, channel.clone()))
+        .collect();
+
+    channels
+        .into_iter()
+        .filter(|channel| {
+            let ancestors = ancestors_for_channel(channel.id, &by_id).unwrap_or_default();
+            crate::acl::effective_acl_chain_has_home_channel_dependent_group(channel, &ancestors)
+        })
+        .collect()
+}
+
+fn channels_affected_by_home_channel_move(
+    channels: Vec<Channel>,
+    old_channel_id: u32,
+    new_channel_id: u32,
+) -> Vec<Channel> {
+    let by_id: HashMap<u32, Channel> = channels
+        .iter()
+        .map(|channel| (channel.id, channel.clone()))
+        .collect();
+    let Some(old_ancestors) = ancestor_ids_for_channel(old_channel_id, &by_id) else {
+        return channels_with_home_channel_dependent_acls(channels);
+    };
+    let Some(new_ancestors) = ancestor_ids_for_channel(new_channel_id, &by_id) else {
+        return channels_with_home_channel_dependent_acls(channels);
+    };
+
+    channels
+        .into_iter()
+        .filter(|channel| {
+            let ancestors = ancestors_for_channel(channel.id, &by_id).unwrap_or_default();
+            crate::acl::effective_acl_chain_home_channel_match_changes(
+                channel,
+                &ancestors,
+                ChannelHierarchy::new(old_channel_id, &old_ancestors),
+                ChannelHierarchy::new(new_channel_id, &new_ancestors),
+            )
+        })
+        .collect()
+}
+
+fn ancestor_ids_for_channel(channel_id: u32, by_id: &HashMap<u32, Channel>) -> Option<Vec<u32>> {
+    ancestors_for_channel(channel_id, by_id)
+        .map(|ancestors| ancestors.into_iter().map(|ancestor| ancestor.id).collect())
+}
+
+fn ancestors_for_channel(channel_id: u32, by_id: &HashMap<u32, Channel>) -> Option<Vec<Channel>> {
+    let mut ancestors = Vec::new();
+    let mut current = by_id.get(&channel_id)?;
+    while let Some(parent_id) = current.parent_id {
+        let Some(parent) = by_id.get(&parent_id) else {
+            break;
+        };
+        ancestors.push(parent.clone());
+        current = parent;
+    }
+    Some(ancestors)
 }

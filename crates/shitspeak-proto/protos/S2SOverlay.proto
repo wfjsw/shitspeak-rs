@@ -113,8 +113,8 @@ message OverlayData {
   repeated uint32 dsts    = 2;   // remaining destinations after this hop
   repeated uint32 path_trace = 3;
   uint32 service_tag      = 4;
-  uint32 service_level    = 5;   // matches s2s::transport::ServiceLevel
-  uint32 message_class    = 6;   // matches s2s::transport::MessageClass
+  uint32 service_level    = 5;   // matches shitspeak_s2s_transport::ServiceLevel
+  uint32 message_class    = 6;   // matches shitspeak_s2s_transport::MessageClass
   bytes  payload          = 7;
   bool   process_on_transit = 8; // deliver to local service on transit hops too
   uint32 route_metric     = 9;   // 0=legacy per-service default, 1=conversational, 2..4=level defaults
