@@ -1133,7 +1133,8 @@ pub struct Config {
     pub authenticate_timeout_ms: u64,
     /// Maximum number of clients concurrently running post-authentication
     /// finalization (initial channel/user sync and publish). Authenticator
-    /// calls still run independently. Default: 4.
+    /// calls still run independently. Default: floor(sqrt(online CPU count)),
+    /// minimum 1.
     #[serde(default = "default_auth_finalization_concurrency")]
     pub auth_finalization_concurrency: usize,
     /// Milliseconds before a pending two-phase channel delete is rolled back.
@@ -1384,7 +1385,28 @@ fn default_authenticate_timeout_ms() -> u64 {
     30_000
 }
 fn default_auth_finalization_concurrency() -> usize {
-    4
+    let online_cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    integer_sqrt(online_cpus).max(1)
+}
+fn integer_sqrt(value: usize) -> usize {
+    if value <= 1 {
+        return value;
+    }
+    let mut low = 1usize;
+    let mut high = value.min(1usize << (usize::BITS as usize / 2));
+    let mut answer = 1usize;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        if mid <= value / mid {
+            answer = mid;
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    answer
 }
 fn default_pending_delete_timeout_ms() -> u64 {
     5_000
@@ -1478,6 +1500,36 @@ mod tests {
         let path = dir.join("s2s-cert.pem");
         std::fs::write(&path, cert.pem()).expect("write cert");
         path
+    }
+
+    #[test]
+    fn integer_sqrt_floors_without_overflow() {
+        let cases = [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (8, 2),
+            (9, 3),
+            (15, 3),
+            (16, 4),
+            (usize::MAX, (1usize << (usize::BITS as usize / 2)) - 1),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(integer_sqrt(value), expected, "value={value}");
+        }
+    }
+
+    #[test]
+    fn auth_finalization_concurrency_defaults_to_sqrt_online_cpus() {
+        let online_cpus = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        assert_eq!(
+            default_auth_finalization_concurrency(),
+            integer_sqrt(online_cpus).max(1)
+        );
     }
 
     /// Ensure the checked-in `config.toml` parses cleanly under the current

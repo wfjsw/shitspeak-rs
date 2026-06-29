@@ -50,7 +50,8 @@ client_idle_timeout_secs = 30
 # Authenticate timeout (milliseconds) after TLS setup.
 authenticate_timeout_ms = 30000
 # Number of clients allowed to run post-auth initial sync concurrently.
-auth_finalization_concurrency = 4
+# Default: floor(sqrt(online CPU count)), minimum 1.
+# auth_finalization_concurrency = 4
 pending_delete_timeout_ms = 5000
 
 # Persistence

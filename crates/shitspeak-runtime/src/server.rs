@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
@@ -43,7 +44,7 @@ use crate::errors::{
     WriteProtoMessageError,
 };
 use crate::geoip::{GeoIpResolver, IpGeoMetadata};
-use crate::messages::encoder::Version;
+use crate::messages::encoder::{TextMessage, Version};
 use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::consume_proxy_protocol_connection_info;
 use crate::user_channel_cache::UserChannelCache;
@@ -68,6 +69,8 @@ const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 128;
 const DYNAMIC_ENTRYPOINT_MIN_PORT: u16 = 49152;
 const DYNAMIC_ENTRYPOINT_MAX_PORT: u16 = 65535;
 const MIN_AUTHENTICATE_TIMEOUT_MS: u64 = 1;
+const AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL: Duration = Duration::from_secs(2);
+const PRE_AUTH_DEFERRED_MESSAGE_LIMIT: usize = 32;
 
 pub type ServerExtensionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), HandleIncomingConnectionError>> + Send + 'a>>;
@@ -1367,7 +1370,7 @@ pub struct Server {
 
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
-    auth_finalization_semaphore: Arc<tokio::sync::Semaphore>,
+    auth_finalization_queue: Arc<AuthFinalizationQueue>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
     user_channel_cache: Arc<UserChannelCache>,
@@ -1406,6 +1409,231 @@ struct EntrypointRuntime {
     udp_voice_enabled: bool,
     udp_ping_enabled: bool,
     shutdown: tokio::sync::watch::Receiver<()>,
+}
+
+struct AuthFinalizationQueue {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    next_ticket: AtomicU64,
+    waiters: Mutex<VecDeque<AuthFinalizationWaiter>>,
+    #[cfg(test)]
+    test_gate: Mutex<Option<AuthFinalizationTestGate>>,
+}
+
+#[derive(Clone)]
+struct AuthFinalizationWaiter {
+    ticket: u64,
+}
+
+#[cfg(test)]
+struct AuthFinalizationTestGate {
+    target_acquire: usize,
+    acquired_count: std::sync::atomic::AtomicUsize,
+    entered_tx: tokio::sync::watch::Sender<usize>,
+    release_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+pub struct AuthFinalizationTestGateHandle {
+    entered_rx: tokio::sync::watch::Receiver<usize>,
+    release_tx: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
+impl AuthFinalizationTestGateHandle {
+    pub async fn wait_entered(&mut self, deadline: Duration) -> Option<usize> {
+        tokio::time::timeout(deadline, async {
+            loop {
+                let value = *self.entered_rx.borrow();
+                if value != 0 {
+                    return value;
+                }
+                if self.entered_rx.changed().await.is_err() {
+                    return 0;
+                }
+            }
+        })
+        .await
+        .ok()
+        .filter(|value| *value != 0)
+    }
+
+    pub fn release(&self) {
+        let _ = self.release_tx.send(true);
+    }
+}
+
+pub struct AuthFinalizationPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    queue: Arc<AuthFinalizationQueue>,
+    ticket: u64,
+}
+
+impl AuthFinalizationQueue {
+    fn new(limit: usize) -> Self {
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
+            next_ticket: AtomicU64::new(1),
+            waiters: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            test_gate: Mutex::new(None),
+        }
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        client: &Arc<Box<Client>>,
+    ) -> Result<AuthFinalizationPermit, MessageHandlerError> {
+        if let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() {
+            self.wait_for_test_gate_if_needed().await;
+            return Ok(AuthFinalizationPermit {
+                _permit: permit,
+                queue: Arc::clone(self),
+                ticket: 0,
+            });
+        }
+
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut waiters = self.waiters.lock();
+            waiters.push_back(AuthFinalizationWaiter { ticket });
+        }
+
+        let waiter = AuthFinalizationTicket {
+            queue: Arc::clone(self),
+            ticket,
+        };
+        self.send_queue_notice(client, ticket).await?;
+
+        let mut notice_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL,
+            AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL,
+        );
+        notice_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let permit = loop {
+            tokio::select! {
+                permit = Arc::clone(&self.semaphore).acquire_owned() => {
+                    break permit.expect("auth finalization semaphore should not be closed");
+                }
+                _ = notice_interval.tick() => {
+                    self.send_queue_notice(client, ticket).await?;
+                }
+            }
+        };
+
+        drop(waiter);
+        self.wait_for_test_gate_if_needed().await;
+        Ok(AuthFinalizationPermit {
+            _permit: permit,
+            queue: Arc::clone(self),
+            ticket,
+        })
+    }
+
+    async fn send_queue_notice(
+        &self,
+        client: &Arc<Box<Client>>,
+        ticket: u64,
+    ) -> Result<(), MessageHandlerError> {
+        if let Some((position, total)) = self.position_and_total(ticket) {
+            let message = auth_finalization_queue_message(client.get_session_id(), position, total);
+            client.write_proto_message(&message).await?;
+        }
+        Ok(())
+    }
+
+    fn remove_waiter(&self, ticket: u64) {
+        if ticket != 0 {
+            self.waiters.lock().retain(|waiter| waiter.ticket != ticket);
+        }
+    }
+
+    fn position_and_total(&self, ticket: u64) -> Option<(usize, usize)> {
+        let waiters = self.waiters.lock();
+        let total = waiters.len();
+        waiters
+            .iter()
+            .position(|waiter| waiter.ticket == ticket)
+            .map(|index| (index + 1, total))
+    }
+
+    #[cfg(test)]
+    fn install_test_gate(&self, target_acquire: usize) -> AuthFinalizationTestGateHandle {
+        let (entered_tx, entered_rx) = tokio::sync::watch::channel(0);
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        *self.test_gate.lock() = Some(AuthFinalizationTestGate {
+            target_acquire,
+            acquired_count: std::sync::atomic::AtomicUsize::new(0),
+            entered_tx,
+            release_rx,
+        });
+        AuthFinalizationTestGateHandle {
+            entered_rx,
+            release_tx,
+        }
+    }
+
+    async fn wait_for_test_gate_if_needed(&self) {
+        #[cfg(test)]
+        {
+            let release_rx = {
+                let guard = self.test_gate.lock();
+                let Some(gate) = guard.as_ref() else {
+                    return;
+                };
+                let acquire_index = gate.acquired_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if acquire_index != gate.target_acquire {
+                    return;
+                }
+                let _ = gate.entered_tx.send(acquire_index);
+                gate.release_rx.clone()
+            };
+            let mut release_rx = release_rx;
+            while !*release_rx.borrow() {
+                if release_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct AuthFinalizationTicket {
+    queue: Arc<AuthFinalizationQueue>,
+    ticket: u64,
+}
+
+impl Drop for AuthFinalizationTicket {
+    fn drop(&mut self) {
+        self.queue.remove_waiter(self.ticket);
+    }
+}
+
+impl Drop for AuthFinalizationPermit {
+    fn drop(&mut self) {
+        self.queue.remove_waiter(self.ticket);
+    }
+}
+
+fn auth_finalization_queue_message(
+    session_id: ClientSessionIdentifier,
+    position: usize,
+    total: usize,
+) -> Message {
+    Message::TextMessage(
+        TextMessage {
+            actor: None,
+            session: vec![u32::from(session_id)],
+            channel_id: Vec::new(),
+            tree_id: Vec::new(),
+            message: format!("Authentication queue: position {position} of {total}."),
+        }
+        .into(),
+    )
+}
+
+fn is_pre_auth_passthrough_message(message: &Message) -> bool {
+    matches!(message, Message::Ping(_))
 }
 
 fn is_realtime_client_message(message: &Message) -> bool {
@@ -1599,6 +1827,122 @@ async fn finish_handler_result(
         user_visibility,
     )
     .await
+}
+
+async fn finish_normal_client_message(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_log_rx: &mut Option<ClientLogReceiver>,
+    channel_log_rx: &mut Option<ChannelLogReceiver>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    message: Message,
+) -> Result<(), HandleIncomingConnectionError> {
+    let result = client.handle_message(server, message).await;
+    finish_handler_result(
+        server,
+        client,
+        client.get_session_id(),
+        client_log_rx,
+        channel_log_rx,
+        channel_tree_shadow,
+        session_channel_shadow,
+        user_visibility,
+        result,
+    )
+    .await?;
+    client.touch_activity();
+    Ok(())
+}
+
+async fn finish_deferred_client_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_log_rx: &mut Option<ClientLogReceiver>,
+    channel_log_rx: &mut Option<ChannelLogReceiver>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    messages: &mut VecDeque<Message>,
+) -> Result<(), HandleIncomingConnectionError> {
+    while let Some(message) = messages.pop_front() {
+        finish_normal_client_message(
+            server,
+            client,
+            client_log_rx,
+            channel_log_rx,
+            channel_tree_shadow,
+            session_channel_shadow,
+            user_visibility,
+            message,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn continue_deferred_client_messages(
+    handler_tasks: &mut JoinSet<Result<(), MessageHandlerError>>,
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_log_rx: &mut Option<ClientLogReceiver>,
+    channel_log_rx: &mut Option<ChannelLogReceiver>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    messages: &mut VecDeque<Message>,
+    pre_auth_handler_in_flight: &mut bool,
+) -> Result<(), HandleIncomingConnectionError> {
+    if messages.is_empty() || *pre_auth_handler_in_flight {
+        return Ok(());
+    }
+
+    if !client.is_authenticated() {
+        if let Some(message) = messages.pop_front() {
+            spawn_client_message_handler(handler_tasks, server, client, message);
+            *pre_auth_handler_in_flight = true;
+        }
+        return Ok(());
+    }
+
+    finish_deferred_client_messages(
+        server,
+        client,
+        client_log_rx,
+        channel_log_rx,
+        channel_tree_shadow,
+        session_channel_shadow,
+        user_visibility,
+        messages,
+    )
+    .await
+}
+
+async fn finish_pre_auth_passthrough_message(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    message: Message,
+) -> Result<(), HandleIncomingConnectionError> {
+    let result = client.handle_message(server, message).await;
+    map_handler_result(client.get_session_id(), result)?;
+    client.touch_activity();
+    Ok(())
+}
+
+fn spawn_client_message_handler(
+    handler_tasks: &mut JoinSet<Result<(), MessageHandlerError>>,
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    message: Message,
+) {
+    let handler_server = Arc::clone(server);
+    let handler_client = Arc::clone(client);
+    handler_tasks.spawn(async move {
+        handler_client
+            .handle_message(&handler_server, message)
+            .await
+    });
 }
 
 fn is_acl_cache_flush_message(message: &Message) -> bool {
@@ -2245,7 +2589,7 @@ impl Server {
             entrypoint_reload_lock: tokio::sync::Mutex::new(()),
             clients: Arc::new(ClientRepository::new(node_id, client_log_max_entries)),
             channels,
-            auth_finalization_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            auth_finalization_queue: Arc::new(AuthFinalizationQueue::new(
                 auth_finalization_concurrency,
             )),
             channel_blobs,
@@ -3388,6 +3732,7 @@ impl Server {
         let result: Result<(), HandleIncomingConnectionError> = async {
             let mut handler_tasks = JoinSet::new();
             let mut pre_auth_handler_in_flight = false;
+            let mut deferred_pre_auth_messages = VecDeque::new();
             let mut authenticate_deadline = Box::pin(tokio::time::sleep(authenticate_timeout));
 
             loop {
@@ -3431,6 +3776,19 @@ impl Server {
                         )
                         .await?;
                         client.touch_activity();
+                        continue_deferred_client_messages(
+                            &mut handler_tasks,
+                            self,
+                            &client,
+                            &mut client_log_rx,
+                            &mut channel_log_rx,
+                            &mut channel_tree_shadow,
+                            &mut session_channel_shadow,
+                            &mut user_visibility,
+                            &mut deferred_pre_auth_messages,
+                            &mut pre_auth_handler_in_flight,
+                        )
+                        .await?;
                     }
 
                     // ── Dedicated writer task completion ─────────────────────
@@ -3448,32 +3806,54 @@ impl Server {
                         }
                     }
 
+                    // ── Deferred pre-auth message ───────────────────────────
+                    _ = std::future::ready(()), if !pre_auth_handler_in_flight && !deferred_pre_auth_messages.is_empty() => {
+                        continue_deferred_client_messages(
+                            &mut handler_tasks,
+                            self,
+                            &client,
+                            &mut client_log_rx,
+                            &mut channel_log_rx,
+                            &mut channel_tree_shadow,
+                            &mut session_channel_shadow,
+                            &mut user_visibility,
+                            &mut deferred_pre_auth_messages,
+                            &mut pre_auth_handler_in_flight,
+                        )
+                        .await?;
+                    }
+
                     // ── Incoming message from this client ────────────────────
-                    result = client.read_proto_message(), if !pre_auth_handler_in_flight => {
+                    result = client.read_proto_message() => {
                         match result {
                             Ok(message) => {
-                                if is_realtime_client_message(&message) {
-                                    let result = client.handle_message(self, message).await;
-                                    finish_handler_result(
+                                if pre_auth_handler_in_flight {
+                                    if is_pre_auth_passthrough_message(&message) {
+                                        finish_pre_auth_passthrough_message(self, &client, message).await?;
+                                    } else if deferred_pre_auth_messages.len() < PRE_AUTH_DEFERRED_MESSAGE_LIMIT {
+                                        deferred_pre_auth_messages.push_back(message);
+                                    } else {
+                                        return Err(HandleIncomingConnectionError::MessageHandlerFailed(
+                                            MessageHandlerError::protocol_violation(
+                                                "too many queued messages before authentication completed",
+                                            ),
+                                        ));
+                                    }
+                                } else if is_realtime_client_message(&message) {
+                                    finish_normal_client_message(
                                         self,
                                         &client,
-                                        client.get_session_id(),
                                         &mut client_log_rx,
                                         &mut channel_log_rx,
                                         &mut channel_tree_shadow,
                                         &mut session_channel_shadow,
                                         &mut user_visibility,
-                                        result,
+                                        message,
                                     )
                                     .await?;
-                                    client.touch_activity();
                                 } else {
-                                    let handler_server = Arc::clone(self);
-                                    let handler_client = Arc::clone(&client);
                                     let spawned_before_auth = !client.is_authenticated();
-                                    handler_tasks.spawn(async move {
-                                        handler_client.handle_message(&handler_server, message).await
-                                    });
+                                    spawn_client_message_handler(&mut handler_tasks, self, &client, message);
                                     if spawned_before_auth {
                                         // Version and Authenticate often arrive back-to-back in
                                         // one TCP read window. Keep pre-auth handlers ordered so
@@ -3923,11 +4303,18 @@ impl Server {
 
     pub async fn acquire_auth_finalization_permit(
         self: &Arc<Box<Self>>,
-    ) -> tokio::sync::OwnedSemaphorePermit {
-        Arc::clone(&self.auth_finalization_semaphore)
-            .acquire_owned()
-            .await
-            .expect("auth finalization semaphore should not be closed")
+        client: &Arc<Box<Client>>,
+    ) -> Result<AuthFinalizationPermit, MessageHandlerError> {
+        self.auth_finalization_queue.acquire(client).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_auth_finalization_test_gate(
+        &self,
+        target_acquire: usize,
+    ) -> AuthFinalizationTestGateHandle {
+        self.auth_finalization_queue
+            .install_test_gate(target_acquire)
     }
 
     pub fn get_send_permission_info(&self) -> bool {

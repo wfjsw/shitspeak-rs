@@ -308,7 +308,7 @@ pub async fn handle_authenticate(
     };
 
     sender.set_authenticated(true);
-    let _auth_finalization_permit = server.acquire_auth_finalization_permit().await;
+    let _auth_finalization_permit = server.acquire_auth_finalization_permit(sender).await?;
 
     // ── Place user in cached/default channel ─────────────────────────────
     {

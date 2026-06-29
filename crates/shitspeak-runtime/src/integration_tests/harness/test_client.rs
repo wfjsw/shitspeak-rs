@@ -278,10 +278,29 @@ pub struct TestClient {
     _reader: JoinHandle<()>,
 }
 
+pub struct ManualNativeClient {
+    write: Mutex<WriteHalf<TlsStream<TcpStream>>>,
+    rx: Mutex<mpsc::UnboundedReceiver<Result<Message, ()>>>,
+    _reader: JoinHandle<()>,
+}
+
 impl Drop for TestClient {
     fn drop(&mut self) {
         self._reader.abort();
     }
+}
+
+impl Drop for ManualNativeClient {
+    fn drop(&mut self) {
+        self._reader.abort();
+    }
+}
+
+struct NativeConnection {
+    write_half: WriteHalf<TlsStream<TcpStream>>,
+    msg_rx: mpsc::UnboundedReceiver<Result<Message, ()>>,
+    reader_handle: JoinHandle<()>,
+    cert_der: Vec<u8>,
 }
 
 impl TestClient {
@@ -361,62 +380,7 @@ impl TestClient {
         declared_version: ProtocolVersion,
         pre_auth_messages: Vec<Message>,
     ) -> Result<TestClient, ConnectError> {
-        // ── Build CA-trusting RootCertStore ───────────────────────────────
-        let ca_pem = std::fs::read_to_string(&server.pki.ca_path).expect("read ca pem");
-        let mut roots = RootCertStore::empty();
-        for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
-            roots
-                .add(cert.expect("parse ca cert"))
-                .expect("add root cert");
-        }
-
-        // ── Generate client cert (whether or not we present it: tests that
-        //    assert on the certificate_hash still need the bytes) ───────────
-        let key_pair = KeyPair::generate().expect("client keypair");
-        let mut cert_params =
-            CertificateParams::new(vec!["test-client".into()]).expect("client cert params");
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "test-client");
-        cert_params.distinguished_name = dn;
-        let client_cert = cert_params.self_signed(&key_pair).expect("self_signed");
-        let cert_pem = client_cert.pem();
-        let key_pem = key_pair.serialize_pem();
-        let cert_der_owned: Vec<u8> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
-            .next()
-            .expect("client cert pem -> der")
-            .expect("client cert der parse")
-            .to_vec();
-
-        // ── Build TLS client config ───────────────────────────────────────
-        let cfg_builder = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert));
-        let cfg = if present_client_cert {
-            let cert_der = CertificateDer::from(cert_der_owned.clone());
-            let key_der: PrivateKeyDer<'static> =
-                PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse client key");
-            cfg_builder
-                .with_client_auth_cert(vec![cert_der], key_der)
-                .expect("build tls client config with client cert")
-        } else {
-            cfg_builder.with_no_client_auth()
-        };
-
-        let connector = TlsConnector::from(Arc::new(cfg));
-
-        // ── TCP + TLS handshake ───────────────────────────────────────────
-        let tcp = TcpStream::connect(server.addr).await?;
-        let server_name = ServerName::try_from("localhost").expect("static server name");
-        let tls = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| ConnectError::Tls(format!("{e}")))?;
-
-        let (read_half, write_half) = tokio::io::split(tls);
-
-        // ── Spawn reader task ─────────────────────────────────────────────
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<Result<Message, ()>>();
-        let reader_handle = tokio::spawn(reader_loop(read_half, msg_tx));
+        let connection = open_native_connection(server, present_client_cert).await?;
 
         let mut client = TestClient {
             session_id: 0,
@@ -427,13 +391,13 @@ impl TestClient {
             max_bandwidth: None,
             initial_permissions: None,
             server_session: ClientSessionIdentifier::from(0u32),
-            cert_der: cert_der_owned,
-            write: Mutex::new(write_half),
-            rx: Mutex::new(msg_rx),
+            cert_der: connection.cert_der,
+            write: Mutex::new(connection.write_half),
+            rx: Mutex::new(connection.msg_rx),
             udp: None,
             udp_server_addr: server.udp_addr,
             crypt: None,
-            _reader: reader_handle,
+            _reader: connection.reader_handle,
         };
 
         // ── Send pre-auth handshake burst ─────────────────────────────────
@@ -1016,6 +980,108 @@ impl TestClient {
         .await;
         res.ok().flatten()
     }
+}
+
+impl ManualNativeClient {
+    pub async fn connect(server: &TestServer) -> Result<Self, ConnectError> {
+        let connection = open_native_connection(server, true).await?;
+        Ok(Self {
+            write: Mutex::new(connection.write_half),
+            rx: Mutex::new(connection.msg_rx),
+            _reader: connection.reader_handle,
+        })
+    }
+
+    pub async fn send(&self, message: Message) {
+        let mut w = self.write.lock().await;
+        let _ = w.write_proto_message(&message).await;
+    }
+
+    pub async fn send_batch(&self, messages: &[Message]) {
+        let mut w = self.write.lock().await;
+        let _ = w.write_proto_message_batch(messages).await;
+    }
+
+    async fn recv_one(&self) -> Option<Message> {
+        let mut rx = self.rx.lock().await;
+        match rx.recv().await? {
+            Ok(m) => Some(m),
+            Err(()) => None,
+        }
+    }
+
+    pub async fn recv(&self, deadline: Duration) -> Option<Message> {
+        timeout(deadline, self.recv_one()).await.ok().flatten()
+    }
+}
+
+async fn open_native_connection(
+    server: &TestServer,
+    present_client_cert: bool,
+) -> Result<NativeConnection, ConnectError> {
+    // ── Build CA-trusting RootCertStore ───────────────────────────────
+    let ca_pem = std::fs::read_to_string(&server.pki.ca_path).expect("read ca pem");
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        roots
+            .add(cert.expect("parse ca cert"))
+            .expect("add root cert");
+    }
+
+    // ── Generate client cert (whether or not we present it: tests that
+    //    assert on the certificate_hash still need the bytes) ───────────
+    let key_pair = KeyPair::generate().expect("client keypair");
+    let mut cert_params =
+        CertificateParams::new(vec!["test-client".into()]).expect("client cert params");
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "test-client");
+    cert_params.distinguished_name = dn;
+    let client_cert = cert_params.self_signed(&key_pair).expect("self_signed");
+    let cert_pem = client_cert.pem();
+    let key_pem = key_pair.serialize_pem();
+    let cert_der_owned: Vec<u8> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .next()
+        .expect("client cert pem -> der")
+        .expect("client cert der parse")
+        .to_vec();
+
+    // ── Build TLS client config ───────────────────────────────────────
+    let cfg_builder = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert));
+    let cfg = if present_client_cert {
+        let cert_der = CertificateDer::from(cert_der_owned.clone());
+        let key_der: PrivateKeyDer<'static> =
+            PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse client key");
+        cfg_builder
+            .with_client_auth_cert(vec![cert_der], key_der)
+            .expect("build tls client config with client cert")
+    } else {
+        cfg_builder.with_no_client_auth()
+    };
+
+    let connector = TlsConnector::from(Arc::new(cfg));
+
+    // ── TCP + TLS handshake ───────────────────────────────────────────
+    let tcp = TcpStream::connect(server.addr).await?;
+    let server_name = ServerName::try_from("localhost").expect("static server name");
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| ConnectError::Tls(format!("{e}")))?;
+
+    let (read_half, write_half) = tokio::io::split(tls);
+
+    // ── Spawn reader task ─────────────────────────────────────────────
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel::<Result<Message, ()>>();
+    let reader_handle = tokio::spawn(reader_loop(read_half, msg_tx));
+
+    Ok(NativeConnection {
+        write_half,
+        msg_rx,
+        reader_handle,
+        cert_der: cert_der_owned,
+    })
 }
 
 async fn reader_loop(

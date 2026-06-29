@@ -2,9 +2,11 @@
 //! and `cert_required` rejection.
 
 use crate::acl::{ACL, ACLPermissions};
-use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::integration_tests::harness::{
+    ManualNativeClient, TestClient, TestServerOpts, spawn_test_server,
+};
 use crate::localization::Language;
-use crate::messages::encoder::{ContextActionModify, RejectType};
+use crate::messages::encoder::{Authenticate, ClientType, ContextActionModify, Ping, RejectType};
 use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::ClientConfig;
@@ -98,6 +100,168 @@ async fn auth_two_clients_succeeds() {
     // Both clients receive the welcome text we configured.
     assert_eq!(alice.welcome_text.as_deref(), Some("test-welcome"));
     assert_eq!(bob.welcome_text.as_deref(), Some("test-welcome"));
+}
+
+#[tokio::test]
+async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
+    let server = spawn_test_server(TestServerOpts {
+        auth_finalization_concurrency: 1,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let mut gate = server.server.install_auth_finalization_test_gate(1);
+    let alice = ManualNativeClient::connect(&server)
+        .await
+        .expect("alice manual connection");
+    assert!(matches!(
+        alice.recv(Duration::from_secs(2)).await,
+        Some(Message::Version(_))
+    ));
+    let alice_handshake = [
+        crate::messages::encoder::Version {
+            version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
+            release: Some("test-client".into()),
+            os: Some("test".into()),
+            os_version: Some("test".into()),
+        }
+        .into(),
+        Authenticate {
+            username: Some("alice".into()),
+            password: None,
+            tokens: Vec::new(),
+            celt_versions: Vec::new(),
+            opus: Some(true),
+            client_type: ClientType::Regular,
+        }
+        .into(),
+    ];
+    alice.send_batch(&alice_handshake).await;
+    assert_eq!(
+        gate.wait_entered(Duration::from_secs(2)).await,
+        Some(1),
+        "first auth finalization should hold the only permit"
+    );
+
+    let bob = ManualNativeClient::connect(&server)
+        .await
+        .expect("bob manual connection");
+    assert!(matches!(
+        bob.recv(Duration::from_secs(2)).await,
+        Some(Message::Version(_))
+    ));
+
+    let handshake = [
+        crate::messages::encoder::Version {
+            version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
+            release: Some("test-client".into()),
+            os: Some("test".into()),
+            os_version: Some("test".into()),
+        }
+        .into(),
+        Authenticate {
+            username: Some("bob".into()),
+            password: None,
+            tokens: Vec::new(),
+            celt_versions: Vec::new(),
+            opus: Some(true),
+            client_type: ClientType::Regular,
+        }
+        .into(),
+    ];
+    bob.send_batch(&handshake).await;
+
+    let queue_notice = bob
+        .recv(Duration::from_secs(2))
+        .await
+        .expect("bob should receive queue notice before ServerSync");
+    let Message::TextMessage(text) = queue_notice else {
+        panic!("expected pre-sync TextMessage queue notice, got {queue_notice:?}");
+    };
+    assert_eq!(text.actor, None);
+    assert_eq!(text.session.len(), 1);
+    assert!(
+        text.message
+            .contains("Authentication queue: position 1 of 1"),
+        "unexpected queue notice text: {}",
+        text.message
+    );
+
+    let ping_timestamp = 42_424_242;
+    bob.send(
+        Ping {
+            timestamp: ping_timestamp,
+            ..Ping::default()
+        }
+        .into(),
+    )
+    .await;
+    assert!(
+        matches!(
+            bob.recv(Duration::from_secs(2)).await,
+            Some(Message::Ping(ping)) if ping.timestamp == Some(ping_timestamp)
+        ),
+        "queued client should still receive TCP Ping replies before ServerSync"
+    );
+
+    gate.release();
+
+    let mut saw_server_sync = false;
+    let mut saw_queue_notice_after_sync = false;
+    for _ in 0..32 {
+        let Some(message) = bob.recv(Duration::from_secs(2)).await else {
+            break;
+        };
+        match message {
+            Message::ServerSync(_) => {
+                saw_server_sync = true;
+                break;
+            }
+            Message::TextMessage(text)
+                if text.message.contains("Authentication queue: position") =>
+            {
+                saw_queue_notice_after_sync = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_server_sync,
+        "bob should complete ServerSync after permit release"
+    );
+    assert!(
+        !saw_queue_notice_after_sync,
+        "queue notices must not be staged into the auth sync burst"
+    );
+
+    let post_sync_messages = collect_manual_messages(&bob, Duration::from_millis(100)).await;
+    assert!(
+        post_sync_messages.into_iter().all(|message| {
+            !matches!(
+                message,
+                Message::TextMessage(text)
+                    if text.message.contains("Authentication queue: position")
+            )
+        }),
+        "queue notices must not be cached and replayed after ServerSync"
+    );
+}
+
+async fn collect_manual_messages(
+    client: &ManualNativeClient,
+    per_message_deadline: Duration,
+) -> Vec<Message> {
+    let mut messages = Vec::new();
+    while let Some(message) = client.recv(per_message_deadline).await {
+        messages.push(message);
+    }
+    messages
 }
 
 #[tokio::test]
