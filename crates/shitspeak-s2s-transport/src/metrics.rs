@@ -612,12 +612,14 @@ impl LinkMetrics {
             return None;
         }
 
-        Some(conversational_quality_score(
-            self.rtt_us,
-            self.jitter_us,
-            self.estimated_throughput_bps(),
-            self.effective_packet_loss_ppm(),
-        ))
+        Some(
+            conversational_quality_score(
+                self.rtt_us,
+                self.jitter_us,
+                self.estimated_throughput_bps(),
+                self.effective_packet_loss_ppm(),
+            ) * 1_000.0,
+        )
     }
 
     /// Cost of this link under the sender-selected route metric. Lower is

@@ -98,6 +98,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         )
         .await;
 
+        self.spawn_propose_retries(op_id);
+
         Ok(())
     }
 }

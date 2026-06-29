@@ -1726,18 +1726,25 @@ async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
     wait_for_convergence_cluster(&cluster).await;
     println!("lag-diagnostic setup: full mesh converged without injected latency");
 
-    cluster.servers[0]
-        .server
-        .get_channels()
-        .create_channel(crate::channels::Channel::new(
-            S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
-            "Lag Diagnostic",
-            0,
-            0,
-            Some(0),
-        ))
-        .await
-        .expect("create diagnostic channel");
+    let diagnostic_channel = crate::channels::Channel::new(
+        S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
+        "Lag Diagnostic",
+        0,
+        0,
+        Some(0),
+    );
+    let diagnostic_channel_op = crate::channel_repository::ChannelOp::CreateChannel {
+        channel: diagnostic_channel,
+    };
+    assert!(
+        cluster.servers[0]
+            .server
+            .s2s_manager()
+            .propose_channel_op(None, diagnostic_channel_op)
+            .await
+            .is_proposed(),
+        "diagnostic channel should be created through strict S2S replication"
+    );
     let channel_ready = wait_until(Duration::from_secs(30), || {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();

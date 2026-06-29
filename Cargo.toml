@@ -72,7 +72,7 @@ tracing = "0.1"
 tracing-appender = { version = "0", features = ["parking_lot"] }
 tracing-subscriber = { version = "0", features = ["parking_lot", "serde", "env-filter", "registry"] }
 tracing-test = "0.2"
-wasmtime = { version = "45", default-features = false, features = ["async", "cranelift", "parallel-compilation", "runtime"] }
+wasmtime = { version = "45", default-features = false, features = ["async", "cranelift", "runtime"] }
 webrtc = "0.17"
 webpki-roots = "1"
 x509-parser = "0"

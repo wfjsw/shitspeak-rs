@@ -516,6 +516,75 @@ mod e2e_tests {
         }
     }
 
+    #[tokio::test]
+    async fn strict_propose_retries_only_missing_acks() {
+        let cfg = Arc::new(
+            ReplicationConfig::default()
+                .with_delivery_tick_interval(Duration::from_millis(10))
+                .with_propose_ttl(Duration::from_secs(5)),
+        );
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo,
+            1,
+            100,
+            "channels".into(),
+            net.clone() as Arc<dyn StrictNet>,
+            CancellationToken::new(),
+            cfg,
+        );
+        let (tx, _rx) = oneshot::channel();
+
+        rt.clone().begin_propose(11u64, tx).await.unwrap();
+        let mut captures = net.drain_captures();
+        let (op_id_hi, op_id_lo, ts_propose) = captures
+            .iter()
+            .find_map(|capture| {
+                let CapturedFrame::StrictMulticast { body, .. } = capture else {
+                    return None;
+                };
+                let StrictBody::Propose(propose) = body else {
+                    return None;
+                };
+                Some((propose.op_id_hi, propose.op_id_lo, propose.ts_propose))
+            })
+            .expect("initial propose multicast");
+        rt.recv_propose_ack(
+            2,
+            super::super::proto::StrictProposeAck {
+                ack_node: 2,
+                coord_node: 1,
+                op_id_hi,
+                op_id_lo,
+                ts_local: ts_propose + 1,
+                src_clock: ts_propose + 1,
+            },
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                captures.extend(net.drain_captures());
+                if captures.iter().any(|capture| {
+                    matches!(
+                        capture,
+                        CapturedFrame::StrictMulticast {
+                            dsts,
+                            body: StrictBody::Propose(_),
+                            ..
+                        } if dsts == &[3]
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retry should target only the peer that has not acked");
+    }
+
     /// Owner-mode: local propose broadcasts, then applies locally.
     #[tokio::test]
     async fn owner_propose_local_broadcasts_then_applies() {

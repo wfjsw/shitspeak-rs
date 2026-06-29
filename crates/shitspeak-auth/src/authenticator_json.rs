@@ -52,8 +52,23 @@ impl AuthenticatorJsonExternalAuthenticateRequest {
 }
 
 #[derive(Serialize)]
+pub(crate) struct ExecAuthenticatorJsonRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<u64>,
+    #[serde(flatten)]
+    command: ExecAuthenticatorJsonCommand,
+}
+
+impl ExecAuthenticatorJsonRequest {
+    pub(crate) fn with_request_id(mut self, request_id: u64) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+}
+
+#[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum ExecAuthenticatorJsonRequest {
+enum ExecAuthenticatorJsonCommand {
     Authenticate {
         username: String,
         password: Option<String>,
@@ -71,10 +86,13 @@ impl ExecAuthenticatorJsonRequest {
         password: Option<&str>,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Self {
-        Self::Authenticate {
-            username: username.to_owned(),
-            password: password.map(ToOwned::to_owned),
-            auxiliary_data: AuthenticatorJsonAuxiliaryData::from(auxiliary_data),
+        Self {
+            request_id: None,
+            command: ExecAuthenticatorJsonCommand::Authenticate {
+                username: username.to_owned(),
+                password: password.map(ToOwned::to_owned),
+                auxiliary_data: AuthenticatorJsonAuxiliaryData::from(auxiliary_data),
+            },
         }
     }
 
@@ -82,9 +100,12 @@ impl ExecAuthenticatorJsonRequest {
         claims: &ExternalAuthClaims,
         auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Self {
-        Self::AuthenticateExternal {
-            claims: AuthenticatorJsonExternalAuthClaims::from(claims),
-            auxiliary_data: AuthenticatorJsonAuxiliaryData::from(auxiliary_data),
+        Self {
+            request_id: None,
+            command: ExecAuthenticatorJsonCommand::AuthenticateExternal {
+                claims: AuthenticatorJsonExternalAuthClaims::from(claims),
+                auxiliary_data: AuthenticatorJsonAuxiliaryData::from(auxiliary_data),
+            },
         }
     }
 }

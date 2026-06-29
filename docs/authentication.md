@@ -38,6 +38,7 @@ backend = "exec"
 
 [authenticator.exec]
 mode = "exec_long_running" # exec_ephemeral, exec_long_running
+long_running_request_mode = "serialized" # serialized, async
 command = "auth-helper"
 args = []
 working_dir = "auth"
@@ -49,6 +50,8 @@ max_response_bytes = 16777216
 
 Unix `uid` and `gid` dropping is optional. If the systemd unit is hardened, extra capabilities may be required for child-process user/group changes. See [Deployment](deployment.md).
 
+For `exec_long_running`, the server sends a `request_id` with each request. `long_running_request_mode = "serialized"` keeps one request in flight at a time and accepts legacy responses without `request_id`; if a response includes `request_id`, it must match. `long_running_request_mode = "async"` allows multiple in-flight requests and requires every response to include the matching `request_id`.
+
 ## WASM Authenticator
 
 WASM authenticators run under Wasmtime without WASI. The host links only the imports documented below.
@@ -59,11 +62,14 @@ backend = "wasm"
 
 [authenticator.wasm]
 path = "auth.wasm"
+max_instances = 4
 file_access_dir = ["auth-files"]
 working_dir = "auth-files"
 ```
 
 `file_access_dir` bounds the raw file stream imports. When it is empty, file stream imports are unavailable. Relative guest file paths resolve under `working_dir` if configured.
+
+The server keeps a reusable pool of WASM instances instead of creating one per authentication call. `max_instances` caps how many instances can be checked out concurrently and defaults to the active CPU count, so WASM authentication can run asynchronously by default. Instance creation is still serialized even when the pool is allowed to grow. This budget is separate from `auth_finalization_concurrency`, which only controls the post-auth initial sync/publish path.
 
 When the configured `.wasm` file changes, reload compiles the new module before activating it. If compilation or loading fails, the previous authenticator remains active.
 

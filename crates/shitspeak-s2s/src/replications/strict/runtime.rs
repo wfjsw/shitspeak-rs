@@ -42,6 +42,7 @@ use shitspeak_s2s_transport::{MessageClass, RoutingMetric, ServiceLevel};
 /// always-on heartbeat behavior.
 const CLOCK_TICK_ACTIVE_BURST_TICKS: usize = 3;
 const CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER: u32 = 4;
+const PROPOSE_RETRY_TICKS: usize = 80;
 // Keep commit gossip alive through the hostile-link/jitter window. A peer can
 // miss the first quorum commit fanout but still be alive and routable shortly
 // after; these retries are the steady-state repair path for that case.
@@ -851,6 +852,53 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     pub fn next_op_id(&self) -> OpId {
         let counter = self.next_op_counter.fetch_add(1, Ordering::Relaxed);
         make_op_id(self.self_id, self.boot_epoch, counter)
+    }
+
+    pub(crate) fn spawn_propose_retries(self: &Arc<Self>, op_id: OpId) {
+        let rt = self.clone();
+        tokio::spawn(async move {
+            for _ in 0..PROPOSE_RETRY_TICKS {
+                tokio::select! {
+                    _ = rt.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(rt.cfg.delivery_tick_interval()) => {},
+                }
+
+                let Some((op_msgpack, ts_propose, src_clock, dsts)) =
+                    rt.pending_propose_retry(op_id)
+                else {
+                    return;
+                };
+                if dsts.is_empty() {
+                    continue;
+                }
+                let body = StrictBody::Propose(StrictPropose {
+                    coord_node: rt.self_id as u32,
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                    ts_propose,
+                    op_msgpack,
+                    src_clock,
+                });
+                if let Err(e) = rt.net.send_multicast(&dsts, &rt.topic, body).await {
+                    trace!(error=%e, "send propose retry multicast failed");
+                }
+            }
+        });
+    }
+
+    fn pending_propose_retry(&self, op_id: OpId) -> Option<(Bytes, u64, u64, Vec<NodeIdentifier>)> {
+        let s = self.state.lock();
+        let p = s.proposals.get(&op_id)?;
+        if p.committed {
+            return None;
+        }
+        let dsts = p
+            .target_set
+            .iter()
+            .copied()
+            .filter(|node| *node != self.self_id && !p.acks.contains_key(node))
+            .collect();
+        Some((p.op_msgpack.clone(), p.ts_propose, s.clock, dsts))
     }
 
     // ------ Inbound recv handlers ------

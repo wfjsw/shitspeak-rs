@@ -113,6 +113,7 @@ backend = "wasm"
 
 [authenticator.wasm]
 path = "/etc/shitspeak-rs/auth/auth.wasm"
+max_instances = 4
 
 [privacy]
 protect_certificate_hashes = "irreversible"
@@ -266,11 +267,12 @@ backend = "wasm"
 
 [authenticator.wasm]
 path = "auth/auth.wasm"
+max_instances = 4
 file_access_dir = ["auth/files"]
 working_dir = "auth/files"
 ```
 
-`file_access_dir` bounds file access from the WASM raw stream imports. When it is empty, file stream imports are unavailable.
+`max_instances` defaults to the active CPU count and caps how many reusable WASM instances can execute concurrently. Lower it to reduce authenticator CPU pressure, or raise it for more WASM auth parallelism without changing `auth_finalization_concurrency`, which limits the later post-auth initial sync/publish path. Instance creation itself remains serialized. `file_access_dir` bounds file access from the WASM raw stream imports. When it is empty, file stream imports are unavailable.
 
 ### Exec Authenticator
 
@@ -280,6 +282,7 @@ backend = "exec"
 
 [authenticator.exec]
 mode = "exec_long_running" # exec_ephemeral, exec_long_running
+long_running_request_mode = "serialized" # serialized, async
 command = "auth-helper"
 args = ["--config", "auth/config.toml"]
 working_dir = "auth"
@@ -289,7 +292,7 @@ max_response_bytes = 16777216
 # gid = 1001
 ```
 
-Exec authenticators exchange JSON over stdin/stdout. See [Authentication](authentication.md) for request/response contracts and WASM imports.
+Exec authenticators exchange JSON over stdin/stdout. `long_running_request_mode = "serialized"` keeps one request in flight at a time for compatibility. `async` allows multiple in-flight requests and requires each response to echo the request's `request_id`. See [Authentication](authentication.md) for request/response contracts and WASM imports.
 
 ## Access Control
 

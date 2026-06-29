@@ -70,6 +70,8 @@ backend = "demo"
 # WASM authenticator configuration used when `backend = "wasm"`.
 # [authenticator.wasm]
 # path = "auth.wasm"
+# Defaults to active CPU count; set to 1 to serialize WASM auth calls.
+# max_instances = 4
 # file_access_dir = ["auth-files"]
 # working_dir = "auth-files"
 
@@ -77,6 +79,7 @@ backend = "demo"
 # are JSON on stdout. Optional uid/gid dropping is supported on Unix.
 # [authenticator.exec]
 # mode = "exec_ephemeral" # exec_ephemeral, exec_long_running
+# long_running_request_mode = "serialized" # serialized, async
 # command = "auth-helper"
 # args = []
 # working_dir = "auth"

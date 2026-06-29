@@ -1,17 +1,20 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::time;
 
-use crate::config::ExecAuthenticatorConfig;
+use crate::config::{ExecAuthenticatorConfig, ExecLongRunningRequestMode};
 
 use super::authenticator_json::{
     AuthenticatorJsonAuthenticateResponse, ExecAuthenticatorJsonRequest,
@@ -66,6 +69,18 @@ pub enum ExecAuthenticatorError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    #[error("exec authenticator `{path}` response is missing request_id")]
+    MissingRequestId { path: PathBuf },
+    #[error("exec authenticator `{path}` response request_id {actual:?} did not match {expected}")]
+    UnexpectedRequestId {
+        path: PathBuf,
+        expected: u64,
+        actual: Option<u64>,
+    },
+    #[error("exec authenticator `{path}` protocol error: {message}")]
+    Protocol { path: PathBuf, message: String },
+    #[error("long-running exec authenticator `{path}` reader stopped")]
+    ReaderStopped { path: PathBuf },
 }
 
 #[derive(Clone)]
@@ -84,10 +99,13 @@ impl ExecAuthenticator {
     }
 
     pub fn long_running(config: ExecAuthenticatorConfig) -> Result<Self, ExecAuthenticatorError> {
+        let request_mode = config.long_running_request_mode();
         Ok(Self {
             inner: Arc::new(ExecAuthenticatorInner::new(
                 ExecAuthenticatorMode::LongRunning {
-                    process: Mutex::new(None),
+                    process: Mutex::new(LongRunningProcessState::default()),
+                    request_mode,
+                    next_request_id: AtomicU64::new(1),
                 },
                 config,
             )?),
@@ -205,13 +223,18 @@ impl ExecAuthenticatorInner {
     where
         Response: DeserializeOwned + Send + 'static,
     {
-        let mut request_json =
-            serde_json::to_vec(&request).map_err(ExecAuthenticatorError::Serialize)?;
-        request_json.push(b'\n');
         let response_json = match &self.mode {
-            ExecAuthenticatorMode::Ephemeral => self.invoke_ephemeral(request_json).await?,
-            ExecAuthenticatorMode::LongRunning { process } => {
-                self.invoke_long_running(process, request_json).await?
+            ExecAuthenticatorMode::Ephemeral => {
+                let request_json = line_json(&request)?;
+                self.invoke_ephemeral(request_json).await?
+            }
+            ExecAuthenticatorMode::LongRunning {
+                process,
+                request_mode,
+                next_request_id,
+            } => {
+                self.invoke_long_running(process, *request_mode, next_request_id, request)
+                    .await?
             }
         };
         serde_json::from_slice(&response_json).map_err(|source| ExecAuthenticatorError::Json {
@@ -275,34 +298,139 @@ impl ExecAuthenticatorInner {
 
     async fn invoke_long_running(
         &self,
-        process: &Mutex<Option<LongRunningExecAuthenticatorProcess>>,
+        process: &Mutex<LongRunningProcessState>,
+        request_mode: ExecLongRunningRequestMode,
+        next_request_id: &AtomicU64,
+        request: ExecAuthenticatorJsonRequest,
+    ) -> Result<Vec<u8>, ExecAuthenticatorError> {
+        match request_mode {
+            ExecLongRunningRequestMode::Serialized => {
+                let request_id = next_request_id.fetch_add(1, Ordering::Relaxed);
+                let request_json = line_json(&request.with_request_id(request_id))?;
+                self.invoke_long_running_serialized(process, request_id, request_json)
+                    .await
+            }
+            ExecLongRunningRequestMode::Async => {
+                let request_id = next_request_id.fetch_add(1, Ordering::Relaxed);
+                let request_json = line_json(&request.with_request_id(request_id))?;
+                self.invoke_long_running_async(process, request_id, request_json)
+                    .await
+            }
+        }
+    }
+
+    async fn invoke_long_running_serialized(
+        &self,
+        process: &Mutex<LongRunningProcessState>,
+        request_id: u64,
         request_json: Vec<u8>,
     ) -> Result<Vec<u8>, ExecAuthenticatorError> {
-        let mut process = process.lock().await;
-        if process.is_none() {
-            *process = Some(self.spawn_long_running()?);
+        let mut state = process.lock().await;
+        if state.serialized.is_none() {
+            state.serialized = Some(self.spawn_long_running_serialized()?);
         }
-        let active = process
+        let active = state
+            .serialized
             .as_mut()
-            .expect("long-running process was just spawned");
-        match self.send_and_read_line(active, &request_json).await {
+            .expect("long-running serialized process was just spawned");
+        match self
+            .send_and_read_correlated_line(active, request_id, &request_json)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(error) => {
-                let failed_path = self.command.clone();
-                drop(process.take());
-                tracing::warn!(
-                    error = %error,
-                    path = %failed_path.display(),
-                    "long-running exec authenticator failed; it will be respawned for the next request"
-                );
+                self.drop_serialized_process(&mut state, &error);
                 Err(error)
             }
         }
     }
 
-    async fn send_and_read_line(
+    async fn invoke_long_running_async(
         &self,
-        process: &mut LongRunningExecAuthenticatorProcess,
+        process: &Mutex<LongRunningProcessState>,
+        request_id: u64,
+        request_json: Vec<u8>,
+    ) -> Result<Vec<u8>, ExecAuthenticatorError> {
+        let (response_rx, pending) = {
+            let mut state = process.lock().await;
+            if state.async_process.is_none() {
+                state.async_process = Some(self.spawn_long_running_async()?);
+            }
+            let Some(active) = state.async_process.as_mut() else {
+                return Err(ExecAuthenticatorError::Protocol {
+                    path: self.command.clone(),
+                    message: "async long-running process was not available after spawn".to_owned(),
+                });
+            };
+            if active.reader_stopped.load(Ordering::Relaxed) {
+                let error = ExecAuthenticatorError::ReaderStopped {
+                    path: self.command.clone(),
+                };
+                self.drop_async_process(&mut state, &error);
+                return Err(error);
+            }
+
+            let (response_tx, response_rx) = oneshot::channel();
+            if active
+                .pending
+                .lock()
+                .expect("long-running exec pending map poisoned")
+                .insert(request_id, response_tx)
+                .is_some()
+            {
+                return Err(ExecAuthenticatorError::Protocol {
+                    path: self.command.clone(),
+                    message: format!("duplicate long-running request id {request_id}"),
+                });
+            }
+
+            let write_result = self
+                .with_timeout(
+                    async {
+                        active.stdin.write_all(&request_json).await?;
+                        active.stdin.flush().await
+                    },
+                    self.timeout,
+                )
+                .await?;
+            if let Err(source) = write_result {
+                active
+                    .pending
+                    .lock()
+                    .expect("long-running exec pending map poisoned")
+                    .remove(&request_id);
+                let error = ExecAuthenticatorError::Write {
+                    path: self.command.clone(),
+                    source,
+                };
+                self.drop_async_process(&mut state, &error);
+                return Err(error);
+            }
+            (response_rx, Arc::clone(&active.pending))
+        };
+
+        match time::timeout(self.timeout, response_rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => Err(ExecAuthenticatorError::ReaderStopped {
+                path: self.command.clone(),
+            }),
+            Err(_) => {
+                pending
+                    .lock()
+                    .expect("long-running exec pending map poisoned")
+                    .remove(&request_id);
+                Err(ExecAuthenticatorError::Timeout {
+                    path: self.command.clone(),
+                    timeout: self.timeout,
+                })
+            }
+        }
+    }
+
+    async fn send_and_read_correlated_line(
+        &self,
+        process: &mut SerializedLongRunningExecAuthenticatorProcess,
+        request_id: u64,
         request_json: &[u8],
     ) -> Result<Vec<u8>, ExecAuthenticatorError> {
         self.with_timeout(
@@ -318,8 +446,10 @@ impl ExecAuthenticatorInner {
             source,
         })?;
 
-        self.with_timeout(self.read_response_line(&mut process.stdout), self.timeout)
-            .await?
+        let response = self
+            .with_timeout(self.read_response_line(&mut process.stdout), self.timeout)
+            .await??;
+        self.unwrap_correlated_response(request_id, response, false)
     }
 
     async fn read_response_to_end(
@@ -375,6 +505,39 @@ impl ExecAuthenticatorInner {
         Ok(response)
     }
 
+    fn unwrap_correlated_response(
+        &self,
+        expected_request_id: u64,
+        response: Vec<u8>,
+        require_request_id: bool,
+    ) -> Result<Vec<u8>, ExecAuthenticatorError> {
+        let mut value = serde_json::from_slice::<Value>(&response).map_err(|source| {
+            ExecAuthenticatorError::Json {
+                path: self.command.clone(),
+                source,
+            }
+        })?;
+        let request_id = value.get("request_id").and_then(Value::as_u64);
+        if require_request_id && request_id.is_none() {
+            return Err(ExecAuthenticatorError::MissingRequestId {
+                path: self.command.clone(),
+            });
+        }
+        if let Some(actual) = request_id
+            && actual != expected_request_id
+        {
+            return Err(ExecAuthenticatorError::UnexpectedRequestId {
+                path: self.command.clone(),
+                expected: expected_request_id,
+                actual: Some(actual),
+            });
+        }
+        if let Value::Object(ref mut object) = value {
+            object.remove("request_id");
+        }
+        serde_json::to_vec(&value).map_err(ExecAuthenticatorError::Serialize)
+    }
+
     fn check_response(&self, response: &[u8]) -> Result<(), ExecAuthenticatorError> {
         if response.is_empty() {
             return Err(ExecAuthenticatorError::EmptyResponse {
@@ -410,9 +573,9 @@ impl ExecAuthenticatorInner {
             })
     }
 
-    fn spawn_long_running(
+    fn spawn_long_running_serialized(
         &self,
-    ) -> Result<LongRunningExecAuthenticatorProcess, ExecAuthenticatorError> {
+    ) -> Result<SerializedLongRunningExecAuthenticatorProcess, ExecAuthenticatorError> {
         let mut child = self.spawn_child(true)?;
         let stdin = child
             .stdin
@@ -426,11 +589,72 @@ impl ExecAuthenticatorInner {
             .ok_or_else(|| ExecAuthenticatorError::MissingStdout {
                 path: self.command.clone(),
             })?;
-        Ok(LongRunningExecAuthenticatorProcess {
+        Ok(SerializedLongRunningExecAuthenticatorProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
         })
+    }
+
+    fn spawn_long_running_async(
+        &self,
+    ) -> Result<AsyncLongRunningExecAuthenticatorProcess, ExecAuthenticatorError> {
+        let mut child = self.spawn_child(true)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ExecAuthenticatorError::MissingStdin {
+                path: self.command.clone(),
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ExecAuthenticatorError::MissingStdout {
+                path: self.command.clone(),
+            })?;
+        let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let reader_stopped = Arc::new(AtomicBool::new(false));
+        tokio::spawn(read_long_running_async_responses(
+            self.command.clone(),
+            self.max_response_bytes,
+            BufReader::new(stdout),
+            Arc::clone(&pending),
+            Arc::clone(&reader_stopped),
+        ));
+        Ok(AsyncLongRunningExecAuthenticatorProcess {
+            child,
+            stdin,
+            pending,
+            reader_stopped,
+        })
+    }
+
+    fn drop_serialized_process(
+        &self,
+        state: &mut LongRunningProcessState,
+        error: &ExecAuthenticatorError,
+    ) {
+        let failed_path = self.command.clone();
+        drop(state.serialized.take());
+        tracing::warn!(
+            error = %error,
+            path = %failed_path.display(),
+            "serialized long-running exec authenticator failed; it will be respawned for the next request"
+        );
+    }
+
+    fn drop_async_process(
+        &self,
+        state: &mut LongRunningProcessState,
+        error: &ExecAuthenticatorError,
+    ) {
+        let failed_path = self.command.clone();
+        drop(state.async_process.take());
+        tracing::warn!(
+            error = %error,
+            path = %failed_path.display(),
+            "async long-running exec authenticator failed; it will be respawned for the next request"
+        );
     }
 
     async fn with_timeout<F, T>(
@@ -453,19 +677,177 @@ impl ExecAuthenticatorInner {
 enum ExecAuthenticatorMode {
     Ephemeral,
     LongRunning {
-        process: Mutex<Option<LongRunningExecAuthenticatorProcess>>,
+        process: Mutex<LongRunningProcessState>,
+        request_mode: ExecLongRunningRequestMode,
+        next_request_id: AtomicU64,
     },
 }
 
-struct LongRunningExecAuthenticatorProcess {
+#[derive(Default)]
+struct LongRunningProcessState {
+    serialized: Option<SerializedLongRunningExecAuthenticatorProcess>,
+    async_process: Option<AsyncLongRunningExecAuthenticatorProcess>,
+}
+
+struct SerializedLongRunningExecAuthenticatorProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
-impl Drop for LongRunningExecAuthenticatorProcess {
+type PendingLongRunningResponses =
+    Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Vec<u8>, ExecAuthenticatorError>>>>>;
+
+struct AsyncLongRunningExecAuthenticatorProcess {
+    child: Child,
+    stdin: ChildStdin,
+    pending: PendingLongRunningResponses,
+    reader_stopped: Arc<AtomicBool>,
+}
+
+impl Drop for SerializedLongRunningExecAuthenticatorProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+    }
+}
+
+impl Drop for AsyncLongRunningExecAuthenticatorProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+fn line_json(request: &ExecAuthenticatorJsonRequest) -> Result<Vec<u8>, ExecAuthenticatorError> {
+    let mut request_json =
+        serde_json::to_vec(request).map_err(ExecAuthenticatorError::Serialize)?;
+    request_json.push(b'\n');
+    Ok(request_json)
+}
+
+async fn read_long_running_async_responses(
+    path: PathBuf,
+    max_response_bytes: usize,
+    mut stdout: BufReader<ChildStdout>,
+    pending: PendingLongRunningResponses,
+    reader_stopped: Arc<AtomicBool>,
+) {
+    loop {
+        let response = match read_response_line_from(&path, max_response_bytes, &mut stdout).await {
+            Ok(response) => response,
+            Err(error) => {
+                fail_pending_responses(&pending, &path, error);
+                reader_stopped.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let (request_id, response) = match unwrap_required_async_response(
+            &path,
+            max_response_bytes,
+            response,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(error = %error, path = %path.display(), "invalid async exec authenticator response");
+                fail_pending_responses(&pending, &path, error);
+                reader_stopped.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let sender = pending
+            .lock()
+            .expect("long-running exec pending map poisoned")
+            .remove(&request_id);
+        let Some(sender) = sender else {
+            tracing::warn!(
+                path = %path.display(),
+                request_id,
+                "async exec authenticator returned response for unknown request_id"
+            );
+            continue;
+        };
+        let _ = sender.send(Ok(response));
+    }
+}
+
+async fn read_response_line_from(
+    path: &Path,
+    max_response_bytes: usize,
+    stdout: &mut BufReader<ChildStdout>,
+) -> Result<Vec<u8>, ExecAuthenticatorError> {
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let bytes_read =
+            stdout
+                .read(&mut byte)
+                .await
+                .map_err(|source| ExecAuthenticatorError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        if bytes_read == 0 {
+            break;
+        }
+        response.push(byte[0]);
+        if response.len() > max_response_bytes {
+            return Err(ExecAuthenticatorError::ResponseTooLarge {
+                path: path.to_path_buf(),
+                limit: max_response_bytes,
+            });
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    trim_line_end(&mut response);
+    if response.is_empty() {
+        return Err(ExecAuthenticatorError::EmptyResponse {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(response)
+}
+
+fn unwrap_required_async_response(
+    path: &Path,
+    _max_response_bytes: usize,
+    response: Vec<u8>,
+) -> Result<(u64, Vec<u8>), ExecAuthenticatorError> {
+    let mut value = serde_json::from_slice::<Value>(&response).map_err(|source| {
+        ExecAuthenticatorError::Json {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let request_id = value
+        .get("request_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ExecAuthenticatorError::MissingRequestId {
+            path: path.to_path_buf(),
+        })?;
+    if let Value::Object(ref mut object) = value {
+        object.remove("request_id");
+    }
+    let response = serde_json::to_vec(&value).map_err(ExecAuthenticatorError::Serialize)?;
+    Ok((request_id, response))
+}
+
+fn fail_pending_responses(
+    pending: &PendingLongRunningResponses,
+    path: &Path,
+    cause: ExecAuthenticatorError,
+) {
+    let pending = std::mem::take(
+        &mut *pending
+            .lock()
+            .expect("long-running exec pending map poisoned"),
+    );
+    let message = cause.to_string();
+    for sender in pending.into_values() {
+        let _ = sender.send(Err(ExecAuthenticatorError::Protocol {
+            path: path.to_path_buf(),
+            message: message.clone(),
+        }));
     }
 }
 
@@ -521,6 +903,7 @@ fn apply_permission_drop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ExecLongRunningRequestMode;
     use bytes::Bytes;
     use shitspeak_core::ProtocolVersion;
     use std::net::IpAddr;
@@ -541,7 +924,8 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_exec_authenticator_reads_json_response() {
-        let authenticator = platform_echo_authenticator(false);
+        let authenticator =
+            platform_echo_authenticator(false, ExecLongRunningRequestMode::Serialized);
         let result = authenticator
             .authenticate("alice", Some("secret"), &auxiliary_data())
             .await
@@ -552,8 +936,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_running_exec_authenticator_reads_json_response() {
-        let authenticator = platform_echo_authenticator(true);
+    async fn serialized_long_running_exec_authenticator_accepts_legacy_json_response() {
+        let authenticator =
+            platform_echo_authenticator(true, ExecLongRunningRequestMode::Serialized);
         for username in ["alice", "bob"] {
             let result = authenticator
                 .authenticate(username, None, &auxiliary_data())
@@ -565,8 +950,27 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn async_long_running_exec_authenticator_correlates_out_of_order_responses() {
+        let authenticator = platform_out_of_order_async_authenticator();
+        let alice_auxiliary = auxiliary_data();
+        let bob_auxiliary = auxiliary_data();
+        let (alice, bob) = tokio::join!(
+            authenticator.authenticate("alice", None, &alice_auxiliary),
+            authenticator.authenticate("bob", None, &bob_auxiliary),
+        );
+
+        let alice = alice.expect("alice authentication result");
+        let bob = bob.expect("bob authentication result");
+        assert_eq!(alice.display_name.as_deref(), Some("alice"));
+        assert_eq!(bob.display_name.as_deref(), Some("bob"));
+    }
+
     #[cfg(windows)]
-    fn platform_echo_authenticator(long_running: bool) -> ExecAuthenticator {
+    fn platform_echo_authenticator(
+        long_running: bool,
+        request_mode: ExecLongRunningRequestMode,
+    ) -> ExecAuthenticator {
         let script = if long_running {
             r#"
 $ErrorActionPreference = 'Stop'
@@ -585,6 +989,7 @@ $request = $line | ConvertFrom-Json
         };
         let config = ExecAuthenticatorConfig::new("powershell")
             .with_args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .with_long_running_request_mode(request_mode)
             .with_timeout_ms(5_000);
         if long_running {
             ExecAuthenticator::long_running(config).unwrap()
@@ -593,8 +998,33 @@ $request = $line | ConvertFrom-Json
         }
     }
 
+    #[cfg(windows)]
+    fn platform_out_of_order_async_authenticator() -> ExecAuthenticator {
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+$first = [Console]::In.ReadLine() | ConvertFrom-Json
+$second = [Console]::In.ReadLine() | ConvertFrom-Json
+'{"request_id":' + $second.request_id + ',"accepted":true,"display_name":"' + $second.username + '","groups":["exec"]}'
+'{"request_id":' + $first.request_id + ',"accepted":true,"display_name":"' + $first.username + '","groups":["exec"]}'
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+    $request = $line | ConvertFrom-Json
+    '{"request_id":' + $request.request_id + ',"accepted":true,"display_name":"' + $request.username + '","groups":["exec"]}'
+}
+"#;
+        ExecAuthenticator::long_running(
+            ExecAuthenticatorConfig::new("powershell")
+                .with_args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .with_long_running_request_mode(ExecLongRunningRequestMode::Async)
+                .with_timeout_ms(5_000),
+        )
+        .unwrap()
+    }
+
     #[cfg(not(windows))]
-    fn platform_echo_authenticator(long_running: bool) -> ExecAuthenticator {
+    fn platform_echo_authenticator(
+        long_running: bool,
+        request_mode: ExecLongRunningRequestMode,
+    ) -> ExecAuthenticator {
         let script = if long_running {
             r#"
 while IFS= read -r line; do
@@ -611,12 +1041,39 @@ printf '{"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$username"
         };
         let config = ExecAuthenticatorConfig::new("sh")
             .with_args(["-c", script])
+            .with_long_running_request_mode(request_mode)
             .with_timeout_ms(5_000);
         if long_running {
             ExecAuthenticator::long_running(config).unwrap()
         } else {
             ExecAuthenticator::ephemeral(config).unwrap()
         }
+    }
+
+    #[cfg(not(windows))]
+    fn platform_out_of_order_async_authenticator() -> ExecAuthenticator {
+        let script = r#"
+read -r first
+read -r second
+first_id=$(printf '%s' "$first" | sed -n 's/.*"request_id":\([0-9][0-9]*\).*/\1/p')
+first_username=$(printf '%s' "$first" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
+second_id=$(printf '%s' "$second" | sed -n 's/.*"request_id":\([0-9][0-9]*\).*/\1/p')
+second_username=$(printf '%s' "$second" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
+printf '{"request_id":%s,"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$second_id" "$second_username"
+printf '{"request_id":%s,"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$first_id" "$first_username"
+while IFS= read -r line; do
+    request_id=$(printf '%s' "$line" | sed -n 's/.*"request_id":\([0-9][0-9]*\).*/\1/p')
+    username=$(printf '%s' "$line" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
+    printf '{"request_id":%s,"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$request_id" "$username"
+done
+"#;
+        ExecAuthenticator::long_running(
+            ExecAuthenticatorConfig::new("sh")
+                .with_args(["-c", script])
+                .with_long_running_request_mode(ExecLongRunningRequestMode::Async)
+                .with_timeout_ms(5_000),
+        )
+        .unwrap()
     }
 
     #[cfg(not(unix))]

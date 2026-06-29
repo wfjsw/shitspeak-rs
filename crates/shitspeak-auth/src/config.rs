@@ -28,10 +28,20 @@ pub enum ExecAuthenticatorMode {
     LongRunning,
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecLongRunningRequestMode {
+    #[default]
+    Serialized,
+    Async,
+}
+
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ExecAuthenticatorConfig {
     #[serde(default)]
     mode: ExecAuthenticatorMode,
+    #[serde(default)]
+    long_running_request_mode: ExecLongRunningRequestMode,
     #[serde(default)]
     command: Option<PathBuf>,
     #[serde(default)]
@@ -52,6 +62,7 @@ impl Default for ExecAuthenticatorConfig {
     fn default() -> Self {
         Self {
             mode: ExecAuthenticatorMode::default(),
+            long_running_request_mode: ExecLongRunningRequestMode::default(),
             command: None,
             args: Vec::new(),
             working_dir: None,
@@ -78,6 +89,11 @@ impl ExecAuthenticatorConfig {
 
     pub fn with_mode(mut self, mode: ExecAuthenticatorMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_long_running_request_mode(mut self, mode: ExecLongRunningRequestMode) -> Self {
+        self.long_running_request_mode = mode;
         self
     }
 
@@ -114,6 +130,10 @@ impl ExecAuthenticatorConfig {
         self.mode
     }
 
+    pub fn long_running_request_mode(&self) -> ExecLongRunningRequestMode {
+        self.long_running_request_mode
+    }
+
     pub fn args(&self) -> &[String] {
         &self.args
     }
@@ -139,12 +159,15 @@ impl ExecAuthenticatorConfig {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WasmAuthenticatorConfig {
     /// Optional WASM authenticator module loaded by the binary at startup and
     /// on hot reload.
     #[serde(default)]
     path: Option<PathBuf>,
+    /// Maximum number of WASM instances that may be checked out concurrently.
+    #[serde(default = "default_wasm_authenticator_max_instances")]
+    max_instances: usize,
     /// Optional directories that bound WASM authenticator file stream access.
     /// When empty, file stream imports are unavailable.
     #[serde(default)]
@@ -155,12 +178,28 @@ pub struct WasmAuthenticatorConfig {
     working_dir: Option<PathBuf>,
 }
 
+impl Default for WasmAuthenticatorConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            max_instances: default_wasm_authenticator_max_instances(),
+            file_access_dir: Vec::new(),
+            working_dir: None,
+        }
+    }
+}
+
 impl WasmAuthenticatorConfig {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: Some(path.into()),
             ..Self::default()
         }
+    }
+
+    pub fn with_max_instances(mut self, max_instances: usize) -> Self {
+        self.max_instances = max_instances.max(1);
+        self
     }
 
     pub fn with_file_access_dir(
@@ -178,6 +217,10 @@ impl WasmAuthenticatorConfig {
 
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
+    }
+
+    pub fn max_instances(&self) -> usize {
+        self.max_instances.max(1)
     }
 
     pub fn file_access_dir(&self) -> &[PathBuf] {
@@ -250,4 +293,11 @@ fn default_exec_authenticator_timeout_ms() -> u64 {
 
 fn default_exec_authenticator_max_response_bytes() -> usize {
     16 * 1024 * 1024
+}
+
+pub(crate) fn default_wasm_authenticator_max_instances() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .max(1)
 }

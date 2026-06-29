@@ -21,7 +21,7 @@ use shitspeak_s2s_transport::{
 
 pub use shitspeak_auth::{
     AuthenticatorBackend, AuthenticatorConfig, AuthenticatorConfigSource, ExecAuthenticatorConfig,
-    ExecAuthenticatorMode, WasmAuthenticatorConfig,
+    ExecAuthenticatorMode, ExecLongRunningRequestMode, WasmAuthenticatorConfig,
 };
 
 const DEFAULT_LOCAL_NODE_ID: NodeIdentifier = 0;
@@ -1825,6 +1825,7 @@ mod tests {
 
                     [authenticator.exec]
                     mode = "exec_long_running"
+                    long_running_request_mode = "async"
                     command = "auth-helper"
                     args = ["--mode", "server"]
                     working_dir = "auth"
@@ -1844,6 +1845,10 @@ mod tests {
         assert_eq!(
             cfg.authenticator.exec().mode(),
             ExecAuthenticatorMode::LongRunning
+        );
+        assert_eq!(
+            cfg.authenticator.exec().long_running_request_mode(),
+            ExecLongRunningRequestMode::Async
         );
         assert_eq!(
             cfg.authenticator.exec().command().map(PathBuf::as_path),
@@ -1881,6 +1886,7 @@ mod tests {
 
                     [authenticator.wasm]
                     path = "auth.wasm"
+                    max_instances = 3
                     file_access_dir = ["auth-files", "shared-auth-files"]
                     working_dir = "auth-files"
                 "#,
@@ -1896,6 +1902,7 @@ mod tests {
             cfg.authenticator.wasm().path().map(PathBuf::as_path),
             Some(Path::new("auth.wasm"))
         );
+        assert_eq!(cfg.authenticator.wasm().max_instances(), 3);
         assert_eq!(
             cfg.authenticator.wasm().file_access_dir(),
             [

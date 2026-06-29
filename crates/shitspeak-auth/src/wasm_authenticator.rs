@@ -14,16 +14,20 @@ use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time;
 use wasmtime::{
     Caller, Config as WasmConfig, Engine as WasmEngine, Extern, ExternType, Instance, Linker,
-    Memory, Module, Store,
+    Memory, Module, Store, TypedFunc,
 };
 
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 
 use crate::Language;
-use crate::config::{AuthenticatorBackend, AuthenticatorConfigSource, ExecAuthenticatorMode};
+use crate::config::{
+    AuthenticatorBackend, AuthenticatorConfigSource, ExecAuthenticatorMode,
+    default_wasm_authenticator_max_instances,
+};
 use crate::http_client;
 
 use super::ExecAuthenticator;
@@ -228,6 +232,7 @@ fn load_authenticator_from_config(
             load_wasm_authenticator(
                 path,
                 config.authenticator_blob_storage_dir(),
+                wasm.max_instances(),
                 wasm.file_access_dir(),
                 wasm.working_dir().map(PathBuf::as_path),
             )
@@ -247,12 +252,14 @@ fn load_authenticator_from_config(
 fn load_wasm_authenticator(
     path: &Path,
     storage_dir: Option<&Path>,
+    max_instances: usize,
     file_access_dirs: &[PathBuf],
     working_dir: Option<&Path>,
 ) -> Result<Arc<dyn Authenticator>, WasmAuthenticatorError> {
-    Ok(Arc::new(WasmAuthenticator::from_file(
+    Ok(Arc::new(WasmAuthenticator::from_file_with_max_instances(
         path,
         storage_dir,
+        max_instances,
         file_access_dirs,
         working_dir,
     )?))
@@ -269,6 +276,27 @@ mod tests {
             .with_wasm(WasmAuthenticatorConfig::new("auth.wasm"));
 
         assert!(load_authenticator_from_config(&config).is_ok());
+    }
+
+    #[test]
+    fn wasm_config_defaults_to_active_cpu_count() {
+        let active_cpus = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        assert_eq!(
+            WasmAuthenticatorConfig::default().max_instances(),
+            active_cpus
+        );
+        assert_eq!(
+            WasmAuthenticatorConfig::new("auth.wasm").max_instances(),
+            active_cpus
+        );
+        assert_eq!(
+            WasmAuthenticatorConfig::new("auth.wasm")
+                .with_max_instances(0)
+                .max_instances(),
+            1
+        );
     }
 
     #[test]
@@ -316,15 +344,28 @@ mod tests {
 
 pub struct WasmAuthenticator {
     module: Arc<CompiledWasmAuthenticator>,
-    http_client: reqwest::Client,
-    cache: Arc<WasmAuthCache>,
-    state: Arc<WasmAuthState>,
 }
 
 impl WasmAuthenticator {
     pub fn from_file(
         path: &Path,
         storage_dir: Option<&Path>,
+        file_access_dirs: &[PathBuf],
+        working_dir: Option<&Path>,
+    ) -> Result<Self, WasmAuthenticatorError> {
+        Self::from_file_with_max_instances(
+            path,
+            storage_dir,
+            default_wasm_authenticator_max_instances(),
+            file_access_dirs,
+            working_dir,
+        )
+    }
+
+    pub fn from_file_with_max_instances(
+        path: &Path,
+        storage_dir: Option<&Path>,
+        max_instances: usize,
         file_access_dirs: &[PathBuf],
         working_dir: Option<&Path>,
     ) -> Result<Self, WasmAuthenticatorError> {
@@ -349,19 +390,24 @@ impl WasmAuthenticator {
             http_client::build_with_webpki_fallback(MAX_FETCH_TIMEOUT, "WASM authenticator fetch")
                 .map_err(|source| WasmAuthenticatorError::HttpClient { source })?;
         let exports = WasmAuthenticatorExports::from_module(&module);
+        let linker = build_linker(&engine)?;
         Ok(Self {
             module: Arc::new(CompiledWasmAuthenticator {
                 engine,
                 module,
+                linker,
                 exports,
+                http_client,
+                cache: Arc::new(WasmAuthCache::default()),
+                state: Arc::new(WasmAuthState::new(
+                    storage_dir,
+                    file_access_dirs,
+                    working_dir,
+                )?),
+                instance_pool: Mutex::new(WasmAuthenticatorInstancePool::default()),
+                instance_slots: Arc::new(Semaphore::new(max_instances.max(1))),
+                instance_creation: Mutex::new(()),
             }),
-            http_client,
-            cache: Arc::new(WasmAuthCache::default()),
-            state: Arc::new(WasmAuthState::new(
-                storage_dir,
-                file_access_dirs,
-                working_dir,
-            )?),
         })
     }
 
@@ -414,13 +460,8 @@ impl WasmAuthenticator {
     {
         let request_json = serde_json::to_vec(&request)?;
         let module = Arc::clone(&self.module);
-        let http_client = self.http_client.clone();
-        let cache = Arc::clone(&self.cache);
-        let state = Arc::clone(&self.state);
 
-        module
-            .invoke_json_export(export_name, &request_json, http_client, cache, state)
-            .await
+        module.invoke_json_export(export_name, &request_json).await
     }
 }
 
@@ -475,7 +516,14 @@ impl Authenticator for WasmAuthenticator {
 struct CompiledWasmAuthenticator {
     engine: WasmEngine,
     module: Module,
+    linker: Linker<HostState>,
     exports: WasmAuthenticatorExports,
+    http_client: reqwest::Client,
+    cache: Arc<WasmAuthCache>,
+    state: Arc<WasmAuthState>,
+    instance_pool: Mutex<WasmAuthenticatorInstancePool>,
+    instance_slots: Arc<Semaphore>,
+    instance_creation: Mutex<()>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -507,9 +555,6 @@ impl CompiledWasmAuthenticator {
         &self,
         export_name: &'static str,
         request_json: &[u8],
-        http_client: reqwest::Client,
-        cache: Arc<WasmAuthCache>,
-        state: Arc<WasmAuthState>,
     ) -> Result<Option<Vec<u8>>, WasmAuthenticatorError> {
         if request_json.len() > MAX_WASM_REQUEST_BYTES {
             return Err(WasmAuthenticatorError::InvalidPayload(format!(
@@ -517,37 +562,24 @@ impl CompiledWasmAuthenticator {
             )));
         }
 
-        let mut store = Store::new(
-            &self.engine,
-            HostState {
-                http_client,
-                cache,
-                state,
-                streams: HostStreams::default(),
-            },
-        );
-        let linker = build_linker(&self.engine)?;
-        let instance = linker
-            .instantiate_async(&mut store, &self.module)
-            .await
-            .map_err(wasm_execution_error)?;
-        let Some(func) = instance.get_func(&mut store, export_name) else {
+        let mut checkout = self.checkout_instance().await?;
+        let Some(func) = checkout
+            .instance
+            .instance
+            .get_func(&mut checkout.instance.store, export_name)
+        else {
+            self.release_instance(checkout).await;
             return Ok(None);
         };
         let func = func
-            .typed::<(i32, i32), i64>(&store)
+            .typed::<(i32, i32), i64>(&checkout.instance.store)
             .map_err(wasm_execution_error)?;
-        let alloc = instance
-            .get_typed_func::<i32, i32>(&mut store, "alloc")
-            .map_err(|_| WasmAuthenticatorError::MissingExport("alloc"))?;
-        let dealloc = optional_dealloc(&mut store, &instance)?;
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or(WasmAuthenticatorError::MissingExport("memory"))?;
 
         let request_len = checked_i32_len(request_json.len())?;
-        let request_ptr = alloc
-            .call_async(&mut store, request_len)
+        let request_ptr = checkout
+            .instance
+            .alloc
+            .call_async(&mut checkout.instance.store, request_len)
             .await
             .map_err(wasm_execution_error)?;
         if request_ptr < 0 {
@@ -555,12 +587,18 @@ impl CompiledWasmAuthenticator {
                 "alloc returned a negative pointer".to_owned(),
             ));
         }
-        memory
-            .write(&mut store, request_ptr as usize, request_json)
+        checkout
+            .instance
+            .memory
+            .write(
+                &mut checkout.instance.store,
+                request_ptr as usize,
+                request_json,
+            )
             .map_err(|error| WasmAuthenticatorError::Memory(error.to_string()))?;
 
         let packed = func
-            .call_async(&mut store, (request_ptr, request_len))
+            .call_async(&mut checkout.instance.store, (request_ptr, request_len))
             .await
             .map_err(wasm_execution_error)?;
         let (response_ptr, response_len) = unpack_ptr_len(packed)?;
@@ -570,22 +608,119 @@ impl CompiledWasmAuthenticator {
             )));
         }
         let mut response = vec![0u8; response_len as usize];
-        memory
-            .read(&store, response_ptr as usize, &mut response)
+        checkout
+            .instance
+            .memory
+            .read(
+                &checkout.instance.store,
+                response_ptr as usize,
+                &mut response,
+            )
             .map_err(|error| WasmAuthenticatorError::Memory(error.to_string()))?;
 
-        if let Some(dealloc) = dealloc {
+        if let Some(dealloc) = checkout.instance.dealloc.as_ref() {
             if request_ptr as u32 != response_ptr || request_len as u32 != response_len {
                 let _ = dealloc
-                    .call_async(&mut store, (request_ptr, request_len))
+                    .call_async(&mut checkout.instance.store, (request_ptr, request_len))
                     .await;
             }
             let _ = dealloc
-                .call_async(&mut store, (response_ptr as i32, response_len as i32))
+                .call_async(
+                    &mut checkout.instance.store,
+                    (response_ptr as i32, response_len as i32),
+                )
                 .await;
         }
 
+        self.release_instance(checkout).await;
         Ok(Some(response))
+    }
+
+    async fn checkout_instance(&self) -> Result<WasmAuthenticatorCheckout, WasmAuthenticatorError> {
+        let permit = Arc::clone(&self.instance_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                WasmAuthenticatorError::Execution(
+                    "WASM authenticator instance limiter closed".to_owned(),
+                )
+            })?;
+
+        if let Some(instance) = self.instance_pool.lock().await.instances.pop() {
+            return Ok(WasmAuthenticatorCheckout { instance, permit });
+        }
+
+        let _creation = self.instance_creation.lock().await;
+        if let Some(instance) = self.instance_pool.lock().await.instances.pop() {
+            return Ok(WasmAuthenticatorCheckout { instance, permit });
+        }
+
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                http_client: self.http_client.clone(),
+                cache: Arc::clone(&self.cache),
+                state: Arc::clone(&self.state),
+                streams: HostStreams::default(),
+            },
+        );
+        let instance = self
+            .linker
+            .instantiate_async(&mut store, &self.module)
+            .await
+            .map_err(wasm_execution_error)?;
+        let instance = WasmAuthenticatorInstance::new(store, instance)?;
+        Ok(WasmAuthenticatorCheckout { instance, permit })
+    }
+
+    async fn release_instance(&self, checkout: WasmAuthenticatorCheckout) {
+        let WasmAuthenticatorCheckout {
+            mut instance,
+            permit,
+        } = checkout;
+        instance.store.data_mut().streams.clear();
+        self.instance_pool.lock().await.instances.push(instance);
+        drop(permit);
+    }
+}
+
+#[derive(Default)]
+struct WasmAuthenticatorInstancePool {
+    instances: Vec<WasmAuthenticatorInstance>,
+}
+
+struct WasmAuthenticatorCheckout {
+    instance: WasmAuthenticatorInstance,
+    permit: OwnedSemaphorePermit,
+}
+
+struct WasmAuthenticatorInstance {
+    store: Store<HostState>,
+    instance: Instance,
+    alloc: TypedFunc<i32, i32>,
+    dealloc: Option<TypedFunc<(i32, i32), ()>>,
+    memory: Memory,
+}
+
+impl WasmAuthenticatorInstance {
+    fn new(
+        mut store: Store<HostState>,
+        instance: Instance,
+    ) -> Result<Self, WasmAuthenticatorError> {
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "alloc")
+            .map_err(|_| WasmAuthenticatorError::MissingExport("alloc"))?;
+        let dealloc = optional_dealloc(&mut store, &instance)?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or(WasmAuthenticatorError::MissingExport("memory"))?;
+        Ok(Self {
+            store,
+            instance,
+            alloc,
+            dealloc,
+            memory,
+        })
     }
 }
 
@@ -1386,6 +1521,11 @@ impl HostStreams {
 
     fn remove(&mut self, handle: i32) -> Option<HostStream> {
         self.streams.remove(&handle)
+    }
+
+    fn clear(&mut self) {
+        self.next_handle = 0;
+        self.streams.clear();
     }
 }
 
