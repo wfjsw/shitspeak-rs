@@ -98,8 +98,8 @@ udp_channel_size = 4096
 
 client_idle_timeout_secs = 30
 authenticate_timeout_ms = 30000
-# Default: floor(sqrt(online CPU count)), minimum 1.
-# auth_finalization_concurrency = 4
+# Default: floor(5th root(active CPU count)), minimum 1.
+# auth_finalization_concurrency = 1
 pending_delete_timeout_ms = 5000
 
 blob_storage_dir = "/var/lib/shitspeak-rs"
@@ -218,12 +218,12 @@ udp_channel_size = 2048
 ```toml
 client_idle_timeout_secs = 30
 authenticate_timeout_ms = 30000
-# Default: floor(sqrt(online CPU count)), minimum 1.
-# auth_finalization_concurrency = 4
+# Default: floor(5th root(active CPU count)), minimum 1.
+# auth_finalization_concurrency = 1
 pending_delete_timeout_ms = 5000
 ```
 
-`authenticate_timeout_ms` starts after TLS setup. `auth_finalization_concurrency` limits how many clients can concurrently run the post-auth initial sync and publish path. When omitted, it defaults to `floor(sqrt(online CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
+`authenticate_timeout_ms` starts after TLS setup. `auth_finalization_concurrency` limits how many clients can concurrently run the post-auth initial sync and publish path. When omitted, it defaults to `floor(5th root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
 
 ## Persistence
 

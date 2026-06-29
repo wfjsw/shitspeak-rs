@@ -1133,7 +1133,7 @@ pub struct Config {
     pub authenticate_timeout_ms: u64,
     /// Maximum number of clients concurrently running post-authentication
     /// finalization (initial channel/user sync and publish). Authenticator
-    /// calls still run independently. Default: floor(sqrt(online CPU count)),
+    /// calls still run independently. Default: floor(5th root(active CPU count)),
     /// minimum 1.
     #[serde(default = "default_auth_finalization_concurrency")]
     pub auth_finalization_concurrency: usize,
@@ -1385,21 +1385,21 @@ fn default_authenticate_timeout_ms() -> u64 {
     30_000
 }
 fn default_auth_finalization_concurrency() -> usize {
-    let online_cpus = std::thread::available_parallelism()
+    let active_cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
-    integer_sqrt(online_cpus).max(1)
+    integer_fifth_root(active_cpus).max(1)
 }
-fn integer_sqrt(value: usize) -> usize {
+fn integer_fifth_root(value: usize) -> usize {
     if value <= 1 {
         return value;
     }
     let mut low = 1usize;
-    let mut high = value.min(1usize << (usize::BITS as usize / 2));
+    let mut high = value.min(1usize << ((usize::BITS as usize + 4) / 5));
     let mut answer = 1usize;
     while low <= high {
         let mid = low + (high - low) / 2;
-        if mid <= value / mid {
+        if fifth_power_at_most(mid, value) {
             answer = mid;
             low = mid + 1;
         } else {
@@ -1407,6 +1407,10 @@ fn integer_sqrt(value: usize) -> usize {
         }
     }
     answer
+}
+fn fifth_power_at_most(base: usize, value: usize) -> bool {
+    debug_assert!(base > 0);
+    base <= value / base / base / base / base
 }
 fn default_pending_delete_timeout_ms() -> u64 {
     5_000
@@ -1503,32 +1507,37 @@ mod tests {
     }
 
     #[test]
-    fn integer_sqrt_floors_without_overflow() {
+    fn integer_fifth_root_floors_without_overflow() {
         let cases = [
             (0, 0),
             (1, 1),
             (2, 1),
-            (3, 1),
-            (4, 2),
-            (8, 2),
-            (9, 3),
-            (15, 3),
-            (16, 4),
-            (usize::MAX, (1usize << (usize::BITS as usize / 2)) - 1),
+            (31, 1),
+            (32, 2),
+            (242, 2),
+            (243, 3),
+            (1023, 3),
+            (1024, 4),
+            (3124, 4),
+            (3125, 5),
         ];
         for (value, expected) in cases {
-            assert_eq!(integer_sqrt(value), expected, "value={value}");
+            assert_eq!(integer_fifth_root(value), expected, "value={value}");
         }
+
+        let max_root = integer_fifth_root(usize::MAX);
+        assert!(fifth_power_at_most(max_root, usize::MAX));
+        assert!(!fifth_power_at_most(max_root + 1, usize::MAX));
     }
 
     #[test]
-    fn auth_finalization_concurrency_defaults_to_sqrt_online_cpus() {
-        let online_cpus = std::thread::available_parallelism()
+    fn auth_finalization_concurrency_defaults_to_fifth_root_active_cpus() {
+        let active_cpus = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
         assert_eq!(
             default_auth_finalization_concurrency(),
-            integer_sqrt(online_cpus).max(1)
+            integer_fifth_root(active_cpus).max(1)
         );
     }
 
