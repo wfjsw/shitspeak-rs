@@ -1401,8 +1401,6 @@ pub struct Server {
 
     codec_info: Mutex<CodecInfo>,
 
-    authenticator: Arc<ReloadableAuthenticator>,
-
     /// Registry of server-defined context menu actions.
     context_actions: Arc<crate::context_action::ContextActionRegistry>,
 
@@ -1435,6 +1433,7 @@ struct EntrypointRuntime {
 }
 
 struct AuthFinalizationQueue {
+    authenticator: Arc<ReloadableAuthenticator>,
     semaphore: Arc<tokio::sync::Semaphore>,
     next_ticket: AtomicU64,
     waiters: Mutex<VecDeque<AuthFinalizationWaiter>>,
@@ -1492,14 +1491,35 @@ pub struct AuthFinalizationPermit {
 }
 
 impl AuthFinalizationQueue {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, authenticator: ReloadableAuthenticator) -> Self {
         Self {
+            authenticator: Arc::new(authenticator),
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
             next_ticket: AtomicU64::new(1),
             waiters: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             test_gate: Mutex::new(None),
         }
+    }
+
+    fn authenticator(&self) -> &dyn Authenticator {
+        self.authenticator.as_ref()
+    }
+
+    fn authenticator_arc(&self) -> Arc<dyn Authenticator> {
+        let authenticator: Arc<dyn Authenticator> = self.authenticator.clone();
+        authenticator
+    }
+
+    fn prepare_authenticator_reload(
+        &self,
+        config: &Config,
+    ) -> Result<Option<Arc<dyn Authenticator>>, crate::api::AuthenticatorBackendError> {
+        self.authenticator.prepare_reload(config)
+    }
+
+    fn apply_prepared_authenticator_reload(&self, next: Option<Arc<dyn Authenticator>>) {
+        self.authenticator.apply_prepared_reload(next);
     }
 
     async fn acquire(
@@ -1639,6 +1659,12 @@ impl Drop for AuthFinalizationTicket {
 impl Drop for AuthFinalizationPermit {
     fn drop(&mut self) {
         self.queue.remove_waiter(self.ticket);
+    }
+}
+
+impl AuthFinalizationPermit {
+    pub(crate) fn authenticator(&self) -> &dyn Authenticator {
+        self.queue.authenticator()
     }
 }
 
@@ -2664,13 +2690,13 @@ impl Server {
             channels,
             auth_finalization_queue: Arc::new(AuthFinalizationQueue::new(
                 auth_finalization_concurrency,
+                authenticator,
             )),
             channel_blobs,
             session_blobs,
             user_channel_cache,
             bans,
             codec_info: Mutex::new(CodecInfo::default()),
-            authenticator: Arc::new(authenticator),
             config: Arc::clone(&config),
             context_actions: Arc::new(crate::context_action::ContextActionRegistry::new()),
             s2s_manager,
@@ -2763,8 +2789,7 @@ impl Server {
     }
 
     pub fn authenticator_arc(&self) -> Arc<dyn Authenticator> {
-        let authenticator: Arc<dyn Authenticator> = self.authenticator.clone();
-        authenticator
+        self.auth_finalization_queue.authenticator_arc()
     }
 
     pub async fn run(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
@@ -4105,7 +4130,9 @@ impl Server {
             Ok(Some(new_config)) => {
                 validate_privacy_config(&new_config)?;
                 let next_tls_acceptor = load_c2s_tls_acceptor(&new_config, &self.extensions)?;
-                let prepared_authenticator = self.authenticator.prepare_reload(&new_config)?;
+                let prepared_authenticator = self
+                    .auth_finalization_queue
+                    .prepare_authenticator_reload(&new_config)?;
                 let authenticator_reloaded = prepared_authenticator.is_some();
 
                 self.apply_entrypoint_config(&new_config).await?;
@@ -4299,8 +4326,8 @@ impl Server {
                 if invalidate_acl_cache {
                     self.channels.invalidate_acl_cache_for_channel(0).await;
                 }
-                self.authenticator
-                    .apply_prepared_reload(prepared_authenticator);
+                self.auth_finalization_queue
+                    .apply_prepared_authenticator_reload(prepared_authenticator);
                 if authenticator_reloaded {
                     tracing::info!("config reload: authenticator backend reloaded");
                 }
@@ -4319,7 +4346,7 @@ impl Server {
     }
 
     pub fn get_authenticator(&self) -> &dyn Authenticator {
-        self.authenticator.as_ref()
+        self.auth_finalization_queue.authenticator()
     }
 
     pub fn get_bans(&self) -> &Arc<crate::ban_repository::BanRepository> {

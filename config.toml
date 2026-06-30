@@ -70,8 +70,6 @@ backend = "demo"
 # WASM authenticator configuration used when `backend = "wasm"`.
 # [authenticator.wasm]
 # path = "auth.wasm"
-# Defaults to active CPU count; set to 1 to serialize WASM auth calls.
-# max_instances = 4
 # file_access_dir = ["auth-files"]
 # working_dir = "auth-files"
 

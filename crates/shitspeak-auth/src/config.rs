@@ -165,9 +165,6 @@ pub struct WasmAuthenticatorConfig {
     /// on hot reload.
     #[serde(default)]
     path: Option<PathBuf>,
-    /// Maximum number of WASM instances that may be checked out concurrently.
-    #[serde(default = "default_wasm_authenticator_max_instances")]
-    max_instances: usize,
     /// Optional directories that bound WASM authenticator file stream access.
     /// When empty, file stream imports are unavailable.
     #[serde(default)]
@@ -182,7 +179,6 @@ impl Default for WasmAuthenticatorConfig {
     fn default() -> Self {
         Self {
             path: None,
-            max_instances: default_wasm_authenticator_max_instances(),
             file_access_dir: Vec::new(),
             working_dir: None,
         }
@@ -195,11 +191,6 @@ impl WasmAuthenticatorConfig {
             path: Some(path.into()),
             ..Self::default()
         }
-    }
-
-    pub fn with_max_instances(mut self, max_instances: usize) -> Self {
-        self.max_instances = max_instances.max(1);
-        self
     }
 
     pub fn with_file_access_dir(
@@ -217,10 +208,6 @@ impl WasmAuthenticatorConfig {
 
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
-    }
-
-    pub fn max_instances(&self) -> usize {
-        self.max_instances.max(1)
     }
 
     pub fn file_access_dir(&self) -> &[PathBuf] {
@@ -293,11 +280,4 @@ fn default_exec_authenticator_timeout_ms() -> u64 {
 
 fn default_exec_authenticator_max_response_bytes() -> usize {
     16 * 1024 * 1024
-}
-
-pub(crate) fn default_wasm_authenticator_max_instances() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
-        .max(1)
 }

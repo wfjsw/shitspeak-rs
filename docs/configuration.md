@@ -113,7 +113,6 @@ backend = "wasm"
 
 [authenticator.wasm]
 path = "/etc/shitspeak-rs/auth/auth.wasm"
-max_instances = 4
 
 [privacy]
 protect_certificate_hashes = "irreversible"
@@ -224,7 +223,7 @@ authenticate_timeout_ms = 30000
 pending_delete_timeout_ms = 5000
 ```
 
-`authenticate_timeout_ms` starts after TLS setup. `auth_finalization_concurrency` limits how many clients can concurrently run the post-auth initial sync and publish path. When omitted, it defaults to `floor(5th root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
+`authenticate_timeout_ms` starts after TLS setup. `auth_finalization_concurrency` limits how many clients can concurrently run authenticator backend work and the initial sync/publish path. When omitted, it defaults to `floor(5th root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
 
 ## Persistence
 
@@ -267,12 +266,11 @@ backend = "wasm"
 
 [authenticator.wasm]
 path = "auth/auth.wasm"
-max_instances = 4
 file_access_dir = ["auth/files"]
 working_dir = "auth/files"
 ```
 
-`max_instances` defaults to the active CPU count and caps how many reusable WASM instances can execute concurrently. Lower it to reduce authenticator CPU pressure, or raise it for more WASM auth parallelism without changing `auth_finalization_concurrency`, which limits the later post-auth initial sync/publish path. Instance creation itself remains serialized. `file_access_dir` bounds file access from the WASM raw stream imports. When it is empty, file stream imports are unavailable.
+The server keeps a reusable pool of WASM instances and creates more as queued authenticator work needs them. `auth_finalization_concurrency` controls how many login authenticator calls can run at once. Instance creation itself remains serialized. `file_access_dir` bounds file access from the WASM raw stream imports. When it is empty, file stream imports are unavailable.
 
 ### Exec Authenticator
 

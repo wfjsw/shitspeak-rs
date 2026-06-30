@@ -1886,7 +1886,6 @@ mod tests {
 
                     [authenticator.wasm]
                     path = "auth.wasm"
-                    max_instances = 3
                     file_access_dir = ["auth-files", "shared-auth-files"]
                     working_dir = "auth-files"
                 "#,
@@ -1902,7 +1901,6 @@ mod tests {
             cfg.authenticator.wasm().path().map(PathBuf::as_path),
             Some(Path::new("auth.wasm"))
         );
-        assert_eq!(cfg.authenticator.wasm().max_instances(), 3);
         assert_eq!(
             cfg.authenticator.wasm().file_access_dir(),
             [

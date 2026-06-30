@@ -94,9 +94,11 @@ pub async fn handle_authenticate(
         );
     }
 
+    let auth_permit = server.acquire_auth_finalization_permit(sender).await?;
+
     // ── Authenticate ──────────────────────────────────────────────────────
-    let auth_result = server
-        .get_authenticator()
+    let auth_result = auth_permit
+        .authenticator()
         .authenticate(&username, password.as_deref(), &auth_auxiliary)
         .await;
 
@@ -200,7 +202,7 @@ pub async fn handle_authenticate(
         }
         None => match result.user_id {
             Some(user_id) => {
-                let hash = match server.get_authenticator().get_user_texture(user_id).await {
+                let hash = match auth_permit.authenticator().get_user_texture(user_id).await {
                     Some(texture) if !texture.is_empty() => server
                         .get_session_blobs()
                         .put_content(&texture)
@@ -232,7 +234,7 @@ pub async fn handle_authenticate(
         }
         None => match result.user_id {
             Some(user_id) => {
-                let hash = match server.get_authenticator().get_user_comment(user_id).await {
+                let hash = match auth_permit.authenticator().get_user_comment(user_id).await {
                     Some(comment) if !comment.is_empty() => server
                         .get_session_blobs()
                         .put_content(comment.as_bytes())
@@ -308,7 +310,6 @@ pub async fn handle_authenticate(
     };
 
     sender.set_authenticated(true);
-    let _auth_finalization_permit = server.acquire_auth_finalization_permit(sender).await?;
 
     // ── Place user in cached/default channel ─────────────────────────────
     {
@@ -567,6 +568,8 @@ pub async fn handle_authenticate(
     }
 
     spawn_permission_info_refresh(server, sender);
+
+    drop(auth_permit);
 
     // The AddClient log entry (emitted by allocate_local_client) will drive
     // the UserState broadcast to all existing per-client subscribers.

@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Mutex;
 use tokio::time;
 use wasmtime::{
     Caller, Config as WasmConfig, Engine as WasmEngine, Extern, ExternType, Instance, Linker,
@@ -24,10 +24,7 @@ use wasmtime::{
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 
 use crate::Language;
-use crate::config::{
-    AuthenticatorBackend, AuthenticatorConfigSource, ExecAuthenticatorMode,
-    default_wasm_authenticator_max_instances,
-};
+use crate::config::{AuthenticatorBackend, AuthenticatorConfigSource, ExecAuthenticatorMode};
 use crate::http_client;
 
 use super::ExecAuthenticator;
@@ -232,7 +229,6 @@ fn load_authenticator_from_config(
             load_wasm_authenticator(
                 path,
                 config.authenticator_blob_storage_dir(),
-                wasm.max_instances(),
                 wasm.file_access_dir(),
                 wasm.working_dir().map(PathBuf::as_path),
             )
@@ -252,14 +248,12 @@ fn load_authenticator_from_config(
 fn load_wasm_authenticator(
     path: &Path,
     storage_dir: Option<&Path>,
-    max_instances: usize,
     file_access_dirs: &[PathBuf],
     working_dir: Option<&Path>,
 ) -> Result<Arc<dyn Authenticator>, WasmAuthenticatorError> {
-    Ok(Arc::new(WasmAuthenticator::from_file_with_max_instances(
+    Ok(Arc::new(WasmAuthenticator::from_file(
         path,
         storage_dir,
-        max_instances,
         file_access_dirs,
         working_dir,
     )?))
@@ -276,27 +270,6 @@ mod tests {
             .with_wasm(WasmAuthenticatorConfig::new("auth.wasm"));
 
         assert!(load_authenticator_from_config(&config).is_ok());
-    }
-
-    #[test]
-    fn wasm_config_defaults_to_active_cpu_count() {
-        let active_cpus = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1);
-        assert_eq!(
-            WasmAuthenticatorConfig::default().max_instances(),
-            active_cpus
-        );
-        assert_eq!(
-            WasmAuthenticatorConfig::new("auth.wasm").max_instances(),
-            active_cpus
-        );
-        assert_eq!(
-            WasmAuthenticatorConfig::new("auth.wasm")
-                .with_max_instances(0)
-                .max_instances(),
-            1
-        );
     }
 
     #[test]
@@ -353,22 +326,6 @@ impl WasmAuthenticator {
         file_access_dirs: &[PathBuf],
         working_dir: Option<&Path>,
     ) -> Result<Self, WasmAuthenticatorError> {
-        Self::from_file_with_max_instances(
-            path,
-            storage_dir,
-            default_wasm_authenticator_max_instances(),
-            file_access_dirs,
-            working_dir,
-        )
-    }
-
-    pub fn from_file_with_max_instances(
-        path: &Path,
-        storage_dir: Option<&Path>,
-        max_instances: usize,
-        file_access_dirs: &[PathBuf],
-        working_dir: Option<&Path>,
-    ) -> Result<Self, WasmAuthenticatorError> {
         let bytes = std::fs::read(path).map_err(|source| WasmAuthenticatorError::Read {
             path: path.to_path_buf(),
             source,
@@ -405,7 +362,6 @@ impl WasmAuthenticator {
                     working_dir,
                 )?),
                 instance_pool: Mutex::new(WasmAuthenticatorInstancePool::default()),
-                instance_slots: Arc::new(Semaphore::new(max_instances.max(1))),
                 instance_creation: Mutex::new(()),
             }),
         })
@@ -522,7 +478,6 @@ struct CompiledWasmAuthenticator {
     cache: Arc<WasmAuthCache>,
     state: Arc<WasmAuthState>,
     instance_pool: Mutex<WasmAuthenticatorInstancePool>,
-    instance_slots: Arc<Semaphore>,
     instance_creation: Mutex<()>,
 }
 
@@ -637,22 +592,13 @@ impl CompiledWasmAuthenticator {
     }
 
     async fn checkout_instance(&self) -> Result<WasmAuthenticatorCheckout, WasmAuthenticatorError> {
-        let permit = Arc::clone(&self.instance_slots)
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                WasmAuthenticatorError::Execution(
-                    "WASM authenticator instance limiter closed".to_owned(),
-                )
-            })?;
-
         if let Some(instance) = self.instance_pool.lock().await.instances.pop() {
-            return Ok(WasmAuthenticatorCheckout { instance, permit });
+            return Ok(WasmAuthenticatorCheckout { instance });
         }
 
         let _creation = self.instance_creation.lock().await;
         if let Some(instance) = self.instance_pool.lock().await.instances.pop() {
-            return Ok(WasmAuthenticatorCheckout { instance, permit });
+            return Ok(WasmAuthenticatorCheckout { instance });
         }
 
         let mut store = Store::new(
@@ -670,17 +616,13 @@ impl CompiledWasmAuthenticator {
             .await
             .map_err(wasm_execution_error)?;
         let instance = WasmAuthenticatorInstance::new(store, instance)?;
-        Ok(WasmAuthenticatorCheckout { instance, permit })
+        Ok(WasmAuthenticatorCheckout { instance })
     }
 
     async fn release_instance(&self, checkout: WasmAuthenticatorCheckout) {
-        let WasmAuthenticatorCheckout {
-            mut instance,
-            permit,
-        } = checkout;
+        let WasmAuthenticatorCheckout { mut instance } = checkout;
         instance.store.data_mut().streams.clear();
         self.instance_pool.lock().await.instances.push(instance);
-        drop(permit);
     }
 }
 
@@ -691,7 +633,6 @@ struct WasmAuthenticatorInstancePool {
 
 struct WasmAuthenticatorCheckout {
     instance: WasmAuthenticatorInstance,
-    permit: OwnedSemaphorePermit,
 }
 
 struct WasmAuthenticatorInstance {
