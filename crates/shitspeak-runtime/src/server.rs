@@ -76,7 +76,7 @@ const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 128;
 const DYNAMIC_ENTRYPOINT_MIN_PORT: u16 = 49152;
 const DYNAMIC_ENTRYPOINT_MAX_PORT: u16 = 65535;
 const MIN_AUTHENTICATE_TIMEOUT_MS: u64 = 1;
-const AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL: Duration = Duration::from_secs(1);
+const AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
 const PRE_AUTH_DEFERRED_MESSAGE_LIMIT: usize = 32;
 
 pub type ServerExtensionFuture<'a> =
