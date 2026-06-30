@@ -25,7 +25,7 @@ use tracing::Instrument;
 
 use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
-use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
+use crate::channel_handler::{ChannelReplayError, ChannelTreeShadow, SessionChannelShadow};
 use crate::channel_repository::{
     ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
 };
@@ -63,6 +63,13 @@ use crate::{
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
 type UdpPacket = (Bytes, std::net::SocketAddr, std::net::SocketAddr);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelLogReceiveOutcome {
+    Continue,
+    Closed,
+}
+
 const CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT: usize = 64;
 const ALPN_MUMBLE: &[u8] = b"mumble";
 const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 128;
@@ -1913,6 +1920,14 @@ fn map_handler_result(
     }
 }
 
+fn map_channel_replay_error(error: ChannelReplayError) -> HandleIncomingConnectionError {
+    match error {
+        ChannelReplayError::ClientWriteFailed(error) => {
+            HandleIncomingConnectionError::ClientWriteFailed(error)
+        }
+    }
+}
+
 async fn activate_client_subscriptions(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -2464,7 +2479,7 @@ async fn append_client_log_entry_messages(
                 dep + 1,
             )
             .await
-            .map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
+            .map_err(map_channel_replay_error)?;
         }
     }
 
@@ -2585,6 +2600,164 @@ fn spawn_native_client_writer_task(
         }
         .instrument(span),
     ))
+}
+
+async fn process_channel_log_result(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_session_id: ClientSessionIdentifier,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    result: Option<Result<Arc<ChannelOperation>, tokio::sync::broadcast::error::RecvError>>,
+) -> Result<ChannelLogReceiveOutcome, HandleIncomingConnectionError> {
+    match result {
+        Some(Ok(op)) => {
+            if op.server_id != client.server_id() {
+                return Ok(ChannelLogReceiveOutcome::Continue);
+            }
+            let last = client.get_last_channel_version().await;
+            if op.version <= last && !op.is_root_name_config_update() {
+                return Ok(ChannelLogReceiveOutcome::Continue);
+            }
+            if op.version > last {
+                replay_channel_log_gap(
+                    server,
+                    client,
+                    &server.channels,
+                    channel_tree_shadow,
+                    session_channel_shadow,
+                    user_visibility,
+                    client_session_id,
+                    last,
+                    op.version,
+                )
+                .await
+                .map_err(map_channel_replay_error)?;
+            }
+            let last_after_replay = client.get_last_channel_version().await;
+            if op.version <= last_after_replay && !op.is_root_name_config_update() {
+                return Ok(ChannelLogReceiveOutcome::Continue);
+            }
+
+            let messages =
+                crate::channel_handler::convert_channel_operation_to_messages_with_shadow(
+                    server,
+                    client,
+                    &op,
+                    &server.channels,
+                    Some(session_channel_shadow),
+                )
+                .await;
+            let mut outbound = Vec::new();
+            for msg in messages {
+                let projected = crate::client::visibility::project_message_with_shadow(
+                    server,
+                    client,
+                    user_visibility,
+                    session_channel_shadow,
+                    &client.server_id(),
+                    &msg,
+                )
+                .await;
+                for msg in projected {
+                    crate::channel_handler::sync_channel_tree_shadow(channel_tree_shadow, &msg);
+                    outbound.push(msg);
+                }
+            }
+            let refresh_scope =
+                crate::client::visibility::visibility_refresh_scope_for_channel_operation(
+                    server, &op,
+                )
+                .await;
+            let projected = crate::client::visibility::visibility_refresh_messages_with_shadow(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                &client.server_id(),
+                refresh_scope,
+            )
+            .await;
+            for msg in projected {
+                crate::channel_handler::sync_channel_tree_shadow(channel_tree_shadow, &msg);
+                outbound.push(msg);
+            }
+            client
+                .write_proto_message_batch(&outbound)
+                .await
+                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+            if op.version > last_after_replay {
+                client.set_last_channel_version(op.version).await;
+            }
+            Ok(ChannelLogReceiveOutcome::Continue)
+        }
+        Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+            let last = client.get_last_channel_version().await;
+            replay_channel_log_gap(
+                server,
+                client,
+                &server.channels,
+                channel_tree_shadow,
+                session_channel_shadow,
+                user_visibility,
+                client_session_id,
+                last,
+                u64::MAX,
+            )
+            .await
+            .map_err(map_channel_replay_error)?;
+            Ok(ChannelLogReceiveOutcome::Continue)
+        }
+        Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+            Ok(ChannelLogReceiveOutcome::Closed)
+        }
+        None => Ok(ChannelLogReceiveOutcome::Continue),
+    }
+}
+
+async fn drain_ready_channel_log_before_client_log(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    client_session_id: ClientSessionIdentifier,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    channel_log_rx: &mut Option<ChannelLogReceiver>,
+) -> Result<ChannelLogReceiveOutcome, HandleIncomingConnectionError> {
+    let Some(rx) = channel_log_rx.as_mut() else {
+        return Ok(ChannelLogReceiveOutcome::Continue);
+    };
+
+    for _ in 0..CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT {
+        let result = match rx.try_recv() {
+            Ok(op) => Some(Ok(op)),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                Some(Err(tokio::sync::broadcast::error::RecvError::Closed))
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => Some(Err(
+                tokio::sync::broadcast::error::RecvError::Lagged(skipped),
+            )),
+        };
+
+        if process_channel_log_result(
+            server,
+            client,
+            client_session_id,
+            channel_tree_shadow,
+            session_channel_shadow,
+            user_visibility,
+            result,
+        )
+        .await?
+            == ChannelLogReceiveOutcome::Closed
+        {
+            return Ok(ChannelLogReceiveOutcome::Closed);
+        }
+    }
+
+    Ok(ChannelLogReceiveOutcome::Continue)
 }
 
 async fn process_client_log_broadcasts(
@@ -4171,82 +4344,37 @@ impl Server {
                     // Must come BEFORE client_log_rx in select! to ensure
                     // channel updates are delivered before client state updates.
                     result = recv_optional(channel_log_rx.as_mut()), if channel_log_rx.is_some() => {
-                        match result {
-            Some(Ok(op)) => {
-                if op.server_id != client.server_id() {
-                    continue;
-                }
-                let last = client.get_last_channel_version().await;
-                if op.version <= last && !op.is_root_name_config_update() {
-                    continue;
-                }
-                if op.version > last {
-                                replay_channel_log_gap(
-                                    self, &client, &self.channels, &mut channel_tree_shadow, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, op.version,
-                                ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
-                }
-                                let last_after_replay = client.get_last_channel_version().await;
-                                if op.version <= last_after_replay && !op.is_root_name_config_update() {
-                                    continue;
-                                }
-
-                                // Use unified message conversion function
-                                let messages = crate::channel_handler::convert_channel_operation_to_messages_with_shadow(
-                                    self,
-                                    &client,
-                                    &op,
-                                    &self.channels,
-                                    Some(&mut session_channel_shadow),
-                                ).await;
-                                let mut outbound = Vec::new();
-                                for msg in messages {
-                                    let projected = crate::client::visibility::project_message_with_shadow(
-                                        self,
-                                        &client,
-                                        &mut user_visibility,
-                                        &mut session_channel_shadow,
-                                        &client.server_id(),
-                                        &msg,
-                                    ).await;
-                                    for msg in projected {
-                                        crate::channel_handler::sync_channel_tree_shadow(&mut channel_tree_shadow, &msg);
-                                        outbound.push(msg);
-                                    }
-                                }
-                                let refresh_scope = crate::client::visibility::visibility_refresh_scope_for_channel_operation(self, &op).await;
-                                let projected = crate::client::visibility::visibility_refresh_messages_with_shadow(
-                                    self,
-                                    &client,
-                                    &mut user_visibility,
-                                    &mut session_channel_shadow,
-                                    &client.server_id(),
-                                    refresh_scope,
-                                ).await;
-                                for msg in projected {
-                                    crate::channel_handler::sync_channel_tree_shadow(&mut channel_tree_shadow, &msg);
-                                    outbound.push(msg);
-                                }
-                                client.write_proto_message_batch(&outbound).await
-                                    .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                if op.version > last_after_replay {
-                                    client.set_last_channel_version(op.version).await;
-                                }
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-                                let last = client.get_last_channel_version().await;
-                                replay_channel_log_gap(
-                                    self, &client, &self.channels, &mut channel_tree_shadow, &mut session_channel_shadow, &mut user_visibility, client_session_id, last, u64::MAX,
-                                ).await.map_err(|()| HandleIncomingConnectionError::ChannelLogGapUnrecoverable)?;
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                                return Ok(());
-                            }
-                            None => {} // not subscribed yet
+                        if process_channel_log_result(
+                            self,
+                            &client,
+                            client_session_id,
+                            &mut channel_tree_shadow,
+                            &mut session_channel_shadow,
+                            &mut user_visibility,
+                            result,
+                        )
+                        .await? == ChannelLogReceiveOutcome::Closed
+                        {
+                            return Ok(());
                         }
                     }
 
                     // ── Client state change notification ─────────────────────
                     result = recv_optional(client_log_rx.as_mut()), if client_log_rx.is_some() => {
+                        if drain_ready_channel_log_before_client_log(
+                            self,
+                            &client,
+                            client_session_id,
+                            &mut channel_tree_shadow,
+                            &mut session_channel_shadow,
+                            &mut user_visibility,
+                            &mut channel_log_rx,
+                        )
+                        .await? == ChannelLogReceiveOutcome::Closed
+                        {
+                            return Ok(());
+                        }
+
                         match result {
                             Some(Ok(broadcast)) => {
                                 if let Some(rx) = client_log_rx.as_mut() {

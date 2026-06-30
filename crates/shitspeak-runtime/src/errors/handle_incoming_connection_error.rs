@@ -168,4 +168,14 @@ mod tests {
         ));
         assert!(!err.is_clean_disconnect());
     }
+
+    #[test]
+    fn client_write_failure_is_not_reported_as_log_pruned() {
+        let err = HandleIncomingConnectionError::ClientWriteFailed(WriteProtoMessageError::from(
+            io_error(std::io::ErrorKind::BrokenPipe),
+        ));
+
+        assert!(!err.to_string().contains("log pruned"));
+        assert!(err.to_string().contains("Client write failed"));
+    }
 }

@@ -22,12 +22,18 @@ use crate::{
             is_member_in_group,
         },
     },
+    errors::WriteProtoMessageError,
     messages::{Message, encoder::ChannelState},
     server::Server,
 };
 
 pub type SessionChannelShadow = HashMap<ClientSessionIdentifier, u32>;
 pub type ChannelTreeShadow = HashSet<u32>;
+
+#[derive(Debug)]
+pub(crate) enum ChannelReplayError {
+    ClientWriteFailed(WriteProtoMessageError),
+}
 
 pub fn sync_channel_tree_shadow(shadow: &mut ChannelTreeShadow, message: &Message) {
     match message {
@@ -436,7 +442,7 @@ pub async fn replay_channel_log_gap(
     session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
     last: u64,
     current: u64,
-) -> Result<(), ()> {
+) -> Result<(), ChannelReplayError> {
     if current <= last + 1 {
         return Ok(());
     }
@@ -547,9 +553,10 @@ pub async fn replay_channel_log_gap(
         client.set_last_channel_version(entry.version).await;
     }
 
-    if client.write_proto_message_batch(&outbound).await.is_err() {
-        return Err(());
-    }
+    client
+        .write_proto_message_batch(&outbound)
+        .await
+        .map_err(ChannelReplayError::ClientWriteFailed)?;
 
     Ok(())
 }
@@ -563,7 +570,7 @@ async fn replay_channel_snapshot(
     user_visibility: &mut crate::client::visibility::UserVisibilityState,
     server_id: &str,
     latest: u64,
-) -> Result<(), ()> {
+) -> Result<(), ChannelReplayError> {
     let snapshot = channels.get_all_in_server(server_id).await;
     let current: ChannelTreeShadow = snapshot.iter().map(|channel| channel.id).collect();
     let mut removed = channel_tree_shadow
@@ -601,9 +608,10 @@ async fn replay_channel_snapshot(
         }
     }
 
-    if client.write_proto_message_batch(&outbound).await.is_err() {
-        return Err(());
-    }
+    client
+        .write_proto_message_batch(&outbound)
+        .await
+        .map_err(ChannelReplayError::ClientWriteFailed)?;
 
     *channel_tree_shadow = current;
     client.set_last_channel_version(latest).await;

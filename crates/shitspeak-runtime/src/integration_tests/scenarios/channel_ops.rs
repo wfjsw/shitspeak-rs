@@ -649,6 +649,96 @@ async fn simultaneous_temporary_channels_get_distinct_ids() {
 }
 
 #[tokio::test]
+async fn channel_dependency_gap_replays_missing_create_before_user_move() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let before_create = server
+        .server
+        .get_channels()
+        .current_version_in_server(DEFAULT_SERVER_ID);
+    let temp_channel_id = create_channel_and_wait(&alice, 0, "DependencyReplayTemp", true).await;
+    wait_for_user_in_channel(&alice, alice.session_id, temp_channel_id).await;
+
+    let create_version = server
+        .server
+        .get_channels()
+        .current_version_in_server(DEFAULT_SERVER_ID);
+    assert_eq!(
+        create_version,
+        before_create + 1,
+        "precondition: temp channel create should advance channel version once"
+    );
+
+    let bob_server_client = server
+        .server
+        .get_clients()
+        .get_client_in_server(DEFAULT_SERVER_ID, bob.server_session)
+        .await
+        .expect("server-side bob client");
+    let _ = bob.drain_now().await;
+    bob_server_client
+        .set_last_channel_version(before_create)
+        .await;
+
+    let mut channel_tree_shadow = ChannelTreeShadow::default();
+    channel_tree_shadow.insert(0);
+    let mut session_channel_shadow = SessionChannelShadow::new();
+    session_channel_shadow.insert(alice.server_session, 0);
+    session_channel_shadow.insert(bob.server_session, 0);
+    let mut user_visibility = UserVisibilityState::default();
+
+    replay_channel_log_gap(
+        &server.server,
+        &bob_server_client,
+        server.server.get_channels(),
+        &mut channel_tree_shadow,
+        &mut session_channel_shadow,
+        &mut user_visibility,
+        bob_server_client.get_session_id(),
+        before_create,
+        create_version + 1,
+    )
+    .await
+    .expect("client-state dependency gap should replay the missing channel create");
+
+    let replayed_create = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::ChannelState(cs)
+                    if cs.channel_id == Some(temp_channel_id)
+                        && cs.name.as_deref() == Some("DependencyReplayTemp"))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        replayed_create.is_some(),
+        "viewer should receive the missing channel create before the dependent user move"
+    );
+    assert_eq!(
+        bob_server_client.get_last_channel_version().await,
+        create_version
+    );
+    assert!(
+        !bob.recv_closed(Duration::from_millis(200)).await,
+        "replaying a one-op channel dependency gap should keep the viewer connected"
+    );
+}
+
+#[tokio::test]
 async fn temp_channel_log_gap_snapshot_removes_stale_channel_without_disconnect() {
     let server = spawn_test_server(TestServerOpts {
         channel_log_max_entries: 1,
