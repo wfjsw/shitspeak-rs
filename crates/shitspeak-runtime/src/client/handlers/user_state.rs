@@ -545,12 +545,16 @@ pub async fn handle_user_state(
                 listening_channel_remove: msg.listening_channel_remove.clone(),
                 expected_from_channel: Some(target_current_channel_id),
             };
-            if !server.s2s_manager().dispatch_moderation_user_state(
-                Some(&server_id),
-                sender_id,
-                target_session_id,
-                patch,
-            ) {
+            if !server
+                .s2s_manager()
+                .dispatch_moderation_user_state(
+                    Some(&server_id),
+                    sender_id,
+                    target_session_id,
+                    patch,
+                )
+                .await
+            {
                 tracing::trace!(
                     target = u32::from(target_session_id),
                     "cross-owner UserState dropped: S2S gateway unavailable",

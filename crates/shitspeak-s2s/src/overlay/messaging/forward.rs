@@ -864,6 +864,30 @@ mod tests {
         data
     }
 
+    async fn fill_outbound_queue(transport: &ConnectionManager, peer: NodeIdentifier) {
+        for _ in 0..4096 {
+            match transport
+                .try_send(
+                    peer,
+                    ServiceLevel::Reliable,
+                    None,
+                    MessageClass::Regular,
+                    Bytes::from_static(b"x"),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(SendError::Backpressure { node, transport }) => {
+                    assert_eq!(node, peer);
+                    assert_eq!(transport, TransportKind::Tcp);
+                    return;
+                }
+                Err(err) => panic!("unexpected outbound queue fill error: {err:?}"),
+            }
+        }
+        panic!("outbound test queue did not report backpressure");
+    }
+
     #[test]
     fn payload_hex_preview_is_bounded() {
         assert_eq!(payload_hex_preview(&[]), "");
@@ -1001,16 +1025,7 @@ mod tests {
     async fn transit_overlay_forward_returns_promptly_when_peer_outbound_queue_is_full() {
         let (transport, _receivers) =
             ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
-        transport
-            .try_send(
-                4,
-                ServiceLevel::Reliable,
-                None,
-                MessageClass::Regular,
-                Bytes::from_static(b"fill"),
-            )
-            .await
-            .unwrap();
+        fill_outbound_queue(&transport, 4).await;
         let routing = routing_with_route(4, 4);
 
         timeout(
@@ -1033,16 +1048,7 @@ mod tests {
     async fn originated_overlay_forward_returns_backpressure_when_peer_outbound_queue_is_full() {
         let (transport, _receivers) =
             ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
-        transport
-            .try_send(
-                4,
-                ServiceLevel::Reliable,
-                None,
-                MessageClass::Regular,
-                Bytes::from_static(b"fill"),
-            )
-            .await
-            .unwrap();
+        fill_outbound_queue(&transport, 4).await;
         let routing = routing_with_route(4, 4);
 
         let err = timeout(
@@ -1073,16 +1079,7 @@ mod tests {
     async fn originated_overlay_forward_still_reaches_healthy_peer_when_another_queue_is_full() {
         let (transport_to_stuck, _stuck_rx) =
             ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
-        transport_to_stuck
-            .try_send(
-                4,
-                ServiceLevel::Reliable,
-                None,
-                MessageClass::Regular,
-                Bytes::from_static(b"fill"),
-            )
-            .await
-            .unwrap();
+        fill_outbound_queue(&transport_to_stuck, 4).await;
 
         let transport = transport_to_stuck;
         let mut healthy_rx = transport.test_install_live_stream(5, TransportKind::Tcp);

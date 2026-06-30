@@ -29,10 +29,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
 use tracing::warn;
 
-use shitspeak_s2s_transport::Inbound;
+use shitspeak_s2s_transport::{AdaptiveInboundReceiver, Inbound};
 
 use super::lsdb::{
     LinkStateDb, LsaEmitter, LsaFloodPacer, handle_flood, handle_sync_request, handle_sync_response,
@@ -69,11 +68,7 @@ pub(crate) fn spawn_dispatcher(ctx: Arc<DispatcherCtx>, inbound: Inbound) {
     tokio::spawn(run_queue(ctx, regular, "regular"));
 }
 
-async fn run_queue(
-    ctx: Arc<DispatcherCtx>,
-    mut rx: mpsc::Receiver<shitspeak_s2s_transport::InboundMessage>,
-    label: &'static str,
-) {
+async fn run_queue(ctx: Arc<DispatcherCtx>, mut rx: AdaptiveInboundReceiver, label: &'static str) {
     loop {
         tokio::select! {
             biased;

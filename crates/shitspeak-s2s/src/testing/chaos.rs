@@ -26,12 +26,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rand::RngExt;
-use tokio::sync::mpsc;
 use tracing::trace;
 
 use crate::overlay::proto::{OverlayBody, decode_message};
 use shitspeak_core::NodeIdentifier;
-use shitspeak_s2s_transport::{Inbound, InboundMessage, MessageClass};
+use shitspeak_s2s_transport::{
+    AdaptiveInboundReceiver, AdaptiveQueueBudget, AdaptiveQueueSender, Inbound, InboundMessage,
+    MessageClass,
+};
 
 /// Variants of `OverlayMessage.body`. Used by per-type drop/filter rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -261,9 +263,10 @@ impl LinkChaos {
     /// spawned (one per priority queue) to avoid head-of-line blocking
     /// between classes.
     pub fn install(&self, real: Inbound) -> Inbound {
-        let (control_tx, control_rx) = mpsc::channel(1024);
-        let (high_tx, high_rx) = mpsc::channel(1024);
-        let (reg_tx, reg_rx) = mpsc::channel(1024);
+        let budget = AdaptiveQueueBudget::new(3 * 1024 * 1024);
+        let (control_tx, control_rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
+        let (high_tx, high_rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
+        let (reg_tx, reg_rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
         let (real_control, real_high, real_reg) = real.into_parts();
         spawn_filter(
             self.clone(),
@@ -285,8 +288,8 @@ impl Default for LinkChaos {
 
 fn spawn_filter(
     chaos: LinkChaos,
-    mut rx: mpsc::Receiver<InboundMessage>,
-    tx: mpsc::Sender<InboundMessage>,
+    mut rx: AdaptiveInboundReceiver,
+    tx: AdaptiveQueueSender<InboundMessage>,
     _class: MessageClass,
 ) {
     tokio::spawn(async move {

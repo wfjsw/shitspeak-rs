@@ -94,6 +94,38 @@ pub async fn handle_authenticate(
         );
     }
 
+    // Send CryptSetup before auth finalization can queue. Native clients start
+    // probing encrypted UDP as soon as they have keys; if this waits behind the
+    // login queue they can falsely latch onto TCP voice for several seconds.
+    let crypt_setup_msg: Message = {
+        let needs_crypt_state = sender.crypt_state().is_none();
+        if needs_crypt_state {
+            if let Err(e) = server
+                .create_client_crypt_state(sender, "OCB2-AES128")
+                .await
+            {
+                tracing::error!(
+                    session = u32::from(session),
+                    error = %e,
+                    "Failed to create crypt state"
+                );
+                return Err(AuthRejection::new(RejectType::None)
+                    .because(text(sender.language(), TextKey::CryptSetupFailed))
+                    .into());
+            }
+        }
+
+        let crypt = sender.crypt_state();
+        let state = crypt.as_ref().expect("crypt state just created");
+        crate::messages::encoder::CryptSetup::new(
+            state.key().map(Bytes::copy_from_slice),
+            Some(Bytes::copy_from_slice(state.decrypt_iv())),
+            Some(Bytes::copy_from_slice(state.encrypt_iv())),
+        )
+        .into()
+    };
+    sender.write_proto_message(&crypt_setup_msg).await?;
+
     let auth_permit = server.acquire_auth_finalization_permit(sender).await?;
 
     // ── Authenticate ──────────────────────────────────────────────────────
@@ -290,25 +322,6 @@ pub async fn handle_authenticate(
         }
     }
 
-    // ── Generate crypt state and send CryptSetup ──────────────────────────
-    if let Err(e) = sender.create_crypt_state("OCB2-AES128") {
-        tracing::error!(session = u32::from(session), error = %e, "Failed to create crypt state");
-        return Err(AuthRejection::new(RejectType::None)
-            .because(text(sender.language(), TextKey::CryptSetupFailed))
-            .into());
-    }
-
-    let crypt_setup_msg: Message = {
-        let crypt = sender.crypt_state();
-        let state = crypt.as_ref().expect("crypt state just created");
-        crate::messages::encoder::CryptSetup::new(
-            state.key().map(Bytes::copy_from_slice),
-            Some(Bytes::copy_from_slice(state.decrypt_iv())),
-            Some(Bytes::copy_from_slice(state.encrypt_iv())),
-        )
-        .into()
-    };
-
     sender.set_authenticated(true);
 
     // ── Place user in cached/default channel ─────────────────────────────
@@ -379,18 +392,20 @@ pub async fn handle_authenticate(
 
     // ── Build the full burst of messages to send to the new client ────────
     //
-    // All of the following are sent to the joining client in a single batch
-    // write to avoid per-message syscall overhead:
+    // CryptSetup was sent before auth finalization so clients waiting in the
+    // login queue can prove UDP reachability immediately. The remaining
+    // messages are sent to the joining client in a single batch to avoid
+    // per-message syscall overhead:
     //
-    //   1. CryptSetup
-    //   2. ChannelState × N  (BFS channel tree)
-    //   3. UserState × M     (all currently authenticated clients)
-    //   4. UserState (self)
-    //   5. ServerSync
-    //   6. ServerConfig
-    //   7. CodecVersion
+    //   1. ChannelState × N  (BFS channel tree)
+    //   2. UserState × M     (all currently authenticated clients)
+    //   3. UserState (self)
+    //   4. ServerSync
+    //   5. ServerConfig
+    //   6. CodecVersion
     //
-    // This matches the Mumble server's auth-complete sequence.
+    // This matches the Mumble server's auth-complete sequence after the
+    // connection-level UDP crypto has already been established.
 
     let (all_clients, all_versions, client_state_rx) = server
         .get_clients()
@@ -415,10 +430,7 @@ pub async fn handle_authenticate(
         burst.push(message);
     };
 
-    // 1. CryptSetup
-    push_burst(crypt_setup_msg);
-
-    // 2. Channel tree — BFS from root
+    // 1. Channel tree — BFS from root
     {
         for channel in &ordered_channels {
             let cs =
@@ -427,7 +439,7 @@ pub async fn handle_authenticate(
         }
     }
 
-    // 3. UserState for every published authenticated client (excluding self)
+    // 2. UserState for every published authenticated client (excluding self)
     {
         for client in &all_clients {
             if client.get_session_id() == session_id
@@ -465,7 +477,7 @@ pub async fn handle_authenticate(
         }
     }
 
-    // 4. UserState for self
+    // 3. UserState for self
     {
         session_channel_shadow.insert(session_id, sender.get_current_channel_id());
         if viewer_independent_user_state {
@@ -496,7 +508,7 @@ pub async fn handle_authenticate(
         user_visibility,
     ));
 
-    // 5. ServerSync
+    // 4. ServerSync
     {
         let root_perm = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
         push_burst(Message::ServerSync(
@@ -510,7 +522,7 @@ pub async fn handle_authenticate(
         ));
     }
 
-    // 6. ServerConfig
+    // 5. ServerConfig
     {
         push_burst(Message::ServerConfig(
             ServerConfig {
@@ -525,7 +537,7 @@ pub async fn handle_authenticate(
         ));
     }
 
-    // 7. CodecVersion — advertise Opus-only (OCB2-AES128 encrypted voice)
+    // 6. CodecVersion — advertise Opus-only (OCB2-AES128 encrypted voice)
     {
         push_burst(Message::CodecVersion(
             CodecVersion {

@@ -13,13 +13,16 @@ use std::time::{Instant, SystemTime};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use scc::HashMap as SccMap;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::types::NodeIdentifier;
 
 use super::SendOptions;
+use super::adaptive_queue::{
+    AdaptiveQueueBudget, AdaptiveQueueItem, AdaptiveQueueReceiver, AdaptiveQueueSender,
+    SendAdaptiveError, TryAdaptiveSendError,
+};
 use super::config::TransportConfig;
 use super::connection::{AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerState};
 use super::endpoint::{
@@ -112,18 +115,20 @@ impl InboundMessage {
     }
 }
 
+pub type AdaptiveInboundReceiver = AdaptiveQueueReceiver<InboundMessage>;
+
 /// Receiver halves returned once at `start`.
 pub struct Inbound {
-    control: mpsc::Receiver<InboundMessage>,
-    high_priority: mpsc::Receiver<InboundMessage>,
-    regular: mpsc::Receiver<InboundMessage>,
+    control: AdaptiveQueueReceiver<InboundMessage>,
+    high_priority: AdaptiveQueueReceiver<InboundMessage>,
+    regular: AdaptiveQueueReceiver<InboundMessage>,
 }
 
 impl Inbound {
     pub fn new(
-        control: mpsc::Receiver<InboundMessage>,
-        high_priority: mpsc::Receiver<InboundMessage>,
-        regular: mpsc::Receiver<InboundMessage>,
+        control: AdaptiveQueueReceiver<InboundMessage>,
+        high_priority: AdaptiveQueueReceiver<InboundMessage>,
+        regular: AdaptiveQueueReceiver<InboundMessage>,
     ) -> Self {
         Self {
             control,
@@ -132,15 +137,15 @@ impl Inbound {
         }
     }
 
-    pub fn control(&mut self) -> &mut mpsc::Receiver<InboundMessage> {
+    pub fn control(&mut self) -> &mut AdaptiveQueueReceiver<InboundMessage> {
         &mut self.control
     }
 
-    pub fn high_priority(&mut self) -> &mut mpsc::Receiver<InboundMessage> {
+    pub fn high_priority(&mut self) -> &mut AdaptiveQueueReceiver<InboundMessage> {
         &mut self.high_priority
     }
 
-    pub fn regular(&mut self) -> &mut mpsc::Receiver<InboundMessage> {
+    pub fn regular(&mut self) -> &mut AdaptiveQueueReceiver<InboundMessage> {
         &mut self.regular
     }
 
@@ -150,9 +155,9 @@ impl Inbound {
     pub fn into_parts(
         self,
     ) -> (
-        mpsc::Receiver<InboundMessage>,
-        mpsc::Receiver<InboundMessage>,
-        mpsc::Receiver<InboundMessage>,
+        AdaptiveQueueReceiver<InboundMessage>,
+        AdaptiveQueueReceiver<InboundMessage>,
+        AdaptiveQueueReceiver<InboundMessage>,
     ) {
         (self.control, self.high_priority, self.regular)
     }
@@ -161,9 +166,9 @@ impl Inbound {
 /// Sender halves used by all stream/datagram pumps. Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct InboundDispatch {
-    control: mpsc::Sender<InboundMessage>,
-    high: mpsc::Sender<InboundMessage>,
-    regular: mpsc::Sender<InboundMessage>,
+    control: AdaptiveQueueSender<InboundMessage>,
+    high: AdaptiveQueueSender<InboundMessage>,
+    regular: AdaptiveQueueSender<InboundMessage>,
     control_watermark: Arc<Mutex<QueueWatermark>>,
     high_watermark: Arc<Mutex<QueueWatermark>>,
     regular_watermark: Arc<Mutex<QueueWatermark>>,
@@ -171,9 +176,9 @@ pub(crate) struct InboundDispatch {
 
 impl InboundDispatch {
     pub fn new(
-        control: mpsc::Sender<InboundMessage>,
-        high: mpsc::Sender<InboundMessage>,
-        regular: mpsc::Sender<InboundMessage>,
+        control: AdaptiveQueueSender<InboundMessage>,
+        high: AdaptiveQueueSender<InboundMessage>,
+        regular: AdaptiveQueueSender<InboundMessage>,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -190,29 +195,44 @@ impl InboundDispatch {
         match msg.class {
             MessageClass::Control => {
                 self.record_control(false);
-                if let Err(e) = self.control.try_send(msg) {
-                    self.record_control(true);
-                    warn!(error=%e, "control inbound queue full; dropping frame");
-                } else {
-                    self.record_control(false);
+                match self.control.try_send(msg) {
+                    Ok(()) => self.record_control(false),
+                    Err(TryAdaptiveSendError::Full(_)) => {
+                        self.record_control(true);
+                        warn!("control inbound adaptive queue full; dropping frame");
+                    }
+                    Err(TryAdaptiveSendError::Closed(_)) => {
+                        self.record_control(true);
+                        warn!("control inbound adaptive queue closed; dropping frame");
+                    }
                 }
             }
             MessageClass::HighPriority => {
                 self.record_high(false);
-                if let Err(e) = self.high.try_send(msg) {
-                    self.record_high(true);
-                    warn!(error=%e, "high-priority inbound queue full; dropping frame");
-                } else {
-                    self.record_high(false);
+                match self.high.try_send(msg) {
+                    Ok(()) => self.record_high(false),
+                    Err(TryAdaptiveSendError::Full(_)) => {
+                        self.record_high(true);
+                        warn!("high-priority inbound adaptive queue full; dropping frame");
+                    }
+                    Err(TryAdaptiveSendError::Closed(_)) => {
+                        self.record_high(true);
+                        warn!("high-priority inbound adaptive queue closed; dropping frame");
+                    }
                 }
             }
             MessageClass::Regular => {
                 self.record_regular(false);
-                if let Err(e) = self.regular.try_send(msg) {
-                    self.record_regular(true);
-                    warn!(error=%e, "regular inbound queue full; dropping frame");
-                } else {
-                    self.record_regular(false);
+                match self.regular.try_send(msg) {
+                    Ok(()) => self.record_regular(false),
+                    Err(TryAdaptiveSendError::Full(_)) => {
+                        self.record_regular(true);
+                        warn!("regular inbound adaptive queue full; dropping frame");
+                    }
+                    Err(TryAdaptiveSendError::Closed(_)) => {
+                        self.record_regular(true);
+                        warn!("regular inbound adaptive queue closed; dropping frame");
+                    }
                 }
             }
         }
@@ -271,7 +291,7 @@ impl InboundDispatch {
     fn record_queue_sample(
         &self,
         class: MessageClass,
-        sender: &mpsc::Sender<InboundMessage>,
+        sender: &AdaptiveQueueSender<InboundMessage>,
         watermark: &Arc<Mutex<QueueWatermark>>,
         is_full: bool,
     ) {
@@ -440,9 +460,22 @@ impl ConnectionManager {
             return Err(ConfigError::NoListener.into());
         }
 
-        let (control_tx, control_rx) = mpsc::channel(cfg.inbound_control_capacity());
-        let (high_tx, high_rx) = mpsc::channel(cfg.inbound_high_capacity());
-        let (regular_tx, regular_rx) = mpsc::channel(cfg.inbound_regular_capacity());
+        let inbound_budget = AdaptiveQueueBudget::auto();
+        let (control_tx, control_rx) =
+            AdaptiveQueueSender::new(inbound_budget.split(adaptive_lane_bytes(
+                inbound_budget.max_bytes(),
+                cfg.inbound_control_capacity(),
+                40,
+            )));
+        let (high_tx, high_rx) = AdaptiveQueueSender::new(inbound_budget.split(
+            adaptive_lane_bytes(inbound_budget.max_bytes(), cfg.inbound_high_capacity(), 35),
+        ));
+        let (regular_tx, regular_rx) =
+            AdaptiveQueueSender::new(inbound_budget.split(adaptive_lane_bytes(
+                inbound_budget.max_bytes(),
+                cfg.inbound_regular_capacity(),
+                35,
+            )));
         let inbound = InboundDispatch::new(control_tx, high_tx, regular_tx);
 
         let inner = Arc::new(ManagerInner {
@@ -480,10 +513,17 @@ impl ConnectionManager {
         self_id: NodeIdentifier,
         peer_node: NodeIdentifier,
         kinds: &[TransportKind],
-    ) -> (Self, Vec<mpsc::Receiver<OutboundFrame>>) {
-        let (control_tx, _control_rx) = mpsc::channel(1);
-        let (high_tx, _high_rx) = mpsc::channel(1);
-        let (regular_tx, _regular_rx) = mpsc::channel(1);
+    ) -> (Self, Vec<AdaptiveQueueReceiver<OutboundFrame>>) {
+        Self::test_with_live_streams_bytes(self_id, peer_node, kinds, 1024 * 1024)
+    }
+
+    pub fn test_with_live_streams_bytes(
+        self_id: NodeIdentifier,
+        peer_node: NodeIdentifier,
+        kinds: &[TransportKind],
+        queue_bytes: usize,
+    ) -> (Self, Vec<AdaptiveQueueReceiver<OutboundFrame>>) {
+        let (inbound, _inbound_rx) = test_inbound_dispatch();
         let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into());
         let inner = Arc::new(ManagerInner {
             self_id,
@@ -491,7 +531,7 @@ impl ConnectionManager {
             seed_backoff: Arc::new(SccMap::new()),
             successful_seeds: Arc::new(SccMap::new()),
             required_outgoing: Arc::new(RwLock::new(HashSet::new())),
-            inbound: InboundDispatch::new(control_tx, high_tx, regular_tx),
+            inbound,
             shutdown: CancellationToken::new(),
             endpoints: EndpointRegistry::empty(),
             cfg,
@@ -500,7 +540,7 @@ impl ConnectionManager {
         let peer = inner.get_or_create_peer(peer_node);
         let mut receivers = Vec::new();
         for kind in kinds {
-            let (tx, rx) = mpsc::channel(1);
+            let (tx, rx) = test_outbound_queue_with_bytes(queue_bytes);
             peer.install_stream(super::connection::ActiveStream::new(
                 *kind,
                 None,
@@ -518,9 +558,9 @@ impl ConnectionManager {
         &self,
         peer_node: NodeIdentifier,
         kind: TransportKind,
-    ) -> mpsc::Receiver<OutboundFrame> {
+    ) -> AdaptiveQueueReceiver<OutboundFrame> {
         let peer = self.inner.get_or_create_peer(peer_node);
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = test_outbound_queue(1);
         peer.install_stream(super::connection::ActiveStream::new(
             kind,
             None,
@@ -895,26 +935,25 @@ impl ConnectionManager {
                 record_outbound_queue_sample(peer, kind, class, &sender, false);
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(frame)) if wait_for_space => {
+            Err(TryAdaptiveSendError::Full(frame)) if wait_for_space => {
                 record_outbound_queue_sample(peer, kind, class, &sender, true);
-                sender
-                    .send(frame)
-                    .await
-                    .map_err(|_| SendError::StreamClosed {
+                sender.send(frame).await.map_err(|SendAdaptiveError(_)| {
+                    SendError::StreamClosed {
                         node: peer.node_id(),
                         transport: kind,
-                    })?;
+                    }
+                })?;
                 record_outbound_queue_sample(peer, kind, class, &sender, false);
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(TryAdaptiveSendError::Full(_)) => {
                 record_outbound_queue_sample(peer, kind, class, &sender, true);
                 Err(SendError::Backpressure {
                     node: peer.node_id(),
                     transport: kind,
                 })
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(SendError::StreamClosed {
+            Err(TryAdaptiveSendError::Closed(_)) => Err(SendError::StreamClosed {
                 node: peer.node_id(),
                 transport: kind,
             }),
@@ -1261,21 +1300,66 @@ fn is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
+pub(crate) fn adaptive_lane_bytes(
+    global_bytes: usize,
+    legacy_capacity: usize,
+    percent: usize,
+) -> usize {
+    let share = global_bytes.saturating_mul(percent).saturating_div(100);
+    let legacy_floor = legacy_capacity.max(1).saturating_mul(512).max(512 * 1024);
+    share.max(legacy_floor).min(global_bytes)
+}
+
+fn test_outbound_queue_with_bytes(
+    bytes: usize,
+) -> (
+    AdaptiveQueueSender<OutboundFrame>,
+    AdaptiveQueueReceiver<OutboundFrame>,
+) {
+    let budget = AdaptiveQueueBudget::new(bytes);
+    AdaptiveQueueSender::new(budget.split(budget.max_bytes()))
+}
+
+fn test_outbound_queue(
+    legacy_capacity: usize,
+) -> (
+    AdaptiveQueueSender<OutboundFrame>,
+    AdaptiveQueueReceiver<OutboundFrame>,
+) {
+    test_outbound_queue_with_bytes(adaptive_lane_bytes(
+        1024 * 1024,
+        legacy_capacity.max(1),
+        100,
+    ))
+}
+
+fn test_inbound_dispatch() -> (InboundDispatch, Inbound) {
+    let budget = AdaptiveQueueBudget::new(3 * 1024 * 1024);
+    let (control_tx, control_rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
+    let (high_tx, high_rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
+    let (regular_tx, regular_rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
+    (
+        InboundDispatch::new(control_tx, high_tx, regular_tx),
+        Inbound::new(control_rx, high_rx, regular_rx),
+    )
+}
+
 fn record_outbound_queue_sample(
     peer: &PeerState,
     transport: TransportKind,
     class: MessageClass,
-    sender: &mpsc::Sender<OutboundFrame>,
+    sender: &AdaptiveQueueSender<OutboundFrame>,
     is_full: bool,
 ) {
     let (depth, max_capacity) = sender_queue_depth(sender);
     peer.record_outbound_queue_sample(transport, class, depth, max_capacity, is_full);
 }
 
-fn sender_queue_depth<T>(sender: &mpsc::Sender<T>) -> (usize, usize) {
-    let remaining = sender.capacity();
-    let max_capacity = sender.max_capacity();
-    (max_capacity.saturating_sub(remaining), max_capacity)
+fn sender_queue_depth<T>(sender: &AdaptiveQueueSender<T>) -> (usize, usize)
+where
+    T: AdaptiveQueueItem,
+{
+    (sender.depth_bytes(), sender.capacity_bytes())
 }
 
 fn record_queue_watermark(
@@ -1375,7 +1459,6 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use std::time::Duration;
-    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     fn socket(raw: &str) -> SocketAddr {
@@ -1384,7 +1467,7 @@ mod tests {
 
     fn peer_with_live_transports(
         kinds: &[TransportKind],
-    ) -> (Arc<PeerState>, Vec<mpsc::Receiver<OutboundFrame>>) {
+    ) -> (Arc<PeerState>, Vec<AdaptiveQueueReceiver<OutboundFrame>>) {
         let peer = PeerState::new(
             2,
             Duration::from_millis(10),
@@ -1393,7 +1476,7 @@ mod tests {
         );
         let mut receivers = Vec::new();
         for kind in kinds {
-            let (tx, rx) = mpsc::channel(1);
+            let (tx, rx) = test_outbound_queue(1);
             peer.install_stream(ActiveStream::new(
                 *kind,
                 None,
@@ -1408,10 +1491,8 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_dispatch_routes_control_to_control_queue() {
-        let (control_tx, mut control_rx) = mpsc::channel(1);
-        let (high_tx, mut high_rx) = mpsc::channel(1);
-        let (regular_tx, mut regular_rx) = mpsc::channel(1);
-        let dispatch = InboundDispatch::new(control_tx, high_tx, regular_tx);
+        let (dispatch, inbound) = test_inbound_dispatch();
+        let (mut control_rx, mut high_rx, mut regular_rx) = inbound.into_parts();
 
         dispatch.dispatch(InboundMessage::new(
             7,
@@ -1430,10 +1511,8 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_dispatch_queue_status_tracks_depth_and_full_samples() {
-        let (control_tx, _control_rx) = mpsc::channel(1);
-        let (high_tx, _high_rx) = mpsc::channel(1);
-        let (regular_tx, mut regular_rx) = mpsc::channel(1);
-        let dispatch = InboundDispatch::new(control_tx, high_tx, regular_tx);
+        let (dispatch, inbound) = test_inbound_dispatch();
+        let (_control_rx, _high_rx, mut regular_rx) = inbound.into_parts();
 
         dispatch.dispatch(InboundMessage::new(
             7,
@@ -1456,19 +1535,31 @@ mod tests {
             .find(|queue| queue.class() == MessageClass::Regular)
             .expect("regular queue status")
             .status();
-        assert_eq!(regular.depth(), 1);
-        assert_eq!(regular.capacity(), 1);
-        assert_eq!(regular.high_depth(), 1);
+        assert_eq!(
+            regular.depth(),
+            (crate::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES + b"first".len())
+                + (crate::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES + b"dropped".len())
+        );
+        assert!(regular.capacity() >= 1024 * 1024);
+        assert!(
+            regular.high_depth()
+                >= crate::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES + b"first".len()
+        );
         assert_eq!(regular.samples(), 4);
-        assert_eq!(regular.full_samples(), 1);
+        assert_eq!(regular.full_samples(), 0);
 
         assert_eq!(&regular_rx.recv().await.unwrap().payload()[..], b"first");
+        assert_eq!(&regular_rx.recv().await.unwrap().payload()[..], b"dropped");
     }
 
     #[tokio::test]
     async fn try_send_with_options_returns_backpressure_when_all_eligible_streams_full() {
-        let (transport, _receivers) =
-            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let (transport, _receivers) = ConnectionManager::test_with_live_streams_bytes(
+            1,
+            2,
+            &[TransportKind::Tcp],
+            1024 * 1024,
+        );
 
         transport
             .try_send_with_options(
@@ -1476,7 +1567,7 @@ mod tests {
                 ServiceLevel::Reliable,
                 None,
                 MessageClass::Regular,
-                Bytes::from_static(b"fill"),
+                Bytes::from(vec![1; 1024 * 1024 - 512]),
                 SendOptions::default(),
             )
             .await
@@ -1489,7 +1580,7 @@ mod tests {
                 ServiceLevel::Reliable,
                 None,
                 MessageClass::Regular,
-                Bytes::from_static(b"dropped"),
+                Bytes::from_static(b"blocked"),
                 SendOptions::default(),
             ),
         )
@@ -1507,10 +1598,11 @@ mod tests {
 
     #[tokio::test]
     async fn try_send_with_options_falls_back_when_earlier_stream_is_full() {
-        let (transport, mut receivers) = ConnectionManager::test_with_live_streams(
+        let (transport, mut receivers) = ConnectionManager::test_with_live_streams_bytes(
             1,
             2,
             &[TransportKind::Tcp, TransportKind::Quic],
+            1024 * 1024,
         );
 
         transport
@@ -1518,7 +1610,7 @@ mod tests {
                 2,
                 TransportKind::Tcp,
                 MessageClass::Regular,
-                Bytes::from_static(b"fill-tcp"),
+                Bytes::from(vec![1; 1024 * 1024 - 512]),
             )
             .await
             .unwrap();
@@ -1535,14 +1627,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(&receivers[0].try_recv().unwrap().payload()[..], b"fill-tcp");
+        assert_eq!(
+            receivers[0].try_recv().unwrap().payload().len(),
+            1024 * 1024 - 512
+        );
         assert_eq!(&receivers[1].try_recv().unwrap().payload()[..], b"fallback");
     }
 
     #[tokio::test]
     async fn send_with_options_still_waits_for_space_on_final_stream() {
-        let (transport, mut receivers) =
-            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let (transport, mut receivers) = ConnectionManager::test_with_live_streams_bytes(
+            1,
+            2,
+            &[TransportKind::Tcp],
+            1024 * 1024,
+        );
 
         transport
             .try_send_with_options(
@@ -1550,7 +1649,7 @@ mod tests {
                 ServiceLevel::Reliable,
                 None,
                 MessageClass::Regular,
-                Bytes::from_static(b"fill"),
+                Bytes::from(vec![1; 1024 * 1024 - 512]),
                 SendOptions::default(),
             )
             .await
@@ -1577,7 +1676,10 @@ mod tests {
             "send_with_options should still wait on the final stream"
         );
 
-        assert_eq!(&receivers[0].recv().await.unwrap().payload()[..], b"fill");
+        assert_eq!(
+            receivers[0].recv().await.unwrap().payload().len(),
+            1024 * 1024 - 512
+        );
         send_task.await.unwrap().unwrap();
         assert_eq!(&receivers[0].recv().await.unwrap().payload()[..], b"waited");
     }

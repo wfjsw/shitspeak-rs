@@ -13,21 +13,17 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rand::RngExt;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::types::NodeIdentifier;
 
 use super::SendOptions;
+use super::adaptive_queue::AdaptiveQueueSender;
 use super::metrics::{MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueWatermark};
 use super::service_level::{MessageClass, PeerAddress, TransportKind};
 
 const MAX_OBSERVED_REMOTE_IPS: usize = 8;
 const BACKOFF_JITTER_DIVISOR: u64 = 5;
-
-fn queue_depth<T>(sender: &mpsc::Sender<T>) -> usize {
-    sender.max_capacity().saturating_sub(sender.capacity())
-}
 
 /// One outbound frame, addressed to a specific stream.
 #[derive(Debug, Clone)]
@@ -88,7 +84,7 @@ impl StreamKey {
 pub(crate) struct ActiveStream {
     transport: TransportKind,
     remote_addr: Option<SocketAddr>,
-    sender: mpsc::Sender<OutboundFrame>,
+    sender: AdaptiveQueueSender<OutboundFrame>,
     closed: CancellationToken,
     is_dialer: bool,
     installed_at: Instant,
@@ -98,7 +94,7 @@ impl ActiveStream {
     pub fn new(
         transport: TransportKind,
         remote_addr: Option<SocketAddr>,
-        sender: mpsc::Sender<OutboundFrame>,
+        sender: AdaptiveQueueSender<OutboundFrame>,
         closed: CancellationToken,
         is_dialer: bool,
     ) -> Self {
@@ -733,7 +729,10 @@ impl PeerState {
 
     /// Attempt to obtain a sender for any stream of the requested transport.
     /// Drops the stream if it has died.
-    pub fn try_get_stream(&self, kind: TransportKind) -> Option<mpsc::Sender<OutboundFrame>> {
+    pub fn try_get_stream(
+        &self,
+        kind: TransportKind,
+    ) -> Option<AdaptiveQueueSender<OutboundFrame>> {
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
         g.values()
@@ -781,8 +780,8 @@ impl PeerState {
             prune_dead_streams(&mut streams);
             let mut current = HashMap::<TransportKind, (usize, usize)>::new();
             for stream in streams.values().filter(|stream| stream.is_alive()) {
-                let depth = queue_depth(&stream.sender);
-                let capacity = stream.sender.max_capacity();
+                let depth = stream.sender.depth_bytes();
+                let capacity = stream.sender.capacity_bytes();
                 current
                     .entry(stream.transport())
                     .and_modify(|(current_depth, current_capacity)| {
@@ -1188,8 +1187,12 @@ mod tests {
         transport: TransportKind,
         remote_addr: SocketAddr,
         is_dialer: bool,
-    ) -> (ActiveStream, mpsc::Receiver<OutboundFrame>) {
-        let (tx, rx) = mpsc::channel(1);
+    ) -> (
+        ActiveStream,
+        crate::adaptive_queue::AdaptiveQueueReceiver<OutboundFrame>,
+    ) {
+        let budget = crate::adaptive_queue::AdaptiveQueueBudget::new(1024 * 1024);
+        let (tx, rx) = crate::adaptive_queue::AdaptiveQueueSender::new(budget.split(1024 * 1024));
         (
             ActiveStream::new(
                 transport,

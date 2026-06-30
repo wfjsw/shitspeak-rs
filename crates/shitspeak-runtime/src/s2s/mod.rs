@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
+use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 
@@ -43,8 +44,6 @@ use shitspeak_s2s::testing as s2s_testing;
 use shitspeak_s2s_transport as s2s_transport;
 use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
 
-const NATIVE_GATEWAY_CAPACITY: usize = 4096;
-const S2S_GATEWAY_CAPACITY: usize = 4096;
 const S2S_CLIENT_REPLICATION_WORKER_CAPACITY: usize = 4096;
 const S2S_CLIENT_REPLICATION_MAX_IN_FLIGHT: usize = 256;
 const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,6 +51,13 @@ const STRICT_PROPOSAL_GATEWAY_SLACK_TICKS: u32 = 4;
 const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const S2S_CLIENT_REPLICATION_SLOW_PROPOSE: Duration = Duration::from_secs(1);
 const S2S_CLIENT_REPLICATION_SLOW_QUEUE_WAIT: Duration = Duration::from_millis(250);
+const S2S_GATEWAY_MEMORY_FRACTION_DIVISOR: u64 = 20;
+const S2S_GATEWAY_MIN_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+const S2S_GATEWAY_FALLBACK_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+const S2S_GATEWAY_MAX_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+const S2S_GATEWAY_COMMAND_OVERHEAD_BYTES: usize = 512;
+const S2S_GATEWAY_CONTROL_MIN_BYTES: usize = 1024 * 1024;
+const S2S_GATEWAY_LANE_MIN_BYTES: usize = 512 * 1024;
 
 fn strict_proposal_gateway_response_timeout(cfg: &s2s_replications::ReplicationConfig) -> Duration {
     let slack = cfg
@@ -92,7 +98,7 @@ struct S2SRuntimeState {
     channel_blob_replications:
         HashMap<String, s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>>,
     bridge_tasks: Vec<JoinHandle<()>>,
-    gateway_tx: Option<mpsc::Sender<NativeToS2SCommand>>,
+    gateway_tx: Option<S2SGatewayTx>,
     #[cfg(test)]
     inbound_chaos: Option<s2s_testing::LinkChaos>,
 }
@@ -114,6 +120,42 @@ enum S2SNativeCommand {
         from_immediate: NodeIdentifier,
         frame: VoiceFrame,
     },
+}
+
+enum S2SNativeClass {
+    Control,
+    Bulk,
+    Voice,
+}
+
+impl S2SNativeCommand {
+    fn class(&self) -> S2SNativeClass {
+        match self {
+            Self::ApplyModeration { .. } => S2SNativeClass::Control,
+            Self::DeliverPluginData { .. } | Self::DeliverTextMessage { .. } => {
+                S2SNativeClass::Bulk
+            }
+            Self::DeliverVoice { .. } => S2SNativeClass::Voice,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ApplyModeration { .. } => "moderation",
+            Self::DeliverPluginData { .. } => "plugin_data",
+            Self::DeliverTextMessage { .. } => "text_message",
+            Self::DeliverVoice { .. } => "voice",
+        }
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::ApplyModeration { envelope, .. } => estimate_proto(envelope),
+            Self::DeliverPluginData { envelope, .. } => estimate_proto(envelope),
+            Self::DeliverTextMessage { envelope, .. } => estimate_proto(envelope),
+            Self::DeliverVoice { frame, .. } => estimate_proto(frame),
+        }
+    }
 }
 
 enum NativeToS2SCommand {
@@ -165,6 +207,543 @@ enum NativeToS2SCommand {
     },
 }
 
+enum S2SGatewayClass {
+    Control,
+    Replication,
+    Bulk,
+    Voice,
+    Coalesced,
+}
+
+impl NativeToS2SCommand {
+    fn class(&self) -> S2SGatewayClass {
+        match self {
+            Self::ProposeChannel { .. }
+            | Self::ProposeBan { .. }
+            | Self::DispatchModeration { .. }
+            | Self::DispatchUserStats { .. } => S2SGatewayClass::Control,
+            Self::ProposeClientReplication(_) => S2SGatewayClass::Replication,
+            Self::DispatchPluginData { .. } | Self::DispatchTextMessage { .. } => {
+                S2SGatewayClass::Bulk
+            }
+            Self::SendVoiceForChannel { .. } | Self::SendVoiceBroadcast { .. } => {
+                S2SGatewayClass::Voice
+            }
+            Self::RefreshVoiceRecipientIndex(_) => S2SGatewayClass::Coalesced,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ProposeChannel { .. } => "channel_proposal",
+            Self::ProposeBan { .. } => "ban_proposal",
+            Self::ProposeClientReplication(_) => "client_replication",
+            Self::RefreshVoiceRecipientIndex(_) => "voice_recipient_index",
+            Self::DispatchPluginData { .. } => "plugin_data",
+            Self::DispatchTextMessage { .. } => "text_message",
+            Self::DispatchModeration { .. } => "moderation",
+            Self::DispatchUserStats { .. } => "user_stats",
+            Self::SendVoiceForChannel { .. } | Self::SendVoiceBroadcast { .. } => "voice",
+        }
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::ProposeChannel { .. } | Self::ProposeBan { .. } => {
+                S2S_GATEWAY_COMMAND_OVERHEAD_BYTES
+            }
+            Self::ProposeClientReplication(entry) => estimate_client_replication_entry(entry),
+            Self::RefreshVoiceRecipientIndex(snapshot) => {
+                estimate_recipient_index_snapshot(snapshot)
+            }
+            Self::DispatchPluginData { envelope, .. } => estimate_proto(envelope),
+            Self::DispatchTextMessage { envelope, .. } => estimate_proto(envelope),
+            Self::DispatchModeration { envelope, .. } => estimate_proto(envelope),
+            Self::DispatchUserStats { server_id, .. } => {
+                S2S_GATEWAY_COMMAND_OVERHEAD_BYTES.saturating_add(server_id.len())
+            }
+            Self::SendVoiceForChannel {
+                server_id, payload, ..
+            } => S2S_GATEWAY_COMMAND_OVERHEAD_BYTES
+                .saturating_add(server_id.len())
+                .saturating_add(payload.len()),
+            Self::SendVoiceBroadcast {
+                server_id,
+                payload,
+                intent,
+                ..
+            } => S2S_GATEWAY_COMMAND_OVERHEAD_BYTES
+                .saturating_add(server_id.len())
+                .saturating_add(payload.len())
+                .saturating_add(intent.encoded_len()),
+        }
+    }
+}
+
+fn estimate_proto(message: &impl ProstMessage) -> usize {
+    S2S_GATEWAY_COMMAND_OVERHEAD_BYTES.saturating_add(message.encoded_len())
+}
+
+fn estimate_client_replication_entry(entry: &ClientStateLogEntry) -> usize {
+    S2S_GATEWAY_COMMAND_OVERHEAD_BYTES.saturating_add(
+        rmp_serde::to_vec(entry)
+            .map(|bytes| bytes.len())
+            .unwrap_or(1024),
+    )
+}
+
+fn estimate_recipient_index_snapshot(snapshot: &HashMap<u32, BTreeSet<NodeIdentifier>>) -> usize {
+    snapshot
+        .values()
+        .map(|nodes| {
+            S2S_GATEWAY_COMMAND_OVERHEAD_BYTES.saturating_add(
+                nodes
+                    .len()
+                    .saturating_mul(std::mem::size_of::<NodeIdentifier>()),
+            )
+        })
+        .sum::<usize>()
+        .max(S2S_GATEWAY_COMMAND_OVERHEAD_BYTES)
+}
+
+#[derive(Clone)]
+struct S2SQueueBudget {
+    inner: Arc<S2SQueueBudgetInner>,
+}
+
+struct S2SQueueBudgetInner {
+    max_bytes: usize,
+    used_bytes: AtomicUsize,
+    notify: Notify,
+}
+
+impl S2SQueueBudget {
+    fn auto() -> Self {
+        Self::new(auto_s2s_gateway_budget_bytes())
+    }
+
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(S2SQueueBudgetInner {
+                max_bytes: max_bytes.max(S2S_GATEWAY_LANE_MIN_BYTES),
+                used_bytes: AtomicUsize::new(0),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn split(&self, max_bytes: usize) -> S2SQueueLaneBudget {
+        S2SQueueLaneBudget {
+            global: self.clone(),
+            max_bytes: max_bytes.max(S2S_GATEWAY_LANE_MIN_BYTES),
+            used_bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct S2SQueueLaneBudget {
+    global: S2SQueueBudget,
+    max_bytes: usize,
+    used_bytes: Arc<AtomicUsize>,
+}
+
+impl S2SQueueLaneBudget {
+    async fn reserve(&self, bytes: usize) -> Option<S2SQueuePermit> {
+        let bytes = bytes.max(1);
+        if bytes > self.max_bytes || bytes > self.global.inner.max_bytes {
+            return None;
+        }
+        loop {
+            if let Some(permit) = self.try_reserve(bytes) {
+                return Some(permit);
+            }
+            self.global.inner.notify.notified().await;
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> Option<S2SQueuePermit> {
+        let bytes = bytes.max(1);
+        if bytes > self.max_bytes || bytes > self.global.inner.max_bytes {
+            return None;
+        }
+        try_add_with_limit(&self.used_bytes, bytes, self.max_bytes)?;
+        if try_add_with_limit(
+            &self.global.inner.used_bytes,
+            bytes,
+            self.global.inner.max_bytes,
+        )
+        .is_none()
+        {
+            self.used_bytes.fetch_sub(bytes, Ordering::Release);
+            return None;
+        }
+        Some(S2SQueuePermit {
+            lane: self.clone(),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn available_bytes(&self) -> usize {
+        self.max_bytes
+            .saturating_sub(self.used_bytes.load(Ordering::Acquire))
+    }
+}
+
+struct S2SQueuePermit {
+    lane: S2SQueueLaneBudget,
+    bytes: usize,
+}
+
+impl Drop for S2SQueuePermit {
+    fn drop(&mut self) {
+        self.lane
+            .used_bytes
+            .fetch_sub(self.bytes, Ordering::Release);
+        self.lane
+            .global
+            .inner
+            .used_bytes
+            .fetch_sub(self.bytes, Ordering::Release);
+        self.lane.global.inner.notify.notify_waiters();
+    }
+}
+
+struct S2SQueued<T> {
+    command: T,
+    _permit: S2SQueuePermit,
+}
+
+fn try_add_with_limit(counter: &AtomicUsize, add: usize, limit: usize) -> Option<()> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(add)?;
+        if next > limit {
+            return None;
+        }
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(()),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct S2SGatewayTx {
+    control: S2SAdaptiveSender<NativeToS2SCommand>,
+    replication: S2SAdaptiveSender<NativeToS2SCommand>,
+    bulk: S2SAdaptiveSender<NativeToS2SCommand>,
+    voice: S2SAdaptiveSender<NativeToS2SCommand>,
+    coalesced: S2SAdaptiveSender<NativeToS2SCommand>,
+}
+
+struct S2SGatewayRx {
+    control: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    replication: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    bulk: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    voice: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    coalesced: S2SAdaptiveReceiver<NativeToS2SCommand>,
+}
+
+impl S2SGatewayTx {
+    fn new(budget: S2SQueueBudget) -> (Self, S2SGatewayRx) {
+        let max = budget.inner.max_bytes;
+        let control_bytes = max
+            .saturating_mul(30)
+            .checked_div(100)
+            .unwrap_or(S2S_GATEWAY_CONTROL_MIN_BYTES)
+            .max(S2S_GATEWAY_CONTROL_MIN_BYTES)
+            .min(max);
+        let replication_bytes = max
+            .saturating_mul(25)
+            .checked_div(100)
+            .unwrap_or(S2S_GATEWAY_LANE_MIN_BYTES)
+            .max(S2S_GATEWAY_LANE_MIN_BYTES)
+            .min(max);
+        let bulk_bytes = max
+            .saturating_mul(20)
+            .checked_div(100)
+            .unwrap_or(S2S_GATEWAY_LANE_MIN_BYTES)
+            .max(S2S_GATEWAY_LANE_MIN_BYTES)
+            .min(max);
+        let voice_bytes = max
+            .saturating_mul(50)
+            .checked_div(100)
+            .unwrap_or(S2S_GATEWAY_LANE_MIN_BYTES)
+            .max(S2S_GATEWAY_LANE_MIN_BYTES)
+            .min(max);
+        let coalesced_bytes = max
+            .saturating_mul(10)
+            .checked_div(100)
+            .unwrap_or(S2S_GATEWAY_LANE_MIN_BYTES)
+            .max(S2S_GATEWAY_LANE_MIN_BYTES)
+            .min(max);
+
+        let (control, control_rx) = S2SAdaptiveSender::new(budget.split(control_bytes));
+        let (replication, replication_rx) = S2SAdaptiveSender::new(budget.split(replication_bytes));
+        let (bulk, bulk_rx) = S2SAdaptiveSender::new(budget.split(bulk_bytes));
+        let (voice, voice_rx) = S2SAdaptiveSender::new(budget.split(voice_bytes));
+        let (coalesced, coalesced_rx) = S2SAdaptiveSender::new(budget.split(coalesced_bytes));
+        (
+            Self {
+                control,
+                replication,
+                bulk,
+                voice,
+                coalesced,
+            },
+            S2SGatewayRx {
+                control: control_rx,
+                replication: replication_rx,
+                bulk: bulk_rx,
+                voice: voice_rx,
+                coalesced: coalesced_rx,
+            },
+        )
+    }
+
+    async fn send_lossless(&self, command: NativeToS2SCommand) -> bool {
+        match command.class() {
+            S2SGatewayClass::Control => self.control.send(command).await,
+            S2SGatewayClass::Replication => self.replication.send(command).await,
+            S2SGatewayClass::Bulk => self.bulk.send(command).await,
+            S2SGatewayClass::Coalesced => self.coalesced.send(command).await,
+            S2SGatewayClass::Voice => self.voice.send(command).await,
+        }
+    }
+
+    fn try_send_voice(&self, command: NativeToS2SCommand) -> bool {
+        self.voice.try_send(command)
+    }
+
+    fn try_send_coalesced(&self, command: NativeToS2SCommand) -> bool {
+        self.coalesced.try_send(command)
+    }
+}
+
+#[derive(Clone)]
+struct S2SNativeGatewayTx {
+    control: S2SAdaptiveSender<S2SNativeCommand>,
+    bulk: S2SAdaptiveSender<S2SNativeCommand>,
+    voice: S2SAdaptiveSender<S2SNativeCommand>,
+}
+
+struct S2SNativeGatewayRx {
+    control: S2SAdaptiveReceiver<S2SNativeCommand>,
+    bulk: S2SAdaptiveReceiver<S2SNativeCommand>,
+    voice: S2SAdaptiveReceiver<S2SNativeCommand>,
+}
+
+impl S2SNativeGatewayTx {
+    fn new(budget: S2SQueueBudget) -> (Self, S2SNativeGatewayRx) {
+        let max = budget.inner.max_bytes;
+        let control_bytes = max
+            .saturating_mul(40)
+            .checked_div(100)
+            .unwrap_or(S2S_GATEWAY_CONTROL_MIN_BYTES)
+            .max(S2S_GATEWAY_CONTROL_MIN_BYTES)
+            .min(max);
+        let bulk_bytes = max
+            .saturating_mul(25)
+            .checked_div(100)
+            .unwrap_or(S2S_GATEWAY_LANE_MIN_BYTES)
+            .max(S2S_GATEWAY_LANE_MIN_BYTES)
+            .min(max);
+        let voice_bytes = max
+            .saturating_mul(50)
+            .checked_div(100)
+            .unwrap_or(S2S_GATEWAY_LANE_MIN_BYTES)
+            .max(S2S_GATEWAY_LANE_MIN_BYTES)
+            .min(max);
+
+        let (control, control_rx) = S2SAdaptiveSender::new(budget.split(control_bytes));
+        let (bulk, bulk_rx) = S2SAdaptiveSender::new(budget.split(bulk_bytes));
+        let (voice, voice_rx) = S2SAdaptiveSender::new(budget.split(voice_bytes));
+        (
+            Self {
+                control,
+                bulk,
+                voice,
+            },
+            S2SNativeGatewayRx {
+                control: control_rx,
+                bulk: bulk_rx,
+                voice: voice_rx,
+            },
+        )
+    }
+
+    async fn send_lossless(&self, command: S2SNativeCommand) -> bool {
+        match command.class() {
+            S2SNativeClass::Control => self.control.send(command).await,
+            S2SNativeClass::Bulk => self.bulk.send(command).await,
+            S2SNativeClass::Voice => self.voice.send(command).await,
+        }
+    }
+
+    fn try_send_voice(&self, command: S2SNativeCommand) -> bool {
+        self.voice.try_send(command)
+    }
+}
+
+struct S2SAdaptiveSender<T> {
+    tx: mpsc::UnboundedSender<S2SQueued<T>>,
+    budget: S2SQueueLaneBudget,
+}
+
+struct S2SAdaptiveReceiver<T> {
+    rx: mpsc::UnboundedReceiver<S2SQueued<T>>,
+}
+
+impl<T> Clone for S2SAdaptiveSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            budget: self.budget.clone(),
+        }
+    }
+}
+
+impl<T> S2SAdaptiveSender<T>
+where
+    T: EstimatedS2SCommand,
+{
+    fn new(budget: S2SQueueLaneBudget) -> (Self, S2SAdaptiveReceiver<T>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { tx, budget }, S2SAdaptiveReceiver { rx })
+    }
+
+    async fn send(&self, command: T) -> bool {
+        let label = command.label();
+        let Some(permit) = self.budget.reserve(command.estimated_bytes()).await else {
+            warn!(
+                label,
+                "s2s gateway command exceeds adaptive queue budget; dropping command"
+            );
+            return false;
+        };
+        match self.tx.send(S2SQueued {
+            command,
+            _permit: permit,
+        }) {
+            Ok(()) => true,
+            Err(_) => {
+                trace!(label, "s2s gateway closed; dropping command");
+                false
+            }
+        }
+    }
+
+    fn try_send(&self, command: T) -> bool {
+        let label = command.label();
+        let Some(permit) = self.budget.try_reserve(command.estimated_bytes()) else {
+            warn!(label, "s2s gateway full; dropping command");
+            return false;
+        };
+        match self.tx.send(S2SQueued {
+            command,
+            _permit: permit,
+        }) {
+            Ok(()) => true,
+            Err(_) => {
+                trace!(label, "s2s gateway closed; dropping command");
+                false
+            }
+        }
+    }
+}
+
+impl<T> S2SAdaptiveReceiver<T> {
+    async fn recv(&mut self) -> Option<T> {
+        self.rx.recv().await.map(|queued| queued.command)
+    }
+}
+
+trait EstimatedS2SCommand {
+    fn label(&self) -> &'static str;
+
+    fn estimated_bytes(&self) -> usize;
+}
+
+impl EstimatedS2SCommand for NativeToS2SCommand {
+    fn label(&self) -> &'static str {
+        NativeToS2SCommand::label(self)
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        NativeToS2SCommand::estimated_bytes(self)
+    }
+}
+
+impl EstimatedS2SCommand for S2SNativeCommand {
+    fn label(&self) -> &'static str {
+        S2SNativeCommand::label(self)
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        S2SNativeCommand::estimated_bytes(self)
+    }
+}
+
+fn auto_s2s_gateway_budget_bytes() -> usize {
+    let detected = available_memory_bytes().map(|bytes| {
+        bytes
+            .checked_div(S2S_GATEWAY_MEMORY_FRACTION_DIVISOR)
+            .unwrap_or(S2S_GATEWAY_FALLBACK_BUDGET_BYTES)
+    });
+    let bytes = detected.unwrap_or(S2S_GATEWAY_FALLBACK_BUDGET_BYTES);
+    bytes
+        .clamp(S2S_GATEWAY_MIN_BUDGET_BYTES, S2S_GATEWAY_MAX_BUDGET_BYTES)
+        .min(usize::MAX as u64) as usize
+}
+
+#[cfg(windows)]
+fn available_memory_bytes() -> Option<u64> {
+    use std::mem::size_of;
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.ullAvailPhys)
+}
+
+#[cfg(not(windows))]
+fn available_memory_bytes() -> Option<u64> {
+    parse_mem_available_from_proc().or_else(parse_cgroup_memory_available)
+}
+
+#[cfg(not(windows))]
+fn parse_mem_available_from_proc() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    contents.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemAvailable:")?.trim();
+        let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        kb.checked_mul(1024)
+    })
+}
+
+#[cfg(not(windows))]
+fn parse_cgroup_memory_available() -> Option<u64> {
+    let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())?;
+    let current = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())?;
+    max.checked_sub(current)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum ChannelOpProposeResult {
@@ -184,9 +763,9 @@ impl ChannelOpProposeResult {
 }
 
 struct S2SGateways {
-    native_tx: mpsc::Sender<S2SNativeCommand>,
-    s2s_tx: mpsc::Sender<NativeToS2SCommand>,
-    s2s_rx: mpsc::Receiver<NativeToS2SCommand>,
+    native_tx: S2SNativeGatewayTx,
+    s2s_tx: S2SGatewayTx,
+    s2s_rx: S2SGatewayRx,
     native_runtime: tokio::runtime::Handle,
 }
 
@@ -422,32 +1001,31 @@ impl S2SManager {
             return ChannelOpProposeResult::Unavailable;
         };
         let (respond, rx) = oneshot::channel();
-        match tx.try_send(NativeToS2SCommand::ProposeChannel {
-            server_id,
-            op,
-            respond,
-        }) {
-            Ok(()) => match tokio::time::timeout(
-                strict_proposal_gateway_response_timeout(&self.replication_config),
-                rx,
-            )
+        if !tx
+            .send_lossless(NativeToS2SCommand::ProposeChannel {
+                server_id,
+                op,
+                respond,
+            })
             .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => {
-                    error!("s2s gateway dropped channel proposal response");
-                    ChannelOpProposeResult::Failed
-                }
-                Err(_) => {
-                    error!("s2s channel proposal timed out waiting for gateway response");
-                    ChannelOpProposeResult::Failed
-                }
-            },
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                error!("s2s gateway full; dropping channel proposal");
+        {
+            return ChannelOpProposeResult::Unavailable;
+        }
+        match tokio::time::timeout(
+            strict_proposal_gateway_response_timeout(&self.replication_config),
+            rx,
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                error!("s2s gateway dropped channel proposal response");
                 ChannelOpProposeResult::Failed
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => ChannelOpProposeResult::Unavailable,
+            Err(_) => {
+                error!("s2s channel proposal timed out waiting for gateway response");
+                ChannelOpProposeResult::Failed
+            }
         }
     }
 
@@ -488,21 +1066,20 @@ impl S2SManager {
             return false;
         };
         let (respond, rx) = oneshot::channel();
-        match tx.try_send(NativeToS2SCommand::ProposeBan { op, respond }) {
-            Ok(()) => tokio::time::timeout(
-                strict_proposal_gateway_response_timeout(&self.replication_config),
-                rx,
-            )
+        if !tx
+            .send_lossless(NativeToS2SCommand::ProposeBan { op, respond })
             .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("s2s gateway full; dropping ban proposal");
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        {
+            return false;
         }
+        tokio::time::timeout(
+            strict_proposal_gateway_response_timeout(&self.replication_config),
+            rx,
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false)
     }
 
     async fn propose_ban_op_direct(&self, op: BanOp) -> bool {
@@ -524,47 +1101,36 @@ impl S2SManager {
         }
     }
 
-    fn try_send_s2s_command(&self, command: NativeToS2SCommand, label: &'static str) -> bool {
+    async fn send_s2s_lossless_command(&self, command: NativeToS2SCommand) -> bool {
         let Some(tx) = self.state.read().gateway_tx.clone() else {
-            trace!(label, "s2s gateway unavailable; dropping command");
+            trace!(
+                label = command.label(),
+                "s2s gateway unavailable; dropping command"
+            );
             return false;
         };
-        match tx.try_send(command) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(label, "s2s gateway full; dropping command");
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                trace!(label, "s2s gateway closed; dropping command");
-                false
-            }
-        }
+        tx.send_lossless(command).await
     }
 
-    pub fn dispatch_plugin_data(
+    pub async fn dispatch_plugin_data(
         &self,
         owner: NodeIdentifier,
         envelope: PluginDataEnvelope,
     ) -> bool {
-        self.try_send_s2s_command(
-            NativeToS2SCommand::DispatchPluginData { owner, envelope },
-            "plugin_data",
-        )
+        self.send_s2s_lossless_command(NativeToS2SCommand::DispatchPluginData { owner, envelope })
+            .await
     }
 
-    pub fn dispatch_text_message(
+    pub async fn dispatch_text_message(
         &self,
         owner: NodeIdentifier,
         envelope: TextMessageEnvelope,
     ) -> bool {
-        self.try_send_s2s_command(
-            NativeToS2SCommand::DispatchTextMessage { owner, envelope },
-            "text_message",
-        )
+        self.send_s2s_lossless_command(NativeToS2SCommand::DispatchTextMessage { owner, envelope })
+            .await
     }
 
-    pub fn dispatch_moderation_user_state(
+    pub async fn dispatch_moderation_user_state(
         &self,
         server_id: Option<&str>,
         actor: ClientSessionIdentifier,
@@ -579,16 +1145,14 @@ impl S2SManager {
             server_id: server_id.to_owned(),
             command: Some(ModerationCommand::UserState(patch)),
         };
-        self.try_send_s2s_command(
-            NativeToS2SCommand::DispatchModeration {
-                owner: target.get_node_id(),
-                envelope,
-            },
-            "moderation",
-        )
+        self.send_s2s_lossless_command(NativeToS2SCommand::DispatchModeration {
+            owner: target.get_node_id(),
+            envelope,
+        })
+        .await
     }
 
-    pub fn dispatch_moderation_user_remove(
+    pub async fn dispatch_moderation_user_remove(
         &self,
         server_id: Option<&str>,
         actor: ClientSessionIdentifier,
@@ -603,13 +1167,11 @@ impl S2SManager {
             server_id: server_id.to_owned(),
             command: Some(ModerationCommand::UserRemove(patch)),
         };
-        self.try_send_s2s_command(
-            NativeToS2SCommand::DispatchModeration {
-                owner: target.get_node_id(),
-                envelope,
-            },
-            "moderation",
-        )
+        self.send_s2s_lossless_command(NativeToS2SCommand::DispatchModeration {
+            owner: target.get_node_id(),
+            envelope,
+        })
+        .await
     }
 
     pub async fn dispatch_user_stats_request(
@@ -624,25 +1186,24 @@ impl S2SManager {
             return Err(ApplicationError::Unavailable);
         };
         let (respond, rx) = oneshot::channel();
-        match tx.try_send(NativeToS2SCommand::DispatchUserStats {
-            owner,
-            actor_session,
-            target_session,
-            stats_only,
-            server_id,
-            respond,
-        }) {
-            Ok(()) => tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(Err(ApplicationError::Unavailable)),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("s2s gateway full; dropping user_stats request");
-                Err(ApplicationError::Unavailable)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(ApplicationError::Unavailable),
+        if !tx
+            .send_lossless(NativeToS2SCommand::DispatchUserStats {
+                owner,
+                actor_session,
+                target_session,
+                stats_only,
+                server_id,
+                respond,
+            })
+            .await
+        {
+            return Err(ApplicationError::Unavailable);
         }
+        tokio::time::timeout(S2S_GATEWAY_RESPONSE_TIMEOUT, rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(Err(ApplicationError::Unavailable))
     }
 
     pub fn send_voice_for_channel(
@@ -653,16 +1214,17 @@ impl S2SManager {
         is_terminator: bool,
         payload: Bytes,
     ) -> bool {
-        self.try_send_s2s_command(
-            NativeToS2SCommand::SendVoiceForChannel {
-                sender_session,
-                server_id,
-                source_channel,
-                is_terminator,
-                payload,
-            },
-            "voice",
-        )
+        let Some(tx) = self.state.read().gateway_tx.clone() else {
+            trace!(label = "voice", "s2s gateway unavailable; dropping command");
+            return false;
+        };
+        tx.try_send_voice(NativeToS2SCommand::SendVoiceForChannel {
+            sender_session,
+            server_id,
+            source_channel,
+            is_terminator,
+            payload,
+        })
     }
 
     pub fn send_voice_broadcast(
@@ -674,17 +1236,18 @@ impl S2SManager {
         payload: Bytes,
         intent: VoiceIntent,
     ) -> bool {
-        self.try_send_s2s_command(
-            NativeToS2SCommand::SendVoiceBroadcast {
-                sender_session,
-                server_id,
-                target_kind,
-                is_terminator,
-                payload,
-                intent,
-            },
-            "voice",
-        )
+        let Some(tx) = self.state.read().gateway_tx.clone() else {
+            trace!(label = "voice", "s2s gateway unavailable; dropping command");
+            return false;
+        };
+        tx.try_send_voice(NativeToS2SCommand::SendVoiceBroadcast {
+            sender_session,
+            server_id,
+            target_kind,
+            is_terminator,
+            payload,
+            intent,
+        })
     }
 
     pub async fn get_channel_blob(&self, server_id: Option<&str>, key: &str) -> Option<Bytes> {
@@ -753,8 +1316,9 @@ impl S2SManager {
         shutdown: watch::Receiver<()>,
     ) -> S2SRuntimeTask {
         let native_runtime = tokio::runtime::Handle::current();
-        let (native_tx, native_rx) = mpsc::channel(NATIVE_GATEWAY_CAPACITY);
-        let (s2s_tx, s2s_rx) = mpsc::channel(S2S_GATEWAY_CAPACITY);
+        let gateway_budget = S2SQueueBudget::auto();
+        let (native_tx, native_rx) = S2SNativeGatewayTx::new(gateway_budget.clone());
+        let (s2s_tx, s2s_rx) = S2SGatewayTx::new(gateway_budget);
         if self.enabled && self.config_error.is_none() && self.transport_config.is_some() {
             self.state.write().gateway_tx = Some(s2s_tx.clone());
         } else {
@@ -1065,8 +1629,8 @@ impl S2SManager {
         server: &Arc<Box<Server>>,
         recipient_index: Arc<RecipientIndex>,
         native_runtime: &tokio::runtime::Handle,
-        s2s_tx: mpsc::Sender<NativeToS2SCommand>,
-        s2s_rx: mpsc::Receiver<NativeToS2SCommand>,
+        s2s_tx: S2SGatewayTx,
+        s2s_rx: S2SGatewayRx,
         shutdown: watch::Receiver<()>,
     ) -> (
         HashMap<String, s2s_replications::StrictHandle<ChannelReplicationAdapter>>,
@@ -1267,7 +1831,7 @@ pub async fn resolve_observability_geo(configured_geo: Option<NodeGeo>) -> Optio
 fn spawn_native_client_replication_bridge(
     runtime: &tokio::runtime::Handle,
     repo: Arc<ClientRepository>,
-    tx: mpsc::Sender<NativeToS2SCommand>,
+    tx: S2SGatewayTx,
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     let mut rx = repo.subscribe();
@@ -1283,17 +1847,17 @@ fn spawn_native_client_replication_bridge(
                     if entry.node_id != repo.local_node_id() {
                         continue;
                     }
-                    match tx.try_send(NativeToS2SCommand::ProposeClientReplication(
-                        (*entry).clone(),
-                    )) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!(
-                                version = entry.version,
-                                "s2s client replication gateway full; dropping proposal"
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    if !tx
+                        .send_lossless(NativeToS2SCommand::ProposeClientReplication(
+                            (*entry).clone(),
+                        ))
+                        .await
+                    {
+                        warn!(
+                            version = entry.version,
+                            "s2s client replication gateway closed; dropping proposal"
+                        );
+                        return;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1308,7 +1872,7 @@ fn spawn_native_client_replication_bridge(
 fn spawn_native_voice_recipient_index_bridge(
     runtime: &tokio::runtime::Handle,
     repo: Arc<ClientRepository>,
-    tx: mpsc::Sender<NativeToS2SCommand>,
+    tx: S2SGatewayTx,
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     let mut rx = repo.subscribe();
@@ -1366,22 +1930,15 @@ fn client_entry_affects_voice_recipient_index(entry: &ClientStateLogEntry) -> bo
     }
 }
 
-async fn enqueue_voice_recipient_index_snapshot(
-    repo: &Arc<ClientRepository>,
-    tx: &mpsc::Sender<NativeToS2SCommand>,
-) {
+async fn enqueue_voice_recipient_index_snapshot(repo: &Arc<ClientRepository>, tx: &S2SGatewayTx) {
     let snapshot = repo.voice_recipient_index_snapshot().await;
-    match tx.try_send(NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot)) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            warn!("s2s voice recipient index gateway full; dropping snapshot");
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    if !tx.try_send_coalesced(NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot)) {
+        warn!("s2s voice recipient index gateway full; dropping snapshot");
     }
 }
 
 fn spawn_s2s_gateway_receiver(
-    mut rx: mpsc::Receiver<NativeToS2SCommand>,
+    rx: S2SGatewayRx,
     manager: Arc<S2SManager>,
     application: Arc<s2s_application::ApplicationLayer>,
     client_handle: Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
@@ -1392,128 +1949,247 @@ fn spawn_s2s_gateway_receiver(
             client_handle,
             S2S_CLIENT_REPLICATION_WORKER_CAPACITY,
         );
-        while let Some(command) = rx.recv().await {
-            match command {
-                NativeToS2SCommand::ProposeChannel {
-                    server_id,
-                    op,
-                    respond,
-                } => {
-                    let _ = respond.send(manager.propose_channel_op_direct(&server_id, op).await);
+        let S2SGatewayRx {
+            control,
+            replication,
+            bulk,
+            voice,
+            coalesced,
+        } = rx;
+        let control_task = run_s2s_control_gateway(control, manager, application.clone());
+        let replication_task = run_s2s_replication_gateway(replication, client_proposal_tx);
+        let bulk_task = run_s2s_bulk_gateway(bulk, application.clone());
+        let voice_task = run_s2s_voice_gateway(voice, application);
+        let coalesced_task = run_s2s_coalesced_gateway(coalesced, recipient_index);
+        tokio::join!(
+            control_task,
+            replication_task,
+            bulk_task,
+            voice_task,
+            coalesced_task
+        );
+    })
+}
+
+async fn run_s2s_control_gateway(
+    mut rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    manager: Arc<S2SManager>,
+    application: Arc<s2s_application::ApplicationLayer>,
+) {
+    while let Some(command) = rx.recv().await {
+        match command {
+            NativeToS2SCommand::ProposeChannel {
+                server_id,
+                op,
+                respond,
+            } => {
+                let _ = respond.send(manager.propose_channel_op_direct(&server_id, op).await);
+            }
+            NativeToS2SCommand::ProposeBan { op, respond } => {
+                let _ = respond.send(manager.propose_ban_op_direct(op).await);
+            }
+            NativeToS2SCommand::DispatchModeration { owner, envelope } => {
+                if let Err(e) = application
+                    .moderation()
+                    .dispatch_envelope_for_gateway(owner, envelope)
+                    .await
+                {
+                    warn!(error = %e, owner, "moderation dispatch failed");
                 }
-                NativeToS2SCommand::ProposeBan { op, respond } => {
-                    let _ = respond.send(manager.propose_ban_op_direct(op).await);
-                }
-                NativeToS2SCommand::ProposeClientReplication(entry) => {
-                    match client_proposal_tx.try_send(QueuedClientReplicationProposal {
-                        entry,
-                        enqueued_at: Instant::now(),
-                    }) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(proposal)) => {
-                            warn!(
-                                version = proposal.entry.version,
-                                "s2s client replication worker full; dropping proposal"
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(proposal)) => {
-                            warn!(
-                                version = proposal.entry.version,
-                                "s2s client replication worker stopped; dropping proposal"
-                            );
-                        }
+            }
+            NativeToS2SCommand::DispatchUserStats {
+                owner,
+                actor_session,
+                target_session,
+                stats_only,
+                server_id,
+                respond,
+            } => {
+                let result = application
+                    .user_stats()
+                    .dispatch_request(
+                        owner,
+                        actor_session,
+                        target_session,
+                        stats_only,
+                        server_id,
+                        None,
+                    )
+                    .await;
+                let _ = respond.send(result);
+            }
+            other => {
+                warn!(
+                    label = other.label(),
+                    "unexpected command on s2s control gateway lane"
+                );
+            }
+        }
+    }
+}
+
+async fn run_s2s_replication_gateway(
+    mut rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    client_proposal_tx: mpsc::Sender<QueuedClientReplicationProposal>,
+) {
+    while let Some(command) = rx.recv().await {
+        match command {
+            NativeToS2SCommand::ProposeClientReplication(entry) => {
+                match client_proposal_tx.try_send(QueuedClientReplicationProposal {
+                    entry,
+                    enqueued_at: Instant::now(),
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(proposal)) => {
+                        warn!(
+                            version = proposal.entry.version,
+                            "s2s client replication worker full; dropping proposal"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(proposal)) => {
+                        warn!(
+                            version = proposal.entry.version,
+                            "s2s client replication worker stopped; dropping proposal"
+                        );
                     }
                 }
-                NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot) => {
-                    recipient_index.replace_all(snapshot);
+            }
+            other => {
+                warn!(
+                    label = other.label(),
+                    "unexpected command on s2s replication gateway lane"
+                );
+            }
+        }
+    }
+}
+
+async fn run_s2s_bulk_gateway(
+    mut rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    application: Arc<s2s_application::ApplicationLayer>,
+) {
+    while let Some(command) = rx.recv().await {
+        match command {
+            NativeToS2SCommand::DispatchPluginData { owner, envelope } => {
+                if let Err(e) = application.plugin_data().dispatch(owner, envelope).await {
+                    warn!(error = %e, owner, "plugin data dispatch failed");
                 }
-                NativeToS2SCommand::DispatchPluginData { owner, envelope } => {
-                    if let Err(e) = application.plugin_data().dispatch(owner, envelope).await {
-                        warn!(error = %e, owner, "plugin data dispatch failed");
-                    }
+            }
+            NativeToS2SCommand::DispatchTextMessage { owner, envelope } => {
+                if let Err(e) = application.text_message().dispatch(owner, envelope).await {
+                    warn!(error = %e, owner, "text message dispatch failed");
                 }
-                NativeToS2SCommand::DispatchTextMessage { owner, envelope } => {
-                    if let Err(e) = application.text_message().dispatch(owner, envelope).await {
-                        warn!(error = %e, owner, "text message dispatch failed");
-                    }
-                }
-                NativeToS2SCommand::DispatchModeration { owner, envelope } => {
-                    if let Err(e) = application
-                        .moderation()
-                        .dispatch_envelope_for_gateway(owner, envelope)
-                        .await
-                    {
-                        warn!(error = %e, owner, "moderation dispatch failed");
-                    }
-                }
-                NativeToS2SCommand::DispatchUserStats {
-                    owner,
-                    actor_session,
-                    target_session,
-                    stats_only,
-                    server_id,
-                    respond,
-                } => {
-                    let result = application
-                        .user_stats()
-                        .dispatch_request(
-                            owner,
-                            actor_session,
-                            target_session,
-                            stats_only,
-                            server_id,
-                            None,
-                        )
-                        .await;
-                    let _ = respond.send(result);
-                }
-                NativeToS2SCommand::SendVoiceForChannel {
+            }
+            other => {
+                warn!(
+                    label = other.label(),
+                    "unexpected command on s2s bulk gateway lane"
+                );
+            }
+        }
+    }
+}
+
+async fn run_s2s_voice_gateway(
+    mut rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    application: Arc<s2s_application::ApplicationLayer>,
+) {
+    let permits = Arc::new(Semaphore::new(default_s2s_voice_gateway_concurrency()));
+    while let Some(command) = rx.recv().await {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            return;
+        };
+        let application = application.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            run_s2s_voice_command(application, command).await;
+        });
+    }
+}
+
+async fn run_s2s_voice_command(
+    application: Arc<s2s_application::ApplicationLayer>,
+    command: NativeToS2SCommand,
+) {
+    match command {
+        NativeToS2SCommand::SendVoiceForChannel {
+            sender_session,
+            server_id,
+            source_channel,
+            is_terminator,
+            payload,
+        } => {
+            if let Err(e) = application
+                .voice()
+                .send_for_channel(
                     sender_session,
                     server_id,
                     source_channel,
                     is_terminator,
                     payload,
-                } => {
-                    if let Err(e) = application
-                        .voice()
-                        .send_for_channel(
-                            sender_session,
-                            server_id,
-                            source_channel,
-                            is_terminator,
-                            payload,
-                        )
-                        .await
-                    {
-                        trace!(error = %e, "voice s2s send_for_channel failed");
-                    }
-                }
-                NativeToS2SCommand::SendVoiceBroadcast {
+                )
+                .await
+            {
+                trace!(error = %e, "voice s2s send_for_channel failed");
+            }
+        }
+        NativeToS2SCommand::SendVoiceBroadcast {
+            sender_session,
+            server_id,
+            target_kind,
+            is_terminator,
+            payload,
+            intent,
+        } => {
+            if let Err(e) = application
+                .voice()
+                .send_broadcast(
                     sender_session,
                     server_id,
                     target_kind,
                     is_terminator,
                     payload,
                     intent,
-                } => {
-                    if let Err(e) = application
-                        .voice()
-                        .send_broadcast(
-                            sender_session,
-                            server_id,
-                            target_kind,
-                            is_terminator,
-                            payload,
-                            intent,
-                        )
-                        .await
-                    {
-                        trace!(error = %e, "voice s2s send_broadcast failed");
-                    }
-                }
+                )
+                .await
+            {
+                trace!(error = %e, "voice s2s send_broadcast failed");
             }
         }
-    })
+        other => {
+            warn!(
+                label = other.label(),
+                "unexpected command on s2s voice gateway lane"
+            );
+        }
+    }
+}
+
+async fn run_s2s_coalesced_gateway(
+    mut rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    recipient_index: Arc<RecipientIndex>,
+) {
+    while let Some(command) = rx.recv().await {
+        match command {
+            NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot) => {
+                recipient_index.replace_all(snapshot);
+            }
+            other => {
+                warn!(
+                    label = other.label(),
+                    "unexpected command on s2s coalesced gateway lane"
+                );
+            }
+        }
+    }
+}
+
+fn default_s2s_voice_gateway_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_mul(4)
+        .clamp(4, 64)
 }
 
 struct QueuedClientReplicationProposal {
@@ -1574,7 +2250,80 @@ fn spawn_client_replication_proposal_worker(
 
 async fn run_native_gateway(
     server: Weak<Box<Server>>,
-    mut rx: mpsc::Receiver<S2SNativeCommand>,
+    rx: S2SNativeGatewayRx,
+    mut shutdown: watch::Receiver<()>,
+) {
+    let S2SNativeGatewayRx {
+        control,
+        bulk,
+        voice,
+    } = rx;
+    let control_task = run_native_control_gateway(server.clone(), control, shutdown.clone());
+    let bulk_task = run_native_bulk_gateway(server.clone(), bulk, shutdown.clone());
+    let voice_task = run_native_voice_gateway(server, voice, shutdown);
+    tokio::join!(control_task, bulk_task, voice_task);
+}
+
+struct S2SNativeGatewaySink {
+    tx: S2SNativeGatewayTx,
+}
+
+impl S2SNativeGatewaySink {
+    fn new(tx: S2SNativeGatewayTx) -> Self {
+        Self { tx }
+    }
+
+    async fn send_lossless(&self, command: S2SNativeCommand) {
+        if !self.tx.send_lossless(command).await {
+            trace!("s2s native gateway closed; dropping command");
+        }
+    }
+
+    fn try_send_voice(&self, command: S2SNativeCommand) {
+        let label = command.label();
+        if !self.tx.try_send_voice(command) {
+            warn!(label, "s2s native gateway full; dropping command");
+        }
+    }
+}
+
+#[async_trait]
+impl ModerationApplier for S2SNativeGatewaySink {
+    async fn apply(&self, from: NodeIdentifier, envelope: ModerationEnvelope) {
+        self.send_lossless(S2SNativeCommand::ApplyModeration { from, envelope })
+            .await;
+    }
+}
+
+#[async_trait]
+impl AudioSink for S2SNativeGatewaySink {
+    async fn deliver(&self, from_immediate: NodeIdentifier, frame: VoiceFrame) {
+        self.try_send_voice(S2SNativeCommand::DeliverVoice {
+            from_immediate,
+            frame,
+        });
+    }
+}
+
+#[async_trait]
+impl s2s_application::plugin_data::PluginDataSink for S2SNativeGatewaySink {
+    async fn deliver(&self, from: NodeIdentifier, envelope: PluginDataEnvelope) {
+        self.send_lossless(S2SNativeCommand::DeliverPluginData { from, envelope })
+            .await;
+    }
+}
+
+#[async_trait]
+impl s2s_application::text_message::TextMessageSink for S2SNativeGatewaySink {
+    async fn deliver(&self, from: NodeIdentifier, envelope: TextMessageEnvelope) {
+        self.send_lossless(S2SNativeCommand::DeliverTextMessage { from, envelope })
+            .await;
+    }
+}
+
+async fn run_native_control_gateway(
+    server: Weak<Box<Server>>,
+    mut rx: S2SAdaptiveReceiver<S2SNativeCommand>,
     mut shutdown: watch::Receiver<()>,
 ) {
     loop {
@@ -1592,6 +2341,31 @@ async fn run_native_gateway(
             S2SNativeCommand::ApplyModeration { from, envelope } => {
                 apply_s2s_moderation(&server, from, envelope).await;
             }
+            other => warn!(
+                label = other.label(),
+                "unexpected command on native control gateway lane"
+            ),
+        }
+    }
+}
+
+async fn run_native_bulk_gateway(
+    server: Weak<Box<Server>>,
+    mut rx: S2SAdaptiveReceiver<S2SNativeCommand>,
+    mut shutdown: watch::Receiver<()>,
+) {
+    loop {
+        let command = tokio::select! {
+            _ = shutdown.changed() => return,
+            next = rx.recv() => match next {
+                Some(command) => command,
+                None => return,
+            },
+        };
+        let Some(server) = server.upgrade() else {
+            return;
+        };
+        match command {
             S2SNativeCommand::DeliverPluginData { from, envelope } => {
                 trace!(from, "s2s plugin data handed to native gateway");
                 deliver_plugin_data_to_local_recipients(&server, envelope).await;
@@ -1600,78 +2374,49 @@ async fn run_native_gateway(
                 trace!(from, "s2s text message handed to native gateway");
                 deliver_text_message_to_local_recipients(&server, envelope).await;
             }
-            S2SNativeCommand::DeliverVoice {
-                from_immediate,
-                frame,
-            } => {
-                crate::voice::route_s2s_voice_frame(&server, from_immediate, frame).await;
-            }
+            other => warn!(
+                label = other.label(),
+                "unexpected command on native bulk gateway lane"
+            ),
         }
     }
 }
 
-struct S2SNativeGatewaySink {
-    tx: mpsc::Sender<S2SNativeCommand>,
-}
-
-impl S2SNativeGatewaySink {
-    fn new(tx: mpsc::Sender<S2SNativeCommand>) -> Self {
-        Self { tx }
-    }
-
-    fn try_send(&self, command: S2SNativeCommand, label: &'static str) {
-        match self.tx.try_send(command) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(label, "s2s native gateway full; dropping command");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                trace!(label, "s2s native gateway closed; dropping command");
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl ModerationApplier for S2SNativeGatewaySink {
-    async fn apply(&self, from: NodeIdentifier, envelope: ModerationEnvelope) {
-        self.try_send(
-            S2SNativeCommand::ApplyModeration { from, envelope },
-            "moderation",
-        );
-    }
-}
-
-#[async_trait]
-impl AudioSink for S2SNativeGatewaySink {
-    async fn deliver(&self, from_immediate: NodeIdentifier, frame: VoiceFrame) {
-        self.try_send(
-            S2SNativeCommand::DeliverVoice {
-                from_immediate,
-                frame,
+async fn run_native_voice_gateway(
+    server: Weak<Box<Server>>,
+    mut rx: S2SAdaptiveReceiver<S2SNativeCommand>,
+    mut shutdown: watch::Receiver<()>,
+) {
+    let permits = Arc::new(Semaphore::new(default_s2s_voice_gateway_concurrency()));
+    loop {
+        let command = tokio::select! {
+            _ = shutdown.changed() => return,
+            next = rx.recv() => match next {
+                Some(command) => command,
+                None => return,
             },
-            "voice",
-        );
-    }
-}
-
-#[async_trait]
-impl s2s_application::plugin_data::PluginDataSink for S2SNativeGatewaySink {
-    async fn deliver(&self, from: NodeIdentifier, envelope: PluginDataEnvelope) {
-        self.try_send(
-            S2SNativeCommand::DeliverPluginData { from, envelope },
-            "plugin_data",
-        );
-    }
-}
-
-#[async_trait]
-impl s2s_application::text_message::TextMessageSink for S2SNativeGatewaySink {
-    async fn deliver(&self, from: NodeIdentifier, envelope: TextMessageEnvelope) {
-        self.try_send(
-            S2SNativeCommand::DeliverTextMessage { from, envelope },
-            "text_message",
-        );
+        };
+        let Some(server) = server.upgrade() else {
+            return;
+        };
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            match command {
+                S2SNativeCommand::DeliverVoice {
+                    from_immediate,
+                    frame,
+                } => {
+                    crate::voice::route_s2s_voice_frame(&server, from_immediate, frame).await;
+                }
+                other => warn!(
+                    label = other.label(),
+                    "unexpected command on native voice gateway lane"
+                ),
+            }
+        });
     }
 }
 
@@ -2842,6 +3587,76 @@ mod tests {
         assert_eq!(
             strict_proposal_gateway_response_timeout(&cfg),
             S2S_GATEWAY_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestGatewayCommand {
+        label: &'static str,
+        bytes: usize,
+    }
+
+    impl EstimatedS2SCommand for TestGatewayCommand {
+        fn label(&self) -> &'static str {
+            self.label
+        }
+
+        fn estimated_bytes(&self) -> usize {
+            self.bytes
+        }
+    }
+
+    #[test]
+    fn queue_budget_releases_permits_when_command_is_dropped() {
+        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
+        let lane = budget.split(S2S_GATEWAY_LANE_MIN_BYTES);
+        let permit = lane
+            .try_reserve(S2S_GATEWAY_LANE_MIN_BYTES * 3 / 4)
+            .expect("reserve fits");
+
+        assert!(lane.try_reserve(S2S_GATEWAY_LANE_MIN_BYTES / 2).is_none());
+        drop(permit);
+        assert!(lane.try_reserve(S2S_GATEWAY_LANE_MIN_BYTES / 2).is_some());
+    }
+
+    #[tokio::test]
+    async fn adaptive_sender_drops_voice_style_command_when_budget_is_full() {
+        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
+        let (tx, mut rx) = S2SAdaptiveSender::new(budget.split(S2S_GATEWAY_LANE_MIN_BYTES));
+
+        assert!(tx.try_send(TestGatewayCommand {
+            label: "voice",
+            bytes: S2S_GATEWAY_LANE_MIN_BYTES * 3 / 4,
+        }));
+        assert!(!tx.try_send(TestGatewayCommand {
+            label: "voice",
+            bytes: S2S_GATEWAY_LANE_MIN_BYTES / 2,
+        }));
+
+        assert_eq!(
+            rx.recv().await,
+            Some(TestGatewayCommand {
+                label: "voice",
+                bytes: S2S_GATEWAY_LANE_MIN_BYTES * 3 / 4,
+            })
+        );
+        assert!(tx.try_send(TestGatewayCommand {
+            label: "voice",
+            bytes: S2S_GATEWAY_LANE_MIN_BYTES / 2,
+        }));
+    }
+
+    #[tokio::test]
+    async fn adaptive_sender_rejects_oversized_lossless_command_without_waiting() {
+        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
+        let (tx, _rx) = S2SAdaptiveSender::new(budget.split(S2S_GATEWAY_LANE_MIN_BYTES));
+
+        assert!(
+            !tx.send(TestGatewayCommand {
+                label: "control",
+                bytes: S2S_GATEWAY_LANE_MIN_BYTES + 1,
+            })
+            .await
         );
     }
 

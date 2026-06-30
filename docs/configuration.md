@@ -98,7 +98,7 @@ udp_channel_size = 4096
 
 client_idle_timeout_secs = 30
 authenticate_timeout_ms = 30000
-# Default: floor(5th root(active CPU count)), minimum 1.
+# Default: floor(3rd root(active CPU count)), minimum 1.
 # auth_finalization_concurrency = 1
 pending_delete_timeout_ms = 5000
 
@@ -218,12 +218,12 @@ udp_channel_size = 2048
 ```toml
 client_idle_timeout_secs = 30
 authenticate_timeout_ms = 30000
-# Default: floor(5th root(active CPU count)), minimum 1.
+# Default: floor(3rd root(active CPU count)), minimum 1.
 # auth_finalization_concurrency = 1
 pending_delete_timeout_ms = 5000
 ```
 
-`authenticate_timeout_ms` starts after TLS setup. `auth_finalization_concurrency` limits how many clients can concurrently run authenticator backend work and the initial sync/publish path. When omitted, it defaults to `floor(5th root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
+`authenticate_timeout_ms` starts after TLS setup. `auth_finalization_concurrency` limits how many clients can concurrently create UDP crypt setup state, run authenticator backend work, and perform the initial sync/publish path. When omitted, it defaults to `floor(3rd root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
 
 ## Persistence
 
@@ -270,7 +270,7 @@ file_access_dir = ["auth/files"]
 working_dir = "auth/files"
 ```
 
-The server keeps a reusable pool of WASM instances and creates more as queued authenticator work needs them. `auth_finalization_concurrency` controls how many login authenticator calls can run at once. Instance creation itself remains serialized. `file_access_dir` bounds file access from the WASM raw stream imports. When it is empty, file stream imports are unavailable.
+The server keeps a reusable pool of WASM instances and creates more as queued authenticator work needs them. `auth_finalization_concurrency` controls how many login authenticator calls can run at once. The same limit also throttles per-client UDP crypt setup so connection spikes do not generate unbounded key setup work. Instance creation itself remains serialized. `file_access_dir` bounds file access from the WASM raw stream imports. When it is empty, file stream imports are unavailable.
 
 ### Exec Authenticator
 
@@ -457,6 +457,12 @@ Transport and replication tuning examples:
 ping_interval_secs = 2
 idle_ping_interval_secs = 10
 max_outgoing_connections = 1024
+# Legacy queue capacity hints. Adaptive byte budgets use available memory;
+# these only raise the per-lane minimum budget.
+inbound_control_capacity = 16384
+inbound_high_capacity = 32768
+inbound_regular_capacity = 32768
+outbound_capacity = 131072
 compression_enabled = true
 compression_min_bytes = 1024
 compression_min_savings_percent = 10
@@ -475,6 +481,11 @@ propose_semaphore_size = 32
 strict_max_catchup_ops = 256
 blob_chunk_size = 65536
 ```
+
+S2S inbound and outbound transport queues are adaptive and byte-budgeted. The
+old `inbound_*_capacity` and `outbound_capacity` knobs are still accepted for
+compatibility, but they act as minimum budget hints rather than hard message
+counts.
 
 See [Clustering](clustering.md) for certificate generation, local demos, and S2S operational notes.
 

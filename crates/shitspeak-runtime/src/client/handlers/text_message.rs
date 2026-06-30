@@ -229,6 +229,7 @@ pub async fn handle_text_message(
             if !server
                 .s2s_manager()
                 .dispatch_text_message(node_id, envelope)
+                .await
             {
                 tracing::trace!(
                     node_id,

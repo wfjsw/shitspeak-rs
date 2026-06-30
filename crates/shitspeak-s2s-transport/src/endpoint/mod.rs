@@ -1081,7 +1081,6 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     use super::super::connection::ActiveStream;
@@ -1106,7 +1105,9 @@ mod tests {
     }
 
     fn install_live_stream(peer: &PeerState) {
-        let (tx, rx) = mpsc::channel(1);
+        let budget = super::super::adaptive_queue::AdaptiveQueueBudget::new(1024 * 1024);
+        let (tx, rx) =
+            super::super::adaptive_queue::AdaptiveQueueSender::new(budget.split(1024 * 1024));
         std::mem::forget(rx);
         peer.install_stream(ActiveStream::new(
             TransportKind::Tcp,
@@ -1118,7 +1119,9 @@ mod tests {
     }
 
     fn install_live_stream_at(peer: &PeerState, remote_addr: &str) {
-        let (tx, rx) = mpsc::channel(1);
+        let budget = super::super::adaptive_queue::AdaptiveQueueBudget::new(1024 * 1024);
+        let (tx, rx) =
+            super::super::adaptive_queue::AdaptiveQueueSender::new(budget.split(1024 * 1024));
         std::mem::forget(rx);
         peer.install_stream(ActiveStream::new(
             TransportKind::Tcp,

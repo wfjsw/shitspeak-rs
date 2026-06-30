@@ -52,7 +52,9 @@ packet IO, and compression views.
 
 The same listener serves Prometheus metrics on `/metrics` and `/s2s/metrics`,
 including `shitspeak_s2s_queue_status` for incoming and outgoing queue depth,
-capacity, high watermark, samples, and full samples.
+capacity, high watermark, samples, and full samples. S2S transport queue depth,
+capacity, and high watermark are reported as bytes because those queues are
+adaptive byte-budgeted queues.
 
 ## Metrics Server
 

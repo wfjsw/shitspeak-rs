@@ -26,7 +26,7 @@ use prost::Message as _;
 use rustls::SignatureScheme;
 use rustls_pki_types::CertificateDer;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{Instant as TokioInstant, Interval, interval_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -35,6 +35,9 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
 
+use super::super::adaptive_queue::{
+    AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender,
+};
 use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::super::frame::{FrameType, build_frame};
@@ -1927,7 +1930,13 @@ fn spawn_udp_write_pump(
     peer_addr: SocketAddr,
     is_dialer: bool,
 ) -> ActiveStream {
-    let (tx, rx) = mpsc::channel::<OutboundFrame>(inner.cfg().outbound_capacity());
+    let budget = AdaptiveQueueBudget::auto();
+    let lane_bytes = super::super::manager::adaptive_lane_bytes(
+        budget.max_bytes(),
+        inner.cfg().outbound_capacity(),
+        50,
+    );
+    let (tx, rx) = AdaptiveQueueSender::new(budget.split(lane_bytes));
     let closed = inner.shutdown().child_token();
     tokio::spawn(run_write(state, session, peer, inner, rx, closed.clone()));
     ActiveStream::new(TransportKind::Udp, Some(peer_addr), tx, closed, is_dialer)
@@ -1942,7 +1951,7 @@ async fn run_write(
     session: Arc<UdpCryptoSession>,
     peer: Arc<PeerState>,
     inner: Arc<ManagerInner>,
-    mut rx: mpsc::Receiver<OutboundFrame>,
+    mut rx: AdaptiveQueueReceiver<OutboundFrame>,
     closed: CancellationToken,
 ) {
     let level = TransportKind::Udp.service_level();

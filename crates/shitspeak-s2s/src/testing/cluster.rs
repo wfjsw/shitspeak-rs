@@ -15,7 +15,7 @@ use crate::overlay::OverlayNetwork;
 use crate::overlay::config::{OverlayConfig, SeedPeer};
 use crate::overlay::messaging::{OverlayInboundMessage, ServiceInbound};
 use shitspeak_s2s_transport::{
-    ConnectionManager, InboundMessage, PeerAddress, TransportConfig, TransportKind,
+    AdaptiveInboundReceiver, ConnectionManager, PeerAddress, TransportConfig, TransportKind,
 };
 
 /// Build a `TransportConfig` for the test cluster: TCP-only, short
@@ -255,4 +255,4 @@ impl ServiceInbound for Capture {
 }
 
 /// Re-export so callers can construct `InboundMessage`-aware closures.
-pub type InboundMpsc = mpsc::Receiver<InboundMessage>;
+pub type InboundMpsc = AdaptiveInboundReceiver;

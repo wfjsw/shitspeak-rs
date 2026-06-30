@@ -503,7 +503,7 @@ fn default_root_channel_name() -> String {
 }
 
 fn default_channel_log_max_entries() -> usize {
-    10_000
+    300
 }
 
 fn default_channel_snapshot_every_ops() -> u64 {

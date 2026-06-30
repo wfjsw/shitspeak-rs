@@ -13,7 +13,7 @@ use crate::{
 };
 
 pub async fn handle_crypt_setup(
-    _server: &Arc<Box<Server>>,
+    server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
     msg: CryptSetup,
 ) -> Result<(), MessageHandlerError> {
@@ -36,8 +36,9 @@ pub async fn handle_crypt_setup(
 
     if msg.is_client_request_resync() {
         // Full re-key
-        sender
-            .create_crypt_state("OCB2-AES128")
+        server
+            .create_client_crypt_state(sender, "OCB2-AES128")
+            .await
             .map_err(|_| RejectType::AuthenticatorFail)?;
 
         let reply: Message = {

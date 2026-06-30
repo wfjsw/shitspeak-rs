@@ -69,7 +69,7 @@ const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 128;
 const DYNAMIC_ENTRYPOINT_MIN_PORT: u16 = 49152;
 const DYNAMIC_ENTRYPOINT_MAX_PORT: u16 = 65535;
 const MIN_AUTHENTICATE_TIMEOUT_MS: u64 = 1;
-const AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL: Duration = Duration::from_secs(2);
+const AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL: Duration = Duration::from_secs(1);
 const PRE_AUTH_DEFERRED_MESSAGE_LIMIT: usize = 32;
 
 pub type ServerExtensionFuture<'a> =
@@ -1513,6 +1513,7 @@ pub struct Server {
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
     auth_finalization_queue: Arc<AuthFinalizationQueue>,
+    crypt_setup_semaphore: Arc<tokio::sync::Semaphore>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
     user_channel_cache: Arc<UserChannelCache>,
@@ -2870,6 +2871,9 @@ impl Server {
                 auth_finalization_concurrency,
                 authenticator,
             )),
+            crypt_setup_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                auth_finalization_concurrency,
+            )),
             channel_blobs,
             session_blobs,
             user_channel_cache,
@@ -3240,53 +3244,43 @@ impl Server {
                     let mut found = None;
 
                     if let Some(c) = address_match {
-                        if !c.is_authenticated() {
-                            tracing::trace!(
-                                "UDP client {:?} matched by address is not authenticated, skipping",
-                                c.get_session_id()
-                            );
-                            server
-                                .clients
-                                .unbind_client_udp_endpoint(local_addr, src_addr);
-                        } else {
-                            let decrypt_result: Option<Result<BytesMut, _>> = {
-                                let mut crypt = c.crypt_state();
-                                crypt.as_mut().map(|state| {
-                                    let mut dec = BytesMut::new();
-                                    state.decrypt(&mut dec, &packet).map(|_| dec)
-                                })
-                            };
+                        let decrypt_result: Option<Result<BytesMut, _>> = {
+                            let mut crypt = c.crypt_state();
+                            crypt.as_mut().map(|state| {
+                                let mut dec = BytesMut::new();
+                                state.decrypt(&mut dec, &packet).map(|_| dec)
+                            })
+                        };
 
-                            match decrypt_result {
-                                Some(Ok(dec)) => {
-                                    tracing::trace!(
-                                        "UDP client matched by address: {} -> session {:?}",
-                                        src_addr,
-                                        c.get_session_id()
-                                    );
-                                    decrypted_from_match = Some(dec);
-                                    found = Some(c);
-                                }
-                                Some(Err(e)) => {
-                                    tracing::trace!(
-                                        "UDP address-match decrypt failed for {:?} from {}: {:?}, removing stale binding",
-                                        c.get_session_id(),
-                                        src_addr,
-                                        e
-                                    );
-                                    server
-                                        .clients
-                                        .unbind_client_udp_endpoint(local_addr, src_addr);
-                                }
-                                None => {
-                                    tracing::trace!(
-                                        "UDP address-matched client {:?} has no crypt state, removing stale binding",
-                                        c.get_session_id()
-                                    );
-                                    server
-                                        .clients
-                                        .unbind_client_udp_endpoint(local_addr, src_addr);
-                                }
+                        match decrypt_result {
+                            Some(Ok(dec)) => {
+                                tracing::trace!(
+                                    "UDP client matched by address: {} -> session {:?}",
+                                    src_addr,
+                                    c.get_session_id()
+                                );
+                                decrypted_from_match = Some(dec);
+                                found = Some(c);
+                            }
+                            Some(Err(e)) => {
+                                tracing::trace!(
+                                    "UDP address-match decrypt failed for {:?} from {}: {:?}, removing stale binding",
+                                    c.get_session_id(),
+                                    src_addr,
+                                    e
+                                );
+                                server
+                                    .clients
+                                    .unbind_client_udp_endpoint(local_addr, src_addr);
+                            }
+                            None => {
+                                tracing::trace!(
+                                    "UDP address-matched client {:?} has no crypt state, removing stale binding",
+                                    c.get_session_id()
+                                );
+                                server
+                                    .clients
+                                    .unbind_client_udp_endpoint(local_addr, src_addr);
                             }
                         }
                     }
@@ -3295,14 +3289,6 @@ impl Server {
                         let candidates = server.clients.get_clients_by_ip(&src_addr.ip()).await;
                         let mut matched = None;
                         for c in &candidates {
-                            if !c.is_authenticated() {
-                                tracing::trace!(
-                                    "UDP client {:?} is not authenticated, skipping for IP fallback",
-                                    c.get_session_id()
-                                );
-                                continue;
-                            }
-
                             let decrypted = {
                                 let mut crypt = c.crypt_state();
                                 match crypt.as_mut() {
@@ -3362,7 +3348,7 @@ impl Server {
                 client.record_udp_packet(packet.len()).await;
                 client.touch_activity();
 
-                // A valid UDP voice packet indicates UDP path is working.
+                // A valid encrypted UDP packet indicates UDP path is working.
                 client.set_prefer_tcp_tunnel(false);
 
                 if matched_via_ip_fallback {
@@ -3449,6 +3435,14 @@ impl Server {
                         continue;
                     }
                     Ok(crate::voice::codec::IncomingUdpPacket::Audio(decoded_audio)) => {
+                        if !client.is_authenticated() {
+                            tracing::trace!(
+                                "UDP audio packet from {} matched unauthenticated client {:?}; dropping",
+                                src_addr,
+                                client.get_session_id()
+                            );
+                            continue;
+                        }
                         tracing::trace!(
                             "UDP audio packet from {}: sender_session={:?}, frame_number={}, format={:?}, payload_len={}",
                             src_addr,
@@ -4584,6 +4578,22 @@ impl Server {
         client: &Arc<Box<Client>>,
     ) -> Result<AuthFinalizationPermit, MessageHandlerError> {
         self.auth_finalization_queue.acquire(client).await
+    }
+
+    pub async fn create_client_crypt_state(
+        &self,
+        client: &Client,
+        mode: &str,
+    ) -> Result<(), crate::client::crypt::CryptError> {
+        let permit = self
+            .crypt_setup_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("crypt setup semaphore should not be closed");
+        let result = client.create_crypt_state(mode);
+        drop(permit);
+        result
     }
 
     #[cfg(test)]

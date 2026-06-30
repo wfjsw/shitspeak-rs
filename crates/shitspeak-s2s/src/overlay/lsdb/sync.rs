@@ -226,7 +226,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::super::store::LsaFloor;
-    use shitspeak_s2s_transport::TransportKind;
+    use shitspeak_s2s_transport::{SendError, TransportKind};
 
     fn entry(origin: NodeIdentifier, boot_epoch: u64, seq: u64) -> LsaEntry {
         LsaEntry {
@@ -243,20 +243,35 @@ mod tests {
         }
     }
 
+    async fn fill_outbound_queue(transport: &ConnectionManager, peer: NodeIdentifier) {
+        for _ in 0..4096 {
+            match transport
+                .try_send(
+                    peer,
+                    ServiceLevel::Reliable,
+                    None,
+                    MessageClass::Regular,
+                    Bytes::from_static(b"x"),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(SendError::Backpressure { node, transport }) => {
+                    assert_eq!(node, peer);
+                    assert_eq!(transport, TransportKind::Tcp);
+                    return;
+                }
+                Err(err) => panic!("unexpected outbound queue fill error: {err:?}"),
+            }
+        }
+        panic!("outbound test queue did not report backpressure");
+    }
+
     #[tokio::test]
     async fn inbound_lsdb_sync_returns_promptly_when_peer_outbound_queue_is_full() {
         let (transport, _receivers) =
             ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
-        transport
-            .try_send(
-                2,
-                ServiceLevel::Reliable,
-                None,
-                MessageClass::Regular,
-                Bytes::from_static(b"fill"),
-            )
-            .await
-            .unwrap();
+        fill_outbound_queue(&transport, 2).await;
 
         let lsdb = LinkStateDb::new(Arc::new(LsaFloor::new(1, None)));
         assert!(matches!(

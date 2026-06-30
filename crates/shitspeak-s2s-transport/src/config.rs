@@ -734,9 +734,9 @@ fn push_unique_socket_addr(out: &mut Vec<SocketAddr>, addr: SocketAddr) {
 }
 
 /// TOML-deserializable shadow of the per-link metrics smoothing, ping-cap,
-/// queue-size, and connection-selection knobs. Listener, advertise, PKI, and
-/// seed fields stay on the higher-level S2S config because they need custom
-/// parsing and validation.
+/// adaptive queue floor hints, and connection-selection knobs. Listener,
+/// advertise, PKI, and seed fields stay on the higher-level S2S config because
+/// they need custom parsing and validation.
 #[derive(Deserialize, Debug, Clone)]
 pub struct TransportTuning {
     #[serde(default = "default_latency_ewma_alpha")]
@@ -772,12 +772,16 @@ pub struct TransportTuning {
     pub unselected_link_probe_interval_secs: u64,
     #[serde(default = "default_max_outgoing_connections")]
     pub max_outgoing_connections: usize,
+    /// Legacy message-count hint used as a minimum adaptive byte budget.
     #[serde(default = "default_inbound_control_capacity")]
     inbound_control_capacity: usize,
+    /// Legacy message-count hint used as a minimum adaptive byte budget.
     #[serde(default = "default_inbound_high_capacity")]
     inbound_high_capacity: usize,
+    /// Legacy message-count hint used as a minimum adaptive byte budget.
     #[serde(default = "default_inbound_regular_capacity")]
     inbound_regular_capacity: usize,
+    /// Legacy message-count hint used as a minimum adaptive byte budget.
     #[serde(default = "default_outbound_capacity")]
     outbound_capacity: usize,
     #[serde(default = "default_compression_enabled")]
@@ -946,16 +950,16 @@ fn default_max_outgoing_connections() -> usize {
     1024
 }
 fn default_inbound_control_capacity() -> usize {
-    1024
+    16384
 }
 fn default_inbound_high_capacity() -> usize {
-    1024
+    32768
 }
 fn default_inbound_regular_capacity() -> usize {
-    1024
+    32768
 }
 fn default_outbound_capacity() -> usize {
-    256
+    131072
 }
 
 #[cfg(test)]

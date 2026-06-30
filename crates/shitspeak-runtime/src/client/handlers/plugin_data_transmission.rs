@@ -105,7 +105,11 @@ pub async fn handle_plugin_data_transmission(
             data_id: relay.data_id.clone(),
             server_id: server_id.clone(),
         };
-        if !server.s2s_manager().dispatch_plugin_data(node_id, envelope) {
+        if !server
+            .s2s_manager()
+            .dispatch_plugin_data(node_id, envelope)
+            .await
+        {
             tracing::trace!(
                 node_id,
                 "cross-node PluginDataTransmission dropped: S2S gateway unavailable"

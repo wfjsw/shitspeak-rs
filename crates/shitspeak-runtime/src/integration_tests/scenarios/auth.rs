@@ -2,19 +2,22 @@
 //! and `cert_required` rejection.
 
 use crate::acl::{ACL, ACLPermissions};
+use crate::client::crypt::CryptState;
 use crate::integration_tests::harness::{
     ManualNativeClient, TestClient, TestServerOpts, spawn_test_server,
 };
 use crate::localization::Language;
 use crate::messages::encoder::{Authenticate, ClientType, ContextActionModify, Ping, RejectType};
 use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
+use crate::voice::codec::IncomingUdpPacket;
+use bytes::BytesMut;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
@@ -177,6 +180,15 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
     ];
     bob.send_batch(&handshake).await;
 
+    let crypt_setup = bob
+        .recv(Duration::from_secs(2))
+        .await
+        .expect("bob should receive CryptSetup before queue notice");
+    let Message::CryptSetup(crypt_setup) = crypt_setup else {
+        panic!("expected pre-sync CryptSetup, got {crypt_setup:?}");
+    };
+    let mut bob_udp_crypt = crypt_state_from_setup(crypt_setup);
+
     let queue_notice = bob
         .recv(Duration::from_secs(2))
         .await
@@ -208,6 +220,12 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
             Some(Message::Ping(ping)) if ping.timestamp == Some(ping_timestamp)
         ),
         "queued client should still receive TCP Ping replies before ServerSync"
+    );
+
+    let udp_ping = send_encrypted_udp_ping(&server, &mut bob_udp_crypt, 77).await;
+    assert_eq!(
+        udp_ping.timestamp, 77,
+        "queued client should receive encrypted UDP ping replies before ServerSync"
     );
 
     gate.release();
@@ -249,6 +267,53 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
         }),
         "queue notices must not be cached and replayed after ServerSync"
     );
+}
+
+fn crypt_state_from_setup(crypt_setup: crate::mumble_proto::CryptSetup) -> CryptState {
+    let key = crypt_setup.key.expect("CryptSetup includes key");
+    let client_nonce = crypt_setup
+        .client_nonce
+        .expect("CryptSetup includes client_nonce");
+    let server_nonce = crypt_setup
+        .server_nonce
+        .expect("CryptSetup includes server_nonce");
+    CryptState::from_key("OCB2-AES128", &key, &client_nonce, &server_nonce)
+        .expect("crypt state from CryptSetup")
+}
+
+async fn send_encrypted_udp_ping(
+    server: &crate::integration_tests::harness::TestServer,
+    crypt: &mut CryptState,
+    timestamp: u8,
+) -> crate::voice::ping::PingRequest {
+    let socket = UdpSocket::bind(("127.0.0.1", 0u16))
+        .await
+        .expect("udp bind");
+    let cleartext = [0x20, timestamp];
+    let mut encrypted = vec![0u8; cleartext.len() + crypt.overhead()];
+    crypt
+        .encrypt(&mut encrypted, &cleartext)
+        .expect("encrypt udp ping");
+    socket
+        .send_to(&encrypted, server.udp_addr)
+        .await
+        .expect("send udp ping");
+
+    timeout(Duration::from_secs(2), async {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (n, _) = socket.recv_from(&mut buf).await.expect("recv udp ping");
+            let mut decrypted = BytesMut::new();
+            if crypt.decrypt(&mut decrypted, &buf[..n]).is_err() {
+                continue;
+            }
+            if let Ok(IncomingUdpPacket::Ping(ping)) = IncomingUdpPacket::decode(&decrypted, None) {
+                return ping;
+            }
+        }
+    })
+    .await
+    .expect("encrypted UDP ping reply")
 }
 
 async fn collect_manual_messages(

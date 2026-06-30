@@ -80,12 +80,16 @@ pub async fn handle_user_remove(
             reason: msg.reason.clone().map(Into::into),
             ban: is_ban,
         };
-        if !server.s2s_manager().dispatch_moderation_user_remove(
-            Some(&server_id),
-            sender.get_session_id(),
-            target_session,
-            patch,
-        ) {
+        if !server
+            .s2s_manager()
+            .dispatch_moderation_user_remove(
+                Some(&server_id),
+                sender.get_session_id(),
+                target_session,
+                patch,
+            )
+            .await
+        {
             tracing::trace!(
                 target = target_raw,
                 "cross-owner UserRemove dropped: S2S gateway unavailable",

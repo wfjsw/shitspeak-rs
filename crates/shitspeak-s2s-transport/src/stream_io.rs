@@ -32,6 +32,7 @@ use tracing::{debug, trace, warn};
 use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
 
+use super::adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 use super::compression::{
     AdaptiveCompressionState, CompressionConfig, CompressionDictionary, CompressionDictionaryKind,
     DICTIONARY_FINGERPRINT_BYTES, maybe_compress_frame_payload_with_dictionary,
@@ -170,7 +171,10 @@ pub(crate) fn spawn_stream_pump<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let (tx, rx) = mpsc::channel::<OutboundFrame>(cfg.outbound_capacity);
+    let budget = AdaptiveQueueBudget::auto();
+    let lane_bytes =
+        super::manager::adaptive_lane_bytes(budget.max_bytes(), cfg.outbound_capacity, 50);
+    let (tx, rx) = AdaptiveQueueSender::new(budget.split(lane_bytes));
 
     let active = ActiveStream::new(cfg.transport, remote_addr, tx, closed.clone(), is_dialer);
 
@@ -296,7 +300,7 @@ async fn run_pump<S>(
     cfg: StreamPumpConfig,
     peer: Arc<PeerState>,
     inbound: InboundDispatch,
-    mut rx: mpsc::Receiver<OutboundFrame>,
+    mut rx: AdaptiveQueueReceiver<OutboundFrame>,
     closed: CancellationToken,
     mut native_sampler: Option<BoxedNativeLossSampler>,
 ) where

@@ -49,15 +49,15 @@ udp_channel_size = 2048
 client_idle_timeout_secs = 30
 # Authenticate timeout (milliseconds) after TLS setup.
 authenticate_timeout_ms = 30000
-# Number of clients allowed to run post-auth initial sync concurrently.
-# Default: floor(5th root(active CPU count)), minimum 1.
+# Number of clients allowed to run UDP crypt setup and post-auth initial sync concurrently.
+# Default: floor(3rd root(active CPU count)), minimum 1.
 # auth_finalization_concurrency = 1
 pending_delete_timeout_ms = 5000
 
 # Persistence
 blob_storage_dir = "data"
-channel_log_max_entries = 10000
-client_log_max_entries = 10000
+channel_log_max_entries = 300
+client_log_max_entries = 2000
 channel_snapshot_every_ops = 10
 channel_snapshot_every_secs = 60
 channel_wal_compaction_expire_count = 2000
@@ -179,6 +179,13 @@ unconfirmed_address_decay_failures = 5
 unselected_link_probe_interval_secs = 30
 # Soft cap on live outbound S2S transport sessions. Inbound is still accepted.
 max_outgoing_connections = 1024
+# Legacy queue capacity hints. Inbound and outbound transport queues now use
+# adaptive byte budgets sized from available memory; these values only raise
+# the per-lane minimum budget for compatibility with older configs.
+# inbound_control_capacity = 16384
+# inbound_high_capacity = 32768
+# inbound_regular_capacity = 32768
+# outbound_capacity = 131072
 # Selective L1 payload compression. Callers still opt in per send.
 compression_enabled = true
 compression_min_bytes = 1024
