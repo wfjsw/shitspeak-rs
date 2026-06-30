@@ -27,6 +27,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         op: R::Op,
         waker: oneshot::Sender<Result<u64, ReplicationError>>,
     ) -> Result<(), ReplicationError> {
+        self.begin_propose_with_accepted(op, None, waker).await
+    }
+
+    pub async fn begin_propose_with_accepted(
+        self: Arc<Self>,
+        op: R::Op,
+        accepted_waker: Option<oneshot::Sender<()>>,
+        waker: oneshot::Sender<Result<u64, ReplicationError>>,
+    ) -> Result<(), ReplicationError> {
         // Bound concurrent in-flight proposals per topic.
         let permit = self
             .propose_semaphore
@@ -51,6 +60,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     ts_propose,
                     acks: HashMap::new(),
                     target_set: target_set.clone(),
+                    accepted_waker,
                     waker: Some(waker),
                     committed: false,
                     started_at: Instant::now(),

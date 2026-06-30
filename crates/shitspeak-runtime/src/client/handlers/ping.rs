@@ -35,7 +35,9 @@ pub async fn handle_ping(
         }
     };
 
-    // Send the ping response back to the sender
-    sender.write_proto_message(&response.into()).await?;
+    // Keep TCP ping replies out of the normal outbound queue so channel/user
+    // fanout backlogs do not look like a dead connection to clients.
+    let response: Message = response.into();
+    sender.write_proto_message_direct(&response).await?;
     Ok(())
 }

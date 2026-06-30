@@ -191,6 +191,7 @@ pub(crate) struct Proposal {
     pub ts_propose: u64,
     pub acks: HashMap<NodeIdentifier, u64>, // ack_node -> ts_local
     pub target_set: HashSet<NodeIdentifier>,
+    pub accepted_waker: Option<oneshot::Sender<()>>,
     pub waker: Option<oneshot::Sender<Result<u64, ReplicationError>>>,
     pub committed: bool,
     pub started_at: Instant,
@@ -980,13 +981,14 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }
 
         // Decide whether quorum reached for this proposal we're coordinating.
-        let to_send: Option<(StrictBody, Vec<NodeIdentifier>)> = {
+        let mut to_send: Option<(StrictBody, Vec<NodeIdentifier>, Option<oneshot::Sender<()>>)> = {
             let mut s = self.state.lock();
 
             // Phase 1: read fields from the proposal entry and decide.
             let op_bytes: Bytes;
             let dsts: Vec<NodeIdentifier>;
             let ts_final: u64;
+            let accepted_waker: Option<oneshot::Sender<()>>;
             {
                 let Some(p) = s.proposals.get_mut(&op_id) else {
                     return;
@@ -1005,6 +1007,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 }
                 ts_final = p.acks.values().copied().max().unwrap_or(p.ts_propose);
                 p.committed = true;
+                accepted_waker = p.accepted_waker.take();
                 op_bytes = p.op_msgpack.clone();
                 dsts = p
                     .target_set
@@ -1031,12 +1034,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 op_msgpack: op_bytes,
                 src_clock: clock_now,
             });
-            Some((body, dsts))
+            Some((body, dsts, accepted_waker))
         };
 
+        let accepted_waker = to_send.as_mut().and_then(|send| send.2.take());
+        if let Some(w) = accepted_waker {
+            let _ = w.send(());
+        }
         self.wake_delivery_and_clock_tick();
 
-        if let Some((body, dsts)) = to_send {
+        if let Some((body, dsts, _)) = to_send {
             if let Err(e) = self
                 .net
                 .send_multicast(&dsts, &self.topic, body.clone())
@@ -2229,6 +2236,7 @@ mod tests {
                 ts_propose: 1,
                 acks: HashMap::new(),
                 target_set: target,
+                accepted_waker: None,
                 waker: Some(tx),
                 committed: false,
                 started_at: Instant::now(),
@@ -2260,6 +2268,7 @@ mod tests {
                 ts_propose: 1,
                 acks: HashMap::new(),
                 target_set: target,
+                accepted_waker: None,
                 waker: Some(tx),
                 committed: false,
                 started_at: Instant::now(),
@@ -2290,6 +2299,7 @@ mod tests {
                 ts_propose: 1,
                 acks: HashMap::new(),
                 target_set: target,
+                accepted_waker: None,
                 waker: Some(tx),
                 committed: false,
                 started_at: stale,

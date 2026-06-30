@@ -7,9 +7,16 @@ use crate::{
     client::Client,
     errors::MessageHandlerError,
     localization::{TextKey, text},
-    messages::encoder::{ChannelState, DenyType, PermissionDenied},
+    messages::{
+        Message,
+        encoder::{ChannelState, DenyType, PermissionDenied, TextMessage},
+    },
+    s2s::{ChannelOpCompletion, ChannelOpProposal, ChannelOpProposeResult},
     server::Server,
 };
+
+const CHANNEL_SETTINGS_PENDING_NOTICE_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(25);
 
 pub async fn handle_channel_state(
     server: &Arc<Box<Server>>,
@@ -132,17 +139,9 @@ pub async fn handle_channel_state(
             }
             let proposed_s2s = server
                 .s2s_manager()
-                .propose_channel_op(Some(&server_id), op.clone())
+                .start_channel_op_proposal(Some(&server_id), op.clone())
                 .await;
-            if proposed_s2s.is_proposed() {
-                if is_temp {
-                    sender.set_current_channel_id(
-                        new_id,
-                        server.get_clients(),
-                        channels.current_version_in_server(&server_id),
-                    );
-                }
-            } else if proposed_s2s.should_apply_locally() {
+            if proposed_s2s.should_apply_locally() {
                 let created = match channels.create_channel_in_server(&server_id, new_ch).await {
                     Ok(channel) => channel,
                     Err(e) => {
@@ -166,10 +165,48 @@ pub async fn handle_channel_state(
                     );
                 }
             } else {
-                return Err(super::channel_op_propose_failed(
-                    u32::from(session),
-                    Some(parent_id),
-                ));
+                let Some(mut proposal) = proposed_s2s.into_started() else {
+                    return Err(super::channel_op_propose_failed(
+                        u32::from(session),
+                        Some(parent_id),
+                    ));
+                };
+                let accepted = proposal.accepted().await;
+                if !accepted.is_proposed() {
+                    return Err(super::channel_op_propose_failed(
+                        u32::from(session),
+                        Some(parent_id),
+                    ));
+                }
+                match wait_accepted_channel_op_commit_grace(sender, proposal).await? {
+                    AcceptedChannelOpCommit::Completed(result) => {
+                        if !result.is_proposed() {
+                            return Err(super::channel_op_propose_failed(
+                                u32::from(session),
+                                Some(parent_id),
+                            ));
+                        }
+                        if is_temp {
+                            move_temp_channel_creator_after_commit(
+                                server, sender, &server_id, new_id,
+                            )
+                            .await;
+                        }
+                    }
+                    AcceptedChannelOpCommit::Pending(proposal) => {
+                        if is_temp {
+                            spawn_temp_channel_creator_move_after_commit(
+                                Arc::clone(server),
+                                Arc::clone(sender),
+                                server_id.clone(),
+                                new_id,
+                                proposal,
+                            );
+                        } else {
+                            spawn_channel_op_completion_log(proposal, "create_channel", new_id);
+                        }
+                    }
+                }
             }
         }
 
@@ -328,7 +365,7 @@ pub async fn handle_channel_state(
             }
             let proposed_s2s = server
                 .s2s_manager()
-                .propose_channel_op(Some(&server_id), op)
+                .start_channel_op_proposal(Some(&server_id), op)
                 .await;
             if proposed_s2s.should_apply_locally() {
                 if let Err(e) = channels
@@ -344,15 +381,150 @@ pub async fn handle_channel_state(
                     tracing::warn!("update_channel {channel_id} failed: {:?}", e);
                     return Ok(());
                 }
-            } else if !proposed_s2s.is_proposed() {
-                return Err(super::channel_op_propose_failed(
-                    u32::from(session),
-                    Some(channel_id),
-                ));
+            } else {
+                let Some(mut proposal) = proposed_s2s.into_started() else {
+                    return Err(super::channel_op_propose_failed(
+                        u32::from(session),
+                        Some(channel_id),
+                    ));
+                };
+                let accepted = proposal.accepted().await;
+                if !accepted.is_proposed() {
+                    return Err(super::channel_op_propose_failed(
+                        u32::from(session),
+                        Some(channel_id),
+                    ));
+                }
+                match wait_accepted_channel_op_commit_grace(sender, proposal).await? {
+                    AcceptedChannelOpCommit::Completed(result) => {
+                        if !result.is_proposed() {
+                            return Err(super::channel_op_propose_failed(
+                                u32::from(session),
+                                Some(channel_id),
+                            ));
+                        }
+                    }
+                    AcceptedChannelOpCommit::Pending(proposal) => {
+                        spawn_channel_op_completion_log(proposal, "edit_channel", channel_id);
+                    }
+                }
             }
         }
     }
 
+    Ok(())
+}
+
+enum AcceptedChannelOpCommit {
+    Completed(ChannelOpProposeResult),
+    Pending(ChannelOpProposal),
+}
+
+async fn wait_accepted_channel_op_commit_grace(
+    sender: &Arc<Box<Client>>,
+    mut proposal: ChannelOpProposal,
+) -> Result<AcceptedChannelOpCommit, MessageHandlerError> {
+    match proposal
+        .wait_completed_for(CHANNEL_SETTINGS_PENDING_NOTICE_GRACE)
+        .await
+    {
+        ChannelOpCompletion::Completed(result) => Ok(AcceptedChannelOpCommit::Completed(result)),
+        ChannelOpCompletion::Pending => {
+            send_channel_settings_pending_notice(sender).await?;
+            Ok(AcceptedChannelOpCommit::Pending(proposal))
+        }
+    }
+}
+
+fn spawn_channel_op_completion_log(
+    proposal: ChannelOpProposal,
+    operation: &'static str,
+    channel_id: u32,
+) {
+    tokio::spawn(async move {
+        let result = proposal.completed_after_acceptance().await;
+        if !result.is_proposed() {
+            tracing::warn!(
+                operation,
+                channel_id,
+                "s2s channel operation failed after acceptance"
+            );
+        }
+    });
+}
+
+fn spawn_temp_channel_creator_move_after_commit(
+    server: Arc<Box<Server>>,
+    sender: Arc<Box<Client>>,
+    server_id: String,
+    channel_id: u32,
+    proposal: ChannelOpProposal,
+) {
+    tokio::spawn(async move {
+        let result = proposal.completed_after_acceptance().await;
+        if !result.is_proposed() {
+            tracing::warn!(
+                channel_id,
+                "s2s temporary channel create failed after acceptance"
+            );
+            return;
+        }
+        move_temp_channel_creator_after_commit(&server, &sender, &server_id, channel_id).await;
+    });
+}
+
+async fn move_temp_channel_creator_after_commit(
+    server: &Arc<Box<Server>>,
+    sender: &Arc<Box<Client>>,
+    server_id: &str,
+    channel_id: u32,
+) {
+    let session = sender.get_session_id();
+    let Some(current) = server
+        .get_clients()
+        .get_client_in_server(server_id, session)
+        .await
+    else {
+        return;
+    };
+    if current.client_instance_id() != sender.client_instance_id() {
+        return;
+    }
+    if server
+        .get_channels()
+        .get_channel_in_server(server_id, channel_id)
+        .await
+        .is_none()
+    {
+        tracing::warn!(
+            channel_id,
+            "temporary channel create completed without local channel"
+        );
+        return;
+    }
+    sender.set_current_channel_id(
+        channel_id,
+        server.get_clients(),
+        server.get_channels().current_version_in_server(server_id),
+    );
+}
+
+async fn send_channel_settings_pending_notice(
+    sender: &Arc<Box<Client>>,
+) -> Result<(), MessageHandlerError> {
+    let message = Message::TextMessage(
+        TextMessage {
+            actor: None,
+            session: vec![u32::from(sender.get_session_id())],
+            channel_id: Vec::new(),
+            tree_id: Vec::new(),
+            message:
+                "Channel settings accepted. Applying them across the cluster may take a moment."
+                    .to_owned(),
+        }
+        .into(),
+    );
+    sender.write_proto_message(&message).await?;
     Ok(())
 }
 

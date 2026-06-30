@@ -162,6 +162,7 @@ enum NativeToS2SCommand {
     ProposeChannel {
         server_id: String,
         op: ChannelOp,
+        accepted: Option<oneshot::Sender<()>>,
         respond: oneshot::Sender<ChannelOpProposeResult>,
     },
     ProposeBan {
@@ -762,6 +763,112 @@ impl ChannelOpProposeResult {
     }
 }
 
+#[must_use]
+pub struct ChannelOpProposal {
+    accepted: Option<oneshot::Receiver<()>>,
+    completed: Option<oneshot::Receiver<ChannelOpProposeResult>>,
+    timeout: Duration,
+}
+
+impl ChannelOpProposal {
+    pub async fn accepted(&mut self) -> ChannelOpProposeResult {
+        let Some(accepted) = self.accepted.take() else {
+            return ChannelOpProposeResult::Failed;
+        };
+        match tokio::time::timeout(self.timeout, accepted).await {
+            Ok(Ok(())) => ChannelOpProposeResult::Proposed,
+            Ok(Err(_)) => match self.wait_completed(self.timeout).await {
+                ChannelOpCompletion::Completed(result) => result,
+                ChannelOpCompletion::Pending => {
+                    error!("s2s channel proposal timed out waiting for gateway response");
+                    ChannelOpProposeResult::Failed
+                }
+            },
+            Err(_) => {
+                error!("s2s channel proposal timed out waiting for acceptance");
+                ChannelOpProposeResult::Failed
+            }
+        }
+    }
+
+    pub async fn completed(mut self) -> ChannelOpProposeResult {
+        match self.wait_completed(self.timeout).await {
+            ChannelOpCompletion::Completed(result) => result,
+            ChannelOpCompletion::Pending => {
+                error!("s2s channel proposal timed out waiting for gateway response");
+                ChannelOpProposeResult::Failed
+            }
+        }
+    }
+
+    pub async fn completed_after_acceptance(mut self) -> ChannelOpProposeResult {
+        let Some(completed) = self.completed.take() else {
+            return ChannelOpProposeResult::Failed;
+        };
+        match completed.await {
+            Ok(result) => result,
+            Err(_) => {
+                error!("s2s gateway dropped accepted channel proposal response");
+                ChannelOpProposeResult::Failed
+            }
+        }
+    }
+
+    pub async fn wait_completed_for(&mut self, timeout: Duration) -> ChannelOpCompletion {
+        self.wait_completed(timeout).await
+    }
+
+    async fn wait_completed(&mut self, timeout: Duration) -> ChannelOpCompletion {
+        let Some(completed) = self.completed.as_mut() else {
+            return ChannelOpCompletion::Completed(ChannelOpProposeResult::Failed);
+        };
+        match tokio::time::timeout(timeout, completed).await {
+            Ok(Ok(result)) => {
+                self.completed = None;
+                ChannelOpCompletion::Completed(result)
+            }
+            Ok(Err(_)) => {
+                self.completed = None;
+                error!("s2s gateway dropped channel proposal response");
+                ChannelOpCompletion::Completed(ChannelOpProposeResult::Failed)
+            }
+            Err(_) => ChannelOpCompletion::Pending,
+        }
+    }
+}
+
+#[must_use]
+pub enum ChannelOpCompletion {
+    Completed(ChannelOpProposeResult),
+    Pending,
+}
+
+#[must_use]
+pub enum ChannelOpProposalStart {
+    Started(ChannelOpProposal),
+    Unavailable,
+}
+
+impl ChannelOpProposalStart {
+    pub async fn completed(self) -> ChannelOpProposeResult {
+        match self {
+            Self::Started(proposal) => proposal.completed().await,
+            Self::Unavailable => ChannelOpProposeResult::Unavailable,
+        }
+    }
+
+    pub fn should_apply_locally(&self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+
+    pub fn into_started(self) -> Option<ChannelOpProposal> {
+        match self {
+            Self::Started(proposal) => Some(proposal),
+            Self::Unavailable => None,
+        }
+    }
+}
+
 struct S2SGateways {
     native_tx: S2SNativeGatewayTx,
     s2s_tx: S2SGatewayTx,
@@ -996,43 +1103,46 @@ impl S2SManager {
         server_id: Option<&str>,
         op: ChannelOp,
     ) -> ChannelOpProposeResult {
+        self.start_channel_op_proposal(server_id, op)
+            .await
+            .completed()
+            .await
+    }
+
+    pub async fn start_channel_op_proposal(
+        &self,
+        server_id: Option<&str>,
+        op: ChannelOp,
+    ) -> ChannelOpProposalStart {
         let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID).to_owned();
         let Some(tx) = self.state.read().gateway_tx.clone() else {
-            return ChannelOpProposeResult::Unavailable;
+            return ChannelOpProposalStart::Unavailable;
         };
+        let (accepted_tx, accepted_rx) = oneshot::channel();
         let (respond, rx) = oneshot::channel();
         if !tx
             .send_lossless(NativeToS2SCommand::ProposeChannel {
                 server_id,
                 op,
+                accepted: Some(accepted_tx),
                 respond,
             })
             .await
         {
-            return ChannelOpProposeResult::Unavailable;
+            return ChannelOpProposalStart::Unavailable;
         }
-        match tokio::time::timeout(
-            strict_proposal_gateway_response_timeout(&self.replication_config),
-            rx,
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => {
-                error!("s2s gateway dropped channel proposal response");
-                ChannelOpProposeResult::Failed
-            }
-            Err(_) => {
-                error!("s2s channel proposal timed out waiting for gateway response");
-                ChannelOpProposeResult::Failed
-            }
-        }
+        ChannelOpProposalStart::Started(ChannelOpProposal {
+            accepted: Some(accepted_rx),
+            completed: Some(rx),
+            timeout: strict_proposal_gateway_response_timeout(&self.replication_config),
+        })
     }
 
-    async fn propose_channel_op_direct(
+    async fn propose_channel_op_direct_with_accepted(
         &self,
         server_id: &str,
         op: ChannelOp,
+        accepted: Option<oneshot::Sender<()>>,
     ) -> ChannelOpProposeResult {
         let handle = match self.channel_replication_handle(server_id) {
             Some(handle) => handle,
@@ -1052,8 +1162,25 @@ impl S2SManager {
             emits_client_message: true,
             op,
         };
-        match handle.propose(operation).await {
-            Ok(_) => ChannelOpProposeResult::Proposed,
+        match handle.propose_with_accepted(operation).await {
+            Ok(mut proposal) => {
+                if let Some(accepted) = accepted {
+                    if let Some(mut accepted_rx) = proposal.take_accepted_receiver() {
+                        tokio::spawn(async move {
+                            if accepted_rx.await.is_ok() {
+                                let _ = accepted.send(());
+                            }
+                        });
+                    }
+                }
+                match proposal.delivered().await {
+                    Ok(_) => ChannelOpProposeResult::Proposed,
+                    Err(e) => {
+                        error!(error = %e, "s2s channel op propose failed");
+                        ChannelOpProposeResult::Failed
+                    }
+                }
+            }
             Err(e) => {
                 error!(error = %e, "s2s channel op propose failed");
                 ChannelOpProposeResult::Failed
@@ -1981,9 +2108,16 @@ async fn run_s2s_control_gateway(
             NativeToS2SCommand::ProposeChannel {
                 server_id,
                 op,
+                accepted,
                 respond,
             } => {
-                let _ = respond.send(manager.propose_channel_op_direct(&server_id, op).await);
+                let manager = Arc::clone(&manager);
+                tokio::spawn(async move {
+                    let result = manager
+                        .propose_channel_op_direct_with_accepted(&server_id, op, accepted)
+                        .await;
+                    let _ = respond.send(result);
+                });
             }
             NativeToS2SCommand::ProposeBan { op, respond } => {
                 let _ = respond.send(manager.propose_ban_op_direct(op).await);

@@ -1883,6 +1883,10 @@ fn is_pre_auth_passthrough_message(message: &Message) -> bool {
     matches!(message, Message::Ping(_))
 }
 
+fn is_pre_auth_dropped_message(message: &Message) -> bool {
+    matches!(message, Message::UDPTunnel(_))
+}
+
 fn is_realtime_client_message(message: &Message) -> bool {
     matches!(message, Message::Ping(_) | Message::UDPTunnel(_))
 }
@@ -4098,7 +4102,15 @@ impl Server {
                         match result {
                             Ok(message) => {
                                 if pre_auth_handler_in_flight {
-                                    if is_pre_auth_passthrough_message(&message) {
+                                    if is_pre_auth_dropped_message(&message) {
+                                        if let Message::UDPTunnel(data) = &message {
+                                            tracing::trace!(
+                                                session = u32::from(client.get_session_id()),
+                                                len = data.len(),
+                                                "dropping UDPTunnel before authentication completed"
+                                            );
+                                        }
+                                    } else if is_pre_auth_passthrough_message(&message) {
                                         finish_pre_auth_passthrough_message(self, &client, message).await?;
                                     } else if deferred_pre_auth_messages.len() < PRE_AUTH_DEFERRED_MESSAGE_LIMIT {
                                         deferred_pre_auth_messages.push_back(message);
@@ -4108,6 +4120,16 @@ impl Server {
                                                 "too many queued messages before authentication completed",
                                             ),
                                         ));
+                                    }
+                                } else if !client.is_authenticated()
+                                    && is_pre_auth_dropped_message(&message)
+                                {
+                                    if let Message::UDPTunnel(data) = &message {
+                                        tracing::trace!(
+                                            session = u32::from(client.get_session_id()),
+                                            len = data.len(),
+                                            "dropping UDPTunnel before authentication completed"
+                                        );
                                     }
                                 } else if is_realtime_client_message(&message) {
                                     finish_normal_client_message(
@@ -4176,6 +4198,7 @@ impl Server {
                                     &self.channels,
                                     Some(&mut session_channel_shadow),
                                 ).await;
+                                let mut outbound = Vec::new();
                                 for msg in messages {
                                     let projected = crate::client::visibility::project_message_with_shadow(
                                         self,
@@ -4187,8 +4210,7 @@ impl Server {
                                     ).await;
                                     for msg in projected {
                                         crate::channel_handler::sync_channel_tree_shadow(&mut channel_tree_shadow, &msg);
-                                        client.write_proto_message(&msg).await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                        outbound.push(msg);
                                     }
                                 }
                                 let refresh_scope = crate::client::visibility::visibility_refresh_scope_for_channel_operation(self, &op).await;
@@ -4202,9 +4224,10 @@ impl Server {
                                 ).await;
                                 for msg in projected {
                                     crate::channel_handler::sync_channel_tree_shadow(&mut channel_tree_shadow, &msg);
-                                    client.write_proto_message(&msg).await
-                                        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    outbound.push(msg);
                                 }
+                                client.write_proto_message_batch(&outbound).await
+                                    .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
                                 if op.version > last_after_replay {
                                     client.set_last_channel_version(op.version).await;
                                 }

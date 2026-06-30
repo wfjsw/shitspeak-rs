@@ -127,6 +127,38 @@ pub struct StrictHandle<R: StrictReplicable> {
     pub(crate) runtime: Arc<runtime::StrictRuntime<R>>,
 }
 
+/// In-flight strict proposal with separate accepted and delivered stages.
+pub struct StrictProposal {
+    accepted: Option<oneshot::Receiver<()>>,
+    delivered: oneshot::Receiver<Result<u64, ReplicationError>>,
+}
+
+impl StrictProposal {
+    /// Resolves when the local coordinator has gathered fast-quorum acks
+    /// and decided the proposal's final timestamp.
+    pub async fn accepted(&mut self) -> Result<(), ReplicationError> {
+        let Some(accepted) = self.accepted.take() else {
+            return Ok(());
+        };
+        accepted.await.map_err(|_| ReplicationError::Shutdown)
+    }
+
+    /// Take the accepted-stage receiver for callers that need to forward it
+    /// while independently awaiting delivery.
+    pub fn take_accepted_receiver(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.accepted.take()
+    }
+
+    /// Resolves once the operation has been delivered locally
+    /// (post-`apply_committed`).
+    pub async fn delivered(self) -> Result<u64, ReplicationError> {
+        match self.delivered.await {
+            Ok(res) => res,
+            Err(_) => Err(ReplicationError::Shutdown),
+        }
+    }
+}
+
 impl<R: StrictReplicable> Clone for StrictHandle<R> {
     fn clone(&self) -> Self {
         Self {
@@ -150,6 +182,24 @@ impl<R: StrictReplicable> StrictHandle<R> {
             Ok(res) => res,
             Err(_) => Err(ReplicationError::Shutdown),
         }
+    }
+
+    /// Begin an op proposal and return handles for both the accepted and
+    /// delivered stages.
+    pub async fn propose_with_accepted(
+        &self,
+        op: R::Op,
+    ) -> Result<StrictProposal, ReplicationError> {
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (delivered_tx, delivered_rx) = oneshot::channel();
+        self.runtime
+            .clone()
+            .begin_propose_with_accepted(op, Some(accepted_tx), delivered_tx)
+            .await?;
+        Ok(StrictProposal {
+            accepted: Some(accepted_rx),
+            delivered: delivered_rx,
+        })
     }
 
     /// Read-only snapshot of the underlying repo's current version.

@@ -469,6 +469,69 @@ mod e2e_tests {
         assert_eq!(repo.log(), vec![(1, 7)]);
     }
 
+    #[tokio::test]
+    async fn strict_propose_accepts_at_quorum_decision() {
+        let net = MockNet::new(1, vec![1, 2]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            42,
+            "channels".into(),
+            net.clone() as Arc<dyn StrictNet>,
+            CancellationToken::new(),
+            default_cfg(),
+        );
+        rt.start();
+
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (delivered_tx, delivered_rx) = oneshot::channel();
+        rt.clone()
+            .begin_propose_with_accepted(7u64, Some(accepted_tx), delivered_tx)
+            .await
+            .unwrap();
+
+        let captures = net.drain_captures();
+        let (op_id_hi, op_id_lo, ts_propose) = captures
+            .iter()
+            .find_map(|capture| {
+                let CapturedFrame::StrictMulticast { body, .. } = capture else {
+                    return None;
+                };
+                let StrictBody::Propose(propose) = body else {
+                    return None;
+                };
+                Some((propose.op_id_hi, propose.op_id_lo, propose.ts_propose))
+            })
+            .expect("initial propose multicast");
+
+        rt.recv_propose_ack(
+            2,
+            super::super::proto::StrictProposeAck {
+                ack_node: 2,
+                coord_node: 1,
+                op_id_hi,
+                op_id_lo,
+                ts_local: ts_propose + 1,
+                src_clock: ts_propose + 1,
+            },
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("proposal should be accepted")
+            .expect("accepted signal should be sent");
+        let version = tokio::time::timeout(Duration::from_secs(1), delivered_rx)
+            .await
+            .expect("proposal should still deliver")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(version, 1);
+        assert_eq!(repo.log(), vec![(1, 7)]);
+    }
+
     /// recv_propose advances clock by max(clock, ts_propose) + 1 and emits
     /// a StrictProposeAck back to the coord via send_unicast.
     #[tokio::test]

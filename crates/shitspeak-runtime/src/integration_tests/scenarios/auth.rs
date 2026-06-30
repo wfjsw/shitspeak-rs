@@ -269,6 +269,76 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
     );
 }
 
+#[tokio::test]
+async fn auth_pre_sync_udp_tunnel_messages_are_dropped_instead_of_queued() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let mut gate = server.server.install_auth_finalization_test_gate(1);
+    let client = ManualNativeClient::connect(&server)
+        .await
+        .expect("manual connection");
+    assert!(matches!(
+        client.recv(Duration::from_secs(2)).await,
+        Some(Message::Version(_))
+    ));
+
+    let mut messages = vec![
+        crate::messages::encoder::Version {
+            version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
+            release: Some("test-client".into()),
+            os: Some("test".into()),
+            os_version: Some("test".into()),
+        }
+        .into(),
+        Authenticate {
+            username: Some("alice".into()),
+            password: None,
+            tokens: Vec::new(),
+            celt_versions: Vec::new(),
+            opus: Some(true),
+            client_type: ClientType::Regular,
+        }
+        .into(),
+    ];
+
+    for frame in 0..40 {
+        messages.push(Message::UDPTunnel(
+            BytesMut::from(&[0x80, frame as u8][..]).freeze(),
+        ));
+    }
+    client.send_batch(&messages).await;
+
+    assert_eq!(
+        gate.wait_entered(Duration::from_secs(2)).await,
+        Some(1),
+        "auth finalization should be stalled by the test gate"
+    );
+    gate.release();
+
+    let mut saw_server_sync = false;
+    for _ in 0..64 {
+        let Some(message) = client.recv(Duration::from_secs(2)).await else {
+            break;
+        };
+        match message {
+            Message::ServerSync(_) => {
+                saw_server_sync = true;
+                break;
+            }
+            Message::Reject(reject) => panic!("unexpected auth reject: {reject:?}"),
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_server_sync,
+        "pre-sync UDPTunnel messages should be dropped without disconnecting the client"
+    );
+}
+
 fn crypt_state_from_setup(crypt_setup: crate::mumble_proto::CryptSetup) -> CryptState {
     let key = crypt_setup.key.expect("CryptSetup includes key");
     let client_nonce = crypt_setup

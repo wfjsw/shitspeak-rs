@@ -498,6 +498,7 @@ pub async fn replay_channel_log_gap(
         .await;
     }
 
+    let mut outbound = Vec::new();
     for entry in &missed {
         if entry.version >= current {
             break;
@@ -522,9 +523,7 @@ pub async fn replay_channel_log_gap(
             .await;
             for msg in projected {
                 sync_channel_tree_shadow(channel_tree_shadow, &msg);
-                if client.write_proto_message(&msg).await.is_err() {
-                    return Err(());
-                }
+                outbound.push(msg);
             }
         }
         let refresh_scope =
@@ -543,11 +542,13 @@ pub async fn replay_channel_log_gap(
         .await;
         for msg in projected {
             sync_channel_tree_shadow(channel_tree_shadow, &msg);
-            if client.write_proto_message(&msg).await.is_err() {
-                return Err(());
-            }
+            outbound.push(msg);
         }
         client.set_last_channel_version(entry.version).await;
+    }
+
+    if client.write_proto_message_batch(&outbound).await.is_err() {
+        return Err(());
     }
 
     Ok(())
@@ -583,6 +584,7 @@ async fn replay_channel_snapshot(
         messages.push(crate::messages::encoder::ChannelRemove { channel_id }.into());
     }
 
+    let mut outbound = Vec::new();
     for msg in messages {
         let projected = crate::client::visibility::project_message_with_shadow(
             server,
@@ -595,10 +597,12 @@ async fn replay_channel_snapshot(
         .await;
         for msg in projected {
             sync_channel_tree_shadow(channel_tree_shadow, &msg);
-            if client.write_proto_message(&msg).await.is_err() {
-                return Err(());
-            }
+            outbound.push(msg);
         }
+    }
+
+    if client.write_proto_message_batch(&outbound).await.is_err() {
+        return Err(());
     }
 
     *channel_tree_shadow = current;

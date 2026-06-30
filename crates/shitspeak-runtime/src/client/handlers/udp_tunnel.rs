@@ -10,9 +10,12 @@ pub(super) async fn handle_udp_tunnel(
     data: Bytes,
 ) -> Result<(), MessageHandlerError> {
     if !sender.is_authenticated() {
-        return Err(MessageHandlerError::protocol_violation(
-            "UDPTunnel message received before authentication",
-        ));
+        tracing::trace!(
+            session = u32::from(sender.get_session_id()),
+            len = data.len(),
+            "dropping UDPTunnel before authentication completed"
+        );
+        return Ok(());
     }
 
     // Match Mumble/shitspeak behavior: a tunneled voice packet means
