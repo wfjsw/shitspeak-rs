@@ -425,7 +425,12 @@ impl ClientStateLogEntry {
         let mut messages = Vec::new();
         if matches!(
             &self.op,
-            ClientStateOperation::AddClient { session_id, .. } if *session_id == viewer_session_id
+            ClientStateOperation::AddClient {
+                session_id,
+                client_instance_id,
+                ..
+            } if *session_id == viewer_session_id
+                && *client_instance_id == viewer_client_instance_id
         ) {
             return messages;
         }
@@ -457,10 +462,10 @@ impl ClientStateLogEntry {
                 initial_state,
                 ..
             } => {
-                if let Some(client) = repo.get_client_in_server(server_id, *session_id).await
-                    && *client_instance_id != 0
-                    && client.client_instance_id() != *client_instance_id
-                {
+                let Some(client) = repo.get_client_in_server(server_id, *session_id).await else {
+                    return None;
+                };
+                if client.client_instance_id() != *client_instance_id {
                     return None;
                 }
                 let us = initial_state.to_initial_user_state(*session_id, cert_hash.as_ref());
@@ -469,17 +474,15 @@ impl ClientStateLogEntry {
             ClientStateOperation::RemoveClient {
                 server_id,
                 session_id,
+                client_instance_id,
                 actor,
                 reason,
                 ban,
-                ..
             } => {
-                if repo
-                    .get_client_in_server(server_id, *session_id)
-                    .await
-                    .is_some()
-                {
-                    return None;
+                if let Some(client) = repo.get_client_in_server(server_id, *session_id).await {
+                    if client.client_instance_id() != *client_instance_id {
+                        return None;
+                    }
                 }
                 Some(
                     crate::messages::encoder::UserRemove {
@@ -502,7 +505,7 @@ impl ClientStateLogEntry {
                     return None;
                 }
                 let client = repo.get_client_in_server(server_id, *session_id).await?;
-                if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
+                if client.client_instance_id() != *client_instance_id {
                     return None;
                 }
                 let mut us = crate::messages::encoder::UserState {

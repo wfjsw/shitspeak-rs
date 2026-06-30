@@ -296,6 +296,10 @@ pub async fn project_message_with_shadow(
     server_id: &str,
     message: &Message,
 ) -> Vec<Message> {
+    if let Message::UserRemove(user_remove) = message {
+        channel_shadow.remove(&ClientSessionIdentifier::from(user_remove.session));
+    }
+
     let projected = project_message(server, viewer, visibility, message).await;
     let mut out = Vec::new();
     for message in projected {
@@ -447,8 +451,13 @@ pub async fn visibility_refresh_scope_for_client_log_entry(
     let mut scope = VisibilityRefreshScope::new();
     match &entry.op {
         ClientStateOperation::UpdateGlobalState {
-            session_id, delta, ..
-        } if *session_id == viewer.get_session_id() => {
+            session_id,
+            client_instance_id,
+            delta,
+            ..
+        } if *session_id == viewer.get_session_id()
+            && *client_instance_id == viewer.client_instance_id() =>
+        {
             scope.merge(
                 visibility_refresh_scope_for_viewer_delta(
                     server,

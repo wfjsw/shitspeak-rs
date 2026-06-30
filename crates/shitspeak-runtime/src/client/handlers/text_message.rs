@@ -21,7 +21,9 @@ pub async fn handle_text_message(
         ));
     }
 
-    let sender_session = u32::from(sender.get_session_id());
+    let sender_id = sender.get_session_id();
+    let sender_instance_id = sender.client_instance_id();
+    let sender_session = u32::from(sender_id);
     let server_id = sender.server_id();
     tracing::debug!(session = sender_session, channels = ?msg.channel_id, trees = ?msg.tree_id, targets = ?msg.session, "TextMessage handler");
 
@@ -156,7 +158,9 @@ pub async fn handle_text_message(
             .get_clients_in_channels_or_listeners_in_server(&server_id, &target_channel_ids)
             .await;
         for client in &channel_clients {
-            if client.get_session_id() == sender.get_session_id() {
+            if client.get_session_id() == sender_id
+                && client.client_instance_id() == sender_instance_id
+            {
                 continue;
             }
             if !client.is_authenticated()
@@ -184,7 +188,9 @@ pub async fn handle_text_message(
             .get_clients_in_channels_or_listeners_in_server(&server_id, &tree_deliverable_channels)
             .await;
         for client in &tree_clients {
-            if client.get_session_id() == sender.get_session_id() {
+            if client.get_session_id() == sender_id
+                && client.client_instance_id() == sender_instance_id
+            {
                 continue;
             }
             if !client.is_authenticated()

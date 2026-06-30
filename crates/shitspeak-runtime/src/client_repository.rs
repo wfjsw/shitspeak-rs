@@ -494,14 +494,13 @@ impl ClientRepository {
         }
 
         let old_scoped_id = ScopedSessionId::new(old_server_id.to_owned(), old_id);
-        let new_local_id = self.allocate_local_session_id(new_server_id);
-        let new_id = ClientSessionIdentifier::new(self.local_node_id, new_local_id).ok()?;
-        let new_scoped_id = ScopedSessionId::new(new_server_id.to_owned(), new_id);
-
         let moved = {
             let mut register = self.register.write().await;
             let mut client_by_udp_address_guard = self.clients_by_udp_address.write();
             let mut client_by_host_guard = self.clients_by_host.write();
+            let new_local_id = self.allocate_local_session_id(new_server_id);
+            let new_id = ClientSessionIdentifier::new(self.local_node_id, new_local_id).ok()?;
+            let new_scoped_id = ScopedSessionId::new(new_server_id.to_owned(), new_id);
 
             let client = register.local_clients.remove(&old_scoped_id)?;
             register.channel_index_remove(&old_scoped_id);
@@ -526,21 +525,21 @@ impl ClientRepository {
                 .local_clients
                 .insert(new_scoped_id.clone(), Arc::clone(&client));
             register.channel_index_insert(new_scoped_id, 0);
-            client
+            (new_id, client)
         };
 
-        self.release_local_session_id(old_server_id, old_id.local_session_id);
-
-        if moved.is_published() {
+        if moved.1.is_published() {
             tracing::warn!(
                 old_server_id,
                 new_server_id,
                 session = u32::from(old_id),
                 "moved already-published local client across server scopes"
             );
+        } else {
+            self.release_local_session_id(old_server_id, old_id.local_session_id);
         }
 
-        Some(new_id)
+        Some(moved.0)
     }
 
     pub async fn allocate_local_client(
@@ -878,7 +877,6 @@ impl ClientRepository {
                     }
                 }
 
-                self.release_local_session_id(scoped_id.server_id(), id.local_session_id);
                 Some(client)
             } else {
                 None
@@ -914,18 +912,25 @@ impl ClientRepository {
         };
 
         if client.get_node_id() == self.local_node_id && client.is_published() {
-            self.commit_operation(
-                ClientStateOperation::RemoveClient {
-                    server_id: server_id.to_owned(),
-                    session_id: id,
-                    client_instance_id: client.client_instance_id(),
-                    actor,
-                    reason,
-                    ban,
-                },
-                None,
-            )
-            .await;
+            if self
+                .commit_operation(
+                    ClientStateOperation::RemoveClient {
+                        server_id: server_id.to_owned(),
+                        session_id: id,
+                        client_instance_id: client.client_instance_id(),
+                        actor,
+                        reason,
+                        ban,
+                    },
+                    None,
+                )
+                .await
+                .is_some()
+            {
+                self.release_local_session_id(server_id, id.local_session_id);
+            }
+        } else if client.get_node_id() == self.local_node_id {
+            self.release_local_session_id(server_id, id.local_session_id);
         }
 
         tracing::info!(
@@ -2290,7 +2295,7 @@ impl ClientRepository {
         &self,
         op: ClientStateOperation,
         channel_version_dep: Option<u64>,
-    ) {
+    ) -> Option<Arc<ClientStateBroadcastPayload>> {
         let broadcast = {
             let mut register = self.register.write().await;
             Self::commit_operation_inner(
@@ -2302,7 +2307,10 @@ impl ClientRepository {
             )
         };
         if let Some(broadcast) = broadcast {
-            let _ = self.tx.send(broadcast);
+            let _ = self.tx.send(Arc::clone(&broadcast));
+            Some(broadcast)
+        } else {
+            None
         }
     }
 
@@ -3383,6 +3391,69 @@ mod tests {
             .find(|candidate| !ClientRepository::client_instance_id_collides(&register, *candidate))
             .expect("available non-colliding client instance id");
         assert_ne!(non_colliding, 0);
+    }
+
+    #[tokio::test]
+    async fn active_local_session_id_is_not_reallocated() {
+        let repo = ClientRepository::new(1, 8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30003);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(8);
+
+        let old = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, old_tx)
+            .await;
+        let old_session = old.get_session_id();
+        repo.publish_client_in_server("alpha", old_session).await;
+
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
+        let new_client = repo
+            .allocate_web_client_in_server(
+                "alpha",
+                peer.ip(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30004),
+                local,
+                new_tx,
+            )
+            .await;
+
+        assert_ne!(
+            new_client.get_session_id(),
+            old_session,
+            "session IDs remain held until the owning client is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_client_log_returns_local_session_id_to_pool() {
+        let repo = ClientRepository::new(1, 8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30003);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(8);
+
+        let old = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, old_tx)
+            .await;
+        let old_session = old.get_session_id();
+        repo.publish_client_in_server("alpha", old_session).await;
+        repo.remove_client_in_server("alpha", old_session).await;
+
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
+        let new_client = repo
+            .allocate_web_client_in_server(
+                "alpha",
+                peer.ip(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30004),
+                local,
+                new_tx,
+            )
+            .await;
+
+        assert_eq!(
+            new_client.get_session_id(),
+            old_session,
+            "committed RemoveClient returns the session ID to the free pool"
+        );
     }
 
     #[tokio::test]

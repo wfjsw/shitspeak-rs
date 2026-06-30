@@ -429,7 +429,9 @@ pub async fn handle_authenticate(
     // 3. UserState for every published authenticated client (excluding self)
     {
         for client in &all_clients {
-            if client.get_session_id() == session_id {
+            if client.get_session_id() == session_id
+                && client.client_instance_id() == sender.client_instance_id()
+            {
                 continue;
             }
             if client.server_id() != server_id {

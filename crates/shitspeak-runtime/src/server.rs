@@ -1825,6 +1825,14 @@ async fn replay_client_log_entries_since(
 
     let mut out = Vec::new();
     for entry in missed {
+        if should_skip_client_add_entry(
+            &entry.op,
+            client.get_session_id(),
+            client.client_instance_id(),
+            session_channel_shadow,
+        ) {
+            continue;
+        }
         append_client_log_entry_messages(
             server,
             client,
@@ -2028,11 +2036,19 @@ fn permission_info_refresh_scope_for_delta(
 fn permission_info_refresh_scope_for_entry(
     entry: &crate::client::state_log::ClientStateLogEntry,
     viewer_session_id: ClientSessionIdentifier,
+    viewer_client_instance_id: ClientInstanceId,
 ) -> Option<PermissionInfoRefreshScope> {
     match &entry.op {
         ClientStateOperation::UpdateGlobalState {
-            session_id, delta, ..
-        } if *session_id == viewer_session_id => permission_info_refresh_scope_for_delta(delta),
+            session_id,
+            client_instance_id,
+            delta,
+            ..
+        } if *session_id == viewer_session_id
+            && *client_instance_id == viewer_client_instance_id =>
+        {
+            permission_info_refresh_scope_for_delta(delta)
+        }
         _ => None,
     }
 }
@@ -2246,19 +2262,22 @@ async fn append_client_log_entry_messages(
     let old_viewer_channel_id = session_channel_shadow
         .get(&client.get_session_id())
         .copied();
-    let permission_refresh_scope =
-        permission_info_refresh_scope_for_entry(entry, client.get_session_id())
-            .map(|scope| match scope {
-                PermissionInfoRefreshScope::HomeChannelDependent {
-                    old_channel_id: _,
-                    new_channel_id,
-                } => PermissionInfoRefreshScope::HomeChannelDependent {
-                    old_channel_id: old_viewer_channel_id,
-                    new_channel_id,
-                },
-                scope => scope,
-            })
-            .unwrap_or(PermissionInfoRefreshScope::All);
+    let permission_refresh_scope = permission_info_refresh_scope_for_entry(
+        entry,
+        client.get_session_id(),
+        client.client_instance_id(),
+    )
+    .map(|scope| match scope {
+        PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id: _,
+            new_channel_id,
+        } => PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id: old_viewer_channel_id,
+            new_channel_id,
+        },
+        scope => scope,
+    })
+    .unwrap_or(PermissionInfoRefreshScope::All);
 
     for msg in entry
         .messages_for_client(
@@ -2469,7 +2488,13 @@ async fn append_client_log_broadcast_messages(
         .await?;
         return Ok(());
     }
-    if is_known_add_client(&entry.op, session_channel_shadow) {
+
+    if should_skip_client_add_entry(
+        &entry.op,
+        client.get_session_id(),
+        client.client_instance_id(),
+        session_channel_shadow,
+    ) {
         client
             .update_last_client_versions(&broadcast.versions)
             .await;
@@ -2494,14 +2519,20 @@ async fn append_client_log_broadcast_messages(
     Ok(())
 }
 
-fn is_known_add_client(
+fn should_skip_client_add_entry(
     op: &ClientStateOperation,
+    viewer_session_id: ClientSessionIdentifier,
+    viewer_client_instance_id: crate::client::ClientInstanceId,
     session_channel_shadow: &SessionChannelShadow,
 ) -> bool {
     matches!(
         op,
-        ClientStateOperation::AddClient { session_id, .. }
-            if session_channel_shadow.contains_key(session_id)
+        ClientStateOperation::AddClient {
+            session_id,
+            client_instance_id,
+            ..
+        } if *session_id == viewer_session_id && *client_instance_id == viewer_client_instance_id
+            || session_channel_shadow.contains_key(session_id)
     )
 }
 
@@ -4561,7 +4592,7 @@ async fn replay_client_log_gap(
         current,
     );
 
-    let missed = repo.get_log_since(last).await;
+    let missed = repo.get_log_since_for_node(node_id, last).await;
     if missed.is_empty() && last > 0 {
         tracing::error!(
             "Client {:?} client log gap unrecoverable (node={}, last={})",

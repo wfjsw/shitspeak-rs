@@ -650,16 +650,20 @@ async fn strict_quorum_never_forms_times_out() {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    cluster
-        .cluster
-        .node(1)
-        .chaos
-        .drop_next_of_type_from(3, MessageType::StrictProposeAck, 1);
-    cluster
-        .cluster
-        .node(1)
-        .chaos
-        .drop_next_of_type_from(4, MessageType::StrictProposeAck, 1);
+    let dropped_ack_attempts =
+        ((cfg.propose_ttl().as_nanos() / cfg.delivery_tick_interval().as_nanos()) + 8)
+            .min(u128::from(u32::MAX)) as u32;
+
+    cluster.cluster.node(1).chaos.drop_next_of_type_from(
+        3,
+        MessageType::StrictProposeAck,
+        dropped_ack_attempts,
+    );
+    cluster.cluster.node(1).chaos.drop_next_of_type_from(
+        4,
+        MessageType::StrictProposeAck,
+        dropped_ack_attempts,
+    );
 
     let h0 = handles[0].clone();
     let task = tokio::spawn(async move { h0.propose(6666u64).await });

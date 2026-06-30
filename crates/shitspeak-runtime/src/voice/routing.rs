@@ -10,7 +10,10 @@ use super::codec::{self, Audio, PacketFormat};
 use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, DatagramBatch};
 use crate::{
-    client::{Client, crypt::CryptState},
+    client::{
+        Client, ClientInstanceId, client_session_identifier::ClientSessionIdentifier,
+        crypt::CryptState,
+    },
     constants::PROTOBUF_INTRODUCED_VERSION,
     messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget},
     server::Server,
@@ -230,12 +233,18 @@ async fn client_matches_voice_target_group(
 
 fn push_unique_target(
     targets: &mut Vec<(Arc<Box<Client>>, AudioContext)>,
-    seen: &mut HashSet<(u32, AudioContext)>,
-    sender_id: crate::client::client_session_identifier::ClientSessionIdentifier,
+    seen: &mut HashSet<(ClientSessionIdentifier, ClientInstanceId, AudioContext)>,
+    sender_id: ClientSessionIdentifier,
+    sender_instance_id: Option<ClientInstanceId>,
     client: Arc<Box<Client>>,
     context: AudioContext,
 ) {
-    if client.get_session_id() == sender_id || !client.is_authenticated() {
+    if client.get_session_id() == sender_id
+        && sender_instance_id.is_some_and(|id| id == client.client_instance_id())
+    {
+        return;
+    }
+    if !client.is_authenticated() {
         return;
     }
     if !client.read_local_state().is_some() {
@@ -244,7 +253,11 @@ fn push_unique_target(
     if !client.can_receive_voice() {
         return;
     }
-    if seen.insert((u32::from(client.get_session_id()), context)) {
+    if seen.insert((
+        client.get_session_id(),
+        client.client_instance_id(),
+        context,
+    )) {
         targets.push((client, context));
     }
 }
@@ -253,13 +266,14 @@ async fn resolve_voice_intent(
     server: &Arc<Box<Server>>,
     sender: Option<&Arc<Box<Client>>>,
     server_id: &str,
-    sender_id: crate::client::client_session_identifier::ClientSessionIdentifier,
+    sender_id: ClientSessionIdentifier,
     intent: &VoiceIntent,
     default_context: AudioContext,
 ) -> Vec<(Arc<Box<Client>>, AudioContext)> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
     let local_node_id = server.get_clients().local_node_id();
+    let sender_instance_id = sender.map(|sender| sender.client_instance_id());
 
     match intent.kind.as_ref() {
         Some(VoiceIntentKind::Normal(normal)) => {
@@ -278,6 +292,7 @@ async fn resolve_voice_intent(
                     &mut targets,
                     &mut seen,
                     sender_id,
+                    sender_instance_id,
                     client,
                     AudioContext::Normal,
                 );
@@ -311,6 +326,7 @@ async fn resolve_voice_intent(
                             &mut targets,
                             &mut seen,
                             sender_id,
+                            sender_instance_id,
                             client,
                             AudioContext::Normal,
                         );
@@ -332,6 +348,7 @@ async fn resolve_voice_intent(
                     &mut targets,
                     &mut seen,
                     sender_id,
+                    sender_instance_id,
                     client,
                     AudioContext::Listen,
                 );
@@ -374,6 +391,7 @@ async fn resolve_voice_intent(
                         &mut targets,
                         &mut seen,
                         sender_id,
+                        sender_instance_id,
                         client,
                         AudioContext::Whisper,
                     );
@@ -466,6 +484,7 @@ async fn resolve_voice_intent(
                         &mut targets,
                         &mut seen,
                         sender_id,
+                        sender_instance_id,
                         client,
                         AudioContext::Shout,
                     );
@@ -499,6 +518,7 @@ async fn resolve_voice_intent(
                             &mut targets,
                             &mut seen,
                             sender_id,
+                            sender_instance_id,
                             client,
                             AudioContext::Listen,
                         );
@@ -512,6 +532,7 @@ async fn resolve_voice_intent(
                     &mut targets,
                     &mut seen,
                     sender_id,
+                    sender_instance_id,
                     sender.clone(),
                     default_context,
                 );
