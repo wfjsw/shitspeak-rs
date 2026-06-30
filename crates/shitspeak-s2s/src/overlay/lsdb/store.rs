@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use tracing::{Level, debug, warn};
+use tracing::{Level, debug, trace, warn};
 
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::PeerAddress;
@@ -688,7 +688,7 @@ impl LinkStateDb {
         let boot_epoch = lsa.boot_epoch;
         let seq = lsa.seq;
         let tombstone = lsa.tombstone;
-        let debug_delta = tracing::enabled!(Level::DEBUG);
+        let debug_delta = tracing::enabled!(Level::TRACE);
         let mut previous_for_log = None;
         let mut delta_for_log = None;
         {
@@ -720,7 +720,7 @@ impl LinkStateDb {
             g.insert(origin, lsa);
         }
         if let Some(delta) = delta_for_log {
-            debug!(
+            trace!(
                 origin,
                 previous_boot_epoch = previous_for_log.as_ref().map(|entry| entry.boot_epoch),
                 previous_seq = previous_for_log.as_ref().map(|entry| entry.seq),

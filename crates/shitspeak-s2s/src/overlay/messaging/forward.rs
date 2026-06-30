@@ -1107,9 +1107,10 @@ mod tests {
                 transport: TransportKind::Tcp,
             })
         ));
-        let forwarded = healthy_rx
-            .try_recv()
-            .expect("healthy peer should receive its frame");
+        let forwarded = timeout(Duration::from_millis(50), healthy_rx.recv())
+            .await
+            .expect("healthy peer should receive its frame")
+            .expect("healthy peer receiver should remain open");
         assert_eq!(forwarded.class(), MessageClass::Regular);
         let decoded = decode_message(forwarded.payload()).expect("overlay data");
         let Some(OverlayBody::Data(data)) = decoded.body else {

@@ -1931,10 +1931,9 @@ fn spawn_udp_write_pump(
     is_dialer: bool,
 ) -> ActiveStream {
     let budget = AdaptiveQueueBudget::auto();
-    let lane_bytes = super::super::manager::adaptive_lane_bytes(
+    let lane_bytes = super::super::stream_io::stream_handoff_lane_bytes(
         budget.max_bytes(),
-        inner.cfg().outbound_capacity(),
-        50,
+        inner.cfg().max_frame_bytes(),
     );
     let (tx, rx) = AdaptiveQueueSender::new(budget.split(lane_bytes));
     let closed = inner.shutdown().child_token();

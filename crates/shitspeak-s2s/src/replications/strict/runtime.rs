@@ -43,6 +43,8 @@ use shitspeak_s2s_transport::{MessageClass, RoutingMetric, ServiceLevel};
 const CLOCK_TICK_ACTIVE_BURST_TICKS: usize = 3;
 const CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER: u32 = 4;
 const PROPOSE_RETRY_TICKS: usize = 80;
+pub(super) const STRICT_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
+const STRICT_DELIVERY_BLOCKED_LOG_INTERVAL: Duration = Duration::from_secs(5);
 // Keep commit gossip alive through the hostile-link/jitter window. A peer can
 // miss the first quorum commit fanout but still be alive and routable shortly
 // after; these retries are the steady-state repair path for that case.
@@ -203,6 +205,7 @@ pub(crate) struct BufferedOp {
     pub op_msgpack: Bytes,
     pub ts_final: u64,
     pub op_id: OpId,
+    buffered_at: Instant,
 }
 
 pub(crate) type BufferKey = (u64, OpId); // (ts_final, op_id)
@@ -279,6 +282,90 @@ pub(crate) struct PendingPropose {
     pub op_msgpack: Bytes,
     pub ts_local: u64,
     pub seen_at: Instant,
+}
+
+struct PendingProposeRetry {
+    op_msgpack: Bytes,
+    ts_propose: u64,
+    src_clock: u64,
+    dsts: Vec<NodeIdentifier>,
+    started_at: Instant,
+    ack_count: usize,
+    target_count: usize,
+    fast_quorum: usize,
+}
+
+struct AcceptedProposal {
+    body: StrictBody,
+    dsts: Vec<NodeIdentifier>,
+    accepted_waker: Option<oneshot::Sender<()>>,
+    elapsed: Duration,
+    ack_count: usize,
+    target_count: usize,
+    fast_quorum: usize,
+    ts_final: u64,
+    clock_now: u64,
+    op_bytes: usize,
+    commit_buffer_len: usize,
+    pending_local_proposals: usize,
+    pending_remote_proposes: usize,
+}
+
+struct BufferedCommitLog {
+    source: &'static str,
+    from: Option<NodeIdentifier>,
+    coord_node: Option<NodeIdentifier>,
+    op_id: OpId,
+    ts_final: u64,
+    clock_now: u64,
+    op_bytes: usize,
+    commit_buffer_len: usize,
+    pending_local_proposals: usize,
+    pending_remote_proposes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DeliveryWatermark {
+    high_water: u64,
+    low_water_node: NodeIdentifier,
+    low_water_clock: u64,
+    missing_clock_peers: usize,
+}
+
+#[derive(Clone)]
+struct UncommittedProposalBlocker {
+    kind: &'static str,
+    op_id: OpId,
+    coord_node: NodeIdentifier,
+    ts: u64,
+    age: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct NextBufferedOpDiagnostics {
+    key: BufferKey,
+    op_id: OpId,
+    ts_final: u64,
+    buffered_for: Duration,
+}
+
+struct DeliveryBlockDiagnostics {
+    next: NextBufferedOpDiagnostics,
+    raw_high_water: u64,
+    effective_high_water: u64,
+    watermark: DeliveryWatermark,
+    pending_blocker: Option<UncommittedProposalBlocker>,
+    alive_count: usize,
+    commit_buffer_len: usize,
+    pending_local_proposals: usize,
+    pending_remote_proposes: usize,
+}
+
+#[derive(Default)]
+struct DeliveryBlockedLogState {
+    key: Option<BufferKey>,
+    blocked_since: Option<Instant>,
+    last_log_at: Option<Instant>,
 }
 
 /// Pure Tempo state machine. No async, no I/O — all logic operates on
@@ -387,6 +474,7 @@ impl StrictState {
             op_msgpack,
             ts_final,
             op_id,
+            buffered_at: Instant::now(),
         });
     }
 
@@ -725,6 +813,7 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// heal, so the initial attempt may fail with NoRoute and we rely on
     /// later membership events to drive a retry).
     pub(super) last_bootstrap_attempt: Mutex<Option<Instant>>,
+    delivery_blocked_log: Mutex<DeliveryBlockedLogState>,
     pub(super) shutdown: CancellationToken,
     pub(super) cfg: Arc<ReplicationConfig>,
 }
@@ -755,6 +844,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             recoveries: Mutex::new(HashMap::new()),
             weak_self: Mutex::new(None),
             last_bootstrap_attempt: Mutex::new(None),
+            delivery_blocked_log: Mutex::new(DeliveryBlockedLogState::default()),
             shutdown,
             cfg,
         });
@@ -864,42 +954,63 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     _ = tokio::time::sleep(rt.cfg.delivery_tick_interval()) => {},
                 }
 
-                let Some((op_msgpack, ts_propose, src_clock, dsts)) =
-                    rt.pending_propose_retry(op_id)
-                else {
+                let Some(retry) = rt.pending_propose_retry(op_id) else {
                     return;
                 };
-                if dsts.is_empty() {
+                if retry.dsts.is_empty() {
                     continue;
                 }
+                debug!(
+                    topic = %rt.topic,
+                    op_id_hi = op_id.0,
+                    op_id_lo = op_id.1,
+                    elapsed_ms = retry.started_at.elapsed().as_millis(),
+                    ack_count = retry.ack_count,
+                    target_count = retry.target_count,
+                    fast_quorum = retry.fast_quorum,
+                    missing_count = retry.dsts.len(),
+                    "strict proposal retrying missing quorum acks"
+                );
                 let body = StrictBody::Propose(StrictPropose {
                     coord_node: rt.self_id as u32,
                     op_id_hi: op_id.0,
                     op_id_lo: op_id.1,
-                    ts_propose,
-                    op_msgpack,
-                    src_clock,
+                    ts_propose: retry.ts_propose,
+                    op_msgpack: retry.op_msgpack,
+                    src_clock: retry.src_clock,
                 });
-                if let Err(e) = rt.net.send_multicast(&dsts, &rt.topic, body).await {
+                if let Err(e) = rt.net.send_multicast(&retry.dsts, &rt.topic, body).await {
                     trace!(error=%e, "send propose retry multicast failed");
                 }
             }
         });
     }
 
-    fn pending_propose_retry(&self, op_id: OpId) -> Option<(Bytes, u64, u64, Vec<NodeIdentifier>)> {
+    fn pending_propose_retry(&self, op_id: OpId) -> Option<PendingProposeRetry> {
         let s = self.state.lock();
         let p = s.proposals.get(&op_id)?;
         if p.committed {
             return None;
         }
+        let ack_count = p.acks.len();
+        let target_count = p.target_set.len();
+        let fast_quorum = fast_quorum_size(target_count);
         let dsts = p
             .target_set
             .iter()
             .copied()
             .filter(|node| *node != self.self_id && !p.acks.contains_key(node))
             .collect();
-        Some((p.op_msgpack.clone(), p.ts_propose, s.clock, dsts))
+        Some(PendingProposeRetry {
+            op_msgpack: p.op_msgpack.clone(),
+            ts_propose: p.ts_propose,
+            src_clock: s.clock,
+            dsts,
+            started_at: p.started_at,
+            ack_count,
+            target_count,
+            fast_quorum,
+        })
     }
 
     // ------ Inbound recv handlers ------
@@ -981,14 +1092,19 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }
 
         // Decide whether quorum reached for this proposal we're coordinating.
-        let mut to_send: Option<(StrictBody, Vec<NodeIdentifier>, Option<oneshot::Sender<()>>)> = {
+        let mut to_send: Option<AcceptedProposal> = {
             let mut s = self.state.lock();
 
             // Phase 1: read fields from the proposal entry and decide.
             let op_bytes: Bytes;
+            let op_bytes_len: usize;
             let dsts: Vec<NodeIdentifier>;
             let ts_final: u64;
             let accepted_waker: Option<oneshot::Sender<()>>;
+            let elapsed: Duration;
+            let ack_count: usize;
+            let target_count: usize;
+            let fast_quorum: usize;
             {
                 let Some(p) = s.proposals.get_mut(&op_id) else {
                     return;
@@ -1001,14 +1117,18 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     return;
                 }
                 p.acks.insert(ack_node, ack.ts_local);
-                let fq = fast_quorum_size(p.target_set.len());
-                if p.acks.len() < fq {
+                target_count = p.target_set.len();
+                fast_quorum = fast_quorum_size(target_count);
+                if p.acks.len() < fast_quorum {
                     return;
                 }
                 ts_final = p.acks.values().copied().max().unwrap_or(p.ts_propose);
                 p.committed = true;
                 accepted_waker = p.accepted_waker.take();
                 op_bytes = p.op_msgpack.clone();
+                op_bytes_len = op_bytes.len();
+                elapsed = p.started_at.elapsed();
+                ack_count = p.acks.len();
                 dsts = p
                     .target_set
                     .iter()
@@ -1025,6 +1145,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             s.peer_clocks.insert(self.self_id, clock_now);
             s.mark_committed(op_id, ts_final);
             s.buffer_commit(op_id, ts_final, op_bytes.clone());
+            let commit_buffer_len = s.commit_buffer.len();
+            let pending_local_proposals = s.proposals.values().filter(|p| !p.committed).count();
+            let pending_remote_proposes = s.pending_proposes.len();
 
             let body = StrictBody::Commit(StrictCommit {
                 coord_node: self.self_id as u32,
@@ -1034,19 +1157,39 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 op_msgpack: op_bytes,
                 src_clock: clock_now,
             });
-            Some((body, dsts, accepted_waker))
+            Some(AcceptedProposal {
+                body,
+                dsts,
+                accepted_waker,
+                elapsed,
+                ack_count,
+                target_count,
+                fast_quorum,
+                ts_final,
+                clock_now,
+                op_bytes: op_bytes_len,
+                commit_buffer_len,
+                pending_local_proposals,
+                pending_remote_proposes,
+            })
         };
 
-        let accepted_waker = to_send.as_mut().and_then(|send| send.2.take());
+        if let Some(accepted) = to_send.as_ref() {
+            log_accepted_proposal(&self.topic, op_id, accepted);
+        }
+
+        let accepted_waker = to_send
+            .as_mut()
+            .and_then(|accepted| accepted.accepted_waker.take());
         if let Some(w) = accepted_waker {
             let _ = w.send(());
         }
         self.wake_delivery_and_clock_tick();
 
-        if let Some((body, dsts, _)) = to_send {
+        if let Some(accepted) = to_send {
             if let Err(e) = self
                 .net
-                .send_multicast(&dsts, &self.topic, body.clone())
+                .send_multicast(&accepted.dsts, &self.topic, accepted.body.clone())
                 .await
             {
                 trace!(error=%e, "send commit multicast failed");
@@ -1055,8 +1198,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 self.net.clone(),
                 self.shutdown.clone(),
                 self.topic.clone(),
-                dsts,
-                body,
+                accepted.dsts,
+                accepted.body,
                 self.cfg.delivery_tick_interval(),
             );
         }
@@ -1066,6 +1209,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let op_id: OpId = (c.op_id_hi, c.op_id_lo);
         let mut notify = false;
         let mut gossip: Option<StrictBody> = None;
+        let mut buffered_log: Option<BufferedCommitLog> = None;
         {
             let mut s = self.state.lock();
             s.observe_peer(from, c.src_clock);
@@ -1092,7 +1236,20 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 }
             } else if s.mark_committed(op_id, c.ts_final) {
                 let op_msgpack = Bytes::from(c.op_msgpack);
+                let op_bytes = op_msgpack.len();
                 s.buffer_commit(op_id, c.ts_final, op_msgpack.clone());
+                buffered_log = Some(BufferedCommitLog {
+                    source: "commit",
+                    from: Some(from),
+                    coord_node: node_from_u32(c.coord_node),
+                    op_id,
+                    ts_final: c.ts_final,
+                    clock_now,
+                    op_bytes,
+                    commit_buffer_len: s.commit_buffer.len(),
+                    pending_local_proposals: s.proposals.values().filter(|p| !p.committed).count(),
+                    pending_remote_proposes: s.pending_proposes.len(),
+                });
                 notify = true;
                 gossip = Some(StrictBody::Commit(StrictCommit {
                     coord_node: c.coord_node,
@@ -1103,6 +1260,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     src_clock: clock_now,
                 }));
             }
+        }
+        if let Some(log) = buffered_log {
+            log_buffered_commit(&self.topic, log);
         }
         if notify {
             self.wake_delivery_and_clock_tick();
@@ -1326,6 +1486,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // Apply locally + advance our clock; broadcast RecoveryCommit.
         let clock_now;
         let mut notify = false;
+        let mut buffered_log: Option<BufferedCommitLog> = None;
         {
             let mut s = self.state.lock();
             if ts_final > s.clock {
@@ -1336,9 +1497,25 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             if s.committed_ts_final.get(&op_id).copied().is_none()
                 && s.mark_committed(op_id, ts_final)
             {
+                let op_bytes = op_msgpack.len();
                 s.buffer_commit(op_id, ts_final, op_msgpack.clone());
+                buffered_log = Some(BufferedCommitLog {
+                    source: "recovery_decision",
+                    from: None,
+                    coord_node: Some(coord),
+                    op_id,
+                    ts_final,
+                    clock_now,
+                    op_bytes,
+                    commit_buffer_len: s.commit_buffer.len(),
+                    pending_local_proposals: s.proposals.values().filter(|p| !p.committed).count(),
+                    pending_remote_proposes: s.pending_proposes.len(),
+                });
                 notify = true;
             }
+        }
+        if let Some(log) = buffered_log {
+            log_buffered_commit(&self.topic, log);
         }
         if notify {
             self.wake_delivery_and_clock_tick();
@@ -1370,6 +1547,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     pub async fn recv_recovery_commit(&self, from: NodeIdentifier, c: StrictRecoveryCommit) {
         let op_id: OpId = (c.op_id_hi, c.op_id_lo);
         let mut notify = false;
+        let mut buffered_log: Option<BufferedCommitLog> = None;
         {
             let mut s = self.state.lock();
             s.observe_peer(from, c.src_clock);
@@ -1401,9 +1579,26 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     );
                 }
             } else if s.mark_committed(op_id, c.ts_final) {
-                s.buffer_commit(op_id, c.ts_final, Bytes::from(c.op_msgpack));
+                let op_msgpack = Bytes::from(c.op_msgpack);
+                let op_bytes = op_msgpack.len();
+                s.buffer_commit(op_id, c.ts_final, op_msgpack);
+                buffered_log = Some(BufferedCommitLog {
+                    source: "recovery_commit",
+                    from: Some(from),
+                    coord_node: node_from_u32(c.coord_node),
+                    op_id,
+                    ts_final: c.ts_final,
+                    clock_now,
+                    op_bytes,
+                    commit_buffer_len: s.commit_buffer.len(),
+                    pending_local_proposals: s.proposals.values().filter(|p| !p.committed).count(),
+                    pending_remote_proposes: s.pending_proposes.len(),
+                });
                 notify = true;
             }
+        }
+        if let Some(log) = buffered_log {
+            log_buffered_commit(&self.topic, log);
         }
         if notify {
             self.wake_delivery_and_clock_tick();
@@ -1702,23 +1897,69 @@ fn spawn_delivery_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
 
 async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     let alive = rt.net.alive_members();
+    let now = Instant::now();
+    let mut blocked: Option<DeliveryBlockDiagnostics> = None;
     let to_apply: Vec<BufferedOp> = {
         let mut s = rt.state.lock();
-        let mut hw = s.delivery_high_water(rt.self_id, &alive);
+        let watermark = delivery_watermark(&s, rt.self_id, &alive);
+        let raw_high_water = watermark.high_water;
+        let pending_blocker = earliest_uncommitted_proposal_blocker(&s, rt.self_id, now);
+        let mut effective_high_water = raw_high_water;
         if let Some(ts) = s.earliest_uncommitted_proposal_ts() {
-            hw = hw.min(ts.saturating_sub(1));
+            effective_high_water = effective_high_water.min(ts.saturating_sub(1));
         }
-        s.drain_deliverable(hw)
+        let drained = s.drain_deliverable(effective_high_water);
+        if let Some(next) = next_buffered_op_diagnostics(&s, now) {
+            if next.ts_final > effective_high_water {
+                blocked = Some(DeliveryBlockDiagnostics {
+                    next,
+                    raw_high_water,
+                    effective_high_water,
+                    watermark,
+                    pending_blocker,
+                    alive_count: alive.len(),
+                    commit_buffer_len: s.commit_buffer.len(),
+                    pending_local_proposals: s.proposals.values().filter(|p| !p.committed).count(),
+                    pending_remote_proposes: s.pending_proposes.len(),
+                });
+            }
+        }
+        drained
     };
+    if let Some(diagnostics) = blocked {
+        log_delivery_blocked(rt, diagnostics);
+    } else {
+        clear_delivery_blocked(rt);
+    }
     for buf in to_apply {
+        let buffered_for = buf.buffered_at.elapsed();
         let op: R::Op = match rmp_serde::from_slice(&buf.op_msgpack) {
             Ok(o) => o,
             Err(e) => {
-                warn!(error=%e, topic=%rt.topic, "failed to decode committed op msgpack");
+                warn!(
+                    error = %e,
+                    topic = %rt.topic,
+                    op_id_hi = buf.op_id.0,
+                    op_id_lo = buf.op_id.1,
+                    ts_final = buf.ts_final,
+                    buffered_for_ms = buffered_for.as_millis(),
+                    "failed to decode committed op msgpack"
+                );
                 continue;
             }
         };
         let version = rt.repo.current_version() + 1;
+        debug!(
+            topic = %rt.topic,
+            op_id_hi = buf.op_id.0,
+            op_id_lo = buf.op_id.1,
+            ts_final = buf.ts_final,
+            version,
+            buffered_for_ms = buffered_for.as_millis(),
+            op_bytes = buf.op_msgpack.len(),
+            "strict delivery applying committed op"
+        );
+        let apply_started = Instant::now();
         rt.repo
             .apply_committed_with_metadata(
                 version,
@@ -1730,17 +1971,239 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
                 }),
             )
             .await;
+        let apply_elapsed = apply_started.elapsed();
         // Fire local proposer's waker, if any, and clear the proposal.
-        let waker = {
+        let (waker, local_proposal_elapsed) = {
             let mut s = rt.state.lock();
             if buf.ts_final > s.delivered_high_water {
                 s.delivered_high_water = buf.ts_final;
             }
-            s.proposals.remove(&buf.op_id).and_then(|p| p.waker)
+            let proposal = s.proposals.remove(&buf.op_id);
+            let elapsed = proposal.as_ref().map(|p| p.started_at.elapsed());
+            let waker = proposal.and_then(|p| p.waker);
+            (waker, elapsed)
         };
+        log_delivery_applied(
+            &rt.topic,
+            &buf,
+            version,
+            buffered_for,
+            apply_elapsed,
+            local_proposal_elapsed,
+        );
         if let Some(w) = waker {
             let _ = w.send(Ok(version));
         }
+    }
+}
+
+fn delivery_watermark(
+    state: &StrictState,
+    self_id: NodeIdentifier,
+    alive: &[NodeIdentifier],
+) -> DeliveryWatermark {
+    let high_water = state.delivery_high_water(self_id, alive);
+    let mut low_water_node = self_id;
+    let mut low_water_clock = state.clock;
+    let mut missing_clock_peers = 0;
+    for node in alive.iter().copied() {
+        if node == self_id {
+            continue;
+        }
+        match state.peer_clocks.get(&node).copied() {
+            Some(clock) => {
+                if clock <= low_water_clock {
+                    low_water_node = node;
+                    low_water_clock = clock;
+                }
+            }
+            None => {
+                missing_clock_peers += 1;
+                if low_water_clock != 0 {
+                    low_water_node = node;
+                    low_water_clock = 0;
+                }
+            }
+        }
+    }
+    DeliveryWatermark {
+        high_water,
+        low_water_node,
+        low_water_clock,
+        missing_clock_peers,
+    }
+}
+
+fn earliest_uncommitted_proposal_blocker(
+    state: &StrictState,
+    self_id: NodeIdentifier,
+    now: Instant,
+) -> Option<UncommittedProposalBlocker> {
+    let local = state
+        .proposals
+        .iter()
+        .filter(|(_, proposal)| !proposal.committed)
+        .map(|(op_id, proposal)| UncommittedProposalBlocker {
+            kind: "local",
+            op_id: *op_id,
+            coord_node: self_id,
+            ts: proposal.ts_propose,
+            age: now.saturating_duration_since(proposal.started_at),
+        });
+    let remote = state
+        .pending_proposes
+        .iter()
+        .map(|(op_id, pending)| UncommittedProposalBlocker {
+            kind: "remote",
+            op_id: *op_id,
+            coord_node: pending.coord_node,
+            ts: pending.ts_local,
+            age: now.saturating_duration_since(pending.seen_at),
+        });
+    local.chain(remote).min_by_key(|blocker| blocker.ts)
+}
+
+fn next_buffered_op_diagnostics(
+    state: &StrictState,
+    now: Instant,
+) -> Option<NextBufferedOpDiagnostics> {
+    state
+        .commit_buffer
+        .iter()
+        .next()
+        .map(|(key, buffered)| NextBufferedOpDiagnostics {
+            key: *key,
+            op_id: buffered.op_id,
+            ts_final: buffered.ts_final,
+            buffered_for: now.saturating_duration_since(buffered.buffered_at),
+        })
+}
+
+fn log_delivery_blocked<R: StrictReplicable>(
+    rt: &Arc<StrictRuntime<R>>,
+    diagnostics: DeliveryBlockDiagnostics,
+) {
+    let now = Instant::now();
+    let (blocked_for, should_log) = {
+        let mut state = rt.delivery_blocked_log.lock();
+        if state.key != Some(diagnostics.next.key) {
+            state.key = Some(diagnostics.next.key);
+            state.blocked_since = Some(now);
+            state.last_log_at = None;
+        }
+        let blocked_since = state.blocked_since.unwrap_or(now);
+        let blocked_for = now.saturating_duration_since(blocked_since);
+        let log_interval_elapsed = state.last_log_at.is_none_or(|last| {
+            now.saturating_duration_since(last) >= STRICT_DELIVERY_BLOCKED_LOG_INTERVAL
+        });
+        let should_log = blocked_for >= STRICT_REPLICATION_SLOW_STAGE && log_interval_elapsed;
+        if should_log {
+            state.last_log_at = Some(now);
+        }
+        (blocked_for, should_log)
+    };
+    if !should_log {
+        return;
+    }
+
+    let blocker_kind = diagnostics
+        .pending_blocker
+        .as_ref()
+        .map(|blocker| blocker.kind)
+        .unwrap_or("none");
+    let blocker_op_id_hi = diagnostics
+        .pending_blocker
+        .as_ref()
+        .map(|blocker| blocker.op_id.0)
+        .unwrap_or(0);
+    let blocker_op_id_lo = diagnostics
+        .pending_blocker
+        .as_ref()
+        .map(|blocker| blocker.op_id.1)
+        .unwrap_or(0);
+    let blocker_coord_node = diagnostics
+        .pending_blocker
+        .as_ref()
+        .map(|blocker| blocker.coord_node)
+        .unwrap_or(0);
+    let blocker_ts = diagnostics
+        .pending_blocker
+        .as_ref()
+        .map(|blocker| blocker.ts)
+        .unwrap_or(0);
+    let blocker_age_ms = diagnostics
+        .pending_blocker
+        .as_ref()
+        .map(|blocker| blocker.age.as_millis())
+        .unwrap_or(0);
+
+    warn!(
+        topic = %rt.topic,
+        op_id_hi = diagnostics.next.op_id.0,
+        op_id_lo = diagnostics.next.op_id.1,
+        ts_final = diagnostics.next.ts_final,
+        blocked_for_ms = blocked_for.as_millis(),
+        buffered_for_ms = diagnostics.next.buffered_for.as_millis(),
+        raw_high_water = diagnostics.raw_high_water,
+        effective_high_water = diagnostics.effective_high_water,
+        low_water_node = diagnostics.watermark.low_water_node,
+        low_water_clock = diagnostics.watermark.low_water_clock,
+        missing_clock_peers = diagnostics.watermark.missing_clock_peers,
+        blocker_kind,
+        blocker_op_id_hi,
+        blocker_op_id_lo,
+        blocker_coord_node,
+        blocker_ts,
+        blocker_age_ms,
+        alive_count = diagnostics.alive_count,
+        commit_buffer_len = diagnostics.commit_buffer_len,
+        pending_local_proposals = diagnostics.pending_local_proposals,
+        pending_remote_proposes = diagnostics.pending_remote_proposes,
+        "strict delivery blocked"
+    );
+}
+
+fn clear_delivery_blocked<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
+    let mut state = rt.delivery_blocked_log.lock();
+    if state.key.is_some() {
+        *state = DeliveryBlockedLogState::default();
+    }
+}
+
+fn log_delivery_applied(
+    topic: &str,
+    buf: &BufferedOp,
+    version: u64,
+    buffered_for: Duration,
+    apply_elapsed: Duration,
+    local_proposal_elapsed: Option<Duration>,
+) {
+    if apply_elapsed >= STRICT_REPLICATION_SLOW_STAGE
+        || local_proposal_elapsed.is_some_and(|elapsed| elapsed >= STRICT_REPLICATION_SLOW_STAGE)
+    {
+        warn!(
+            topic = %topic,
+            op_id_hi = buf.op_id.0,
+            op_id_lo = buf.op_id.1,
+            ts_final = buf.ts_final,
+            version,
+            buffered_for_ms = buffered_for.as_millis(),
+            apply_elapsed_ms = apply_elapsed.as_millis(),
+            local_proposal_elapsed_ms = ?local_proposal_elapsed.map(|elapsed| elapsed.as_millis()),
+            "strict delivery applied slowly"
+        );
+    } else {
+        debug!(
+            topic = %topic,
+            op_id_hi = buf.op_id.0,
+            op_id_lo = buf.op_id.1,
+            ts_final = buf.ts_final,
+            version,
+            buffered_for_ms = buffered_for.as_millis(),
+            apply_elapsed_ms = apply_elapsed.as_millis(),
+            local_proposal_elapsed_ms = ?local_proposal_elapsed.map(|elapsed| elapsed.as_millis()),
+            "strict delivery applied"
+        );
     }
 }
 
@@ -1827,6 +2290,61 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let alive = self.net.alive_members();
         let state = self.state.lock();
         clock_tick_needed_for_state(&state, self.self_id, &alive)
+    }
+}
+
+fn log_buffered_commit(topic: &str, log: BufferedCommitLog) {
+    debug!(
+        topic = %topic,
+        source = log.source,
+        from = ?log.from,
+        coord_node = ?log.coord_node,
+        op_id_hi = log.op_id.0,
+        op_id_lo = log.op_id.1,
+        ts_final = log.ts_final,
+        clock_now = log.clock_now,
+        op_bytes = log.op_bytes,
+        commit_buffer_len = log.commit_buffer_len,
+        pending_local_proposals = log.pending_local_proposals,
+        pending_remote_proposes = log.pending_remote_proposes,
+        "strict commit buffered"
+    );
+}
+
+fn log_accepted_proposal(topic: &str, op_id: OpId, accepted: &AcceptedProposal) {
+    if accepted.elapsed >= STRICT_REPLICATION_SLOW_STAGE {
+        warn!(
+            topic = %topic,
+            op_id_hi = op_id.0,
+            op_id_lo = op_id.1,
+            elapsed_ms = accepted.elapsed.as_millis(),
+            ack_count = accepted.ack_count,
+            target_count = accepted.target_count,
+            fast_quorum = accepted.fast_quorum,
+            ts_final = accepted.ts_final,
+            clock_now = accepted.clock_now,
+            op_bytes = accepted.op_bytes,
+            commit_buffer_len = accepted.commit_buffer_len,
+            pending_local_proposals = accepted.pending_local_proposals,
+            pending_remote_proposes = accepted.pending_remote_proposes,
+            "strict proposal accepted slowly"
+        );
+    } else {
+        debug!(
+            topic = %topic,
+            op_id_hi = op_id.0,
+            op_id_lo = op_id.1,
+            elapsed_ms = accepted.elapsed.as_millis(),
+            ack_count = accepted.ack_count,
+            target_count = accepted.target_count,
+            fast_quorum = accepted.fast_quorum,
+            ts_final = accepted.ts_final,
+            clock_now = accepted.clock_now,
+            commit_buffer_len = accepted.commit_buffer_len,
+            pending_local_proposals = accepted.pending_local_proposals,
+            pending_remote_proposes = accepted.pending_remote_proposes,
+            "strict proposal accepted"
+        );
     }
 }
 

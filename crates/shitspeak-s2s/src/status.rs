@@ -427,7 +427,7 @@ pub(crate) fn build_topology_snapshot(
             let status = queue.status();
             OutboundQueueMetric {
                 peer: queue.peer(),
-                transport: transport_kind_name(queue.transport()),
+                transport: outbound_queue_transport_name(queue.transport()),
                 depth: status.depth(),
                 high_watermark: status.high_depth(),
                 capacity: status.capacity(),
@@ -1258,6 +1258,10 @@ fn transport_kind_name(kind: TransportKind) -> &'static str {
         TransportKind::Quic => "quic",
         TransportKind::Udp => "udp",
     }
+}
+
+fn outbound_queue_transport_name(kind: Option<TransportKind>) -> &'static str {
+    kind.map(transport_kind_name).unwrap_or("routed")
 }
 
 fn service_level_name(level: ServiceLevel) -> &'static str {

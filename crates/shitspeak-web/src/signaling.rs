@@ -539,9 +539,10 @@ where
                                 let old_channel_id = client.get_current_channel_id();
                                 server
                                     .get_clients()
-                                    .remove_client_in_server(
+                                    .remove_client_instance_in_server(
                                         &server_id,
                                         client.get_session_id(),
+                                        client.client_instance_id(),
                                     )
                                     .await;
                                 shitspeak_runtime::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
@@ -1167,7 +1168,11 @@ async fn handle_signaling_authenticate(
                         let server_id = client.server_id();
                         server
                             .get_clients()
-                            .remove_client_in_server(&server_id, client.get_session_id())
+                            .remove_client_instance_in_server(
+                                &server_id,
+                                client.get_session_id(),
+                                client.client_instance_id(),
+                            )
                             .await;
                         session.session_id = DEFAULT_WEB_SESSION_ID;
                     }

@@ -50,6 +50,7 @@ const DICTIONARY_COMPRESSION_LEGACY_ADAPTIVE_FLAG: u8 = 0x01;
 const DICTIONARY_COMPRESSION_CONFIGURED_FLAG: u8 = 0x02;
 const DICTIONARY_COMPRESSION_ADAPTIVE_ADVERTISEMENT_FLAG: u8 = 0x04;
 const MAX_ADAPTIVE_DICTIONARIES_PER_STREAM: usize = 4;
+const STREAM_HANDOFF_FRAMES: usize = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PeerDictionaryCompressionSupport {
@@ -116,7 +117,6 @@ pub(crate) struct StreamPumpConfig {
     peer_node: NodeIdentifier,
     transport: TransportKind,
     max_frame_bytes: usize,
-    outbound_capacity: usize,
     ping_interval: Duration,
     idle_ping_interval: Duration,
     native_stats_interval: Duration,
@@ -134,7 +134,7 @@ impl StreamPumpConfig {
         peer_node: NodeIdentifier,
         transport: TransportKind,
         max_frame_bytes: usize,
-        outbound_capacity: usize,
+        _outbound_capacity: usize,
         ping_interval: Duration,
         idle_ping_interval: Duration,
         native_stats_interval: Duration,
@@ -146,7 +146,6 @@ impl StreamPumpConfig {
             peer_node,
             transport,
             max_frame_bytes,
-            outbound_capacity,
             ping_interval,
             idle_ping_interval,
             native_stats_interval,
@@ -172,8 +171,7 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let budget = AdaptiveQueueBudget::auto();
-    let lane_bytes =
-        super::manager::adaptive_lane_bytes(budget.max_bytes(), cfg.outbound_capacity, 50);
+    let lane_bytes = stream_handoff_lane_bytes(budget.max_bytes(), cfg.max_frame_bytes);
     let (tx, rx) = AdaptiveQueueSender::new(budget.split(lane_bytes));
 
     let active = ActiveStream::new(cfg.transport, remote_addr, tx, closed.clone(), is_dialer);
@@ -189,6 +187,14 @@ where
     ));
 
     active
+}
+
+pub(crate) fn stream_handoff_lane_bytes(global_bytes: usize, max_frame_bytes: usize) -> usize {
+    max_frame_bytes
+        .saturating_add(super::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES)
+        .saturating_mul(STREAM_HANDOFF_FRAMES)
+        .max(1)
+        .min(global_bytes)
 }
 
 /// In-flight ping bookkeeping.

@@ -8,11 +8,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use scc::HashMap as SccMap;
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -24,6 +25,7 @@ use super::adaptive_queue::{
     SendAdaptiveError, TryAdaptiveSendError,
 };
 use super::config::TransportConfig;
+use super::connection::OutboundEnvelope;
 use super::connection::{AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerState};
 use super::endpoint::{
     EndpointRegistry, kcp::KcpEndpoint, mux::UdpMuxSet, quic::QuicEndpoint, tcp::TcpEndpoint,
@@ -39,6 +41,8 @@ use super::service_level::{
     MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, TransportKind,
 };
 use super::tls::build_tls_configs;
+
+const OUTBOUND_DISPATCH_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone)]
 pub struct PeerAddressSnapshot {
@@ -116,6 +120,12 @@ impl InboundMessage {
 }
 
 pub type AdaptiveInboundReceiver = AdaptiveQueueReceiver<InboundMessage>;
+
+impl AdaptiveQueueItem for OutboundEnvelope {
+    fn estimated_queue_bytes(&self) -> usize {
+        super::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES.saturating_add(self.payload().len())
+    }
+}
 
 /// Receiver halves returned once at `start`.
 pub struct Inbound {
@@ -352,6 +362,17 @@ impl ManagerInner {
         if let Some(existing) = self.peers.get_sync(&id) {
             return existing.get().clone();
         }
+        self.insert_peer_with_outbound_queue_bytes(id, outbound_queue_bytes(&self.cfg))
+    }
+
+    fn insert_peer_with_outbound_queue_bytes(
+        &self,
+        id: NodeIdentifier,
+        outbound_queue_bytes: usize,
+    ) -> Arc<PeerState> {
+        if let Some(existing) = self.peers.get_sync(&id) {
+            return existing.get().clone();
+        }
         let new = PeerState::new(
             id,
             self.cfg.backoff_initial(),
@@ -361,13 +382,29 @@ impl ManagerInner {
                 jitter_alpha: self.cfg.jitter_ewma_alpha(),
                 packet_loss_alpha: self.cfg.packet_loss_ewma_alpha(),
             },
+            outbound_queue_bytes,
         );
         match self.peers.entry_sync(id) {
             scc::hash_map::Entry::Occupied(e) => e.get().clone(),
             scc::hash_map::Entry::Vacant(e) => {
                 e.insert_entry(new.clone());
+                spawn_peer_outbound_dispatcher(Arc::new(self.clone_for_dispatcher()), new.clone());
                 new
             }
+        }
+    }
+
+    fn clone_for_dispatcher(&self) -> ManagerInner {
+        ManagerInner {
+            self_id: self.self_id,
+            peers: self.peers.clone(),
+            seed_backoff: self.seed_backoff.clone(),
+            successful_seeds: self.successful_seeds.clone(),
+            required_outgoing: self.required_outgoing.clone(),
+            inbound: self.inbound.clone(),
+            shutdown: self.shutdown.clone(),
+            cfg: self.cfg.clone(),
+            endpoints: self.endpoints.clone(),
         }
     }
 
@@ -537,7 +574,7 @@ impl ConnectionManager {
             cfg,
         });
 
-        let peer = inner.get_or_create_peer(peer_node);
+        let peer = inner.insert_peer_with_outbound_queue_bytes(peer_node, queue_bytes);
         let mut receivers = Vec::new();
         for kind in kinds {
             let (tx, rx) = test_outbound_queue_with_bytes(queue_bytes);
@@ -854,36 +891,13 @@ impl ConnectionManager {
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
 
-        let choices = pick_transports(&peer, level, routing_metric);
-        if choices.is_empty() {
+        if !has_eligible_transport(&peer, level, routing_metric) {
             return Err(SendError::NoSuitableTransport { node });
         }
 
-        let mut first_err = None;
-        let choice_count = choices.len();
-        for (idx, chosen) in choices.into_iter().enumerate() {
-            let wait_for_space = wait_on_final_transport && idx + 1 == choice_count;
-            match self
-                .send_stream(
-                    &peer,
-                    chosen,
-                    class,
-                    payload.clone(),
-                    options,
-                    wait_for_space,
-                )
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-            }
-        }
-
-        Err(first_err.unwrap_or(SendError::NoSuitableTransport { node }))
+        let envelope = OutboundEnvelope::routed(level, routing_metric, class, payload, options);
+        self.enqueue_outbound(&peer, envelope, wait_on_final_transport)
+            .await
     }
 
     /// Send via a specific transport, ignoring the fallback ordering. Useful
@@ -911,52 +925,51 @@ impl ConnectionManager {
             .inner
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
-        self.send_stream(&peer, transport, class, payload, options, true)
-            .await
+        if peer.try_get_stream(transport).is_none() {
+            return Err(SendError::StreamClosed { node, transport });
+        }
+        let envelope = OutboundEnvelope::fixed_transport(transport, class, payload, options);
+        self.enqueue_outbound(&peer, envelope, true).await
     }
 
-    async fn send_stream(
+    async fn enqueue_outbound(
         &self,
         peer: &Arc<PeerState>,
-        kind: TransportKind,
-        class: MessageClass,
-        payload: Bytes,
-        options: SendOptions,
+        envelope: OutboundEnvelope,
         wait_for_space: bool,
     ) -> Result<(), SendError> {
-        let sender = peer.try_get_stream(kind).ok_or(SendError::StreamClosed {
-            node: peer.node_id(),
-            transport: kind,
-        })?;
-        let frame = OutboundFrame::with_options(class, payload, options);
-        record_outbound_queue_sample(peer, kind, class, &sender, false);
-        match sender.try_send(frame) {
+        let class = envelope.class();
+        let sender = peer.outbound_sender();
+        record_outbound_queue_sample(peer, class, &sender, false);
+        match sender.try_send(envelope) {
             Ok(()) => {
-                record_outbound_queue_sample(peer, kind, class, &sender, false);
+                peer.notify_outbound_dispatch();
+                record_outbound_queue_sample(peer, class, &sender, false);
                 Ok(())
             }
-            Err(TryAdaptiveSendError::Full(frame)) if wait_for_space => {
-                record_outbound_queue_sample(peer, kind, class, &sender, true);
-                sender.send(frame).await.map_err(|SendAdaptiveError(_)| {
-                    SendError::StreamClosed {
-                        node: peer.node_id(),
-                        transport: kind,
-                    }
-                })?;
-                record_outbound_queue_sample(peer, kind, class, &sender, false);
+            Err(TryAdaptiveSendError::Full(envelope)) if wait_for_space => {
+                record_outbound_queue_sample(peer, class, &sender, true);
+                sender
+                    .send(envelope)
+                    .await
+                    .map_err(|SendAdaptiveError(_)| SendError::Shutdown)?;
+                peer.notify_outbound_dispatch();
+                record_outbound_queue_sample(peer, class, &sender, false);
                 Ok(())
             }
-            Err(TryAdaptiveSendError::Full(_)) => {
-                record_outbound_queue_sample(peer, kind, class, &sender, true);
+            Err(TryAdaptiveSendError::Full(envelope)) => {
+                record_outbound_queue_sample(peer, class, &sender, true);
                 Err(SendError::Backpressure {
                     node: peer.node_id(),
-                    transport: kind,
+                    transport: envelope.target_transport().unwrap_or_else(|| {
+                        pick_transports(peer, envelope.level(), envelope.routing_metric())
+                            .into_iter()
+                            .next()
+                            .unwrap_or(TransportKind::Tcp)
+                    }),
                 })
             }
-            Err(TryAdaptiveSendError::Closed(_)) => Err(SendError::StreamClosed {
-                node: peer.node_id(),
-                transport: kind,
-            }),
+            Err(TryAdaptiveSendError::Closed(_)) => Err(SendError::Shutdown),
         }
     }
 
@@ -973,7 +986,7 @@ impl ConnectionManager {
             .into_iter()
             .flat_map(|(_, peer)| peer.outbound_queue_status())
             .collect::<Vec<_>>();
-        outbound_queues.sort_by_key(|queue| (queue.peer(), queue.transport()));
+        outbound_queues.sort_by_key(|queue| (queue.peer(), queue.queue_key()));
         assemble_snapshot(entries, outbound_queues, self.inner.inbound.queue_status())
     }
 
@@ -1132,6 +1145,100 @@ fn pick_transports(
     }
 
     ranked
+}
+
+fn has_eligible_transport(
+    peer: &PeerState,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+) -> bool {
+    !pick_transports(peer, level, routing_metric).is_empty()
+}
+
+fn spawn_peer_outbound_dispatcher(inner: Arc<ManagerInner>, peer: Arc<PeerState>) {
+    let Some(receiver) = peer.take_outbound_receiver() else {
+        return;
+    };
+    tokio::spawn(run_peer_outbound_dispatcher(inner, peer, receiver));
+}
+
+async fn run_peer_outbound_dispatcher(
+    inner: Arc<ManagerInner>,
+    peer: Arc<PeerState>,
+    mut receiver: AdaptiveQueueReceiver<OutboundEnvelope>,
+) {
+    let mut retry_tick = interval(OUTBOUND_DISPATCH_RETRY_INTERVAL);
+    retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        let maybe_envelope = tokio::select! {
+            biased;
+            _ = inner.shutdown().cancelled() => return,
+            envelope = receiver.recv() => envelope,
+        };
+        let Some(mut envelope) = maybe_envelope else {
+            return;
+        };
+
+        loop {
+            if inner.shutdown().is_cancelled() {
+                return;
+            }
+            match try_dispatch_envelope(&peer, envelope) {
+                Ok(()) => break,
+                Err(envelope_back) => {
+                    envelope = envelope_back;
+                }
+            }
+
+            tokio::select! {
+                biased;
+                _ = inner.shutdown().cancelled() => return,
+                _ = peer.wait_for_outbound_dispatch_signal() => {}
+                _ = retry_tick.tick() => {}
+            }
+        }
+    }
+}
+
+fn try_dispatch_envelope(
+    peer: &Arc<PeerState>,
+    envelope: OutboundEnvelope,
+) -> Result<(), OutboundEnvelope> {
+    let class = envelope.class();
+    let choices = if let Some(transport) = envelope.target_transport() {
+        vec![transport]
+    } else {
+        pick_transports(peer, envelope.level(), envelope.routing_metric())
+    };
+
+    if choices.is_empty() {
+        return Err(envelope);
+    }
+
+    let frame = envelope.clone().into_frame();
+    for transport in choices {
+        let Some(sender) = peer.try_get_stream(transport) else {
+            continue;
+        };
+        if sender.depth_bytes() > 0 {
+            record_outbound_stream_queue_sample(peer, transport, class, &sender, true);
+            continue;
+        }
+        record_outbound_stream_queue_sample(peer, transport, class, &sender, false);
+        match sender.try_send(frame.clone()) {
+            Ok(()) => {
+                record_outbound_stream_queue_sample(peer, transport, class, &sender, false);
+                return Ok(());
+            }
+            Err(TryAdaptiveSendError::Full(_)) => {
+                record_outbound_stream_queue_sample(peer, transport, class, &sender, true);
+            }
+            Err(TryAdaptiveSendError::Closed(_)) => {}
+        }
+    }
+
+    Err(envelope)
 }
 
 fn accepts(kind: TransportKind, requested: ServiceLevel) -> bool {
@@ -1310,6 +1417,11 @@ pub(crate) fn adaptive_lane_bytes(
     share.max(legacy_floor).min(global_bytes)
 }
 
+fn outbound_queue_bytes(cfg: &TransportConfig) -> usize {
+    let budget = AdaptiveQueueBudget::auto();
+    adaptive_lane_bytes(budget.max_bytes(), cfg.outbound_capacity(), 50)
+}
+
 fn test_outbound_queue_with_bytes(
     bytes: usize,
 ) -> (
@@ -1346,13 +1458,23 @@ fn test_inbound_dispatch() -> (InboundDispatch, Inbound) {
 
 fn record_outbound_queue_sample(
     peer: &PeerState,
+    class: MessageClass,
+    sender: &AdaptiveQueueSender<OutboundEnvelope>,
+    is_full: bool,
+) {
+    let (depth, max_capacity) = sender_queue_depth(sender);
+    peer.record_outbound_queue_sample(class, depth, max_capacity, is_full);
+}
+
+fn record_outbound_stream_queue_sample(
+    peer: &PeerState,
     transport: TransportKind,
     class: MessageClass,
     sender: &AdaptiveQueueSender<OutboundFrame>,
     is_full: bool,
 ) {
     let (depth, max_capacity) = sender_queue_depth(sender);
-    peer.record_outbound_queue_sample(transport, class, depth, max_capacity, is_full);
+    peer.record_outbound_stream_queue_sample(transport, class, depth, max_capacity, is_full);
 }
 
 fn sender_queue_depth<T>(sender: &AdaptiveQueueSender<T>) -> (usize, usize)
@@ -1473,6 +1595,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_secs(60),
             MetricsTuning::default(),
+            1024 * 1024,
         );
         let mut receivers = Vec::new();
         for kind in kinds {
@@ -1597,7 +1720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_send_with_options_falls_back_when_earlier_stream_is_full() {
+    async fn dispatcher_falls_back_when_earlier_stream_handoff_is_full() {
         let (transport, mut receivers) = ConnectionManager::test_with_live_streams_bytes(
             1,
             2,
@@ -1605,14 +1728,15 @@ mod tests {
             1024 * 1024,
         );
 
-        transport
-            .send_via(
-                2,
-                TransportKind::Tcp,
+        let direct_peer = transport.inner.get_peer(2).expect("peer");
+        let tcp_sender = direct_peer
+            .try_get_stream(TransportKind::Tcp)
+            .expect("tcp sender");
+        tcp_sender
+            .try_send(OutboundFrame::new(
                 MessageClass::Regular,
                 Bytes::from(vec![1; 1024 * 1024 - 512]),
-            )
-            .await
+            ))
             .unwrap();
 
         transport
@@ -1627,15 +1751,19 @@ mod tests {
             .await
             .unwrap();
 
+        let forwarded = tokio::time::timeout(Duration::from_millis(50), receivers[1].recv())
+            .await
+            .expect("fallback dispatch should not wait for tcp")
+            .expect("quic receiver");
+        assert_eq!(&forwarded.payload()[..], b"fallback");
         assert_eq!(
             receivers[0].try_recv().unwrap().payload().len(),
             1024 * 1024 - 512
         );
-        assert_eq!(&receivers[1].try_recv().unwrap().payload()[..], b"fallback");
     }
 
     #[tokio::test]
-    async fn send_with_options_still_waits_for_space_on_final_stream() {
+    async fn send_with_options_waits_for_peer_queue_space_not_stream_handoff_space() {
         let (transport, mut receivers) = ConnectionManager::test_with_live_streams_bytes(
             1,
             2,
@@ -1643,45 +1771,38 @@ mod tests {
             1024 * 1024,
         );
 
+        let direct_peer = transport.inner.get_peer(2).expect("peer");
+        let tcp_sender = direct_peer
+            .try_get_stream(TransportKind::Tcp)
+            .expect("tcp sender");
+        tcp_sender
+            .try_send(OutboundFrame::new(
+                MessageClass::Regular,
+                Bytes::from(vec![1; 1024 * 1024 - 512]),
+            ))
+            .unwrap();
+
         transport
-            .try_send_with_options(
+            .send_with_options(
                 2,
                 ServiceLevel::Reliable,
                 None,
                 MessageClass::Regular,
-                Bytes::from(vec![1; 1024 * 1024 - 512]),
+                Bytes::from_static(b"queued-before-routing"),
                 SendOptions::default(),
             )
             .await
             .unwrap();
 
-        let transport_for_task = transport.clone();
-        let mut send_task = tokio::spawn(async move {
-            transport_for_task
-                .send_with_options(
-                    2,
-                    ServiceLevel::Reliable,
-                    None,
-                    MessageClass::Regular,
-                    Bytes::from_static(b"waited"),
-                    SendOptions::default(),
-                )
-                .await
-        });
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut send_task)
-                .await
-                .is_err(),
-            "send_with_options should still wait on the final stream"
-        );
-
         assert_eq!(
             receivers[0].recv().await.unwrap().payload().len(),
             1024 * 1024 - 512
         );
-        send_task.await.unwrap().unwrap();
-        assert_eq!(&receivers[0].recv().await.unwrap().payload()[..], b"waited");
+        let forwarded = tokio::time::timeout(Duration::from_millis(50), receivers[0].recv())
+            .await
+            .expect("dispatcher should retry once handoff space is available")
+            .expect("tcp receiver");
+        assert_eq!(&forwarded.payload()[..], b"queued-before-routing");
     }
 
     #[test]

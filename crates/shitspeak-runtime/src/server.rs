@@ -3932,7 +3932,9 @@ impl Server {
                     last_ping,
                     timeout_secs,
                 );
-                self.clients.remove_client_in_server(&server_id, sid).await;
+                self.clients
+                    .remove_client_instance_in_server(&server_id, sid, client.client_instance_id())
+                    .await;
                 if let Err(e) = client.disconnect().await {
                     tracing::debug!(
                         error = %e,
@@ -4420,7 +4422,11 @@ impl Server {
                 let server_id = client.server_id();
                 let old_channel_id = client.get_current_channel_id();
                 self.clients
-                    .remove_client_in_server(&server_id, client.get_session_id())
+                    .remove_client_instance_in_server(
+                        &server_id,
+                        client.get_session_id(),
+                        client.client_instance_id(),
+                    )
                     .await;
                 crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
                     self,

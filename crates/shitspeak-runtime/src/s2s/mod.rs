@@ -12,7 +12,7 @@ use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::ban_repository::{BanEntry, BanOp, BanOperation, BanRepository};
 use crate::blob_store::ChannelBlobStore;
@@ -49,6 +49,7 @@ const S2S_CLIENT_REPLICATION_MAX_IN_FLIGHT: usize = 256;
 const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const STRICT_PROPOSAL_GATEWAY_SLACK_TICKS: u32 = 4;
 const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const S2S_CHANNEL_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
 const S2S_CLIENT_REPLICATION_SLOW_PROPOSE: Duration = Duration::from_secs(1);
 const S2S_CLIENT_REPLICATION_SLOW_QUEUE_WAIT: Duration = Duration::from_millis(250);
 const S2S_GATEWAY_MEMORY_FRACTION_DIVISOR: u64 = 20;
@@ -65,6 +66,21 @@ fn strict_proposal_gateway_response_timeout(cfg: &s2s_replications::ReplicationC
         .checked_mul(STRICT_PROPOSAL_GATEWAY_SLACK_TICKS)
         .unwrap_or_else(|| cfg.max_clock_tick());
     S2S_GATEWAY_RESPONSE_TIMEOUT.max(cfg.propose_ttl().saturating_add(slack))
+}
+
+fn channel_op_log_fields(op: &ChannelOp) -> (&'static str, Option<u32>) {
+    match op {
+        ChannelOp::CreateChannel { channel } => ("CreateChannel", Some(channel.id)),
+        ChannelOp::EditChannel { id, .. } => ("EditChannel", Some(*id)),
+        ChannelOp::UpdateChannel { id, .. } => ("UpdateChannel", Some(*id)),
+        ChannelOp::MarkPendingDelete { id, .. } => ("MarkPendingDelete", Some(*id)),
+        ChannelOp::DeleteChannel { id, .. } => ("DeleteChannel", Some(*id)),
+        ChannelOp::CancelPendingDelete { id, .. } => ("CancelPendingDelete", Some(*id)),
+        ChannelOp::AddLink { a, .. } => ("AddLink", Some(*a)),
+        ChannelOp::RemoveLink { a, .. } => ("RemoveLink", Some(*a)),
+        ChannelOp::SetAcls { channel_id, .. } => ("SetAcls", Some(*channel_id)),
+        ChannelOp::InstallSnapshot { .. } => ("InstallSnapshot", None),
+    }
 }
 
 pub struct S2SManager {
@@ -1144,11 +1160,15 @@ impl S2SManager {
         op: ChannelOp,
         accepted: Option<oneshot::Sender<()>>,
     ) -> ChannelOpProposeResult {
+        let started_at = Instant::now();
+        let (op_kind, channel_id) = channel_op_log_fields(&op);
         let handle = match self.channel_replication_handle(server_id) {
             Some(handle) => handle,
             None => {
                 error!(
                     server_id,
+                    op_kind,
+                    channel_id = ?channel_id,
                     "s2s channel op propose failed: replication handle unavailable"
                 );
                 return ChannelOpProposeResult::Failed;
@@ -1162,27 +1182,90 @@ impl S2SManager {
             emits_client_message: true,
             op,
         };
+        debug!(
+            server_id,
+            op_kind,
+            channel_id = ?channel_id,
+            node_id = operation.node_id,
+            "s2s channel op proposal started"
+        );
         match handle.propose_with_accepted(operation).await {
             Ok(mut proposal) => {
                 if let Some(accepted) = accepted {
                     if let Some(mut accepted_rx) = proposal.take_accepted_receiver() {
+                        let accepted_started_at = started_at;
+                        let accepted_server_id = server_id.to_owned();
                         tokio::spawn(async move {
                             if accepted_rx.await.is_ok() {
+                                let elapsed = accepted_started_at.elapsed();
+                                if elapsed >= S2S_CHANNEL_REPLICATION_SLOW_STAGE {
+                                    warn!(
+                                        server_id = %accepted_server_id,
+                                        op_kind,
+                                        channel_id = ?channel_id,
+                                        accepted_elapsed_ms = elapsed.as_millis(),
+                                        "s2s channel op proposal accepted slowly"
+                                    );
+                                } else {
+                                    debug!(
+                                        server_id = %accepted_server_id,
+                                        op_kind,
+                                        channel_id = ?channel_id,
+                                        accepted_elapsed_ms = elapsed.as_millis(),
+                                        "s2s channel op proposal accepted"
+                                    );
+                                }
                                 let _ = accepted.send(());
                             }
                         });
                     }
                 }
                 match proposal.delivered().await {
-                    Ok(_) => ChannelOpProposeResult::Proposed,
+                    Ok(version) => {
+                        let elapsed = started_at.elapsed();
+                        if elapsed >= S2S_CHANNEL_REPLICATION_SLOW_STAGE {
+                            warn!(
+                                server_id,
+                                op_kind,
+                                channel_id = ?channel_id,
+                                version,
+                                delivered_elapsed_ms = elapsed.as_millis(),
+                                "s2s channel op proposal delivered slowly"
+                            );
+                        } else {
+                            debug!(
+                                server_id,
+                                op_kind,
+                                channel_id = ?channel_id,
+                                version,
+                                delivered_elapsed_ms = elapsed.as_millis(),
+                                "s2s channel op proposal delivered"
+                            );
+                        }
+                        ChannelOpProposeResult::Proposed
+                    }
                     Err(e) => {
-                        error!(error = %e, "s2s channel op propose failed");
+                        error!(
+                            server_id,
+                            op_kind,
+                            channel_id = ?channel_id,
+                            elapsed_ms = started_at.elapsed().as_millis(),
+                            error = %e,
+                            "s2s channel op propose failed"
+                        );
                         ChannelOpProposeResult::Failed
                     }
                 }
             }
             Err(e) => {
-                error!(error = %e, "s2s channel op propose failed");
+                error!(
+                    server_id,
+                    op_kind,
+                    channel_id = ?channel_id,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %e,
+                    "s2s channel op propose failed"
+                );
                 ChannelOpProposeResult::Failed
             }
         }

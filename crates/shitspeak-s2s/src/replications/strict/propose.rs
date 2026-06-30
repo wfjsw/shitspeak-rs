@@ -17,7 +17,7 @@ use tracing::trace;
 use super::super::error::ReplicationError;
 use super::super::proto::{StrictBody, StrictPropose, StrictProposeAck};
 use super::StrictReplicable;
-use super::runtime::{Proposal, StrictRuntime};
+use super::runtime::{Proposal, STRICT_REPLICATION_SLOW_STAGE, StrictRuntime};
 
 impl<R: StrictReplicable> StrictRuntime<R> {
     /// Begin a local proposal. Stores a waker in the proposal that the
@@ -46,9 +46,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&op)?);
         let op_id = self.next_op_id();
-        let (target_set, _fq) = self.snapshot_target_set();
+        let op_bytes = op_msgpack.len();
+        let (target_set, fq) = self.snapshot_target_set();
+        let target_count = target_set.len();
 
         // Register the proposal and advance our local clock.
+        let started_at = Instant::now();
         let (ts_propose, src_clock) = {
             let mut s = self.state.lock();
             let ts_propose = s.tick_clock();
@@ -63,12 +66,23 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     accepted_waker,
                     waker: Some(waker),
                     committed: false,
-                    started_at: Instant::now(),
+                    started_at,
                     _permit: permit,
                 },
             );
             (ts_propose, s.clock)
         };
+        tracing::debug!(
+            topic = %self.topic,
+            op_id_hi = op_id.0,
+            op_id_lo = op_id.1,
+            node = self.self_id,
+            ts_propose,
+            target_count,
+            fast_quorum = fq,
+            op_bytes,
+            "strict proposal started"
+        );
 
         // Send `StrictPropose` to every peer in the target set. We don't
         // include ourselves in the multicast — instead, we feed a
@@ -92,6 +106,18 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             if let Err(e) = self.net.send_multicast(&dsts, &self.topic, body).await {
                 trace!(error=%e, "send propose multicast failed");
             }
+        }
+        let multicast_elapsed = started_at.elapsed();
+        if multicast_elapsed >= STRICT_REPLICATION_SLOW_STAGE {
+            tracing::warn!(
+                topic = %self.topic,
+                op_id_hi = op_id.0,
+                op_id_lo = op_id.1,
+                elapsed_ms = multicast_elapsed.as_millis(),
+                target_count,
+                peer_count = dsts.len(),
+                "strict proposal multicast was slow"
+            );
         }
 
         // Self-ack via the regular path.

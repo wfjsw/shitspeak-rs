@@ -1266,19 +1266,27 @@ pub struct MetricsSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboundQueueStatusSnapshot {
     peer: NodeIdentifier,
-    transport: TransportKind,
+    kind: OutboundQueueKind,
     status: QueueStatusSnapshot,
 }
 
 impl OutboundQueueStatusSnapshot {
-    pub(crate) fn new(
+    pub(crate) fn new_routed(peer: NodeIdentifier, status: QueueStatusSnapshot) -> Self {
+        Self {
+            peer,
+            kind: OutboundQueueKind::Routed,
+            status,
+        }
+    }
+
+    pub(crate) fn new_transport(
         peer: NodeIdentifier,
         transport: TransportKind,
         status: QueueStatusSnapshot,
     ) -> Self {
         Self {
             peer,
-            transport,
+            kind: OutboundQueueKind::Transport(transport),
             status,
         }
     }
@@ -1287,13 +1295,29 @@ impl OutboundQueueStatusSnapshot {
         self.peer
     }
 
-    pub fn transport(&self) -> TransportKind {
-        self.transport
+    pub fn transport(&self) -> Option<TransportKind> {
+        match self.kind {
+            OutboundQueueKind::Routed => None,
+            OutboundQueueKind::Transport(transport) => Some(transport),
+        }
+    }
+
+    pub(crate) fn queue_key(&self) -> (u8, Option<TransportKind>) {
+        match self.kind {
+            OutboundQueueKind::Routed => (0, None),
+            OutboundQueueKind::Transport(transport) => (1, Some(transport)),
+        }
     }
 
     pub fn status(&self) -> QueueStatusSnapshot {
         self.status
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundQueueKind {
+    Routed,
+    Transport(TransportKind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

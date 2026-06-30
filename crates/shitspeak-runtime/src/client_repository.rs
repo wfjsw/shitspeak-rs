@@ -835,8 +835,25 @@ impl ClientRepository {
         server_id: &str,
         id: ClientSessionIdentifier,
     ) -> Option<Arc<Box<Client>>> {
-        self.remove_client_in_server_with_metadata(server_id, id, None, None, false)
+        self.remove_client_in_server_inner(server_id, id, None, None, false, None)
             .await
+    }
+
+    pub async fn remove_client_instance_in_server(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+        client_instance_id: ClientInstanceId,
+    ) -> Option<Arc<Box<Client>>> {
+        self.remove_client_in_server_inner(
+            server_id,
+            id,
+            None,
+            None,
+            false,
+            Some(client_instance_id),
+        )
+        .await
     }
 
     pub(crate) async fn remove_client_in_server_with_metadata(
@@ -847,11 +864,39 @@ impl ClientRepository {
         reason: Option<String>,
         ban: bool,
     ) -> Option<Arc<Box<Client>>> {
+        self.remove_client_in_server_inner(server_id, id, actor, reason, ban, None)
+            .await
+    }
+
+    async fn remove_client_in_server_inner(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+        actor: Option<ClientSessionIdentifier>,
+        reason: Option<String>,
+        ban: bool,
+        expected_client_instance_id: Option<ClientInstanceId>,
+    ) -> Option<Arc<Box<Client>>> {
         let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
         let local_client = {
             let mut register = self.register.write().await;
             let mut client_by_udp_address_guard = self.clients_by_udp_address.write();
             let mut client_by_host_guard = self.clients_by_host.write();
+
+            if let Some(expected) = expected_client_instance_id {
+                if let Some(client) = register.local_clients.get(&scoped_id) {
+                    if client.client_instance_id() != expected {
+                        tracing::debug!(
+                            server_id,
+                            session = u32::from(id),
+                            expected_client_instance_id = expected,
+                            current_client_instance_id = client.client_instance_id(),
+                            "skipping stale client removal for reused session"
+                        );
+                        return None;
+                    }
+                }
+            }
 
             if let Some(client) = register.local_clients.remove(&scoped_id) {
                 register.channel_index_remove(&scoped_id);
@@ -889,6 +934,20 @@ impl ClientRepository {
             let remote_register = self.get_remote_register(id.node_id).await?;
             let (removed, should_remove_register) = {
                 let mut register = remote_register.write().await;
+                if let Some(expected) = expected_client_instance_id {
+                    if let Some(client) = register.clients.get(&scoped_id) {
+                        if client.client_instance_id() != expected {
+                            tracing::debug!(
+                                server_id,
+                                session = u32::from(id),
+                                expected_client_instance_id = expected,
+                                current_client_instance_id = client.client_instance_id(),
+                                "skipping stale remote client removal for reused session"
+                            );
+                            return None;
+                        }
+                    }
+                }
                 let removed = register.clients.remove(&scoped_id);
                 register.channel_index_remove(&scoped_id);
                 register.listener_index_remove_all(&scoped_id);
@@ -3779,6 +3838,59 @@ mod tests {
             stale_update.to_message(&repo).await.is_none(),
             "stale UpdateGlobalState with a reused session must not convert to UserState"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_instance_removal_does_not_remove_reused_session() {
+        let repo = ClientRepository::new(1, 128);
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30007);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+
+        let old = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, old_tx)
+            .await;
+        let session = old.get_session_id();
+        let old_instance = old.client_instance_id();
+        repo.publish_client_in_server("alpha", session).await;
+        assert!(
+            repo.remove_client_instance_in_server("alpha", session, old_instance)
+                .await
+                .is_some()
+        );
+
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
+        let new_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30008);
+        let new_client = repo
+            .allocate_web_client_in_server("alpha", new_peer.ip(), new_peer, local, new_tx)
+            .await;
+        assert_eq!(new_client.get_session_id(), session);
+        assert_ne!(new_client.client_instance_id(), old_instance);
+
+        assert!(
+            repo.remove_client_instance_in_server("alpha", session, old_instance)
+                .await
+                .is_none()
+        );
+        let retained = repo
+            .get_client_in_server("alpha", session)
+            .await
+            .expect("new client should survive stale close cleanup");
+        assert_eq!(
+            retained.client_instance_id(),
+            new_client.client_instance_id()
+        );
+
+        assert!(
+            repo.remove_client_instance_in_server(
+                "alpha",
+                session,
+                new_client.client_instance_id()
+            )
+            .await
+            .is_some()
+        );
+        assert!(repo.get_client_in_server("alpha", session).await.is_none());
     }
 }
 

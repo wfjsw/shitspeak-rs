@@ -13,14 +13,15 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rand::RngExt;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::types::NodeIdentifier;
 
 use super::SendOptions;
-use super::adaptive_queue::AdaptiveQueueSender;
+use super::adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 use super::metrics::{MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueWatermark};
-use super::service_level::{MessageClass, PeerAddress, TransportKind};
+use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
 
 const MAX_OBSERVED_REMOTE_IPS: usize = 8;
 const BACKOFF_JITTER_DIVISOR: u64 = 5;
@@ -56,6 +57,76 @@ impl OutboundFrame {
 
     pub fn options(&self) -> SendOptions {
         self.options
+    }
+}
+
+/// A durable outbound message queued before selecting a transport.
+#[derive(Debug, Clone)]
+pub(crate) struct OutboundEnvelope {
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    fixed_transport: Option<TransportKind>,
+    class: MessageClass,
+    payload: Bytes,
+    options: SendOptions,
+}
+
+impl OutboundEnvelope {
+    pub fn routed(
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        payload: Bytes,
+        options: SendOptions,
+    ) -> Self {
+        Self {
+            level,
+            routing_metric,
+            fixed_transport: None,
+            class,
+            payload,
+            options,
+        }
+    }
+
+    pub fn fixed_transport(
+        transport: TransportKind,
+        class: MessageClass,
+        payload: Bytes,
+        options: SendOptions,
+    ) -> Self {
+        Self {
+            level: transport.service_level(),
+            routing_metric: RoutingMetric::default_for_level(transport.service_level()),
+            fixed_transport: Some(transport),
+            class,
+            payload,
+            options,
+        }
+    }
+
+    pub fn level(&self) -> ServiceLevel {
+        self.level
+    }
+
+    pub fn routing_metric(&self) -> RoutingMetric {
+        self.routing_metric
+    }
+
+    pub fn target_transport(&self) -> Option<TransportKind> {
+        self.fixed_transport
+    }
+
+    pub fn class(&self) -> MessageClass {
+        self.class
+    }
+
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+
+    pub fn into_frame(self) -> OutboundFrame {
+        OutboundFrame::with_options(self.class, self.payload, self.options)
     }
 }
 
@@ -333,6 +404,8 @@ pub(crate) struct PeerState {
     addresses: Mutex<Vec<PeerAddress>>,
     advertised_addresses: Mutex<HashSet<PeerAddress>>,
     streams: Mutex<HashMap<StreamKey, ActiveStream>>,
+    outbound_sender: AdaptiveQueueSender<OutboundEnvelope>,
+    outbound_receiver: Mutex<Option<AdaptiveQueueReceiver<OutboundEnvelope>>>,
     udp_seen_at: Mutex<Option<Instant>>,
     udp_addr: Mutex<Option<std::net::SocketAddr>>,
     /// Authenticated inbound remote IPs by transport. Source ports are often
@@ -342,7 +415,9 @@ pub(crate) struct PeerState {
     metrics: Arc<PeerMetrics>,
     backoff_initial: Duration,
     address_backoffs: Mutex<HashMap<PeerAddress, BackoffState>>,
-    outbound_queue_watermarks: Mutex<HashMap<TransportKind, QueueWatermark>>,
+    outbound_queue_watermark: Mutex<QueueWatermark>,
+    outbound_stream_queue_watermarks: Mutex<HashMap<TransportKind, QueueWatermark>>,
+    outbound_dispatch_notify: Notify,
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
     connecting: AtomicBool,
@@ -354,12 +429,18 @@ impl PeerState {
         backoff_initial: Duration,
         bandwidth_window: Duration,
         metrics_tuning: MetricsTuning,
+        outbound_queue_bytes: usize,
     ) -> Arc<Self> {
+        let outbound_budget = AdaptiveQueueBudget::new(outbound_queue_bytes);
+        let (outbound_sender, outbound_receiver) =
+            AdaptiveQueueSender::new(outbound_budget.split(outbound_budget.max_bytes()));
         Arc::new(Self {
             node_id,
             addresses: Mutex::new(Vec::new()),
             advertised_addresses: Mutex::new(HashSet::new()),
             streams: Mutex::new(HashMap::new()),
+            outbound_sender,
+            outbound_receiver: Mutex::new(Some(outbound_receiver)),
             udp_seen_at: Mutex::new(None),
             udp_addr: Mutex::new(None),
             observed_remote_ips: Mutex::new(HashMap::new()),
@@ -367,7 +448,9 @@ impl PeerState {
             metrics: Arc::new(PeerMetrics::new(bandwidth_window, metrics_tuning)),
             backoff_initial,
             address_backoffs: Mutex::new(HashMap::new()),
-            outbound_queue_watermarks: Mutex::new(HashMap::new()),
+            outbound_queue_watermark: Mutex::new(QueueWatermark::new(Instant::now())),
+            outbound_stream_queue_watermarks: Mutex::new(HashMap::new()),
+            outbound_dispatch_notify: Notify::new(),
             connecting: AtomicBool::new(false),
         })
     }
@@ -378,6 +461,30 @@ impl PeerState {
 
     pub fn metrics(&self) -> &Arc<PeerMetrics> {
         &self.metrics
+    }
+
+    pub fn take_outbound_receiver(&self) -> Option<AdaptiveQueueReceiver<OutboundEnvelope>> {
+        self.outbound_receiver.lock().take()
+    }
+
+    pub fn outbound_sender(&self) -> AdaptiveQueueSender<OutboundEnvelope> {
+        self.outbound_sender.clone()
+    }
+
+    pub fn outbound_queue_depth_bytes(&self) -> usize {
+        self.outbound_sender.depth_bytes()
+    }
+
+    pub fn outbound_queue_capacity_bytes(&self) -> usize {
+        self.outbound_sender.capacity_bytes()
+    }
+
+    pub fn notify_outbound_dispatch(&self) {
+        self.outbound_dispatch_notify.notify_waiters();
+    }
+
+    pub async fn wait_for_outbound_dispatch_signal(&self) {
+        self.outbound_dispatch_notify.notified().await;
     }
 
     /// Atomically claim the connect slot. Returns `true` if this caller now
@@ -670,6 +777,7 @@ impl PeerState {
         if let Some(prev) = g.insert(key, stream) {
             prev.closed.cancel();
         }
+        self.notify_outbound_dispatch();
         self.note_seen_now();
     }
 
@@ -687,6 +795,7 @@ impl PeerState {
         if let Some(prev) = g.insert(key, new_stream) {
             prev.closed.cancel();
         }
+        self.notify_outbound_dispatch();
         self.note_seen_now();
         Ok(())
     }
@@ -701,6 +810,7 @@ impl PeerState {
                 true
             }
         });
+        self.notify_outbound_dispatch();
     }
 
     pub fn has_live_outgoing_to(&self, addr: PeerAddress) -> bool {
@@ -743,6 +853,33 @@ impl PeerState {
 
     pub fn record_outbound_queue_sample(
         &self,
+        class: MessageClass,
+        depth: usize,
+        capacity: usize,
+        is_full: bool,
+    ) {
+        let report =
+            self.outbound_queue_watermark
+                .lock()
+                .record(Instant::now(), depth, capacity, is_full);
+        if let Some(report) = report {
+            let status = report.status();
+            tracing::debug!(
+                peer = %self.node_id,
+                ?class,
+                queue_capacity = status.capacity(),
+                queue_depth = status.depth(),
+                queue_high_watermark = status.high_depth(),
+                queue_samples = status.samples(),
+                queue_full_samples = status.full_samples(),
+                interval_secs = report.interval().as_secs(),
+                "s2s outbound peer queue watermark"
+            );
+        }
+    }
+
+    pub fn record_outbound_stream_queue_sample(
+        &self,
         transport: TransportKind,
         class: MessageClass,
         depth: usize,
@@ -751,7 +888,7 @@ impl PeerState {
     ) {
         let report = {
             let now = Instant::now();
-            let mut watermarks = self.outbound_queue_watermarks.lock();
+            let mut watermarks = self.outbound_stream_queue_watermarks.lock();
             watermarks
                 .entry(transport)
                 .or_insert_with(|| QueueWatermark::new(now))
@@ -769,12 +906,26 @@ impl PeerState {
                 queue_samples = status.samples(),
                 queue_full_samples = status.full_samples(),
                 interval_secs = report.interval().as_secs(),
-                "s2s outbound queue watermark"
+                "s2s outbound stream queue watermark"
             );
         }
     }
 
     pub fn outbound_queue_status(&self) -> Vec<OutboundQueueStatusSnapshot> {
+        let mut out = Vec::new();
+        let routed_status = self
+            .outbound_queue_watermark
+            .lock()
+            .snapshot()
+            .with_current(
+                self.outbound_queue_depth_bytes(),
+                self.outbound_queue_capacity_bytes(),
+            );
+        out.push(OutboundQueueStatusSnapshot::new_routed(
+            self.node_id,
+            routed_status,
+        ));
+
         let current_by_transport = {
             let mut streams = self.streams.lock();
             prune_dead_streams(&mut streams);
@@ -793,24 +944,21 @@ impl PeerState {
             current
         };
 
-        let watermarks = self.outbound_queue_watermarks.lock();
+        let watermarks = self.outbound_stream_queue_watermarks.lock();
         let mut transports: HashSet<_> = watermarks.keys().copied().collect();
         transports.extend(current_by_transport.keys().copied());
 
-        let mut out = transports
-            .into_iter()
-            .map(|transport| {
-                let mut status = watermarks
-                    .get(&transport)
-                    .map(QueueWatermark::snapshot)
-                    .unwrap_or_default();
-                if let Some((depth, capacity)) = current_by_transport.get(&transport).copied() {
-                    status = status.with_current(depth, capacity);
-                }
-                OutboundQueueStatusSnapshot::new(self.node_id, transport, status)
-            })
-            .collect::<Vec<_>>();
-        out.sort_by_key(|snapshot| snapshot.transport());
+        out.extend(transports.into_iter().map(|transport| {
+            let mut status = watermarks
+                .get(&transport)
+                .map(QueueWatermark::snapshot)
+                .unwrap_or_default();
+            if let Some((depth, capacity)) = current_by_transport.get(&transport).copied() {
+                status = status.with_current(depth, capacity);
+            }
+            OutboundQueueStatusSnapshot::new_transport(self.node_id, transport, status)
+        }));
+        out.sort_by_key(|snapshot| snapshot.queue_key());
         out
     }
 
@@ -844,6 +992,7 @@ impl PeerState {
         let mut g = self.streams.lock();
         if let Some(prev) = g.remove(&key) {
             prev.closed.cancel();
+            self.notify_outbound_dispatch();
             true
         } else {
             false
@@ -1136,6 +1285,7 @@ mod tests {
             Duration::from_millis(250),
             Duration::from_secs(5),
             MetricsTuning::default(),
+            1024 * 1024,
         )
     }
 

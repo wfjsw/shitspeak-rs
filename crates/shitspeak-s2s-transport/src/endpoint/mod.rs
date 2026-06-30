@@ -25,7 +25,7 @@ use futures_util::future::join_all;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{sleep, timeout};
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::types::NodeIdentifier;
 
@@ -188,6 +188,7 @@ pub(crate) trait Endpoint: Send + Sync + 'static {
 
 /// Holds one shared endpoint per `TransportKind`. `None` means the local
 /// node didn't configure that transport.
+#[derive(Clone)]
 pub(crate) struct EndpointRegistry {
     tcp: Option<Arc<tcp::TcpEndpoint>>,
     kcp: Option<Arc<kcp::KcpEndpoint>>,
@@ -875,17 +876,31 @@ async fn try_dial_peer(
                             "dial failed for unconfirmed peer address; will retry with stale-address backoff"
                         );
                     } else {
-                        debug!(
-                            peer=%peer.node_id(),
-                            ?addr,
-                            transport=?transport,
-                            error=%e,
-                            retry_in_ms=backoff.retry_delay().as_millis(),
-                            retry_cap_ms=retry_policy.retry_cap().as_millis(),
-                            next_backoff_base_ms=backoff.next_delay().as_millis(),
-                            consecutive_failures=backoff.consecutive_failures(),
-                            "dial failed; will retry with exponential backoff"
-                        );
+                        if backoff.consecutive_failures() < 5 {
+                            debug!(
+                                peer=%peer.node_id(),
+                                ?addr,
+                                transport=?transport,
+                                error=%e,
+                                retry_in_ms=backoff.retry_delay().as_millis(),
+                                retry_cap_ms=retry_policy.retry_cap().as_millis(),
+                                next_backoff_base_ms=backoff.next_delay().as_millis(),
+                                consecutive_failures=backoff.consecutive_failures(),
+                                "dial failed; will retry with exponential backoff"
+                            );
+                        } else {
+                            trace!(
+                                peer=%peer.node_id(),
+                                ?addr,
+                                transport=?transport,
+                                error=%e,
+                                retry_in_ms=backoff.retry_delay().as_millis(),
+                                retry_cap_ms=retry_policy.retry_cap().as_millis(),
+                                next_backoff_base_ms=backoff.next_delay().as_millis(),
+                                consecutive_failures=backoff.consecutive_failures(),
+                                "dial failed; will retry with exponential backoff"
+                            );
+                        }
                     }
                 }
                 last_err = Some(e);
@@ -1099,6 +1114,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_secs(1),
             MetricsTuning::default(),
+            1024 * 1024,
         );
         peer.add_address(tcp_peer_address(node_id));
         peer
@@ -1254,6 +1270,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_secs(1),
             MetricsTuning::default(),
+            1024 * 1024,
         );
         peer.add_address(PeerAddress::new(
             "[fd00::12]:64739".parse().unwrap(),
