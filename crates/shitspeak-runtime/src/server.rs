@@ -2232,12 +2232,6 @@ enum PermissionInfoRefreshScope {
     },
 }
 
-impl PermissionInfoRefreshScope {
-    fn forwards_flush_message(self) -> bool {
-        matches!(self, PermissionInfoRefreshScope::All)
-    }
-}
-
 fn permission_info_refresh_scope_for_delta(
     delta: &ClientGlobalStateDelta,
 ) -> Option<PermissionInfoRefreshScope> {
@@ -2292,12 +2286,24 @@ async fn permission_info_refresh_messages(
 ) -> Vec<Message> {
     match scope {
         PermissionInfoRefreshScope::All => {
-            crate::channel_handler::build_channel_permission_info_refresh_messages(
-                server,
-                client,
-                server.get_channels(),
-            )
-            .await
+            let mut messages =
+                crate::channel_handler::build_channel_permission_query_refresh_messages(
+                    server,
+                    client,
+                    server.get_channels(),
+                )
+                .await;
+            if server.get_send_permission_info() {
+                messages.extend(
+                    crate::channel_handler::build_channel_permission_info_refresh_messages(
+                        server,
+                        client,
+                        server.get_channels(),
+                    )
+                    .await,
+                );
+            }
+            messages
         }
         PermissionInfoRefreshScope::HomeChannelDependent {
             old_channel_id,
@@ -2355,7 +2361,7 @@ async fn write_projected_client_log_message_with_acl_refresh_scope(
     .await;
 
     let should_refresh_permissions = is_acl_cache_flush_message(message);
-    if should_refresh_permissions && !refresh_scope.forwards_flush_message() {
+    if should_refresh_permissions {
         out.clear();
     }
 
@@ -2403,7 +2409,7 @@ async fn projected_client_log_messages_with_acl_refresh_scope(
     .await;
 
     let should_refresh_permissions = is_acl_cache_flush_message(message);
-    if should_refresh_permissions && !refresh_scope.forwards_flush_message() {
+    if should_refresh_permissions {
         out.clear();
     }
 
@@ -4653,7 +4659,7 @@ impl Server {
                         .await;
                 }
                 if invalidate_acl_cache {
-                    self.channels.invalidate_acl_cache_for_channel(0).await;
+                    self.channels.invalidate_all_acl_cache().await;
                 }
                 self.auth_finalization_queue
                     .apply_prepared_authenticator_reload(prepared_authenticator);

@@ -1339,6 +1339,76 @@ async fn acl_cache_parent_acl_change_updates_descendant_permissions() {
 }
 
 #[tokio::test]
+async fn acl_cache_parent_acl_change_does_not_invalidate_unrelated_channel_cache() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(
+            54,
+            "Affected Parent".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(
+            55,
+            "Affected Child".to_owned(),
+            0,
+            0,
+            Some(54),
+        ))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(56, "Unrelated".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let bob_client = connected_client(&server, &bob).await;
+    let cache_generation_before = server
+        .server
+        .get_channels()
+        .channel_acl_generation_for_channel(&bob_client.server_id(), 56);
+    let unrelated = cached_permissions(&server, &bob, 56).await;
+    assert!(unrelated.contains(ACLPermissions::Enter));
+
+    chans
+        .set_acls(
+            54,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Enter.into(),
+                true,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let cache_generation_after = server
+        .server
+        .get_channels()
+        .channel_acl_generation_for_channel(&bob_client.server_id(), 56);
+    assert_eq!(
+        cache_generation_before, cache_generation_after,
+        "Changing a parent ACL should not bump cache generation for unrelated channels"
+    );
+    let unrelated_after = cached_permissions(&server, &bob, 56).await;
+    assert_eq!(unrelated, unrelated_after);
+}
+
+#[tokio::test]
 async fn explicit_enter_deny_can_override_write_permission() {
     let server = spawn_test_server(TestServerOpts {
         explicit_enter_deny_overrides_write: true,
@@ -1904,7 +1974,7 @@ async fn acl_cache_does_not_cross_reused_local_session_ids() {
 }
 
 #[tokio::test]
-async fn acl_cache_global_purge_sends_permission_query_flush_to_all_clients() {
+async fn acl_cache_acl_update_sends_channel_scoped_permission_refresh_to_all_clients() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
@@ -1942,33 +2012,58 @@ async fn acl_cache_global_purge_sends_permission_query_flush_to_all_clients() {
         .await
         .unwrap();
 
+    let alice_refresh = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionQuery(pq)
+                    if pq.channel_id == Some(67)
+                        && pq.permissions.is_some()
+                        && pq.flush == Some(false))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    let bob_refresh = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionQuery(pq)
+                    if pq.channel_id == Some(67)
+                        && pq.permissions.is_some()
+                        && pq.flush == Some(false))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+
+    let Some(Message::PermissionQuery(alice_refresh)) = alice_refresh else {
+        panic!("Alice should receive channel-scoped ACL cache refresh");
+    };
+    let Some(Message::PermissionQuery(bob_refresh)) = bob_refresh else {
+        panic!("Bob should receive channel-scoped ACL cache refresh");
+    };
+    assert_eq!(alice_refresh.flush, Some(false));
+    assert_eq!(bob_refresh.flush, Some(false));
+
     let alice_flush = alice
         .recv_until(
             |m| matches!(m, Message::PermissionQuery(pq) if pq.flush == Some(true)),
-            Duration::from_secs(2),
+            Duration::from_millis(250),
         )
         .await;
     let bob_flush = bob
         .recv_until(
             |m| matches!(m, Message::PermissionQuery(pq) if pq.flush == Some(true)),
-            Duration::from_secs(2),
+            Duration::from_millis(250),
         )
         .await;
-
-    let Some(Message::PermissionQuery(alice_flush)) = alice_flush else {
-        panic!("Alice should receive global ACL cache flush");
-    };
-    let Some(Message::PermissionQuery(bob_flush)) = bob_flush else {
-        panic!("Bob should receive global ACL cache flush");
-    };
-    assert_eq!(alice_flush.channel_id, None);
-    assert_eq!(alice_flush.permissions, None);
-    assert_eq!(bob_flush.channel_id, None);
-    assert_eq!(bob_flush.permissions, None);
+    assert!(
+        alice_flush.is_none() && bob_flush.is_none(),
+        "ACL updates should not send global permission cache flushes"
+    );
 }
 
 #[tokio::test]
-async fn acl_cache_per_user_purge_sends_permission_query_flush_only_to_that_user() {
+async fn acl_cache_per_user_purge_sends_scoped_permission_refresh_only_to_that_user() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
@@ -1988,26 +2083,36 @@ async fn acl_cache_per_user_purge_sends_permission_query_flush_only_to_that_user
 
     send_token_update(&bob, vec!["door"]).await;
 
-    let bob_flush = bob
+    let bob_refresh = bob
         .recv_until(
-            |m| matches!(m, Message::PermissionQuery(pq) if pq.flush == Some(true)),
+            |m| {
+                matches!(m, Message::PermissionQuery(pq)
+                    if pq.channel_id.is_some()
+                        && pq.permissions.is_some()
+                        && pq.flush == Some(false))
+            },
             Duration::from_secs(2),
         )
         .await;
     assert!(
-        bob_flush.is_some(),
-        "Bob should receive his per-user ACL cache flush"
+        bob_refresh.is_some(),
+        "Bob should receive his per-user scoped ACL cache refresh"
     );
 
-    let alice_flush = alice
+    let alice_refresh = alice
         .recv_until(
-            |m| matches!(m, Message::PermissionQuery(pq) if pq.flush == Some(true)),
+            |m| {
+                matches!(m, Message::PermissionQuery(pq)
+                    if pq.channel_id.is_some()
+                        && pq.permissions.is_some()
+                        && pq.flush == Some(false))
+            },
             Duration::from_millis(250),
         )
         .await;
     assert!(
-        alice_flush.is_none(),
-        "Alice should not receive Bob's per-user ACL cache flush"
+        alice_refresh.is_none(),
+        "Alice should not receive Bob's per-user scoped ACL cache refresh"
     );
 }
 
@@ -2189,6 +2294,96 @@ async fn channel_state_permission_info_refreshes_after_acl_update() {
     assert!(
         refreshed.is_some(),
         "Bob should receive refreshed ChannelState permission info after ACL update"
+    );
+}
+
+#[tokio::test]
+async fn channel_create_permission_info_does_not_refresh_existing_channels() {
+    let server = spawn_test_server(TestServerOpts {
+        send_permission_info: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(72, "Existing".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .set_acls(
+            72,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Enter.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice.drain_now().await;
+    bob.drain_now().await;
+
+    alice.create_channel(0, "New Channel", false).await;
+
+    let mut created_new_with_permission_info = false;
+    let mut refreshed_existing = false;
+    let mut global_flush = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && !created_new_with_permission_info {
+        let Some(message) = bob.recv(Duration::from_millis(100)).await else {
+            continue;
+        };
+        global_flush |= matches!(&message, Message::PermissionQuery(pq) if pq.flush == Some(true));
+        created_new_with_permission_info |= matches!(&message, Message::ChannelState(cs)
+            if cs.name.as_deref() == Some("New Channel")
+                && cs.is_enter_restricted.is_some()
+                && cs.can_enter.is_some());
+        refreshed_existing |= matches!(&message, Message::ChannelState(cs)
+            if cs.channel_id == Some(72)
+                && cs.name.is_none()
+                && cs.is_enter_restricted.is_some()
+                && cs.can_enter.is_some());
+    }
+    assert!(
+        created_new_with_permission_info,
+        "Bob should receive permission info on the new channel's ChannelState"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while tokio::time::Instant::now() < deadline {
+        let Some(message) = bob.recv(Duration::from_millis(25)).await else {
+            continue;
+        };
+        global_flush |= matches!(&message, Message::PermissionQuery(pq) if pq.flush == Some(true));
+        refreshed_existing |= matches!(&message, Message::ChannelState(cs)
+            if cs.channel_id == Some(72)
+                && cs.name.is_none()
+                && cs.is_enter_restricted.is_some()
+                && cs.can_enter.is_some());
+    }
+    assert!(
+        !global_flush,
+        "Creating a channel should not flush every client's permission cache"
+    );
+    assert!(
+        !refreshed_existing,
+        "Creating a channel should not refresh permission info for unchanged existing channels"
     );
 }
 

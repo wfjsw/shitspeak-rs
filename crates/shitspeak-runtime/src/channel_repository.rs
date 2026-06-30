@@ -452,6 +452,8 @@ pub struct ChannelRepository {
     log_max_entries: usize,
     /// Bumped whenever channel state can change effective ACL results.
     channel_acl_generation: AtomicU64,
+    /// Per-channel ACL generations for targeted channel cache eviction.
+    channel_acl_generations: ParkingRwLock<HashMap<(String, u32), u64>>,
     /// Cached effective permissions:
     /// (server_id, session_id_u64, client_instance_id, channel_id) -> entry.
     /// Lock-free concurrent cache using scc::HashCache.
@@ -503,6 +505,7 @@ impl ChannelRepository {
             log: ParkingRwLock::new(std::collections::VecDeque::new()),
             log_max_entries: tuning.log_max_entries,
             channel_acl_generation: AtomicU64::new(0),
+            channel_acl_generations: ParkingRwLock::new(HashMap::new()),
             acl_cache: HashCache::new(),
             storage_dir: None,
             wal_file: None,
@@ -644,6 +647,7 @@ impl ChannelRepository {
             log: ParkingRwLock::new(log_entries),
             log_max_entries: tuning.log_max_entries,
             channel_acl_generation: AtomicU64::new(0),
+            channel_acl_generations: ParkingRwLock::new(HashMap::new()),
             acl_cache: HashCache::new(),
             storage_dir: Some(storage_dir.to_owned()),
             wal_file: Some(AsyncMutex::new(wal_file)),
@@ -690,8 +694,41 @@ impl ChannelRepository {
         self.channel_acl_generation.load(Ordering::Acquire)
     }
 
+    pub(crate) fn channel_acl_generation_for_channel(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> u64 {
+        self.channel_acl_generation
+            .load(Ordering::Acquire)
+            .wrapping_add(
+                self.channel_acl_generations
+                    .read()
+                    .get(&(server_id.to_owned(), channel_id))
+                    .copied()
+                    .unwrap_or(0),
+            )
+    }
+
     fn bump_channel_acl_generation(&self) {
         self.channel_acl_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn bump_channel_acl_generation_for_channels(
+        &self,
+        server_id: &str,
+        channel_ids: &HashSet<u32>,
+    ) {
+        if channel_ids.is_empty() {
+            return;
+        }
+        let mut generations = self.channel_acl_generations.write();
+        for channel_id in channel_ids {
+            generations
+                .entry((server_id.to_owned(), *channel_id))
+                .and_modify(|generation| *generation = generation.wrapping_add(1))
+                .or_insert(1);
+        }
     }
 
     pub fn local_node_id(&self) -> u16 {
@@ -1154,11 +1191,11 @@ impl ChannelRepository {
         channel_id: u32,
     ) -> (u64, Option<Channel>, Vec<Channel>) {
         loop {
-            let generation = self.channel_acl_generation();
+            let generation = self.channel_acl_generation_for_channel(server_id, channel_id);
             let (channel, ancestors) = self
                 .get_channel_with_ancestors_in_server(server_id, channel_id)
                 .await;
-            if self.channel_acl_generation() == generation {
+            if self.channel_acl_generation_for_channel(server_id, channel_id) == generation {
                 return (generation, channel, ancestors);
             }
         }
@@ -1235,7 +1272,6 @@ impl ChannelRepository {
             op
         };
 
-        self.bump_channel_acl_generation();
         self.commit(op).await?;
         Ok(channel)
     }
@@ -1304,7 +1340,8 @@ impl ChannelRepository {
         };
 
         if parent_changed {
-            self.bump_channel_acl_generation();
+            self.invalidate_acl_cache_for_op_in_server(server_id, &op.op)
+                .await;
         }
         self.commit(op).await?;
         Ok(updated)
@@ -1407,7 +1444,8 @@ impl ChannelRepository {
             },
         );
         if parent_changed {
-            self.bump_channel_acl_generation();
+            self.invalidate_acl_cache_for_op_in_server(server_id, &op.op)
+                .await;
         }
         self.commit(op).await?;
         Ok(updated)
@@ -1521,7 +1559,7 @@ impl ChannelRepository {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
-        let deleted = {
+        let affected_acl_channels = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
@@ -1541,14 +1579,17 @@ impl ChannelRepository {
                 remove_links_to_channels(channels, &to_delete);
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, server_id, channels);
+                Some(to_delete.into_iter().collect())
+            } else {
+                None
             }
-            can_delete
         };
         let mut op = self.make_op_in_server(server_id, ChannelOp::DeleteChannel { id, nonce });
-        op.emits_client_message = deleted;
-        if deleted {
-            self.bump_channel_acl_generation();
+        op.emits_client_message = affected_acl_channels.is_some();
+        if let Some(affected_acl_channels) = affected_acl_channels {
+            self.invalidate_acl_cache_for_op_scope(server_id, affected_acl_channels);
         }
+        let deleted = op.emits_client_message;
         self.commit(op).await?;
         Ok(deleted)
     }
@@ -1697,7 +1738,8 @@ impl ChannelRepository {
                 acls,
             },
         );
-        self.bump_channel_acl_generation();
+        self.invalidate_acl_cache_for_op_in_server(server_id, &op.op)
+            .await;
         self.commit(op).await?;
         Ok(())
     }
@@ -1783,24 +1825,65 @@ impl ChannelRepository {
         explicit_enter_deny_overrides_write: bool,
         permissions: BitFlags<ACLPermissions>,
     ) {
-        let _ = self.acl_cache.put_sync(
-            (
-                server_id.to_owned(),
-                session_id,
-                client_instance_id,
-                channel_id,
-            ),
-            CachedAclPermissions {
+        let key = (
+            server_id.to_owned(),
+            session_id,
+            client_instance_id,
+            channel_id,
+        );
+        let _ = self
+            .acl_cache
+            .entry_sync(key)
+            .put_entry(CachedAclPermissions {
                 channel_acl_generation,
                 client_acl_generation,
                 explicit_enter_deny_overrides_write,
                 permissions,
-            },
-        );
+            });
     }
 
-    pub async fn invalidate_acl_cache_for_channel(&self, _channel_id: u32) {
+    pub async fn invalidate_acl_cache_for_channel(&self, channel_id: u32) {
+        self.invalidate_acl_cache_for_channel_in_server(DEFAULT_SERVER_ID, channel_id)
+            .await;
+    }
+
+    pub async fn invalidate_acl_cache_for_channel_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) {
+        let channel_ids = HashSet::from([channel_id]);
+        self.invalidate_acl_cache_for_channels(server_id, &channel_ids);
+    }
+
+    pub async fn invalidate_all_acl_cache(&self) {
+        self.invalidate_all_acl_cache_sync();
+    }
+
+    fn invalidate_all_acl_cache_sync(&self) {
         self.bump_channel_acl_generation();
+        self.acl_cache.clear_sync();
+    }
+
+    fn invalidate_acl_cache_for_channels(&self, server_id: &str, channel_ids: &HashSet<u32>) {
+        if channel_ids.is_empty() {
+            return;
+        }
+        self.bump_channel_acl_generation_for_channels(server_id, channel_ids);
+        self.acl_cache.retain_sync(|key, _| {
+            let (entry_server_id, _, _, entry_channel_id) = key;
+            entry_server_id != server_id || !channel_ids.contains(entry_channel_id)
+        });
+    }
+
+    fn invalidate_acl_cache_for_op_scope(&self, server_id: &str, channel_ids: HashSet<u32>) {
+        self.invalidate_acl_cache_for_channels(server_id, &channel_ids);
+    }
+
+    async fn invalidate_acl_cache_for_op_in_server(&self, server_id: &str, op: &ChannelOp) {
+        if let Some(channel_ids) = self.acl_affected_channel_ids_for_op(server_id, op).await {
+            self.invalidate_acl_cache_for_op_scope(server_id, channel_ids);
+        }
     }
 
     pub async fn invalidate_acl_cache_for_user(&self, _session_id: u64) {}
@@ -1979,6 +2062,16 @@ impl ChannelRepository {
             .collect()
     }
 
+    pub(crate) async fn acl_affected_channel_ids_for_op(
+        &self,
+        server_id: &str,
+        op: &ChannelOp,
+    ) -> Option<HashSet<u32>> {
+        let channels = self.channels.read();
+        let channels = channels.get(server_id)?;
+        Some(acl_affected_channel_ids_for_op_in_map(channels, op)?)
+    }
+
     /// Apply an operation that arrived from a remote node.
     ///
     /// The operation is applied to the local in-memory map but **not**
@@ -1992,38 +2085,52 @@ impl ChannelRepository {
         if op.version <= self.current_version_in_server(&op.server_id) {
             return Ok(());
         }
-        let (new_version, acl_changed) = {
+        let (new_version, affected_acl_channels) = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(op.server_id.clone()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
             let normalized_op = normalize_op_for_root(&op.op, &root_config);
-            let mut acl_changed = channel_op_affects_acl_generation(&normalized_op);
+            let mut should_invalidate_acl = channel_op_invalidates_acl_cache(&normalized_op);
+            let mut deleted_subtree = None;
             if let ChannelOp::DeleteChannel { id, nonce } = &normalized_op {
                 let can_delete = channels
                     .get(id)
                     .and_then(|ch| ch.pending_delete.as_ref())
                     .is_some_and(|pending| pending.nonce == *nonce);
-                acl_changed = can_delete;
+                should_invalidate_acl = can_delete;
+                if can_delete {
+                    deleted_subtree = Some(
+                        collect_subtree(channels, *id)
+                            .into_iter()
+                            .collect::<HashSet<_>>(),
+                    );
+                }
             }
             apply_op_to_map(channels, &normalized_op, op.node_id, &root_config);
             if channel_op_affects_link_topology(&normalized_op) {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, &op.server_id, channels);
             }
+            let affected_acl_channels = if deleted_subtree.is_some() {
+                deleted_subtree
+            } else {
+                should_invalidate_acl
+                    .then(|| acl_affected_channel_ids_for_op_in_map(channels, &normalized_op))
+                    .flatten()
+            };
             let new_version = op.version;
             self.versions
                 .write()
                 .entry(op.server_id.clone())
                 .and_modify(|version| *version = (*version).max(new_version))
                 .or_insert(new_version);
-            (new_version, acl_changed)
+            (new_version, affected_acl_channels)
         };
 
-        if acl_changed {
-            self.bump_channel_acl_generation();
+        if let Some(affected_acl_channels) = affected_acl_channels {
+            self.invalidate_acl_cache_for_op_scope(&op.server_id, affected_acl_channels);
         }
-        self.invalidate_acl_cache_for_op(&op.op).await;
 
         // Notify ClientRepository to drain pending ops whose dep is now satisfied
         let client_repo = self.client_repo.lock().clone();
@@ -2057,14 +2164,15 @@ impl ChannelRepository {
             return Ok(Arc::new(op));
         }
 
-        let mut acl_changed = channel_op_affects_acl_generation(&op.op);
+        let mut should_invalidate_acl = channel_op_invalidates_acl_cache(&op.op);
         let server_id = op.server_id.clone();
-        let evicting_pending_delete = {
+        let (evicting_pending_delete, affected_acl_channels) = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.clone()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
             op.op = normalize_op_for_root(&op.op, &root_config);
+            let mut deleted_subtree = None;
             let evicting_pending_delete = match &op.op {
                 ChannelOp::MarkPendingDelete {
                     id,
@@ -2080,7 +2188,14 @@ impl ChannelRepository {
                         .and_then(|ch| ch.pending_delete.as_ref())
                         .is_some_and(|pending| pending.nonce == *nonce);
                     op.emits_client_message = can_delete;
-                    acl_changed = can_delete;
+                    should_invalidate_acl = can_delete;
+                    if can_delete {
+                        deleted_subtree = Some(
+                            collect_subtree(channels, *id)
+                                .into_iter()
+                                .collect::<HashSet<_>>(),
+                        );
+                    }
                     None
                 }
                 _ => None,
@@ -2090,13 +2205,19 @@ impl ChannelRepository {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, &server_id, channels);
             }
-            evicting_pending_delete
+            let affected_acl_channels = if deleted_subtree.is_some() {
+                deleted_subtree
+            } else {
+                should_invalidate_acl
+                    .then(|| acl_affected_channel_ids_for_op_in_map(channels, &op.op))
+                    .flatten()
+            };
+            (evicting_pending_delete, affected_acl_channels)
         };
 
-        if acl_changed {
-            self.bump_channel_acl_generation();
+        if let Some(affected_acl_channels) = affected_acl_channels {
+            self.invalidate_acl_cache_for_op_scope(&server_id, affected_acl_channels);
         }
-        self.invalidate_acl_cache_for_op(&op.op).await;
         let committed = self.commit_assigned_operation(op, strict_metadata).await?;
 
         if let Some((id, nonce)) = evicting_pending_delete {
@@ -2426,12 +2547,6 @@ impl ChannelRepository {
         op.version = version;
         let _ = self.commit_assigned_operation(op, None).await?;
         Ok(())
-    }
-
-    async fn invalidate_acl_cache_for_op(&self, op: &ChannelOp) {
-        if channel_op_affects_acl_generation(op) {
-            self.acl_cache.clear_sync();
-        }
     }
 
     fn root_channel(&self) -> Channel {
@@ -2799,6 +2914,131 @@ pub(crate) fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
         | ChannelOp::MarkPendingDelete { .. }
         | ChannelOp::CancelPendingDelete { .. } => false,
     }
+}
+
+pub(crate) fn channel_op_invalidates_acl_cache(op: &ChannelOp) -> bool {
+    channel_op_affects_acl_generation(op) && !matches!(op, ChannelOp::CreateChannel { .. })
+}
+
+fn acl_affected_channel_ids_for_op_in_map(
+    channels: &HashMap<u32, Channel>,
+    op: &ChannelOp,
+) -> Option<HashSet<u32>> {
+    match op {
+        ChannelOp::CreateChannel { .. } => Some(HashSet::new()),
+        ChannelOp::SetAcls { channel_id, .. } => {
+            Some(collect_subtree(channels, *channel_id).into_iter().collect())
+        }
+        ChannelOp::UpdateChannel { id, patch } | ChannelOp::EditChannel { id, patch, .. }
+            if patch.parent_id.is_some() =>
+        {
+            let mut affected: HashSet<u32> = collect_subtree(channels, *id).into_iter().collect();
+            affected.extend(channels_with_home_channel_dependent_acls_in_map(channels));
+            Some(affected)
+        }
+        ChannelOp::DeleteChannel { .. } => Some(HashSet::new()),
+        ChannelOp::InstallSnapshot { channels, .. } => {
+            Some(channels.iter().map(|channel| channel.id).collect())
+        }
+        ChannelOp::UpdateChannel { .. }
+        | ChannelOp::EditChannel { .. }
+        | ChannelOp::MarkPendingDelete { .. }
+        | ChannelOp::CancelPendingDelete { .. }
+        | ChannelOp::AddLink { .. }
+        | ChannelOp::RemoveLink { .. } => Some(HashSet::new()),
+    }
+}
+
+fn channels_with_home_channel_dependent_acls_in_map(
+    channels: &HashMap<u32, Channel>,
+) -> HashSet<u32> {
+    let mut children_by_parent: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
+    for channel in channels.values() {
+        children_by_parent
+            .entry(channel.parent_id)
+            .or_default()
+            .push(channel.id);
+    }
+
+    let mut roots: Vec<u32> = channels
+        .values()
+        .filter(|channel| {
+            channel
+                .parent_id
+                .is_none_or(|parent_id| !channels.contains_key(&parent_id))
+        })
+        .map(|channel| channel.id)
+        .collect();
+    roots.sort_unstable();
+
+    let mut affected = HashSet::new();
+    for root_id in roots {
+        collect_home_channel_dependent_acl_channel_ids(
+            channels,
+            &children_by_parent,
+            root_id,
+            false,
+            &mut affected,
+        );
+    }
+    affected
+}
+
+fn collect_home_channel_dependent_acl_channel_ids(
+    channels: &HashMap<u32, Channel>,
+    children_by_parent: &HashMap<Option<u32>, Vec<u32>>,
+    channel_id: u32,
+    inherited_home_channel_dependent_acl: bool,
+    affected: &mut HashSet<u32>,
+) {
+    let Some(channel) = channels.get(&channel_id) else {
+        return;
+    };
+    let inherited_home_channel_dependent_acl =
+        channel.inherit_acl && inherited_home_channel_dependent_acl;
+    let applies_here = inherited_home_channel_dependent_acl
+        || channel.acls.iter().any(|acl| {
+            acl.apply_here
+                && acl
+                    .group
+                    .as_deref()
+                    .is_some_and(group_depends_on_home_channel_for_cache_scope)
+        });
+    let applies_to_subs = channel.acls.iter().any(|acl| {
+        acl.apply_subs
+            && acl
+                .group
+                .as_deref()
+                .is_some_and(group_depends_on_home_channel_for_cache_scope)
+    });
+
+    if applies_here {
+        affected.insert(channel_id);
+    }
+
+    let descendant_inherited = inherited_home_channel_dependent_acl || applies_to_subs;
+    if let Some(children) = children_by_parent.get(&Some(channel_id)) {
+        for child_id in children {
+            collect_home_channel_dependent_acl_channel_ids(
+                channels,
+                children_by_parent,
+                *child_id,
+                descendant_inherited,
+                affected,
+            );
+        }
+    }
+}
+
+fn group_depends_on_home_channel_for_cache_scope(group: &str) -> bool {
+    let mut group = group;
+    while let Some(stripped) = group.strip_prefix('!') {
+        group = stripped;
+    }
+    if let Some(stripped) = group.strip_prefix('~') {
+        group = stripped;
+    }
+    matches!(group, "in" | "out") || group.starts_with("sub")
 }
 
 /// Collect `root_id` and all of its descendants (BFS), returning their IDs.

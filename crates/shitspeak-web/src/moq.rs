@@ -1345,19 +1345,10 @@ async fn client_log_message_events_with_acl_refresh(
     server_id: &str,
     message: &Message,
 ) -> Vec<ServerEvent> {
-    let mut events = message_with_synthetic_events(
-        server,
-        client,
-        channel_shadow,
-        user_visibility,
-        server_id,
-        message,
-    )
-    .await;
-
     if is_acl_cache_flush_message(message) {
+        let mut events = Vec::new();
         for refresh in
-            shitspeak_runtime::channel_handler::build_channel_permission_info_refresh_messages(
+            shitspeak_runtime::channel_handler::build_channel_permission_query_refresh_messages(
                 server,
                 client,
                 server.get_channels(),
@@ -1376,9 +1367,40 @@ async fn client_log_message_events_with_acl_refresh(
                 .await,
             );
         }
+        if server.get_send_permission_info() {
+            for refresh in
+                shitspeak_runtime::channel_handler::build_channel_permission_info_refresh_messages(
+                    server,
+                    client,
+                    server.get_channels(),
+                )
+                .await
+            {
+                events.extend(
+                    message_with_synthetic_events(
+                        server,
+                        client,
+                        channel_shadow,
+                        user_visibility,
+                        server_id,
+                        &refresh,
+                    )
+                    .await,
+                );
+            }
+        }
+        return events;
     }
 
-    events
+    message_with_synthetic_events(
+        server,
+        client,
+        channel_shadow,
+        user_visibility,
+        server_id,
+        message,
+    )
+    .await
 }
 
 #[cfg(feature = "moq")]

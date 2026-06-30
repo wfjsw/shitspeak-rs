@@ -1677,12 +1677,6 @@ enum PermissionInfoRefreshScope {
     },
 }
 
-impl PermissionInfoRefreshScope {
-    fn forwards_flush_message(self) -> bool {
-        matches!(self, PermissionInfoRefreshScope::All)
-    }
-}
-
 fn permission_info_refresh_scope_for_delta(
     delta: &shitspeak_runtime::client::state_log::ClientGlobalStateDelta,
 ) -> Option<PermissionInfoRefreshScope> {
@@ -1721,12 +1715,24 @@ async fn permission_info_refresh_messages(
 ) -> Vec<Message> {
     match scope {
         PermissionInfoRefreshScope::All => {
-            shitspeak_runtime::channel_handler::build_channel_permission_info_refresh_messages(
-                server,
-                client,
-                server.get_channels(),
-            )
-            .await
+            let mut messages =
+                shitspeak_runtime::channel_handler::build_channel_permission_query_refresh_messages(
+                    server,
+                    client,
+                    server.get_channels(),
+                )
+                .await;
+            if server.get_send_permission_info() {
+                messages.extend(
+                    shitspeak_runtime::channel_handler::build_channel_permission_info_refresh_messages(
+                        server,
+                        client,
+                        server.get_channels(),
+                    )
+                    .await,
+                );
+            }
+            messages
         }
         PermissionInfoRefreshScope::HomeChannelDependent {
             old_channel_id,
@@ -1806,6 +1812,20 @@ async fn send_web_client_log_message_with_acl_refresh_scope(
     message: &Message,
     refresh_scope: PermissionInfoRefreshScope,
 ) -> io::Result<()> {
+    if is_acl_cache_flush_message(message) {
+        return send_scoped_web_permission_refresh(
+            stream,
+            server,
+            client,
+            peer,
+            channel_shadow,
+            user_visibility,
+            server_id,
+            refresh_scope,
+        )
+        .await;
+    }
+
     send_web_outbound_message_with_synthetic(
         stream,
         server,
@@ -1816,38 +1836,7 @@ async fn send_web_client_log_message_with_acl_refresh_scope(
         server_id,
         message,
     )
-    .await?;
-
-    if is_acl_cache_flush_message(message) {
-        if !refresh_scope.forwards_flush_message() {
-            return send_scoped_web_permission_refresh(
-                stream,
-                server,
-                client,
-                peer,
-                channel_shadow,
-                user_visibility,
-                server_id,
-                refresh_scope,
-            )
-            .await;
-        }
-        for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
-            send_web_outbound_message_with_synthetic(
-                stream,
-                server,
-                client,
-                peer,
-                channel_shadow,
-                user_visibility,
-                server_id,
-                &refresh,
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
+    .await
 }
 
 async fn send_scoped_web_permission_refresh(

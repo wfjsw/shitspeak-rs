@@ -10,9 +10,7 @@ use std::{
 };
 
 use crate::{
-    channel_repository::{
-        ChannelOp, ChannelOperation, ChannelRepository, channel_op_affects_acl_generation,
-    },
+    channel_repository::{ChannelOp, ChannelOperation, ChannelRepository},
     channels::Channel,
     client::{
         Client,
@@ -136,8 +134,19 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
         return messages;
     }
 
-    if channel_op_affects_acl_generation(&op.op) {
-        messages.push(crate::messages::encoder::PermissionQuery::flush_cache().into());
+    if let Some(channel_ids) = channels
+        .acl_affected_channel_ids_for_op(&server_id, &op.op)
+        .await
+    {
+        messages.extend(
+            build_channel_permission_query_refresh_messages_for_channel_ids(
+                server,
+                client,
+                channels,
+                channel_ids,
+            )
+            .await,
+        );
     }
 
     match &op.op {
@@ -217,29 +226,21 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
         }
     }
 
-    // For SetAcls operations, generate PermissionQuery when send_permission_info is enabled
-    if send_permission_info {
-        if let ChannelOp::SetAcls { channel_id, .. } = &op.op {
-            let perms =
-                crate::client::acl::compute_permissions_for_client(server, client, *channel_id)
-                    .await;
-            let permission_query: crate::messages::Message =
-                crate::messages::encoder::PermissionQuery {
-                    channel_id: Some(*channel_id),
-                    permissions: Some(perms.bits()),
-                    flush: Some(false),
-                }
-                .into();
-            messages.push(permission_query);
-        }
-    }
-
     if send_permission_info
-        && channel_op_affects_acl_generation(&op.op)
+        && let Some(channel_ids) = channels
+            .acl_affected_channel_ids_for_op(&server_id, &op.op)
+            .await
         && !matches!(op.op, ChannelOp::InstallSnapshot { .. })
     {
-        messages
-            .extend(build_channel_permission_info_refresh_messages(server, client, channels).await);
+        messages.extend(
+            build_channel_permission_info_refresh_messages_for_channel_ids(
+                server,
+                client,
+                channels,
+                channel_ids,
+            )
+            .await,
+        );
     }
 
     messages
@@ -939,6 +940,84 @@ pub async fn build_channel_permission_info_refresh_messages(
     build_channel_permission_info_refresh_messages_for_channels(server, client, channels).await
 }
 
+pub async fn build_channel_permission_query_refresh_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+) -> Vec<Message> {
+    let server_id = client.server_id();
+    let channel_ids = channels
+        .get_all_in_server(&server_id)
+        .await
+        .into_iter()
+        .map(|channel| channel.id)
+        .collect();
+    build_channel_permission_query_refresh_messages_for_channel_ids(
+        server,
+        client,
+        channels,
+        channel_ids,
+    )
+    .await
+}
+
+pub async fn build_channel_permission_info_refresh_messages_for_channel_ids(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+    channel_ids: HashSet<u32>,
+) -> Vec<Message> {
+    if channel_ids.is_empty() || !server.get_send_permission_info() {
+        return Vec::new();
+    }
+
+    let server_id = client.server_id();
+    let channels = channels
+        .get_all_in_server(&server_id)
+        .await
+        .into_iter()
+        .filter(|channel| channel_ids.contains(&channel.id))
+        .collect();
+    build_channel_permission_info_refresh_messages_for_channels(server, client, channels).await
+}
+
+pub async fn build_channel_permission_query_refresh_messages_for_channel_ids(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+    mut channel_ids: HashSet<u32>,
+) -> Vec<Message> {
+    if channel_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let server_id = client.server_id();
+    let existing_channel_ids: HashSet<u32> = channels
+        .get_all_in_server(&server_id)
+        .await
+        .into_iter()
+        .map(|channel| channel.id)
+        .collect();
+    channel_ids.retain(|channel_id| existing_channel_ids.contains(channel_id));
+    let mut channel_ids: Vec<_> = channel_ids.into_iter().collect();
+    channel_ids.sort_unstable();
+
+    let mut messages = Vec::with_capacity(channel_ids.len());
+    for channel_id in channel_ids {
+        let perms =
+            crate::client::acl::compute_permissions_for_client(server, client, channel_id).await;
+        messages.push(
+            crate::messages::encoder::PermissionQuery {
+                channel_id: Some(channel_id),
+                permissions: Some(perms.bits()),
+                flush: Some(false),
+            }
+            .into(),
+        );
+    }
+    messages
+}
+
 /// Build permission-only `ChannelState` deltas for channels whose permissions
 /// may depend on the viewer's current channel.
 pub async fn build_home_channel_permission_info_refresh_messages(
@@ -948,10 +1027,6 @@ pub async fn build_home_channel_permission_info_refresh_messages(
     old_channel_id: Option<u32>,
     new_channel_id: u32,
 ) -> Vec<Message> {
-    if !server.get_send_permission_info() {
-        return Vec::new();
-    }
-
     let server_id = client.server_id();
     let all_channels = channels.get_all_in_server(&server_id).await;
     let channels = match old_channel_id {
@@ -1010,6 +1085,7 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
 ) -> Vec<Message> {
     channels.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
 
+    let send_permission_info = server.get_send_permission_info();
     let mut messages = Vec::with_capacity(channels.len() * 2);
     for channel in channels {
         let (is_enter_restricted, perms) =
@@ -1022,14 +1098,16 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
             }
             .into(),
         );
-        messages.push(
-            ChannelState {
-                channel_id: Some(channel.id),
-                ..Default::default()
-            }
-            .with_permission_info(is_enter_restricted, perms)
-            .into(),
-        );
+        if send_permission_info {
+            messages.push(
+                ChannelState {
+                    channel_id: Some(channel.id),
+                    ..Default::default()
+                }
+                .with_permission_info(is_enter_restricted, perms)
+                .into(),
+            );
+        }
     }
     messages
 }

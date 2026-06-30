@@ -47,7 +47,8 @@ async fn compute_permissions_for_client_inner(
     let channels = server.get_channels();
     let server_id = client.server_id();
     let client_acl_generation = client.get_acl_generation();
-    let channel_acl_generation = channels.channel_acl_generation();
+    let channel_acl_generation =
+        channels.channel_acl_generation_for_channel(&server_id, channel_id);
     let cache_session = u64::from(session);
     let cache_client_instance = client.client_instance_id();
     let use_acl_cache = !is_superuser && home_channel_override.is_none();
@@ -182,7 +183,8 @@ async fn compute_permissions_for_client_inner(
     );
 
     if use_acl_cache
-        && channels.channel_acl_generation() == channel_acl_generation
+        && channels.channel_acl_generation_for_channel(&server_id, channel_id)
+            == channel_acl_generation
         && client.get_acl_generation() == client_acl_generation
     {
         channels
