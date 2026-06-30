@@ -801,6 +801,33 @@ mod tests {
         root_update.await.expect("root channel update task joins");
     }
 
+    fn auth_queue_test_client(
+        session: u32,
+    ) -> (Arc<Box<Client>>, tokio::sync::mpsc::Receiver<Message>) {
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30_000 + session as u16);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000 + session as u16);
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(8);
+        let client = Client::new_web_gateway(
+            ClientSessionIdentifier::new(1, session).expect("test session id"),
+            peer.ip(),
+            peer,
+            local,
+            outbound_tx,
+        );
+        (Arc::new(client), outbound_rx)
+    }
+
+    async fn recv_auth_queue_notice(rx: &mut tokio::sync::mpsc::Receiver<Message>) -> TextMessage {
+        let message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("queue notice should arrive")
+            .expect("queue notice channel should remain open");
+        let Message::TextMessage(text) = message else {
+            panic!("expected queue notice TextMessage, got {message:?}");
+        };
+        text
+    }
+
     #[derive(Debug)]
     struct AcceptAnyServerCert;
 
@@ -1366,6 +1393,104 @@ mod tests {
         assert_eq!(last_announced_position, Some(1));
     }
 
+    #[test]
+    fn auth_finalization_queue_keeps_new_arrivals_behind_existing_waiters() {
+        let queue = Arc::new(AuthFinalizationQueue::new(
+            1,
+            ReloadableAuthenticator::fixed(TestAuthenticator),
+        ));
+
+        let first_permit = match queue.reserve_or_queue() {
+            AuthFinalizationAdmission::Immediate(permit) => permit,
+            AuthFinalizationAdmission::Queued(_) => {
+                panic!("first acquire should use the free permit")
+            }
+        };
+        let second_ticket = match queue.reserve_or_queue() {
+            AuthFinalizationAdmission::Queued(ticket) => ticket,
+            AuthFinalizationAdmission::Immediate(_) => panic!("second acquire should queue"),
+        };
+
+        drop(first_permit);
+
+        let third_ticket = match queue.reserve_or_queue() {
+            AuthFinalizationAdmission::Queued(ticket) => ticket,
+            AuthFinalizationAdmission::Immediate(_) => {
+                panic!("new arrival must not bypass an existing queued waiter")
+            }
+        };
+
+        assert_eq!(queue.position(second_ticket), Some(1));
+        assert_eq!(queue.position(third_ticket), Some(2));
+    }
+
+    #[tokio::test]
+    async fn auth_finalization_queue_admits_waiters_fifo() {
+        let queue = Arc::new(AuthFinalizationQueue::new(
+            1,
+            ReloadableAuthenticator::fixed(TestAuthenticator),
+        ));
+        let (first_client, _first_rx) = auth_queue_test_client(1);
+        let first_permit = queue
+            .acquire(&first_client)
+            .await
+            .expect("first client should acquire immediately");
+
+        let (second_client, mut second_rx) = auth_queue_test_client(2);
+        let second_queue = Arc::clone(&queue);
+        let mut second_task =
+            tokio::spawn(async move { second_queue.acquire(&second_client).await });
+        let second_notice = recv_auth_queue_notice(&mut second_rx).await;
+        assert!(
+            second_notice
+                .message
+                .contains("You're in the login queue. There are 0 users ahead of you."),
+            "unexpected second notice text: {}",
+            second_notice.message
+        );
+
+        let (third_client, mut third_rx) = auth_queue_test_client(3);
+        let third_queue = Arc::clone(&queue);
+        let mut third_task = tokio::spawn(async move { third_queue.acquire(&third_client).await });
+        let third_notice = recv_auth_queue_notice(&mut third_rx).await;
+        assert!(
+            third_notice
+                .message
+                .contains("You're in the login queue. There are 1 users ahead of you."),
+            "unexpected third notice text: {}",
+            third_notice.message
+        );
+
+        drop(first_permit);
+
+        tokio::select! {
+            second = &mut second_task => {
+                let second_permit = second
+                    .expect("second acquire task should join")
+                    .expect("second client should acquire next");
+
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut third_task)
+                        .await
+                        .is_err(),
+                    "third client acquired before the first queued client released its permit"
+                );
+
+                drop(second_permit);
+                let _third_permit = tokio::time::timeout(Duration::from_secs(1), third_task)
+                    .await
+                    .expect("third client should acquire after second releases")
+                    .expect("third acquire task should join")
+                    .expect("third client should acquire");
+            }
+            third = &mut third_task => {
+                third.expect("third acquire task should join")
+                    .expect("third acquire should not fail");
+                panic!("third client acquired before the first queued client");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn reload_root_channel_work_does_not_hold_config_write_lock() {
         install_default_provider();
@@ -1437,6 +1562,7 @@ struct AuthFinalizationQueue {
     semaphore: Arc<tokio::sync::Semaphore>,
     next_ticket: AtomicU64,
     waiters: Mutex<VecDeque<AuthFinalizationWaiter>>,
+    waiters_changed: tokio::sync::Notify,
     #[cfg(test)]
     test_gate: Mutex<Option<AuthFinalizationTestGate>>,
 }
@@ -1444,6 +1570,11 @@ struct AuthFinalizationQueue {
 #[derive(Clone)]
 struct AuthFinalizationWaiter {
     ticket: u64,
+}
+
+enum AuthFinalizationAdmission {
+    Immediate(tokio::sync::OwnedSemaphorePermit),
+    Queued(u64),
 }
 
 #[cfg(test)]
@@ -1497,6 +1628,7 @@ impl AuthFinalizationQueue {
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
             next_ticket: AtomicU64::new(1),
             waiters: Mutex::new(VecDeque::new()),
+            waiters_changed: tokio::sync::Notify::new(),
             #[cfg(test)]
             test_gate: Mutex::new(None),
         }
@@ -1526,20 +1658,17 @@ impl AuthFinalizationQueue {
         self: &Arc<Self>,
         client: &Arc<Box<Client>>,
     ) -> Result<AuthFinalizationPermit, MessageHandlerError> {
-        if let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() {
-            self.wait_for_test_gate_if_needed().await;
-            return Ok(AuthFinalizationPermit {
-                _permit: permit,
-                queue: Arc::clone(self),
-                ticket: 0,
-            });
-        }
-
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut waiters = self.waiters.lock();
-            waiters.push_back(AuthFinalizationWaiter { ticket });
-        }
+        let ticket = match self.reserve_or_queue() {
+            AuthFinalizationAdmission::Immediate(permit) => {
+                self.wait_for_test_gate_if_needed().await;
+                return Ok(AuthFinalizationPermit {
+                    _permit: permit,
+                    queue: Arc::clone(self),
+                    ticket: 0,
+                });
+            }
+            AuthFinalizationAdmission::Queued(ticket) => ticket,
+        };
 
         let waiter = AuthFinalizationTicket {
             queue: Arc::clone(self),
@@ -1548,23 +1677,9 @@ impl AuthFinalizationQueue {
         let mut last_announced_position = None;
         self.send_queue_notice(client, ticket, &mut last_announced_position)
             .await?;
-
-        let mut notice_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL,
-            AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL,
-        );
-        notice_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        let permit = loop {
-            tokio::select! {
-                permit = Arc::clone(&self.semaphore).acquire_owned() => {
-                    break permit.expect("auth finalization semaphore should not be closed");
-                }
-                _ = notice_interval.tick() => {
-                    self.send_queue_notice(client, ticket, &mut last_announced_position).await?;
-                }
-            }
-        };
+        let permit = self
+            .acquire_queued_permit(client, ticket, &mut last_announced_position)
+            .await?;
 
         drop(waiter);
         self.wait_for_test_gate_if_needed().await;
@@ -1573,6 +1688,60 @@ impl AuthFinalizationQueue {
             queue: Arc::clone(self),
             ticket,
         })
+    }
+
+    fn reserve_or_queue(self: &Arc<Self>) -> AuthFinalizationAdmission {
+        let mut waiters = self.waiters.lock();
+        if waiters.is_empty()
+            && let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned()
+        {
+            return AuthFinalizationAdmission::Immediate(permit);
+        }
+
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        waiters.push_back(AuthFinalizationWaiter { ticket });
+        AuthFinalizationAdmission::Queued(ticket)
+    }
+
+    async fn acquire_queued_permit(
+        self: &Arc<Self>,
+        client: &Arc<Box<Client>>,
+        ticket: u64,
+        last_announced_position: &mut Option<usize>,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, MessageHandlerError> {
+        let mut notice_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL,
+            AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL,
+        );
+        notice_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            let waiters_changed = self.waiters_changed.notified();
+            tokio::pin!(waiters_changed);
+
+            if !self.is_front(ticket) {
+                tokio::select! {
+                    _ = &mut waiters_changed => {}
+                    _ = notice_interval.tick() => {
+                        self.send_queue_notice(client, ticket, last_announced_position).await?;
+                    }
+                }
+                continue;
+            }
+
+            let permit = Arc::clone(&self.semaphore).acquire_owned();
+            tokio::pin!(permit);
+            loop {
+                tokio::select! {
+                    permit = &mut permit => {
+                        return Ok(permit.expect("auth finalization semaphore should not be closed"));
+                    }
+                    _ = notice_interval.tick() => {
+                        self.send_queue_notice(client, ticket, last_announced_position).await?;
+                    }
+                }
+            }
+        }
     }
 
     async fn send_queue_notice(
@@ -1592,8 +1761,23 @@ impl AuthFinalizationQueue {
 
     fn remove_waiter(&self, ticket: u64) {
         if ticket != 0 {
-            self.waiters.lock().retain(|waiter| waiter.ticket != ticket);
+            let removed = {
+                let mut waiters = self.waiters.lock();
+                let before = waiters.len();
+                waiters.retain(|waiter| waiter.ticket != ticket);
+                waiters.len() != before
+            };
+            if removed {
+                self.waiters_changed.notify_waiters();
+            }
         }
+    }
+
+    fn is_front(&self, ticket: u64) -> bool {
+        let waiters = self.waiters.lock();
+        waiters
+            .front()
+            .is_some_and(|waiter| waiter.ticket == ticket)
     }
 
     fn position(&self, ticket: u64) -> Option<usize> {
