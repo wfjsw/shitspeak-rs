@@ -57,7 +57,10 @@ fn channel_op_propose_failed(session: u32, channel_id: Option<u32>) -> MessageHa
         r#type: crate::messages::encoder::DenyType::Permission,
         session,
         channel_id,
-        reason: Some("Channel operation failed; please try again".into()),
+        reason: Some(
+            "Channel operation failed because the S2S commit could not complete; please try again"
+                .into(),
+        ),
         name: None,
         permission: None,
     })

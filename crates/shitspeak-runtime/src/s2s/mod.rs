@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::ban_repository::{BanEntry, BanOp, BanOperation, BanRepository};
 use crate::blob_store::ChannelBlobStore;
@@ -435,16 +435,16 @@ impl S2SManager {
             {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => {
-                    warn!("s2s gateway dropped channel proposal response");
+                    error!("s2s gateway dropped channel proposal response");
                     ChannelOpProposeResult::Failed
                 }
                 Err(_) => {
-                    warn!("s2s channel proposal timed out waiting for gateway response");
+                    error!("s2s channel proposal timed out waiting for gateway response");
                     ChannelOpProposeResult::Failed
                 }
             },
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("s2s gateway full; dropping channel proposal");
+                error!("s2s gateway full; dropping channel proposal");
                 ChannelOpProposeResult::Failed
             }
             Err(mpsc::error::TrySendError::Closed(_)) => ChannelOpProposeResult::Unavailable,
@@ -458,7 +458,13 @@ impl S2SManager {
     ) -> ChannelOpProposeResult {
         let handle = match self.channel_replication_handle(server_id) {
             Some(handle) => handle,
-            None => return ChannelOpProposeResult::Failed,
+            None => {
+                error!(
+                    server_id,
+                    "s2s channel op propose failed: replication handle unavailable"
+                );
+                return ChannelOpProposeResult::Failed;
+            }
         };
         let operation = ChannelOperation {
             server_id: server_id.to_owned(),
@@ -471,7 +477,7 @@ impl S2SManager {
         match handle.propose(operation).await {
             Ok(_) => ChannelOpProposeResult::Proposed,
             Err(e) => {
-                warn!(error = %e, "s2s channel op propose failed");
+                error!(error = %e, "s2s channel op propose failed");
                 ChannelOpProposeResult::Failed
             }
         }
@@ -2700,10 +2706,7 @@ impl OwnerReplicable for ClientReplicationAdapter {
     fn snapshot_for_origin(&self, origin: NodeIdentifier) -> Option<(u64, u64, Bytes)> {
         let clients = self.clients.clone();
         block_in_place_or_current(|handle| {
-            let entries = handle.block_on(clients.get_log_since(0));
-            let version = entries.last().map(|entry| entry.version).unwrap_or(0);
-            let entries: Vec<ClientStateLogEntry> =
-                entries.into_iter().map(|entry| (*entry).clone()).collect();
+            let (version, entries) = handle.block_on(clients.local_origin_snapshot_entries());
             let bytes =
                 Bytes::from(rmp_serde::to_vec(&ClientOriginSnapshot { version, entries }).ok()?);
             Some((self.local_epoch, version, bytes))
@@ -2717,6 +2720,10 @@ impl OwnerReplicable for ClientReplicationAdapter {
         origin: NodeIdentifier,
         since: u64,
     ) -> s2s_replications::owner::LogSlice<Self::Op> {
+        if since == 0 {
+            return s2s_replications::owner::LogSlice::TooOld;
+        }
+
         let clients = self.clients.clone();
         let entries = block_in_place_or_current(|handle| {
             handle.block_on(clients.get_log_since_for_node(origin, since))
@@ -2767,22 +2774,18 @@ impl OwnerReplicable for ClientReplicationAdapter {
                 return;
             }
         };
+        let mut entries = Vec::with_capacity(decoded.entries.len());
         for mut entry in decoded.entries {
-            entry.node_id = origin;
             let current_channel_version = self
                 .channels
                 .current_version_in_server(entry.op.server_id());
             self.sanitize_channel_dependencies(&mut entry, current_channel_version)
                 .await;
-            if let Err(()) = self
-                .clients
-                .apply_remote_operation(Arc::new(entry), current_channel_version)
-                .await
-            {
-                warn!(origin, "s2s client snapshot entry apply failed");
-                return;
-            }
+            entries.push(entry);
         }
+        self.clients
+            .install_remote_client_snapshot(origin, decoded.version, entries)
+            .await;
     }
 
     async fn reset_origin(&self, origin: NodeIdentifier, _new_epoch: u64) {
@@ -2813,9 +2816,12 @@ fn block_in_place_or_current<T>(f: impl FnOnce(&tokio::runtime::Handle) -> T) ->
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
     use super::*;
+    use crate::channel_repository::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
+    use crate::messages::Message;
 
     #[test]
     fn strict_proposal_gateway_timeout_tracks_replication_ttl() {
@@ -2903,5 +2909,215 @@ mod tests {
         };
 
         assert!(!client_entry_affects_voice_recipient_index(&entry));
+    }
+
+    fn test_channel_repo(node_id: u16) -> Arc<ChannelRepository> {
+        ChannelRepository::new_in_memory(
+            node_id,
+            ChannelRootConfig::new("Root"),
+            ChannelRepoTuning {
+                log_max_entries: 128,
+                snapshot_every_ops: 100,
+                snapshot_every_secs: 60,
+                wal_compaction_expire_count: 100,
+            },
+        )
+    }
+
+    async fn make_published_web_client(
+        repo: &ClientRepository,
+        server_id: &str,
+        port: u16,
+        name: &str,
+    ) -> Arc<Box<crate::client::Client>> {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let peer = SocketAddr::new(ip, port);
+        let local = SocketAddr::new(ip, 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client = repo
+            .allocate_web_client_in_server(server_id, ip, peer, local, tx)
+            .await;
+        {
+            let mut gs = client.write_global_state_direct();
+            gs.set_display_name(Some(name.to_owned()));
+            gs.set_user_id(Some(u32::from(port)));
+        }
+        repo.publish_client_in_server(server_id, client.get_session_id())
+            .await;
+        client
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_replication_initial_snapshot_contains_only_live_clients() {
+        let clients = Arc::new(ClientRepository::new(1, 128));
+        let channels = test_channel_repo(1);
+        let adapter = ClientReplicationAdapter::new(Arc::clone(&clients), channels, 42);
+
+        let old = make_published_web_client(&clients, DEFAULT_SERVER_ID, 30001, "old-user").await;
+        let old_session = old.get_session_id();
+        {
+            let mut gs = old.write_global_state(&clients);
+            gs.set_display_name(Some("old-user-renamed".to_owned()));
+        }
+        clients
+            .remove_client_in_server(DEFAULT_SERVER_ID, old_session)
+            .await;
+        let live = make_published_web_client(&clients, DEFAULT_SERVER_ID, 30002, "live-user").await;
+
+        assert!(matches!(
+            adapter.log_for_origin(clients.local_node_id(), 0),
+            s2s_replications::owner::LogSlice::TooOld
+        ));
+
+        let (_epoch, version, bytes) = adapter
+            .snapshot_for_origin(clients.local_node_id())
+            .expect("local origin snapshot is available");
+        let decoded: ClientOriginSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.version, version);
+        assert_eq!(decoded.entries.len(), 1);
+        match &decoded.entries[0].op {
+            ClientStateOperation::AddClient {
+                session_id,
+                client_instance_id,
+                initial_state,
+                ..
+            } => {
+                assert_eq!(*session_id, live.get_session_id());
+                assert_eq!(*client_instance_id, live.client_instance_id());
+                assert_eq!(
+                    initial_state.display_name,
+                    Some(Some("live-user".to_owned()))
+                );
+            }
+            other => panic!("expected live AddClient snapshot entry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_replication_snapshot_install_does_not_replay_old_activity_trail() {
+        let origin_clients = Arc::new(ClientRepository::new(1, 128));
+        let origin_channels = test_channel_repo(1);
+        let origin_adapter =
+            ClientReplicationAdapter::new(Arc::clone(&origin_clients), origin_channels, 42);
+
+        let old =
+            make_published_web_client(&origin_clients, DEFAULT_SERVER_ID, 30101, "old-user").await;
+        let old_session = old.get_session_id();
+        let old_instance_id = old.client_instance_id();
+        {
+            let mut gs = old.write_global_state(&origin_clients);
+            gs.set_display_name(Some("old-user-renamed".to_owned()));
+        }
+        origin_clients
+            .remove_client_in_server(DEFAULT_SERVER_ID, old_session)
+            .await;
+        let live =
+            make_published_web_client(&origin_clients, DEFAULT_SERVER_ID, 30102, "live-user").await;
+        let (_epoch, version, bytes) = origin_adapter
+            .snapshot_for_origin(origin_clients.local_node_id())
+            .expect("local origin snapshot is available");
+
+        let peer_clients = Arc::new(ClientRepository::new(2, 128));
+        let peer_channels = test_channel_repo(2);
+        let peer_adapter =
+            ClientReplicationAdapter::new(Arc::clone(&peer_clients), peer_channels, 77);
+        let mut rx = peer_clients.subscribe();
+
+        peer_adapter
+            .install_snapshot_for_origin(origin_clients.local_node_id(), 42, version, bytes)
+            .await;
+
+        let snapshot_message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("snapshot should broadcast live AddClient")
+            .expect("snapshot broadcast channel open");
+        assert!(matches!(
+            snapshot_message.entry.op,
+            ClientStateOperation::AddClient { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let replicated_live = peer_clients
+            .get_client_in_server(DEFAULT_SERVER_ID, live.get_session_id())
+            .await
+            .expect("live client should be installed from snapshot");
+        assert_eq!(old_session, live.get_session_id());
+        assert_ne!(replicated_live.client_instance_id(), old_instance_id);
+        assert_eq!(
+            replicated_live.display_name_opt().as_deref(),
+            Some("live-user")
+        );
+
+        let (messages, versions) = peer_clients
+            .replay_since_in_server(DEFAULT_SERVER_ID, &HashMap::new())
+            .await
+            .expect("snapshot replay succeeds");
+        assert_eq!(
+            versions.get(&origin_clients.local_node_id()),
+            Some(&version)
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::UserState(_)))
+                .count(),
+            1
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !matches!(message, Message::UserRemove(_)))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_replication_empty_snapshot_advances_origin_without_user_messages() {
+        let origin_clients = Arc::new(ClientRepository::new(1, 128));
+        let origin_channels = test_channel_repo(1);
+        let origin_adapter =
+            ClientReplicationAdapter::new(Arc::clone(&origin_clients), origin_channels, 42);
+
+        let old =
+            make_published_web_client(&origin_clients, DEFAULT_SERVER_ID, 30201, "old-user").await;
+        origin_clients
+            .remove_client_in_server(DEFAULT_SERVER_ID, old.get_session_id())
+            .await;
+        let (_epoch, version, bytes) = origin_adapter
+            .snapshot_for_origin(origin_clients.local_node_id())
+            .expect("local origin snapshot is available");
+        let decoded: ClientOriginSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.version, version);
+        assert!(decoded.entries.is_empty());
+        assert!(version > 0);
+
+        let peer_clients = Arc::new(ClientRepository::new(2, 128));
+        let peer_channels = test_channel_repo(2);
+        let peer_adapter =
+            ClientReplicationAdapter::new(Arc::clone(&peer_clients), peer_channels, 77);
+        let mut rx = peer_clients.subscribe();
+
+        peer_adapter
+            .install_snapshot_for_origin(origin_clients.local_node_id(), 42, version, bytes)
+            .await;
+
+        let snapshot_marker = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("snapshot should broadcast version marker")
+            .expect("snapshot broadcast channel open");
+        assert!(matches!(
+            snapshot_marker.entry.op,
+            ClientStateOperation::ResetNode { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let (messages, versions) = peer_clients
+            .replay_since_in_server(DEFAULT_SERVER_ID, &HashMap::new())
+            .await
+            .expect("empty snapshot replay succeeds");
+        assert_eq!(
+            versions.get(&origin_clients.local_node_id()),
+            Some(&version)
+        );
+        assert!(messages.is_empty());
     }
 }

@@ -817,7 +817,7 @@ mod tests {
         (Arc::new(client), outbound_rx)
     }
 
-    async fn recv_auth_queue_notice(rx: &mut tokio::sync::mpsc::Receiver<Message>) -> TextMessage {
+    async fn recv_auth_queue_notice(rx: &mut tokio::sync::mpsc::Receiver<Message>) -> String {
         let message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("queue notice should arrive")
@@ -825,7 +825,7 @@ mod tests {
         let Message::TextMessage(text) = message else {
             panic!("expected queue notice TextMessage, got {message:?}");
         };
-        text
+        text.message
     }
 
     #[derive(Debug)]
@@ -1442,11 +1442,8 @@ mod tests {
             tokio::spawn(async move { second_queue.acquire(&second_client).await });
         let second_notice = recv_auth_queue_notice(&mut second_rx).await;
         assert!(
-            second_notice
-                .message
-                .contains("You're in the login queue. There are 0 users ahead of you."),
-            "unexpected second notice text: {}",
-            second_notice.message
+            second_notice.contains("You're in the login queue. There are 0 users ahead of you."),
+            "unexpected second notice text: {second_notice}"
         );
 
         let (third_client, mut third_rx) = auth_queue_test_client(3);
@@ -1454,11 +1451,8 @@ mod tests {
         let mut third_task = tokio::spawn(async move { third_queue.acquire(&third_client).await });
         let third_notice = recv_auth_queue_notice(&mut third_rx).await;
         assert!(
-            third_notice
-                .message
-                .contains("You're in the login queue. There are 1 users ahead of you."),
-            "unexpected third notice text: {}",
-            third_notice.message
+            third_notice.contains("You're in the login queue. There are 1 users ahead of you."),
+            "unexpected third notice text: {third_notice}"
         );
 
         drop(first_permit);

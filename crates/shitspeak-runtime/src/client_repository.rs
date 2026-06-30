@@ -1729,6 +1729,149 @@ impl ClientRepository {
         (clients, versions, rx)
     }
 
+    pub(crate) async fn local_origin_snapshot_entries(&self) -> (u64, Vec<ClientStateLogEntry>) {
+        let (version, clients) = {
+            let register = self.register.read().await;
+            (
+                register.version,
+                register
+                    .local_clients()
+                    .filter(|client| client.is_published())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let entries = clients
+            .into_iter()
+            .map(|client| ClientStateLogEntry {
+                version: 0,
+                node_id: self.local_node_id,
+                timestamp,
+                channel_version_dep: None,
+                op: ClientStateOperation::AddClient {
+                    server_id: client.server_id(),
+                    session_id: client.get_session_id(),
+                    client_instance_id: client.client_instance_id(),
+                    real_ip: client.get_real_ip_address(),
+                    tcp_addr: client.get_tcp_address(),
+                    udp_addr: client.get_udp_address(),
+                    local_addr: client.get_local_address(),
+                    cert_hash: client
+                        .get_certificate_hash()
+                        .map(bytes::Bytes::copy_from_slice),
+                    login_time: client.get_login_time(),
+                    initial_state: ClientGlobalStateDelta::from_global_state(
+                        &client.read_global_state(),
+                    ),
+                },
+            })
+            .collect();
+
+        (version, entries)
+    }
+
+    pub(crate) async fn install_remote_client_snapshot(
+        &self,
+        origin: u16,
+        snapshot_version: u64,
+        entries: Vec<ClientStateLogEntry>,
+    ) {
+        if origin == self.local_node_id {
+            return;
+        }
+
+        let mut snapshot_entries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match &entry.op {
+                ClientStateOperation::AddClient { session_id, .. }
+                    if session_id.get_node_id() == origin =>
+                {
+                    snapshot_entries.push(entry);
+                }
+                other => {
+                    tracing::warn!(
+                        origin,
+                        op = ?other,
+                        "s2s client snapshot ignored non-local AddClient entry"
+                    );
+                }
+            }
+        }
+
+        if snapshot_entries.len() as u64 > snapshot_version {
+            tracing::warn!(
+                origin,
+                snapshot_version,
+                entries = snapshot_entries.len(),
+                "s2s client snapshot has more live entries than origin version; dropping snapshot"
+            );
+            return;
+        }
+
+        let first_entry_version = snapshot_version
+            .checked_sub(snapshot_entries.len() as u64)
+            .map(|version| version + 1);
+        let now = chrono::Utc::now().timestamp_millis();
+        let normalized_entries = snapshot_entries
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, mut entry)| {
+                let version = first_entry_version? + index as u64;
+                entry.node_id = origin;
+                entry.version = version;
+                entry.timestamp = now + index as i64;
+                entry.channel_version_dep = None;
+                Some(Arc::new(entry))
+            })
+            .collect::<Vec<_>>();
+
+        let remote_register = self.get_or_create_remote_register(origin).await;
+        let mut broadcasts = Vec::with_capacity(normalized_entries.len());
+        {
+            let mut register = remote_register.write().await;
+            register.clients.clear();
+            register.log.clear();
+            register.version = 0;
+            register.clients_by_channel.clear();
+            register.client_channel.clear();
+            register.listeners_by_channel.clear();
+            register.pending_ops.clear();
+            register.last_pending_effective_dep_by_server.clear();
+            register.pending_channel_versions.clear();
+
+            for entry in normalized_entries {
+                Self::apply_op_inner(&mut register, &entry, origin, self.log_max_entries);
+                broadcasts.push(Arc::new(ClientStateBroadcastPayload {
+                    entry: Arc::clone(&entry),
+                    versions: HashMap::from([(origin, entry.version)]),
+                }));
+            }
+            if register.version == 0 && snapshot_version > 0 {
+                let entry = Arc::new(ClientStateLogEntry {
+                    version: snapshot_version,
+                    node_id: origin,
+                    timestamp: now,
+                    channel_version_dep: None,
+                    op: ClientStateOperation::ResetNode {
+                        server_id: crate::types::default_server_id(),
+                    },
+                });
+                Self::apply_op_inner(&mut register, &entry, origin, self.log_max_entries);
+                broadcasts.push(Arc::new(ClientStateBroadcastPayload {
+                    entry,
+                    versions: HashMap::from([(origin, snapshot_version)]),
+                }));
+            }
+            register.version = register.version.max(snapshot_version);
+        }
+
+        for broadcast in broadcasts {
+            let _ = self.tx.send(broadcast);
+        }
+    }
+
     /// Replay all log entries newer than the given per-node versions.
     ///
     /// `last_seen` maps `node_id → version` — typically the map returned
