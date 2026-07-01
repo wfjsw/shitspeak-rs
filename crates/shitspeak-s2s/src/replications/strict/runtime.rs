@@ -3417,6 +3417,7 @@ mod tests {
     async fn non_snapshot_catchup_response_is_ignored_during_history_election() {
         let net = MockNet::new(1, vec![1, 2]);
         let repo = CountingStrictRepo::new();
+        repo.apply_committed(1, 101).await;
         let rt = StrictRuntime::new(
             repo.clone(),
             1,
@@ -3450,10 +3451,60 @@ mod tests {
         )
         .await;
 
-        assert_eq!(repo.current_version(), 0);
-        assert!(repo.log().is_empty());
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(repo.log(), vec![(1, 101)]);
         assert!(rt.state.lock().history_election_pending);
         assert!(net.drain_captures().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_repo_accepts_log_catchup_during_startup_history_election() {
+        let net = MockNet::new(1, vec![1, 2]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            0,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        rt.recv_catchup_resp(
+            2,
+            StrictCatchupResp {
+                snapshot_version: 0,
+                snapshot_msgpack: Bytes::new(),
+                ops: vec![
+                    repl_proto::CatchupOp {
+                        version: 1,
+                        op_msgpack: Bytes::from(rmp_serde::to_vec(&201u64).unwrap()),
+                        strict_op_id_hi: 0,
+                        strict_op_id_lo: 0,
+                        strict_ts_final: 0,
+                    },
+                    repl_proto::CatchupOp {
+                        version: 2,
+                        op_msgpack: Bytes::from(rmp_serde::to_vec(&202u64).unwrap()),
+                        strict_op_id_hi: 0,
+                        strict_op_id_lo: 0,
+                        strict_ts_final: 0,
+                    },
+                ],
+                has_more: false,
+                next_chunk_token: 2,
+                too_old_use_snapshot: false,
+                history_version: 2,
+                history_freshness: 0,
+                runtime_started_at: 0,
+                history_node: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(repo.log(), vec![(1, 201), (2, 202)]);
+        assert!(rt.state.lock().history_election_pending);
     }
 
     #[test]

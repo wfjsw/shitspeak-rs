@@ -146,7 +146,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         return;
     }
 
-    if can_bootstrap {
+    if can_bootstrap && rt.repo.current_version() > 0 {
         return;
     }
 
