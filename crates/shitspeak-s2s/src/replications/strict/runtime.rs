@@ -720,8 +720,7 @@ impl StrictState {
         self.pending_proposes.retain(|op_id, p| {
             let stale = now.duration_since(p.seen_at) >= pending_propose_ttl;
             let coord_alive = alive.contains(&p.coord_node);
-            let protects_buffered_commit =
-                max_buffered_ts.is_some_and(|ts| ts >= p.ts_local);
+            let protects_buffered_commit = max_buffered_ts.is_some_and(|ts| ts >= p.ts_local);
             if stale {
                 if coord_alive || protects_buffered_commit {
                     return true;
@@ -2251,8 +2250,12 @@ fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     // ts_final entries that have been delivered everywhere, and drop
     // hung in-progress recoveries that never reached quorum.
     {
-        let alive: HashSet<NodeIdentifier> =
-            rt.net.alive_members().into_iter().chain([rt.self_id]).collect();
+        let alive: HashSet<NodeIdentifier> = rt
+            .net
+            .alive_members()
+            .into_iter()
+            .chain([rt.self_id])
+            .collect();
         let mut s = rt.state.lock();
         let _dropped = s.gc_stale_pending_proposes(now, rt.cfg.pending_propose_ttl(), &alive);
         s.gc_committed_ts_final();
@@ -3340,7 +3343,8 @@ mod tests {
         s.record_pending_propose((1, 1), 5, Bytes::new(), 1, stale_at);
         s.record_pending_propose((2, 2), 5, Bytes::new(), 2, fresh_at);
         let alive = HashSet::new();
-        let dropped = s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
+        let dropped =
+            s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
         assert_eq!(dropped, vec![(1, 1)]);
         assert_eq!(s.pending_proposes.len(), 1);
         assert!(s.pending_proposes.contains_key(&(2, 2)));
@@ -3354,7 +3358,8 @@ mod tests {
         s.record_pending_propose((1, 1), 5, Bytes::new(), 40, stale_at);
         let alive = HashSet::from([5u16]);
 
-        let dropped = s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
+        let dropped =
+            s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
 
         assert!(dropped.is_empty());
         assert!(s.pending_proposes.contains_key(&(1, 1)));
@@ -3369,7 +3374,8 @@ mod tests {
         s.buffer_commit((2, 2), 50, Bytes::new());
         let alive = HashSet::new();
 
-        let dropped = s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
+        let dropped =
+            s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
 
         assert!(dropped.is_empty());
         assert!(s.pending_proposes.contains_key(&(1, 1)));

@@ -475,6 +475,9 @@ impl Server {
 
                 if len <= 1 {
                     // Empty packages or packages consisting only of the header byte are invalid
+                    crate::voice::metrics::record_udp_drain_drop(
+                        crate::voice::metrics::UdpDrainDropReason::PacketTooShort,
+                    );
                     continue;
                 }
 
@@ -520,6 +523,9 @@ impl Server {
                             // Not a ping packet, continue with normal processing
                         }
                         Err(e) => {
+                            crate::voice::metrics::record_udp_drain_drop(
+                                crate::voice::metrics::UdpDrainDropReason::PingDecodeFailed,
+                            );
                             tracing::trace!("UDP packet decode failed from {}: {e}", src_addr);
                             continue;
                         }
@@ -531,15 +537,25 @@ impl Server {
                     match tx.try_send((packet, src_addr, local_addr)) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            crate::voice::metrics::record_udp_drain_drop(
+                                crate::voice::metrics::UdpDrainDropReason::ProcessingQueueFull,
+                            );
                             tracing::warn!(
                                 "UDP processing channel is full, dropping packet from {}",
                                 src_addr
                             );
                         }
                         Err(e) => {
+                            crate::voice::metrics::record_udp_drain_drop(
+                                crate::voice::metrics::UdpDrainDropReason::ProcessingQueueClosed,
+                            );
                             tracing::warn!("UDP processing channel error for {}: {e}", src_addr);
                         }
                     }
+                } else {
+                    crate::voice::metrics::record_udp_drain_drop(
+                        crate::voice::metrics::UdpDrainDropReason::VoiceDisabled,
+                    );
                 }
             }
             tracing::info!("UDP drain stopped");
@@ -588,6 +604,10 @@ impl Server {
 
                         match decrypt_result {
                             Some(Ok(dec)) => {
+                                crate::voice::metrics::record_udp_decrypt(
+                                    crate::voice::metrics::UdpDecryptPath::Address,
+                                    crate::voice::metrics::UdpDecryptResult::Success,
+                                );
                                 tracing::trace!(
                                     "UDP client matched by address: {} -> session {:?}",
                                     src_addr,
@@ -597,6 +617,10 @@ impl Server {
                                 found = Some(c);
                             }
                             Some(Err(e)) => {
+                                crate::voice::metrics::record_udp_decrypt(
+                                    crate::voice::metrics::UdpDecryptPath::Address,
+                                    crate::voice::metrics::UdpDecryptResult::Failure,
+                                );
                                 tracing::trace!(
                                     "UDP address-match decrypt failed for {:?} from {}: {:?}, removing stale binding",
                                     c.get_session_id(),
@@ -608,6 +632,10 @@ impl Server {
                                     .unbind_client_udp_endpoint(local_addr, src_addr);
                             }
                             None => {
+                                crate::voice::metrics::record_udp_decrypt(
+                                    crate::voice::metrics::UdpDecryptPath::Address,
+                                    crate::voice::metrics::UdpDecryptResult::NoCryptState,
+                                );
                                 tracing::trace!(
                                     "UDP address-matched client {:?} has no crypt state, removing stale binding",
                                     c.get_session_id()
@@ -621,6 +649,7 @@ impl Server {
 
                     if found.is_none() {
                         let candidates = server.clients.get_clients_by_ip(&src_addr.ip()).await;
+                        crate::voice::metrics::record_udp_ip_fallback(candidates.len());
                         let mut matched = None;
                         for c in &candidates {
                             let decrypted = {
@@ -630,6 +659,10 @@ impl Server {
                                         let mut decrypted = BytesMut::new();
                                         match state.decrypt(&mut decrypted, &packet) {
                                             Ok(()) => {
+                                                crate::voice::metrics::record_udp_decrypt(
+                                                    crate::voice::metrics::UdpDecryptPath::IpFallback,
+                                                    crate::voice::metrics::UdpDecryptResult::Success,
+                                                );
                                                 tracing::trace!(
                                                     "UDP packet from {} successfully decrypted with client {:?} during IP fallback",
                                                     src_addr,
@@ -638,6 +671,10 @@ impl Server {
                                                 Some(decrypted)
                                             }
                                             Err(e) => {
+                                                crate::voice::metrics::record_udp_decrypt(
+                                                    crate::voice::metrics::UdpDecryptPath::IpFallback,
+                                                    crate::voice::metrics::UdpDecryptResult::Failure,
+                                                );
                                                 tracing::trace!(
                                                     "UDP packet from {} failed to decrypt with client {:?} during IP fallback: {:?}",
                                                     src_addr,
@@ -649,6 +686,10 @@ impl Server {
                                         }
                                     }
                                     None => {
+                                        crate::voice::metrics::record_udp_decrypt(
+                                            crate::voice::metrics::UdpDecryptPath::IpFallback,
+                                            crate::voice::metrics::UdpDecryptResult::NoCryptState,
+                                        );
                                         tracing::trace!(
                                             "UDP client {:?} has no crypt state yet, skipping for IP fallback",
                                             c.get_session_id()
@@ -777,6 +818,10 @@ impl Server {
                             );
                             continue;
                         }
+                        crate::voice::metrics::record_ingress(
+                            crate::voice::metrics::VoiceIngressTransport::Udp,
+                            packet.len(),
+                        );
                         tracing::trace!(
                             "UDP audio packet from {}: sender_session={:?}, frame_number={}, format={:?}, payload_len={}",
                             src_addr,

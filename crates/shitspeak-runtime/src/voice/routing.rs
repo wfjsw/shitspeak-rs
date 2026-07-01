@@ -2,11 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use tracing::Instrument;
 
 use super::codec::{self, Audio, PacketFormat};
+use super::metrics::{
+    VoiceDispatchMode, VoiceEgressResult, VoiceEgressTransport, VoiceRouteSource,
+};
 use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, DatagramBatch};
 use crate::{
@@ -544,6 +548,7 @@ async fn resolve_voice_intent(
 }
 
 pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, audio: &Audio) {
+    let started_at = Instant::now();
     let sender_id = sender.get_session_id();
     let server_id = sender.server_id();
     let sender_channel = sender.get_current_channel_id();
@@ -574,6 +579,11 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         AudioTarget::ServerLoopback => {
             let targets = vec![(sender.clone(), AudioContext::Normal)];
             flush_voice_batch(server, audio, &targets).await;
+            super::metrics::record_route(
+                VoiceRouteSource::Loopback,
+                targets.len(),
+                started_at.elapsed(),
+            );
             return;
         }
         AudioTarget::VoiceTarget(slot) => {
@@ -605,6 +615,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         "resolved local voice recipients"
     );
     flush_voice_batch(server, audio, &targets).await;
+    super::metrics::record_route(VoiceRouteSource::Local, targets.len(), started_at.elapsed());
 
     if send_s2s {
         let payload = encode_s2s_voice_payload(audio);
@@ -629,6 +640,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
                 intent,
             ),
         };
+        super::metrics::record_s2s_forward(sent);
         if !sent {
             tracing::trace!("voice s2s send dropped: S2S gateway unavailable");
         }
@@ -640,6 +652,7 @@ pub(crate) async fn route_s2s_voice_frame(
     from_immediate: crate::types::NodeIdentifier,
     frame: VoiceFrame,
 ) {
+    let started_at = Instant::now();
     let sender_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
         frame.sender_session,
     );
@@ -702,6 +715,17 @@ pub(crate) async fn route_s2s_voice_frame(
         "routing s2s voice frame to local recipients"
     );
     flush_voice_batch(server, &decoded, &targets).await;
+    super::metrics::record_route(VoiceRouteSource::S2s, targets.len(), started_at.elapsed());
+}
+
+fn enqueue_voice_tcp_metric(client: &Client, bytes: &Bytes) {
+    let queued = client.try_enqueue_voice_tcp(bytes.clone());
+    let result = if queued {
+        VoiceEgressResult::Queued
+    } else {
+        VoiceEgressResult::Dropped
+    };
+    super::metrics::record_egress(VoiceEgressTransport::TcpTunnel, result, 1, bytes.len());
 }
 
 pub(crate) async fn flush_voice_batch(
@@ -726,6 +750,7 @@ pub(crate) async fn flush_voice_batch(
     let server_protocol_version = server.get_server_protocol_version();
 
     if targets.len() < RAYON_FANOUT_THRESHOLD {
+        super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
         let mut cache = EncodeCache::new();
         let mut udp_batches: HashMap<std::net::SocketAddr, DatagramBatch> = HashMap::new();
 
@@ -734,19 +759,19 @@ pub(crate) async fn flush_voice_batch(
             let entry = cache.get_or_encode(audio, *context, format);
 
             if client.prefers_tcp_tunnel() {
-                client.try_enqueue_voice_tcp(entry.bytes);
+                enqueue_voice_tcp_metric(client, &entry.bytes);
                 continue;
             }
 
             let Some(addr) = client.get_udp_address() else {
-                client.try_enqueue_voice_tcp(entry.bytes);
+                enqueue_voice_tcp_metric(client, &entry.bytes);
                 continue;
             };
             let Some(local_addr) = server
                 .udp_socket_for_client(client)
                 .and_then(|socket| socket.local_addr().ok())
             else {
-                client.try_enqueue_voice_tcp(entry.bytes);
+                enqueue_voice_tcp_metric(client, &entry.bytes);
                 continue;
             };
 
@@ -768,7 +793,7 @@ pub(crate) async fn flush_voice_batch(
                     session = u32::from(client.get_session_id()),
                     "encryption failed for client, falling back to TCP tunnel"
                 );
-                client.try_enqueue_voice_tcp(entry.bytes);
+                enqueue_voice_tcp_metric(client, &entry.bytes);
                 continue;
             }
         }
@@ -777,16 +802,45 @@ pub(crate) async fn flush_voice_batch(
             if udp_batch.is_empty() {
                 continue;
             }
+            let packet_count = udp_batch.len();
+            let byte_count = udp_batch.bytes_len();
+            super::metrics::record_egress(
+                VoiceEgressTransport::Udp,
+                VoiceEgressResult::Queued,
+                packet_count,
+                byte_count,
+            );
             let Some(socket) = server.udp_socket_for_client_addr(local_addr) else {
                 tracing::warn!(%local_addr, "UDP batch has no matching local socket");
+                super::metrics::record_egress(
+                    VoiceEgressTransport::Udp,
+                    VoiceEgressResult::Dropped,
+                    packet_count,
+                    byte_count,
+                );
                 continue;
             };
             if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &udp_batch).await {
                 tracing::warn!("UDP batch send error: {e}");
+                super::metrics::record_egress(
+                    VoiceEgressTransport::Udp,
+                    VoiceEgressResult::Failed,
+                    packet_count,
+                    byte_count,
+                );
+            } else {
+                super::metrics::record_egress(
+                    VoiceEgressTransport::Udp,
+                    VoiceEgressResult::Sent,
+                    packet_count,
+                    byte_count,
+                );
             }
         }
         return;
     }
+
+    super::metrics::record_dispatch(VoiceDispatchMode::Rayon);
 
     // Large-fanout path: bucket recipients while collecting unique
     // (format, context) keys, pre-encode each unique key once, then dispatch
@@ -828,7 +882,7 @@ pub(crate) async fn flush_voice_batch(
     // TCP fallback recipients — enqueue using the cached plaintext, do not await.
     for (client, format, context) in &tcp_items {
         let entry = cache.get_or_encode(audio, *context, *format);
-        client.try_enqueue_voice_tcp(entry.bytes);
+        enqueue_voice_tcp_metric(client, &entry.bytes);
     }
 
     if udp_items.is_empty() {
@@ -895,12 +949,39 @@ pub(crate) async fn flush_voice_batch(
         if batch.is_empty() {
             continue;
         }
+        let packet_count = batch.len();
+        let byte_count = batch.bytes_len();
+        super::metrics::record_egress(
+            VoiceEgressTransport::Udp,
+            VoiceEgressResult::Queued,
+            packet_count,
+            byte_count,
+        );
         let Some(socket) = server.udp_socket_for_client_addr(local_addr) else {
             tracing::warn!(%local_addr, "UDP batch has no matching local socket");
+            super::metrics::record_egress(
+                VoiceEgressTransport::Udp,
+                VoiceEgressResult::Dropped,
+                packet_count,
+                byte_count,
+            );
             continue;
         };
         if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &batch).await {
             tracing::warn!("UDP batch send error: {e}");
+            super::metrics::record_egress(
+                VoiceEgressTransport::Udp,
+                VoiceEgressResult::Failed,
+                packet_count,
+                byte_count,
+            );
+        } else {
+            super::metrics::record_egress(
+                VoiceEgressTransport::Udp,
+                VoiceEgressResult::Sent,
+                packet_count,
+                byte_count,
+            );
         }
     }
 }

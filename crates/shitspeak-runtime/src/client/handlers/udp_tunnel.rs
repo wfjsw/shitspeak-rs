@@ -24,6 +24,10 @@ pub(super) async fn handle_udp_tunnel(
 
     match crate::voice::codec::Audio::decode(&data, Some(sender.get_session_id())) {
         Ok(audio) => {
+            crate::voice::metrics::record_ingress(
+                crate::voice::metrics::VoiceIngressTransport::TcpTunnel,
+                data.len(),
+            );
             tracing::trace!(session = u32::from(sender.get_session_id()), target = %audio.target, frame = audio.frame_number, len = audio.audio_payload.len(), "UDPTunnel: routing voice");
             sender.push_voice_routing(audio);
             Ok(())

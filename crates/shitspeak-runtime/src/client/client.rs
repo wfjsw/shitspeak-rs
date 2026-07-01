@@ -1258,14 +1258,19 @@ impl Client {
         self.voice_targets.lock().get(&id).cloned()
     }
 
-    pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) {
+    pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) -> bool {
         let payload = VoiceRoutingPayload { decoded_audio };
         if self.voice_routing_tx.try_send(payload).is_err() {
+            crate::voice::metrics::record_queue_drop(
+                crate::voice::metrics::VoiceQueueDropReason::RoutingQueueFullOrClosed,
+            );
             tracing::trace!(
                 session = u32::from(self.get_session_id()),
                 "voice routing queue full or closed, dropping packet"
             );
+            return false;
         }
+        true
     }
 
     /// Take the receiver half of the voice routing queue.  Called once by
@@ -1282,10 +1287,13 @@ impl Client {
     /// indicates the per-user TCP send task is not keeping up; in release
     /// builds the packet is silently dropped (voice is realtime, backlog is
     /// worse than loss).
-    pub fn try_enqueue_voice_tcp(&self, raw: Bytes) {
+    pub fn try_enqueue_voice_tcp(&self, raw: Bytes) -> bool {
         match self.voice_tcp_tx.try_send(raw) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
+                crate::voice::metrics::record_queue_drop(
+                    crate::voice::metrics::VoiceQueueDropReason::TcpQueueFull,
+                );
                 debug_assert!(
                     false,
                     "voice TCP queue full for session {}",
@@ -1295,12 +1303,17 @@ impl Client {
                     session = u32::from(self.get_session_id()),
                     "voice TCP queue full, dropping packet"
                 );
+                false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                crate::voice::metrics::record_queue_drop(
+                    crate::voice::metrics::VoiceQueueDropReason::TcpQueueClosed,
+                );
                 tracing::trace!(
                     session = u32::from(self.get_session_id()),
                     "voice TCP queue closed, dropping packet"
                 );
+                false
             }
         }
     }

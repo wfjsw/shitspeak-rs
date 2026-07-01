@@ -52,6 +52,14 @@ impl DatagramBatch {
         self.datagrams.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.datagrams.len()
+    }
+
+    pub fn bytes_len(&self) -> usize {
+        self.datagrams.iter().map(|datagram| datagram.len).sum()
+    }
+
     pub fn try_push_zeroed<E>(
         &mut self,
         addr: SocketAddr,

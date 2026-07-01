@@ -4,11 +4,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use shitspeak_s2s::overlay::OverlayConfig;
 use shitspeak_s2s::replications::{
     OwnerHandle, OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager,
     StrictHandle, StrictReplicable,
 };
-use shitspeak_s2s::overlay::OverlayConfig;
 use shitspeak_s2s::testing::{
     Cluster, full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing,
 };

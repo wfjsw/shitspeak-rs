@@ -122,6 +122,10 @@ impl ServerMetricsSource {
             ConsensusMetricsSnapshot::from_repositories(&self.clients, &self.channels).await;
         consensus_samples_from_snapshot(&snapshot)
     }
+
+    fn voice_samples(&self) -> Vec<PrometheusSample> {
+        crate::voice::metrics::prometheus_samples()
+    }
 }
 
 #[async_trait]
@@ -132,6 +136,7 @@ impl S2sMetricsSource for ServerMetricsSource {
             body.push('\n');
         }
         render_consensus_metrics_into(&mut body, &self.consensus_samples().await);
+        render_voice_metrics_into(&mut body, &self.voice_samples());
         Some(body)
     }
 
@@ -142,6 +147,7 @@ impl S2sMetricsSource for ServerMetricsSource {
     ) -> Option<Vec<Vec<u8>>> {
         let mut samples = self.s2s.prometheus_samples().unwrap_or_default();
         samples.extend(self.consensus_samples().await);
+        samples.extend(self.voice_samples());
         let timestamp_ms = now_unix_ms();
         Some(remote_write_bodies(
             &samples,
@@ -289,6 +295,88 @@ const CONSENSUS_METRIC_HEADERS: &[(&str, &str)] = &[
     (
         "shitspeak_consensus_channels_by_server",
         "Materialized channels in the channel repository by server scope.",
+    ),
+];
+
+fn render_voice_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
+    for (name, help, kind) in VOICE_METRIC_HEADERS {
+        render_prometheus_header(out, name, help, kind);
+    }
+    for sample in samples {
+        render_prometheus_sample(out, sample);
+    }
+}
+
+const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
+    (
+        "shitspeak_voice_ingress_packets_total",
+        "Total decoded voice ingress packets by transport.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_ingress_bytes_total",
+        "Total decoded voice ingress bytes by transport.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_decrypt_attempts_total",
+        "Total UDP decrypt attempts by matching path and result.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_ip_fallbacks_total",
+        "Total UDP packets that required IP-based client fallback matching.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_ip_fallback_candidate_bucket_total",
+        "Bucketed number of same-IP client candidates considered during UDP fallback matching.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_drain_drops_total",
+        "Total UDP packets dropped before voice processing by reason.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_queue_drops_total",
+        "Total voice packets dropped by bounded routing or TCP voice queues.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_routed_frames_total",
+        "Total voice frames routed by source.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_fanout_bucket_total",
+        "Bucketed local recipient fanout per routed voice frame.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_route_duration_us_bucket_total",
+        "Bucketed wall-clock route duration in microseconds by source.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_dispatch_frames_total",
+        "Total voice fanout flushes by dispatch mode.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_egress_packets_total",
+        "Total outbound voice packets by transport and result.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_egress_bytes_total",
+        "Total outbound voice bytes by transport and result.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_s2s_forward_attempts_total",
+        "Total voice S2S forward attempts by send result.",
+        "counter",
     ),
 ];
 

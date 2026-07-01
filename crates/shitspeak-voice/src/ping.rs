@@ -158,7 +158,7 @@ fn write_legacy_varint(buf: &mut impl BufMut, value: u64) {
 impl PingResponse {
     /// Encode a ping response in the same format as the request.
     pub fn encode(&self, format: PacketFormat) -> Result<Bytes, EncodeError> {
-        tracing::debug!(
+        tracing::trace!(
             "Encoding ping response: format={}, timestamp={}, version={}, users={}/{}, max_bandwidth={}",
             format,
             self.timestamp,
