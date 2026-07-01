@@ -2509,7 +2509,7 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
 }
 
 async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
-    if rt.state.lock().can_bootstrap_catchup() {
+    if rt.state.lock().history_election_pending {
         return;
     }
     let alive = rt.net.alive_members();
@@ -3389,6 +3389,71 @@ mod tests {
         s.finish_history_election();
         assert!(!s.history_election_pending);
         assert!(!s.history_election_installing);
+    }
+
+    #[tokio::test]
+    async fn steady_state_catchup_stands_down_while_history_election_is_pending() {
+        let net = MockNet::new(1, vec![1, 2]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo,
+            1,
+            0,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        request_steady_state_catchup(&rt).await;
+
+        assert!(
+            net.drain_captures().is_empty(),
+            "ordinary catchup must not race a pending history election"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_snapshot_catchup_response_is_ignored_during_history_election() {
+        let net = MockNet::new(1, vec![1, 2]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            0,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        rt.recv_catchup_resp(
+            2,
+            StrictCatchupResp {
+                snapshot_version: 0,
+                snapshot_msgpack: Bytes::new(),
+                ops: vec![repl_proto::CatchupOp {
+                    version: 1,
+                    op_msgpack: Bytes::from(rmp_serde::to_vec(&201u64).unwrap()),
+                    strict_op_id_hi: 0,
+                    strict_op_id_lo: 0,
+                    strict_ts_final: 0,
+                }],
+                has_more: false,
+                next_chunk_token: 1,
+                too_old_use_snapshot: false,
+                history_version: 1,
+                history_freshness: 0,
+                runtime_started_at: 0,
+                history_node: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(repo.current_version(), 0);
+        assert!(repo.log().is_empty());
+        assert!(rt.state.lock().history_election_pending);
+        assert!(net.drain_captures().is_empty());
     }
 
     #[test]

@@ -146,14 +146,11 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         return;
     }
 
-    if can_bootstrap && !remote_rank.beats(local_rank) {
-        rt.state
-            .lock()
-            .record_history_election_response(remote_node, None);
+    if can_bootstrap {
         return;
     }
 
-    if !can_bootstrap && resp.ops.is_empty() {
+    if resp.ops.is_empty() {
         return;
     }
 
@@ -221,11 +218,6 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             .net
             .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))
             .await;
-    }
-    if can_bootstrap && !resp.has_more {
-        rt.state
-            .lock()
-            .record_history_election_response(remote_node, None);
     }
 }
 
