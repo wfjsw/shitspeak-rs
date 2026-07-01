@@ -772,6 +772,9 @@ async fn s2s_cross_node_user_stats_rpc() {
         .await
         .expect("bob");
 
+    wait_for_server_to_track_client(&a, bob.server_session).await;
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+
     alice
         .send(
             UserStats {
@@ -811,6 +814,9 @@ async fn s2s_cross_node_user_stats_omits_sensitive_fields_for_non_superuser() {
     let bob = TestClient::connect_and_authenticate(&b, "bob", None)
         .await
         .expect("bob");
+
+    wait_for_server_to_track_client(&a, bob.server_session).await;
+    wait_for_server_to_track_client(&b, alice.server_session).await;
 
     alice
         .send(
