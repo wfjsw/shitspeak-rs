@@ -124,6 +124,7 @@ debug_acl_enter = false
 explicit_enter_deny_overrides_write = true
 preserve_write_acl_on_edit = false
 grant_temp_channel_creator_acl = true
+reevaluate_speak_on_acl_change = true
 ```
 
 ## Top-Level Server Settings
@@ -319,12 +320,14 @@ debug_acl_enter = false
 explicit_enter_deny_overrides_write = true
 preserve_write_acl_on_edit = false
 grant_temp_channel_creator_acl = true
+reevaluate_speak_on_acl_change = true
 ```
 
 - `debug_acl_enter`: when true, superusers ignore channel Enter denies.
 - `explicit_enter_deny_overrides_write`: when true, explicit Enter denies remain denied even if Write would otherwise imply Enter.
 - `preserve_write_acl_on_edit`: when true, registered non-superuser ACL editors keep a personal Write fallback if their edit would remove their own Write permission.
 - `grant_temp_channel_creator_acl`: when true, temporary channel creators receive local ACL grants for missing Write, Enter, and Speak permissions.
+- `reevaluate_speak_on_acl_change`: when true, ACL edits reevaluate Speak for clients currently in the changed channel subtree and update their `UserState.suppress` state.
 
 The checked-in development config sets stricter values than the code defaults for some ACL toggles.
 

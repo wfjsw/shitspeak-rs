@@ -824,6 +824,10 @@ pub struct AclConfig {
     /// any missing Write, Enter, and Speak permissions.
     #[serde(default = "default_true")]
     grant_temp_channel_creator_acl: bool,
+    /// When true, ACL edits reevaluate Speak for clients currently in the
+    /// changed channel subtree and update their suppress state.
+    #[serde(default)]
+    reevaluate_speak_on_acl_change: bool,
 }
 
 impl Default for AclConfig {
@@ -833,6 +837,7 @@ impl Default for AclConfig {
             explicit_enter_deny_overrides_write: false,
             preserve_write_acl_on_edit: true,
             grant_temp_channel_creator_acl: true,
+            reevaluate_speak_on_acl_change: false,
         }
     }
 }
@@ -862,11 +867,28 @@ impl AclConfig {
         preserve_write_acl_on_edit: bool,
         grant_temp_channel_creator_acl: bool,
     ) -> Self {
+        Self::with_acl_behavior_and_speak_reevaluation(
+            debug_acl_enter,
+            explicit_enter_deny_overrides_write,
+            preserve_write_acl_on_edit,
+            grant_temp_channel_creator_acl,
+            false,
+        )
+    }
+
+    pub fn with_acl_behavior_and_speak_reevaluation(
+        debug_acl_enter: bool,
+        explicit_enter_deny_overrides_write: bool,
+        preserve_write_acl_on_edit: bool,
+        grant_temp_channel_creator_acl: bool,
+        reevaluate_speak_on_acl_change: bool,
+    ) -> Self {
         Self {
             debug_acl_enter,
             explicit_enter_deny_overrides_write,
             preserve_write_acl_on_edit,
             grant_temp_channel_creator_acl,
+            reevaluate_speak_on_acl_change,
         }
     }
 
@@ -884,6 +906,10 @@ impl AclConfig {
 
     pub fn grant_temp_channel_creator_acl(&self) -> bool {
         self.grant_temp_channel_creator_acl
+    }
+
+    pub fn reevaluate_speak_on_acl_change(&self) -> bool {
+        self.reevaluate_speak_on_acl_change
     }
 }
 
@@ -1577,6 +1603,7 @@ mod tests {
         assert!(cfg.acl.explicit_enter_deny_overrides_write());
         assert!(!cfg.acl.preserve_write_acl_on_edit());
         assert!(cfg.acl.grant_temp_channel_creator_acl());
+        assert!(cfg.acl.reevaluate_speak_on_acl_change());
         assert_eq!(cfg.root_channel_name, "Root");
         assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Demo);
         assert!(cfg.geoip.enabled());
@@ -1965,6 +1992,7 @@ mod tests {
         assert!(!default_cfg.explicit_enter_deny_overrides_write());
         assert!(default_cfg.preserve_write_acl_on_edit());
         assert!(default_cfg.grant_temp_channel_creator_acl());
+        assert!(!default_cfg.reevaluate_speak_on_acl_change());
 
         let cfg: AclConfig = ::config::Config::builder()
             .add_source(::config::File::from_str(
@@ -1973,6 +2001,7 @@ mod tests {
                     explicit_enter_deny_overrides_write = true
                     preserve_write_acl_on_edit = false
                     grant_temp_channel_creator_acl = false
+                    reevaluate_speak_on_acl_change = true
                 "#,
                 ::config::FileFormat::Toml,
             ))
@@ -1984,6 +2013,7 @@ mod tests {
         assert!(cfg.explicit_enter_deny_overrides_write());
         assert!(!cfg.preserve_write_acl_on_edit());
         assert!(!cfg.grant_temp_channel_creator_acl());
+        assert!(cfg.reevaluate_speak_on_acl_change());
     }
 
     #[test]

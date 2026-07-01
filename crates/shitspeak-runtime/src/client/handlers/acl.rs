@@ -223,7 +223,7 @@ pub async fn handle_acl(
         }
         let proposed_s2s = server
             .s2s_manager()
-            .propose_channel_op(Some(&server_id), op)
+            .propose_channel_op(Some(&server_id), op.clone())
             .await;
         if proposed_s2s.should_apply_locally() {
             if let Err(e) = server
@@ -234,6 +234,10 @@ pub async fn handle_acl(
                 tracing::warn!("set_acls {channel_id} failed: {:?}", e);
                 return Ok(());
             }
+            let channel_version = server.get_channels().current_version_in_server(&server_id);
+            server
+                .reevaluate_speak_after_acl_change(&server_id, &op, channel_version)
+                .await;
         } else if !proposed_s2s.is_proposed() {
             return Err(super::channel_op_propose_failed(
                 u32::from(sender.get_session_id()),

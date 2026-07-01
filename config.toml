@@ -99,6 +99,9 @@ preserve_write_acl_on_edit = false
 # When true, temporary channel creators receive local ACL grants for any missing
 # Write, Enter, and Speak permissions not already inherited by the new channel.
 grant_temp_channel_creator_acl = true
+# When true, ACL edits reevaluate Speak for clients currently in the changed
+# channel subtree and update their suppress state.
+reevaluate_speak_on_acl_change = true
 
 # Privacy behavior toggles
 [privacy]

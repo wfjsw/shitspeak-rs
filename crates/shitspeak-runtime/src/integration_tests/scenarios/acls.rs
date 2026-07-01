@@ -2063,6 +2063,112 @@ async fn acl_cache_acl_update_sends_channel_scoped_permission_refresh_to_all_cli
 }
 
 #[tokio::test]
+async fn acl_update_reevaluates_speak_suppress_when_enabled() {
+    let server = spawn_test_server(TestServerOpts {
+        reevaluate_speak_on_acl_change: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice.drain_now().await;
+    bob.drain_now().await;
+
+    alice
+        .set_acls(
+            0,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: true,
+                inherited: false,
+                user_id: None,
+                group: Some("all".to_owned()),
+                grant: 0,
+                deny: ACLPermissions::Speak as u32,
+            }],
+            true,
+        )
+        .await;
+
+    let suppressed = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id)
+                        && us.suppress == Some(true))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        suppressed.is_some(),
+        "Bob should be suppressed when an ACL edit removes Speak and reevaluation is enabled"
+    );
+}
+
+#[tokio::test]
+async fn acl_update_does_not_reevaluate_speak_suppress_by_default() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice.drain_now().await;
+    bob.drain_now().await;
+
+    alice
+        .set_acls(
+            0,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: true,
+                inherited: false,
+                user_id: None,
+                group: Some("all".to_owned()),
+                grant: 0,
+                deny: ACLPermissions::Speak as u32,
+            }],
+            true,
+        )
+        .await;
+
+    let suppressed = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id)
+                        && us.suppress == Some(true))
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        suppressed.is_none(),
+        "Bob should not receive suppress reevaluation from ACL edits by default"
+    );
+}
+
+#[tokio::test]
 async fn acl_cache_per_user_purge_sends_scoped_permission_refresh_only_to_that_user() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::channel_handler::{ChannelReplayError, ChannelTreeShadow, SessionChannelShadow};
 use crate::channel_repository::{
-    ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
+    ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
 };
 use crate::client::{
     AsyncMessageHandlerExt, Client, ClientInstanceId, ClientOutboundMessage,
@@ -2277,6 +2277,12 @@ fn is_own_client_log_entry(
     client_instance_id: ClientInstanceId,
 ) -> bool {
     op.session_id() == Some(session_id) && op.client_instance_id() == client_instance_id
+}
+
+fn sorted_channel_ids(channel_ids: &HashSet<u32>) -> Vec<u32> {
+    let mut channel_ids: Vec<_> = channel_ids.iter().copied().collect();
+    channel_ids.sort_unstable();
+    channel_ids
 }
 
 async fn permission_info_refresh_messages(
@@ -4629,6 +4635,15 @@ impl Server {
                             new_config.acl.grant_temp_channel_creator_acl()
                         );
                     }
+                    if current.acl.reevaluate_speak_on_acl_change()
+                        != new_config.acl.reevaluate_speak_on_acl_change()
+                    {
+                        tracing::info!(
+                            "config reload: acl.reevaluate_speak_on_acl_change {} -> {}",
+                            current.acl.reevaluate_speak_on_acl_change(),
+                            new_config.acl.reevaluate_speak_on_acl_change()
+                        );
+                    }
                     if current.privacy.certificate_hash_protection()
                         != new_config.privacy.certificate_hash_protection()
                     {
@@ -4790,6 +4805,57 @@ impl Server {
 
     pub fn get_grant_temp_channel_creator_acl(&self) -> bool {
         self.read_config().acl.grant_temp_channel_creator_acl()
+    }
+
+    pub fn get_reevaluate_speak_on_acl_change(&self) -> bool {
+        self.read_config().acl.reevaluate_speak_on_acl_change()
+    }
+
+    pub(crate) async fn reevaluate_speak_after_acl_change(
+        self: &Arc<Box<Self>>,
+        server_id: &str,
+        op: &ChannelOp,
+        channel_version: u64,
+    ) {
+        if !self.get_reevaluate_speak_on_acl_change() {
+            return;
+        }
+        let ChannelOp::SetAcls { .. } = op else {
+            return;
+        };
+        let Some(affected_channel_ids) = self
+            .get_channels()
+            .acl_affected_channel_ids_for_op(server_id, op)
+            .await
+        else {
+            return;
+        };
+        if affected_channel_ids.is_empty() {
+            return;
+        }
+
+        let affected_clients = self
+            .get_clients()
+            .get_local_clients_in_channels_in_server(
+                server_id,
+                &sorted_channel_ids(&affected_channel_ids),
+            )
+            .await;
+
+        for client in affected_clients {
+            let permissions = crate::client::acl::compute_permissions_for_client(
+                self,
+                &client,
+                client.get_current_channel_id(),
+            )
+            .await;
+            let suppress = !permissions.contains(crate::acl::ACLPermissions::Speak);
+            {
+                let mut state =
+                    client.write_global_state_as(self.get_clients(), None, Some(channel_version));
+                state.set_suppress(suppress);
+            }
+        }
     }
 
     pub fn get_certificate_hash_privacy(&self) -> Option<(CertificateHashProtection, String)> {
