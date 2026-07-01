@@ -57,6 +57,7 @@ pub struct MockNet {
     pub alive: Mutex<Vec<NodeIdentifier>>,
     pub epochs: Mutex<std::collections::HashMap<NodeIdentifier, u64>>,
     routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
+    live_routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
     pub captured: Mutex<Vec<CapturedFrame>>,
     pub edge_rtts: Mutex<Vec<Duration>>,
 }
@@ -68,6 +69,7 @@ impl MockNet {
             alive: Mutex::new(alive),
             epochs: Mutex::new(Default::default()),
             routes: Mutex::new(None),
+            live_routes: Mutex::new(None),
             captured: Mutex::new(Vec::new()),
             edge_rtts: Mutex::new(Vec::new()),
         })
@@ -91,6 +93,18 @@ impl MockNet {
 
     pub fn set_reliable_routes(&self, routes: impl IntoIterator<Item = NodeIdentifier>) {
         self.set_routes(ServiceLevel::Reliable, routes);
+    }
+
+    pub fn set_live_routes(
+        &self,
+        level: ServiceLevel,
+        routes: impl IntoIterator<Item = NodeIdentifier>,
+    ) {
+        *self.live_routes.lock() = Some(routes.into_iter().map(|dst| (level, dst)).collect());
+    }
+
+    pub fn set_live_reliable_routes(&self, routes: impl IntoIterator<Item = NodeIdentifier>) {
+        self.set_live_routes(ServiceLevel::Reliable, routes);
     }
 
     pub fn set_epoch(&self, node: NodeIdentifier, epoch: u64) {
@@ -176,6 +190,13 @@ impl StrictNet for MockNet {
         match self.routes.lock().as_ref() {
             Some(routes) => routes.contains(&(level, dst)),
             None => true,
+        }
+    }
+
+    fn has_live_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
+        match self.live_routes.lock().as_ref() {
+            Some(routes) => routes.contains(&(level, dst)),
+            None => self.has_route(dst, level),
         }
     }
 

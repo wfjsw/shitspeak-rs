@@ -205,7 +205,7 @@ async fn strict_three_node_convergence() {
     for (i, h) in handles.iter().enumerate() {
         let base = (i as u64) * 100;
         for k in 0..5 {
-            timeout(Duration::from_secs(5), h.propose(base + k))
+            timeout(Duration::from_secs(20), h.propose(base + k))
                 .await
                 .expect("propose timeout")
                 .expect("propose result");

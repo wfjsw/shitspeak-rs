@@ -105,6 +105,9 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
     fn has_route(&self, _dst: NodeIdentifier, _level: ServiceLevel) -> bool {
         true
     }
+    fn has_live_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
+        self.has_route(dst, level)
+    }
     /// Snapshot of every directed-edge RTT in the overlay's LSDB. Used to
     /// scale the clock-tick cadence to measured network latency.
     fn edge_rtt_snapshot(&self) -> Vec<Duration>;
@@ -179,6 +182,10 @@ impl StrictNet for OverlayStrictNet {
 
     fn has_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
         self.overlay.has_route(dst, level)
+    }
+
+    fn has_live_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
+        self.overlay.has_live_route(dst, level)
     }
 
     fn edge_rtt_snapshot(&self) -> Vec<Duration> {
@@ -1924,7 +1931,7 @@ fn spawn_delivery_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
 }
 
 async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
-    let alive = rt.net.alive_members();
+    let alive = delivery_members(rt.net.as_ref(), rt.self_id);
     let now = Instant::now();
     let mut blocked: Option<DeliveryBlockDiagnostics> = None;
     let to_apply: Vec<BufferedOp> = {
@@ -2060,6 +2067,20 @@ fn delivery_watermark(
         low_water_clock,
         missing_clock_peers,
     }
+}
+
+fn delivery_members(net: &dyn StrictNet, self_id: NodeIdentifier) -> Vec<NodeIdentifier> {
+    let mut seen = HashSet::new();
+    let mut members = Vec::new();
+    for node in net.alive_members().into_iter().chain([self_id]) {
+        if !seen.insert(node) {
+            continue;
+        }
+        if node == self_id || net.has_live_route(node, ServiceLevel::Reliable) {
+            members.push(node);
+        }
+    }
+    members
 }
 
 fn earliest_uncommitted_proposal_blocker(
@@ -2321,7 +2342,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     fn clock_tick_needed(&self) -> bool {
-        let alive = self.net.alive_members();
+        let alive = delivery_members(self.net.as_ref(), self.self_id);
         let state = self.state.lock();
         clock_tick_needed_for_state(&state, self.self_id, &alive)
     }
@@ -2768,6 +2789,42 @@ mod tests {
         let alive = vec![10u16, 20, 30];
         let hw = s.delivery_high_water(10, &alive);
         assert_eq!(hw, 0);
+    }
+
+    #[test]
+    fn delivery_members_exclude_alive_peers_without_live_routes() {
+        let net = MockNet::new(10, vec![10, 20, 30]);
+        net.set_live_reliable_routes([20]);
+
+        let members = delivery_members(net.as_ref(), 10);
+
+        assert_eq!(members, vec![10, 20]);
+    }
+
+    #[test]
+    fn delivery_high_water_ignores_unroutable_unobserved_peer() {
+        let net = MockNet::new(10, vec![10, 20, 30]);
+        net.set_live_reliable_routes([20]);
+        let alive = delivery_members(net.as_ref(), 10);
+        let mut s = StrictState::new();
+        s.clock = 7;
+        s.peer_clocks.insert(20, 5);
+
+        let hw = s.delivery_high_water(10, &alive);
+
+        assert_eq!(hw, 5);
+    }
+
+    #[test]
+    fn clock_tick_not_needed_for_unroutable_unobserved_peer() {
+        let net = MockNet::new(10, vec![10, 20, 30]);
+        net.set_live_reliable_routes([20]);
+        let alive = delivery_members(net.as_ref(), 10);
+        let mut s = StrictState::new();
+        s.finish_history_election();
+        s.peer_clocks.insert(20, 3);
+
+        assert!(!clock_tick_needed_for_state(&s, 10, &alive));
     }
 
     #[test]

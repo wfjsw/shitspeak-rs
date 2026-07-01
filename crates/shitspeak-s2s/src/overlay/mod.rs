@@ -1140,6 +1140,12 @@ impl OverlayNetwork {
         self.inner.routing.load().has_route(dst, level)
     }
 
+    /// Returns true if a route exists and its next hop currently has a live
+    /// transport that can carry `level`.
+    pub fn has_live_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
+        self.has_live_route_with_metric(dst, level, RoutingMetric::default_for_level(level))
+    }
+
     /// Returns true if any route can satisfy `level` for `dst` using an
     /// explicit routing metric.
     pub fn has_route_with_metric(
@@ -1152,6 +1158,27 @@ impl OverlayNetwork {
             .routing
             .load()
             .has_route_with_metric(dst, level, routing_metric)
+    }
+
+    /// Returns true if a route exists for `routing_metric` and its next hop
+    /// currently has a live transport that can carry `level`.
+    pub fn has_live_route_with_metric(
+        &self,
+        dst: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+    ) -> bool {
+        if dst == self.inner.self_id {
+            return true;
+        }
+        let Some(next_hop) = self.route_to_with_metric(dst, level, routing_metric) else {
+            return false;
+        };
+        !self
+            .inner
+            .transport
+            .ranked_live_transports_for(next_hop, level, routing_metric)
+            .is_empty()
     }
 
     /// Announce graceful leave (tombstone LSA flood) to every direct
