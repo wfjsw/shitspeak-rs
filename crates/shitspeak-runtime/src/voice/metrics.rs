@@ -106,6 +106,23 @@ impl VoiceRouteSource {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum VoiceRouteKind {
+    Normal,
+    Target,
+    Loopback,
+}
+
+impl VoiceRouteKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Target => "target",
+            Self::Loopback => "loopback",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum VoiceDispatchMode {
     Sequential,
     Rayon,
@@ -160,9 +177,18 @@ const UDP_DECRYPT_RESULT_COUNT: usize = 3;
 const UDP_DRAIN_DROP_REASON_COUNT: usize = 5;
 const VOICE_QUEUE_DROP_REASON_COUNT: usize = 3;
 const VOICE_ROUTE_SOURCE_COUNT: usize = 3;
+const VOICE_ROUTE_KIND_COUNT: usize = 3;
 const VOICE_DISPATCH_MODE_COUNT: usize = 2;
 const VOICE_EGRESS_TRANSPORT_COUNT: usize = 2;
 const VOICE_EGRESS_RESULT_COUNT: usize = 4;
+
+const ROUTE_DIMENSIONS: [(VoiceRouteSource, VoiceRouteKind); 5] = [
+    (VoiceRouteSource::Local, VoiceRouteKind::Normal),
+    (VoiceRouteSource::Local, VoiceRouteKind::Target),
+    (VoiceRouteSource::S2s, VoiceRouteKind::Normal),
+    (VoiceRouteSource::S2s, VoiceRouteKind::Target),
+    (VoiceRouteSource::Loopback, VoiceRouteKind::Loopback),
+];
 
 const FANOUT_BUCKETS: [(&str, u64); 8] = [
     ("0", 0),
@@ -205,13 +231,16 @@ static UDP_DRAIN_DROPS: [AtomicU64; UDP_DRAIN_DROP_REASON_COUNT] =
     [const { AtomicU64::new(0) }; UDP_DRAIN_DROP_REASON_COUNT];
 static QUEUE_DROPS: [AtomicU64; VOICE_QUEUE_DROP_REASON_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_QUEUE_DROP_REASON_COUNT];
-static ROUTED_FRAMES: [AtomicU64; VOICE_ROUTE_SOURCE_COUNT] =
-    [const { AtomicU64::new(0) }; VOICE_ROUTE_SOURCE_COUNT];
+static ROUTED_FRAMES: [AtomicU64; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
+    [const { AtomicU64::new(0) }; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
 static ROUTE_DURATION_BUCKETS: [[AtomicU64; ROUTE_DURATION_BUCKETS_US.len()];
-    VOICE_ROUTE_SOURCE_COUNT] = [const { [const { AtomicU64::new(0) }; ROUTE_DURATION_BUCKETS_US.len()] };
-    VOICE_ROUTE_SOURCE_COUNT];
-static FANOUT_BUCKETS_TOTAL: [[AtomicU64; FANOUT_BUCKETS.len()]; VOICE_ROUTE_SOURCE_COUNT] =
-    [const { [const { AtomicU64::new(0) }; FANOUT_BUCKETS.len()] }; VOICE_ROUTE_SOURCE_COUNT];
+    VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
+    [const { [const { AtomicU64::new(0) }; ROUTE_DURATION_BUCKETS_US.len()] };
+        VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
+static FANOUT_BUCKETS_TOTAL: [[AtomicU64; FANOUT_BUCKETS.len()];
+    VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
+    [const { [const { AtomicU64::new(0) }; FANOUT_BUCKETS.len()] };
+        VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
 static DISPATCH_FRAMES: [AtomicU64; VOICE_DISPATCH_MODE_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_DISPATCH_MODE_COUNT];
 static EGRESS_PACKETS: [[AtomicU64; VOICE_EGRESS_RESULT_COUNT]; VOICE_EGRESS_TRANSPORT_COUNT] =
@@ -268,6 +297,18 @@ fn route_source_index(source: VoiceRouteSource) -> usize {
         VoiceRouteSource::S2s => 1,
         VoiceRouteSource::Loopback => 2,
     }
+}
+
+fn route_kind_index(kind: VoiceRouteKind) -> usize {
+    match kind {
+        VoiceRouteKind::Normal => 0,
+        VoiceRouteKind::Target => 1,
+        VoiceRouteKind::Loopback => 2,
+    }
+}
+
+fn route_index(source: VoiceRouteSource, kind: VoiceRouteKind) -> usize {
+    route_source_index(source) * VOICE_ROUTE_KIND_COUNT + route_kind_index(kind)
 }
 
 fn dispatch_mode_index(mode: VoiceDispatchMode) -> usize {
@@ -337,17 +378,18 @@ pub(crate) fn record_queue_drop(reason: VoiceQueueDropReason) {
     increment(&QUEUE_DROPS[queue_drop_index(reason)], 1);
 }
 
-pub(crate) fn record_route(source: VoiceRouteSource, fanout: usize, duration: Duration) {
-    let source_index = route_source_index(source);
-    increment(&ROUTED_FRAMES[source_index], 1);
-    observe_bucket(
-        &FANOUT_BUCKETS_TOTAL[source_index],
-        &FANOUT_BUCKETS,
-        fanout as u64,
-    );
+pub(crate) fn record_route(
+    source: VoiceRouteSource,
+    kind: VoiceRouteKind,
+    fanout: usize,
+    duration: Duration,
+) {
+    let index = route_index(source, kind);
+    increment(&ROUTED_FRAMES[index], 1);
+    observe_bucket(&FANOUT_BUCKETS_TOTAL[index], &FANOUT_BUCKETS, fanout as u64);
     let duration_us = duration.as_micros().min(u64::MAX as u128) as u64;
     observe_bucket(
-        &ROUTE_DURATION_BUCKETS[source_index],
+        &ROUTE_DURATION_BUCKETS[index],
         &ROUTE_DURATION_BUCKETS_US,
         duration_us,
     );
@@ -454,35 +496,33 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         ));
     }
 
-    for source in [
-        VoiceRouteSource::Local,
-        VoiceRouteSource::S2s,
-        VoiceRouteSource::Loopback,
-    ] {
-        let source_index = route_source_index(source);
+    for (source, kind) in ROUTE_DIMENSIONS {
+        let index = route_index(source, kind);
+        let labels = vec![
+            ("source".to_owned(), source.label().to_owned()),
+            ("kind".to_owned(), kind.label().to_owned()),
+        ];
         samples.push(PrometheusSample::new(
             "shitspeak_voice_routed_frames_total",
-            vec![("source".to_owned(), source.label().to_owned())],
-            ROUTED_FRAMES[source_index].load(Ordering::Relaxed) as f64,
+            labels.clone(),
+            ROUTED_FRAMES[index].load(Ordering::Relaxed) as f64,
         ));
         for (bucket_index, (bucket, _)) in FANOUT_BUCKETS.iter().enumerate() {
+            let mut labels = labels.clone();
+            labels.push(("bucket".to_owned(), (*bucket).to_owned()));
             samples.push(PrometheusSample::new(
                 "shitspeak_voice_fanout_bucket_total",
-                vec![
-                    ("source".to_owned(), source.label().to_owned()),
-                    ("bucket".to_owned(), (*bucket).to_owned()),
-                ],
-                FANOUT_BUCKETS_TOTAL[source_index][bucket_index].load(Ordering::Relaxed) as f64,
+                labels,
+                FANOUT_BUCKETS_TOTAL[index][bucket_index].load(Ordering::Relaxed) as f64,
             ));
         }
         for (bucket_index, (bucket, _)) in ROUTE_DURATION_BUCKETS_US.iter().enumerate() {
+            let mut labels = labels.clone();
+            labels.push(("bucket".to_owned(), (*bucket).to_owned()));
             samples.push(PrometheusSample::new(
                 "shitspeak_voice_route_duration_us_bucket_total",
-                vec![
-                    ("source".to_owned(), source.label().to_owned()),
-                    ("bucket".to_owned(), (*bucket).to_owned()),
-                ],
-                ROUTE_DURATION_BUCKETS[source_index][bucket_index].load(Ordering::Relaxed) as f64,
+                labels,
+                ROUTE_DURATION_BUCKETS[index][bucket_index].load(Ordering::Relaxed) as f64,
             ));
         }
     }
@@ -530,4 +570,43 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
     }
 
     samples
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn route_samples_use_only_real_route_dimensions() {
+        let route_dimensions = prometheus_samples()
+            .into_iter()
+            .filter(|sample| sample.name() == "shitspeak_voice_routed_frames_total")
+            .map(|sample| {
+                let source = sample
+                    .labels()
+                    .iter()
+                    .find_map(|(key, value)| (key == "source").then_some(value.as_str()))
+                    .expect("source label");
+                let kind = sample
+                    .labels()
+                    .iter()
+                    .find_map(|(key, value)| (key == "kind").then_some(value.as_str()))
+                    .expect("kind label");
+                (source.to_owned(), kind.to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            route_dimensions,
+            BTreeSet::from([
+                ("local".to_owned(), "normal".to_owned()),
+                ("local".to_owned(), "target".to_owned()),
+                ("s2s".to_owned(), "normal".to_owned()),
+                ("s2s".to_owned(), "target".to_owned()),
+                ("loopback".to_owned(), "loopback".to_owned()),
+            ])
+        );
+    }
 }

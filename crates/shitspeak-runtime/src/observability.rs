@@ -345,17 +345,17 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
     ),
     (
         "shitspeak_voice_routed_frames_total",
-        "Total voice frames routed by source.",
+        "Total voice frames routed by source and route kind.",
         "counter",
     ),
     (
         "shitspeak_voice_fanout_bucket_total",
-        "Bucketed local recipient fanout per routed voice frame.",
+        "Bucketed local recipient fanout per routed voice frame by source and route kind.",
         "counter",
     ),
     (
         "shitspeak_voice_route_duration_us_bucket_total",
-        "Bucketed wall-clock route duration in microseconds by source.",
+        "Bucketed wall-clock route duration in microseconds by source and route kind.",
         "counter",
     ),
     (
