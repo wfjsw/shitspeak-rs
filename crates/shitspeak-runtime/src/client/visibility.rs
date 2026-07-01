@@ -14,6 +14,8 @@ use crate::server::Server;
 #[derive(Debug, Clone, Default)]
 pub struct UserVisibilityState {
     known: HashMap<ClientSessionIdentifier, KnownUserVisibility>,
+    sessions_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
+    sessions_by_listener_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +28,7 @@ struct KnownUserVisibility {
 pub struct VisibilityRefreshScope {
     sessions: HashSet<ClientSessionIdentifier>,
     channels: HashSet<u32>,
+    listener_channel_removals: HashMap<ClientSessionIdentifier, HashSet<u32>>,
     include_all_channels: bool,
     include_known_users: bool,
 }
@@ -60,6 +63,17 @@ impl VisibilityRefreshScope {
         self.channels.extend(channel_ids);
     }
 
+    fn include_listener_channel_removal(
+        &mut self,
+        session: ClientSessionIdentifier,
+        channel_ids: impl IntoIterator<Item = u32>,
+    ) {
+        self.listener_channel_removals
+            .entry(session)
+            .or_default()
+            .extend(channel_ids);
+    }
+
     pub fn include_all_channels(&mut self) {
         self.include_all_channels = true;
     }
@@ -71,6 +85,7 @@ impl VisibilityRefreshScope {
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
             && self.channels.is_empty()
+            && self.listener_channel_removals.is_empty()
             && !self.include_all_channels
             && !self.include_known_users
     }
@@ -78,6 +93,12 @@ impl VisibilityRefreshScope {
     pub fn merge(&mut self, other: VisibilityRefreshScope) {
         self.sessions.extend(other.sessions);
         self.channels.extend(other.channels);
+        for (session, channel_ids) in other.listener_channel_removals {
+            self.listener_channel_removals
+                .entry(session)
+                .or_default()
+                .extend(channel_ids);
+        }
         self.include_all_channels |= other.include_all_channels;
         self.include_known_users |= other.include_known_users;
     }
@@ -86,6 +107,8 @@ impl VisibilityRefreshScope {
 impl UserVisibilityState {
     pub fn clear(&mut self) {
         self.known.clear();
+        self.sessions_by_channel.clear();
+        self.sessions_by_listener_channel.clear();
     }
 
     pub fn known_channel(&self, session: ClientSessionIdentifier) -> Option<u32> {
@@ -102,6 +125,17 @@ impl UserVisibilityState {
         channel_id: u32,
         listener_channels: HashSet<u32>,
     ) {
+        self.remove(session);
+        self.sessions_by_channel
+            .entry(channel_id)
+            .or_default()
+            .insert(session);
+        for listener_channel_id in &listener_channels {
+            self.sessions_by_listener_channel
+                .entry(*listener_channel_id)
+                .or_default()
+                .insert(session);
+        }
         self.known.insert(
             session,
             KnownUserVisibility {
@@ -112,7 +146,18 @@ impl UserVisibilityState {
     }
 
     fn remove(&mut self, session: ClientSessionIdentifier) -> bool {
-        self.known.remove(&session).is_some()
+        let Some(known) = self.known.remove(&session) else {
+            return false;
+        };
+        remove_indexed_session(&mut self.sessions_by_channel, known.channel_id, session);
+        for listener_channel_id in known.listener_channels {
+            remove_indexed_session(
+                &mut self.sessions_by_listener_channel,
+                listener_channel_id,
+                session,
+            );
+        }
+        true
     }
 
     fn known_sessions(&self) -> impl Iterator<Item = ClientSessionIdentifier> + '_ {
@@ -122,39 +167,95 @@ impl UserVisibilityState {
     fn known_sessions_in_channels<'a>(
         &'a self,
         channel_ids: &'a HashSet<u32>,
-    ) -> impl Iterator<Item = ClientSessionIdentifier> + 'a {
-        self.known.iter().filter_map(|(session, known)| {
-            (channel_ids.contains(&known.channel_id)
-                || known
-                    .listener_channels
-                    .iter()
-                    .any(|channel_id| channel_ids.contains(channel_id)))
-            .then_some(*session)
-        })
+    ) -> HashSet<ClientSessionIdentifier> {
+        self.sessions_in_indexed_channels(channel_ids)
     }
 
     fn referenced_channel_ids(&self) -> HashSet<u32> {
         let mut channel_ids = HashSet::new();
-        for known in self.known.values() {
-            channel_ids.insert(known.channel_id);
-            channel_ids.extend(known.listener_channels.iter().copied());
-        }
+        channel_ids.extend(self.sessions_by_channel.keys().copied());
+        channel_ids.extend(self.sessions_by_listener_channel.keys().copied());
         channel_ids
     }
 
-    fn sessions_referencing_deleted_channels<'a>(
-        &'a self,
-        deleted_root_id: u32,
-        existing_channel_ids: &'a HashSet<u32>,
-    ) -> impl Iterator<Item = ClientSessionIdentifier> + 'a {
-        self.known.iter().filter_map(move |(session, known)| {
-            (known.channel_id == deleted_root_id
-                || !existing_channel_ids.contains(&known.channel_id)
-                || known.listener_channels.iter().any(|channel_id| {
-                    *channel_id == deleted_root_id || !existing_channel_ids.contains(channel_id)
-                }))
-            .then_some(*session)
-        })
+    fn sessions_in_indexed_channels(
+        &self,
+        channel_ids: &HashSet<u32>,
+    ) -> HashSet<ClientSessionIdentifier> {
+        let mut sessions = HashSet::new();
+        for channel_id in channel_ids {
+            if let Some(channel_sessions) = self.sessions_by_channel.get(channel_id) {
+                sessions.extend(channel_sessions.iter().copied());
+            }
+            if let Some(listener_sessions) = self.sessions_by_listener_channel.get(channel_id) {
+                sessions.extend(listener_sessions.iter().copied());
+            }
+        }
+        sessions
+    }
+
+    fn sessions_in_current_channels(
+        &self,
+        channel_ids: &HashSet<u32>,
+    ) -> HashSet<ClientSessionIdentifier> {
+        let mut sessions = HashSet::new();
+        for channel_id in channel_ids {
+            if let Some(channel_sessions) = self.sessions_by_channel.get(channel_id) {
+                sessions.extend(channel_sessions.iter().copied());
+            }
+        }
+        sessions
+    }
+
+    fn sessions_listening_to_channels(
+        &self,
+        channel_ids: &HashSet<u32>,
+    ) -> HashSet<ClientSessionIdentifier> {
+        let mut sessions = HashSet::new();
+        for channel_id in channel_ids {
+            if let Some(listener_sessions) = self.sessions_by_listener_channel.get(channel_id) {
+                sessions.extend(listener_sessions.iter().copied());
+            }
+        }
+        sessions
+    }
+
+    fn remove_visible_listener_channels(
+        &mut self,
+        session: ClientSessionIdentifier,
+        channel_ids: &HashSet<u32>,
+    ) -> Vec<u32> {
+        let Some(known) = self.known.get_mut(&session) else {
+            return Vec::new();
+        };
+        let mut removed = known
+            .listener_channels
+            .intersection(channel_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        removed.sort_unstable();
+        for channel_id in &removed {
+            known.listener_channels.remove(channel_id);
+            remove_indexed_session(&mut self.sessions_by_listener_channel, *channel_id, session);
+        }
+        removed
+    }
+}
+
+fn remove_indexed_session(
+    index: &mut HashMap<u32, HashSet<ClientSessionIdentifier>>,
+    channel_id: u32,
+    session: ClientSessionIdentifier,
+) {
+    let Some(sessions) = index.get_mut(&channel_id) else {
+        return;
+    };
+    sessions.remove(&session);
+    if sessions.is_empty() {
+        index.remove(&channel_id);
     }
 }
 
@@ -388,19 +489,19 @@ pub async fn visibility_refresh_messages(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,
     visibility: &mut UserVisibilityState,
-    scope: VisibilityRefreshScope,
+    mut scope: VisibilityRefreshScope,
 ) -> Vec<Message> {
     if !server.get_hide_users_without_traverse() || scope.is_empty() {
         return Vec::new();
     }
 
     let server_id = viewer.server_id();
-    let mut sessions = scope.sessions;
+    let mut sessions = std::mem::take(&mut scope.sessions);
     if scope.include_known_users {
         sessions.extend(visibility.known_sessions());
     }
 
-    let mut channels = scope.channels;
+    let mut channels = std::mem::take(&mut scope.channels);
     if scope.include_all_channels {
         channels.extend(
             server
@@ -425,11 +526,29 @@ pub async fn visibility_refresh_messages(
         );
     }
 
+    let mut messages = Vec::new();
+    for (session, channel_ids) in scope.listener_channel_removals {
+        if sessions.contains(&session) {
+            continue;
+        }
+        let removed = visibility.remove_visible_listener_channels(session, &channel_ids);
+        if removed.is_empty() {
+            continue;
+        }
+        messages.push(
+            UserState {
+                session: Some(session),
+                listening_channel_remove: removed,
+                ..Default::default()
+            }
+            .into(),
+        );
+    }
+
     let mut sessions = sessions.into_iter().collect::<Vec<_>>();
     sessions.sort_by_key(|session| u32::from(*session));
     sessions.dedup();
 
-    let mut messages = Vec::new();
     for session in sessions {
         match server
             .get_clients()
@@ -547,12 +666,20 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
         }
         ChannelOp::DeleteChannel { id, .. } => {
             if let Some(visibility) = visibility {
-                let referenced_channel_ids = visibility.referenced_channel_ids();
-                let existing_channel_ids =
-                    channels.existing_channel_ids_in_server(&op.server_id, &referenced_channel_ids);
-                scope.include_sessions(
-                    visibility.sessions_referencing_deleted_channels(*id, &existing_channel_ids),
-                );
+                if let Some(deleted_channel_ids) = channels.delete_visibility_hint_for_operation(op)
+                {
+                    let deleted_channel_ids = deleted_channel_ids.iter().copied().collect();
+                    include_delete_visibility_refresh(&mut scope, visibility, &deleted_channel_ids);
+                } else {
+                    let referenced_channel_ids = visibility.referenced_channel_ids();
+                    let existing_channel_ids = channels
+                        .existing_channel_ids_in_server(&op.server_id, &referenced_channel_ids);
+                    let stale_channel_ids = referenced_channel_ids
+                        .into_iter()
+                        .filter(|channel_id| !existing_channel_ids.contains(channel_id))
+                        .collect();
+                    include_delete_visibility_refresh(&mut scope, visibility, &stale_channel_ids);
+                }
             } else {
                 scope.include_channel(*id);
                 scope.include_known_users();
@@ -568,6 +695,26 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
         | ChannelOp::RemoveLink { .. } => {}
     }
     scope
+}
+
+fn include_delete_visibility_refresh(
+    scope: &mut VisibilityRefreshScope,
+    visibility: &UserVisibilityState,
+    deleted_channel_ids: &HashSet<u32>,
+) {
+    let current_sessions = visibility.sessions_in_current_channels(deleted_channel_ids);
+    scope.include_sessions(current_sessions.iter().copied());
+
+    for channel_id in deleted_channel_ids {
+        if let Some(listener_sessions) = visibility.sessions_by_listener_channel.get(channel_id) {
+            for session in listener_sessions {
+                if current_sessions.contains(session) {
+                    continue;
+                }
+                scope.include_listener_channel_removal(*session, std::iter::once(*channel_id));
+            }
+        }
+    }
 }
 
 async fn visibility_refresh_scope_for_viewer_delta(
@@ -812,50 +959,131 @@ mod tests {
     }
 
     #[test]
-    fn delete_selector_includes_known_session_in_deleted_root() {
+    fn indexes_current_and_listener_channels_on_insert() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 42, channels(&[7, 8]));
+
+        assert_eq!(
+            visibility.sessions_in_current_channels(&channels(&[42])),
+            HashSet::from([session(10)])
+        );
+        assert_eq!(
+            visibility.sessions_listening_to_channels(&channels(&[7])),
+            HashSet::from([session(10)])
+        );
+    }
+
+    #[test]
+    fn indexes_remove_old_entries_on_insert_overwrite() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 42, channels(&[7]));
+        visibility.insert(session(10), 99, channels(&[8]));
+
+        assert!(
+            visibility
+                .sessions_in_current_channels(&channels(&[42]))
+                .is_empty()
+        );
+        assert!(
+            visibility
+                .sessions_listening_to_channels(&channels(&[7]))
+                .is_empty()
+        );
+        assert_eq!(
+            visibility.sessions_in_current_channels(&channels(&[99])),
+            HashSet::from([session(10)])
+        );
+        assert_eq!(
+            visibility.sessions_listening_to_channels(&channels(&[8])),
+            HashSet::from([session(10)])
+        );
+    }
+
+    #[test]
+    fn indexes_remove_entries_on_remove_and_clear() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 42, channels(&[7]));
+        visibility.insert(session(11), 43, channels(&[8]));
+
+        assert!(visibility.remove(session(10)));
+        assert!(
+            visibility
+                .sessions_in_current_channels(&channels(&[42]))
+                .is_empty()
+        );
+        assert!(
+            visibility
+                .sessions_listening_to_channels(&channels(&[7]))
+                .is_empty()
+        );
+
+        visibility.clear();
+        assert!(visibility.known_sessions().collect::<Vec<_>>().is_empty());
+        assert!(
+            visibility
+                .sessions_in_current_channels(&channels(&[43]))
+                .is_empty()
+        );
+        assert!(
+            visibility
+                .sessions_listening_to_channels(&channels(&[8]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn listener_cleanup_updates_known_state_and_indexes() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 42, channels(&[7, 8, 9]));
+
+        let removed = visibility.remove_visible_listener_channels(session(10), &channels(&[7, 9]));
+
+        assert_eq!(removed, vec![7, 9]);
+        assert_eq!(
+            visibility.get(session(10)).unwrap().listener_channels,
+            channels(&[8])
+        );
+        assert!(
+            visibility
+                .sessions_listening_to_channels(&channels(&[7, 9]))
+                .is_empty()
+        );
+        assert_eq!(
+            visibility.sessions_listening_to_channels(&channels(&[8])),
+            HashSet::from([session(10)])
+        );
+    }
+
+    #[test]
+    fn delete_scope_records_exact_listener_channel_removals() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 42, channels(&[7, 99]));
+        visibility.insert(session(11), 7, channels(&[8]));
+        visibility.insert(session(12), 43, channels(&[8]));
+
+        let mut scope = VisibilityRefreshScope::new();
+        include_delete_visibility_refresh(&mut scope, &visibility, &channels(&[7, 8]));
+
+        assert_eq!(scope.sessions, HashSet::from([session(11)]));
+        assert_eq!(
+            scope.listener_channel_removals.get(&session(10)).cloned(),
+            Some(channels(&[7]))
+        );
+        assert_eq!(
+            scope.listener_channel_removals.get(&session(12)).cloned(),
+            Some(channels(&[8]))
+        );
+        assert!(!scope.listener_channel_removals.contains_key(&session(11)));
+    }
+
+    #[test]
+    fn delete_scope_with_empty_deleted_set_skips_valid_listener_channels() {
         let mut visibility = UserVisibilityState::default();
         visibility.insert(session(10), 42, channels(&[7]));
 
-        let selected = visibility
-            .sessions_referencing_deleted_channels(42, &channels(&[0, 7]))
-            .collect::<HashSet<_>>();
+        let mut scope = VisibilityRefreshScope::new();
+        include_delete_visibility_refresh(&mut scope, &visibility, &HashSet::new());
 
-        assert_eq!(selected, HashSet::from([session(10)]));
-    }
-
-    #[test]
-    fn delete_selector_includes_known_session_with_deleted_listener_channel() {
-        let mut visibility = UserVisibilityState::default();
-        visibility.insert(session(10), 7, channels(&[42, 9]));
-
-        let selected = visibility
-            .sessions_referencing_deleted_channels(42, &channels(&[0, 7, 9]))
-            .collect::<HashSet<_>>();
-
-        assert_eq!(selected, HashSet::from([session(10)]));
-    }
-
-    #[test]
-    fn delete_selector_includes_known_session_with_missing_channel_reference() {
-        let mut visibility = UserVisibilityState::default();
-        visibility.insert(session(10), 7, channels(&[99]));
-
-        let selected = visibility
-            .sessions_referencing_deleted_channels(42, &channels(&[0, 7]))
-            .collect::<HashSet<_>>();
-
-        assert_eq!(selected, HashSet::from([session(10)]));
-    }
-
-    #[test]
-    fn delete_selector_ignores_unrelated_known_session() {
-        let mut visibility = UserVisibilityState::default();
-        visibility.insert(session(10), 7, channels(&[8, 9]));
-
-        let selected = visibility
-            .sessions_referencing_deleted_channels(42, &channels(&[0, 7, 8, 9]))
-            .collect::<HashSet<_>>();
-
-        assert!(selected.is_empty());
+        assert!(scope.is_empty());
     }
 }

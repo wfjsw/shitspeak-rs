@@ -677,6 +677,91 @@ async fn traverse_visibility_delete_refresh_skips_unrelated_known_users() {
 }
 
 #[tokio::test]
+async fn traverse_visibility_delete_refresh_removes_deleted_listener_channel() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(91, "Parent".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(92, "Child".to_owned(), 0, 0, Some(91)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice
+        .recv_until(
+            |m| matches!(m, Message::UserState(us) if us.session == Some(bob.session_id)),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob before listener add");
+
+    bob.send(
+        UserState {
+            session: Some(bob.server_session),
+            listening_channel_add: vec![92],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .await;
+    alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id)
+                        && us.listening_channel_add.contains(&92))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob listen to visible child");
+    alice.drain_now().await;
+
+    alice.remove_channel(91).await;
+    alice
+        .recv_until(
+            |m| matches!(m, Message::ChannelRemove(cr) if cr.channel_id == 91),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees parent removed");
+    let listener_remove = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id)
+                        && us.channel_id.is_none()
+                        && us.listening_channel_remove == vec![92])
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        listener_remove.is_some(),
+        "delete refresh should remove listener-only stale channels without a full refresh"
+    );
+}
+
+#[tokio::test]
 async fn traverse_visibility_hidden_users_are_missing_from_targeted_surfaces() {
     let server = spawn_test_server(TestServerOpts {
         hide_users_without_traverse: true,

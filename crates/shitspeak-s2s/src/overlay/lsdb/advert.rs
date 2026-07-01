@@ -830,7 +830,7 @@ enum EmitReason {
 
 fn unchanged_refresh_deadline(cfg: &OverlayConfig) -> Duration {
     cfg.lsa_unchanged_refresh_interval()
-        .min(cfg.lsa_max_age() / 2)
+        .min((cfg.lsa_max_age() / 3).max(Duration::from_millis(1)))
 }
 
 fn should_emit_content(
@@ -1325,6 +1325,15 @@ mod tests {
             EmitReason::Periodic,
             &cfg
         ));
+    }
+
+    #[test]
+    fn unchanged_refresh_deadline_leaves_room_before_lsa_expiry() {
+        let cfg = OverlayConfig::new(vec![])
+            .with_lsa_max_age(Duration::from_secs(5))
+            .with_lsa_unchanged_refresh_interval(Duration::from_secs(90));
+
+        assert_eq!(unchanged_refresh_deadline(&cfg), Duration::from_secs(5) / 3);
     }
 
     #[test]

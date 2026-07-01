@@ -521,6 +521,7 @@ pub struct ChannelRepository {
     /// In-memory log for `get_log_since` and future S2S queries.
     log: ParkingRwLock<std::collections::VecDeque<ChannelLogEntry>>,
     log_max_entries: usize,
+    delete_visibility_hints: ParkingRwLock<HashMap<(String, u64), Arc<[u32]>>>,
     /// Bumped whenever channel state can change effective ACL results.
     channel_acl_generation: AtomicU64,
     /// Per-channel ACL generations for targeted channel cache eviction.
@@ -575,6 +576,7 @@ impl ChannelRepository {
             versions: ParkingRwLock::new(versions),
             log: ParkingRwLock::new(std::collections::VecDeque::new()),
             log_max_entries: tuning.log_max_entries,
+            delete_visibility_hints: ParkingRwLock::new(HashMap::new()),
             channel_acl_generation: AtomicU64::new(0),
             channel_acl_generations: ParkingRwLock::new(HashMap::new()),
             acl_cache: HashCache::new(),
@@ -717,6 +719,7 @@ impl ChannelRepository {
             versions: ParkingRwLock::new(versions),
             log: ParkingRwLock::new(log_entries),
             log_max_entries: tuning.log_max_entries,
+            delete_visibility_hints: ParkingRwLock::new(HashMap::new()),
             channel_acl_generation: AtomicU64::new(0),
             channel_acl_generations: ParkingRwLock::new(HashMap::new()),
             acl_cache: HashCache::new(),
@@ -888,6 +891,19 @@ impl ChannelRepository {
             .copied()
             .filter(|id| *id == 0 || channels.contains_key(id))
             .collect()
+    }
+
+    pub(crate) fn delete_visibility_hint_for_operation(
+        &self,
+        op: &ChannelOperation,
+    ) -> Option<Arc<[u32]>> {
+        if !matches!(op.op, ChannelOp::DeleteChannel { .. }) || !op.emits_client_message {
+            return None;
+        }
+        self.delete_visibility_hints
+            .read()
+            .get(&(op.server_id.clone(), op.version))
+            .cloned()
     }
 
     pub async fn subtree_ids_in_server(&self, server_id: &str, root_id: u32) -> Vec<u32> {
@@ -1702,7 +1718,11 @@ impl ChannelRepository {
             );
         }
         let deleted = op.emits_client_message;
-        self.commit(op).await?;
+        self.commit_with_delete_visibility_hint(
+            op,
+            applied_delete.map(|applied_delete| applied_delete.deleted_ids),
+        )
+        .await?;
         Ok(deleted)
     }
 
@@ -2292,6 +2312,7 @@ impl ChannelRepository {
 
         let mut should_invalidate_acl = channel_op_invalidates_acl_cache(&op.op);
         let server_id = op.server_id.clone();
+        let mut deleted_channel_hint = None;
         let (evicting_pending_delete, affected_acl_channels) = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.clone()).or_default();
@@ -2317,6 +2338,7 @@ impl ChannelRepository {
                     op.emits_client_message = applied_delete.is_some();
                     should_invalidate_acl = applied_delete.is_some();
                     if let Some(applied_delete) = applied_delete {
+                        deleted_channel_hint = Some(applied_delete.deleted_ids.clone());
                         deleted_subtree =
                             Some(applied_delete.deleted_ids.iter().copied().collect());
                         applied_delete.link_topology_effect
@@ -2352,7 +2374,9 @@ impl ChannelRepository {
         if let Some(affected_acl_channels) = affected_acl_channels {
             self.invalidate_acl_cache_for_op_scope(&server_id, affected_acl_channels);
         }
-        let committed = self.commit_assigned_operation(op, strict_metadata).await?;
+        let committed = self
+            .commit_assigned_operation(op, strict_metadata, deleted_channel_hint)
+            .await?;
 
         if let Some((id, nonce)) = evicting_pending_delete {
             let subtree = self
@@ -2629,6 +2653,7 @@ impl ChannelRepository {
         &self,
         mut op: ChannelOperation,
         strict_metadata: Option<StrictReplicationMetadata>,
+        deleted_channel_ids: Option<Vec<u32>>,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
         let root_config = self.root_config.read().clone();
         op.op = normalize_op_for_root(&op.op, &root_config);
@@ -2641,8 +2666,20 @@ impl ChannelRepository {
                 .or_insert(op.version);
             let op = Arc::new(op);
             log.push_back(ChannelLogEntry::new(Arc::clone(&op), strict_metadata));
+            if let Some(mut deleted_channel_ids) = deleted_channel_ids {
+                deleted_channel_ids.sort_unstable();
+                deleted_channel_ids.dedup();
+                self.delete_visibility_hints.write().insert(
+                    (op.server_id.clone(), op.version),
+                    Arc::<[u32]>::from(deleted_channel_ids.into_boxed_slice()),
+                );
+            }
             while log.len() > self.log_max_entries {
-                log.pop_front();
+                if let Some(evicted) = log.pop_front() {
+                    self.delete_visibility_hints
+                        .write()
+                        .remove(&(evicted.op.server_id.clone(), evicted.op.version));
+                }
             }
             op
         };
@@ -2704,7 +2741,31 @@ impl ChannelRepository {
             "ChannelRepository version counter approaching u64::MAX — likely a bug"
         );
         op.version = version;
-        let _ = self.commit_assigned_operation(op, None).await?;
+        let _ = self.commit_assigned_operation(op, None, None).await?;
+        Ok(())
+    }
+
+    async fn commit_with_delete_visibility_hint(
+        &self,
+        mut op: ChannelOperation,
+        deleted_channel_ids: Option<Vec<u32>>,
+    ) -> Result<(), ChannelRepoError> {
+        let root_config = self.root_config.read().clone();
+        op.op = normalize_op_for_root(&op.op, &root_config);
+        let version = {
+            let mut versions = self.versions.write();
+            let version = versions.entry(op.server_id.clone()).or_insert(0);
+            *version += 1;
+            *version
+        };
+        debug_assert!(
+            version < u64::MAX - 1_000_000,
+            "ChannelRepository version counter approaching u64::MAX — likely a bug"
+        );
+        op.version = version;
+        let _ = self
+            .commit_assigned_operation(op, None, deleted_channel_ids)
+            .await?;
         Ok(())
     }
 
@@ -3384,6 +3445,17 @@ mod tests {
         ChannelRepository::new_in_memory(1, root_config(), tuning())
     }
 
+    fn repo_with_log_max_entries(log_max_entries: usize) -> Arc<ChannelRepository> {
+        ChannelRepository::new_in_memory(
+            1,
+            root_config(),
+            ChannelRepoTuning {
+                log_max_entries,
+                ..tuning()
+            },
+        )
+    }
+
     fn effective_group(repo: &ChannelRepository, channel_id: u32) -> Vec<u32> {
         repo.effective_link_group_in_server(DEFAULT_SERVER_ID, channel_id)
             .map(|group| group.as_ref().to_vec())
@@ -3549,6 +3621,82 @@ mod tests {
         assert!(effective_group(&repo, 6).is_empty());
         assert!(repo.get_channel(1).await.unwrap().links.is_empty());
         assert!(repo.get_channel(3).await.unwrap().links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_visibility_hint_is_stored_for_successful_delete() {
+        let repo = repo();
+        repo.create_channel(Channel::new(2, "parent", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(3, "child", 0, 0, Some(2)))
+            .await
+            .unwrap();
+        repo.mark_pending_delete(2, 99).await.unwrap();
+        repo.apply_delete_channel(2, 99).await.unwrap();
+
+        let op = repo
+            .get_log_since(0)
+            .await
+            .into_iter()
+            .find(|op| matches!(op.op, ChannelOp::DeleteChannel { id: 2, .. }))
+            .expect("delete op");
+        let hint = repo
+            .delete_visibility_hint_for_operation(&op)
+            .expect("successful delete stores hint");
+
+        assert_eq!(hint.as_ref(), &[2, 3]);
+    }
+
+    #[tokio::test]
+    async fn delete_visibility_hint_is_absent_for_stale_no_op_delete() {
+        let repo = repo();
+        repo.create_channel(Channel::new(2, "parent", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.mark_pending_delete(2, 99).await.unwrap();
+        repo.apply_delete_channel(2, 100).await.unwrap();
+
+        let op = repo
+            .get_log_since(0)
+            .await
+            .into_iter()
+            .find(|op| matches!(op.op, ChannelOp::DeleteChannel { id: 2, .. }))
+            .expect("delete op");
+
+        assert!(repo.delete_visibility_hint_for_operation(&op).is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_visibility_hint_is_pruned_with_channel_log() {
+        let repo = repo_with_log_max_entries(1);
+        repo.create_channel(Channel::new(2, "doomed", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.mark_pending_delete(2, 99).await.unwrap();
+        repo.apply_delete_channel(2, 99).await.unwrap();
+        let delete_op = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: repo.current_version(),
+            node_id: 1,
+            timestamp: 0,
+            emits_client_message: true,
+            op: ChannelOp::DeleteChannel { id: 2, nonce: 99 },
+        };
+
+        assert!(
+            repo.delete_visibility_hint_for_operation(&delete_op)
+                .is_some()
+        );
+
+        repo.create_channel(Channel::new(3, "after", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        assert!(
+            repo.delete_visibility_hint_for_operation(&delete_op)
+                .is_none()
+        );
     }
 
     #[tokio::test]

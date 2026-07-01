@@ -509,25 +509,30 @@ impl StrictState {
             .min()
     }
 
-    /// Fail every in-flight proposal whose still-alive target subset has
-    /// shrunk below fast-quorum. Returns the wakers to fire externally
-    /// (locking discipline: state lock held during the search, then
-    /// released before sending).
+    /// Fail every in-flight proposal whose received acks plus still-reachable
+    /// missing targets can no longer reach fast-quorum. Returns the wakers to
+    /// fire externally (locking discipline: state lock held during the search,
+    /// then released before sending).
     pub fn fail_quorum_lost(
         &mut self,
         alive: &HashSet<NodeIdentifier>,
-    ) -> Vec<oneshot::Sender<Result<u64, ReplicationError>>> {
+    ) -> Vec<(OpId, oneshot::Sender<Result<u64, ReplicationError>>)> {
         let mut to_fire = Vec::new();
         let mut to_remove = Vec::new();
         for (op_id, p) in self.proposals.iter_mut() {
             if p.committed {
                 continue;
             }
-            let still = p.target_set.iter().filter(|n| alive.contains(*n)).count();
             let fq = fast_quorum_size(p.target_set.len());
-            if still < fq {
+            let reachable_missing = p
+                .target_set
+                .iter()
+                .filter(|n| alive.contains(*n) && !p.acks.contains_key(*n))
+                .count();
+            let possible_acks = p.acks.len() + reachable_missing;
+            if possible_acks < fq {
                 if let Some(w) = p.waker.take() {
-                    to_fire.push(w);
+                    to_fire.push((*op_id, w));
                 }
                 to_remove.push(*op_id);
             }
@@ -700,17 +705,27 @@ impl StrictState {
             .retain(|_, ts_final| *ts_final >= dhw);
     }
 
-    /// Drop pending_proposes entries older than `pending_propose_ttl`.
+    /// Drop pending_proposes entries older than `pending_propose_ttl` only
+    /// after their coordinator is no longer alive and they no longer protect
+    /// the ordering of buffered commits.
     /// Returns the dropped op-ids for logging.
     pub fn gc_stale_pending_proposes(
         &mut self,
         now: Instant,
         pending_propose_ttl: Duration,
+        alive: &HashSet<NodeIdentifier>,
     ) -> Vec<OpId> {
         let mut dropped = Vec::new();
+        let max_buffered_ts = self.commit_buffer.keys().next_back().map(|(ts, _)| *ts);
         self.pending_proposes.retain(|op_id, p| {
             let stale = now.duration_since(p.seen_at) >= pending_propose_ttl;
+            let coord_alive = alive.contains(&p.coord_node);
+            let protects_buffered_commit =
+                max_buffered_ts.is_some_and(|ts| ts >= p.ts_local);
             if stale {
+                if coord_alive || protects_buffered_commit {
+                    return true;
+                }
                 dropped.push(*op_id);
             }
             !stale
@@ -1755,25 +1770,39 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// longer reach fast-quorum, and initiates slow-path recovery for any
     /// pending Propose whose coord just died.
     pub fn on_membership_change(&self, ev: &MembershipEvent) {
-        let alive_set: HashSet<NodeIdentifier> = self
-            .net
-            .alive_members()
-            .into_iter()
-            .chain([self.self_id])
-            .collect();
-        let wakers = {
-            let mut s = self.state.lock();
-            s.fail_quorum_lost(&alive_set)
-        };
-        for w in wakers {
-            let _ = w.send(Err(ReplicationError::QuorumLost));
-        }
         // If a coord died (Failed or Left), we may need to take over
         // recovery for any of its in-flight Proposes we hold.
         let failed_coord = match ev {
             MembershipEvent::Failed(n) | MembershipEvent::Left(n) => Some(*n),
             _ => None,
         };
+        let peer_removed = matches!(
+            ev,
+            MembershipEvent::Failed(_) | MembershipEvent::Left(_) | MembershipEvent::Restarted(_)
+        );
+        if peer_removed {
+            let alive_set: HashSet<NodeIdentifier> = self
+                .net
+                .alive_members()
+                .into_iter()
+                .chain([self.self_id])
+                .collect();
+            let wakers = {
+                let mut s = self.state.lock();
+                s.fail_quorum_lost(&alive_set)
+            };
+            for (op_id, w) in wakers {
+                warn!(
+                    topic = %self.topic,
+                    op_id_hi = op_id.0,
+                    op_id_lo = op_id.1,
+                    alive = ?alive_set,
+                    event = ?ev,
+                    "strict proposal failed because fast quorum became unreachable"
+                );
+                let _ = w.send(Err(ReplicationError::QuorumLost));
+            }
+        }
         if let Some(coord) = failed_coord {
             // Spawn a task — maybe_initiate_recovery is async (needs the
             // network). Upgrade the weak self-pointer set in `new()`.
@@ -2222,8 +2251,10 @@ fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     // ts_final entries that have been delivered everywhere, and drop
     // hung in-progress recoveries that never reached quorum.
     {
+        let alive: HashSet<NodeIdentifier> =
+            rt.net.alive_members().into_iter().chain([rt.self_id]).collect();
         let mut s = rt.state.lock();
-        let _dropped = s.gc_stale_pending_proposes(now, rt.cfg.pending_propose_ttl());
+        let _dropped = s.gc_stale_pending_proposes(now, rt.cfg.pending_propose_ttl(), &alive);
         s.gc_committed_ts_final();
     }
     {
@@ -2801,6 +2832,38 @@ mod tests {
     }
 
     #[test]
+    fn fail_quorum_lost_counts_already_received_acks() {
+        let mut s = StrictState::new();
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let (tx, _rx) = oneshot::channel();
+        let target = HashSet::from([10u16, 20, 30, 40]);
+        let op_id: OpId = (4, 4);
+        s.proposals.insert(
+            op_id,
+            Proposal {
+                op_msgpack: Bytes::new(),
+                ts_propose: 1,
+                acks: HashMap::from([(10, 1), (30, 2)]),
+                target_set: target,
+                accepted_waker: None,
+                waker: Some(tx),
+                committed: false,
+                started_at: Instant::now(),
+                _permit: permit,
+            },
+        );
+
+        // fast_quorum(4) = 3. Even though only {10, 20} are still alive,
+        // ack from 30 was already received, so ack(10) + ack(30) +
+        // reachable missing 20 can still reach quorum.
+        let alive: HashSet<NodeIdentifier> = [10u16, 20].into_iter().collect();
+        let wakers = s.fail_quorum_lost(&alive);
+
+        assert_eq!(wakers.len(), 0);
+        assert_eq!(s.proposals.len(), 1);
+    }
+
+    #[test]
     fn gc_stale_proposals_fires_after_ttl() {
         let cfg = ReplicationConfig::default();
         let mut s = StrictState::new();
@@ -3276,10 +3339,40 @@ mod tests {
         let fresh_at = Instant::now();
         s.record_pending_propose((1, 1), 5, Bytes::new(), 1, stale_at);
         s.record_pending_propose((2, 2), 5, Bytes::new(), 2, fresh_at);
-        let dropped = s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl());
+        let alive = HashSet::new();
+        let dropped = s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
         assert_eq!(dropped, vec![(1, 1)]);
         assert_eq!(s.pending_proposes.len(), 1);
         assert!(s.pending_proposes.contains_key(&(2, 2)));
+    }
+
+    #[test]
+    fn gc_stale_pending_proposes_keeps_entries_from_alive_coord() {
+        let cfg = ReplicationConfig::default();
+        let mut s = StrictState::new();
+        let stale_at = Instant::now() - cfg.pending_propose_ttl() - Duration::from_secs(1);
+        s.record_pending_propose((1, 1), 5, Bytes::new(), 40, stale_at);
+        let alive = HashSet::from([5u16]);
+
+        let dropped = s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
+
+        assert!(dropped.is_empty());
+        assert!(s.pending_proposes.contains_key(&(1, 1)));
+    }
+
+    #[test]
+    fn gc_stale_pending_proposes_keeps_ordering_barriers_for_later_commits() {
+        let cfg = ReplicationConfig::default();
+        let mut s = StrictState::new();
+        let stale_at = Instant::now() - cfg.pending_propose_ttl() - Duration::from_secs(1);
+        s.record_pending_propose((1, 1), 5, Bytes::new(), 40, stale_at);
+        s.buffer_commit((2, 2), 50, Bytes::new());
+        let alive = HashSet::new();
+
+        let dropped = s.gc_stale_pending_proposes(Instant::now(), cfg.pending_propose_ttl(), &alive);
+
+        assert!(dropped.is_empty());
+        assert!(s.pending_proposes.contains_key(&(1, 1)));
     }
 
     #[test]
