@@ -1507,8 +1507,10 @@ async fn send_web_channel_log_update(
         .await?;
     }
     let refresh_scope =
-        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation(
-            &server, &op,
+        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+            &server,
+            &op,
+            &session.user_visibility,
         )
         .await;
     send_web_visibility_refresh(
@@ -1573,8 +1575,10 @@ async fn send_web_channel_log_gap(
             .await?;
         }
         let refresh_scope =
-            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation(
-                &server, &op,
+            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+                &server,
+                &op,
+                &session.user_visibility,
             )
             .await;
         send_web_visibility_refresh(

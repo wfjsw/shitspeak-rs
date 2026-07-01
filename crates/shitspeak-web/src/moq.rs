@@ -946,8 +946,10 @@ impl MoqSessionRuntime {
             );
         }
         let refresh_scope =
-            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation(
-                &server, &op,
+            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+                &server,
+                &op,
+                &self.user_visibility,
             )
             .await;
         events.extend(
@@ -1007,8 +1009,10 @@ impl MoqSessionRuntime {
                 );
             }
             let refresh_scope =
-                shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation(
-                    &server, &op,
+                shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+                    &server,
+                    &op,
+                    &self.user_visibility,
                 )
                 .await;
             events.extend(

@@ -45,6 +45,13 @@ impl VisibilityRefreshScope {
         self.sessions.insert(session);
     }
 
+    pub fn include_sessions(
+        &mut self,
+        sessions: impl IntoIterator<Item = ClientSessionIdentifier>,
+    ) {
+        self.sessions.extend(sessions);
+    }
+
     pub fn include_channel(&mut self, channel_id: u32) {
         self.channels.insert(channel_id);
     }
@@ -122,6 +129,30 @@ impl UserVisibilityState {
                     .listener_channels
                     .iter()
                     .any(|channel_id| channel_ids.contains(channel_id)))
+            .then_some(*session)
+        })
+    }
+
+    fn referenced_channel_ids(&self) -> HashSet<u32> {
+        let mut channel_ids = HashSet::new();
+        for known in self.known.values() {
+            channel_ids.insert(known.channel_id);
+            channel_ids.extend(known.listener_channels.iter().copied());
+        }
+        channel_ids
+    }
+
+    fn sessions_referencing_deleted_channels<'a>(
+        &'a self,
+        deleted_root_id: u32,
+        existing_channel_ids: &'a HashSet<u32>,
+    ) -> impl Iterator<Item = ClientSessionIdentifier> + 'a {
+        self.known.iter().filter_map(move |(session, known)| {
+            (known.channel_id == deleted_root_id
+                || !existing_channel_ids.contains(&known.channel_id)
+                || known.listener_channels.iter().any(|channel_id| {
+                    *channel_id == deleted_root_id || !existing_channel_ids.contains(channel_id)
+                }))
             .then_some(*session)
         })
     }
@@ -480,6 +511,22 @@ pub async fn visibility_refresh_scope_for_channel_operation(
     server: &Arc<Box<Server>>,
     op: &ChannelOperation,
 ) -> VisibilityRefreshScope {
+    visibility_refresh_scope_for_channel_operation_inner(server, op, None).await
+}
+
+pub async fn visibility_refresh_scope_for_channel_operation_with_state(
+    server: &Arc<Box<Server>>,
+    op: &ChannelOperation,
+    visibility: &UserVisibilityState,
+) -> VisibilityRefreshScope {
+    visibility_refresh_scope_for_channel_operation_inner(server, op, Some(visibility)).await
+}
+
+async fn visibility_refresh_scope_for_channel_operation_inner(
+    server: &Arc<Box<Server>>,
+    op: &ChannelOperation,
+    visibility: Option<&UserVisibilityState>,
+) -> VisibilityRefreshScope {
     let mut scope = VisibilityRefreshScope::new();
     let channels = server.get_channels();
     match &op.op {
@@ -499,8 +546,17 @@ pub async fn visibility_refresh_scope_for_channel_operation(
             );
         }
         ChannelOp::DeleteChannel { id, .. } => {
-            scope.include_channel(*id);
-            scope.include_known_users();
+            if let Some(visibility) = visibility {
+                let referenced_channel_ids = visibility.referenced_channel_ids();
+                let existing_channel_ids =
+                    channels.existing_channel_ids_in_server(&op.server_id, &referenced_channel_ids);
+                scope.include_sessions(
+                    visibility.sessions_referencing_deleted_channels(*id, &existing_channel_ids),
+                );
+            } else {
+                scope.include_channel(*id);
+                scope.include_known_users();
+            }
         }
         ChannelOp::InstallSnapshot { channels, .. } => {
             scope.include_channels(channels.iter().map(|channel| channel.id));
@@ -741,4 +797,65 @@ fn user_state_delta_empty(state: &UserState) -> bool {
         && state.listening_channel_add.is_empty()
         && state.listening_channel_remove.is_empty()
         && state.listening_volume_adjustment.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: u32) -> ClientSessionIdentifier {
+        ClientSessionIdentifier::new(1, id).expect("valid session")
+    }
+
+    fn channels(ids: &[u32]) -> HashSet<u32> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn delete_selector_includes_known_session_in_deleted_root() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 42, channels(&[7]));
+
+        let selected = visibility
+            .sessions_referencing_deleted_channels(42, &channels(&[0, 7]))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(selected, HashSet::from([session(10)]));
+    }
+
+    #[test]
+    fn delete_selector_includes_known_session_with_deleted_listener_channel() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 7, channels(&[42, 9]));
+
+        let selected = visibility
+            .sessions_referencing_deleted_channels(42, &channels(&[0, 7, 9]))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(selected, HashSet::from([session(10)]));
+    }
+
+    #[test]
+    fn delete_selector_includes_known_session_with_missing_channel_reference() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 7, channels(&[99]));
+
+        let selected = visibility
+            .sessions_referencing_deleted_channels(42, &channels(&[0, 7]))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(selected, HashSet::from([session(10)]));
+    }
+
+    #[test]
+    fn delete_selector_ignores_unrelated_known_session() {
+        let mut visibility = UserVisibilityState::default();
+        visibility.insert(session(10), 7, channels(&[8, 9]));
+
+        let selected = visibility
+            .sessions_referencing_deleted_channels(42, &channels(&[0, 7, 8, 9]))
+            .collect::<HashSet<_>>();
+
+        assert!(selected.is_empty());
+    }
 }

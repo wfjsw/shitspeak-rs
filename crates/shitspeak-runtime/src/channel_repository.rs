@@ -419,6 +419,77 @@ impl LinkTopology {
     fn group_for(&self, channel_id: u32) -> Option<Arc<[u32]>> {
         self.groups_by_channel.get(&channel_id).cloned()
     }
+
+    fn remove_deleted_channels(&mut self, channels: &HashMap<u32, Channel>, deleted_ids: &[u32]) {
+        let deleted_ids: HashSet<u32> = deleted_ids.iter().copied().collect();
+        let mut affected_ids = HashSet::new();
+
+        for deleted_id in &deleted_ids {
+            if let Some(group) = self.groups_by_channel.get(deleted_id) {
+                for &member_id in group.iter() {
+                    if !deleted_ids.contains(&member_id) && channels.contains_key(&member_id) {
+                        affected_ids.insert(member_id);
+                    }
+                }
+            }
+        }
+
+        for deleted_id in &deleted_ids {
+            self.groups_by_channel.remove(deleted_id);
+        }
+        if affected_ids.is_empty() {
+            return;
+        }
+
+        for affected_id in &affected_ids {
+            self.groups_by_channel.remove(affected_id);
+        }
+
+        let mut visited = HashSet::new();
+        for &start in &affected_ids {
+            if !visited.insert(start) {
+                continue;
+            }
+
+            let mut component = Vec::new();
+            let mut queue = VecDeque::new();
+            queue.push_back(start);
+
+            while let Some(id) = queue.pop_front() {
+                component.push(id);
+                let Some(channel) = channels.get(&id) else {
+                    continue;
+                };
+                for &next in &channel.links {
+                    if affected_ids.contains(&next) && visited.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+
+            if component.len() <= 1 {
+                continue;
+            }
+
+            component.sort_unstable();
+            let group = Arc::<[u32]>::from(component.into_boxed_slice());
+            for &id in group.iter() {
+                self.groups_by_channel.insert(id, Arc::clone(&group));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkTopologyEffect {
+    Unchanged,
+    DeletedChannels(Vec<u32>),
+    Rebuild,
+}
+
+struct DeleteChannelApplied {
+    deleted_ids: Vec<u32>,
+    link_topology_effect: LinkTopologyEffect,
 }
 
 fn channel_op_affects_link_topology(op: &ChannelOp) -> bool {
@@ -429,8 +500,8 @@ fn channel_op_affects_link_topology(op: &ChannelOp) -> bool {
             links_remove,
             ..
         } => !links_add.is_empty() || !links_remove.is_empty(),
-        ChannelOp::DeleteChannel { .. }
-        | ChannelOp::AddLink { .. }
+        ChannelOp::DeleteChannel { .. } => false,
+        ChannelOp::AddLink { .. }
         | ChannelOp::RemoveLink { .. }
         | ChannelOp::InstallSnapshot { .. } => true,
         ChannelOp::UpdateChannel { .. }
@@ -799,6 +870,24 @@ impl ChannelRepository {
             .and_then(|channels| channels.get(&id))
             .cloned()
             .or_else(|| (id == 0).then(|| self.root_channel()))
+    }
+
+    pub(crate) fn existing_channel_ids_in_server(
+        &self,
+        server_id: &str,
+        ids: &HashSet<u32>,
+    ) -> HashSet<u32> {
+        if ids.is_empty() {
+            return HashSet::new();
+        }
+        let channels = self.channels.read();
+        let Some(channels) = channels.get(server_id) else {
+            return ids.iter().copied().filter(|id| *id == 0).collect();
+        };
+        ids.iter()
+            .copied()
+            .filter(|id| *id == 0 || channels.contains_key(id))
+            .collect()
     }
 
     pub async fn subtree_ids_in_server(&self, server_id: &str, root_id: u32) -> Vec<u32> {
@@ -1245,11 +1334,19 @@ impl ChannelRepository {
                 if !channels.contains_key(&pid) && pid != 0 {
                     return Err(ChannelRepoError::ParentNotFound(pid));
                 }
+                if channels
+                    .get(&pid)
+                    .is_some_and(|parent| parent.is_temporary())
+                {
+                    return Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(pid));
+                }
             }
 
             if channels.contains_key(&channel.id) {
                 channel.id = next_available_channel_id(channels, channel.is_temporary());
             }
+
+            validate_new_channel_links(channels, &channel)?;
 
             // Validate name uniqueness within parent
             if channels.values().any(|c| {
@@ -1308,6 +1405,12 @@ impl ChannelRepository {
                 if let Some(pid) = new_parent {
                     if !channels.contains_key(&pid) {
                         return Err(ChannelRepoError::ParentNotFound(pid));
+                    }
+                    if channels
+                        .get(&pid)
+                        .is_some_and(|parent| parent.is_temporary())
+                    {
+                        return Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(pid));
                     }
                     // Ensure we aren't moving into a descendant
                     if is_descendant(&channels, pid, id) {
@@ -1384,6 +1487,12 @@ impl ChannelRepository {
                     if !channels.contains_key(&pid) {
                         return Err(ChannelRepoError::ParentNotFound(pid));
                     }
+                    if channels
+                        .get(&pid)
+                        .is_some_and(|parent| parent.is_temporary())
+                    {
+                        return Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(pid));
+                    }
                     if is_descendant(&channels, pid, id) {
                         return Err(ChannelRepoError::CannotMoveIntoDescendant);
                     }
@@ -1400,12 +1509,18 @@ impl ChannelRepository {
                 }
             }
 
+            if !links_add.is_empty() && channels[&id].is_temporary() {
+                return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(id));
+            }
             for &link_add in &links_add {
                 if link_add == id {
                     continue;
                 }
                 if !channels.contains_key(&link_add) {
                     return Err(ChannelRepoError::NotFound(link_add));
+                }
+                if channels[&link_add].is_temporary() {
+                    return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(link_add));
                 }
             }
 
@@ -1559,35 +1674,32 @@ impl ChannelRepository {
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
-        let affected_acl_channels = {
+        let applied_delete = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
-            let Some(channel) = channels.get(&id) else {
+            if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
             };
-            let can_delete = channel
-                .pending_delete
-                .as_ref()
-                .is_some_and(|pending| pending.nonce == nonce);
-            if can_delete {
-                let to_delete = collect_subtree(&channels, id);
-                for del_id in &to_delete {
-                    channels.remove(del_id);
-                }
-                remove_links_to_channels(channels, &to_delete);
-                let mut link_topologies = self.link_topologies.write();
-                sync_link_topology_for_server(&mut link_topologies, server_id, channels);
-                Some(to_delete.into_iter().collect())
-            } else {
-                None
+            let applied_delete = apply_delete_channel_to_map(channels, id, nonce);
+            if let Some(applied_delete) = &applied_delete {
+                apply_link_topology_effect(
+                    &self.link_topologies,
+                    server_id,
+                    channels,
+                    applied_delete.link_topology_effect.clone(),
+                );
             }
+            applied_delete
         };
         let mut op = self.make_op_in_server(server_id, ChannelOp::DeleteChannel { id, nonce });
-        op.emits_client_message = affected_acl_channels.is_some();
-        if let Some(affected_acl_channels) = affected_acl_channels {
-            self.invalidate_acl_cache_for_op_scope(server_id, affected_acl_channels);
+        op.emits_client_message = applied_delete.is_some();
+        if let Some(applied_delete) = &applied_delete {
+            self.invalidate_acl_cache_for_op_scope(
+                server_id,
+                applied_delete.deleted_ids.iter().copied().collect(),
+            );
         }
         let deleted = op.emits_client_message;
         self.commit(op).await?;
@@ -1659,6 +1771,12 @@ impl ChannelRepository {
             }
             if !channels.contains_key(&b) {
                 return Err(ChannelRepoError::NotFound(b));
+            }
+            if channels[&a].is_temporary() {
+                return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(a));
+            }
+            if channels[&b].is_temporary() {
+                return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(b));
             }
             channels.get_mut(&a).unwrap().links.insert(b);
             channels.get_mut(&b).unwrap().links.insert(a);
@@ -2093,25 +2211,33 @@ impl ChannelRepository {
             let normalized_op = normalize_op_for_root(&op.op, &root_config);
             let mut should_invalidate_acl = channel_op_invalidates_acl_cache(&normalized_op);
             let mut deleted_subtree = None;
-            if let ChannelOp::DeleteChannel { id, nonce } = &normalized_op {
-                let can_delete = channels
-                    .get(id)
-                    .and_then(|ch| ch.pending_delete.as_ref())
-                    .is_some_and(|pending| pending.nonce == *nonce);
-                should_invalidate_acl = can_delete;
-                if can_delete {
-                    deleted_subtree = Some(
-                        collect_subtree(channels, *id)
-                            .into_iter()
-                            .collect::<HashSet<_>>(),
-                    );
+            let link_topology_effect = match &normalized_op {
+                ChannelOp::DeleteChannel { id, nonce } => {
+                    let applied_delete = apply_delete_channel_to_map(channels, *id, *nonce);
+                    should_invalidate_acl = applied_delete.is_some();
+                    if let Some(applied_delete) = applied_delete {
+                        deleted_subtree =
+                            Some(applied_delete.deleted_ids.iter().copied().collect());
+                        applied_delete.link_topology_effect
+                    } else {
+                        LinkTopologyEffect::Unchanged
+                    }
                 }
-            }
-            apply_op_to_map(channels, &normalized_op, op.node_id, &root_config);
-            if channel_op_affects_link_topology(&normalized_op) {
-                let mut link_topologies = self.link_topologies.write();
-                sync_link_topology_for_server(&mut link_topologies, &op.server_id, channels);
-            }
+                _ => {
+                    apply_op_to_map(channels, &normalized_op, op.node_id, &root_config);
+                    if channel_op_affects_link_topology(&normalized_op) {
+                        LinkTopologyEffect::Rebuild
+                    } else {
+                        LinkTopologyEffect::Unchanged
+                    }
+                }
+            };
+            apply_link_topology_effect(
+                &self.link_topologies,
+                &op.server_id,
+                channels,
+                link_topology_effect,
+            );
             let affected_acl_channels = if deleted_subtree.is_some() {
                 deleted_subtree
             } else {
@@ -2182,29 +2308,37 @@ impl ChannelRepository {
                     let _ = channel;
                     (*id, *nonce)
                 }),
-                ChannelOp::DeleteChannel { id, nonce } => {
-                    let can_delete = channels
-                        .get(id)
-                        .and_then(|ch| ch.pending_delete.as_ref())
-                        .is_some_and(|pending| pending.nonce == *nonce);
-                    op.emits_client_message = can_delete;
-                    should_invalidate_acl = can_delete;
-                    if can_delete {
-                        deleted_subtree = Some(
-                            collect_subtree(channels, *id)
-                                .into_iter()
-                                .collect::<HashSet<_>>(),
-                        );
-                    }
-                    None
-                }
+                ChannelOp::DeleteChannel { .. } => None,
                 _ => None,
             };
-            apply_op_to_map(channels, &op.op, op.node_id, &root_config);
-            if channel_op_affects_link_topology(&op.op) {
-                let mut link_topologies = self.link_topologies.write();
-                sync_link_topology_for_server(&mut link_topologies, &server_id, channels);
-            }
+            let link_topology_effect = match &op.op {
+                ChannelOp::DeleteChannel { id, nonce } => {
+                    let applied_delete = apply_delete_channel_to_map(channels, *id, *nonce);
+                    op.emits_client_message = applied_delete.is_some();
+                    should_invalidate_acl = applied_delete.is_some();
+                    if let Some(applied_delete) = applied_delete {
+                        deleted_subtree =
+                            Some(applied_delete.deleted_ids.iter().copied().collect());
+                        applied_delete.link_topology_effect
+                    } else {
+                        LinkTopologyEffect::Unchanged
+                    }
+                }
+                _ => {
+                    apply_op_to_map(channels, &op.op, op.node_id, &root_config);
+                    if channel_op_affects_link_topology(&op.op) {
+                        LinkTopologyEffect::Rebuild
+                    } else {
+                        LinkTopologyEffect::Unchanged
+                    }
+                }
+            };
+            apply_link_topology_effect(
+                &self.link_topologies,
+                &server_id,
+                channels,
+                link_topology_effect,
+            );
             let affected_acl_channels = if deleted_subtree.is_some() {
                 deleted_subtree
             } else {
@@ -2385,7 +2519,14 @@ impl ChannelRepository {
                     if !channels.contains_key(&pid) && pid != 0 {
                         return Err(ChannelRepoError::ParentNotFound(pid));
                     }
+                    if channels
+                        .get(&pid)
+                        .is_some_and(|parent| parent.is_temporary())
+                    {
+                        return Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(pid));
+                    }
                 }
+                validate_new_channel_links(channels, channel)?;
                 if channels.values().any(|c| {
                     c.parent_id == channel.parent_id && c.name == channel.name && c.id != channel.id
                 }) {
@@ -2400,6 +2541,12 @@ impl ChannelRepository {
                     if let Some(pid) = new_parent {
                         if !channels.contains_key(&pid) {
                             return Err(ChannelRepoError::ParentNotFound(pid));
+                        }
+                        if channels
+                            .get(&pid)
+                            .is_some_and(|parent| parent.is_temporary())
+                        {
+                            return Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(pid));
                         }
                         if is_descendant(&channels, pid, *id) {
                             return Err(ChannelRepoError::CannotMoveIntoDescendant);
@@ -2416,9 +2563,15 @@ impl ChannelRepository {
                     }
                 }
                 if let ChannelOp::EditChannel { links_add, .. } = &op {
+                    if !links_add.is_empty() && channels[id].is_temporary() {
+                        return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(*id));
+                    }
                     for &link_add in links_add {
                         if link_add != *id && !channels.contains_key(&link_add) {
                             return Err(ChannelRepoError::NotFound(link_add));
+                        }
+                        if link_add != *id && channels[&link_add].is_temporary() {
+                            return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(link_add));
                         }
                     }
                 }
@@ -2453,6 +2606,12 @@ impl ChannelRepository {
                 }
                 if !channels.contains_key(b) {
                     return Err(ChannelRepoError::NotFound(*b));
+                }
+                if channels[a].is_temporary() {
+                    return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(*a));
+                }
+                if channels[b].is_temporary() {
+                    return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(*b));
                 }
             }
             ChannelOp::RemoveLink { .. } => {}
@@ -2592,6 +2751,53 @@ fn next_available_channel_id(channels: &HashMap<u32, Channel>, temporary: bool) 
     }
 }
 
+fn validate_new_channel_links(
+    channels: &HashMap<u32, Channel>,
+    channel: &Channel,
+) -> Result<(), ChannelRepoError> {
+    if channel.links.is_empty() {
+        return Ok(());
+    }
+    if channel.is_temporary() {
+        return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(channel.id));
+    }
+    for &linked_id in &channel.links {
+        if linked_id == channel.id {
+            continue;
+        }
+        if !channels.contains_key(&linked_id) {
+            return Err(ChannelRepoError::NotFound(linked_id));
+        }
+        if channels[&linked_id].is_temporary() {
+            return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(linked_id));
+        }
+    }
+    Ok(())
+}
+
+fn apply_link_topology_effect(
+    link_topologies: &ParkingRwLock<HashMap<String, LinkTopology>>,
+    server_id: &str,
+    channels: &mut HashMap<u32, Channel>,
+    effect: LinkTopologyEffect,
+) {
+    match effect {
+        LinkTopologyEffect::Unchanged => {}
+        LinkTopologyEffect::DeletedChannels(deleted_ids) => {
+            let mut link_topologies = link_topologies.write();
+            if let Some(topology) = link_topologies.get_mut(server_id) {
+                topology.remove_deleted_channels(channels, &deleted_ids);
+            } else {
+                sync_link_topology_for_server(&mut link_topologies, server_id, channels);
+            }
+        }
+        LinkTopologyEffect::Rebuild => {
+            let mut link_topologies = link_topologies.write();
+            sync_link_topology_for_server(&mut link_topologies, server_id, channels);
+        }
+    }
+}
+
 /// Apply a `ChannelOp` to the in-memory channel map.
 fn apply_op_to_map(
     channels: &mut HashMap<u32, Channel>,
@@ -2652,17 +2858,7 @@ fn apply_op_to_map(
             }
         }
         ChannelOp::DeleteChannel { id, nonce } => {
-            let can_delete = channels
-                .get(id)
-                .and_then(|ch| ch.pending_delete.as_ref())
-                .is_some_and(|pending| pending.nonce == *nonce);
-            if can_delete {
-                let to_delete = collect_subtree(channels, *id);
-                for del_id in &to_delete {
-                    channels.remove(del_id);
-                }
-                remove_links_to_channels(channels, &to_delete);
-            }
+            let _ = apply_delete_channel_to_map(channels, *id, *nonce);
         }
         ChannelOp::CancelPendingDelete { id, nonce } => {
             let to_cancel = collect_subtree(channels, *id);
@@ -2738,6 +2934,39 @@ fn apply_patch(ch: &mut Channel, patch: &ChannelPatch) {
     }
 }
 
+fn apply_delete_channel_to_map(
+    channels: &mut HashMap<u32, Channel>,
+    id: u32,
+    nonce: u64,
+) -> Option<DeleteChannelApplied> {
+    let channel = channels.get(&id)?;
+    if !channel
+        .pending_delete
+        .as_ref()
+        .is_some_and(|pending| pending.nonce == nonce)
+    {
+        return None;
+    }
+
+    let to_delete = collect_subtree(channels, id);
+    let link_topology_effect = if deleted_channels_have_links(channels, &to_delete) {
+        LinkTopologyEffect::DeletedChannels(to_delete.clone())
+    } else {
+        LinkTopologyEffect::Unchanged
+    };
+    let external_link_neighbors = linked_neighbors_outside_deleted_subtree(channels, &to_delete);
+
+    for del_id in &to_delete {
+        channels.remove(del_id);
+    }
+    remove_links_from_deleted_channel_neighbors(channels, &external_link_neighbors, &to_delete);
+
+    Some(DeleteChannelApplied {
+        deleted_ids: to_delete,
+        link_topology_effect,
+    })
+}
+
 fn rebuild_all_link_topologies(
     channels_by_server: &mut HashMap<String, HashMap<u32, Channel>>,
 ) -> HashMap<String, LinkTopology> {
@@ -2781,6 +3010,50 @@ fn normalize_channel_links(channels: &mut HashMap<u32, Channel>) {
         }
         if let Some(channel) = channels.get_mut(&b) {
             channel.links.insert(a);
+        }
+    }
+}
+
+fn deleted_channels_have_links(channels: &HashMap<u32, Channel>, deleted_ids: &[u32]) -> bool {
+    deleted_ids.iter().any(|id| {
+        channels
+            .get(id)
+            .is_some_and(|channel| !channel.links.is_empty())
+    })
+}
+
+fn linked_neighbors_outside_deleted_subtree(
+    channels: &HashMap<u32, Channel>,
+    deleted_ids: &[u32],
+) -> Vec<u32> {
+    let deleted_ids: HashSet<u32> = deleted_ids.iter().copied().collect();
+    let mut neighbors = HashSet::new();
+    for deleted_id in &deleted_ids {
+        if let Some(channel) = channels.get(deleted_id) {
+            for &linked_id in &channel.links {
+                if !deleted_ids.contains(&linked_id) {
+                    neighbors.insert(linked_id);
+                }
+            }
+        }
+    }
+    neighbors.into_iter().collect()
+}
+
+fn remove_links_from_deleted_channel_neighbors(
+    channels: &mut HashMap<u32, Channel>,
+    neighbor_ids: &[u32],
+    removed_ids: &[u32],
+) {
+    if neighbor_ids.is_empty() || removed_ids.is_empty() {
+        return;
+    }
+    let removed_ids: HashSet<u32> = removed_ids.iter().copied().collect();
+    for neighbor_id in neighbor_ids {
+        if let Some(channel) = channels.get_mut(neighbor_id) {
+            channel
+                .links
+                .retain(|linked_id| !removed_ids.contains(linked_id));
         }
     }
 }
@@ -3043,6 +3316,13 @@ fn group_depends_on_home_channel_for_cache_scope(group: &str) -> bool {
 
 /// Collect `root_id` and all of its descendants (BFS), returning their IDs.
 fn collect_subtree(channels: &HashMap<u32, Channel>, root_id: u32) -> Vec<u32> {
+    if channels
+        .get(&root_id)
+        .is_some_and(|channel| channel.is_temporary())
+    {
+        return vec![root_id];
+    }
+
     let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
     for channel in channels.values() {
         if let Some(parent_id) = channel.parent_id {
@@ -3131,6 +3411,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn temporary_channels_cannot_have_children_or_links() {
+        let repo = repo();
+        let temp_id = TEMPORARY_CHANNEL_ID_BIT | 1;
+        repo.create_channel(Channel::new(temp_id, "temp", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        let child = repo
+            .create_channel(Channel::new(10, "child", 0, 0, Some(temp_id)))
+            .await;
+        assert!(matches!(
+            child,
+            Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(id)) if id == temp_id
+        ));
+
+        repo.create_channel(Channel::new(10, "ordinary", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        let moved_child = repo
+            .update_channel(
+                10,
+                ChannelPatch {
+                    name: None,
+                    position: None,
+                    max_users: None,
+                    description_hash: None,
+                    parent_id: Some(Some(temp_id)),
+                },
+            )
+            .await;
+        assert!(matches!(
+            moved_child,
+            Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(id)) if id == temp_id
+        ));
+
+        let linked = repo.add_link(temp_id, 10).await;
+        assert!(matches!(
+            linked,
+            Err(ChannelRepoError::TemporaryChannelCannotBeLinked(id)) if id == temp_id
+        ));
+
+        let edit_link = repo
+            .edit_channel(
+                10,
+                ChannelPatch {
+                    name: None,
+                    position: None,
+                    max_users: None,
+                    description_hash: None,
+                    parent_id: None,
+                },
+                vec![temp_id],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            edit_link,
+            Err(ChannelRepoError::TemporaryChannelCannotBeLinked(id)) if id == temp_id
+        ));
+    }
+
+    #[test]
+    fn temporary_subtree_collection_is_leaf_only() {
+        let temp_id = TEMPORARY_CHANNEL_ID_BIT | 1;
+        let mut channels = HashMap::new();
+        channels.insert(temp_id, Channel::new(temp_id, "temp", 0, 0, Some(0)));
+        channels.insert(10, Channel::new(10, "legacy-child", 0, 0, Some(temp_id)));
+
+        assert_eq!(collect_subtree(&channels, temp_id), vec![temp_id]);
+    }
+
+    #[tokio::test]
     async fn removing_link_splits_effective_group_only_when_connectivity_breaks() {
         let repo = repo();
         for id in 1..=3 {
@@ -3170,6 +3523,30 @@ mod tests {
 
         assert!(effective_group(&repo, 1).is_empty());
         assert!(effective_group(&repo, 3).is_empty());
+        assert!(repo.get_channel(1).await.unwrap().links.is_empty());
+        assert!(repo.get_channel(3).await.unwrap().links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_linked_channel_updates_only_affected_link_component() {
+        let repo = repo();
+        for id in 1..=6 {
+            repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
+                .await
+                .unwrap();
+        }
+
+        repo.add_link(1, 2).await.unwrap();
+        repo.add_link(2, 3).await.unwrap();
+        repo.add_link(4, 5).await.unwrap();
+        repo.mark_pending_delete(2, 99).await.unwrap();
+        repo.apply_delete_channel(2, 99).await.unwrap();
+
+        assert!(effective_group(&repo, 1).is_empty());
+        assert!(effective_group(&repo, 3).is_empty());
+        assert_eq!(effective_group(&repo, 4), vec![4, 5]);
+        assert_eq!(effective_group(&repo, 5), vec![4, 5]);
+        assert!(effective_group(&repo, 6).is_empty());
         assert!(repo.get_channel(1).await.unwrap().links.is_empty());
         assert!(repo.get_channel(3).await.unwrap().links.is_empty());
     }

@@ -621,6 +621,62 @@ async fn traverse_visibility_filters_listener_add_and_remove() {
 }
 
 #[tokio::test]
+async fn traverse_visibility_delete_refresh_skips_unrelated_known_users() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(90, "Doomed".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice
+        .recv_until(
+            |m| matches!(m, Message::UserState(us) if us.session == Some(bob.session_id)),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob in root before unrelated delete");
+    alice.drain_now().await;
+
+    alice.remove_channel(90).await;
+    alice
+        .recv_until(
+            |m| matches!(m, Message::ChannelRemove(cr) if cr.channel_id == 90),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees the deleted channel removed");
+
+    let redundant_bob_refresh = alice
+        .recv_until(
+            |m| matches!(m, Message::UserState(us) if us.session == Some(bob.session_id)),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        redundant_bob_refresh.is_none(),
+        "delete visibility refresh should not recheck unrelated known users"
+    );
+}
+
+#[tokio::test]
 async fn traverse_visibility_hidden_users_are_missing_from_targeted_surfaces() {
     let server = spawn_test_server(TestServerOpts {
         hide_users_without_traverse: true,

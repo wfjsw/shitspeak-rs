@@ -19,6 +19,12 @@ pub enum ChannelRepoError {
     #[error("cannot move a channel into one of its own descendants")]
     CannotMoveIntoDescendant,
 
+    #[error("temporary channel {0} cannot have child channels")]
+    TemporaryChannelCannotHaveChildren(u32),
+
+    #[error("temporary channel {0} cannot be linked")]
+    TemporaryChannelCannotBeLinked(u32),
+
     #[error("WAL I/O error: {0}")]
     WalIo(#[from] io::Error),
 
