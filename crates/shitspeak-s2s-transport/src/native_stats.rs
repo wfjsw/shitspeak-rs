@@ -128,8 +128,8 @@ impl KcpNativeLossSampler {
 
 impl NativeLossSampler for KcpNativeLossSampler {
     fn sample(&mut self) -> Option<NativeLossSample> {
-        let stats = self.handle.stats();
-        let current = RawNativeCounters::new(stats.sent_segments(), stats.lost_segments());
+        let current =
+            RawNativeCounters::new(self.handle.sent_segments(), self.handle.lost_segments());
         delta_from_counters(&mut self.previous, current)
     }
 }

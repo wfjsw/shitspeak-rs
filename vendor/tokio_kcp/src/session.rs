@@ -1,33 +1,60 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     fmt::{self, Debug},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use byte_string::ByteStr;
+use futures_util::task::AtomicWaker;
 use kcp::{KcpResult, KcpStats};
 use log::{error, trace};
-use spin::Mutex as SpinMutex;
 use tokio::{
-    sync::{mpsc, Notify},
+    sync::{Mutex, Notify, mpsc},
     time::{self, Instant},
 };
 
-use crate::{skcp::KcpSocket, udp_io::SharedUdpIo, KcpConfig};
+use crate::{KcpConfig, skcp::KcpSocket, udp_io::SharedUdpIo};
 
 pub struct KcpSession {
-    socket: SpinMutex<KcpSocket>,
+    socket: Mutex<KcpSocket>,
     closed: AtomicBool,
     session_expire: Duration,
     session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
     input_tx: mpsc::Sender<Vec<u8>>,
     notifier: Notify,
+    socket_waker: AtomicWaker,
+    stats: KcpStatsSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct KcpStatsSnapshot {
+    sent_segments: AtomicU64,
+    lost_segments: AtomicU64,
+}
+
+impl KcpStatsSnapshot {
+    fn update(&self, stats: &KcpStats) {
+        self.sent_segments.store(stats.sent_segments(), Ordering::Relaxed);
+        self.lost_segments.store(stats.lost_segments(), Ordering::Relaxed);
+    }
+
+    fn sent_segments(&self) -> u64 {
+        self.sent_segments.load(Ordering::Relaxed)
+    }
+
+    fn lost_segments(&self) -> u64 {
+        self.lost_segments.load(Ordering::Relaxed)
+    }
+
+    fn get(&self) -> KcpStats {
+        KcpStats::new(self.sent_segments(), self.lost_segments())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -41,15 +68,22 @@ impl KcpStatsHandle {
     }
 
     pub fn stats(&self) -> KcpStats {
-        self.session.stats()
+        self.session.snapshot_stats()
+    }
+
+    pub fn sent_segments(&self) -> u64 {
+        self.session.sent_segments()
+    }
+
+    pub fn lost_segments(&self) -> u64 {
+        self.session.lost_segments()
     }
 }
 
 impl Drop for KcpSession {
     fn drop(&mut self) {
         trace!(
-            "[SESSION] KcpSession conv {} is dropping, closed? {}",
-            self.socket.lock().conv(),
+            "[SESSION] KcpSession is dropping, closed? {}",
             self.closed.load(Ordering::Acquire),
         );
     }
@@ -58,12 +92,13 @@ impl Drop for KcpSession {
 impl Debug for KcpSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KcpSession")
-            .field("socket", self.socket.lock().deref())
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .field("session_expired", &self.session_expire)
             .field("session_close_notifier", &self.session_close_notifier)
             .field("input_tx", &self.input_tx)
             .field("notifier", &self.notifier)
+            .field("sent_segments", &self.sent_segments())
+            .field("lost_segments", &self.lost_segments())
             .finish()
     }
 }
@@ -75,13 +110,17 @@ impl KcpSession {
         session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
         input_tx: mpsc::Sender<Vec<u8>>,
     ) -> KcpSession {
+        let stats = KcpStatsSnapshot::default();
+        stats.update(&socket.stats());
         KcpSession {
-            socket: SpinMutex::new(socket),
+            socket: Mutex::new(socket),
             closed: AtomicBool::new(false),
             session_expire,
             session_close_notifier,
             input_tx,
             notifier: Notify::new(),
+            socket_waker: AtomicWaker::new(),
+            stats,
         }
     }
 
@@ -131,7 +170,7 @@ impl KcpSession {
                                     trace!("[SESSION] UDP recv {} bytes, conv: {}, going to input {:?}",
                                            n, input_conv, ByteStr::new(input_buffer));
 
-                                    let mut socket = session.socket.lock();
+                                    let mut socket = session.socket.lock().await;
 
                                     // Server may allocate another conv for this client.
                                     if !socket.waiting_conv() && socket.conv() != input_conv {
@@ -149,6 +188,8 @@ impl KcpSession {
                                                    n, err, ByteStr::new(input_buffer));
                                         }
                                     }
+                                    session.update_stats(&socket);
+                                    session.wake_socket_waiters();
                                     session.notify();
                                 }
                             }
@@ -156,21 +197,26 @@ impl KcpSession {
 
                         // bytes received from listener socket
                         input_opt = input_rx.recv() => {
-                            if let Some(input_buffer) = input_opt {
-                                let mut socket = session.socket.lock();
-                                match socket.input(&input_buffer) {
-                                    Ok(waked) => {
-                                        // trace!("[SESSION] UDP input {} bytes from channel {:?}",
-                                        //        input_buffer.len(), ByteStr::new(&input_buffer));
-                                        trace!("[SESSION] UDP input {} bytes from channel, waked? {} sender/receiver",
-                                               input_buffer.len(), waked);
+                            match input_opt {
+                                Some(input_buffer) => {
+                                    let mut socket = session.socket.lock().await;
+                                    match socket.input(&input_buffer) {
+                                        Ok(waked) => {
+                                            // trace!("[SESSION] UDP input {} bytes from channel {:?}",
+                                            //        input_buffer.len(), ByteStr::new(&input_buffer));
+                                            trace!("[SESSION] UDP input {} bytes from channel, waked? {} sender/receiver",
+                                                   input_buffer.len(), waked);
+                                        }
+                                        Err(err) => {
+                                            error!("[SESSION] UDP input {} bytes from channel failed, error: {}, input buffer {:?}",
+                                                   input_buffer.len(), err, ByteStr::new(&input_buffer));
+                                        }
                                     }
-                                    Err(err) => {
-                                        error!("[SESSION] UDP input {} bytes from channel failed, error: {}, input buffer {:?}",
-                                               input_buffer.len(), err, ByteStr::new(&input_buffer));
-                                    }
+                                    session.update_stats(&socket);
+                                    session.wake_socket_waiters();
+                                    session.notify();
                                 }
-                                session.notify();
+                                None => break,
                             }
                         }
                     }
@@ -184,7 +230,7 @@ impl KcpSession {
             tokio::spawn(async move {
                 while !session.closed.load(Ordering::Relaxed) {
                     let next = {
-                        let mut socket = session.socket.lock();
+                        let mut socket = session.socket.lock().await;
                         let mut next = None;
 
                         let is_closed = session.closed.load(Ordering::Acquire);
@@ -241,6 +287,8 @@ impl KcpSession {
                                 }
                             });
                         }
+                        session.update_stats(&socket);
+                        session.wake_socket_waiters();
                         next
                     };
 
@@ -261,8 +309,10 @@ impl KcpSession {
                     // Close the socket.
                     // Wake all pending tasks and let all send/recv return EOF
 
-                    let mut socket = session.socket.lock();
+                    let mut socket = session.socket.lock().await;
                     socket.close();
+                    session.update_stats(&socket);
+                    session.wake_socket_waiters();
                 }
 
                 if let Some((ref notifier, peer_addr)) = session.session_close_notifier {
@@ -279,12 +329,40 @@ impl KcpSession {
         session
     }
 
-    pub fn kcp_socket(&self) -> &SpinMutex<KcpSocket> {
+    pub fn kcp_socket(&self) -> &Mutex<KcpSocket> {
         &self.socket
     }
 
-    pub fn stats(&self) -> KcpStats {
-        self.socket.lock().stats()
+    pub fn snapshot_stats(&self) -> KcpStats {
+        self.stats.get()
+    }
+
+    pub async fn stats(&self) -> KcpStats {
+        let socket = self.socket.lock().await;
+        let stats = socket.stats();
+        self.stats.update(&stats);
+        stats
+    }
+
+    pub fn sent_segments(&self) -> u64 {
+        self.stats.sent_segments()
+    }
+
+    pub fn lost_segments(&self) -> u64 {
+        self.stats.lost_segments()
+    }
+
+    pub(crate) fn update_stats(&self, socket: &KcpSocket) {
+        let stats = socket.stats();
+        self.stats.update(&stats);
+    }
+
+    pub(crate) fn register_socket_waker(&self, waker: &std::task::Waker) {
+        self.socket_waker.register(waker);
+    }
+
+    pub(crate) fn wake_socket_waiters(&self) {
+        self.socket_waker.wake();
     }
 
     pub fn close(&self) {
@@ -297,7 +375,7 @@ impl KcpSession {
     }
 
     pub async fn conv(&self) -> u32 {
-        let socket = self.socket.lock();
+        let socket = self.socket.lock().await;
         socket.conv()
     }
 
@@ -326,12 +404,14 @@ impl Deref for KcpSessionUniq {
 
 pub struct KcpSessionManager {
     sessions: HashMap<SocketAddr, KcpSessionUniq>,
+    sessions_by_ip: HashMap<IpAddr, usize>,
 }
 
 impl KcpSessionManager {
     pub fn new() -> KcpSessionManager {
         KcpSessionManager {
             sessions: HashMap::new(),
+            sessions_by_ip: HashMap::new(),
         }
     }
 
@@ -345,7 +425,35 @@ impl KcpSessionManager {
     }
 
     pub fn close_peer(&mut self, peer_addr: SocketAddr) {
-        self.sessions.remove(&peer_addr);
+        if self.sessions.remove(&peer_addr).is_some() {
+            self.decrement_ip(peer_addr.ip());
+        }
+    }
+
+    pub fn get_peer(&self, peer_addr: SocketAddr) -> Option<Arc<KcpSession>> {
+        self.sessions.get(&peer_addr).map(|session| session.0.clone())
+    }
+
+    fn increment_ip(&mut self, ip: IpAddr) {
+        *self.sessions_by_ip.entry(ip).or_insert(0) += 1;
+    }
+
+    fn decrement_ip(&mut self, ip: IpAddr) {
+        match self.sessions_by_ip.get_mut(&ip) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                self.sessions_by_ip.remove(&ip);
+            }
+            None => {}
+        }
+    }
+
+    pub fn is_full(&self, max_sessions: usize) -> bool {
+        self.sessions.len() >= max_sessions
+    }
+
+    pub fn ip_is_full(&self, ip: IpAddr, max_sessions_per_ip: usize) -> bool {
+        self.sessions_by_ip.get(&ip).copied().unwrap_or(0) >= max_sessions_per_ip
     }
 
     pub async fn get_or_create(
@@ -376,9 +484,7 @@ impl KcpSessionManager {
                     let old_conv = old_session.conv().await;
                     trace!(
                         "replaced session with conv: {} (old: {}), peer: {}",
-                        conv,
-                        old_conv,
-                        peer_addr
+                        conv, old_conv, peer_addr
                     );
 
                     Ok((session, true))
@@ -395,6 +501,7 @@ impl KcpSessionManager {
                 );
                 trace!("created session for conv: {}, peer: {}", conv, peer_addr);
                 vac.insert(KcpSessionUniq(session.clone()));
+                self.increment_ip(peer_addr.ip());
                 Ok((session, true))
             }
         }

@@ -91,6 +91,26 @@ impl KcpListener {
 
                                 let sn = kcp::get_sn(packet);
 
+                                let is_new_peer = sessions.get_peer(peer_addr).is_none();
+                                if is_new_peer && sessions.is_full(config.max_sessions()) {
+                                    debug!(
+                                        "dropping new KCP session from {}: listener session cap {} reached",
+                                        peer_addr,
+                                        config.max_sessions()
+                                    );
+                                    continue;
+                                }
+                                if is_new_peer
+                                    && sessions.ip_is_full(peer_addr.ip(), config.max_sessions_per_ip())
+                                {
+                                    debug!(
+                                        "dropping new KCP session from {}: per-IP session cap {} reached",
+                                        peer_addr,
+                                        config.max_sessions_per_ip()
+                                    );
+                                    continue;
+                                }
+
                                 let session = match sessions.get_or_create(&config, conv, sn, &udp, peer_addr, &close_tx).await {
                                     Ok((s, created)) => {
                                         if created {
@@ -156,8 +176,9 @@ impl KcpListener {
 
     pub fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<KcpResult<(KcpStream, SocketAddr)>> {
         self.accept_rx.poll_recv(cx).map(|op_res| {
-            op_res
-                .ok_or_else(|| KcpError::IoError(io::Error::new(ErrorKind::Other, "accept channel closed unexpectedly")))
+            op_res.ok_or_else(|| {
+                KcpError::IoError(io::Error::new(ErrorKind::Other, "accept channel closed unexpectedly"))
+            })
         })
     }
 
@@ -171,9 +192,19 @@ impl KcpListener {
 mod test {
     use futures_util::future;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UdpSocket;
+    use tokio::time::{Duration, timeout};
 
     use super::KcpListener;
     use crate::{config::KcpConfig, stream::KcpStream};
+
+    async fn send_open_packet(server_addr: std::net::SocketAddr, conv: u32) -> std::io::Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let mut packet = vec![0u8; kcp::KCP_OVERHEAD as usize];
+        kcp::set_conv(&mut packet, conv);
+        socket.send_to(&packet, server_addr).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn multi_echo() {
@@ -222,5 +253,44 @@ mod test {
         }
 
         future::join_all(vfut).await;
+    }
+
+    #[tokio::test]
+    async fn listener_caps_accepted_sessions() {
+        let config = KcpConfig::default().with_max_sessions(1);
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        send_open_packet(server_addr, 1).await.unwrap();
+        send_open_packet(server_addr, 2).await.unwrap();
+
+        let (_stream, _peer) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("first session should be accepted")
+            .expect("first accept should succeed");
+
+        let second = timeout(Duration::from_millis(100), listener.accept()).await;
+        assert!(second.is_err(), "second session must be dropped at the cap");
+    }
+
+    #[tokio::test]
+    async fn listener_caps_accepted_sessions_per_ip() {
+        let config = KcpConfig::default().with_max_sessions(8).with_max_sessions_per_ip(1);
+        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        send_open_packet(server_addr, 3).await.unwrap();
+        send_open_packet(server_addr, 4).await.unwrap();
+
+        let (_stream, _peer) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("first session should be accepted")
+            .expect("first accept should succeed");
+
+        let second = timeout(Duration::from_millis(100), listener.accept()).await;
+        assert!(
+            second.is_err(),
+            "second same-IP session must be dropped at the per-IP cap"
+        );
     }
 }

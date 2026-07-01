@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustls_pki_types::ServerName;
+use tokio::sync::Semaphore;
 use tokio_kcp::{KcpConfig, KcpListener, KcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
@@ -23,6 +24,10 @@ use super::{
     mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpDialMode, UdpMuxSet},
     remote_udp_addr_is_muxed, seed_udp_addr_is_muxed,
 };
+
+const KCP_MAX_LISTENER_SESSIONS: usize = 512;
+const KCP_MAX_LISTENER_SESSIONS_PER_IP: usize = 32;
+const KCP_MAX_INBOUND_HANDSHAKES: usize = 64;
 
 pub(crate) struct KcpEndpoint {
     server_tls: Arc<rustls::ServerConfig>,
@@ -68,7 +73,7 @@ impl Endpoint for KcpEndpoint {
                             .map_err(|e| io::Error::other(format!("kcp mux bind {addr}: {e}")))?
                     }
                     None => {
-                        let cfg = KcpConfig::default();
+                        let cfg = kcp_config_for_mode(UdpDialMode::Direct);
                         let socket =
                             bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?;
                         KcpListener::from_socket(cfg, socket)
@@ -77,7 +82,12 @@ impl Endpoint for KcpEndpoint {
                     }
                 };
                 debug!(%addr, %ipv6_only, "kcp listener up");
-                tokio::spawn(accept_loop(listener, acceptor.clone(), inner.clone()));
+                tokio::spawn(accept_loop(
+                    listener,
+                    acceptor.clone(),
+                    inner.clone(),
+                    Arc::new(Semaphore::new(KCP_MAX_INBOUND_HANDSHAKES)),
+                ));
             }
             Ok(())
         }
@@ -184,7 +194,8 @@ fn kcp_config_for_mode(mode: UdpDialMode) -> KcpConfig {
     if mode == UdpDialMode::Muxed {
         cfg.mtu = cfg.mtu.saturating_sub(DISCRIMINATOR_LEN);
     }
-    cfg
+    cfg.with_max_sessions(KCP_MAX_LISTENER_SESSIONS)
+        .with_max_sessions_per_ip(KCP_MAX_LISTENER_SESSIONS_PER_IP)
 }
 
 async fn connect_kcp_stream(
@@ -204,7 +215,12 @@ async fn connect_kcp_stream(
     }
 }
 
-async fn accept_loop(mut listener: KcpListener, acceptor: TlsAcceptor, inner: Arc<ManagerInner>) {
+async fn accept_loop(
+    mut listener: KcpListener,
+    acceptor: TlsAcceptor,
+    inner: Arc<ManagerInner>,
+    inbound_handshakes: Arc<Semaphore>,
+) {
     loop {
         tokio::select! {
             _ = inner.shutdown().cancelled() => return,
@@ -213,9 +229,18 @@ async fn accept_loop(mut listener: KcpListener, acceptor: TlsAcceptor, inner: Ar
                     Ok(v) => v,
                     Err(e) => { warn!(error=%e, "kcp accept failed"); continue; }
                 };
+                let Ok(permit) = inbound_handshakes.clone().try_acquire_owned() else {
+                    warn!(
+                        %peer_addr,
+                        max_inbound_handshakes = KCP_MAX_INBOUND_HANDSHAKES,
+                        "dropping KCP inbound stream: handshake cap reached"
+                    );
+                    continue;
+                };
                 let inner_c = inner.clone();
                 let acceptor_c = acceptor.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_inbound(inner_c, acceptor_c, sock, peer_addr).await {
                         warn!(error=%e, %peer_addr, "kcp inbound handshake failed");
                     }

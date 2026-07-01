@@ -133,11 +133,28 @@ impl KcpStream {
 
     /// `send` data in `buf`
     pub fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<KcpResult<usize>> {
-        // Mutex doesn't have poll_lock, spinning on it.
-        let mut kcp = self.session.kcp_socket().lock();
-        let result = ready!(kcp.poll_send(cx, buf));
-        self.session.notify();
-        result.into()
+        let mut kcp = match self.session.kcp_socket().try_lock() {
+            Ok(kcp) => kcp,
+            Err(_) => {
+                self.session.register_socket_waker(cx.waker());
+                return Poll::Pending;
+            }
+        };
+        match kcp.poll_send(cx, buf) {
+            Poll::Ready(result) => {
+                self.session.update_stats(&kcp);
+                drop(kcp);
+                self.session.wake_socket_waiters();
+                self.session.notify();
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                self.session.update_stats(&kcp);
+                drop(kcp);
+                self.session.wake_socket_waiters();
+                Poll::Pending
+            }
+        }
     }
 
     /// `send` data in `buf`
@@ -159,8 +176,13 @@ impl KcpStream {
                 return Ok(copy_length).into();
             }
 
-            // Mutex doesn't have poll_lock, spinning on it.
-            let mut kcp = self.session.kcp_socket().lock();
+            let mut kcp = match self.session.kcp_socket().try_lock() {
+                Ok(kcp) => kcp,
+                Err(_) => {
+                    self.session.register_socket_waker(cx.waker());
+                    return Poll::Pending;
+                }
+            };
 
             // Try to read from KCP
             // 1. Read directly with user provided `buf`
@@ -168,13 +190,27 @@ impl KcpStream {
 
             // 1.1. User's provided buffer is larger than available buffer's size
             if peek_size > 0 && peek_size <= buf.len() {
-                match ready!(kcp.poll_recv(cx, buf)) {
-                    Ok(n) => {
+                match kcp.poll_recv(cx, buf) {
+                    Poll::Ready(Ok(n)) => {
                         trace!("[CLIENT] recv directly {} bytes", n);
+                        self.session.update_stats(&kcp);
+                        drop(kcp);
+                        self.session.wake_socket_waiters();
                         return Ok(n).into();
                     }
-                    Err(KcpError::UserBufTooSmall) => {}
-                    Err(err) => return Err(err).into(),
+                    Poll::Ready(Err(KcpError::UserBufTooSmall)) => {}
+                    Poll::Ready(Err(err)) => {
+                        self.session.update_stats(&kcp);
+                        drop(kcp);
+                        self.session.wake_socket_waiters();
+                        return Err(err).into();
+                    }
+                    Poll::Pending => {
+                        self.session.update_stats(&kcp);
+                        drop(kcp);
+                        self.session.wake_socket_waiters();
+                        return Poll::Pending;
+                    }
                 }
             }
 
@@ -184,14 +220,33 @@ impl KcpStream {
                 self.recv_buffer.resize(required_size, 0);
             }
 
-            match ready!(kcp.poll_recv(cx, &mut self.recv_buffer)) {
-                Ok(0) => return Ok(0).into(),
-                Ok(n) => {
+            match kcp.poll_recv(cx, &mut self.recv_buffer) {
+                Poll::Ready(Ok(0)) => {
+                    self.session.update_stats(&kcp);
+                    drop(kcp);
+                    self.session.wake_socket_waiters();
+                    return Ok(0).into();
+                }
+                Poll::Ready(Ok(n)) => {
                     trace!("[CLIENT] recv buffered {} bytes", n);
                     self.recv_buffer_pos = 0;
                     self.recv_buffer_cap = n;
+                    self.session.update_stats(&kcp);
+                    drop(kcp);
+                    self.session.wake_socket_waiters();
                 }
-                Err(err) => return Err(err).into(),
+                Poll::Ready(Err(err)) => {
+                    self.session.update_stats(&kcp);
+                    drop(kcp);
+                    self.session.wake_socket_waiters();
+                    return Err(err).into();
+                }
+                Poll::Pending => {
+                    self.session.update_stats(&kcp);
+                    drop(kcp);
+                    self.session.wake_socket_waiters();
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -207,7 +262,7 @@ impl KcpStream {
     }
 
     pub fn stats(&self) -> KcpStats {
-        self.session.stats()
+        self.session.snapshot_stats()
     }
 
     pub fn stats_handle(&self) -> KcpStatsHandle {
@@ -237,16 +292,34 @@ impl AsyncWrite for KcpStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Mutex doesn't have poll_lock, spinning on it.
-        let mut kcp = self.session.kcp_socket().lock();
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut kcp = match self.session.kcp_socket().try_lock() {
+            Ok(kcp) => kcp,
+            Err(_) => {
+                self.session.register_socket_waker(cx.waker());
+                return Poll::Pending;
+            }
+        };
         match kcp.flush() {
             Ok(..) => {
+                self.session.update_stats(&kcp);
+                drop(kcp);
+                self.session.wake_socket_waiters();
                 self.session.notify();
                 Ok(()).into()
             }
-            Err(KcpError::IoError(err)) => Err(err).into(),
-            Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
+            Err(KcpError::IoError(err)) => {
+                self.session.update_stats(&kcp);
+                drop(kcp);
+                self.session.wake_socket_waiters();
+                Err(err).into()
+            }
+            Err(err) => {
+                self.session.update_stats(&kcp);
+                drop(kcp);
+                self.session.wake_socket_waiters();
+                Err(io::Error::new(ErrorKind::Other, err)).into()
+            }
         }
     }
 

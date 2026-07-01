@@ -77,6 +77,8 @@ pub struct KcpConfig {
     pub stream: bool,
     /// Allow recv 0 byte packet. KCP Segments with 0 byte data are skipped by default.
     pub allow_recv_empty_packet: bool,
+    max_sessions: usize,
+    max_sessions_per_ip: usize,
 }
 
 impl Default for KcpConfig {
@@ -90,11 +92,35 @@ impl Default for KcpConfig {
             flush_acks_input: false,
             stream: false,
             allow_recv_empty_packet: false,
+            max_sessions: 1024,
+            max_sessions_per_ip: 64,
         }
     }
 }
 
 impl KcpConfig {
+    /// Maximum live server-side KCP sessions accepted by a listener.
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
+    /// Return a copy of this config with a different listener session cap.
+    pub fn with_max_sessions(mut self, max_sessions: usize) -> Self {
+        self.max_sessions = max_sessions.max(1);
+        self
+    }
+
+    /// Maximum live server-side KCP sessions accepted from one remote IP.
+    pub fn max_sessions_per_ip(&self) -> usize {
+        self.max_sessions_per_ip
+    }
+
+    /// Return a copy of this config with a different per-IP session cap.
+    pub fn with_max_sessions_per_ip(mut self, max_sessions_per_ip: usize) -> Self {
+        self.max_sessions_per_ip = max_sessions_per_ip.max(1);
+        self
+    }
+
     /// Applies config onto `Kcp`
     #[doc(hidden)]
     pub fn apply_config<W: Write>(&self, k: &mut Kcp<W>) {

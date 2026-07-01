@@ -8,8 +8,8 @@ use std::io::{self, Cursor, Read, Write};
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::error::Error;
 use crate::KcpResult;
+use crate::error::Error;
 
 const KCP_RTO_NDL: u32 = 30; // no delay min rto
 const KCP_RTO_MIN: u32 = 100; // normal min rto
@@ -153,6 +153,14 @@ pub struct KcpStats {
 }
 
 impl KcpStats {
+    /// Build a stats snapshot from cumulative segment counters.
+    pub fn new(sent_segments: u64, lost_segments: u64) -> Self {
+        Self {
+            sent_segments,
+            lost_segments,
+        }
+    }
+
     /// Number of KCP segment transmissions attempted.
     pub fn sent_segments(&self) -> u64 {
         self.sent_segments
@@ -475,9 +483,7 @@ impl<Output: Write> Kcp<Output> {
 
                     trace!(
                         "send stream mss={} last length={} extend={}",
-                        self.mss,
-                        l,
-                        extend
+                        self.mss, l, extend
                     );
 
                     let (lf, rt) = buf.split_at(extend);
