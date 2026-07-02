@@ -582,7 +582,7 @@ impl MoqSessionRuntime {
             client_log_rx: None,
             channel_log_rx: None,
             voice_rx: None,
-            channel_shadow: HashMap::new(),
+            channel_shadow: SessionChannelShadow::new(),
             user_visibility: UserVisibilityState::default(),
             inbound_voice: InboundVoiceMetadata::new(),
             frame_numbers: crate::voice::RtpFrameNumberMapper::new(),

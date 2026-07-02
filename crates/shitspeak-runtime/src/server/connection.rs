@@ -1287,7 +1287,7 @@ impl Server {
         let mut channel_log_rx: Option<ChannelLogReceiver> = None;
         let mut writer_task = spawn_native_client_writer_task(&client);
         let mut channel_tree_shadow = ChannelTreeShadow::default();
-        let mut session_channel_shadow: SessionChannelShadow = HashMap::new();
+        let mut session_channel_shadow = SessionChannelShadow::new();
         let mut user_visibility = UserVisibilityState::default();
 
         // Run the connection loop.  On any unrecoverable error, clean up

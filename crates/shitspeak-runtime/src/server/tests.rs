@@ -745,8 +745,10 @@ async fn activate_subscriptions_fast_path_replays_missed_client_add() {
         .channels
         .snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
     viewer.stage_channel_state_subscription(channel_version, channel_state_rx);
+    let mut viewer_session_shadow = SessionChannelShadow::new();
+    viewer_session_shadow.insert(viewer_session, viewer.get_current_channel_id());
     viewer.stage_post_auth_baseline(crate::client::PostAuthBaseline::new(
-        HashMap::from([(viewer_session, viewer.get_current_channel_id())]),
+        viewer_session_shadow,
         channels.iter().map(|channel| channel.id).collect(),
     ));
 

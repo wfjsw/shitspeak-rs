@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -495,7 +494,7 @@ impl Default for SignalingSession {
             outbound_rx: None,
             client_log_rx: None,
             channel_log_rx: None,
-            channel_shadow: HashMap::new(),
+            channel_shadow: SessionChannelShadow::new(),
             user_visibility: UserVisibilityState::default(),
             peer: None,
             peer_signal_rx: None,

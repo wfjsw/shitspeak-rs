@@ -25,7 +25,97 @@ use crate::{
     server::Server,
 };
 
-pub type SessionChannelShadow = HashMap<ClientSessionIdentifier, u32>;
+#[derive(Debug, Clone, Default)]
+pub struct SessionChannelShadow {
+    session_channel: HashMap<ClientSessionIdentifier, u32>,
+    sessions_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
+}
+
+impl SessionChannelShadow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, session: ClientSessionIdentifier, channel_id: u32) -> Option<u32> {
+        let old = self.session_channel.insert(session, channel_id);
+        if old == Some(channel_id) {
+            return old;
+        }
+        if let Some(old_channel_id) = old {
+            self.remove_index_entry(session, old_channel_id);
+        }
+        self.sessions_by_channel
+            .entry(channel_id)
+            .or_default()
+            .insert(session);
+        old
+    }
+
+    pub fn remove(&mut self, session: &ClientSessionIdentifier) -> Option<u32> {
+        let old = self.session_channel.remove(session)?;
+        self.remove_index_entry(*session, old);
+        Some(old)
+    }
+
+    pub fn clear(&mut self) {
+        self.session_channel.clear();
+        self.sessions_by_channel.clear();
+    }
+
+    pub fn extend(&mut self, sessions: impl IntoIterator<Item = (ClientSessionIdentifier, u32)>) {
+        for (session, channel_id) in sessions {
+            self.insert(session, channel_id);
+        }
+    }
+
+    pub fn get(&self, session: &ClientSessionIdentifier) -> Option<&u32> {
+        self.session_channel.get(session)
+    }
+
+    pub fn contains_key(&self, session: &ClientSessionIdentifier) -> bool {
+        self.session_channel.contains_key(session)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ClientSessionIdentifier, &u32)> {
+        self.session_channel.iter()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &u32> {
+        self.session_channel.values()
+    }
+
+    pub fn sessions_in_channels(&self, channel_ids: &HashSet<u32>) -> Vec<ClientSessionIdentifier> {
+        let mut sessions = HashSet::new();
+        for channel_id in channel_ids {
+            if let Some(channel_sessions) = self.sessions_by_channel.get(channel_id) {
+                sessions.extend(channel_sessions.iter().copied());
+            }
+        }
+        let mut sessions = sessions.into_iter().collect::<Vec<_>>();
+        sessions.sort_by_key(|session| u32::from(*session));
+        sessions
+    }
+
+    fn remove_index_entry(&mut self, session: ClientSessionIdentifier, channel_id: u32) {
+        let Some(sessions) = self.sessions_by_channel.get_mut(&channel_id) else {
+            return;
+        };
+        sessions.remove(&session);
+        if sessions.is_empty() {
+            self.sessions_by_channel.remove(&channel_id);
+        }
+    }
+}
+
+impl IntoIterator for SessionChannelShadow {
+    type Item = (ClientSessionIdentifier, u32);
+    type IntoIter = std::collections::hash_map::IntoIter<ClientSessionIdentifier, u32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.session_channel.into_iter()
+    }
+}
+
 pub type ChannelTreeShadow = HashSet<u32>;
 
 #[derive(Debug)]
@@ -163,6 +253,7 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
                     *id,
                     *nonce,
                     false,
+                    None,
                     &server_id,
                     &mut messages,
                 )
@@ -172,6 +263,9 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
         ChannelOp::DeleteChannel { id, nonce } => {
             if op.emits_client_message {
                 if let Some(shadow) = session_channel_shadow.as_deref_mut() {
+                    let deleted_channel_ids = channels
+                        .delete_visibility_hint_for_operation(op)
+                        .map(|channel_ids| channel_ids.iter().copied().collect::<HashSet<_>>());
                     append_pending_delete_synthetic_moves(
                         server,
                         channels,
@@ -179,6 +273,7 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
                         *id,
                         *nonce,
                         true,
+                        deleted_channel_ids.as_ref(),
                         &server_id,
                         &mut messages,
                     )
@@ -319,11 +414,16 @@ async fn append_pending_delete_synthetic_moves(
     id: u32,
     nonce: u64,
     include_deleted_snapshot: bool,
+    deleted_channel_ids: Option<&HashSet<u32>>,
     server_id: &str,
     messages: &mut Vec<Message>,
 ) {
     let subtree: std::collections::HashSet<u32> = if include_deleted_snapshot {
-        deleted_subtree_from_shadow(channels, server_id, id, shadow).await
+        if let Some(deleted_channel_ids) = deleted_channel_ids {
+            deleted_channel_ids.clone()
+        } else {
+            deleted_subtree_from_shadow(channels, server_id, id, shadow).await
+        }
     } else {
         channels
             .pending_delete_subtree_in_server(server_id, id, nonce)
@@ -338,10 +438,7 @@ async fn append_pending_delete_synthetic_moves(
     let initial_target = channels
         .redirect_pending_delete_target_in_server(server_id, id)
         .await;
-    let sessions: Vec<_> = shadow
-        .iter()
-        .filter_map(|(session, channel_id)| subtree.contains(channel_id).then_some(*session))
-        .collect();
+    let sessions = shadow.sessions_in_channels(&subtree);
 
     for session in sessions {
         let Some(current) = shadow.get(&session).copied() else {
@@ -676,15 +773,16 @@ pub fn ordered_snapshot_channels(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use crate::acl::ACL;
     use crate::channels::Channel;
+    use crate::client::client_session_identifier::ClientSessionIdentifier;
     use crate::client::group::ChannelHierarchy;
 
     use super::{
-        channels_affected_by_home_channel_move, channels_with_home_channel_dependent_acls,
-        ordered_snapshot_channels,
+        SessionChannelShadow, channels_affected_by_home_channel_move,
+        channels_with_home_channel_dependent_acls, ordered_snapshot_channels,
     };
 
     fn channel(id: u32, parent_id: Option<u32>, position: i32) -> Channel {
@@ -704,6 +802,14 @@ mod tests {
 
     fn ids(channels: Vec<Channel>) -> Vec<u32> {
         channels.into_iter().map(|channel| channel.id).collect()
+    }
+
+    fn session(id: u32) -> ClientSessionIdentifier {
+        ClientSessionIdentifier::new(1, id).expect("valid session")
+    }
+
+    fn channel_set(ids: &[u32]) -> HashSet<u32> {
+        ids.iter().copied().collect()
     }
 
     fn ancestors_for_channel(
@@ -864,6 +970,68 @@ mod tests {
         let baseline_local_scope = baseline_home_channel_move_affected_ids(&channels, 14, 11);
         assert_eq!(optimized_local_scope, baseline_local_scope);
         assert_eq!(optimized_local_scope, vec![14]);
+    }
+
+    #[test]
+    fn session_channel_shadow_tracks_insert_overwrite_remove_and_clear() {
+        let mut shadow = SessionChannelShadow::new();
+        shadow.insert(session(10), 1);
+        shadow.insert(session(11), 1);
+        shadow.insert(session(12), 2);
+
+        assert_eq!(
+            shadow.sessions_in_channels(&channel_set(&[1])),
+            vec![session(10), session(11)]
+        );
+
+        shadow.insert(session(10), 2);
+        assert_eq!(shadow.get(&session(10)).copied(), Some(2));
+        assert_eq!(
+            shadow.sessions_in_channels(&channel_set(&[1])),
+            vec![session(11)]
+        );
+        assert_eq!(
+            shadow.sessions_in_channels(&channel_set(&[2])),
+            vec![session(10), session(12)]
+        );
+
+        assert_eq!(shadow.remove(&session(12)), Some(2));
+        assert_eq!(
+            shadow.sessions_in_channels(&channel_set(&[2])),
+            vec![session(10)]
+        );
+
+        shadow.clear();
+        assert!(shadow.get(&session(10)).is_none());
+        assert!(
+            shadow
+                .sessions_in_channels(&channel_set(&[1, 2]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn session_channel_shadow_extend_and_bucket_union_are_indexed() {
+        let mut base = SessionChannelShadow::new();
+        base.insert(session(10), 1);
+        base.insert(session(11), 2);
+
+        let mut shadow = SessionChannelShadow::new();
+        shadow.extend(base);
+        shadow.extend([(session(12), 2), (session(13), 3)]);
+
+        assert!(shadow.contains_key(&session(10)));
+        assert_eq!(
+            shadow.sessions_in_channels(&channel_set(&[2, 3])),
+            vec![session(11), session(12), session(13)]
+        );
+        assert_eq!(
+            shadow
+                .iter()
+                .map(|(session, _)| *session)
+                .collect::<HashSet<_>>(),
+            HashSet::from([session(10), session(11), session(12), session(13)])
+        );
     }
 }
 
