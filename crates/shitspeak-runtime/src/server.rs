@@ -81,6 +81,7 @@ pub struct Server {
 
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
+    visibility_fanout_index: Arc<crate::client::visibility::VisibilityFanoutIndex>,
     auth_finalization_queue: Arc<AuthFinalizationQueue>,
     crypt_setup_semaphore: Arc<tokio::sync::Semaphore>,
     channel_blobs: Arc<ChannelBlobStore>,
@@ -201,6 +202,9 @@ impl Server {
             entrypoint_reload_lock: tokio::sync::Mutex::new(()),
             clients: Arc::new(ClientRepository::new(node_id, client_log_max_entries)),
             channels,
+            visibility_fanout_index: Arc::new(
+                crate::client::visibility::VisibilityFanoutIndex::new(),
+            ),
             auth_finalization_queue: Arc::new(AuthFinalizationQueue::new(
                 auth_finalization_concurrency,
                 authenticator,
@@ -1453,6 +1457,12 @@ impl Server {
 
     pub fn get_channels(&self) -> &Arc<ChannelRepository> {
         &self.channels
+    }
+
+    pub(crate) fn visibility_fanout_index(
+        &self,
+    ) -> &Arc<crate::client::visibility::VisibilityFanoutIndex> {
+        &self.visibility_fanout_index
     }
 
     pub fn get_channel_blobs(&self) -> &Arc<ChannelBlobStore> {

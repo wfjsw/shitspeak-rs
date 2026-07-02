@@ -949,7 +949,7 @@ impl MoqSessionRuntime {
             shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
                 &server,
                 &op,
-                &self.user_visibility,
+                &mut self.user_visibility,
             )
             .await;
         events.extend(
@@ -1012,7 +1012,7 @@ impl MoqSessionRuntime {
                 shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
                     &server,
                     &op,
-                    &self.user_visibility,
+                    &mut self.user_visibility,
                 )
                 .await;
             events.extend(

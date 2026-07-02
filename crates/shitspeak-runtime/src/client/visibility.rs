@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::acl::ACLPermissions;
 use crate::channel_handler::SessionChannelShadow;
@@ -10,18 +11,387 @@ use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, Clie
 use crate::messages::Message;
 use crate::messages::encoder::{UserRemove, UserState};
 use crate::server::Server;
+use parking_lot::RwLock as ParkingRwLock;
 
-#[derive(Debug, Clone, Default)]
+const DELETE_FANOUT_CACHE_MAX_ENTRIES: usize = 128;
+
+#[derive(Debug)]
 pub struct UserVisibilityState {
     known: HashMap<ClientSessionIdentifier, KnownUserVisibility>,
     sessions_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
     sessions_by_listener_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
+    registration: Option<VisibilityRegistration>,
 }
 
 #[derive(Debug, Clone)]
 struct KnownUserVisibility {
     channel_id: u32,
     listener_channels: HashSet<u32>,
+}
+
+impl Clone for UserVisibilityState {
+    fn clone(&self) -> Self {
+        Self {
+            known: self.known.clone(),
+            sessions_by_channel: self.sessions_by_channel.clone(),
+            sessions_by_listener_channel: self.sessions_by_listener_channel.clone(),
+            registration: None,
+        }
+    }
+}
+
+impl Default for UserVisibilityState {
+    fn default() -> Self {
+        Self {
+            known: HashMap::new(),
+            sessions_by_channel: HashMap::new(),
+            sessions_by_listener_channel: HashMap::new(),
+            registration: None,
+        }
+    }
+}
+
+impl Drop for UserVisibilityState {
+    fn drop(&mut self) {
+        self.registration.take();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VisibilityViewerId(u64);
+
+#[derive(Debug)]
+struct VisibilityRegistration {
+    index: Arc<VisibilityFanoutIndex>,
+    viewer_id: VisibilityViewerId,
+    server_id: String,
+}
+
+impl VisibilityRegistration {
+    fn matches(&self, index: &Arc<VisibilityFanoutIndex>, server_id: &str) -> bool {
+        Arc::ptr_eq(&self.index, index) && self.server_id == server_id
+    }
+
+    fn add_current_channel(&self, channel_id: u32) {
+        self.index
+            .add_current_channel(self.viewer_id, &self.server_id, channel_id);
+    }
+
+    fn remove_current_channel(&self, channel_id: u32) {
+        self.index
+            .remove_current_channel(self.viewer_id, &self.server_id, channel_id);
+    }
+
+    fn add_listener_channel(&self, channel_id: u32) {
+        self.index
+            .add_listener_channel(self.viewer_id, &self.server_id, channel_id);
+    }
+
+    fn remove_listener_channel(&self, channel_id: u32) {
+        self.index
+            .remove_listener_channel(self.viewer_id, &self.server_id, channel_id);
+    }
+
+    fn clear_refs(&self) {
+        self.index.clear_viewer_refs(self.viewer_id);
+    }
+}
+
+impl Drop for VisibilityRegistration {
+    fn drop(&mut self) {
+        self.index.unregister_viewer(self.viewer_id);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VisibilityChannelKey {
+    server_id: String,
+    channel_id: u32,
+}
+
+impl VisibilityChannelKey {
+    fn new(server_id: &str, channel_id: u32) -> Self {
+        Self {
+            server_id: server_id.to_owned(),
+            channel_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VisibilityDeleteCacheKey {
+    server_id: String,
+    version: u64,
+}
+
+impl VisibilityDeleteCacheKey {
+    fn new(server_id: &str, version: u64) -> Self {
+        Self {
+            server_id: server_id.to_owned(),
+            version,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct VisibilityViewerRefs {
+    current_channels: HashSet<u32>,
+    listener_channels: HashSet<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VisibilityViewerDeleteFanout {
+    current_channels: HashSet<u32>,
+    listener_channels: HashSet<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VisibilityDeleteFanout {
+    viewers: HashMap<VisibilityViewerId, VisibilityViewerDeleteFanout>,
+}
+
+impl VisibilityDeleteFanout {
+    fn get(&self, viewer_id: VisibilityViewerId) -> Option<&VisibilityViewerDeleteFanout> {
+        self.viewers.get(&viewer_id)
+    }
+}
+
+#[derive(Debug)]
+struct VisibilityFanoutInner {
+    current_by_channel: HashMap<VisibilityChannelKey, HashSet<VisibilityViewerId>>,
+    listeners_by_channel: HashMap<VisibilityChannelKey, HashSet<VisibilityViewerId>>,
+    viewer_refs: HashMap<VisibilityViewerId, VisibilityViewerRefs>,
+    delete_cache: HashMap<VisibilityDeleteCacheKey, Arc<VisibilityDeleteFanout>>,
+    delete_cache_order: VecDeque<VisibilityDeleteCacheKey>,
+    delete_cache_max_entries: usize,
+}
+
+impl VisibilityFanoutInner {
+    fn new(delete_cache_max_entries: usize) -> Self {
+        Self {
+            current_by_channel: HashMap::new(),
+            listeners_by_channel: HashMap::new(),
+            viewer_refs: HashMap::new(),
+            delete_cache: HashMap::new(),
+            delete_cache_order: VecDeque::new(),
+            delete_cache_max_entries: delete_cache_max_entries.max(1),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct VisibilityFanoutIndex {
+    next_viewer_id: AtomicU64,
+    inner: ParkingRwLock<VisibilityFanoutInner>,
+}
+
+impl Default for VisibilityFanoutIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VisibilityFanoutIndex {
+    pub(crate) fn new() -> Self {
+        Self::with_delete_cache_max_entries(DELETE_FANOUT_CACHE_MAX_ENTRIES)
+    }
+
+    fn with_delete_cache_max_entries(delete_cache_max_entries: usize) -> Self {
+        Self {
+            next_viewer_id: AtomicU64::new(1),
+            inner: ParkingRwLock::new(VisibilityFanoutInner::new(delete_cache_max_entries)),
+        }
+    }
+
+    fn register_viewer(self: &Arc<Self>, server_id: String) -> VisibilityRegistration {
+        let viewer_id = VisibilityViewerId(self.next_viewer_id.fetch_add(1, Ordering::Relaxed));
+        self.inner.write().viewer_refs.entry(viewer_id).or_default();
+        VisibilityRegistration {
+            index: Arc::clone(self),
+            viewer_id,
+            server_id,
+        }
+    }
+
+    fn unregister_viewer(&self, viewer_id: VisibilityViewerId) {
+        let mut inner = self.inner.write();
+        remove_viewer_refs_from_inner(&mut inner, viewer_id);
+        inner.viewer_refs.remove(&viewer_id);
+    }
+
+    fn clear_viewer_refs(&self, viewer_id: VisibilityViewerId) {
+        let mut inner = self.inner.write();
+        remove_viewer_refs_from_inner(&mut inner, viewer_id);
+        inner.viewer_refs.entry(viewer_id).or_default();
+    }
+
+    fn add_current_channel(&self, viewer_id: VisibilityViewerId, server_id: &str, channel_id: u32) {
+        let mut inner = self.inner.write();
+        inner
+            .viewer_refs
+            .entry(viewer_id)
+            .or_default()
+            .current_channels
+            .insert(channel_id);
+        inner
+            .current_by_channel
+            .entry(VisibilityChannelKey::new(server_id, channel_id))
+            .or_default()
+            .insert(viewer_id);
+    }
+
+    fn remove_current_channel(
+        &self,
+        viewer_id: VisibilityViewerId,
+        server_id: &str,
+        channel_id: u32,
+    ) {
+        let mut inner = self.inner.write();
+        if let Some(refs) = inner.viewer_refs.get_mut(&viewer_id) {
+            refs.current_channels.remove(&channel_id);
+        }
+        remove_viewer_from_channel_index(
+            &mut inner.current_by_channel,
+            &VisibilityChannelKey::new(server_id, channel_id),
+            viewer_id,
+        );
+    }
+
+    fn add_listener_channel(
+        &self,
+        viewer_id: VisibilityViewerId,
+        server_id: &str,
+        channel_id: u32,
+    ) {
+        let mut inner = self.inner.write();
+        inner
+            .viewer_refs
+            .entry(viewer_id)
+            .or_default()
+            .listener_channels
+            .insert(channel_id);
+        inner
+            .listeners_by_channel
+            .entry(VisibilityChannelKey::new(server_id, channel_id))
+            .or_default()
+            .insert(viewer_id);
+    }
+
+    fn remove_listener_channel(
+        &self,
+        viewer_id: VisibilityViewerId,
+        server_id: &str,
+        channel_id: u32,
+    ) {
+        let mut inner = self.inner.write();
+        if let Some(refs) = inner.viewer_refs.get_mut(&viewer_id) {
+            refs.listener_channels.remove(&channel_id);
+        }
+        remove_viewer_from_channel_index(
+            &mut inner.listeners_by_channel,
+            &VisibilityChannelKey::new(server_id, channel_id),
+            viewer_id,
+        );
+    }
+
+    fn delete_fanout(
+        &self,
+        server_id: &str,
+        version: u64,
+        deleted_channel_ids: &[u32],
+    ) -> Arc<VisibilityDeleteFanout> {
+        let cache_key = VisibilityDeleteCacheKey::new(server_id, version);
+        let mut inner = self.inner.write();
+        if let Some(fanout) = inner.delete_cache.get(&cache_key) {
+            return Arc::clone(fanout);
+        }
+
+        let mut fanout = VisibilityDeleteFanout::default();
+        for channel_id in deleted_channel_ids {
+            let channel_key = VisibilityChannelKey::new(server_id, *channel_id);
+            if let Some(viewers) = inner.current_by_channel.get(&channel_key) {
+                for viewer_id in viewers {
+                    fanout
+                        .viewers
+                        .entry(*viewer_id)
+                        .or_default()
+                        .current_channels
+                        .insert(*channel_id);
+                }
+            }
+            if let Some(viewers) = inner.listeners_by_channel.get(&channel_key) {
+                for viewer_id in viewers {
+                    fanout
+                        .viewers
+                        .entry(*viewer_id)
+                        .or_default()
+                        .listener_channels
+                        .insert(*channel_id);
+                }
+            }
+        }
+
+        let fanout = Arc::new(fanout);
+        inner
+            .delete_cache
+            .insert(cache_key.clone(), Arc::clone(&fanout));
+        inner.delete_cache_order.push_back(cache_key);
+        while inner.delete_cache_order.len() > inner.delete_cache_max_entries {
+            if let Some(evicted) = inner.delete_cache_order.pop_front() {
+                inner.delete_cache.remove(&evicted);
+            }
+        }
+        fanout
+    }
+}
+
+fn remove_viewer_refs_from_inner(inner: &mut VisibilityFanoutInner, viewer_id: VisibilityViewerId) {
+    let Some(refs) = inner.viewer_refs.get_mut(&viewer_id) else {
+        return;
+    };
+    let current_channels = std::mem::take(&mut refs.current_channels);
+    let listener_channels = std::mem::take(&mut refs.listener_channels);
+    for channel_id in current_channels {
+        remove_viewer_from_channel_index_by_id(
+            &mut inner.current_by_channel,
+            viewer_id,
+            channel_id,
+        );
+    }
+    for channel_id in listener_channels {
+        remove_viewer_from_channel_index_by_id(
+            &mut inner.listeners_by_channel,
+            viewer_id,
+            channel_id,
+        );
+    }
+}
+
+fn remove_viewer_from_channel_index_by_id(
+    index: &mut HashMap<VisibilityChannelKey, HashSet<VisibilityViewerId>>,
+    viewer_id: VisibilityViewerId,
+    channel_id: u32,
+) {
+    index.retain(|key, viewers| {
+        if key.channel_id == channel_id {
+            viewers.remove(&viewer_id);
+        }
+        !viewers.is_empty()
+    });
+}
+
+fn remove_viewer_from_channel_index(
+    index: &mut HashMap<VisibilityChannelKey, HashSet<VisibilityViewerId>>,
+    key: &VisibilityChannelKey,
+    viewer_id: VisibilityViewerId,
+) {
+    let Some(viewers) = index.get_mut(key) else {
+        return;
+    };
+    viewers.remove(&viewer_id);
+    if viewers.is_empty() {
+        index.remove(key);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,7 +475,42 @@ impl VisibilityRefreshScope {
 }
 
 impl UserVisibilityState {
+    fn ensure_registered_for_server(&mut self, server: &Arc<Box<Server>>, server_id: &str) -> bool {
+        self.register_with_index(Arc::clone(server.visibility_fanout_index()), server_id)
+    }
+
+    fn register_with_index(&mut self, index: Arc<VisibilityFanoutIndex>, server_id: &str) -> bool {
+        if self
+            .registration
+            .as_ref()
+            .is_some_and(|registration| registration.matches(&index, server_id))
+        {
+            return false;
+        }
+
+        self.registration.take();
+        let registration = index.register_viewer(server_id.to_owned());
+        for channel_id in self.sessions_by_channel.keys().copied() {
+            registration.add_current_channel(channel_id);
+        }
+        for channel_id in self.sessions_by_listener_channel.keys().copied() {
+            registration.add_listener_channel(channel_id);
+        }
+        self.registration = Some(registration);
+        true
+    }
+
+    fn registered_viewer_id(&self, server_id: &str) -> Option<VisibilityViewerId> {
+        self.registration
+            .as_ref()
+            .filter(|registration| registration.server_id == server_id)
+            .map(|registration| registration.viewer_id)
+    }
+
     pub fn clear(&mut self) {
+        if let Some(registration) = &self.registration {
+            registration.clear_refs();
+        }
         self.known.clear();
         self.sessions_by_channel.clear();
         self.sessions_by_listener_channel.clear();
@@ -126,15 +531,33 @@ impl UserVisibilityState {
         listener_channels: HashSet<u32>,
     ) {
         self.remove(session);
+        let current_bucket_was_empty = self
+            .sessions_by_channel
+            .get(&channel_id)
+            .is_none_or(HashSet::is_empty);
         self.sessions_by_channel
             .entry(channel_id)
             .or_default()
             .insert(session);
+        if current_bucket_was_empty {
+            if let Some(registration) = &self.registration {
+                registration.add_current_channel(channel_id);
+            }
+        }
         for listener_channel_id in &listener_channels {
+            let listener_bucket_was_empty = self
+                .sessions_by_listener_channel
+                .get(listener_channel_id)
+                .is_none_or(HashSet::is_empty);
             self.sessions_by_listener_channel
                 .entry(*listener_channel_id)
                 .or_default()
                 .insert(session);
+            if listener_bucket_was_empty {
+                if let Some(registration) = &self.registration {
+                    registration.add_listener_channel(*listener_channel_id);
+                }
+            }
         }
         self.known.insert(
             session,
@@ -149,13 +572,21 @@ impl UserVisibilityState {
         let Some(known) = self.known.remove(&session) else {
             return false;
         };
-        remove_indexed_session(&mut self.sessions_by_channel, known.channel_id, session);
+        if remove_indexed_session(&mut self.sessions_by_channel, known.channel_id, session) {
+            if let Some(registration) = &self.registration {
+                registration.remove_current_channel(known.channel_id);
+            }
+        }
         for listener_channel_id in known.listener_channels {
-            remove_indexed_session(
+            if remove_indexed_session(
                 &mut self.sessions_by_listener_channel,
                 listener_channel_id,
                 session,
-            );
+            ) {
+                if let Some(registration) = &self.registration {
+                    registration.remove_listener_channel(listener_channel_id);
+                }
+            }
         }
         true
     }
@@ -239,7 +670,12 @@ impl UserVisibilityState {
         removed.sort_unstable();
         for channel_id in &removed {
             known.listener_channels.remove(channel_id);
-            remove_indexed_session(&mut self.sessions_by_listener_channel, *channel_id, session);
+            if remove_indexed_session(&mut self.sessions_by_listener_channel, *channel_id, session)
+            {
+                if let Some(registration) = &self.registration {
+                    registration.remove_listener_channel(*channel_id);
+                }
+            }
         }
         removed
     }
@@ -249,13 +685,16 @@ fn remove_indexed_session(
     index: &mut HashMap<u32, HashSet<ClientSessionIdentifier>>,
     channel_id: u32,
     session: ClientSessionIdentifier,
-) {
+) -> bool {
     let Some(sessions) = index.get_mut(&channel_id) else {
-        return;
+        return false;
     };
     sessions.remove(&session);
     if sessions.is_empty() {
         index.remove(&channel_id);
+        true
+    } else {
+        false
     }
 }
 
@@ -348,6 +787,9 @@ pub async fn initialize(
     visibility.clear();
     channel_shadow.clear();
     let server_id = viewer.server_id();
+    if server.get_hide_users_without_traverse() {
+        visibility.ensure_registered_for_server(server, &server_id);
+    }
     for target in server
         .get_clients()
         .get_all_clients_in_server(&server_id)
@@ -374,6 +816,9 @@ pub async fn project_message(
     visibility: &mut UserVisibilityState,
     message: &Message,
 ) -> Vec<Message> {
+    if server.get_hide_users_without_traverse() {
+        visibility.ensure_registered_for_server(server, &viewer.server_id());
+    }
     match message {
         Message::UserState(user_state) => {
             let Ok(user_state) = UserState::try_from(user_state.clone()) else {
@@ -496,6 +941,7 @@ pub async fn visibility_refresh_messages(
     }
 
     let server_id = viewer.server_id();
+    visibility.ensure_registered_for_server(server, &server_id);
     let mut sessions = std::mem::take(&mut scope.sessions);
     if scope.include_known_users {
         sessions.extend(visibility.known_sessions());
@@ -636,7 +1082,7 @@ pub async fn visibility_refresh_scope_for_channel_operation(
 pub async fn visibility_refresh_scope_for_channel_operation_with_state(
     server: &Arc<Box<Server>>,
     op: &ChannelOperation,
-    visibility: &UserVisibilityState,
+    visibility: &mut UserVisibilityState,
 ) -> VisibilityRefreshScope {
     visibility_refresh_scope_for_channel_operation_inner(server, op, Some(visibility)).await
 }
@@ -644,10 +1090,11 @@ pub async fn visibility_refresh_scope_for_channel_operation_with_state(
 async fn visibility_refresh_scope_for_channel_operation_inner(
     server: &Arc<Box<Server>>,
     op: &ChannelOperation,
-    visibility: Option<&UserVisibilityState>,
+    visibility: Option<&mut UserVisibilityState>,
 ) -> VisibilityRefreshScope {
     let mut scope = VisibilityRefreshScope::new();
     let channels = server.get_channels();
+    let mut visibility = visibility;
     match &op.op {
         ChannelOp::CreateChannel { channel } => {
             scope.include_channel(channel.id);
@@ -665,11 +1112,33 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
             );
         }
         ChannelOp::DeleteChannel { id, .. } => {
-            if let Some(visibility) = visibility {
+            if let Some(visibility) = visibility.as_deref_mut() {
                 if let Some(deleted_channel_ids) = channels.delete_visibility_hint_for_operation(op)
                 {
-                    let deleted_channel_ids = deleted_channel_ids.iter().copied().collect();
-                    include_delete_visibility_refresh(&mut scope, visibility, &deleted_channel_ids);
+                    let registered_now =
+                        visibility.ensure_registered_for_server(server, &op.server_id);
+                    if registered_now {
+                        let deleted_channel_ids = deleted_channel_ids.iter().copied().collect();
+                        include_delete_visibility_refresh(
+                            &mut scope,
+                            visibility,
+                            &deleted_channel_ids,
+                        );
+                    } else if let Some(viewer_id) = visibility.registered_viewer_id(&op.server_id) {
+                        let fanout = server.visibility_fanout_index().delete_fanout(
+                            &op.server_id,
+                            op.version,
+                            &deleted_channel_ids,
+                        );
+                        if let Some(viewer_fanout) = fanout.get(viewer_id) {
+                            include_delete_visibility_refresh_for_channels(
+                                &mut scope,
+                                visibility,
+                                &viewer_fanout.current_channels,
+                                &viewer_fanout.listener_channels,
+                            );
+                        }
+                    }
                 } else {
                     let referenced_channel_ids = visibility.referenced_channel_ids();
                     let existing_channel_ids = channels
@@ -702,10 +1171,24 @@ fn include_delete_visibility_refresh(
     visibility: &UserVisibilityState,
     deleted_channel_ids: &HashSet<u32>,
 ) {
-    let current_sessions = visibility.sessions_in_current_channels(deleted_channel_ids);
+    include_delete_visibility_refresh_for_channels(
+        scope,
+        visibility,
+        deleted_channel_ids,
+        deleted_channel_ids,
+    );
+}
+
+fn include_delete_visibility_refresh_for_channels(
+    scope: &mut VisibilityRefreshScope,
+    visibility: &UserVisibilityState,
+    current_channel_ids: &HashSet<u32>,
+    listener_channel_ids: &HashSet<u32>,
+) {
+    let current_sessions = visibility.sessions_in_current_channels(current_channel_ids);
     scope.include_sessions(current_sessions.iter().copied());
 
-    for channel_id in deleted_channel_ids {
+    for channel_id in listener_channel_ids {
         if let Some(listener_sessions) = visibility.sessions_by_listener_channel.get(channel_id) {
             for session in listener_sessions {
                 if current_sessions.contains(session) {
@@ -1085,5 +1568,171 @@ mod tests {
         include_delete_visibility_refresh(&mut scope, &visibility, &HashSet::new());
 
         assert!(scope.is_empty());
+    }
+
+    #[test]
+    fn fanout_index_returns_only_affected_viewers_with_exact_channels() {
+        let index = Arc::new(VisibilityFanoutIndex::with_delete_cache_max_entries(8));
+        let mut affected = UserVisibilityState::default();
+        let mut unaffected = UserVisibilityState::default();
+        affected.register_with_index(Arc::clone(&index), "server-a");
+        unaffected.register_with_index(Arc::clone(&index), "server-a");
+        affected.insert(session(10), 42, channels(&[7, 99]));
+        unaffected.insert(session(20), 100, channels(&[8]));
+
+        let affected_id = affected.registered_viewer_id("server-a").unwrap();
+        let unaffected_id = unaffected.registered_viewer_id("server-a").unwrap();
+        let fanout = index.delete_fanout("server-a", 1, &[7, 42, 88]);
+        let affected_fanout = fanout.get(affected_id).expect("affected viewer");
+
+        assert_eq!(affected_fanout.current_channels, channels(&[42]));
+        assert_eq!(affected_fanout.listener_channels, channels(&[7]));
+        assert!(fanout.get(unaffected_id).is_none());
+    }
+
+    #[test]
+    fn fanout_index_tracks_bucket_transitions() {
+        let index = Arc::new(VisibilityFanoutIndex::with_delete_cache_max_entries(8));
+        let mut visibility = UserVisibilityState::default();
+        visibility.register_with_index(Arc::clone(&index), "server-a");
+        let viewer_id = visibility.registered_viewer_id("server-a").unwrap();
+        visibility.insert(session(10), 42, channels(&[7]));
+        visibility.insert(session(11), 42, channels(&[7]));
+
+        assert!(
+            index
+                .delete_fanout("server-a", 1, &[42, 7])
+                .get(viewer_id)
+                .is_some()
+        );
+
+        assert!(visibility.remove(session(10)));
+        assert!(
+            index
+                .delete_fanout("server-a", 2, &[42, 7])
+                .get(viewer_id)
+                .is_some()
+        );
+
+        assert!(visibility.remove(session(11)));
+        assert!(
+            index
+                .delete_fanout("server-a", 3, &[42, 7])
+                .get(viewer_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fanout_index_unregisters_on_drop() {
+        let index = Arc::new(VisibilityFanoutIndex::with_delete_cache_max_entries(8));
+        let viewer_id = {
+            let mut visibility = UserVisibilityState::default();
+            visibility.register_with_index(Arc::clone(&index), "server-a");
+            visibility.insert(session(10), 42, channels(&[7]));
+            visibility.registered_viewer_id("server-a").unwrap()
+        };
+
+        assert!(
+            index
+                .delete_fanout("server-a", 1, &[42, 7])
+                .get(viewer_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn registered_clear_removes_global_refs_but_keeps_registration() {
+        let index = Arc::new(VisibilityFanoutIndex::with_delete_cache_max_entries(8));
+        let mut visibility = UserVisibilityState::default();
+        visibility.register_with_index(Arc::clone(&index), "server-a");
+        visibility.insert(session(10), 42, channels(&[7]));
+        let viewer_id = visibility.registered_viewer_id("server-a").unwrap();
+
+        visibility.clear();
+        assert!(
+            index
+                .delete_fanout("server-a", 1, &[42, 7])
+                .get(viewer_id)
+                .is_none()
+        );
+
+        visibility.insert(session(11), 43, channels(&[8]));
+        let fanout = index.delete_fanout("server-a", 2, &[43, 8]);
+        let viewer_fanout = fanout.get(viewer_id).expect("viewer remains registered");
+        assert_eq!(viewer_fanout.current_channels, channels(&[43]));
+        assert_eq!(viewer_fanout.listener_channels, channels(&[8]));
+    }
+
+    #[test]
+    fn listener_cleanup_updates_global_fanout_index() {
+        let index = Arc::new(VisibilityFanoutIndex::with_delete_cache_max_entries(8));
+        let mut visibility = UserVisibilityState::default();
+        visibility.register_with_index(Arc::clone(&index), "server-a");
+        visibility.insert(session(10), 42, channels(&[7, 8]));
+        let viewer_id = visibility.registered_viewer_id("server-a").unwrap();
+
+        assert_eq!(
+            visibility.remove_visible_listener_channels(session(10), &channels(&[7])),
+            vec![7]
+        );
+
+        assert!(
+            index
+                .delete_fanout("server-a", 1, &[7])
+                .get(viewer_id)
+                .is_none()
+        );
+        assert!(
+            index
+                .delete_fanout("server-a", 2, &[8])
+                .get(viewer_id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cloned_visibility_state_is_unregistered_until_reindexed() {
+        let index = Arc::new(VisibilityFanoutIndex::with_delete_cache_max_entries(8));
+        let mut visibility = UserVisibilityState::default();
+        visibility.register_with_index(Arc::clone(&index), "server-a");
+        visibility.insert(session(10), 42, channels(&[7]));
+
+        let mut cloned = visibility.clone();
+        assert!(cloned.registered_viewer_id("server-a").is_none());
+
+        cloned.register_with_index(Arc::clone(&index), "server-a");
+        let cloned_id = cloned.registered_viewer_id("server-a").unwrap();
+        let fanout = index.delete_fanout("server-a", 1, &[42, 7]);
+        let cloned_fanout = fanout.get(cloned_id).expect("clone reindexed");
+        assert_eq!(cloned_fanout.current_channels, channels(&[42]));
+        assert_eq!(cloned_fanout.listener_channels, channels(&[7]));
+    }
+
+    #[test]
+    fn delete_fanout_cache_is_bounded() {
+        let index = Arc::new(VisibilityFanoutIndex::with_delete_cache_max_entries(2));
+
+        let _ = index.delete_fanout("server-a", 1, &[42]);
+        let _ = index.delete_fanout("server-a", 2, &[42]);
+        let _ = index.delete_fanout("server-a", 3, &[42]);
+
+        let inner = index.inner.read();
+        assert_eq!(inner.delete_cache.len(), 2);
+        assert!(
+            !inner
+                .delete_cache
+                .contains_key(&VisibilityDeleteCacheKey::new("server-a", 1))
+        );
+        assert!(
+            inner
+                .delete_cache
+                .contains_key(&VisibilityDeleteCacheKey::new("server-a", 2))
+        );
+        assert!(
+            inner
+                .delete_cache
+                .contains_key(&VisibilityDeleteCacheKey::new("server-a", 3))
+        );
     }
 }

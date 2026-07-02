@@ -1510,7 +1510,7 @@ async fn send_web_channel_log_update(
         shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
             &server,
             &op,
-            &session.user_visibility,
+            &mut session.user_visibility,
         )
         .await;
     send_web_visibility_refresh(
@@ -1578,7 +1578,7 @@ async fn send_web_channel_log_gap(
             shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
                 &server,
                 &op,
-                &session.user_visibility,
+                &mut session.user_visibility,
             )
             .await;
         send_web_visibility_refresh(
