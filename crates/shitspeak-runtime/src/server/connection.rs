@@ -835,7 +835,7 @@ async fn process_channel_log_result(
                 )
                 .await;
                 for msg in projected {
-                    crate::channel_handler::sync_channel_tree_shadow(channel_tree_shadow, &msg);
+                    channel_tree_shadow.sync_message(&msg);
                     outbound.push(msg);
                 }
             }
@@ -856,7 +856,7 @@ async fn process_channel_log_result(
             )
             .await;
             for msg in projected {
-                crate::channel_handler::sync_channel_tree_shadow(channel_tree_shadow, &msg);
+                channel_tree_shadow.sync_message(&msg);
                 outbound.push(msg);
             }
             client

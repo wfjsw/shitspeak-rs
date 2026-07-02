@@ -116,25 +116,75 @@ impl IntoIterator for SessionChannelShadow {
     }
 }
 
-pub type ChannelTreeShadow = HashSet<u32>;
+#[derive(Debug, Clone, Default)]
+pub struct ChannelTreeShadow {
+    channel_ids: HashSet<u32>,
+}
+
+impl ChannelTreeShadow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, channel_id: u32) -> bool {
+        self.channel_ids.insert(channel_id)
+    }
+
+    pub fn remove(&mut self, channel_id: &u32) -> bool {
+        self.channel_ids.remove(channel_id)
+    }
+
+    pub fn contains(&self, channel_id: &u32) -> bool {
+        self.channel_ids.contains(channel_id)
+    }
+
+    pub fn clear(&mut self) {
+        self.channel_ids.clear();
+    }
+
+    pub fn extend(&mut self, channel_ids: impl IntoIterator<Item = u32>) {
+        self.channel_ids.extend(channel_ids);
+    }
+
+    pub fn difference<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = &'a u32> {
+        self.channel_ids.difference(&other.channel_ids)
+    }
+
+    pub fn sync_message(&mut self, message: &Message) {
+        match message {
+            Message::ChannelState(channel_state) => {
+                if let Some(channel_id) = channel_state.channel_id {
+                    self.insert(channel_id);
+                }
+            }
+            Message::ChannelRemove(channel_remove) => {
+                self.remove(&channel_remove.channel_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl FromIterator<u32> for ChannelTreeShadow {
+    fn from_iter<T: IntoIterator<Item = u32>>(iter: T) -> Self {
+        let mut shadow = Self::new();
+        shadow.extend(iter);
+        shadow
+    }
+}
+
+impl IntoIterator for ChannelTreeShadow {
+    type Item = u32;
+    type IntoIter = std::collections::hash_set::IntoIter<u32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.channel_ids.into_iter()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum ChannelReplayError {
     ClientWriteFailed(WriteProtoMessageError),
-}
-
-pub fn sync_channel_tree_shadow(shadow: &mut ChannelTreeShadow, message: &Message) {
-    match message {
-        Message::ChannelState(channel_state) => {
-            if let Some(channel_id) = channel_state.channel_id {
-                shadow.insert(channel_id);
-            }
-        }
-        Message::ChannelRemove(channel_remove) => {
-            shadow.remove(&channel_remove.channel_id);
-        }
-        _ => {}
-    }
 }
 
 pub(crate) async fn permission_info_for_channel(
@@ -626,7 +676,7 @@ pub async fn replay_channel_log_gap(
             )
             .await;
             for msg in projected {
-                sync_channel_tree_shadow(channel_tree_shadow, &msg);
+                channel_tree_shadow.sync_message(&msg);
                 outbound.push(msg);
             }
         }
@@ -647,7 +697,7 @@ pub async fn replay_channel_log_gap(
         )
         .await;
         for msg in projected {
-            sync_channel_tree_shadow(channel_tree_shadow, &msg);
+            channel_tree_shadow.sync_message(&msg);
             outbound.push(msg);
         }
         client.set_last_channel_version(entry.version).await;
@@ -703,7 +753,7 @@ async fn replay_channel_snapshot(
         )
         .await;
         for msg in projected {
-            sync_channel_tree_shadow(channel_tree_shadow, &msg);
+            channel_tree_shadow.sync_message(&msg);
             outbound.push(msg);
         }
     }
@@ -779,9 +829,10 @@ mod tests {
     use crate::channels::Channel;
     use crate::client::client_session_identifier::ClientSessionIdentifier;
     use crate::client::group::ChannelHierarchy;
+    use crate::messages::{Message, encoder};
 
     use super::{
-        SessionChannelShadow, channels_affected_by_home_channel_move,
+        ChannelTreeShadow, SessionChannelShadow, channels_affected_by_home_channel_move,
         channels_with_home_channel_dependent_acls, ordered_snapshot_channels,
     };
 
@@ -1032,6 +1083,34 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([session(10), session(11), session(12), session(13)])
         );
+    }
+
+    #[test]
+    fn channel_tree_shadow_sync_message_tracks_channel_state_and_remove() {
+        let mut shadow = ChannelTreeShadow::new();
+
+        let create_7: Message = encoder::ChannelState {
+            channel_id: Some(7),
+            ..Default::default()
+        }
+        .into();
+        let create_8: Message = encoder::ChannelState {
+            channel_id: Some(8),
+            ..Default::default()
+        }
+        .into();
+
+        shadow.sync_message(&create_7);
+        shadow.sync_message(&create_8);
+
+        assert!(shadow.contains(&7));
+        assert!(shadow.contains(&8));
+
+        let remove_7: Message = encoder::ChannelRemove { channel_id: 7 }.into();
+        shadow.sync_message(&remove_7);
+
+        assert!(!shadow.contains(&7));
+        assert!(shadow.contains(&8));
     }
 }
 
