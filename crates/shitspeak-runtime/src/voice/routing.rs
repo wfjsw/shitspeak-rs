@@ -740,7 +740,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
             None,
         ),
         AudioTarget::ServerLoopback => {
-            let targets = vec![(sender.clone(), AudioContext::Normal)];
+            let targets = [(sender.clone(), AudioContext::Normal)];
             flush_voice_batch(server, audio, &targets).await;
             super::metrics::record_route(
                 VoiceRouteSource::Loopback,
@@ -757,6 +757,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
             if vt.is_empty() {
                 return;
             }
+
             let resolved_channels =
                 resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
             (
@@ -1187,7 +1188,7 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
         Some(rx) => rx,
         None => {
             span.in_scope(|| {
-                tracing::warn!(
+                tracing::error!(
                     session = u32::from(sender.get_session_id()),
                     "voice routing task already spawned"
                 );

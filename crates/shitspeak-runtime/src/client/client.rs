@@ -38,8 +38,8 @@ use crate::{
     voice::VoiceRoutingPayload,
 };
 
-const VOICE_ROUTING_QUEUE_CAPACITY: usize = 256;
-const VOICE_TCP_QUEUE_CAPACITY: usize = 256;
+const VOICE_ROUTING_QUEUE_CAPACITY: usize = 1024;
+const VOICE_TCP_QUEUE_CAPACITY: usize = 2048;
 const OUTBOUND_MESSAGE_QUEUE_CAPACITY: usize = 1024;
 const GRACEFUL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
