@@ -506,6 +506,100 @@ async fn voice_target_to_channel_shouts_only_to_that_channel() {
     .await;
 }
 
+/// Checks that cached channel voice target recipients are invalidated when
+/// client channel membership changes.
+#[tokio::test]
+async fn voice_target_channel_cache_tracks_client_moves() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(102, "CachedTarget".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(
+            103,
+            "CachedElsewhere".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(102).await;
+    carol.move_to_channel(103).await;
+    expect_user_channel(&bob, 102, "Bob enters cached target channel").await;
+    expect_user_channel(&carol, 103, "Carol enters elsewhere channel").await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    alice
+        .set_voice_target(voice_target(
+            7,
+            vec![voice_target_channel(102, false, false, None)],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(7, 42, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive the first cached channel target packet",
+    )
+    .await;
+    expect_no_voice(
+        &carol,
+        "Carol should not receive the first cached channel target packet",
+    )
+    .await;
+
+    bob.move_to_channel(103).await;
+    carol.move_to_channel(102).await;
+    expect_user_channel(&bob, 103, "Bob leaves cached target channel").await;
+    expect_user_channel(&carol, 102, "Carol enters cached target channel").await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    alice
+        .send_voice_tcp(7, 43, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(
+        &carol,
+        &alice,
+        "Carol should receive the second cached channel target packet",
+    )
+    .await;
+    expect_no_voice(
+        &bob,
+        "Bob should not receive the second cached channel target packet after moving away",
+    )
+    .await;
+}
+
 /// Checks that a plain channel voice target to the sender's current channel is
 /// allowed by Speak permission and does not require Whisper.
 #[tokio::test]

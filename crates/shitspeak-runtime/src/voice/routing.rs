@@ -18,7 +18,7 @@ use crate::{
         Client, ClientInstanceId,
         client_session_identifier::ClientSessionIdentifier,
         crypt::CryptState,
-        voice_target::{ResolvedVoiceTargetChannel, VoiceTarget},
+        voice_target::{ResolvedVoiceTargetChannel, ResolvedVoiceTargetRecipient, VoiceTarget},
     },
     constants::PROTOBUF_INTRODUCED_VERSION,
     messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget},
@@ -266,6 +266,60 @@ fn push_unique_target(
     )) {
         targets.push((client, context));
     }
+}
+
+async fn live_targets_from_cached_recipients(
+    server: &Arc<Box<Server>>,
+    server_id: &str,
+    recipients: &[ResolvedVoiceTargetRecipient],
+) -> Vec<(Arc<Box<Client>>, AudioContext)> {
+    let mut targets = Vec::with_capacity(recipients.len());
+    let local_node_id = server.get_clients().local_node_id();
+
+    for recipient in recipients {
+        let session_id = recipient.session_id();
+        if session_id.get_node_id() != local_node_id {
+            continue;
+        }
+        let Some(client) = server
+            .get_clients()
+            .get_client_in_server(server_id, session_id)
+            .await
+        else {
+            continue;
+        };
+        if client.client_instance_id() != recipient.client_instance_id() {
+            continue;
+        }
+        if !client.is_authenticated() {
+            continue;
+        }
+        if !client.read_local_state().is_some() {
+            continue;
+        }
+        if !client.can_receive_voice() {
+            continue;
+        }
+        targets.push((client, recipient.context()));
+    }
+
+    targets
+}
+
+fn cacheable_recipients_from_targets(
+    targets: &[(Arc<Box<Client>>, AudioContext)],
+) -> Arc<[ResolvedVoiceTargetRecipient]> {
+    targets
+        .iter()
+        .map(|(client, context)| {
+            ResolvedVoiceTargetRecipient::new(
+                client.get_session_id(),
+                client.client_instance_id(),
+                *context,
+            )
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
 
 async fn resolve_voice_intent(
@@ -704,6 +758,55 @@ async fn resolved_voice_target_channels(
     channels
 }
 
+async fn resolved_voice_target_recipients(
+    server: &Arc<Box<Server>>,
+    sender: &Arc<Box<Client>>,
+    server_id: &str,
+    sender_id: ClientSessionIdentifier,
+    source_channel: u32,
+    intent: &VoiceIntent,
+    default_context: AudioContext,
+    vt: &VoiceTarget,
+    resolved_channels: &[ResolvedVoiceTargetChannel],
+) -> Vec<(Arc<Box<Client>>, AudioContext)> {
+    let channel_version = server.get_channels().current_version_in_server(server_id);
+    let channel_acl_generation = server.get_channels().channel_acl_generation();
+    let client_version = server.get_clients().current_version_in_server(server_id);
+    let hide_users_without_traverse = server.get_hide_users_without_traverse();
+
+    if let Some(recipients) = vt.cached_resolved_recipients(
+        server_id,
+        channel_version,
+        channel_acl_generation,
+        client_version,
+        hide_users_without_traverse,
+        source_channel,
+    ) {
+        return live_targets_from_cached_recipients(server, server_id, &recipients).await;
+    }
+
+    let targets = resolve_voice_intent_with_resolved_channels(
+        server,
+        Some(sender),
+        server_id,
+        sender_id,
+        intent,
+        default_context,
+        Some(resolved_channels),
+    )
+    .await;
+    vt.store_resolved_recipients(
+        server_id,
+        channel_version,
+        channel_acl_generation,
+        client_version,
+        hide_users_without_traverse,
+        source_channel,
+        cacheable_recipients_from_targets(&targets),
+    );
+    targets
+}
+
 pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, audio: &Audio) {
     let started_at = Instant::now();
     let sender_id = sender.get_session_id();
@@ -731,56 +834,76 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         "routing voice packet"
     );
 
-    let (intent, target_kind, send_s2s, route_kind, resolved_channels) = match audio.target {
-        AudioTarget::Normal => (
-            normal_intent(sender_channel),
-            S2S_TARGET_NORMAL,
-            true,
-            VoiceRouteKind::Normal,
-            None,
-        ),
-        AudioTarget::ServerLoopback => {
-            let targets = [(sender.clone(), AudioContext::Normal)];
-            flush_voice_batch(server, audio, &targets).await;
-            super::metrics::record_route(
-                VoiceRouteSource::Loopback,
-                VoiceRouteKind::Loopback,
-                targets.len(),
-                started_at.elapsed(),
-            );
-            return;
-        }
-        AudioTarget::VoiceTarget(slot) => {
-            let Some(vt) = sender.voice_target(slot) else {
-                return;
-            };
-            if vt.is_empty() {
+    let (intent, target_kind, send_s2s, route_kind, resolved_channels, voice_target) =
+        match audio.target {
+            AudioTarget::Normal => (
+                normal_intent(sender_channel),
+                S2S_TARGET_NORMAL,
+                true,
+                VoiceRouteKind::Normal,
+                None,
+                None,
+            ),
+            AudioTarget::ServerLoopback => {
+                let targets = [(sender.clone(), AudioContext::Normal)];
+                flush_voice_batch(server, audio, &targets).await;
+                super::metrics::record_route(
+                    VoiceRouteSource::Loopback,
+                    VoiceRouteKind::Loopback,
+                    targets.len(),
+                    started_at.elapsed(),
+                );
                 return;
             }
+            AudioTarget::VoiceTarget(slot) => {
+                let Some(vt) = sender.voice_target(slot) else {
+                    return;
+                };
+                if vt.is_empty() {
+                    return;
+                }
 
-            let resolved_channels =
-                resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
-            (
-                target_intent(sender_channel, &vt),
-                S2S_TARGET_SHOUT,
-                true,
-                VoiceRouteKind::Target,
-                Some(resolved_channels),
-            )
-        }
-    };
+                let resolved_channels =
+                    resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
+                (
+                    target_intent(sender_channel, &vt),
+                    S2S_TARGET_SHOUT,
+                    true,
+                    VoiceRouteKind::Target,
+                    Some(resolved_channels),
+                    Some(vt),
+                )
+            }
+        };
 
     let default_context = audio_context_from_target_kind(target_kind);
-    let targets = resolve_voice_intent_with_resolved_channels(
-        server,
-        Some(sender),
-        &server_id,
-        sender_id,
-        &intent,
-        default_context,
-        resolved_channels.as_deref(),
-    )
-    .await;
+    let targets = if let (Some(vt), Some(resolved_channels)) =
+        (voice_target.as_ref(), resolved_channels.as_deref())
+    {
+        resolved_voice_target_recipients(
+            server,
+            sender,
+            &server_id,
+            sender_id,
+            sender_channel,
+            &intent,
+            default_context,
+            vt,
+            resolved_channels,
+        )
+        .await
+    } else {
+        resolve_voice_intent_with_resolved_channels(
+            server,
+            Some(sender),
+            &server_id,
+            sender_id,
+            &intent,
+            default_context,
+            resolved_channels.as_deref(),
+        )
+        .await
+    };
 
     tracing::trace!(
         session = u32::from(sender_id),
