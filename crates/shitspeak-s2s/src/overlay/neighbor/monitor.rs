@@ -25,6 +25,7 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{ConnectionManager, TransportKind};
 
 use super::super::config::OverlayConfig;
+use super::super::duplicate::DuplicateDetector;
 use super::super::membership::MembershipEvent;
 use super::super::proto::transports_to_mask;
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
@@ -196,6 +197,7 @@ fn selected_edge_loss(
 pub struct NeighborMonitor {
     self_id: NodeIdentifier,
     transport: ConnectionManager,
+    duplicate_detector: Arc<DuplicateDetector>,
     cfg: OverlayConfig,
     state: Mutex<HashMap<NodeIdentifier, NeighborState>>,
     /// Notified whenever a neighbor goes up/down or boot_epoch changes.
@@ -215,12 +217,14 @@ impl NeighborMonitor {
     pub fn new(
         self_id: NodeIdentifier,
         transport: ConnectionManager,
+        duplicate_detector: Arc<DuplicateDetector>,
         cfg: OverlayConfig,
         membership_events: broadcast::Sender<MembershipEvent>,
     ) -> Self {
         Self {
             self_id,
             transport,
+            duplicate_detector,
             cfg,
             state: Mutex::new(HashMap::new()),
             on_change: Arc::new(Notify::new()),
@@ -554,6 +558,9 @@ impl NeighborMonitor {
         let mut out = Vec::new();
         for (nid, kinds) in self.transport.live_peers() {
             if nid == self.self_id {
+                continue;
+            }
+            if self.duplicate_detector.is_quarantined(nid) {
                 continue;
             }
             out.push((nid, kinds));

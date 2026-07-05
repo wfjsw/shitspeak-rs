@@ -23,6 +23,7 @@ pub(crate) struct TopologySnapshot {
     nodes: Vec<TopologyNode>,
     links: Vec<TopologyLink>,
     routes: Vec<TopologyRoute>,
+    duplicate_nodes: Vec<TopologyDuplicateNode>,
     local_metrics: Vec<TransportMetric>,
     outbound_queues: Vec<OutboundQueueMetric>,
     inbound_queues: Vec<InboundQueueMetric>,
@@ -78,6 +79,25 @@ pub(crate) struct TopologyRoute {
     service_fit: &'static str,
     cost: u64,
     transport_cost: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TopologyDuplicateNode {
+    node: NodeIdentifier,
+    observed_epochs: usize,
+    conflict: bool,
+    quarantined: bool,
+    reason: &'static str,
+    quarantine_age_ms: u128,
+    quarantine_remaining_ms: u128,
+    conflicts_total: u64,
+    dropped_messages_total: Vec<TopologyDuplicateDrop>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TopologyDuplicateDrop {
+    kind: &'static str,
+    count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -280,6 +300,29 @@ pub(crate) fn build_topology_snapshot(
         .unwrap_or_default();
     let lsas = overlay.link_state_snapshot();
     let routing = overlay.routing_snapshot();
+    let mut duplicate_nodes = overlay
+        .duplicate_node_snapshot()
+        .into_iter()
+        .map(|node| TopologyDuplicateNode {
+            node: node.node_id(),
+            observed_epochs: node.observed_epochs(),
+            conflict: node.observed_epochs() > 1,
+            quarantined: node.quarantined(),
+            reason: node.reason(),
+            quarantine_age_ms: node.age_ms(),
+            quarantine_remaining_ms: node.remaining_ms(),
+            conflicts_total: node.conflicts_total(),
+            dropped_messages_total: node
+                .dropped_messages_total()
+                .iter()
+                .map(|drop| TopologyDuplicateDrop {
+                    kind: drop.kind(),
+                    count: drop.count(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    duplicate_nodes.sort_by_key(|node| node.node);
     let metrics = transport.metrics_snapshot();
 
     let mut lsa_by_origin = BTreeMap::new();
@@ -328,7 +371,13 @@ pub(crate) fn build_topology_snapshot(
 
     let mut links = Vec::new();
     for lsa in &lsas {
+        if overlay.is_node_quarantined(lsa.origin) {
+            continue;
+        }
         for link in &lsa.links {
+            if overlay.is_node_quarantined(link.neighbor) {
+                continue;
+            }
             links.push(TopologyLink {
                 source: lsa.origin,
                 target: link.neighbor,
@@ -461,6 +510,7 @@ pub(crate) fn build_topology_snapshot(
         nodes,
         links,
         routes,
+        duplicate_nodes,
         local_metrics,
         outbound_queues,
         inbound_queues,
@@ -610,6 +660,41 @@ impl<'a> PrometheusWriter<'a> {
             "shitspeak_s2s_route_service_fit",
             "S2S route service-fit state.",
             "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_duplicate_node_conflict",
+            "S2S duplicate node-id conflict state.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_node_quarantined",
+            "S2S duplicate node quarantine state.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_duplicate_node_observed_epochs",
+            "S2S live/recent boot epochs observed for a node ID.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_duplicate_node_quarantine_age_ms",
+            "S2S duplicate node quarantine age in milliseconds.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_duplicate_node_quarantine_remaining_ms",
+            "S2S duplicate node quarantine remaining time in milliseconds.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_duplicate_node_conflicts_total",
+            "S2S duplicate node-id conflicts observed.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_duplicate_node_dropped_messages_total",
+            "S2S messages dropped due to duplicate node-id quarantine.",
+            "counter",
         );
         self.header(
             "shitspeak_s2s_direct_metric_rtt_us",
@@ -890,6 +975,55 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
                 "shitspeak_s2s_route_service_fit",
                 labels,
                 if route.service_fit == fit { 1.0 } else { 0.0 },
+            ));
+        }
+    }
+
+    for duplicate in &snapshot.duplicate_nodes {
+        let source = local_node.clone();
+        let node = duplicate.node.to_string();
+        let base = vec![("source", source.as_str()), ("node", node.as_str())];
+        out.push(sample_with_base(
+            "shitspeak_s2s_duplicate_node_conflict",
+            &base,
+            if duplicate.conflict { 1.0 } else { 0.0 },
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_duplicate_node_observed_epochs",
+            &base,
+            duplicate.observed_epochs as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_duplicate_node_quarantine_age_ms",
+            &base,
+            duplicate.quarantine_age_ms as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_duplicate_node_quarantine_remaining_ms",
+            &base,
+            duplicate.quarantine_remaining_ms as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_duplicate_node_conflicts_total",
+            &base,
+            duplicate.conflicts_total as f64,
+        ));
+        {
+            let mut labels = base.clone();
+            labels.push(("reason", duplicate.reason));
+            out.push(sample(
+                "shitspeak_s2s_node_quarantined",
+                labels,
+                if duplicate.quarantined { 1.0 } else { 0.0 },
+            ));
+        }
+        for drop in &duplicate.dropped_messages_total {
+            let mut labels = base.clone();
+            labels.push(("kind", drop.kind));
+            out.push(sample(
+                "shitspeak_s2s_duplicate_node_dropped_messages_total",
+                labels,
+                drop.count as f64,
             ));
         }
     }
@@ -1681,6 +1815,20 @@ mod tests {
                 cost: 42,
                 transport_cost: Some(21),
             }],
+            duplicate_nodes: vec![TopologyDuplicateNode {
+                node: 4,
+                observed_epochs: 2,
+                conflict: true,
+                quarantined: true,
+                reason: "duplicate_boot_epoch",
+                quarantine_age_ms: 50,
+                quarantine_remaining_ms: 950,
+                conflicts_total: 1,
+                dropped_messages_total: vec![TopologyDuplicateDrop {
+                    kind: "OverlayData",
+                    count: 3,
+                }],
+            }],
             local_metrics: vec![TransportMetric {
                 peer: 2,
                 transport: "quic",
@@ -1751,6 +1899,15 @@ mod tests {
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_route_service_fit{source=\"1\",target=\"3\",dst=\"3\",next_hop=\"2\",metric=\"conversational\",level=\"reliable\",transport=\"quic\",service_fit=\"chosen\"} 1"
+        ));
+        assert!(
+            rendered.contains("shitspeak_s2s_duplicate_node_conflict{source=\"1\",node=\"4\"} 1")
+        );
+        assert!(rendered.contains(
+            "shitspeak_s2s_node_quarantined{source=\"1\",node=\"4\",reason=\"duplicate_boot_epoch\"} 1"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_duplicate_node_dropped_messages_total{source=\"1\",node=\"4\",kind=\"OverlayData\"} 3"
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_direct_metric_traffic_bps{source=\"1\",peer=\"2\",transport=\"quic\",direction=\"sent\"} 2000"

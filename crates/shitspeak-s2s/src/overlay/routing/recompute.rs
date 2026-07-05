@@ -16,6 +16,7 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{ConnectionManager, ServiceLevel};
 
 use super::super::config::OverlayConfig;
+use super::super::duplicate::DuplicateDetector;
 use super::super::lsdb::LinkStateDb;
 use super::RoutingTables;
 use super::dijkstra;
@@ -26,6 +27,7 @@ pub fn spawn_recomputer(
     self_id: NodeIdentifier,
     tables: Arc<ArcSwap<RoutingTables>>,
     transport: ConnectionManager,
+    duplicate_detector: Arc<DuplicateDetector>,
     cfg: OverlayConfig,
     shutdown: CancellationToken,
 ) {
@@ -34,10 +36,22 @@ pub fn spawn_recomputer(
         // before any LSAs land.
         let mut dynamic = if cfg.routing_dynamic_spf_enabled() {
             Some(recompute_dynamic_full(
-                &lsdb, self_id, &tables, &transport, &cfg,
+                &lsdb,
+                self_id,
+                &tables,
+                &transport,
+                &duplicate_detector,
+                &cfg,
             ))
         } else {
-            recompute_now(&lsdb, self_id, &tables, &transport, &cfg);
+            recompute_now(
+                &lsdb,
+                self_id,
+                &tables,
+                &transport,
+                &duplicate_detector,
+                &cfg,
+            );
             None
         };
         lsdb.drain_dirty_origins();
@@ -54,9 +68,14 @@ pub fn spawn_recomputer(
             }
             if cfg.routing_dynamic_spf_enabled() {
                 let dirty = lsdb.drain_dirty_origins();
-                let engine =
-                    dynamic.get_or_insert_with(|| DynamicSpf::rebuild(&lsdb, self_id, &cfg));
-                let new = engine.update(&lsdb, dirty, &cfg);
+                let engine = dynamic.get_or_insert_with(|| {
+                    DynamicSpf::rebuild_filtered(&lsdb, self_id, &cfg, |node| {
+                        !duplicate_detector.is_quarantined(node)
+                    })
+                });
+                let new = engine.update_filtered(&lsdb, dirty, &cfg, |node| {
+                    !duplicate_detector.is_quarantined(node)
+                });
                 transport
                     .set_required_outgoing_nodes(component_bridge_targets(engine.graph(), self_id));
                 trace!(
@@ -67,7 +86,14 @@ pub fn spawn_recomputer(
                 );
                 tables.store(Arc::new(new));
             } else {
-                recompute_now(&lsdb, self_id, &tables, &transport, &cfg);
+                recompute_now(
+                    &lsdb,
+                    self_id,
+                    &tables,
+                    &transport,
+                    &duplicate_detector,
+                    &cfg,
+                );
                 lsdb.drain_dirty_origins();
             }
         }
@@ -79,9 +105,12 @@ fn recompute_dynamic_full(
     self_id: NodeIdentifier,
     tables: &Arc<ArcSwap<RoutingTables>>,
     transport: &ConnectionManager,
+    duplicate_detector: &DuplicateDetector,
     cfg: &OverlayConfig,
 ) -> DynamicSpf {
-    let engine = DynamicSpf::rebuild(lsdb, self_id, cfg);
+    let engine = DynamicSpf::rebuild_filtered(lsdb, self_id, cfg, |node| {
+        !duplicate_detector.is_quarantined(node)
+    });
     transport.set_required_outgoing_nodes(component_bridge_targets(engine.graph(), self_id));
     let new = engine.routing_tables(cfg);
     trace!(
@@ -99,9 +128,12 @@ fn recompute_now(
     self_id: NodeIdentifier,
     tables: &Arc<ArcSwap<RoutingTables>>,
     transport: &ConnectionManager,
+    duplicate_detector: &DuplicateDetector,
     cfg: &OverlayConfig,
 ) {
-    let graph = dijkstra::RoutingGraph::from_lsdb(lsdb);
+    let graph = dijkstra::RoutingGraph::from_lsdb_filtered(lsdb, |node| {
+        !duplicate_detector.is_quarantined(node)
+    });
     transport.set_required_outgoing_nodes(component_bridge_targets(&graph, self_id));
 
     let new = RoutingTables::from_graph(&graph, self_id, cfg);

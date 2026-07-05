@@ -24,6 +24,7 @@ use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{ConnectionManager, MessageClass, ServiceLevel};
 
 use super::super::config::OverlayConfig;
+use super::super::duplicate::{DuplicateDetector, DuplicateEvidenceKind};
 use super::super::lsdb::{LinkStateDb, full_pull, push_snapshot};
 use super::super::proto::{OverlayBody, encode_message, node_to_wire, wrap};
 use super::monitor::NeighborMonitor;
@@ -37,6 +38,7 @@ pub struct HelloContext {
     pub transport: ConnectionManager,
     pub monitor: Arc<NeighborMonitor>,
     pub lsdb: Arc<LinkStateDb>,
+    pub duplicate_detector: Arc<DuplicateDetector>,
     pub cfg: OverlayConfig,
     pub shutdown: CancellationToken,
     pub nonce_counter: AtomicU64,
@@ -154,6 +156,16 @@ pub fn spawn_link_up_watcher(
 
 /// Inbound: respond to a Hello with a HelloAck echoing nonce + ts.
 pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: pb::Hello) {
+    ctx.duplicate_detector.observe_epoch(
+        from,
+        hello.src_boot_epoch,
+        false,
+        DuplicateEvidenceKind::Hello,
+    );
+    if ctx.duplicate_detector.is_quarantined(from) {
+        ctx.duplicate_detector.record_drop(from, "hello");
+        return;
+    }
     ctx.monitor.record_hello(from, hello.src_boot_epoch);
     let body = OverlayBody::HelloAck(pb::HelloAck {
         src_node: node_to_wire(ctx.self_id),
@@ -198,6 +210,16 @@ pub fn handle_hello_ack(
     ack: pb::HelloAck,
     transport_kind: shitspeak_s2s_transport::TransportKind,
 ) {
+    ctx.duplicate_detector.observe_epoch(
+        from,
+        ack.src_boot_epoch,
+        false,
+        DuplicateEvidenceKind::HelloAck,
+    );
+    if ctx.duplicate_detector.is_quarantined(from) {
+        ctx.duplicate_detector.record_drop(from, "hello_ack");
+        return;
+    }
     ctx.monitor.record_hello_ack(
         from,
         ack.src_boot_epoch,

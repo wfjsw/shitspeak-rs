@@ -28,6 +28,7 @@ use shitspeak_s2s_transport::{ConnectionManager, MessageClass, SendOptions, Serv
 
 use super::super::config::OverlayConfig;
 use super::super::discovery::learn_from_lsa;
+use super::super::duplicate::{DuplicateDetector, DuplicateEvidenceKind};
 use super::super::neighbor::monitor::NeighborMonitor;
 use super::super::proto::{OverlayBody, encode_message, node_to_wire, wrap};
 use super::advert::LsaFloodPacer;
@@ -195,6 +196,7 @@ pub fn handle_response(
     monitor: &NeighborMonitor,
     transport: &ConnectionManager,
     pacer: &LsaFloodPacer,
+    duplicate_detector: &DuplicateDetector,
     sender: NodeIdentifier,
     resp: pb::LsdbSyncResp,
 ) {
@@ -204,6 +206,16 @@ pub fn handle_response(
         let Some(lsa) = LsaEntry::from_pb(&pb_lsa) else {
             continue;
         };
+        duplicate_detector.observe_epoch(
+            lsa.origin,
+            lsa.boot_epoch,
+            lsa.tombstone,
+            DuplicateEvidenceKind::Lsa,
+        );
+        if duplicate_detector.is_quarantined(lsa.origin) {
+            duplicate_detector.record_drop(lsa.origin, "lsa");
+            continue;
+        }
         if matches!(lsdb.admit(lsa.clone()), AdmissionResult::Accepted) {
             learn_from_lsa(transport, &lsa);
             accepted_lsas.push(pb_lsa);

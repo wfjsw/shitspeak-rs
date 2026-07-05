@@ -115,6 +115,8 @@ struct S2SRuntimeState {
         HashMap<String, s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>>,
     bridge_tasks: Vec<JoinHandle<()>>,
     gateway_tx: Option<S2SGatewayTx>,
+    startup_duplicate_failures: u64,
+    last_startup_duplicate_node: Option<NodeIdentifier>,
     #[cfg(test)]
     inbound_chaos: Option<s2s_testing::LinkChaos>,
 }
@@ -986,24 +988,49 @@ impl S2SManager {
 
     pub fn prometheus_metrics_text(&self) -> Option<String> {
         let state = self.state.read();
-        let overlay = state.overlay.as_ref()?;
-        let transport = state.transport.as_ref()?;
-        Some(s2s_status::render_prometheus_metrics(
-            overlay,
-            transport,
-            state.local_geo.clone(),
-        ))
+        if let (Some(overlay), Some(transport)) = (state.overlay.as_ref(), state.transport.as_ref())
+        {
+            return Some(s2s_status::render_prometheus_metrics(
+                overlay,
+                transport,
+                state.local_geo.clone(),
+            ));
+        }
+        (state.startup_duplicate_failures > 0).then(|| {
+            let node = state
+                .last_startup_duplicate_node
+                .map(|node| node.to_string())
+                .unwrap_or_default();
+            format!(
+                "# HELP shitspeak_s2s_duplicate_node_startup_failures_total S2S startup failures caused by duplicate node-id detection.\n# TYPE shitspeak_s2s_duplicate_node_startup_failures_total counter\nshitspeak_s2s_duplicate_node_startup_failures_total{{node=\"{node}\"}} {}\n",
+                state.startup_duplicate_failures
+            )
+        })
     }
 
     pub(crate) fn prometheus_samples(&self) -> Option<Vec<s2s_status::PrometheusSample>> {
         let state = self.state.read();
-        let overlay = state.overlay.as_ref()?;
-        let transport = state.transport.as_ref()?;
-        Some(s2s_status::prometheus_samples(
-            overlay,
-            transport,
-            state.local_geo.clone(),
-        ))
+        if let (Some(overlay), Some(transport)) = (state.overlay.as_ref(), state.transport.as_ref())
+        {
+            return Some(s2s_status::prometheus_samples(
+                overlay,
+                transport,
+                state.local_geo.clone(),
+            ));
+        }
+        (state.startup_duplicate_failures > 0).then(|| {
+            vec![s2s_status::PrometheusSample::new(
+                "shitspeak_s2s_duplicate_node_startup_failures_total",
+                vec![(
+                    "node".to_owned(),
+                    state
+                        .last_startup_duplicate_node
+                        .map(|node| node.to_string())
+                        .unwrap_or_default(),
+                )],
+                state.startup_duplicate_failures as f64,
+            )]
+        })
     }
 
     pub fn prometheus_remote_write_requests(
@@ -1642,6 +1669,36 @@ impl S2SManager {
                 inbound
             }
         };
+
+        let local_node = transport.local_node_id();
+        let preflight_window = self
+            .overlay_config
+            .hello_interval()
+            .saturating_mul(2)
+            .min(self.overlay_config.hello_dead_interval())
+            .min(Duration::from_millis(250))
+            .max(Duration::from_millis(100));
+        let (inbound, duplicate_evidence) =
+            s2s_overlay::duplicate_startup_preflight(local_node, inbound, preflight_window).await;
+        if let Some(evidence) = duplicate_evidence {
+            error!(
+                node = local_node,
+                source = evidence.source(),
+                kind = evidence.kind(),
+                "fatal s2s startup failure: duplicate local node id observed on the network; disabling S2S for this server process"
+            );
+            {
+                let mut state = self.state.write();
+                state.startup_duplicate_failures =
+                    state.startup_duplicate_failures.saturating_add(1);
+                state.last_startup_duplicate_node = Some(local_node);
+            }
+            transport.shutdown().await;
+            self.clear_gateway_tx();
+            drop(gateways);
+            let _ = shutdown.changed().await;
+            return;
+        }
 
         let local_geo = resolve_observability_geo(self.local_geo.clone()).await;
 

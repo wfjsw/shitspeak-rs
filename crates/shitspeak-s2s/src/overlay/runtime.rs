@@ -23,6 +23,7 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{ConnectionManager, Inbound, PeerAddress};
 
 use super::config::OverlayConfig;
+use super::duplicate::DuplicateDetector;
 use super::error::OverlayError;
 use super::lsdb::advert::cost_changed_significantly;
 use super::lsdb::{
@@ -144,6 +145,7 @@ pub(crate) struct OverlayInner {
     pub neighbor: Arc<NeighborMonitor>,
     pub routing: RoutingHandle,
     pub services: Arc<ServiceRegistry>,
+    pub duplicate_detector: Arc<DuplicateDetector>,
     ordering: Arc<OverlayOrdering>,
     pub emitter: Arc<LsaEmitter>,
     pub flood_pacer: Arc<LsaFloodPacer>,
@@ -168,10 +170,16 @@ impl OverlayInner {
         let lsdb = Arc::new(LinkStateDb::new(floor));
 
         let (table, events_tx) = super::membership::new_table(self_id, lsdb.clone(), 256);
+        let duplicate_detector = Arc::new(DuplicateDetector::new(
+            self_id,
+            cfg.lsa_max_age()
+                .max(cfg.hello_dead_interval().saturating_mul(2)),
+        ));
 
         let neighbor = Arc::new(NeighborMonitor::new(
             self_id,
             transport.clone(),
+            duplicate_detector.clone(),
             cfg.clone(),
             events_tx,
         ));
@@ -197,6 +205,7 @@ impl OverlayInner {
             transport: transport.clone(),
             monitor: neighbor.clone(),
             lsdb: lsdb.clone(),
+            duplicate_detector: duplicate_detector.clone(),
             cfg: cfg.clone(),
             shutdown: shutdown.clone(),
             nonce_counter: AtomicU64::new(1),
@@ -211,6 +220,7 @@ impl OverlayInner {
             neighbor,
             routing,
             services,
+            duplicate_detector,
             ordering,
             emitter,
             flood_pacer,
@@ -322,6 +332,7 @@ impl OverlayInner {
             self.self_id,
             self.routing.clone(),
             self.transport.clone(),
+            self.duplicate_detector.clone(),
             self.cfg.clone(),
             self.shutdown.clone(),
         );
@@ -372,6 +383,7 @@ impl OverlayInner {
             lsdb: self.lsdb.clone(),
             routing: self.routing.clone(),
             services: self.services.clone(),
+            duplicate_detector: self.duplicate_detector.clone(),
             ordering: self.ordering.clone(),
             transport: self.transport.clone(),
             self_id: self.self_id,

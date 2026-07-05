@@ -54,20 +54,45 @@ impl RoutingGraph {
         lsdb.with_entries(|entries| Self::from_entries(entries.values()))
     }
 
+    pub(crate) fn from_lsdb_filtered<F>(lsdb: &LinkStateDb, include_node: F) -> Self
+    where
+        F: Fn(NodeIdentifier) -> bool,
+    {
+        lsdb.with_entries(|entries| Self::from_entries_filtered(entries.values(), include_node))
+    }
+
     fn from_entries<'a>(entries: impl IntoIterator<Item = &'a LsaEntry>) -> Self {
+        Self::from_entries_filtered(entries, |_| true)
+    }
+
+    fn from_entries_filtered<'a, F>(
+        entries: impl IntoIterator<Item = &'a LsaEntry>,
+        include_node: F,
+    ) -> Self
+    where
+        F: Fn(NodeIdentifier) -> bool,
+    {
         let mut active = HashSet::new();
         let mut transit_disabled = HashSet::new();
         let mut links = HashMap::new();
 
         for entry in entries {
-            if entry.tombstone {
+            if entry.tombstone || !include_node(entry.origin) {
                 continue;
             }
             active.insert(entry.origin);
             if entry.transit_disabled {
                 transit_disabled.insert(entry.origin);
             }
-            links.insert(entry.origin, entry.links.clone());
+            links.insert(
+                entry.origin,
+                entry
+                    .links
+                    .iter()
+                    .filter(|link| include_node(link.neighbor))
+                    .cloned()
+                    .collect(),
+            );
         }
 
         Self {

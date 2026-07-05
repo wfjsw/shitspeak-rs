@@ -33,6 +33,7 @@ use tracing::warn;
 
 use shitspeak_s2s_transport::{AdaptiveInboundReceiver, Inbound};
 
+use super::duplicate::DuplicateDetector;
 use super::lsdb::{
     LinkStateDb, LsaEmitter, LsaFloodPacer, handle_flood, handle_sync_request, handle_sync_response,
 };
@@ -50,6 +51,7 @@ pub(crate) struct DispatcherCtx {
     pub routing: RoutingHandle,
     pub services: Arc<super::messaging::ServiceRegistry>,
     pub ordering: Arc<super::messaging::ordering::OverlayOrdering>,
+    pub duplicate_detector: Arc<DuplicateDetector>,
     pub transport: shitspeak_s2s_transport::ConnectionManager,
     pub self_id: shitspeak_core::NodeIdentifier,
     pub shutdown: tokio_util::sync::CancellationToken,
@@ -104,6 +106,10 @@ async fn handle(
         return;
     };
     let body_kind = body_kind(&body);
+    if ctx.duplicate_detector.is_quarantined(from) {
+        ctx.duplicate_detector.record_drop(from, body_kind);
+        return;
+    }
     #[cfg(debug_assertions)]
     {
         let packet_kind = crate::debug_io::classify_overlay_body(&body);
@@ -119,6 +125,7 @@ async fn handle(
                 &ctx.monitor,
                 &ctx.transport,
                 &ctx.flood_pacer,
+                &ctx.duplicate_detector,
                 from,
                 f,
             )
@@ -139,6 +146,7 @@ async fn handle(
             &ctx.monitor,
             &ctx.transport,
             &ctx.flood_pacer,
+            &ctx.duplicate_detector,
             from,
             resp,
         ),

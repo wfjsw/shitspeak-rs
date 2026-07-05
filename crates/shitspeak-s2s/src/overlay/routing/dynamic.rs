@@ -24,6 +24,7 @@ pub(crate) struct DynamicSpf {
 }
 
 impl DynamicSpf {
+    #[cfg(test)]
     pub(crate) fn rebuild(
         lsdb: &LinkStateDb,
         self_id: NodeIdentifier,
@@ -32,6 +33,23 @@ impl DynamicSpf {
         Self::from_graph(RoutingGraph::from_lsdb(lsdb), self_id, cfg)
     }
 
+    pub(crate) fn rebuild_filtered<F>(
+        lsdb: &LinkStateDb,
+        self_id: NodeIdentifier,
+        cfg: &OverlayConfig,
+        include_node: F,
+    ) -> Self
+    where
+        F: Fn(NodeIdentifier) -> bool,
+    {
+        Self::from_graph(
+            RoutingGraph::from_lsdb_filtered(lsdb, include_node),
+            self_id,
+            cfg,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn update(
         &mut self,
         lsdb: &LinkStateDb,
@@ -43,6 +61,33 @@ impl DynamicSpf {
         }
 
         let next_graph = RoutingGraph::from_lsdb(lsdb);
+        if dirty_origins.len() > DYNAMIC_DIRTY_FALLBACK_ORIGINS {
+            *self = Self::from_graph(next_graph, self.self_id, cfg);
+            return self.routing_tables(cfg);
+        }
+
+        for table in self.tables.values_mut() {
+            table.update(&self.graph, &next_graph, &dirty_origins, self.self_id, cfg);
+        }
+        self.graph = next_graph;
+        self.routing_tables(cfg)
+    }
+
+    pub(crate) fn update_filtered<F>(
+        &mut self,
+        lsdb: &LinkStateDb,
+        dirty_origins: HashSet<NodeIdentifier>,
+        cfg: &OverlayConfig,
+        include_node: F,
+    ) -> RoutingTables
+    where
+        F: Fn(NodeIdentifier) -> bool,
+    {
+        if dirty_origins.is_empty() {
+            return self.routing_tables(cfg);
+        }
+
+        let next_graph = RoutingGraph::from_lsdb_filtered(lsdb, include_node);
         if dirty_origins.len() > DYNAMIC_DIRTY_FALLBACK_ORIGINS {
             *self = Self::from_graph(next_graph, self.self_id, cfg);
             return self.routing_tables(cfg);

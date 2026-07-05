@@ -24,6 +24,7 @@
 
 pub(crate) mod config;
 mod discovery;
+mod duplicate;
 mod error;
 mod inbound;
 mod lane;
@@ -37,20 +38,116 @@ mod runtime;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::broadcast;
+use tokio::time::{Instant, timeout};
 
 use shitspeak_core::NodeIdentifier;
-use shitspeak_s2s_transport::{ConnectionManager, Inbound, MessageClass, ServiceLevel};
+use shitspeak_s2s_transport::{
+    AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage, MessageClass, ServiceLevel,
+};
 
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
+pub use duplicate::{DuplicateDetector, DuplicateEvidenceKind, DuplicateNodeSnapshot};
 pub use error::OverlayError;
 pub use lane::LaneId;
 pub use lsdb::ReplicationServices;
 pub use membership::{MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{OverlayInboundMessage, OverlaySendOptions, ServiceInbound};
 pub use routing::{RouteEntry, RoutingMetric};
+
+#[derive(Debug, Clone)]
+pub struct StartupDuplicateEvidence {
+    source: NodeIdentifier,
+    kind: &'static str,
+}
+
+impl StartupDuplicateEvidence {
+    pub fn source(&self) -> NodeIdentifier {
+        self.source
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+}
+
+pub async fn duplicate_startup_preflight(
+    local_node: NodeIdentifier,
+    inbound: Inbound,
+    window: Duration,
+) -> (Inbound, Option<StartupDuplicateEvidence>) {
+    let (mut control, mut high_priority, mut regular) = inbound.into_parts();
+    let deadline = Instant::now() + window.max(Duration::from_millis(1));
+    let mut evidence = None;
+
+    while evidence.is_none() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match timeout(
+            deadline.saturating_duration_since(now),
+            recv_preflight_any(&mut control, &mut high_priority, &mut regular),
+        )
+        .await
+        {
+            Ok(Some(msg)) => {
+                evidence = startup_duplicate_evidence(local_node, &msg);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    (Inbound::new(control, high_priority, regular), evidence)
+}
+
+async fn recv_preflight_any(
+    control: &mut AdaptiveInboundReceiver,
+    high_priority: &mut AdaptiveInboundReceiver,
+    regular: &mut AdaptiveInboundReceiver,
+) -> Option<InboundMessage> {
+    tokio::select! {
+        msg = control.recv() => msg,
+        msg = high_priority.recv() => msg,
+        msg = regular.recv() => msg,
+    }
+}
+
+fn startup_duplicate_evidence(
+    local_node: NodeIdentifier,
+    msg: &InboundMessage,
+) -> Option<StartupDuplicateEvidence> {
+    if msg.from() == local_node {
+        return Some(StartupDuplicateEvidence {
+            source: msg.from(),
+            kind: "transport_peer",
+        });
+    }
+    let decoded = proto::decode_message(msg.payload()).ok()?;
+    let body = decoded.body?;
+    match body {
+        proto::OverlayBody::Hello(hello)
+            if NodeIdentifier::try_from(hello.src_node).ok() == Some(local_node) =>
+        {
+            Some(StartupDuplicateEvidence {
+                source: msg.from(),
+                kind: "hello",
+            })
+        }
+        proto::OverlayBody::HelloAck(ack)
+            if NodeIdentifier::try_from(ack.src_node).ok() == Some(local_node) =>
+        {
+            Some(StartupDuplicateEvidence {
+                source: msg.from(),
+                kind: "hello_ack",
+            })
+        }
+        _ => None,
+    }
+}
 
 /// Public handle for the overlay network. Cheap to clone — internally a
 /// shared `Arc`.
@@ -132,6 +229,16 @@ impl OverlayNetwork {
         self.inner.lsdb.snapshot()
     }
 
+    /// Snapshot of duplicate node-id observations and quarantine state.
+    pub fn duplicate_node_snapshot(&self) -> Vec<DuplicateNodeSnapshot> {
+        self.inner.duplicate_detector.snapshot()
+    }
+
+    /// Whether a node ID is currently quarantined due to duplicate identity evidence.
+    pub fn is_node_quarantined(&self, node: NodeIdentifier) -> bool {
+        self.inner.duplicate_detector.is_quarantined(node)
+    }
+
     /// Current routing-table snapshot for diagnostics and topology rendering.
     pub fn routing_snapshot(&self) -> routing::RoutingTables {
         self.inner.routing.load().as_ref().clone()
@@ -139,37 +246,70 @@ impl OverlayNetwork {
 
     /// Snapshot of the current membership view, sorted by node id.
     pub fn members(&self) -> Vec<MemberSnapshot> {
-        self.inner.table.snapshot()
+        self.inner
+            .table
+            .snapshot()
+            .into_iter()
+            .filter(|member| !self.is_node_quarantined(member.node_id()))
+            .collect()
     }
 
     /// Look up one peer.
     pub fn member(&self, node: NodeIdentifier) -> Option<MemberSnapshot> {
-        self.inner.table.snapshot_one(node)
+        if self.is_node_quarantined(node) {
+            None
+        } else {
+            self.inner.table.snapshot_one(node)
+        }
     }
 
     /// IDs of every origin with a current non-tombstone LSA.
     pub fn alive_members(&self) -> Vec<NodeIdentifier> {
-        self.inner.table.alive_members()
+        self.inner
+            .table
+            .alive_members()
+            .into_iter()
+            .filter(|node| !self.is_node_quarantined(*node))
+            .collect()
     }
 
     /// IDs of active members that advertise strict replication service.
     pub fn strict_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.inner.table.strict_replication_members()
+        self.inner
+            .table
+            .strict_replication_members()
+            .into_iter()
+            .filter(|node| !self.is_node_quarantined(*node))
+            .collect()
     }
 
     /// IDs of active members that advertise content/blob replication service.
     pub fn content_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.inner.table.content_replication_members()
+        self.inner
+            .table
+            .content_replication_members()
+            .into_iter()
+            .filter(|node| !self.is_node_quarantined(*node))
+            .collect()
     }
 
     /// IDs of active members that advertise owner-scoped replication service.
     pub fn owner_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.inner.table.owner_replication_members()
+        self.inner
+            .table
+            .owner_replication_members()
+            .into_iter()
+            .filter(|node| !self.is_node_quarantined(*node))
+            .collect()
     }
 
     /// Sum local max_users advertised by alive cluster members.
     pub fn alive_max_users(&self) -> u64 {
-        self.inner.table.alive_max_users()
+        self.members()
+            .into_iter()
+            .filter(|member| member.status() == MemberStatus::Alive)
+            .map(|member| member.max_users())
+            .sum()
     }
 
     /// Publish a changed local max_users value in the next local LSA.
