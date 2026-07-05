@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use parking_lot::{
     MappedMutexGuard as ParkingMappedMutexGuard, Mutex as ParkingMutex,
@@ -41,6 +41,11 @@ use crate::{
 const VOICE_ROUTING_QUEUE_CAPACITY: usize = 1024;
 const VOICE_TCP_QUEUE_CAPACITY: usize = 2048;
 const OUTBOUND_MESSAGE_QUEUE_CAPACITY: usize = 1024;
+const PROTO_MESSAGE_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+const PROTO_MESSAGE_WRITE_CHUNK_MESSAGES: usize = 32;
+const UDP_TUNNEL_MESSAGE_TYPE: u16 = 1;
+const VOICE_TCP_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+const VOICE_TCP_WRITE_CHUNK_MESSAGES: usize = 128;
 const GRACEFUL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sentinel bit on the packed `protocol_version` atomic indicating that
@@ -48,6 +53,40 @@ const GRACEFUL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `impl From<ProtocolVersion> for u64` only uses bits 16..64 (it always
 /// shifts left by 16), so bit 0 is free to use as a "set" marker.
 const PROTOCOL_VERSION_SET_BIT: u64 = 1;
+
+fn proto_message_write_chunk_end(messages: &[Message], start: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut end = start;
+    while end < messages.len() {
+        let message_bytes = 6 + messages[end].encoded_len();
+        if end > start
+            && (end - start >= PROTO_MESSAGE_WRITE_CHUNK_MESSAGES
+                || bytes + message_bytes > PROTO_MESSAGE_WRITE_CHUNK_BYTES)
+        {
+            break;
+        }
+        bytes += message_bytes;
+        end += 1;
+    }
+    end
+}
+
+fn udp_tunnel_write_chunk_end(frames: &[Bytes], start: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut end = start;
+    while end < frames.len() {
+        let message_bytes = 6 + frames[end].len();
+        if end > start
+            && (end - start >= VOICE_TCP_WRITE_CHUNK_MESSAGES
+                || bytes + message_bytes > VOICE_TCP_WRITE_CHUNK_BYTES)
+        {
+            break;
+        }
+        bytes += message_bytes;
+        end += 1;
+    }
+    end
+}
 
 pub type ClientInstanceId = u64;
 pub type ClientStateSubscription = tokio::sync::broadcast::Receiver<
@@ -181,11 +220,10 @@ pub struct Client {
     voice_targets: ParkingMutex<HashMap<u32, VoiceTarget>>,
     voice_routing_tx: mpsc::Sender<VoiceRoutingPayload>,
     voice_routing_rx: ParkingMutex<Option<mpsc::Receiver<VoiceRoutingPayload>>>,
-    /// Per-user outgoing TCP voice tunnel queue.  The routing task pushes raw
-    /// `UDPTunnel` payload bytes here without awaiting the TCP write; a
-    /// dedicated per-user task drains the queue and writes them to the TLS
-    /// stream serially.  This decouples the routing fan-out from per-recipient
-    /// TCP backpressure.
+    /// Per-user outgoing TCP voice tunnel queue. The routing task pushes raw
+    /// `UDPTunnel` payload bytes here without awaiting normal control fanout.
+    /// Native clients drain this as a separate priority input in the writer
+    /// task; gateway clients use the fallback bridge in `voice::routing`.
     voice_tcp_tx: mpsc::Sender<Bytes>,
     voice_tcp_rx: ParkingMutex<Option<mpsc::Receiver<Bytes>>>,
     outbound_message_tx: mpsc::Sender<ClientOutboundMessage>,
@@ -1174,8 +1212,20 @@ impl Client {
             .sum();
         match &self.transport {
             ClientTransport::NativeTls { tx, .. } => {
-                let mut guard = tx.lock().await;
-                guard.write_proto_message_batch(messages).await?;
+                let mut start = 0;
+                while start < messages.len() {
+                    let end = proto_message_write_chunk_end(messages, start);
+                    {
+                        let mut guard = tx.lock().await;
+                        guard
+                            .write_proto_message_batch(&messages[start..end])
+                            .await?;
+                    }
+                    start = end;
+                    if start < messages.len() {
+                        tokio::task::yield_now().await;
+                    }
+                }
             }
             ClientTransport::WebGateway { outbound_tx, .. } => {
                 for message in messages {
@@ -1188,6 +1238,60 @@ impl Client {
             ClientTransport::Remote => return Err(transport_not_writable_error().into()),
         }
         self.record_tcp_packets(messages.len(), bytes).await;
+        Ok(())
+    }
+
+    pub(crate) async fn write_udp_tunnel_batch_direct(
+        &self,
+        frames: &[Bytes],
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.write_udp_tunnel_batch_direct_inner(frames))
+            .await
+    }
+
+    async fn write_udp_tunnel_batch_direct_inner(
+        &self,
+        frames: &[Bytes],
+    ) -> Result<(), WriteProtoMessageError> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        let bytes = frames.iter().map(|frame| 6 + frame.len()).sum();
+        match &self.transport {
+            ClientTransport::NativeTls { tx, .. } => {
+                let mut start = 0;
+                while start < frames.len() {
+                    let end = udp_tunnel_write_chunk_end(frames, start);
+                    let chunk = &frames[start..end];
+                    let chunk_bytes = chunk.iter().map(|frame| 6 + frame.len()).sum();
+                    let mut buf = BytesMut::with_capacity(chunk_bytes);
+                    for frame in chunk {
+                        buf.extend_from_slice(&UDP_TUNNEL_MESSAGE_TYPE.to_be_bytes());
+                        buf.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(frame);
+                    }
+                    {
+                        let mut guard = tx.lock().await;
+                        guard.write_all(&buf).await?;
+                    }
+                    start = end;
+                    if start < frames.len() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            ClientTransport::WebGateway { outbound_tx, .. } => {
+                for frame in frames {
+                    outbound_tx
+                        .send(Message::UDPTunnel(frame.clone()))
+                        .await
+                        .map_err(|_| transport_closed_error())?;
+                }
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
+        self.record_tcp_packets(frames.len(), bytes).await;
         Ok(())
     }
 
@@ -1318,8 +1422,8 @@ impl Client {
         }
     }
 
-    /// Take the receiver half of the voice TCP send queue.  Called once by
-    /// `spawn_voice_tcp_task`; returns `None` on any subsequent call.
+    /// Take the receiver half of the voice TCP send queue. Called once by the
+    /// native writer task or gateway fallback bridge; returns `None` after that.
     pub fn take_voice_tcp_rx(&self) -> Option<mpsc::Receiver<Bytes>> {
         self.voice_tcp_rx.lock().take()
     }

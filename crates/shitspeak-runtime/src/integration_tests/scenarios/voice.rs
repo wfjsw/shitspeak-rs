@@ -5,23 +5,60 @@
 //! queue) and real UDP (sender encrypts with OCB2 and sends via a UDP
 //! socket; recipient receives, decrypts, decodes).
 
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
+use parking_lot::Mutex as ParkingMutex;
+use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
+use serde::Deserialize;
 
 use crate::acl::ACLPermissions;
 use crate::channels::Channel;
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
-use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::integration_tests::harness::{
+    TestClient, TestServer, TestServerOpts, spawn_test_server, test_client::ConnectError,
+};
 use crate::messages::Message;
-use crate::messages::encoder::{ChanAcl, UserState, VoiceTarget};
+use crate::messages::encoder::{ChanAcl, Ping, UserState, VoiceTarget};
 use crate::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{AudioPayload, PacketFormat};
+use crate::voice::metrics::{
+    VoiceRouteKind, VoiceRouteSource, route_metric_snapshot, route_resolution_metric_snapshot,
+};
 
 const VOICE_DEADLINE: Duration = Duration::from_secs(2);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(500);
 const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+const LARGE_TREE_SERVER_BRANCHES: usize = 2;
+const LARGE_TREE_CLIENTS_PER_BRANCH: usize = 500;
+const LARGE_TREE_CLIENTS: usize = LARGE_TREE_SERVER_BRANCHES * LARGE_TREE_CLIENTS_PER_BRANCH;
+const LARGE_TREE_SEED: u64 = 0x5771_7EC0;
+const LARGE_TREE_NEGATIVE_SAMPLE: usize = 40;
+const LARGE_TREE_CONNECT_DEADLINE: Duration = Duration::from_secs(600);
+const LARGE_TREE_CONNECT_ATTEMPT_DEADLINE: Duration = Duration::from_secs(60);
+const LARGE_TREE_CONNECT_ATTEMPTS: usize = 3;
+const LARGE_TREE_AUTHENTICATE_TIMEOUT_MS: u64 = 600_000;
+const LARGE_TREE_AUTH_FINALIZATION_CONCURRENCY: usize = 64;
+const LARGE_TREE_STREAM_BARRIER_DEADLINE: Duration = Duration::from_secs(30);
+const LARGE_TREE_SEGMENT_FRAMES: usize = 501;
+const LARGE_TREE_FRAME_INTERVAL: Duration = Duration::from_millis(20);
+const LARGE_TREE_MIN_SPEAK_SPAN: Duration = Duration::from_secs(10);
+const LARGE_TREE_FRAME_LATENCY_BUDGET: Duration = Duration::from_secs(2);
+const LARGE_TREE_END_TO_END_LATENCY_BUDGET: Duration = Duration::from_secs(2);
+const LARGE_TREE_CPU_CORE_BUDGET: f64 = 0.40;
+const LARGE_TREE_CPU_SPIKE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const LARGE_TREE_OPUS_FRAME: &[u8] = SAMPLE_OPUS;
 
 fn opus_frame(payload: &AudioPayload) -> &[u8] {
     match payload {
@@ -114,6 +151,885 @@ async fn listen_to_channel(listener: &TestClient, channel_id: u32, reason: &str)
         .await
         .expect(reason);
     listener.drain_now().await;
+}
+
+#[derive(Clone, Deserialize)]
+struct LargeTreeChannelSpec {
+    id: u32,
+    parent_id: Option<u32>,
+    name: String,
+    position: i32,
+    max_users: u32,
+    links: Vec<u32>,
+}
+
+struct LargeTreeClient {
+    client: TestClient,
+    channel_id: u32,
+    in_casters: bool,
+}
+
+struct LargeTreeShoutCase {
+    slot: u32,
+    target_channel: u32,
+    children: bool,
+    links: bool,
+    group: Option<&'static str>,
+    frame: u64,
+    label: &'static str,
+}
+
+#[derive(Deserialize)]
+struct LargeTreeFixture {
+    channels: Vec<LargeTreeChannelSpec>,
+}
+
+fn large_tree_channel_specs() -> Vec<LargeTreeChannelSpec> {
+    serde_json::from_str::<LargeTreeFixture>(include_str!("../fixtures/large_channel_tree.json"))
+        .expect("large channel tree fixture should parse")
+        .channels
+}
+
+fn large_tree_channel_tree(specs: &[LargeTreeChannelSpec]) -> HashMap<u32, Vec<u32>> {
+    let mut tree: HashMap<u32, Vec<u32>> = HashMap::new();
+    for spec in specs {
+        if let Some(parent_id) = spec.parent_id {
+            tree.entry(parent_id).or_default().push(spec.id);
+        }
+        tree.entry(spec.id).or_default();
+    }
+    tree
+}
+
+fn large_tree_subtree_ids(tree: &HashMap<u32, Vec<u32>>, root: u32) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if !out.insert(id) {
+            continue;
+        }
+        if let Some(children) = tree.get(&id) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    out
+}
+
+fn large_tree_link_groups(specs: &[LargeTreeChannelSpec]) -> Vec<Vec<u32>> {
+    let mut adjacency: HashMap<u32, HashSet<u32>> = HashMap::new();
+    for spec in specs {
+        adjacency.entry(spec.id).or_default();
+        for &linked_id in &spec.links {
+            adjacency.entry(spec.id).or_default().insert(linked_id);
+            adjacency.entry(linked_id).or_default().insert(spec.id);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut groups = Vec::new();
+    for &start in adjacency.keys() {
+        if !seen.insert(start) {
+            continue;
+        }
+        let mut group = Vec::new();
+        let mut stack = vec![start];
+        while let Some(id) = stack.pop() {
+            group.push(id);
+            if let Some(neighbors) = adjacency.get(&id) {
+                for &neighbor in neighbors {
+                    if seen.insert(neighbor) {
+                        stack.push(neighbor);
+                    }
+                }
+            }
+        }
+        if group.len() > 1 {
+            group.sort_unstable();
+            groups.push(group);
+        }
+    }
+    groups.sort_by_key(|group| (std::cmp::Reverse(group.len()), group[0]));
+    groups
+}
+
+fn large_tree_target_channels(
+    tree: &HashMap<u32, Vec<u32>>,
+    link_groups: &[Vec<u32>],
+    case: &LargeTreeShoutCase,
+) -> HashSet<u32> {
+    let mut channels = if case.children {
+        large_tree_subtree_ids(tree, case.target_channel)
+    } else {
+        HashSet::from([case.target_channel])
+    };
+
+    if case.links {
+        let initial: Vec<u32> = channels.iter().copied().collect();
+        for group in link_groups {
+            if group.iter().any(|id| initial.contains(id)) {
+                channels.extend(group.iter().copied());
+            }
+        }
+    }
+
+    channels
+}
+
+fn large_tree_expected_recipients(
+    clients: &[LargeTreeClient],
+    tree: &HashMap<u32, Vec<u32>>,
+    link_groups: &[Vec<u32>],
+    case: &LargeTreeShoutCase,
+) -> HashSet<usize> {
+    let target_channels = large_tree_target_channels(tree, link_groups, case);
+    clients
+        .iter()
+        .enumerate()
+        .filter(|(_, client)| {
+            target_channels.contains(&client.channel_id)
+                && case
+                    .group
+                    .map_or(true, |group| group == "casters" && client.in_casters)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn large_tree_root_id(specs: &[LargeTreeChannelSpec]) -> u32 {
+    specs
+        .iter()
+        .find(|spec| spec.parent_id.is_none())
+        .expect("fixture has root")
+        .id
+}
+
+fn large_tree_leaves_under(tree: &HashMap<u32, Vec<u32>>, root: u32) -> Vec<u32> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        match tree.get(&id) {
+            Some(children) if !children.is_empty() => {
+                stack.extend(children.iter().copied());
+            }
+            _ => leaves.push(id),
+        }
+    }
+    leaves.sort_unstable();
+    leaves
+}
+
+fn large_tree_server_roots(
+    specs: &[LargeTreeChannelSpec],
+    tree: &HashMap<u32, Vec<u32>>,
+    count: usize,
+) -> Vec<u32> {
+    let root_id = large_tree_root_id(specs);
+    let mut roots = tree
+        .get(&root_id)
+        .expect("fixture root has top-level branches")
+        .iter()
+        .copied()
+        .filter(|id| !large_tree_leaves_under(tree, *id).is_empty())
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|id| {
+        (
+            std::cmp::Reverse(large_tree_subtree_ids(tree, *id).len()),
+            *id,
+        )
+    });
+    roots.truncate(count);
+    assert_eq!(
+        roots.len(),
+        count,
+        "fixture does not have enough top-level branches"
+    );
+    roots
+}
+
+fn deepest_descendant_or_self(tree: &HashMap<u32, Vec<u32>>, root: u32) -> u32 {
+    let mut best = root;
+    let mut stack = vec![(root, 0usize)];
+    while let Some((id, depth)) = stack.pop() {
+        let best_depth = distance_from_root(tree, root, best);
+        if depth > best_depth || (depth == best_depth && id < best) {
+            best = id;
+        }
+        if let Some(children) = tree.get(&id) {
+            stack.extend(children.iter().copied().map(|child| (child, depth + 1)));
+        }
+    }
+    best
+}
+
+fn distance_from_root(tree: &HashMap<u32, Vec<u32>>, root: u32, target: u32) -> usize {
+    let mut stack = vec![(root, 0usize)];
+    while let Some((id, depth)) = stack.pop() {
+        if id == target {
+            return depth;
+        }
+        if let Some(children) = tree.get(&id) {
+            stack.extend(children.iter().copied().map(|child| (child, depth + 1)));
+        }
+    }
+    0
+}
+
+fn large_tree_shout_cases(
+    tree: &HashMap<u32, Vec<u32>>,
+    link_groups: &[Vec<u32>],
+    server_roots: &[u32],
+) -> Vec<LargeTreeShoutCase> {
+    let selected_channels = server_roots
+        .iter()
+        .flat_map(|root| large_tree_subtree_ids(tree, *root))
+        .collect::<HashSet<_>>();
+    let exact = *large_tree_leaves_under(tree, server_roots[0])
+        .first()
+        .expect("selected branch has leaves");
+    let recursive = server_roots[0];
+    let linked = link_groups
+        .iter()
+        .find(|group| group.iter().any(|id| selected_channels.contains(id)))
+        .and_then(|group| group.iter().find(|id| selected_channels.contains(id)))
+        .copied()
+        .expect("selected branches have linked channels");
+    let recursive_linked = server_roots
+        .iter()
+        .copied()
+        .find(|root| {
+            let subtree = large_tree_subtree_ids(tree, *root);
+            link_groups
+                .iter()
+                .any(|group| group.iter().any(|id| subtree.contains(id)))
+        })
+        .unwrap_or(recursive);
+    let second_recursive = server_roots.get(1).copied();
+
+    let mut cases = vec![
+        LargeTreeShoutCase {
+            slot: 7,
+            target_channel: exact,
+            children: false,
+            links: false,
+            group: None,
+            frame: 500,
+            label: "exact leaf channel",
+        },
+        LargeTreeShoutCase {
+            slot: 8,
+            target_channel: recursive,
+            children: true,
+            links: false,
+            group: None,
+            frame: 600,
+            label: "recursive production branch",
+        },
+        LargeTreeShoutCase {
+            slot: 9,
+            target_channel: linked,
+            children: false,
+            links: true,
+            group: None,
+            frame: 700,
+            label: "linked production channels",
+        },
+        LargeTreeShoutCase {
+            slot: 10,
+            target_channel: recursive_linked,
+            children: true,
+            links: true,
+            group: None,
+            frame: 800,
+            label: "recursive linked production branch",
+        },
+        LargeTreeShoutCase {
+            slot: 11,
+            target_channel: recursive_linked,
+            children: true,
+            links: true,
+            group: Some("casters"),
+            frame: 900,
+            label: "caster-only recursive linked production branch",
+        },
+    ];
+    if let Some(second_recursive) = second_recursive {
+        cases.push(LargeTreeShoutCase {
+            slot: 12,
+            target_channel: second_recursive,
+            children: true,
+            links: false,
+            group: None,
+            frame: 1000,
+            label: "recursive second production branch",
+        });
+    }
+    cases
+}
+
+async fn drain_large_tree_clients_until_quiet(alice: &TestClient, clients: &[LargeTreeClient]) {
+    let mut quiet_ticks = 0usize;
+    for _ in 0..200 {
+        let mut drained = alice.drain_now().await.len();
+        for client in clients {
+            drained += client.client.drain_now().await.len();
+        }
+        if drained == 0 {
+            quiet_ticks += 1;
+            if quiet_ticks >= 8 {
+                return;
+            }
+        } else {
+            quiet_ticks = 0;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn sync_large_tree_test_client_stream(client: &TestClient, timestamp: u64, label: &str) {
+    client
+        .send(Ping::default_from_timestamp(timestamp).into())
+        .await;
+    client
+        .recv_until(
+            |message| matches!(message, Message::Ping(ping) if ping.timestamp == Some(timestamp)),
+            LARGE_TREE_STREAM_BARRIER_DEADLINE,
+        )
+        .await
+        .unwrap_or_else(|| panic!("large-tree stream barrier timed out for {label}"));
+}
+
+async fn wait_for_large_tree_clients_indexed(
+    server: &crate::integration_tests::harness::TestServer,
+    clients: &[LargeTreeClient],
+) {
+    let repo = server.server.get_clients();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut indexed = HashSet::new();
+        let target_channels: HashSet<u32> =
+            clients.iter().map(|client| client.channel_id).collect();
+        for channel_id in target_channels {
+            for client in repo.get_local_clients_in_channel(channel_id).await {
+                indexed.insert(u32::from(client.get_session_id()));
+            }
+        }
+
+        let missing = clients
+            .iter()
+            .filter(|client| !indexed.contains(&u32::from(client.client.server_session)))
+            .count();
+        if missing == 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{missing} large-tree clients were not indexed in assigned channels"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn connect_large_tree_load_client(
+    server: &TestServer,
+    username: &str,
+) -> Result<TestClient, ConnectError> {
+    let mut last_error = None;
+    for attempt in 1..=LARGE_TREE_CONNECT_ATTEMPTS {
+        match TestClient::connect_and_authenticate_with_deadline(
+            server,
+            username,
+            None,
+            LARGE_TREE_CONNECT_ATTEMPT_DEADLINE,
+        )
+        .await
+        {
+            Ok(client) => {
+                if attempt > 1 {
+                    eprintln!(
+                        "large_tree_connect username={} recovered_on_attempt={}",
+                        username, attempt
+                    );
+                }
+                return Ok(client);
+            }
+            Err(error) => {
+                eprintln!(
+                    "large_tree_connect username={} attempt={} failed={:?}",
+                    username, attempt, error
+                );
+                last_error = Some(error);
+                if attempt < LARGE_TREE_CONNECT_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or(ConnectError::NoServerSync))
+}
+
+struct LargeTreeClientDelivery {
+    first_at: Instant,
+    last_at: Instant,
+    max_frame_gap: Duration,
+}
+
+async fn send_and_assert_large_tree_shout_delivery(
+    alice: &TestClient,
+    clients: &[LargeTreeClient],
+    expected: &HashSet<usize>,
+    case: &LargeTreeShoutCase,
+    frames: &[(u64, Bytes)],
+) {
+    let speak_start = Instant::now();
+    let route_sample = RouteResourceSample::capture_target();
+    let send_task = async {
+        let resource_sample = SpeakResourceSample::capture();
+        send_large_tree_voice_segment(alice, case, frames).await;
+        let send_end = Instant::now();
+        let resources = resource_sample.finish().await;
+        (send_end, resources)
+    };
+    let receive_task = async {
+        let mut expected_indices = expected.iter().copied().collect::<Vec<_>>();
+        expected_indices.sort_unstable();
+        join_all(expected_indices.iter().map(|&idx| async move {
+            let mut first_at = None;
+            let mut last_at = None;
+            let mut previous_frame = None;
+            let mut previous_receive_at = None;
+            let mut max_frame_gap = Duration::from_millis(0);
+            for (frame_number, payload) in frames {
+                let audio = clients[idx]
+                    .client
+                    .recv_voice_tcp(LARGE_TREE_FRAME_LATENCY_BUDGET)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{}: client {idx} should receive frame {frame_number}",
+                            case.label
+                        )
+                    });
+                let received_at = Instant::now();
+                if first_at.is_none() {
+                    first_at = Some(received_at);
+                }
+                if let Some(previous_receive_at) = previous_receive_at {
+                    max_frame_gap =
+                        max_frame_gap.max(received_at.duration_since(previous_receive_at));
+                }
+                previous_receive_at = Some(received_at);
+
+                assert_eq!(audio.sender_session, Some(alice.server_session));
+                assert_eq!(
+                    audio.frame_number, *frame_number,
+                    "{}: client {idx} received a non-contiguous frame",
+                    case.label
+                );
+                assert_eq!(
+                    opus_frame(&audio.audio_payload),
+                    payload.as_ref(),
+                    "{}: client {idx} received corrupted voice payload",
+                    case.label
+                );
+                if let Some(previous_frame) = previous_frame {
+                    assert_eq!(
+                        *frame_number,
+                        previous_frame + 1,
+                        "{}: generated segment frames must be contiguous",
+                        case.label
+                    );
+                }
+                previous_frame = Some(*frame_number);
+                last_at = Some(received_at);
+            }
+            LargeTreeClientDelivery {
+                first_at: first_at.expect("large-tree delivery should include at least one frame"),
+                last_at: last_at.expect("large-tree delivery should include at least one frame"),
+                max_frame_gap,
+            }
+        }))
+        .await
+    };
+
+    let ((send_end, resources), deliveries) = tokio::join!(send_task, receive_task);
+    let route_resources = route_sample.finish();
+    let max_first_frame_latency = deliveries
+        .iter()
+        .map(|delivery| delivery.first_at.duration_since(speak_start))
+        .max()
+        .unwrap_or_default();
+    let last_at = deliveries
+        .iter()
+        .map(|delivery| delivery.last_at)
+        .max()
+        .unwrap_or(send_end);
+    let tail_latency = last_at.saturating_duration_since(send_end);
+    let max_frame_gap = deliveries
+        .iter()
+        .map(|delivery| delivery.max_frame_gap)
+        .max()
+        .unwrap_or_default();
+    let budget = large_tree_cpu_core_budget();
+    let route_busy_cores = route_busy_cores(route_resources.resolution_duration(), resources.wall)
+        .expect("large-tree speak duration should be non-zero");
+    eprintln!(
+        "large_tree_speak_metrics case={} recipients={} frames={} routed_frames={} send_ms={} first_latency_ms={} tail_latency_ms={} max_gap_ms={} route_resolution_ms={} route_total_ms={} route_busy_cores={:.2} process_cpu_ms={} process_avg_cores={} process_max_interval_cores={} routing_budget_cores={:.2}",
+        case.label,
+        expected.len(),
+        frames.len(),
+        route_resources.frames(),
+        resources.wall.as_millis(),
+        max_first_frame_latency.as_millis(),
+        tail_latency.as_millis(),
+        max_frame_gap.as_millis(),
+        route_resources.resolution_duration().as_millis(),
+        route_resources.total_duration().as_millis(),
+        route_busy_cores,
+        resources.cpu.unwrap_or_default().as_millis(),
+        resources
+            .average_cpu_cores()
+            .map(|cores| format!("{cores:.2}"))
+            .unwrap_or_else(|| "unavailable".to_owned()),
+        resources
+            .max_interval_cores
+            .map(|cores| format!("{cores:.2}"))
+            .unwrap_or_else(|| "unavailable".to_owned()),
+        budget
+    );
+
+    assert!(
+        max_first_frame_latency <= LARGE_TREE_END_TO_END_LATENCY_BUDGET,
+        "{}: first voice frame latency was {:?}, expected <= {:?}",
+        case.label,
+        max_first_frame_latency,
+        LARGE_TREE_END_TO_END_LATENCY_BUDGET
+    );
+    assert!(
+        tail_latency <= LARGE_TREE_END_TO_END_LATENCY_BUDGET,
+        "{}: voice segment tail latency was {:?}, expected <= {:?}",
+        case.label,
+        tail_latency,
+        LARGE_TREE_END_TO_END_LATENCY_BUDGET
+    );
+    assert!(
+        max_frame_gap <= LARGE_TREE_FRAME_LATENCY_BUDGET,
+        "{}: voice stream had a receive gap of {:?}, expected <= {:?}",
+        case.label,
+        max_frame_gap,
+        LARGE_TREE_FRAME_LATENCY_BUDGET
+    );
+
+    assert!(
+        route_resources.frames() >= frames.len() as u64,
+        "{}: expected at least {} routed target frames, saw {}",
+        case.label,
+        frames.len(),
+        route_resources.frames()
+    );
+    assert!(
+        route_busy_cores <= budget,
+        "{}: server voice routing resolution used {:.2} busy cores over {:?}, budget {:.2}",
+        case.label,
+        route_busy_cores,
+        resources.wall,
+        budget
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut checked = 0usize;
+    for (idx, client) in clients.iter().enumerate() {
+        if expected.contains(&idx) {
+            continue;
+        }
+        assert!(
+            client
+                .client
+                .recv_voice_tcp(Duration::from_millis(25))
+                .await
+                .is_none(),
+            "{}: client {idx} in channel {} should not receive shout",
+            case.label,
+            client.channel_id
+        );
+        checked += 1;
+        if checked >= LARGE_TREE_NEGATIVE_SAMPLE {
+            break;
+        }
+    }
+    assert!(
+        checked > 0,
+        "{} should leave at least one non-recipient to sample",
+        case.label
+    );
+}
+
+async fn wait_for_voice_target_installed(
+    server: &crate::integration_tests::harness::TestServer,
+    client: &TestClient,
+    slot: u32,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sender = server
+            .server
+            .get_clients()
+            .get_client(client.server_session)
+            .await
+            .expect("sender should remain connected");
+        if sender.voice_target(slot).is_some() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "voice target slot {slot} was not installed before shout"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn large_tree_voice_segment(case: &LargeTreeShoutCase) -> Vec<(u64, Bytes)> {
+    (0..LARGE_TREE_SEGMENT_FRAMES)
+        .map(|offset| {
+            let frame_number = case.frame + offset as u64;
+            let payload = Bytes::from_static(LARGE_TREE_OPUS_FRAME);
+            (frame_number, payload)
+        })
+        .collect()
+}
+
+fn large_tree_segment_send_span(frames: &[(u64, Bytes)]) -> Duration {
+    let intervals = frames.len().saturating_sub(1) as u32;
+    LARGE_TREE_FRAME_INTERVAL * intervals
+}
+
+async fn send_large_tree_voice_segment(
+    alice: &TestClient,
+    case: &LargeTreeShoutCase,
+    frames: &[(u64, Bytes)],
+) {
+    for (idx, (frame_number, payload)) in frames.iter().enumerate() {
+        alice
+            .send_voice_tcp(case.slot, *frame_number, payload.clone())
+            .await;
+        if idx + 1 < frames.len() {
+            tokio::time::sleep(LARGE_TREE_FRAME_INTERVAL).await;
+        }
+    }
+}
+
+struct SpeakResourceSample {
+    wall: Instant,
+    cpu: Option<Duration>,
+    spike_probe: Option<CpuSpikeProbe>,
+}
+
+impl SpeakResourceSample {
+    fn capture() -> Self {
+        Self {
+            wall: Instant::now(),
+            cpu: process_cpu_time(),
+            spike_probe: CpuSpikeProbe::start(),
+        }
+    }
+
+    async fn finish(self) -> SpeakResourceMeasurement {
+        let wall = self.wall.elapsed();
+        let cpu = self.cpu.and_then(|start| {
+            process_cpu_time().map(|end| end.checked_sub(start).unwrap_or_default())
+        });
+        let max_interval_cores = match self.spike_probe {
+            Some(probe) => probe.finish().await,
+            None => None,
+        };
+        SpeakResourceMeasurement {
+            wall,
+            cpu,
+            max_interval_cores,
+        }
+    }
+}
+
+struct SpeakResourceMeasurement {
+    wall: Duration,
+    cpu: Option<Duration>,
+    max_interval_cores: Option<f64>,
+}
+
+impl SpeakResourceMeasurement {
+    fn average_cpu_cores(&self) -> Option<f64> {
+        let wall_secs = self.wall.as_secs_f64();
+        if wall_secs <= f64::EPSILON {
+            return None;
+        }
+        self.cpu.map(|cpu| cpu.as_secs_f64() / wall_secs)
+    }
+}
+
+struct RouteResourceSample {
+    total_before: crate::voice::metrics::VoiceRouteMetricSnapshot,
+    resolution_before: crate::voice::metrics::VoiceRouteMetricSnapshot,
+}
+
+impl RouteResourceSample {
+    fn capture_target() -> Self {
+        Self {
+            total_before: route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Target),
+            resolution_before: route_resolution_metric_snapshot(
+                VoiceRouteSource::Local,
+                VoiceRouteKind::Target,
+            ),
+        }
+    }
+
+    fn finish(self) -> RouteResourceMeasurement {
+        let total = route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Target)
+            .saturating_sub(self.total_before);
+        let resolution =
+            route_resolution_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Target)
+                .saturating_sub(self.resolution_before);
+        RouteResourceMeasurement { total, resolution }
+    }
+}
+
+struct RouteResourceMeasurement {
+    total: crate::voice::metrics::VoiceRouteMetricSnapshot,
+    resolution: crate::voice::metrics::VoiceRouteMetricSnapshot,
+}
+
+impl RouteResourceMeasurement {
+    fn frames(&self) -> u64 {
+        self.total.frames()
+    }
+
+    fn total_duration(&self) -> Duration {
+        self.total.duration()
+    }
+
+    fn resolution_duration(&self) -> Duration {
+        self.resolution.duration()
+    }
+}
+
+fn route_busy_cores(route_duration: Duration, wall: Duration) -> Option<f64> {
+    let wall_secs = wall.as_secs_f64();
+    if wall_secs <= f64::EPSILON {
+        return None;
+    }
+    Some(route_duration.as_secs_f64() / wall_secs)
+}
+
+struct CpuSpikeProbe {
+    stop: Arc<AtomicBool>,
+    max_cores: Arc<ParkingMutex<f64>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl CpuSpikeProbe {
+    fn start() -> Option<Self> {
+        let initial_cpu = process_cpu_time()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let max_cores = Arc::new(ParkingMutex::new(0.0));
+        let task_stop = Arc::clone(&stop);
+        let task_max_cores = Arc::clone(&max_cores);
+        let handle = tokio::spawn(async move {
+            let mut previous_cpu = initial_cpu;
+            let mut previous_wall = Instant::now();
+            while !task_stop.load(Ordering::Relaxed) {
+                tokio::time::sleep(LARGE_TREE_CPU_SPIKE_SAMPLE_INTERVAL).await;
+                let Some(current_cpu) = process_cpu_time() else {
+                    continue;
+                };
+                let current_wall = Instant::now();
+                let wall = current_wall.duration_since(previous_wall);
+                if wall.as_secs_f64() > f64::EPSILON {
+                    let cpu = current_cpu
+                        .checked_sub(previous_cpu)
+                        .unwrap_or_default()
+                        .as_secs_f64();
+                    let cores = cpu / wall.as_secs_f64();
+                    let mut max = task_max_cores.lock();
+                    if cores > *max {
+                        *max = cores;
+                    }
+                }
+                previous_cpu = current_cpu;
+                previous_wall = current_wall;
+            }
+        });
+        Some(Self {
+            stop,
+            max_cores,
+            handle,
+        })
+    }
+
+    async fn finish(self) -> Option<f64> {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.handle.await;
+        Some(*self.max_cores.lock())
+    }
+}
+
+fn large_tree_cpu_core_budget() -> f64 {
+    LARGE_TREE_CPU_CORE_BUDGET
+}
+
+#[cfg(unix)]
+fn process_cpu_time() -> Option<Duration> {
+    unsafe {
+        let mut usage = std::mem::zeroed::<libc::rusage>();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return None;
+        }
+        Some(timeval_duration(usage.ru_utime) + timeval_duration(usage.ru_stime))
+    }
+}
+
+#[cfg(unix)]
+fn timeval_duration(value: libc::timeval) -> Duration {
+    Duration::from_secs(value.tv_sec as u64) + Duration::from_micros(value.tv_usec as u64)
+}
+
+#[cfg(windows)]
+fn process_cpu_time() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    unsafe {
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = creation;
+        let mut kernel = creation;
+        let mut user = creation;
+        if GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return None;
+        }
+
+        let kernel_ticks = filetime_100ns_ticks(kernel);
+        let user_ticks = filetime_100ns_ticks(user);
+        Some(Duration::from_nanos(
+            kernel_ticks.saturating_add(user_ticks).saturating_mul(100),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn filetime_100ns_ticks(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    ((value.dwHighDateTime as u64) << 32) | value.dwLowDateTime as u64
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_cpu_time() -> Option<Duration> {
+    None
 }
 
 // ── TCP-tunneled tests ──────────────────────────────────────────────────────
@@ -1311,6 +2227,249 @@ async fn voice_target_group_filter_applies_to_linked_channel_listeners() {
         "Carol should not receive linked listener audio for a group she is not in",
     )
     .await;
+}
+
+/// Stresses shout routing against an anonymized production-sized channel tree.
+/// 500 clients per selected top-level branch are deterministically scattered
+/// across the real topology, then a superuser shouts to channel targets with
+/// exact, recursive, linked, recursive+linked, and group-filtered settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_target_large_root_multi_branch_1000_clients_shout_matrix() {
+    let server = spawn_test_server(TestServerOpts {
+        max_users: (LARGE_TREE_CLIENTS + 8) as u64,
+        client_idle_timeout_secs: LARGE_TREE_AUTHENTICATE_TIMEOUT_MS / 1_000,
+        auth_finalization_concurrency: LARGE_TREE_AUTH_FINALIZATION_CONCURRENCY,
+        authenticate_timeout_ms: LARGE_TREE_AUTHENTICATE_TIMEOUT_MS,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+
+    for idx in 0..LARGE_TREE_CLIENTS {
+        let username = format!("load-client-{idx:03}");
+        let user_id = 10_000 + idx as u32;
+        let groups = if idx % 5 == 0 {
+            vec!["casters".into()]
+        } else {
+            Vec::new()
+        };
+        server
+            .authenticator
+            .register_user(&username, None, Some(user_id), groups);
+    }
+
+    let specs = large_tree_channel_specs();
+    let tree = large_tree_channel_tree(&specs);
+    let link_groups = large_tree_link_groups(&specs);
+    let server_roots = large_tree_server_roots(&specs, &tree, LARGE_TREE_SERVER_BRANCHES);
+    let cases = large_tree_shout_cases(&tree, &link_groups, &server_roots);
+    let branch_leaf_channels = server_roots
+        .iter()
+        .map(|root| large_tree_leaves_under(&tree, *root))
+        .collect::<Vec<_>>();
+
+    let chans = server.server.get_channels();
+    let mut created = HashSet::from([0u32]);
+    let mut pending: Vec<&LargeTreeChannelSpec> = specs
+        .iter()
+        .filter(|spec| spec.parent_id.is_some())
+        .collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut remaining = Vec::new();
+        for spec in pending {
+            let parent_id = spec.parent_id.expect("non-root channel");
+            if !created.contains(&parent_id) {
+                remaining.push(spec);
+                continue;
+            }
+            chans
+                .create_channel(Channel::new(
+                    spec.id,
+                    spec.name.clone(),
+                    spec.position,
+                    spec.max_users,
+                    Some(parent_id),
+                ))
+                .await
+                .unwrap();
+            created.insert(spec.id);
+        }
+        assert!(
+            remaining.len() < before,
+            "large channel tree fixture contains parent cycles or missing parents"
+        );
+        pending = remaining;
+    }
+    for spec in &specs {
+        for &linked_id in &spec.links {
+            if spec.id < linked_id {
+                chans.add_link(spec.id, linked_id).await.unwrap();
+            }
+        }
+    }
+
+    let mut rng = SmallRng::seed_from_u64(LARGE_TREE_SEED);
+    let mut placements = Vec::with_capacity(LARGE_TREE_CLIENTS);
+    for idx in 0..LARGE_TREE_CLIENTS {
+        let branch_index = idx / LARGE_TREE_CLIENTS_PER_BRANCH;
+        let branch_local_index = idx % LARGE_TREE_CLIENTS_PER_BRANCH;
+        let branch_leaves = &branch_leaf_channels[branch_index];
+        let random_channel = branch_leaves[rng.random_range(0..branch_leaves.len())];
+        let channel_id = if branch_index == 0 {
+            match branch_local_index {
+                0..=19 => cases[0].target_channel,
+                20..=39 => deepest_descendant_or_self(&tree, cases[1].target_channel),
+                40..=59 => cases[2].target_channel,
+                60..=79 => deepest_descendant_or_self(&tree, cases[3].target_channel),
+                80..=99 => *large_tree_target_channels(&tree, &link_groups, &cases[2])
+                    .iter()
+                    .find(|&&id| id != cases[2].target_channel)
+                    .unwrap_or(&cases[2].target_channel),
+                100..=119 => *large_tree_target_channels(&tree, &link_groups, &cases[3])
+                    .iter()
+                    .find(|&&id| id != cases[3].target_channel)
+                    .unwrap_or(&cases[3].target_channel),
+                _ => random_channel,
+            }
+        } else {
+            random_channel
+        };
+        placements.push(channel_id);
+        server
+            .server
+            .get_user_channel_cache()
+            .remember_last_channel(&(10_000 + idx as u32).to_string(), channel_id)
+            .await
+            .unwrap();
+    }
+
+    let mut clients = Vec::with_capacity(LARGE_TREE_CLIENTS);
+    for branch_index in 0..LARGE_TREE_SERVER_BRANCHES {
+        let branch_start = branch_index * LARGE_TREE_CLIENTS_PER_BRANCH;
+        let branch_end = branch_start + LARGE_TREE_CLIENTS_PER_BRANCH;
+        let server_ref = &server;
+        let branch_wall = Instant::now();
+        eprintln!(
+            "large_tree_connect branch={} clients={} start",
+            branch_index, LARGE_TREE_CLIENTS_PER_BRANCH
+        );
+        let mut pending = FuturesUnordered::new();
+        for idx in branch_start..branch_end {
+            let username = format!("load-client-{idx:03}");
+            pending.push(async move {
+                let connected_at = Instant::now();
+                let result = connect_large_tree_load_client(server_ref, &username).await;
+                (idx, connected_at.elapsed(), result)
+            });
+        }
+
+        let mut connected = Vec::with_capacity(LARGE_TREE_CLIENTS_PER_BRANCH);
+        let mut progress_tick = tokio::time::interval(Duration::from_secs(5));
+        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while connected.len() < LARGE_TREE_CLIENTS_PER_BRANCH {
+            tokio::select! {
+                item = pending.next() => {
+                    let Some((idx, elapsed, client)) = item else {
+                        break;
+                    };
+                    let client =
+                        client.unwrap_or_else(|err| panic!("connect large-tree client {idx}: {err:?}"));
+                    connected.push((idx, client));
+                    if connected.len() % 50 == 0 || connected.len() == LARGE_TREE_CLIENTS_PER_BRANCH {
+                        eprintln!(
+                            "large_tree_connect branch={} completed={} pending={} last_client={} last_ms={} elapsed_ms={}",
+                            branch_index,
+                            connected.len(),
+                            pending.len(),
+                            idx,
+                            elapsed.as_millis(),
+                            branch_wall.elapsed().as_millis(),
+                        );
+                    }
+                }
+                _ = progress_tick.tick() => {
+                    let local_clients = server.server.get_clients().get_local_clients().await;
+                    let authenticated = local_clients.iter().filter(|client| client.is_authenticated()).count();
+                    let published = local_clients.iter().filter(|client| client.is_published()).count();
+                    let auth_calls = server.authenticator.authenticated_auxiliary_data().len();
+                    eprintln!(
+                        "large_tree_connect branch={} waiting completed={} pending={} local={} authenticated={} published={} auth_calls={} elapsed_ms={}",
+                        branch_index,
+                        connected.len(),
+                        pending.len(),
+                        local_clients.len(),
+                        authenticated,
+                        published,
+                        auth_calls,
+                        branch_wall.elapsed().as_millis(),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            connected.len(),
+            LARGE_TREE_CLIENTS_PER_BRANCH,
+            "large-tree branch {branch_index} should authenticate every client"
+        );
+        connected.sort_by_key(|(idx, _)| *idx);
+
+        for (idx, client) in connected {
+            clients.push(LargeTreeClient {
+                client,
+                channel_id: placements[idx],
+                in_casters: idx % 5 == 0,
+            });
+        }
+    }
+
+    wait_for_large_tree_clients_indexed(&server, &clients).await;
+    let alice = TestClient::connect_and_authenticate_with_deadline(
+        &server,
+        "alice",
+        None,
+        LARGE_TREE_CONNECT_DEADLINE,
+    )
+    .await
+    .expect("alice");
+    drain_large_tree_clients_until_quiet(&alice, &clients).await;
+
+    for case in cases {
+        let expected = large_tree_expected_recipients(&clients, &tree, &link_groups, &case);
+        assert!(
+            !expected.is_empty(),
+            "{} should have at least one recipient",
+            case.label
+        );
+
+        drain_large_tree_clients_until_quiet(&alice, &clients).await;
+        alice
+            .set_voice_target(voice_target(
+                case.slot,
+                vec![voice_target_channel(
+                    case.target_channel,
+                    case.children,
+                    case.links,
+                    case.group,
+                )],
+            ))
+            .await;
+        wait_for_voice_target_installed(&server, &alice, case.slot).await;
+        sync_large_tree_test_client_stream(&alice, 0x571E_8000 + case.slot as u64, case.label)
+            .await;
+        drain_large_tree_clients_until_quiet(&alice, &clients).await;
+        let frames = large_tree_voice_segment(&case);
+        assert!(
+            large_tree_segment_send_span(&frames) >= LARGE_TREE_MIN_SPEAK_SPAN,
+            "{} should continuously speak for at least {:?}",
+            case.label,
+            LARGE_TREE_MIN_SPEAK_SPAN
+        );
+        send_and_assert_large_tree_shout_delivery(&alice, &clients, &expected, &case, &frames)
+            .await;
+    }
 }
 
 // ── Real UDP / OCB2 tests ──────────────────────────────────────────────────

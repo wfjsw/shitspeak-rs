@@ -28,7 +28,11 @@ use super::config::TransportConfig;
 use super::connection::OutboundEnvelope;
 use super::connection::{AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerState};
 use super::endpoint::{
-    EndpointRegistry, kcp::KcpEndpoint, mux::UdpMuxSet, quic::QuicEndpoint, tcp::TcpEndpoint,
+    EndpointRegistry,
+    kcp::KcpEndpoint,
+    mux::{UdpMuxQueueTuning, UdpMuxSet},
+    quic::QuicEndpoint,
+    tcp::TcpEndpoint,
     udp::UdpEndpoint,
 };
 use super::error::{ConfigError, SendError, TransportError};
@@ -1504,7 +1508,10 @@ fn build_endpoints(
     server_tls: Arc<rustls::ServerConfig>,
     client_tls: Arc<rustls::ClientConfig>,
 ) -> Result<EndpointRegistry, TransportError> {
-    let mux = UdpMuxSet::new(&udp_family_listen_addrs(cfg));
+    let mux = UdpMuxSet::new(
+        &udp_family_listen_addrs(cfg),
+        UdpMuxQueueTuning::for_max_users(cfg.max_users()),
+    );
     let has_seed = |kind| {
         cfg.seed_targets()
             .iter()

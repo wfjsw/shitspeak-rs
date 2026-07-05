@@ -43,6 +43,8 @@ udp_ping_enabled = true
 # Per-port virtual-server UDP ping status can be overridden with
 # [[server_entrypoints]].udp_ping_status_server_id; otherwise a listen entrypoint reports its server_id.
 udp_ping_user_count_scope = "cluster"
+# Native UDP voice processing queue floor. Effective capacity scales from max_users:
+# baseline = max_users * 16 packets, burst = 5x baseline, hard cap = max_users * 128 packets.
 udp_channel_size = 2048
 
 # Idle timeout (seconds)
@@ -165,6 +167,8 @@ idle_ping_interval_secs = 10
 native_stats_interval_secs = 10
 # Cap on in-flight pings remembered per stream/UDP session.
 max_pending_pings = 64
+# Shared UDP-family S2S mux queues are sized from top-level max_users:
+# baseline = max_users * 16 datagrams, burst = 5x baseline, hard cap = max_users * 128 datagrams.
 # Exponential probing retry cap for peers seen recently.
 recent_probe_retry_cap_secs = 30
 # Exponential probing retry cap for peers not seen for stale_probe_age_secs.

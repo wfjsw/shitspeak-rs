@@ -443,6 +443,18 @@ fn dynamic_bind_retry_randomizes_candidates_after_first_attempt() {
 }
 
 #[test]
+fn udp_processing_channel_size_scales_from_max_users() {
+    assert_eq!(effective_udp_processing_channel_size(2_048, 100), 12_800);
+    assert_eq!(effective_udp_processing_channel_size(2_048, 400), 51_200);
+}
+
+#[test]
+fn udp_processing_channel_size_keeps_configured_floor() {
+    assert_eq!(effective_udp_processing_channel_size(70_000, 100), 70_000);
+    assert_eq!(effective_udp_processing_channel_size(1, 0), 5_120);
+}
+
+#[test]
 fn c2s_tls_provider_only_advertises_pfs_cipher_suites() {
     let provider = c2s_pfs_tls_provider();
 

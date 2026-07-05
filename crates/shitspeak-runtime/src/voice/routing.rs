@@ -275,17 +275,21 @@ async fn live_targets_from_cached_recipients(
 ) -> Vec<(Arc<Box<Client>>, AudioContext)> {
     let mut targets = Vec::with_capacity(recipients.len());
     let local_node_id = server.get_clients().local_node_id();
+    let session_ids = recipients
+        .iter()
+        .map(ResolvedVoiceTargetRecipient::session_id)
+        .collect::<Vec<_>>();
+    let clients = server
+        .get_clients()
+        .get_local_clients_by_ids_in_server(server_id, &session_ids)
+        .await;
 
-    for recipient in recipients {
+    for (recipient, client) in recipients.iter().zip(clients) {
         let session_id = recipient.session_id();
         if session_id.get_node_id() != local_node_id {
             continue;
         }
-        let Some(client) = server
-            .get_clients()
-            .get_client_in_server(server_id, session_id)
-            .await
-        else {
+        let Some(client) = client else {
             continue;
         };
         if client.client_instance_id() != recipient.client_instance_id() {
@@ -911,7 +915,13 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         count = targets.len(),
         "resolved local voice recipients"
     );
+    let resolution_duration = started_at.elapsed();
     flush_voice_batch(server, audio, &targets).await;
+    super::metrics::record_route_resolution(
+        VoiceRouteSource::Local,
+        route_kind,
+        resolution_duration,
+    );
     super::metrics::record_route(
         VoiceRouteSource::Local,
         route_kind,
@@ -1022,7 +1032,9 @@ pub(crate) async fn route_s2s_voice_frame(
         count = targets.len(),
         "routing s2s voice frame to local recipients"
     );
+    let resolution_duration = started_at.elapsed();
     flush_voice_batch(server, &decoded, &targets).await;
+    super::metrics::record_route_resolution(VoiceRouteSource::S2s, route_kind, resolution_duration);
     super::metrics::record_route(
         VoiceRouteSource::S2s,
         route_kind,
@@ -1031,14 +1043,43 @@ pub(crate) async fn route_s2s_voice_frame(
     );
 }
 
-fn enqueue_voice_tcp_metric(client: &Client, bytes: &Bytes) {
-    let queued = client.try_enqueue_voice_tcp(bytes.clone());
-    let result = if queued {
-        VoiceEgressResult::Queued
-    } else {
-        VoiceEgressResult::Dropped
-    };
-    super::metrics::record_egress(VoiceEgressTransport::TcpTunnel, result, 1, bytes.len());
+#[derive(Default)]
+struct VoiceTcpEgressTally {
+    queued_packets: usize,
+    queued_bytes: usize,
+    dropped_packets: usize,
+    dropped_bytes: usize,
+}
+
+impl VoiceTcpEgressTally {
+    fn enqueue(&mut self, client: &Client, bytes: &Bytes) {
+        if client.try_enqueue_voice_tcp(bytes.clone()) {
+            self.queued_packets += 1;
+            self.queued_bytes += bytes.len();
+        } else {
+            self.dropped_packets += 1;
+            self.dropped_bytes += bytes.len();
+        }
+    }
+
+    fn record(self) {
+        if self.queued_packets > 0 {
+            super::metrics::record_egress(
+                VoiceEgressTransport::TcpTunnel,
+                VoiceEgressResult::Queued,
+                self.queued_packets,
+                self.queued_bytes,
+            );
+        }
+        if self.dropped_packets > 0 {
+            super::metrics::record_egress(
+                VoiceEgressTransport::TcpTunnel,
+                VoiceEgressResult::Dropped,
+                self.dropped_packets,
+                self.dropped_bytes,
+            );
+        }
+    }
 }
 
 pub(crate) async fn flush_voice_batch(
@@ -1066,25 +1107,26 @@ pub(crate) async fn flush_voice_batch(
         super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
         let mut cache = EncodeCache::new();
         let mut udp_batches: HashMap<std::net::SocketAddr, DatagramBatch> = HashMap::new();
+        let mut tcp_tally = VoiceTcpEgressTally::default();
 
         for (client, context) in targets {
             let format = client_packet_format(client, server_protocol_version);
             let entry = cache.get_or_encode(audio, *context, format);
 
             if client.prefers_tcp_tunnel() {
-                enqueue_voice_tcp_metric(client, &entry.bytes);
+                tcp_tally.enqueue(client, &entry.bytes);
                 continue;
             }
 
             let Some(addr) = client.get_udp_address() else {
-                enqueue_voice_tcp_metric(client, &entry.bytes);
+                tcp_tally.enqueue(client, &entry.bytes);
                 continue;
             };
             let Some(local_addr) = server
                 .udp_socket_for_client(client)
                 .and_then(|socket| socket.local_addr().ok())
             else {
-                enqueue_voice_tcp_metric(client, &entry.bytes);
+                tcp_tally.enqueue(client, &entry.bytes);
                 continue;
             };
 
@@ -1106,10 +1148,11 @@ pub(crate) async fn flush_voice_batch(
                     session = u32::from(client.get_session_id()),
                     "encryption failed for client, falling back to TCP tunnel"
                 );
-                enqueue_voice_tcp_metric(client, &entry.bytes);
+                tcp_tally.enqueue(client, &entry.bytes);
                 continue;
             }
         }
+        tcp_tally.record();
 
         for (local_addr, udp_batch) in udp_batches {
             if udp_batch.is_empty() {
@@ -1193,10 +1236,12 @@ pub(crate) async fn flush_voice_batch(
     }
 
     // TCP fallback recipients — enqueue using the cached plaintext, do not await.
+    let mut tcp_tally = VoiceTcpEgressTally::default();
     for (client, format, context) in &tcp_items {
         let entry = cache.get_or_encode(audio, *context, *format);
-        enqueue_voice_tcp_metric(client, &entry.bytes);
+        tcp_tally.enqueue(client, &entry.bytes);
     }
+    tcp_tally.record();
 
     if udp_items.is_empty() {
         return;
@@ -1333,13 +1378,12 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
     );
 }
 
-/// Spawn a per-user voice TCP send task.
+/// Spawn a fallback per-user voice TCP send task.
 ///
-/// Drains the per-user `voice_tcp` queue and writes each `UDPTunnel` payload
-/// to the TLS stream serially.  Decouples the routing fan-out from
-/// per-recipient TCP backpressure: if a recipient's TLS write is slow,
-/// only their own queue backs up (and ultimately drops), other recipients
-/// in the same fan-out are unaffected.
+/// Native TLS clients drain the separate `voice_tcp` queue in their connection
+/// writer task. Gateway transports do not have that writer, so this bridge
+/// forwards queued `UDPTunnel` payloads through the transport's queued send
+/// API.
 ///
 /// Holds a `Weak` reference to the client so the task does not prevent
 /// client drop; on a failed upgrade or a write error, the task exits.

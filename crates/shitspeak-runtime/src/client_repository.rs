@@ -1126,6 +1126,23 @@ impl ClientRepository {
         }
     }
 
+    pub async fn get_local_clients_by_ids_in_server(
+        &self,
+        server_id: &str,
+        ids: &[ClientSessionIdentifier],
+    ) -> Vec<Option<Arc<Box<Client>>>> {
+        let register = self.register.read().await;
+        ids.iter()
+            .map(|id| {
+                if id.get_node_id() != self.local_node_id {
+                    return None;
+                }
+                let scoped_id = ScopedSessionId::new(server_id.to_owned(), *id);
+                register.local_clients.get(&scoped_id).cloned()
+            })
+            .collect()
+    }
+
     /// Look up a client by their UDP socket address.
     pub async fn get_client_by_udp_address(&self, addr: &SocketAddr) -> Option<Arc<Box<Client>>> {
         self.get_client_by_udp_address_key(UdpBindingKey::legacy(*addr))

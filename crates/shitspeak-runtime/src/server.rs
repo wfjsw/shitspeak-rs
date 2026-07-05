@@ -54,6 +54,13 @@ use entrypoints::{
 };
 use tls::{load_c2s_tls_acceptor, validate_privacy_config};
 
+const UDP_PROCESSING_MIN_BASELINE_CAPACITY: usize = 1024;
+const UDP_PROCESSING_PACKETS_PER_USER_BASELINE: usize = 16;
+const UDP_PROCESSING_BURST_MULTIPLIER: usize = 5;
+const UDP_PROCESSING_MIN_HARD_CAPACITY: usize =
+    UDP_PROCESSING_MIN_BASELINE_CAPACITY * UDP_PROCESSING_BURST_MULTIPLIER;
+const UDP_PROCESSING_PACKETS_PER_USER_HARD_CAP: usize = 128;
+
 #[cfg(test)]
 use auth_finalization::{AuthFinalizationAdmission, should_send_auth_finalization_queue_notice};
 #[cfg(test)]
@@ -327,11 +334,32 @@ impl Server {
         self.s2s_manager.log_startup_summary();
 
         // Snapshot startup-only config values (cannot be hot-reloaded).
-        let udp_channel_size = self.read_config().udp_channel_size;
-        let udp_voice_enabled = self.read_config().udp_voice_enabled;
-        let udp_ping_enabled = self.read_config().udp_ping_enabled;
-        let idle_timeout_secs = self.read_config().client_idle_timeout_secs;
-        let pending_delete_timeout_ms = self.read_config().pending_delete_timeout_ms;
+        let (
+            configured_udp_channel_size,
+            max_users,
+            udp_voice_enabled,
+            udp_ping_enabled,
+            idle_timeout_secs,
+            pending_delete_timeout_ms,
+        ) = {
+            let config = self.read_config();
+            (
+                config.udp_channel_size,
+                config.max_users,
+                config.udp_voice_enabled,
+                config.udp_ping_enabled,
+                config.client_idle_timeout_secs,
+                config.pending_delete_timeout_ms,
+            )
+        };
+        let udp_channel_size =
+            effective_udp_processing_channel_size(configured_udp_channel_size, max_users);
+        tracing::debug!(
+            configured_udp_channel_size,
+            max_users,
+            udp_channel_size,
+            "native UDP processing channel sized"
+        );
 
         // Bounded channel shared between UDP drain and processing tasks.
         let (udp_in, udp_out) = tokio::sync::mpsc::channel::<UdpPacket>(udp_channel_size);
@@ -1096,8 +1124,8 @@ impl Server {
         Ok(())
     }
 
-    /// Spawn a periodic task that disconnects local clients who haven't sent a
-    /// ping within `timeout_secs`.
+    /// Spawn a periodic task that disconnects authenticated local clients who
+    /// haven't sent a ping within `timeout_secs`.
     fn spawn_idle_reaper(
         server: Arc<Box<Self>>,
         timeout_secs: u64,
@@ -1127,6 +1155,9 @@ impl Server {
         let clients = self.clients.get_local_clients().await;
 
         for client in &clients {
+            if !client.is_authenticated() {
+                continue;
+            }
             let last_ping = client.get_last_ping().await;
             if now - last_ping > timeout {
                 let sid = client.get_session_id();
@@ -1758,4 +1789,17 @@ impl Server {
             self.clients.broadcast_all(&msg).await;
         }
     }
+}
+
+fn effective_udp_processing_channel_size(configured_floor: usize, max_users: u64) -> usize {
+    let users = usize::try_from(max_users).unwrap_or(usize::MAX).max(1);
+    let baseline = users
+        .saturating_mul(UDP_PROCESSING_PACKETS_PER_USER_BASELINE)
+        .max(UDP_PROCESSING_MIN_BASELINE_CAPACITY);
+    let burst = baseline.saturating_mul(UDP_PROCESSING_BURST_MULTIPLIER);
+    let hard = users
+        .saturating_mul(UDP_PROCESSING_PACKETS_PER_USER_HARD_CAP)
+        .max(UDP_PROCESSING_MIN_HARD_CAPACITY)
+        .max(burst);
+    configured_floor.max(hard)
 }

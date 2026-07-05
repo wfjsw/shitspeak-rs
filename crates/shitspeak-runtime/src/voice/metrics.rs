@@ -233,6 +233,11 @@ static QUEUE_DROPS: [AtomicU64; VOICE_QUEUE_DROP_REASON_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_QUEUE_DROP_REASON_COUNT];
 static ROUTED_FRAMES: [AtomicU64; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
+static ROUTE_RESOLUTION_DURATION_TOTAL_US: [AtomicU64;
+    VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
+    [const { AtomicU64::new(0) }; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
+static ROUTE_DURATION_TOTAL_US: [AtomicU64; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
+    [const { AtomicU64::new(0) }; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
 static ROUTE_DURATION_BUCKETS: [[AtomicU64; ROUTE_DURATION_BUCKETS_US.len()];
     VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
     [const { [const { AtomicU64::new(0) }; ROUTE_DURATION_BUCKETS_US.len()] };
@@ -388,11 +393,73 @@ pub(crate) fn record_route(
     increment(&ROUTED_FRAMES[index], 1);
     observe_bucket(&FANOUT_BUCKETS_TOTAL[index], &FANOUT_BUCKETS, fanout as u64);
     let duration_us = duration.as_micros().min(u64::MAX as u128) as u64;
+    increment(&ROUTE_DURATION_TOTAL_US[index], duration_us);
     observe_bucket(
         &ROUTE_DURATION_BUCKETS[index],
         &ROUTE_DURATION_BUCKETS_US,
         duration_us,
     );
+}
+
+pub(crate) fn record_route_resolution(
+    source: VoiceRouteSource,
+    kind: VoiceRouteKind,
+    duration: Duration,
+) {
+    let index = route_index(source, kind);
+    let duration_us = duration.as_micros().min(u64::MAX as u128) as u64;
+    increment(&ROUTE_RESOLUTION_DURATION_TOTAL_US[index], duration_us);
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VoiceRouteMetricSnapshot {
+    frames: u64,
+    duration: Duration,
+}
+
+#[cfg(test)]
+impl VoiceRouteMetricSnapshot {
+    pub(crate) fn frames(self) -> u64 {
+        self.frames
+    }
+
+    pub(crate) fn duration(self) -> Duration {
+        self.duration
+    }
+
+    pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            frames: self.frames.saturating_sub(earlier.frames),
+            duration: self.duration.saturating_sub(earlier.duration),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn route_metric_snapshot(
+    source: VoiceRouteSource,
+    kind: VoiceRouteKind,
+) -> VoiceRouteMetricSnapshot {
+    let index = route_index(source, kind);
+    VoiceRouteMetricSnapshot {
+        frames: ROUTED_FRAMES[index].load(Ordering::Relaxed),
+        duration: Duration::from_micros(ROUTE_DURATION_TOTAL_US[index].load(Ordering::Relaxed)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn route_resolution_metric_snapshot(
+    source: VoiceRouteSource,
+    kind: VoiceRouteKind,
+) -> VoiceRouteMetricSnapshot {
+    let index = route_index(source, kind);
+    VoiceRouteMetricSnapshot {
+        frames: ROUTED_FRAMES[index].load(Ordering::Relaxed),
+        duration: Duration::from_micros(
+            ROUTE_RESOLUTION_DURATION_TOTAL_US[index].load(Ordering::Relaxed),
+        ),
+    }
 }
 
 pub(crate) fn record_dispatch(mode: VoiceDispatchMode) {

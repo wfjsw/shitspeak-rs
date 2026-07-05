@@ -6,11 +6,15 @@ use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
 
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{
+    Mutex,
+    mpsc::{self, error::TrySendError},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -24,8 +28,50 @@ pub(crate) const DISCRIMINATOR_LEN: usize = 1;
 const MARKER_MASK: u8 = 0b1100_0000;
 const MARKER_BITS: u8 = 0b1000_0000;
 const ID_MASK: u8 = 0b0011_1111;
-const QUEUE_CAPACITY: usize = 1024;
+const MIN_BASELINE_QUEUE_CAPACITY: usize = 1024;
+const DATAGRAMS_PER_USER_BASELINE: usize = 16;
+const BURST_MULTIPLIER: usize = 5;
+const MIN_HARD_QUEUE_CAPACITY: usize = MIN_BASELINE_QUEUE_CAPACITY * BURST_MULTIPLIER;
+const DATAGRAMS_PER_USER_HARD_CAP: usize = 128;
 const MAX_DATAGRAM: usize = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UdpMuxQueueTuning {
+    baseline_capacity: usize,
+    burst_capacity: usize,
+    hard_capacity: usize,
+}
+
+impl UdpMuxQueueTuning {
+    pub(crate) fn for_max_users(max_users: usize) -> Self {
+        let users = max_users.max(1);
+        let baseline_capacity = users
+            .saturating_mul(DATAGRAMS_PER_USER_BASELINE)
+            .max(MIN_BASELINE_QUEUE_CAPACITY);
+        let burst_capacity = baseline_capacity.saturating_mul(BURST_MULTIPLIER);
+        let hard_capacity = users
+            .saturating_mul(DATAGRAMS_PER_USER_HARD_CAP)
+            .max(MIN_HARD_QUEUE_CAPACITY)
+            .max(burst_capacity);
+        Self {
+            baseline_capacity,
+            burst_capacity,
+            hard_capacity,
+        }
+    }
+
+    pub(crate) fn baseline_capacity(&self) -> usize {
+        self.baseline_capacity
+    }
+
+    pub(crate) fn burst_capacity(&self) -> usize {
+        self.burst_capacity
+    }
+
+    pub(crate) fn hard_capacity(&self) -> usize {
+        self.hard_capacity
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UdpDialMode {
@@ -96,14 +142,18 @@ struct MuxDatagram {
 struct ProtocolSlot {
     tx: mpsc::Sender<MuxDatagram>,
     rx: parking_lot::Mutex<Option<mpsc::Receiver<MuxDatagram>>>,
+    adaptive_capacity: AtomicUsize,
+    tuning: UdpMuxQueueTuning,
 }
 
 impl ProtocolSlot {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+    fn new(tuning: UdpMuxQueueTuning) -> Self {
+        let (tx, rx) = mpsc::channel(tuning.hard_capacity());
         Self {
             tx,
             rx: parking_lot::Mutex::new(Some(rx)),
+            adaptive_capacity: AtomicUsize::new(tuning.baseline_capacity()),
+            tuning,
         }
     }
 
@@ -114,6 +164,46 @@ impl ProtocolSlot {
                 "S2S UDP mux protocol receiver was already taken",
             )
         })
+    }
+
+    fn try_send(
+        &self,
+        datagram: MuxDatagram,
+    ) -> Result<Option<(usize, usize)>, TrySendError<MuxDatagram>> {
+        let queued_len = self.queued_len();
+        let growth = self.grow_for_queued_len(queued_len);
+        self.tx.try_send(datagram)?;
+        Ok(growth)
+    }
+
+    fn queued_len(&self) -> usize {
+        self.tx.max_capacity().saturating_sub(self.tx.capacity())
+    }
+
+    fn capacity(&self) -> usize {
+        self.adaptive_capacity.load(Ordering::Relaxed)
+    }
+
+    fn grow_for_queued_len(&self, queued_len: usize) -> Option<(usize, usize)> {
+        loop {
+            let current = self.adaptive_capacity.load(Ordering::Acquire);
+            if queued_len < current || current >= self.tuning.hard_capacity() {
+                return None;
+            }
+            let next = current
+                .saturating_mul(BURST_MULTIPLIER)
+                .min(self.tuning.hard_capacity())
+                .max(current.saturating_add(1));
+            match self.adaptive_capacity.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some((current, next)),
+                Err(_) => continue,
+            }
+        }
     }
 }
 
@@ -126,10 +216,15 @@ struct UdpMuxSocket {
 }
 
 impl UdpMuxSocket {
-    fn new(addr: SocketAddr, ipv6_only: bool, protocols: Vec<TransportKind>) -> Self {
+    fn new(
+        addr: SocketAddr,
+        ipv6_only: bool,
+        protocols: Vec<TransportKind>,
+        queue_tuning: UdpMuxQueueTuning,
+    ) -> Self {
         let mut slots = HashMap::new();
         for kind in protocols {
-            slots.insert(kind, ProtocolSlot::new());
+            slots.insert(kind, ProtocolSlot::new(queue_tuning));
         }
         Self {
             addr,
@@ -185,7 +280,10 @@ pub(crate) struct UdpMuxSet {
 }
 
 impl UdpMuxSet {
-    pub(crate) fn new(listen_addrs: &[(TransportKind, SocketAddr)]) -> Self {
+    pub(crate) fn new(
+        listen_addrs: &[(TransportKind, SocketAddr)],
+        queue_tuning: UdpMuxQueueTuning,
+    ) -> Self {
         let mut by_addr: HashMap<SocketAddr, Vec<TransportKind>> = HashMap::new();
         for (kind, addr) in listen_addrs.iter().copied() {
             if MuxProtocol::from_transport(kind).is_some() {
@@ -206,7 +304,12 @@ impl UdpMuxSet {
                 continue;
             }
             let ipv6_only = ipv6_only_for_address(addr, &all_addrs);
-            sockets.push(Arc::new(UdpMuxSocket::new(addr, ipv6_only, protocols)));
+            sockets.push(Arc::new(UdpMuxSocket::new(
+                addr,
+                ipv6_only,
+                protocols,
+                queue_tuning,
+            )));
         }
 
         Self {
@@ -268,8 +371,35 @@ async fn run_mux_read_loop(
                     payload: payload.to_vec(),
                     peer_addr,
                 };
-                if let Err(e) = slot.tx.try_send(datagram) {
-                    debug!(addr=%mux.addr, %peer_addr, protocol=?protocol, error=%e, "dropped S2S UDP mux datagram because protocol queue is full");
+                match slot.try_send(datagram) {
+                    Ok(Some((old_capacity, new_capacity))) => {
+                        debug!(
+                            addr=%mux.addr,
+                            %peer_addr,
+                            protocol=?protocol,
+                            old_capacity,
+                            new_capacity,
+                            burst_capacity=slot.tuning.burst_capacity(),
+                            hard_capacity=slot.tuning.hard_capacity(),
+                            queued_len=slot.queued_len(),
+                            "grew S2S UDP mux protocol queue capacity"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        debug!(
+                            addr=%mux.addr,
+                            %peer_addr,
+                            protocol=?protocol,
+                            queue_capacity=slot.capacity(),
+                            baseline_capacity=slot.tuning.baseline_capacity(),
+                            burst_capacity=slot.tuning.burst_capacity(),
+                            hard_capacity=slot.tuning.hard_capacity(),
+                            queued_len=slot.queued_len(),
+                            error=%e,
+                            "dropped S2S UDP mux datagram because protocol queue is full"
+                        );
+                    }
                 }
             }
         }
@@ -666,5 +796,41 @@ mod tests {
             decode_prefixed(MuxProtocol::Udp, &datagram).unwrap(),
             Some(&[][..])
         );
+    }
+
+    #[test]
+    fn protocol_slot_grows_when_initial_capacity_is_exhausted() {
+        let tuning = UdpMuxQueueTuning::for_max_users(16);
+        let slot = ProtocolSlot::new(tuning);
+        for _ in 0..tuning.baseline_capacity() {
+            assert_eq!(
+                slot.try_send(MuxDatagram {
+                    payload: Vec::new(),
+                    peer_addr: "127.0.0.1:1".parse().unwrap(),
+                })
+                .unwrap(),
+                None
+            );
+        }
+
+        assert_eq!(slot.capacity(), tuning.baseline_capacity());
+        assert_eq!(
+            slot.try_send(MuxDatagram {
+                payload: Vec::new(),
+                peer_addr: "127.0.0.1:1".parse().unwrap(),
+            })
+            .unwrap(),
+            Some((tuning.baseline_capacity(), tuning.burst_capacity()))
+        );
+        assert_eq!(slot.capacity(), tuning.burst_capacity());
+    }
+
+    #[test]
+    fn udp_mux_queue_tuning_uses_five_x_burst_and_server_size_cap() {
+        let tuning = UdpMuxQueueTuning::for_max_users(400);
+
+        assert_eq!(tuning.baseline_capacity(), 6_400);
+        assert_eq!(tuning.burst_capacity(), 32_000);
+        assert_eq!(tuning.hard_capacity(), 51_200);
     }
 }

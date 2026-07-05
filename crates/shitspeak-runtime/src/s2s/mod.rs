@@ -927,8 +927,10 @@ impl S2SManager {
             .filter(|host| !host.is_empty());
         let (transport_config, config_error) = match config
             .s2s
-            .transport_config_with_auto_advertise_host(auto_advertise_host)
-        {
+            .transport_config_with_max_users_and_auto_advertise_host(
+                config.max_users,
+                auto_advertise_host,
+            ) {
             Ok(cfg) => (cfg, None),
             Err(e) => (None, Some(e)),
         };

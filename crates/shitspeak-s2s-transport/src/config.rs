@@ -88,6 +88,10 @@ pub struct TransportConfig {
     /// accepted so a too-low cap cannot isolate this node by itself.
     max_outgoing_connections: usize,
 
+    /// Local server user cap used to size transport burst buffers that absorb
+    /// fanout proportional to the number of clients this node can host.
+    max_users: usize,
+
     /// Whether private listen/advertise addresses should be published in the
     /// overlay. LAN/VPN/container clusters usually need this enabled.
     advertise_private_ips: bool,
@@ -145,6 +149,7 @@ impl TransportConfig {
             native_stats_interval: Duration::from_secs(1),
             max_pending_pings: 64,
             max_outgoing_connections: 1024,
+            max_users: 100,
             advertise_private_ips: true,
             local_advertise_interfaces: Vec::new(),
         }
@@ -393,6 +398,10 @@ impl TransportConfig {
 
     pub fn max_outgoing_connections(&self) -> usize {
         self.max_outgoing_connections
+    }
+
+    pub fn max_users(&self) -> usize {
+        self.max_users
     }
 
     pub fn advertise_private_ips(&self) -> bool {
@@ -699,6 +708,11 @@ impl TransportConfig {
 
     pub fn with_max_outgoing_connections(mut self, n: usize) -> Self {
         self.max_outgoing_connections = n;
+        self
+    }
+
+    pub fn with_max_users(mut self, n: usize) -> Self {
+        self.max_users = n.max(1);
         self
     }
 

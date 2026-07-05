@@ -565,8 +565,11 @@ pub async fn handle_authenticate(
     // ── Spawn per-user voice routing task ─────────────────────────────────
     crate::voice::spawn_voice_routing_task(Arc::clone(server), Arc::clone(sender));
 
-    // ── Spawn per-user TCP voice send task ────────────────────────────────
-    crate::voice::spawn_voice_tcp_task(Arc::clone(sender));
+    // Native TLS clients have their TCP voice queue drained by the native
+    // writer task. Gateway transports do not, so keep the fallback bridge.
+    if sender.transport_kind() != crate::client::ClientTransportKind::NativeMumble {
+        crate::voice::spawn_voice_tcp_task(Arc::clone(sender));
+    }
 
     // ── Record last-seen versions so the client doesn't replay old entries ─
     sender.update_last_client_versions(&all_versions).await;

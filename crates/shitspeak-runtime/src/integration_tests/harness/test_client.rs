@@ -248,6 +248,8 @@ fn write_pds_varint(buf: &mut BytesMut, value: u64) {
 pub enum ConnectError {
     Io(std::io::Error),
     Tls(String),
+    Read(String),
+    Write(String),
     Rejected(crate::mumble_proto::Reject),
     NoCryptSetup,
     NoServerSync,
@@ -271,7 +273,7 @@ pub struct TestClient {
     pub server_session: ClientSessionIdentifier,
     pub cert_der: Vec<u8>,
     write: Mutex<WriteHalf<TlsStream<TcpStream>>>,
-    rx: Mutex<mpsc::UnboundedReceiver<Result<Message, ()>>>,
+    rx: Mutex<mpsc::UnboundedReceiver<Result<Message, String>>>,
     udp: Option<Arc<UdpSocket>>,
     udp_server_addr: SocketAddr,
     crypt: Option<Arc<PMutex<CryptState>>>,
@@ -280,7 +282,7 @@ pub struct TestClient {
 
 pub struct ManualNativeClient {
     write: Mutex<WriteHalf<TlsStream<TcpStream>>>,
-    rx: Mutex<mpsc::UnboundedReceiver<Result<Message, ()>>>,
+    rx: Mutex<mpsc::UnboundedReceiver<Result<Message, String>>>,
     _reader: JoinHandle<()>,
 }
 
@@ -298,7 +300,7 @@ impl Drop for ManualNativeClient {
 
 struct NativeConnection {
     write_half: WriteHalf<TlsStream<TcpStream>>,
-    msg_rx: mpsc::UnboundedReceiver<Result<Message, ()>>,
+    msg_rx: mpsc::UnboundedReceiver<Result<Message, String>>,
     reader_handle: JoinHandle<()>,
     cert_der: Vec<u8>,
 }
@@ -313,6 +315,21 @@ impl TestClient {
         username: &str,
         password: Option<&str>,
     ) -> Result<TestClient, ConnectError> {
+        Self::connect_and_authenticate_with_deadline(
+            server,
+            username,
+            password,
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    pub async fn connect_and_authenticate_with_deadline(
+        server: &TestServer,
+        username: &str,
+        password: Option<&str>,
+        deadline: Duration,
+    ) -> Result<TestClient, ConnectError> {
         Self::connect_with(
             server,
             username,
@@ -320,6 +337,7 @@ impl TestClient {
             true,
             ProtocolVersion::new(1, 5, 0),
             Vec::new(),
+            deadline,
         )
         .await
     }
@@ -334,7 +352,16 @@ impl TestClient {
         password: Option<&str>,
         version: ProtocolVersion,
     ) -> Result<TestClient, ConnectError> {
-        Self::connect_with(server, username, password, true, version, Vec::new()).await
+        Self::connect_with(
+            server,
+            username,
+            password,
+            true,
+            version,
+            Vec::new(),
+            Duration::from_secs(5),
+        )
+        .await
     }
 
     /// Same as `connect_and_authenticate` but does not present a client cert.
@@ -351,6 +378,7 @@ impl TestClient {
             false,
             ProtocolVersion::new(1, 5, 0),
             Vec::new(),
+            Duration::from_secs(5),
         )
         .await
     }
@@ -368,6 +396,7 @@ impl TestClient {
             true,
             ProtocolVersion::new(1, 5, 0),
             pre_auth_messages,
+            Duration::from_secs(5),
         )
         .await
     }
@@ -379,109 +408,123 @@ impl TestClient {
         present_client_cert: bool,
         declared_version: ProtocolVersion,
         pre_auth_messages: Vec<Message>,
+        deadline: Duration,
     ) -> Result<TestClient, ConnectError> {
-        let connection = open_native_connection(server, present_client_cert).await?;
+        let connect_result = timeout(deadline, async {
+            let connection = open_native_connection(server, present_client_cert).await?;
 
-        let mut client = TestClient {
-            session_id: 0,
-            user_id: None,
-            initial_channel_states: Vec::new(),
-            initial_user_states: Vec::new(),
-            welcome_text: None,
-            max_bandwidth: None,
-            initial_permissions: None,
-            server_session: ClientSessionIdentifier::from(0u32),
-            cert_der: connection.cert_der,
-            write: Mutex::new(connection.write_half),
-            rx: Mutex::new(connection.msg_rx),
-            udp: None,
-            udp_server_addr: server.udp_addr,
-            crypt: None,
-            _reader: connection.reader_handle,
-        };
+            let mut client = TestClient {
+                session_id: 0,
+                user_id: None,
+                initial_channel_states: Vec::new(),
+                initial_user_states: Vec::new(),
+                welcome_text: None,
+                max_bandwidth: None,
+                initial_permissions: None,
+                server_session: ClientSessionIdentifier::from(0u32),
+                cert_der: connection.cert_der,
+                write: Mutex::new(connection.write_half),
+                rx: Mutex::new(connection.msg_rx),
+                udp: None,
+                udp_server_addr: server.udp_addr,
+                crypt: None,
+                _reader: connection.reader_handle,
+            };
 
-        // ── Send pre-auth handshake burst ─────────────────────────────────
-        let version: Message = Version {
-            version: Some(declared_version),
-            release: Some("test-client".into()),
-            os: Some("test".into()),
-            os_version: Some("test".into()),
-        }
-        .into();
+            // ── Send pre-auth handshake burst ─────────────────────────────────
+            let version: Message = Version {
+                version: Some(declared_version),
+                release: Some("test-client".into()),
+                os: Some("test".into()),
+                os_version: Some("test".into()),
+            }
+            .into();
 
-        let authenticate: Message = Authenticate {
-            username: Some(username.into()),
-            password: password.map(str::to_owned),
-            tokens: Vec::new(),
-            celt_versions: Vec::new(),
-            opus: Some(true),
-            client_type: ClientType::Regular,
-        }
-        .into();
+            let authenticate: Message = Authenticate {
+                username: Some(username.into()),
+                password: password.map(str::to_owned),
+                tokens: Vec::new(),
+                celt_versions: Vec::new(),
+                opus: Some(true),
+                client_type: ClientType::Regular,
+            }
+            .into();
 
-        let mut handshake = Vec::with_capacity(pre_auth_messages.len() + 2);
-        handshake.push(version);
-        handshake.extend(pre_auth_messages);
-        handshake.push(authenticate);
-        client.send_batch(&handshake).await;
+            let mut handshake = Vec::with_capacity(pre_auth_messages.len() + 2);
+            handshake.push(version);
+            handshake.extend(pre_auth_messages);
+            handshake.push(authenticate);
+            client
+                .send_batch(&handshake)
+                .await
+                .map_err(|err| ConnectError::Write(err.to_string()))?;
 
-        // ── Drain until ServerSync (collecting state along the way) ───────
-        let deadline = Duration::from_secs(5);
-        let result = timeout(deadline, async {
-            loop {
-                let msg = match client.recv_one().await {
-                    Some(m) => m,
-                    None => return Err(ConnectError::NoServerSync),
-                };
-                match msg {
-                    Message::Version(_) => {}
-                    Message::CryptSetup(cs) => {
-                        let key = cs.key.unwrap_or_default();
-                        let client_nonce = cs.client_nonce.unwrap_or_default();
-                        let server_nonce = cs.server_nonce.unwrap_or_default();
-                        if !key.is_empty() && !client_nonce.is_empty() && !server_nonce.is_empty() {
-                            // From the client's POV: encrypt with client_nonce,
-                            // decrypt with server_nonce.
-                            let state = CryptState::from_key(
-                                "OCB2-AES128",
-                                &key,
-                                &client_nonce,
-                                &server_nonce,
-                            )
-                            .expect("crypt state from CryptSetup");
-                            client.crypt = Some(Arc::new(PMutex::new(state)));
-                        }
-                    }
-                    Message::ChannelState(cs) => client.initial_channel_states.push(cs),
-                    Message::UserState(us) => client.initial_user_states.push(us),
-                    Message::ServerConfig(_) => {}
-                    Message::CodecVersion(_) => {}
-                    Message::Reject(r) => return Err(ConnectError::Rejected(r)),
-                    Message::ServerSync(sync) => {
-                        let session_u32 = sync.session.unwrap_or(0);
-                        client.session_id = session_u32;
-                        client.server_session = ClientSessionIdentifier::from(session_u32);
-                        client.welcome_text = sync.welcome_text;
-                        client.max_bandwidth = sync.max_bandwidth;
-                        client.initial_permissions = sync.permissions;
-                        // Find self UserState to extract user_id
-                        for us in &client.initial_user_states {
-                            if us.session == Some(session_u32) {
-                                client.user_id = us.user_id;
-                                break;
+            // ── Drain until ServerSync (collecting state along the way) ───────
+            let result = timeout(deadline, async {
+                loop {
+                    let msg = match client.recv_one_for_connect().await? {
+                        Some(m) => m,
+                        None => return Err(ConnectError::NoServerSync),
+                    };
+                    match msg {
+                        Message::Version(_) => {}
+                        Message::CryptSetup(cs) => {
+                            let key = cs.key.unwrap_or_default();
+                            let client_nonce = cs.client_nonce.unwrap_or_default();
+                            let server_nonce = cs.server_nonce.unwrap_or_default();
+                            if !key.is_empty()
+                                && !client_nonce.is_empty()
+                                && !server_nonce.is_empty()
+                            {
+                                // From the client's POV: encrypt with client_nonce,
+                                // decrypt with server_nonce.
+                                let state = CryptState::from_key(
+                                    "OCB2-AES128",
+                                    &key,
+                                    &client_nonce,
+                                    &server_nonce,
+                                )
+                                .expect("crypt state from CryptSetup");
+                                client.crypt = Some(Arc::new(PMutex::new(state)));
                             }
                         }
-                        return Ok(());
+                        Message::ChannelState(cs) => client.initial_channel_states.push(cs),
+                        Message::UserState(us) => client.initial_user_states.push(us),
+                        Message::ServerConfig(_) => {}
+                        Message::CodecVersion(_) => {}
+                        Message::Reject(r) => return Err(ConnectError::Rejected(r)),
+                        Message::ServerSync(sync) => {
+                            let session_u32 = sync.session.unwrap_or(0);
+                            client.session_id = session_u32;
+                            client.server_session = ClientSessionIdentifier::from(session_u32);
+                            client.welcome_text = sync.welcome_text;
+                            client.max_bandwidth = sync.max_bandwidth;
+                            client.initial_permissions = sync.permissions;
+                            // Find self UserState to extract user_id
+                            for us in &client.initial_user_states {
+                                if us.session == Some(session_u32) {
+                                    client.user_id = us.user_id;
+                                    break;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        _ => {} // ignore others
                     }
-                    _ => {} // ignore others
                 }
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => Ok(client),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(ConnectError::NoServerSync),
             }
         })
         .await;
 
-        match result {
-            Ok(Ok(())) => Ok(client),
-            Ok(Err(e)) => Err(e),
+        match connect_result {
+            Ok(result) => result,
             Err(_) => Err(ConnectError::NoServerSync),
         }
     }
@@ -502,16 +545,28 @@ impl TestClient {
         let _ = w.write_proto_message(&message).await;
     }
 
-    async fn send_batch(&self, messages: &[Message]) {
+    async fn send_batch(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), crate::errors::WriteProtoMessageError> {
         let mut w = self.write.lock().await;
-        let _ = w.write_proto_message_batch(messages).await;
+        w.write_proto_message_batch(messages).await
     }
 
     async fn recv_one(&self) -> Option<Message> {
         let mut rx = self.rx.lock().await;
         match rx.recv().await? {
             Ok(m) => Some(m),
-            Err(()) => None,
+            Err(_) => None,
+        }
+    }
+
+    async fn recv_one_for_connect(&self) -> Result<Option<Message>, ConnectError> {
+        let mut rx = self.rx.lock().await;
+        match rx.recv().await {
+            Some(Ok(message)) => Ok(Some(message)),
+            Some(Err(error)) => Err(ConnectError::Read(error)),
+            None => Ok(None),
         }
     }
 
@@ -527,7 +582,7 @@ impl TestClient {
                 let mut rx = self.rx.lock().await;
                 match rx.recv().await {
                     Some(Ok(_)) => continue,
-                    Some(Err(())) | None => return true,
+                    Some(Err(_)) | None => return true,
                 }
             }
         })
@@ -1006,7 +1061,7 @@ impl ManualNativeClient {
         let mut rx = self.rx.lock().await;
         match rx.recv().await? {
             Ok(m) => Some(m),
-            Err(()) => None,
+            Err(_) => None,
         }
     }
 
@@ -1064,6 +1119,7 @@ async fn open_native_connection(
 
     // ── TCP + TLS handshake ───────────────────────────────────────────
     let tcp = TcpStream::connect(server.addr).await?;
+    tcp.set_nodelay(true)?;
     let server_name = ServerName::try_from("localhost").expect("static server name");
     let tls = connector
         .connect(server_name, tcp)
@@ -1073,7 +1129,7 @@ async fn open_native_connection(
     let (read_half, write_half) = tokio::io::split(tls);
 
     // ── Spawn reader task ─────────────────────────────────────────────
-    let (msg_tx, msg_rx) = mpsc::unbounded_channel::<Result<Message, ()>>();
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel::<Result<Message, String>>();
     let reader_handle = tokio::spawn(reader_loop(read_half, msg_tx));
 
     Ok(NativeConnection {
@@ -1086,7 +1142,7 @@ async fn open_native_connection(
 
 async fn reader_loop(
     mut read_half: ReadHalf<TlsStream<TcpStream>>,
-    tx: mpsc::UnboundedSender<Result<Message, ()>>,
+    tx: mpsc::UnboundedSender<Result<Message, String>>,
 ) {
     loop {
         match read_half.read_proto_message().await {
@@ -1095,8 +1151,8 @@ async fn reader_loop(
                     break;
                 }
             }
-            Err(_) => {
-                let _ = tx.send(Err(()));
+            Err(error) => {
+                let _ = tx.send(Err(error.to_string()));
                 break;
             }
         }

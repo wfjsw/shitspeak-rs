@@ -45,6 +45,8 @@ enum ChannelLogReceiveOutcome {
 }
 
 const CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT: usize = 64;
+const CLIENT_LOG_BROADCAST_DRAIN_LIMIT: usize = 4;
+const CLIENT_VOICE_TCP_QUEUE_DRAIN_LIMIT: usize = 64;
 const MIN_AUTHENTICATE_TIMEOUT_MS: u64 = 1;
 const PRE_AUTH_DEFERRED_MESSAGE_LIMIT: usize = 32;
 
@@ -738,6 +740,24 @@ async fn drain_outbound_message_queue(
     client.write_proto_message_batch_direct(&messages).await
 }
 
+async fn drain_voice_tcp_queue(
+    client: &Arc<Box<Client>>,
+    first: bytes::Bytes,
+    rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+) -> Result<(), WriteProtoMessageError> {
+    let mut frames = Vec::with_capacity(CLIENT_VOICE_TCP_QUEUE_DRAIN_LIMIT);
+    frames.push(first);
+    for _ in 1..CLIENT_VOICE_TCP_QUEUE_DRAIN_LIMIT {
+        match rx.try_recv() {
+            Ok(raw) => frames.push(raw),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    client.write_udp_tunnel_batch_direct(&frames).await
+}
+
 fn push_outbound_message(message: ClientOutboundMessage, out: &mut Vec<Message>) {
     match message {
         ClientOutboundMessage::Single(message) => out.push(message),
@@ -761,14 +781,60 @@ fn spawn_native_client_writer_task(
             return None;
         }
     };
+    let mut voice_rx = match client.take_voice_tcp_rx() {
+        Some(rx) => rx,
+        None => {
+            span.in_scope(|| {
+                tracing::warn!(
+                    session = u32::from(client.get_session_id()),
+                    "native client voice TCP queue already claimed"
+                );
+            });
+            return None;
+        }
+    };
     let weak_client = Arc::downgrade(client);
     Some(tokio::spawn(
         async move {
-            while let Some(message) = rx.recv().await {
+            let mut outbound_closed = false;
+            let mut voice_closed = false;
+            loop {
                 let Some(client) = weak_client.upgrade() else {
                     break;
                 };
-                drain_outbound_message_queue(&client, message, &mut rx).await?;
+
+                if !voice_closed {
+                    match voice_rx.try_recv() {
+                        Ok(raw) => {
+                            drain_voice_tcp_queue(&client, raw, &mut voice_rx).await?;
+                            continue;
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            voice_closed = true;
+                        }
+                    }
+                }
+
+                if outbound_closed && voice_closed {
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+                    raw = voice_rx.recv(), if !voice_closed => {
+                        match raw {
+                            Some(raw) => drain_voice_tcp_queue(&client, raw, &mut voice_rx).await?,
+                            None => voice_closed = true,
+                        }
+                    }
+                    message = rx.recv(), if !outbound_closed => {
+                        match message {
+                            Some(message) => drain_outbound_message_queue(&client, message, &mut rx).await?,
+                            None => outbound_closed = true,
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -946,9 +1012,9 @@ async fn process_client_log_broadcasts(
     first: Arc<ClientStateBroadcastPayload>,
     rx: &mut ClientLogReceiver,
 ) -> Result<(), HandleIncomingConnectionError> {
-    let mut broadcasts = Vec::with_capacity(CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT);
+    let mut broadcasts = Vec::with_capacity(CLIENT_LOG_BROADCAST_DRAIN_LIMIT);
     broadcasts.push(first);
-    for _ in 1..CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT {
+    for _ in 1..CLIENT_LOG_BROADCAST_DRAIN_LIMIT {
         match rx.try_recv() {
             Ok(broadcast) => broadcasts.push(broadcast),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
@@ -1129,6 +1195,13 @@ impl Server {
             provisional_server_id,
             "TCP connection established"
         );
+        if let Err(error) = tcp_stream.set_nodelay(true) {
+            tracing::debug!(
+                %remote_addr,
+                %error,
+                "failed to enable TCP_NODELAY for native connection"
+            );
+        }
         let proxy_connection = if self
             .allowed_proxies
             .iter()
@@ -1300,6 +1373,8 @@ impl Server {
 
             loop {
                 tokio::select! {
+                    biased;
+
                     // ── Authenticate timeout ────────────────────────────────
                     _ = &mut authenticate_deadline, if !client.is_authenticated() => {
                         tracing::info!(

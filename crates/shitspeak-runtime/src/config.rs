@@ -158,11 +158,26 @@ impl S2sConfig {
     }
 
     pub fn transport_config(&self) -> Result<Option<TransportConfig>, String> {
-        self.transport_config_with_auto_advertise_host(None)
+        self.transport_config_with_max_users_and_auto_advertise_host(100, None)
+    }
+
+    pub fn transport_config_with_max_users(
+        &self,
+        max_users: u64,
+    ) -> Result<Option<TransportConfig>, String> {
+        self.transport_config_with_max_users_and_auto_advertise_host(max_users, None)
     }
 
     pub fn transport_config_with_auto_advertise_host(
         &self,
+        auto_advertise_host: Option<&str>,
+    ) -> Result<Option<TransportConfig>, String> {
+        self.transport_config_with_max_users_and_auto_advertise_host(100, auto_advertise_host)
+    }
+
+    pub fn transport_config_with_max_users_and_auto_advertise_host(
+        &self,
+        max_users: u64,
         auto_advertise_host: Option<&str>,
     ) -> Result<Option<TransportConfig>, String> {
         if !self.enabled {
@@ -249,7 +264,10 @@ impl S2sConfig {
                 .map(S2sSeedAddressConfig::seed_address)
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        let mut cfg = self.transport.try_apply(cfg)?;
+        let mut cfg = self
+            .transport
+            .try_apply(cfg)?
+            .with_max_users(max_users.try_into().unwrap_or(usize::MAX));
         if let Some(dir) = self.persistence_dir.clone() {
             cfg = cfg.with_compression_adaptive_dictionary_cache_dir(dir);
         }
@@ -1142,9 +1160,10 @@ pub struct Config {
     /// this node's local users/max users. Default: `cluster`.
     #[serde(default = "default_udp_ping_user_count_scope")]
     pub udp_ping_user_count_scope: UdpPingUserCountScope,
-    /// Capacity of the bounded channel between the UDP drain task and the
-    /// processing task.  Larger values tolerate processing bursts at the
-    /// cost of memory.  Default: 2048 (~2 MB of buffered packets).
+    /// Minimum capacity of the bounded channel between the UDP drain task and
+    /// the processing task. The effective capacity scales with `max_users`.
+    /// Larger values tolerate processing bursts at the cost of memory.
+    /// Default floor: 2048 (~2 MB of buffered packets).
     #[serde(default = "default_udp_channel_size")]
     pub udp_channel_size: usize,
 
@@ -2358,7 +2377,7 @@ mod tests {
         );
 
         let transport = cfg
-            .transport_config()
+            .transport_config_with_max_users(432)
             .expect("valid transport config")
             .expect("s2s enabled");
         assert_eq!(
@@ -2420,6 +2439,7 @@ mod tests {
         assert_eq!(transport.idle_ping_interval(), Duration::from_secs(19));
         assert_eq!(transport.native_stats_interval(), Duration::from_secs(11));
         assert_eq!(transport.max_outgoing_connections(), 777);
+        assert_eq!(transport.max_users(), 432);
         assert!(!transport.compression_enabled());
         assert_eq!(transport.compression_min_bytes(), 2048);
         assert_eq!(transport.compression_min_savings_percent(), 25);
