@@ -547,7 +547,11 @@ async fn forward_pb_as(
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let tables = routing.load();
 
-    let path_trace_set: HashSet<u32> = data.path_trace.iter().copied().collect();
+    let path_trace_set: HashSet<NodeIdentifier> = data
+        .path_trace
+        .iter()
+        .filter_map(|node| NodeIdentifier::try_from(*node).ok())
+        .collect();
     let mut buckets: HashMap<NodeIdentifier, Vec<u32>> = HashMap::new();
     for dst_wire in &data.dsts {
         let Ok(dst) = NodeIdentifier::try_from(*dst_wire) else {
@@ -558,6 +562,7 @@ async fn forward_pb_as(
         }
         match select_forward_next_hop(
             &tables,
+            self_id,
             dst,
             level,
             routing_metric,
@@ -717,13 +722,13 @@ fn transport_options_for_overlay_data(data: &pb::OverlayData) -> TransportSendOp
 
 fn select_forward_next_hop(
     tables: &RoutingTables,
+    self_id: NodeIdentifier,
     dst: NodeIdentifier,
     level: ServiceLevel,
     routing_metric: RoutingMetric,
-    path_trace_set: &HashSet<u32>,
+    path_trace_set: &HashSet<NodeIdentifier>,
     is_originator: bool,
 ) -> Result<ForwardNextHop, OverlayError> {
-    let dst_wire = node_to_wire(dst);
     let Some(entry) = tables.lookup_with_metric(dst, level, routing_metric) else {
         if is_originator {
             return Err(OverlayError::NoRoute { dst, level });
@@ -731,7 +736,19 @@ fn select_forward_next_hop(
         return direct_fallback(dst, path_trace_set, DirectFallbackReason::NoRoute);
     };
 
-    if path_trace_set.contains(&node_to_wire(entry.next_hop)) {
+    if path_trace_set.contains(&entry.next_hop) {
+        if let Some(alternate) = tables.lookup_path_aware_with_metric(
+            self_id,
+            dst,
+            level,
+            routing_metric,
+            path_trace_set,
+        ) {
+            return Ok(ForwardNextHop::Send {
+                next_hop: alternate.next_hop,
+                fallback: None,
+            });
+        }
         return direct_fallback(
             dst,
             path_trace_set,
@@ -741,7 +758,7 @@ fn select_forward_next_hop(
         );
     }
 
-    if path_trace_set.contains(&dst_wire) {
+    if path_trace_set.contains(&dst) {
         return Ok(ForwardNextHop::DropAlreadyVisited);
     }
 
@@ -753,10 +770,10 @@ fn select_forward_next_hop(
 
 fn direct_fallback(
     dst: NodeIdentifier,
-    path_trace_set: &HashSet<u32>,
+    path_trace_set: &HashSet<NodeIdentifier>,
     reason: DirectFallbackReason,
 ) -> Result<ForwardNextHop, OverlayError> {
-    if path_trace_set.contains(&node_to_wire(dst)) {
+    if path_trace_set.contains(&dst) {
         return Ok(ForwardNextHop::DropAlreadyVisited);
     }
     Ok(ForwardNextHop::Send {
@@ -799,10 +816,17 @@ async fn send_encoded_to_target(
 #[cfg(test)]
 mod tests {
     use super::super::super::proto::decode_message;
-    use super::super::super::routing::{RouteEntry, new_handle};
+    use super::super::super::routing::{RouteEntry, dijkstra::EdgeCost, new_handle};
     use super::*;
     use shitspeak_s2s_transport::{SendError, TransportKind};
     use tokio::time::timeout;
+
+    fn edge(cost: u64) -> EdgeCost {
+        EdgeCost {
+            primary: cost,
+            latency_us: cost,
+        }
+    }
 
     fn test_overlay_data(allow_l1_compression: bool) -> pb::OverlayData {
         pb::OverlayData {
@@ -929,10 +953,11 @@ mod tests {
     #[test]
     fn transit_no_route_uses_direct_fallback() {
         let tables = RoutingTables::empty();
-        let path_trace = HashSet::from([node_to_wire(1)]);
+        let path_trace = HashSet::from([1]);
 
         let selected = select_forward_next_hop(
             &tables,
+            2,
             4,
             ServiceLevel::Reliable,
             RoutingMetric::ReliableCost,
@@ -957,6 +982,7 @@ mod tests {
 
         let err = select_forward_next_hop(
             &tables,
+            1,
             4,
             ServiceLevel::Reliable,
             RoutingMetric::ReliableCost,
@@ -982,10 +1008,11 @@ mod tests {
                 },
             )]),
         );
-        let path_trace = HashSet::from([node_to_wire(1)]);
+        let path_trace = HashSet::from([1]);
 
         let selected = select_forward_next_hop(
             &tables,
+            2,
             4,
             ServiceLevel::Reliable,
             RoutingMetric::ReliableCost,
@@ -1004,12 +1031,55 @@ mod tests {
     }
 
     #[test]
-    fn already_visited_destination_drops() {
-        let tables = RoutingTables::empty();
-        let path_trace = HashSet::from([node_to_wire(4)]);
+    fn transit_loop_uses_path_aware_alternate_when_available() {
+        let mut tables = RoutingTables::empty();
+        tables.insert_table_with_adjacency(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            HashMap::from([(
+                4,
+                RouteEntry {
+                    next_hop: 1,
+                    cost: 2,
+                },
+            )]),
+            HashMap::from([
+                (13, vec![(1, edge(1)), (2, edge(1)), (3, edge(5))]),
+                (2, vec![(1, edge(1))]),
+                (1, vec![(4, edge(1))]),
+                (3, vec![(4, edge(5))]),
+            ]),
+        );
+        let path_trace = HashSet::from([1]);
 
         let selected = select_forward_next_hop(
             &tables,
+            13,
+            4,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected,
+            ForwardNextHop::Send {
+                next_hop: 3,
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn already_visited_destination_drops() {
+        let tables = RoutingTables::empty();
+        let path_trace = HashSet::from([4]);
+
+        let selected = select_forward_next_hop(
+            &tables,
+            2,
             4,
             ServiceLevel::Reliable,
             RoutingMetric::ReliableCost,

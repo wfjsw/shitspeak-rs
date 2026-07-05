@@ -39,30 +39,36 @@ impl DynamicSpf {
         cfg: &OverlayConfig,
     ) -> RoutingTables {
         if dirty_origins.is_empty() {
-            return self.routing_tables();
+            return self.routing_tables(cfg);
         }
 
         let next_graph = RoutingGraph::from_lsdb(lsdb);
         if dirty_origins.len() > DYNAMIC_DIRTY_FALLBACK_ORIGINS {
             *self = Self::from_graph(next_graph, self.self_id, cfg);
-            return self.routing_tables();
+            return self.routing_tables(cfg);
         }
 
         for table in self.tables.values_mut() {
             table.update(&self.graph, &next_graph, &dirty_origins, self.self_id, cfg);
         }
         self.graph = next_graph;
-        self.routing_tables()
+        self.routing_tables(cfg)
     }
 
     pub(crate) fn graph(&self) -> &RoutingGraph {
         &self.graph
     }
 
-    pub(crate) fn routing_tables(&self) -> RoutingTables {
+    pub(crate) fn routing_tables(&self, cfg: &OverlayConfig) -> RoutingTables {
         let mut out = RoutingTables::empty();
+        out.set_transit_disabled_from_graph(&self.graph);
         for (key, table) in &self.tables {
-            out.insert_table(key.metric, key.level, table.routes.clone());
+            out.insert_table_with_adjacency(
+                key.metric,
+                key.level,
+                table.routes.clone(),
+                dijkstra::adjacency_for(&self.graph, key.level, key.metric, cfg),
+            );
         }
         out
     }

@@ -17,9 +17,9 @@ use shitspeak_s2s_transport::{ConnectionManager, ServiceLevel};
 
 use super::super::config::OverlayConfig;
 use super::super::lsdb::LinkStateDb;
+use super::RoutingTables;
 use super::dijkstra;
 use super::dynamic::DynamicSpf;
-use super::{RoutingMetric, RoutingTables};
 
 pub fn spawn_recomputer(
     lsdb: Arc<LinkStateDb>,
@@ -83,7 +83,7 @@ fn recompute_dynamic_full(
 ) -> DynamicSpf {
     let engine = DynamicSpf::rebuild(lsdb, self_id, cfg);
     transport.set_required_outgoing_nodes(component_bridge_targets(engine.graph(), self_id));
-    let new = engine.routing_tables();
+    let new = engine.routing_tables(cfg);
     trace!(
         reliable = new.for_level(ServiceLevel::Reliable).len(),
         rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
@@ -104,13 +104,7 @@ fn recompute_now(
     let graph = dijkstra::RoutingGraph::from_lsdb(lsdb);
     transport.set_required_outgoing_nodes(component_bridge_targets(&graph, self_id));
 
-    let mut new = RoutingTables::empty();
-    for metric in RoutingMetric::ALL {
-        for level in ServiceLevel::ALL {
-            let table = dijkstra::compute_on_graph(&graph, self_id, level, metric, cfg);
-            new.insert_table(metric, level, table);
-        }
-    }
+    let new = RoutingTables::from_graph(&graph, self_id, cfg);
     trace!(
         reliable = new.for_level(ServiceLevel::Reliable).len(),
         rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
