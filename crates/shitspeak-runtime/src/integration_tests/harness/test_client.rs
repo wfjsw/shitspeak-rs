@@ -1068,6 +1068,20 @@ impl ManualNativeClient {
     pub async fn recv(&self, deadline: Duration) -> Option<Message> {
         timeout(deadline, self.recv_one()).await.ok().flatten()
     }
+
+    pub async fn recv_closed(&self, deadline: Duration) -> bool {
+        timeout(deadline, async {
+            loop {
+                let mut rx = self.rx.lock().await;
+                match rx.recv().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return true,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
 }
 
 async fn open_native_connection(

@@ -9,26 +9,49 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 
 use crate::ban_repository::{BanEntry, BanOp};
+use crate::channels::Channel;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::config::{S2sConfig, S2sSeedAddressConfig, S2sTransportKindConfig};
 use crate::integration_tests::harness::{
     TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
-    spawn_s2s_test_server_with_config,
+    spawn_s2s_test_server_with_config, test_client::ConnectError,
 };
 use crate::messages::Message;
-use crate::messages::encoder::{Ping, PluginDataTransmission, TextMessage, UserStats};
+use crate::messages::encoder::{Ping, PluginDataTransmission, TextMessage, UserStats, VoiceTarget};
+use crate::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use crate::voice::codec::AudioPayload;
+use crate::voice::metrics::{
+    VoiceRouteKind, VoiceRouteSource, route_metric_snapshot, route_resolution_metric_snapshot,
+};
 use shitspeak_s2s::testing::{
-    LinkChaos, Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port, s2s_network_test_guard,
-    wait_until,
+    LinkChaos, MessageType, Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port,
+    s2s_network_test_guard, wait_until,
 };
 use shitspeak_s2s_transport::{PeerAddress, ServiceLevel, TransportKind};
 
 const S2S_DEADLINE: Duration = Duration::from_secs(10);
 const CLIENT_DEADLINE: Duration = Duration::from_secs(4);
 const SAMPLE_OPUS: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+const S2S_SHOUT_REMOTE_CLIENTS: usize = 500;
+const S2S_SHOUT_CHANNEL_ID: u32 = 42;
+const S2S_SHOUT_TARGET_SLOT: u32 = 7;
+const S2S_SHOUT_FRAMES: usize = 501;
+const S2S_SHOUT_FRAME_INTERVAL: Duration = Duration::from_millis(20);
+const S2S_SHOUT_MIN_SPEAK_SPAN: Duration = Duration::from_secs(10);
+const S2S_SHOUT_CONNECT_DEADLINE: Duration = Duration::from_secs(600);
+const S2S_SHOUT_CONNECT_ATTEMPT_DEADLINE: Duration = Duration::from_secs(60);
+const S2S_SHOUT_CONNECT_ATTEMPTS: usize = 3;
+const S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS: u64 = 600_000;
+const S2S_SHOUT_AUTH_FINALIZATION_CONCURRENCY: usize = 64;
+const S2S_SHOUT_FRAME_LATENCY_BUDGET: Duration = Duration::from_secs(2);
+const S2S_SHOUT_STREAM_GAP_BUDGET: Duration = Duration::from_millis(250);
+const S2S_SHOUT_ROUTE_CPU_BUDGET: f64 = 0.40;
 const CONVERGENCE_NODE_COUNT: u16 = 6;
 const CONVERGENCE_USERS_PER_NODE: usize = 800;
 const CONVERGENCE_LIGHT_USERS_PER_NODE: usize = 20;
@@ -46,12 +69,19 @@ const S2S_LAG_DIAGNOSTIC_OUTBOUND_CAPACITY: usize = 8;
 const S2S_LAG_DIAGNOSTIC_REMOTE_WAIT_SECS: u64 = 35;
 
 async fn spawn_s2s_pair() -> (TestServer, TestServer) {
+    spawn_s2s_pair_with_opts(TestServerOpts::default(), TestServerOpts::default()).await
+}
+
+async fn spawn_s2s_pair_with_opts(
+    a_opts: TestServerOpts,
+    b_opts: TestServerOpts,
+) -> (TestServer, TestServer) {
     let pki = Arc::new(mint_pki(&[1, 2]));
     let a_s2s_port = pick_free_port().await;
     let b_s2s_port = pick_free_port().await;
 
     let a = spawn_s2s_test_server(
-        TestServerOpts::default(),
+        a_opts,
         Arc::clone(&pki),
         TestS2sServerOpts {
             node_id: 1,
@@ -66,7 +96,7 @@ async fn spawn_s2s_pair() -> (TestServer, TestServer) {
     .await;
 
     let b = spawn_s2s_test_server(
-        TestServerOpts::default(),
+        b_opts,
         pki,
         TestS2sServerOpts {
             node_id: 2,
@@ -81,6 +111,64 @@ async fn spawn_s2s_pair() -> (TestServer, TestServer) {
     .await;
 
     (a, b)
+}
+
+async fn spawn_s2s_three_node_with_opts(
+    a_opts: TestServerOpts,
+    b_opts: TestServerOpts,
+    c_opts: TestServerOpts,
+) -> (TestServer, TestServer, TestServer) {
+    let pki = Arc::new(mint_pki(&[1, 2, 3]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+    let c_s2s_port = pick_free_port().await;
+
+    let a = spawn_s2s_test_server(
+        a_opts,
+        Arc::clone(&pki),
+        TestS2sServerOpts {
+            node_id: 1,
+            cert_index: 0,
+            tcp_listen: loopback(a_s2s_port),
+            seed_addresses: vec![
+                S2sSeedAddressConfig::new(S2sTransportKindConfig::Tcp, loopback(b_s2s_port)),
+                S2sSeedAddressConfig::new(S2sTransportKindConfig::Tcp, loopback(c_s2s_port)),
+            ],
+        },
+    )
+    .await;
+
+    let b = spawn_s2s_test_server(
+        b_opts,
+        Arc::clone(&pki),
+        TestS2sServerOpts {
+            node_id: 2,
+            cert_index: 1,
+            tcp_listen: loopback(b_s2s_port),
+            seed_addresses: vec![
+                S2sSeedAddressConfig::new(S2sTransportKindConfig::Tcp, loopback(a_s2s_port)),
+                S2sSeedAddressConfig::new(S2sTransportKindConfig::Tcp, loopback(c_s2s_port)),
+            ],
+        },
+    )
+    .await;
+
+    let c = spawn_s2s_test_server(
+        c_opts,
+        pki,
+        TestS2sServerOpts {
+            node_id: 3,
+            cert_index: 2,
+            tcp_listen: loopback(c_s2s_port),
+            seed_addresses: vec![
+                S2sSeedAddressConfig::new(S2sTransportKindConfig::Tcp, loopback(a_s2s_port)),
+                S2sSeedAddressConfig::new(S2sTransportKindConfig::Tcp, loopback(b_s2s_port)),
+            ],
+        },
+    )
+    .await;
+
+    (a, b, c)
 }
 
 async fn spawn_s2s_pair_on_ports(
@@ -734,6 +822,301 @@ fn opus_frame(payload: &AudioPayload) -> &[u8] {
     }
 }
 
+fn s2s_voice_target(slot: u32, targets: Vec<VoiceTargetEntry>) -> VoiceTarget {
+    VoiceTarget {
+        id: Some(slot),
+        targets,
+    }
+}
+
+fn s2s_voice_target_channel(
+    channel_id: u32,
+    children: bool,
+    links: bool,
+    group: Option<&str>,
+) -> VoiceTargetEntry {
+    VoiceTargetEntry {
+        session: Vec::new(),
+        channel_id: Some(channel_id),
+        group: group.map(str::to_owned),
+        links: Some(links),
+        children: Some(children),
+    }
+}
+
+struct S2SVoiceStreamDelivery {
+    first_at: Instant,
+    last_at: Instant,
+    max_frame_latency: Duration,
+    max_frame_gap: Duration,
+}
+
+struct S2SRouteResourceSample {
+    total_before: crate::voice::metrics::VoiceRouteMetricSnapshot,
+    resolution_before: crate::voice::metrics::VoiceRouteMetricSnapshot,
+}
+
+impl S2SRouteResourceSample {
+    fn capture_target() -> Self {
+        Self {
+            total_before: route_metric_snapshot(VoiceRouteSource::S2s, VoiceRouteKind::Target),
+            resolution_before: route_resolution_metric_snapshot(
+                VoiceRouteSource::S2s,
+                VoiceRouteKind::Target,
+            ),
+        }
+    }
+
+    fn finish(self) -> S2SRouteResourceMeasurement {
+        let total = route_metric_snapshot(VoiceRouteSource::S2s, VoiceRouteKind::Target)
+            .saturating_sub(self.total_before);
+        let resolution =
+            route_resolution_metric_snapshot(VoiceRouteSource::S2s, VoiceRouteKind::Target)
+                .saturating_sub(self.resolution_before);
+        S2SRouteResourceMeasurement { total, resolution }
+    }
+}
+
+struct S2SRouteResourceMeasurement {
+    total: crate::voice::metrics::VoiceRouteMetricSnapshot,
+    resolution: crate::voice::metrics::VoiceRouteMetricSnapshot,
+}
+
+impl S2SRouteResourceMeasurement {
+    fn frames(&self) -> u64 {
+        self.total.frames()
+    }
+
+    fn total_duration(&self) -> Duration {
+        self.total.duration()
+    }
+
+    fn resolution_duration(&self) -> Duration {
+        self.resolution.duration()
+    }
+}
+
+fn s2s_shout_route_busy_cores(route_duration: Duration, wall: Duration) -> Option<f64> {
+    let wall_secs = wall.as_secs_f64();
+    if wall_secs <= f64::EPSILON {
+        return None;
+    }
+    Some(route_duration.as_secs_f64() / wall_secs)
+}
+
+fn s2s_shout_voice_segment(base_frame: u64) -> Vec<(u64, Bytes)> {
+    (0..S2S_SHOUT_FRAMES)
+        .map(|offset| {
+            let frame_number = base_frame + offset as u64;
+            let payload = Bytes::from(format!("s2s-shout-opus-frame-{frame_number}").into_bytes());
+            (frame_number, payload)
+        })
+        .collect()
+}
+
+fn s2s_shout_segment_send_span(frames: &[(u64, Bytes)]) -> Duration {
+    let intervals = frames.len().saturating_sub(1) as u32;
+    S2S_SHOUT_FRAME_INTERVAL * intervals
+}
+
+async fn send_s2s_shout_voice_segment(alice: &TestClient, slot: u32, frames: &[(u64, Bytes)]) {
+    for (idx, (frame_number, payload)) in frames.iter().enumerate() {
+        if idx + 1 == frames.len() {
+            alice
+                .send_voice_tcp_terminator(slot, *frame_number, payload.clone())
+                .await;
+        } else {
+            alice
+                .send_voice_tcp(slot, *frame_number, payload.clone())
+                .await;
+            tokio::time::sleep(S2S_SHOUT_FRAME_INTERVAL).await;
+        }
+    }
+}
+
+async fn receive_s2s_shout_stream(
+    client: &TestClient,
+    sender: &TestClient,
+    client_index: usize,
+    speak_start: Instant,
+    frames: &[(u64, Bytes)],
+) -> S2SVoiceStreamDelivery {
+    let mut first_at = None;
+    let mut last_at = None;
+    let mut previous_receive_at = None;
+    let mut max_frame_latency = Duration::from_millis(0);
+    let mut max_frame_gap = Duration::from_millis(0);
+
+    for (offset, (frame_number, payload)) in frames.iter().enumerate() {
+        let audio = client
+            .recv_voice_tcp(S2S_SHOUT_FRAME_LATENCY_BUDGET)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "remote listener {client_index} should receive cross-node shout frame {frame_number}"
+                )
+            });
+        let received_at = Instant::now();
+        if first_at.is_none() {
+            first_at = Some(received_at);
+        }
+        if let Some(previous) = previous_receive_at {
+            max_frame_gap = max_frame_gap.max(received_at.duration_since(previous));
+        }
+        previous_receive_at = Some(received_at);
+
+        let expected_send_at = speak_start + S2S_SHOUT_FRAME_INTERVAL * offset as u32;
+        max_frame_latency =
+            max_frame_latency.max(received_at.saturating_duration_since(expected_send_at));
+
+        assert_eq!(
+            audio.sender_session,
+            Some(sender.server_session),
+            "remote listener {client_index} saw the wrong sender for frame {frame_number}"
+        );
+        assert_eq!(
+            audio.frame_number, *frame_number,
+            "remote listener {client_index} received non-contiguous cross-node shout audio"
+        );
+        assert_eq!(
+            opus_frame(&audio.audio_payload),
+            payload.as_ref(),
+            "remote listener {client_index} received corrupted cross-node shout payload"
+        );
+        last_at = Some(received_at);
+    }
+
+    S2SVoiceStreamDelivery {
+        first_at: first_at.expect("voice stream should contain at least one frame"),
+        last_at: last_at.expect("voice stream should contain at least one frame"),
+        max_frame_latency,
+        max_frame_gap,
+    }
+}
+
+async fn wait_for_s2s_voice_target_installed(
+    server: &crate::integration_tests::harness::TestServer,
+    client: &TestClient,
+    slot: u32,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sender = server
+            .server
+            .get_clients()
+            .get_client(client.server_session)
+            .await
+            .expect("sender should remain connected");
+        if sender.voice_target(slot).is_some() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "voice target slot {slot} was not installed before cross-node shout"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn connect_s2s_shout_listener(
+    server: &TestServer,
+    username: &str,
+) -> Result<TestClient, ConnectError> {
+    let mut last_error = None;
+    for attempt in 1..=S2S_SHOUT_CONNECT_ATTEMPTS {
+        match TestClient::connect_and_authenticate_with_deadline(
+            server,
+            username,
+            None,
+            S2S_SHOUT_CONNECT_ATTEMPT_DEADLINE,
+        )
+        .await
+        {
+            Ok(client) => {
+                if attempt > 1 {
+                    eprintln!(
+                        "s2s_shout_connect username={} recovered_on_attempt={}",
+                        username, attempt
+                    );
+                }
+                return Ok(client);
+            }
+            Err(error) => {
+                eprintln!(
+                    "s2s_shout_connect username={} attempt={} failed={:?}",
+                    username, attempt, error
+                );
+                last_error = Some(error);
+                if attempt < S2S_SHOUT_CONNECT_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or(ConnectError::NoServerSync))
+}
+
+async fn connect_s2s_shout_listeners(server: &TestServer, count: usize) -> Vec<TestClient> {
+    let started = Instant::now();
+    let mut pending = FuturesUnordered::new();
+    for idx in 0..count {
+        let username = format!("remote-listener-{idx:03}");
+        pending.push(async move {
+            let connected_at = Instant::now();
+            let result = connect_s2s_shout_listener(server, &username).await;
+            (idx, connected_at.elapsed(), result)
+        });
+    }
+
+    let mut connected = Vec::with_capacity(count);
+    let mut progress_tick = tokio::time::interval(Duration::from_secs(5));
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    while connected.len() < count {
+        tokio::select! {
+            item = pending.next() => {
+                let Some((idx, elapsed, client)) = item else {
+                    break;
+                };
+                let client = client.unwrap_or_else(|err| {
+                    panic!("connect remote-listener-{idx:03}: {err:?}");
+                });
+                connected.push((idx, client));
+                if connected.len() % 50 == 0 || connected.len() == count {
+                    eprintln!(
+                        "s2s_shout_connect completed={} pending={} last_client={} last_ms={} elapsed_ms={}",
+                        connected.len(),
+                        pending.len(),
+                        idx,
+                        elapsed.as_millis(),
+                        started.elapsed().as_millis(),
+                    );
+                }
+            }
+            _ = progress_tick.tick() => {
+                let local_clients = server.server.get_clients().get_local_clients().await;
+                let authenticated = local_clients.iter().filter(|client| client.is_authenticated()).count();
+                let published = local_clients.iter().filter(|client| client.is_published()).count();
+                eprintln!(
+                    "s2s_shout_connect waiting completed={} pending={} local={} authenticated={} published={} elapsed_ms={}",
+                    connected.len(),
+                    pending.len(),
+                    local_clients.len(),
+                    authenticated,
+                    published,
+                    started.elapsed().as_millis(),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        connected.len(),
+        count,
+        "every cross-node shout listener should authenticate"
+    );
+    connected.sort_by_key(|(idx, _)| *idx);
+    connected.into_iter().map(|(_, client)| client).collect()
+}
+
 /// Checks that two S2S-enabled servers discover each other from configured seed
 /// addresses that do not include node ids.
 /// Expected: the pair converges and both servers expose an S2S application
@@ -1039,6 +1422,386 @@ async fn s2s_cross_node_voice_routes_normal_channel() {
 
     assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
     assert_eq!(audio.sender_session, Some(alice.server_session));
+}
+
+/// Checks sustained cross-node voice-target shout delivery under a large
+/// receiver batch.
+/// Expected: 500 real native clients on server B receive Alice's 10-second
+/// channel shout from server A as one contiguous, byte-identical stream. This
+/// catches the failure mode where S2S accepts every frame but later scatters,
+/// cuts, or reorders the stream before the remote TCP voice queues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2s_cross_node_voice_target_shout_stream_is_contiguous_under_load() {
+    let _guard = s2s_network_test_guard().await;
+    let a_opts = TestServerOpts {
+        max_users: (S2S_SHOUT_REMOTE_CLIENTS + 16) as u64,
+        client_idle_timeout_secs: S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS / 1_000,
+        authenticate_timeout_ms: S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS,
+        auth_finalization_concurrency: S2S_SHOUT_AUTH_FINALIZATION_CONCURRENCY,
+        ..TestServerOpts::default()
+    };
+    let b_opts = TestServerOpts {
+        max_users: (S2S_SHOUT_REMOTE_CLIENTS + 16) as u64,
+        client_idle_timeout_secs: S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS / 1_000,
+        authenticate_timeout_ms: S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS,
+        auth_finalization_concurrency: S2S_SHOUT_AUTH_FINALIZATION_CONCURRENCY,
+        ..TestServerOpts::default()
+    };
+    let (a, b) = spawn_s2s_pair_with_opts(a_opts, b_opts).await;
+    wait_for_s2s_pair(&a, &b).await;
+
+    a.authenticator
+        .register_superuser("speaker", None, Some(1), vec!["admin".into()]);
+    for idx in 0..S2S_SHOUT_REMOTE_CLIENTS {
+        b.authenticator.register_user(
+            &format!("remote-listener-{idx:03}"),
+            None,
+            Some(20_000 + idx as u32),
+            Vec::new(),
+        );
+    }
+
+    a.server
+        .get_channels()
+        .create_channel(Channel::new(
+            S2S_SHOUT_CHANNEL_ID,
+            "Remote Voice Room".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create cross-node shout channel");
+    let channel_replicated = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(b.server.get_channels().get_channel(S2S_SHOUT_CHANNEL_ID))
+                .is_some()
+        })
+    })
+    .await;
+    assert!(
+        channel_replicated,
+        "server B should learn the shout target channel before listeners connect"
+    );
+
+    for idx in 0..S2S_SHOUT_REMOTE_CLIENTS {
+        b.server
+            .get_user_channel_cache()
+            .remember_last_channel(&(20_000 + idx as u32).to_string(), S2S_SHOUT_CHANNEL_ID)
+            .await
+            .expect("remember listener channel");
+    }
+    let listeners = connect_s2s_shout_listeners(&b, S2S_SHOUT_REMOTE_CLIENTS).await;
+    let listener_sessions = listeners
+        .iter()
+        .map(|client| client.session_id)
+        .collect::<Vec<_>>();
+    assert!(
+        wait_for_server_sessions_in_channel(
+            &b,
+            &listener_sessions,
+            S2S_SHOUT_CHANNEL_ID,
+            S2S_DEADLINE,
+        )
+        .await
+        .is_some(),
+        "server B should place every listener in the shout channel during authentication"
+    );
+
+    let alice = TestClient::connect_and_authenticate_with_deadline(
+        &a,
+        "speaker",
+        None,
+        S2S_SHOUT_CONNECT_DEADLINE,
+    )
+    .await
+    .expect("speaker");
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+    alice
+        .set_voice_target(s2s_voice_target(
+            S2S_SHOUT_TARGET_SLOT,
+            vec![s2s_voice_target_channel(
+                S2S_SHOUT_CHANNEL_ID,
+                false,
+                false,
+                None,
+            )],
+        ))
+        .await;
+    wait_for_s2s_voice_target_installed(&a, &alice, S2S_SHOUT_TARGET_SLOT).await;
+    alice.drain_now().await;
+    for listener in &listeners {
+        listener.drain_now().await;
+    }
+
+    let frames = s2s_shout_voice_segment(50_000);
+    assert!(
+        s2s_shout_segment_send_span(&frames) >= S2S_SHOUT_MIN_SPEAK_SPAN,
+        "cross-node shout test should continuously speak for at least {:?}",
+        S2S_SHOUT_MIN_SPEAK_SPAN
+    );
+
+    let speak_start = Instant::now();
+    let route_sample = S2SRouteResourceSample::capture_target();
+    let send_task = async {
+        send_s2s_shout_voice_segment(&alice, S2S_SHOUT_TARGET_SLOT, &frames).await;
+        Instant::now()
+    };
+    let receive_task = async {
+        join_all(listeners.iter().enumerate().map(|(idx, listener)| {
+            receive_s2s_shout_stream(listener, &alice, idx, speak_start, &frames)
+        }))
+        .await
+    };
+    let (send_end, deliveries) = tokio::join!(send_task, receive_task);
+    let route_resources = route_sample.finish();
+    let wall = speak_start.elapsed();
+
+    let max_first_frame_latency = deliveries
+        .iter()
+        .map(|delivery| delivery.first_at.duration_since(speak_start))
+        .max()
+        .unwrap_or_default();
+    let max_frame_latency = deliveries
+        .iter()
+        .map(|delivery| delivery.max_frame_latency)
+        .max()
+        .unwrap_or_default();
+    let tail_latency = deliveries
+        .iter()
+        .map(|delivery| delivery.last_at)
+        .max()
+        .unwrap_or(send_end)
+        .saturating_duration_since(send_end);
+    let max_frame_gap = deliveries
+        .iter()
+        .map(|delivery| delivery.max_frame_gap)
+        .max()
+        .unwrap_or_default();
+    let route_busy_cores = s2s_shout_route_busy_cores(route_resources.resolution_duration(), wall)
+        .expect("cross-node shout duration should be non-zero");
+    eprintln!(
+        "s2s_shout_stream_metrics listeners={} frames={} routed_frames={} wall_ms={} first_latency_ms={} max_frame_latency_ms={} tail_latency_ms={} max_gap_ms={} route_resolution_ms={} route_total_ms={} route_busy_cores={:.2} budget_cores={:.2}",
+        listeners.len(),
+        frames.len(),
+        route_resources.frames(),
+        wall.as_millis(),
+        max_first_frame_latency.as_millis(),
+        max_frame_latency.as_millis(),
+        tail_latency.as_millis(),
+        max_frame_gap.as_millis(),
+        route_resources.resolution_duration().as_millis(),
+        route_resources.total_duration().as_millis(),
+        route_busy_cores,
+        S2S_SHOUT_ROUTE_CPU_BUDGET
+    );
+
+    assert!(
+        max_frame_latency <= S2S_SHOUT_FRAME_LATENCY_BUDGET,
+        "cross-node shout frame latency was {:?}, expected <= {:?}",
+        max_frame_latency,
+        S2S_SHOUT_FRAME_LATENCY_BUDGET
+    );
+    assert!(
+        tail_latency <= S2S_SHOUT_FRAME_LATENCY_BUDGET,
+        "cross-node shout tail latency was {:?}, expected <= {:?}",
+        tail_latency,
+        S2S_SHOUT_FRAME_LATENCY_BUDGET
+    );
+    assert!(
+        max_frame_gap <= S2S_SHOUT_STREAM_GAP_BUDGET,
+        "cross-node shout stream had a receive gap of {:?}, expected <= {:?}",
+        max_frame_gap,
+        S2S_SHOUT_STREAM_GAP_BUDGET
+    );
+    assert!(
+        route_resources.frames() >= frames.len() as u64,
+        "expected at least {} routed S2S target frames, saw {}",
+        frames.len(),
+        route_resources.frames()
+    );
+    assert!(
+        route_busy_cores <= S2S_SHOUT_ROUTE_CPU_BUDGET,
+        "S2S shout route resolution used {:.2} busy cores over {:?}, budget {:.2}",
+        route_busy_cores,
+        wall,
+        S2S_SHOUT_ROUTE_CPU_BUDGET
+    );
+}
+
+/// Checks broadcast-style shout resilience when a different peer is hostile.
+/// Expected: Alice shouts to root with `children=true`, forcing the S2S voice
+/// service to broadcast to every alive peer. Server B's 500 healthy listeners
+/// receive the complete 10-second stream even while server C drops and delays
+/// A's overlay data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2s_broadcast_shout_to_all_clients_survives_bad_node() {
+    let _guard = s2s_network_test_guard().await;
+    let bad_node_chaos = LinkChaos::new();
+    let a_opts = TestServerOpts {
+        max_users: (S2S_SHOUT_REMOTE_CLIENTS + 16) as u64,
+        client_idle_timeout_secs: S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS / 1_000,
+        authenticate_timeout_ms: S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS,
+        auth_finalization_concurrency: S2S_SHOUT_AUTH_FINALIZATION_CONCURRENCY,
+        ..TestServerOpts::default()
+    };
+    let b_opts = TestServerOpts {
+        max_users: (S2S_SHOUT_REMOTE_CLIENTS + 16) as u64,
+        client_idle_timeout_secs: S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS / 1_000,
+        authenticate_timeout_ms: S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS,
+        auth_finalization_concurrency: S2S_SHOUT_AUTH_FINALIZATION_CONCURRENCY,
+        ..TestServerOpts::default()
+    };
+    let c_opts = TestServerOpts {
+        max_users: 16,
+        s2s_inbound_chaos: Some(bad_node_chaos.clone()),
+        ..TestServerOpts::default()
+    };
+    let (a, b, _c) = spawn_s2s_three_node_with_opts(a_opts, b_opts, c_opts).await;
+    wait_for_s2s_cluster(&[(&a, 1), (&b, 2), (&_c, 3)]).await;
+
+    a.authenticator
+        .register_superuser("speaker", None, Some(1), vec!["admin".into()]);
+    for idx in 0..S2S_SHOUT_REMOTE_CLIENTS {
+        b.authenticator.register_user(
+            &format!("remote-listener-{idx:03}"),
+            None,
+            Some(20_000 + idx as u32),
+            Vec::new(),
+        );
+    }
+
+    let listeners = connect_s2s_shout_listeners(&b, S2S_SHOUT_REMOTE_CLIENTS).await;
+    let listener_sessions = listeners
+        .iter()
+        .map(|client| client.session_id)
+        .collect::<Vec<_>>();
+    assert!(
+        wait_for_server_sessions_in_channel(&b, &listener_sessions, 0, S2S_DEADLINE)
+            .await
+            .is_some(),
+        "server B should keep every broadcast listener in root"
+    );
+
+    let alice = TestClient::connect_and_authenticate_with_deadline(
+        &a,
+        "speaker",
+        None,
+        S2S_SHOUT_CONNECT_DEADLINE,
+    )
+    .await
+    .expect("speaker");
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+    alice
+        .set_voice_target(s2s_voice_target(
+            S2S_SHOUT_TARGET_SLOT,
+            vec![s2s_voice_target_channel(0, true, false, None)],
+        ))
+        .await;
+    wait_for_s2s_voice_target_installed(&a, &alice, S2S_SHOUT_TARGET_SLOT).await;
+    alice.drain_now().await;
+    for listener in &listeners {
+        listener.drain_now().await;
+    }
+
+    bad_node_chaos.add_latency(1, Duration::from_secs(5));
+    bad_node_chaos.set_bandwidth(Some(1));
+    bad_node_chaos.drop_next_of_type_from(1, MessageType::Data, S2S_SHOUT_FRAMES as u32);
+
+    let frames = s2s_shout_voice_segment(60_000);
+    assert!(
+        s2s_shout_segment_send_span(&frames) >= S2S_SHOUT_MIN_SPEAK_SPAN,
+        "broadcast shout test should continuously speak for at least {:?}",
+        S2S_SHOUT_MIN_SPEAK_SPAN
+    );
+
+    let speak_start = Instant::now();
+    let route_sample = S2SRouteResourceSample::capture_target();
+    let send_task = async {
+        send_s2s_shout_voice_segment(&alice, S2S_SHOUT_TARGET_SLOT, &frames).await;
+        Instant::now()
+    };
+    let receive_task = async {
+        join_all(listeners.iter().enumerate().map(|(idx, listener)| {
+            receive_s2s_shout_stream(listener, &alice, idx, speak_start, &frames)
+        }))
+        .await
+    };
+    let (send_end, deliveries) = tokio::join!(send_task, receive_task);
+    let route_resources = route_sample.finish();
+    let wall = speak_start.elapsed();
+
+    let max_first_frame_latency = deliveries
+        .iter()
+        .map(|delivery| delivery.first_at.duration_since(speak_start))
+        .max()
+        .unwrap_or_default();
+    let max_frame_latency = deliveries
+        .iter()
+        .map(|delivery| delivery.max_frame_latency)
+        .max()
+        .unwrap_or_default();
+    let tail_latency = deliveries
+        .iter()
+        .map(|delivery| delivery.last_at)
+        .max()
+        .unwrap_or(send_end)
+        .saturating_duration_since(send_end);
+    let max_frame_gap = deliveries
+        .iter()
+        .map(|delivery| delivery.max_frame_gap)
+        .max()
+        .unwrap_or_default();
+    let route_busy_cores = s2s_shout_route_busy_cores(route_resources.resolution_duration(), wall)
+        .expect("broadcast shout duration should be non-zero");
+    eprintln!(
+        "s2s_broadcast_shout_bad_node_metrics listeners={} frames={} routed_frames={} wall_ms={} first_latency_ms={} max_frame_latency_ms={} tail_latency_ms={} max_gap_ms={} route_resolution_ms={} route_total_ms={} route_busy_cores={:.2} budget_cores={:.2}",
+        listeners.len(),
+        frames.len(),
+        route_resources.frames(),
+        wall.as_millis(),
+        max_first_frame_latency.as_millis(),
+        max_frame_latency.as_millis(),
+        tail_latency.as_millis(),
+        max_frame_gap.as_millis(),
+        route_resources.resolution_duration().as_millis(),
+        route_resources.total_duration().as_millis(),
+        route_busy_cores,
+        S2S_SHOUT_ROUTE_CPU_BUDGET
+    );
+
+    assert!(
+        max_frame_latency <= S2S_SHOUT_FRAME_LATENCY_BUDGET,
+        "broadcast shout frame latency was {:?}, expected <= {:?}",
+        max_frame_latency,
+        S2S_SHOUT_FRAME_LATENCY_BUDGET
+    );
+    assert!(
+        tail_latency <= S2S_SHOUT_FRAME_LATENCY_BUDGET,
+        "broadcast shout tail latency was {:?}, expected <= {:?}",
+        tail_latency,
+        S2S_SHOUT_FRAME_LATENCY_BUDGET
+    );
+    assert!(
+        max_frame_gap <= S2S_SHOUT_STREAM_GAP_BUDGET,
+        "broadcast shout stream had a receive gap of {:?}, expected <= {:?}",
+        max_frame_gap,
+        S2S_SHOUT_STREAM_GAP_BUDGET
+    );
+    assert!(
+        route_resources.frames() >= frames.len() as u64,
+        "expected at least {} routed S2S target frames on the healthy node, saw {}",
+        frames.len(),
+        route_resources.frames()
+    );
+    assert!(
+        route_busy_cores <= S2S_SHOUT_ROUTE_CPU_BUDGET,
+        "broadcast shout route resolution used {:.2} busy cores over {:?}, budget {:.2}",
+        route_busy_cores,
+        wall,
+        S2S_SHOUT_ROUTE_CPU_BUDGET
+    );
 }
 
 /// Checks that channel creation is replicated to another S2S node.

@@ -1604,6 +1604,10 @@ async fn voice_target_plain_current_channel_uses_speak_permission() {
             vec![voice_target_channel(105, false, false, None)],
         ))
         .await;
+    let normal_routes_before =
+        route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Normal);
+    let target_routes_before =
+        route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Target);
     alice
         .send_voice_tcp(7, 36, Bytes::from_static(SAMPLE_OPUS))
         .await;
@@ -1614,6 +1618,20 @@ async fn voice_target_plain_current_channel_uses_speak_permission() {
         "Bob should hear a plain current-channel VoiceTarget when Alice can Speak",
     )
     .await;
+    let normal_routes = route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Normal)
+        .saturating_sub(normal_routes_before);
+    let target_routes = route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Target)
+        .saturating_sub(target_routes_before);
+    assert_eq!(
+        normal_routes.frames(),
+        0,
+        "plain current-channel VoiceTarget should keep shout semantics"
+    );
+    assert_eq!(
+        target_routes.frames(),
+        1,
+        "plain current-channel VoiceTarget should still process as target shout routing"
+    );
 }
 
 /// Checks that the plain-current-channel Speak exception does not leak into

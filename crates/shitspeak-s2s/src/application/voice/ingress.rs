@@ -5,6 +5,7 @@
 //! hands emitted frames to the installed audio sink. The speaker-side API
 //! wraps already-encoded audio payloads with unresolved routing intent.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -313,6 +314,87 @@ impl VoiceService {
                         .await
                     }
                 }
+            }
+        }
+    }
+
+    /// Channel-aware send for a non-normal voice intent. This preserves
+    /// the original target kind and intent while reusing the targeted
+    /// delivery strategy's recipient-index multicast path.
+    pub async fn send_for_target_channels(
+        &self,
+        sender_session: u32,
+        server_id: String,
+        channel_ids: &[u32],
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+    ) -> Result<(), ApplicationError> {
+        match self.delivery_strategy {
+            DeliveryStrategy::Broadcast => {
+                self.send_broadcast(
+                    sender_session,
+                    server_id,
+                    target_kind,
+                    is_terminator,
+                    payload,
+                    intent,
+                )
+                .await
+            }
+            DeliveryStrategy::Targeted => {
+                let mut nodes = BTreeSet::new();
+                let mut missing_channel = None;
+                {
+                    let index_guard = self.recipient_index.read();
+                    if let Some(index) = index_guard.as_ref() {
+                        for &channel_id in channel_ids {
+                            match index.lookup_nodes_for(channel_id) {
+                                Some(channel_nodes) => nodes.extend(channel_nodes),
+                                None => {
+                                    missing_channel = Some(channel_id);
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        missing_channel = channel_ids.first().copied();
+                    }
+                }
+
+                if let Some(channel_id) = missing_channel {
+                    trace!(
+                        channel_id,
+                        "voice targeted: incomplete target channel index; falling back to broadcast"
+                    );
+                    return self
+                        .send_broadcast(
+                            sender_session,
+                            server_id,
+                            target_kind,
+                            is_terminator,
+                            payload,
+                            intent,
+                        )
+                        .await;
+                }
+
+                let local = self.transport.local_node_id();
+                let dsts: Vec<NodeIdentifier> = nodes.into_iter().filter(|n| *n != local).collect();
+                if dsts.is_empty() {
+                    return Ok(());
+                }
+                self.send_multicast(
+                    sender_session,
+                    server_id,
+                    target_kind,
+                    is_terminator,
+                    payload,
+                    intent,
+                    &dsts,
+                )
+                .await
             }
         }
     }
@@ -640,6 +722,101 @@ mod tests {
             }
             other => panic!("expected Multicast, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_for_target_channels_targeted_preserves_shout_intent() {
+        use crate::application::proto::{VoiceIntentKind, VoiceIntentTarget, VoiceTargetChannel};
+        use crate::application::voice::targeted::RecipientIndex;
+
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service_with_strategy(transport.clone(), "targeted");
+        let idx = RecipientIndex::new();
+        idx.add(5, 1);
+        idx.add(6, 2);
+        idx.add(6, 7);
+        svc.set_recipient_index(idx);
+
+        let intent = VoiceIntent {
+            kind: Some(VoiceIntentKind::Target(VoiceIntentTarget {
+                source_channel: 5,
+                sessions: Vec::new(),
+                channels: vec![VoiceTargetChannel {
+                    id: 5,
+                    children: false,
+                    links: true,
+                    group: String::new(),
+                }],
+            })),
+        };
+        svc.send_for_target_channels(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            &[5, 6],
+            1,
+            false,
+            Bytes::from_static(b"shout"),
+            intent,
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            FakeCall::Multicast { dsts, body } => {
+                let mut sorted = dsts.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec![1, 2]);
+                let frame = proto::decode_voice(body.as_ref()).unwrap();
+                assert_eq!(frame.target_kind, 1);
+                assert!(matches!(
+                    frame.intent.and_then(|intent| intent.kind),
+                    Some(VoiceIntentKind::Target(_))
+                ));
+            }
+            other => panic!("expected Multicast, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_for_target_channels_falls_back_when_any_channel_missing() {
+        use crate::application::proto::{VoiceIntentKind, VoiceIntentTarget, VoiceTargetChannel};
+        use crate::application::voice::targeted::RecipientIndex;
+
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service_with_strategy(transport.clone(), "targeted");
+        let idx = RecipientIndex::new();
+        idx.add(5, 1);
+        svc.set_recipient_index(idx);
+
+        let intent = VoiceIntent {
+            kind: Some(VoiceIntentKind::Target(VoiceIntentTarget {
+                source_channel: 5,
+                sessions: Vec::new(),
+                channels: vec![VoiceTargetChannel {
+                    id: 5,
+                    children: false,
+                    links: true,
+                    group: String::new(),
+                }],
+            })),
+        };
+        svc.send_for_target_channels(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            &[5, 6],
+            1,
+            false,
+            Bytes::from_static(b"shout"),
+            intent,
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(calls[0], FakeCall::Broadcast { .. }));
     }
 
     #[tokio::test]

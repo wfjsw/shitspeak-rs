@@ -922,6 +922,60 @@ async fn auth_wrong_password_rejected() {
 }
 
 #[tokio::test]
+async fn auth_wrong_password_closes_connection_after_reject() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", Some("hunter2"), Some(1), vec![]);
+
+    let client = ManualNativeClient::connect(&server)
+        .await
+        .expect("manual connection");
+    assert!(matches!(
+        client.recv(Duration::from_secs(2)).await,
+        Some(Message::Version(_))
+    ));
+
+    let handshake = [
+        crate::messages::encoder::Version {
+            version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
+            release: Some("test-client".into()),
+            os: Some("test".into()),
+            os_version: Some("test".into()),
+        }
+        .into(),
+        Authenticate {
+            username: Some("alice".into()),
+            password: Some("nope".into()),
+            tokens: Vec::new(),
+            celt_versions: Vec::new(),
+            opus: Some(true),
+            client_type: ClientType::Regular,
+        }
+        .into(),
+    ];
+    client.send_batch(&handshake).await;
+
+    let mut saw_reject = false;
+    for _ in 0..8 {
+        let Some(message) = client.recv(Duration::from_secs(2)).await else {
+            break;
+        };
+        if let Message::Reject(reject) = message {
+            assert_eq!(reject.r#type, Some(RejectType::WrongUserPw as i32));
+            saw_reject = true;
+            break;
+        }
+    }
+
+    assert!(saw_reject, "wrong password should receive Reject");
+    assert!(
+        client.recv_closed(Duration::from_secs(2)).await,
+        "server should close connection immediately after auth rejection"
+    );
+}
+
+#[tokio::test]
 async fn auth_wrong_password_uses_default_unauthenticated_language() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server.authenticator.register_user_with_language(

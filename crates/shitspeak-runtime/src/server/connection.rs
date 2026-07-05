@@ -253,6 +253,9 @@ async fn finish_handler_result(
     user_visibility: &mut UserVisibilityState,
     result: Result<(), MessageHandlerError>,
 ) -> Result<(), HandleIncomingConnectionError> {
+    if matches!(result, Err(MessageHandlerError::AuthRejection(_))) {
+        let _ = client.force_disconnect().await;
+    }
     map_handler_result(client_session_id, result)?;
     activate_client_subscriptions(
         server,

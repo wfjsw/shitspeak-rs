@@ -179,6 +179,17 @@ fn target_intent(
     }
 }
 
+fn voice_target_is_current_channel_or_links(vt: &VoiceTarget, source_channel: u32) -> bool {
+    if !vt.sessions().is_empty() || vt.channels().len() != 1 {
+        return false;
+    }
+
+    let channel = &vt.channels()[0];
+    channel.id() == source_channel
+        && !channel.sub_channels()
+        && channel.only_group().trim().is_empty()
+}
+
 fn audio_context_from_target_kind(target_kind: u32) -> AudioContext {
     match target_kind {
         1 => AudioContext::Shout,
@@ -838,47 +849,64 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         "routing voice packet"
     );
 
-    let (intent, target_kind, send_s2s, route_kind, resolved_channels, voice_target) =
-        match audio.target {
-            AudioTarget::Normal => (
-                normal_intent(sender_channel),
-                S2S_TARGET_NORMAL,
-                true,
-                VoiceRouteKind::Normal,
-                None,
-                None,
-            ),
-            AudioTarget::ServerLoopback => {
-                let targets = [(sender.clone(), AudioContext::Normal)];
-                flush_voice_batch(server, audio, &targets).await;
-                super::metrics::record_route(
-                    VoiceRouteSource::Loopback,
-                    VoiceRouteKind::Loopback,
-                    targets.len(),
-                    started_at.elapsed(),
-                );
+    let (
+        intent,
+        target_kind,
+        send_s2s,
+        route_kind,
+        resolved_channels,
+        voice_target,
+        s2s_target_channels,
+    ) = match audio.target {
+        AudioTarget::Normal => (
+            normal_intent(sender_channel),
+            S2S_TARGET_NORMAL,
+            true,
+            VoiceRouteKind::Normal,
+            None,
+            None,
+            None,
+        ),
+        AudioTarget::ServerLoopback => {
+            let targets = [(sender.clone(), AudioContext::Normal)];
+            flush_voice_batch(server, audio, &targets).await;
+            super::metrics::record_route(
+                VoiceRouteSource::Loopback,
+                VoiceRouteKind::Loopback,
+                targets.len(),
+                started_at.elapsed(),
+            );
+            return;
+        }
+        AudioTarget::VoiceTarget(slot) => {
+            let Some(vt) = sender.voice_target(slot) else {
+                return;
+            };
+            if vt.is_empty() {
                 return;
             }
-            AudioTarget::VoiceTarget(slot) => {
-                let Some(vt) = sender.voice_target(slot) else {
-                    return;
+            let resolved_channels =
+                resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
+            let s2s_target_channels =
+                if voice_target_is_current_channel_or_links(&vt, sender_channel) {
+                    resolved_channels
+                        .first()
+                        .map(|channel| channel.channel_ids().to_vec())
+                } else {
+                    None
                 };
-                if vt.is_empty() {
-                    return;
-                }
 
-                let resolved_channels =
-                    resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
-                (
-                    target_intent(sender_channel, &vt),
-                    S2S_TARGET_SHOUT,
-                    true,
-                    VoiceRouteKind::Target,
-                    Some(resolved_channels),
-                    Some(vt),
-                )
-            }
-        };
+            (
+                target_intent(sender_channel, &vt),
+                S2S_TARGET_SHOUT,
+                true,
+                VoiceRouteKind::Target,
+                Some(resolved_channels),
+                Some(vt),
+                s2s_target_channels,
+            )
+        }
+    };
 
     let default_context = audio_context_from_target_kind(target_kind);
     let targets = if let (Some(vt), Some(resolved_channels)) =
@@ -935,22 +963,36 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
             &audio.audio_payload,
             codec::AudioPayload::Opus(payload) if payload.is_terminator
         );
-        let sent = match intent.kind.as_ref() {
-            Some(VoiceIntentKind::Normal(normal)) => server.s2s_manager().send_voice_for_channel(
+        let sent = if let Some(target_channels) = s2s_target_channels {
+            server.s2s_manager().send_voice_for_target_channels(
                 u32::from(sender_id),
                 server_id.clone(),
-                normal.source_channel,
-                is_terminator,
-                payload,
-            ),
-            _ => server.s2s_manager().send_voice_broadcast(
-                u32::from(sender_id),
-                server_id.clone(),
+                target_channels,
                 target_kind,
                 is_terminator,
                 payload,
                 intent,
-            ),
+            )
+        } else {
+            match intent.kind.as_ref() {
+                Some(VoiceIntentKind::Normal(normal)) => {
+                    server.s2s_manager().send_voice_for_channel(
+                        u32::from(sender_id),
+                        server_id.clone(),
+                        normal.source_channel,
+                        is_terminator,
+                        payload,
+                    )
+                }
+                _ => server.s2s_manager().send_voice_broadcast(
+                    u32::from(sender_id),
+                    server_id.clone(),
+                    target_kind,
+                    is_terminator,
+                    payload,
+                    intent,
+                ),
+            }
         };
         super::metrics::record_s2s_forward(sent);
         if !sent {

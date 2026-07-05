@@ -441,7 +441,7 @@ async fn handle_message_inner(
             );
             let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
             let msg = crate::messages::Message::Reject(reject_msg.into());
-            client.write_proto_message(&msg).await?;
+            client.write_proto_message_direct(&msg).await?;
             Err(MessageHandlerError::AuthRejection(reject))
         }
         Err(MessageHandlerError::AuthRejection(reject)) => {
@@ -449,7 +449,7 @@ async fn handle_message_inner(
             let reject_msg: crate::messages::encoder::Reject =
                 reject.clone().localized(client.language()).into();
             let msg = crate::messages::Message::Reject(reject_msg.into());
-            client.write_proto_message(&msg).await?;
+            client.write_proto_message_direct(&msg).await?;
             Err(MessageHandlerError::AuthRejection(reject))
         }
         Err(MessageHandlerError::PermissionDenied(mut deny)) => {

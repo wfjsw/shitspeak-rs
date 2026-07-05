@@ -216,6 +216,15 @@ enum NativeToS2SCommand {
         is_terminator: bool,
         payload: Bytes,
     },
+    SendVoiceForTargetChannels {
+        sender_session: u32,
+        server_id: String,
+        target_channels: Vec<u32>,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+    },
     SendVoiceBroadcast {
         sender_session: u32,
         server_id: String,
@@ -245,9 +254,9 @@ impl NativeToS2SCommand {
             Self::DispatchPluginData { .. } | Self::DispatchTextMessage { .. } => {
                 S2SGatewayClass::Bulk
             }
-            Self::SendVoiceForChannel { .. } | Self::SendVoiceBroadcast { .. } => {
-                S2SGatewayClass::Voice
-            }
+            Self::SendVoiceForChannel { .. }
+            | Self::SendVoiceForTargetChannels { .. }
+            | Self::SendVoiceBroadcast { .. } => S2SGatewayClass::Voice,
             Self::RefreshVoiceRecipientIndex(_) => S2SGatewayClass::Coalesced,
         }
     }
@@ -262,7 +271,9 @@ impl NativeToS2SCommand {
             Self::DispatchTextMessage { .. } => "text_message",
             Self::DispatchModeration { .. } => "moderation",
             Self::DispatchUserStats { .. } => "user_stats",
-            Self::SendVoiceForChannel { .. } | Self::SendVoiceBroadcast { .. } => "voice",
+            Self::SendVoiceForChannel { .. }
+            | Self::SendVoiceForTargetChannels { .. }
+            | Self::SendVoiceBroadcast { .. } => "voice",
         }
     }
 
@@ -286,6 +297,21 @@ impl NativeToS2SCommand {
             } => S2S_GATEWAY_COMMAND_OVERHEAD_BYTES
                 .saturating_add(server_id.len())
                 .saturating_add(payload.len()),
+            Self::SendVoiceForTargetChannels {
+                server_id,
+                target_channels,
+                payload,
+                intent,
+                ..
+            } => S2S_GATEWAY_COMMAND_OVERHEAD_BYTES
+                .saturating_add(server_id.len())
+                .saturating_add(
+                    target_channels
+                        .len()
+                        .saturating_mul(std::mem::size_of::<u32>()),
+                )
+                .saturating_add(payload.len())
+                .saturating_add(intent.encoded_len()),
             Self::SendVoiceBroadcast {
                 server_id,
                 payload,
@@ -1466,6 +1492,31 @@ impl S2SManager {
         })
     }
 
+    pub fn send_voice_for_target_channels(
+        &self,
+        sender_session: u32,
+        server_id: String,
+        target_channels: Vec<u32>,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+    ) -> bool {
+        let Some(tx) = self.state.read().gateway_tx.clone() else {
+            trace!(label = "voice", "s2s gateway unavailable; dropping command");
+            return false;
+        };
+        tx.try_send_voice(NativeToS2SCommand::SendVoiceForTargetChannels {
+            sender_session,
+            server_id,
+            target_channels,
+            target_kind,
+            is_terminator,
+            payload,
+            intent,
+        })
+    }
+
     pub fn send_voice_broadcast(
         &self,
         sender_session: u32,
@@ -2370,16 +2421,8 @@ async fn run_s2s_voice_gateway(
     mut rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
     application: Arc<s2s_application::ApplicationLayer>,
 ) {
-    let permits = Arc::new(Semaphore::new(default_s2s_voice_gateway_concurrency()));
     while let Some(command) = rx.recv().await {
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            return;
-        };
-        let application = application.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            run_s2s_voice_command(application, command).await;
-        });
+        run_s2s_voice_command(application.clone(), command).await;
     }
 }
 
@@ -2407,6 +2450,31 @@ async fn run_s2s_voice_command(
                 .await
             {
                 trace!(error = %e, "voice s2s send_for_channel failed");
+            }
+        }
+        NativeToS2SCommand::SendVoiceForTargetChannels {
+            sender_session,
+            server_id,
+            target_channels,
+            target_kind,
+            is_terminator,
+            payload,
+            intent,
+        } => {
+            if let Err(e) = application
+                .voice()
+                .send_for_target_channels(
+                    sender_session,
+                    server_id,
+                    &target_channels,
+                    target_kind,
+                    is_terminator,
+                    payload,
+                    intent,
+                )
+                .await
+            {
+                trace!(error = %e, "voice s2s send_for_target_channels failed");
             }
         }
         NativeToS2SCommand::SendVoiceBroadcast {
@@ -2458,14 +2526,6 @@ async fn run_s2s_coalesced_gateway(
             }
         }
     }
-}
-
-fn default_s2s_voice_gateway_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .saturating_mul(4)
-        .clamp(4, 64)
 }
 
 struct QueuedClientReplicationProposal {
@@ -2663,7 +2723,6 @@ async fn run_native_voice_gateway(
     mut rx: S2SAdaptiveReceiver<S2SNativeCommand>,
     mut shutdown: watch::Receiver<()>,
 ) {
-    let permits = Arc::new(Semaphore::new(default_s2s_voice_gateway_concurrency()));
     loop {
         let command = tokio::select! {
             _ = shutdown.changed() => return,
@@ -2675,24 +2734,18 @@ async fn run_native_voice_gateway(
         let Some(server) = server.upgrade() else {
             return;
         };
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            return;
-        };
-        tokio::spawn(async move {
-            let _permit = permit;
-            match command {
-                S2SNativeCommand::DeliverVoice {
-                    from_immediate,
-                    frame,
-                } => {
-                    crate::voice::route_s2s_voice_frame(&server, from_immediate, frame).await;
-                }
-                other => warn!(
-                    label = other.label(),
-                    "unexpected command on native voice gateway lane"
-                ),
+        match command {
+            S2SNativeCommand::DeliverVoice {
+                from_immediate,
+                frame,
+            } => {
+                crate::voice::route_s2s_voice_frame(&server, from_immediate, frame).await;
             }
-        });
+            other => warn!(
+                label = other.label(),
+                "unexpected command on native voice gateway lane"
+            ),
+        }
     }
 }
 

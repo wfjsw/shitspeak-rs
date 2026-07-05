@@ -152,6 +152,11 @@ async fn mod_kicks_other() {
         "Bob should receive the kick reason before disconnect"
     );
 
+    assert!(
+        bob.recv_closed(Duration::from_secs(2)).await,
+        "Bob's TCP connection should close immediately after kick"
+    );
+
     // Alice should see UserRemove for Bob's session.
     let alice_observed = alice
         .recv_until(
@@ -168,11 +173,6 @@ async fn mod_kicks_other() {
     assert!(
         alice_observed.is_some(),
         "Alice should have received UserRemove for Bob"
-    );
-
-    assert!(
-        bob.recv_closed(Duration::from_secs(2)).await,
-        "Bob's TCP connection should close after kick"
     );
 }
 
@@ -241,7 +241,29 @@ async fn mod_bans_other_blocks_reconnect() {
         .expect("bob");
 
     let bob_session = bob.session_id;
-    alice.ban(bob_session, "banned for the test").await;
+    let ban_reason = "banned for the test";
+    alice.ban(bob_session, ban_reason).await;
+
+    let bob_observed = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserRemove(ur)
+                    if ur.session == bob_session
+                        && ur.actor == Some(alice.session_id)
+                        && ur.reason.as_deref() == Some(ban_reason)
+                        && ur.ban == Some(true))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        bob_observed.is_some(),
+        "Bob should receive the ban reason before disconnect"
+    );
+    assert!(
+        bob.recv_closed(Duration::from_secs(2)).await,
+        "Bob's TCP connection should close immediately after ban"
+    );
 
     // Wait until Alice sees the UserRemove broadcast; that confirms the ban
     // path completed on the server side.
