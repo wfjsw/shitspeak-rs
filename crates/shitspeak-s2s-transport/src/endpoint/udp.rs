@@ -58,6 +58,9 @@ const TAG_LEN: usize = 16;
 const X25519_PUBLIC_KEY_LEN: usize = 32;
 const MAX_HANDSHAKE_DATAGRAM: usize = 16 * 1024;
 const UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD: usize = 3;
+const UDP_KEX_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(250);
+const UDP_KEX_MAX_RETRANSMIT_AGE: Duration = Duration::from_secs(30);
+const UDP_KEX_MAX_RETRANSMITS: u32 = 16;
 const KEX_TRANSCRIPT_DOMAIN: &[u8] = b"shitspeak-s2s-udp-kex-v1";
 const KEX_KEY_INFO: &[u8] = b"shitspeak-s2s-udp-packet-keys-v1";
 const SUPPORTED_SIGNATURE_SCHEMES: &[SignatureScheme] = &[
@@ -414,6 +417,7 @@ struct PeerKeyExchange {
     early_ready: Vec<Vec<u8>>,
     waiters: Vec<oneshot::Sender<io::Result<()>>>,
     local_initiated: bool,
+    send_budget: ExchangeSendBudget,
 }
 
 struct LocalKeyOffer {
@@ -443,6 +447,20 @@ struct KeyCandidate {
     ready_packet: Vec<u8>,
     ready_received: bool,
     promoted: bool,
+}
+
+#[derive(Default)]
+struct ExchangeSendBudget {
+    offer: HandshakePacketBudget,
+    ready: HandshakePacketBudget,
+}
+
+#[derive(Default)]
+struct HandshakePacketBudget {
+    first_sent: Option<Instant>,
+    last_sent: Option<Instant>,
+    retransmits: u32,
+    exhausted_logged: bool,
 }
 
 struct PromoteSession {
@@ -1042,7 +1060,12 @@ async fn begin_symmetric_exchange(
     exchange.local_initiated = true;
     exchange.waiters.push(waiter);
     ensure_local_offer(exchange, identity, peer_node)?;
-    Ok(exchange_packets(exchange))
+    Ok(exchange_packets_due(
+        exchange,
+        Instant::now(),
+        identity.node_id(),
+        peer_node,
+    ))
 }
 
 async fn accept_peer_offer(
@@ -1067,15 +1090,19 @@ async fn accept_peer_offer(
             .as_ref()
             .is_none_or(|local| local.private_key.is_none())
         {
-            exchange.local = Some(new_local_offer(identity, peer_node)?);
+            replace_local_offer(exchange, identity, peer_node)?;
         }
         exchange.peer = Some(peer_offer);
         match derive_candidate(exchange, local_node, peer_node, peer_addr) {
-            Ok(candidate) => exchange.candidate = Some(candidate),
+            Ok(candidate) => {
+                exchange.candidate = Some(candidate);
+                exchange.send_budget.ready.reset();
+            }
             Err(e) => {
                 exchange.local = None;
                 exchange.peer = None;
                 exchange.candidate = None;
+                exchange.send_budget = ExchangeSendBudget::default();
                 return Err(e);
             }
         }
@@ -1084,7 +1111,7 @@ async fn accept_peer_offer(
         candidate.peer_addr = peer_addr;
     }
 
-    let packets = exchange_packets(exchange);
+    let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
     let promote = promote_if_ready(exchange, local_node, peer_node);
     Ok((packets, promote))
 }
@@ -1107,21 +1134,34 @@ async fn accept_key_ready(
         if exchange.early_ready.len() < 4 {
             exchange.early_ready.push(packet.to_vec());
         }
-        return Ok((exchange_packets(exchange), None));
+        debug!(
+            local = %local_node,
+            peer = %peer_node,
+            received_exchange_id = header.seq,
+            "buffering udp key ready before a candidate exists"
+        );
+        return Ok((Vec::new(), None));
     };
 
     if exchange_id != header.seq {
         if exchange.early_ready.len() < 4 {
             exchange.early_ready.push(packet.to_vec());
         }
-        return Ok((exchange_packets(exchange), None));
+        debug!(
+            local = %local_node,
+            peer = %peer_node,
+            expected_exchange_id = exchange_id,
+            received_exchange_id = header.seq,
+            "ignoring udp key ready for a stale exchange"
+        );
+        return Ok((Vec::new(), None));
     }
 
     accept_ready_packet(exchange, local_node, peer_node, packet, header)?;
     if let Some(candidate) = exchange.candidate.as_mut() {
         candidate.peer_addr = peer_addr;
     }
-    let packets = exchange_packets(exchange);
+    let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
     let promote = promote_if_ready(exchange, local_node, peer_node);
     Ok((packets, promote))
 }
@@ -1147,7 +1187,7 @@ async fn decrypt_with_candidate_data(
         };
         candidate.ready_received = true;
         candidate.peer_addr = peer_addr;
-        let packets = exchange_packets(exchange);
+        let packets = exchange_packets_due(exchange, Instant::now(), inner.self_id(), header.src);
         let promote = promote_if_ready(exchange, inner.self_id(), header.src);
         (plaintext, packets, promote)
     };
@@ -1173,8 +1213,19 @@ fn ensure_local_offer(
                 .as_ref()
                 .is_some_and(|local| local.private_key.is_none()));
     if needs_offer {
-        exchange.local = Some(new_local_offer(identity, peer_node)?);
+        replace_local_offer(exchange, identity, peer_node)?;
     }
+    Ok(())
+}
+
+fn replace_local_offer(
+    exchange: &mut PeerKeyExchange,
+    identity: &NodeIdentity,
+    peer_node: NodeIdentifier,
+) -> io::Result<()> {
+    exchange.local = Some(new_local_offer(identity, peer_node)?);
+    exchange.send_budget.offer.reset();
+    exchange.send_budget.ready.reset();
     Ok(())
 }
 
@@ -1293,7 +1344,12 @@ fn accept_ready_packet(
     Ok(())
 }
 
-fn exchange_packets(exchange: &PeerKeyExchange) -> Vec<Vec<u8>> {
+fn exchange_packets_due(
+    exchange: &mut PeerKeyExchange,
+    now: Instant,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+) -> Vec<Vec<u8>> {
     if exchange
         .candidate
         .as_ref()
@@ -1303,12 +1359,76 @@ fn exchange_packets(exchange: &PeerKeyExchange) -> Vec<Vec<u8>> {
     }
     let mut packets = Vec::new();
     if let Some(local) = &exchange.local {
-        packets.push(local.packet.clone());
+        if exchange.send_budget.offer.should_send(
+            now,
+            local_node,
+            peer_node,
+            UdpPacketKind::KeyOffer,
+            local.offer_id,
+        ) {
+            packets.push(local.packet.clone());
+        }
     }
     if let Some(candidate) = &exchange.candidate {
-        packets.push(candidate.ready_packet.clone());
+        if exchange.send_budget.ready.should_send(
+            now,
+            local_node,
+            peer_node,
+            UdpPacketKind::KeyReady,
+            candidate.exchange_id,
+        ) {
+            packets.push(candidate.ready_packet.clone());
+        }
     }
     packets
+}
+
+impl HandshakePacketBudget {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn should_send(
+        &mut self,
+        now: Instant,
+        local_node: NodeIdentifier,
+        peer_node: NodeIdentifier,
+        kind: UdpPacketKind,
+        seq: u64,
+    ) -> bool {
+        let Some(first_sent) = self.first_sent else {
+            self.first_sent = Some(now);
+            self.last_sent = Some(now);
+            self.retransmits = 0;
+            return true;
+        };
+
+        let age = now.saturating_duration_since(first_sent);
+        if age >= UDP_KEX_MAX_RETRANSMIT_AGE || self.retransmits >= UDP_KEX_MAX_RETRANSMITS {
+            if !self.exhausted_logged {
+                self.exhausted_logged = true;
+                warn!(
+                    local = %local_node,
+                    peer = %peer_node,
+                    kind = ?kind,
+                    seq,
+                    age_ms = age.as_millis(),
+                    attempts = self.retransmits,
+                    "udp key exchange retransmit budget exhausted"
+                );
+            }
+            return false;
+        }
+
+        let last_sent = self.last_sent.unwrap_or(first_sent);
+        if now.saturating_duration_since(last_sent) < UDP_KEX_RETRANSMIT_INTERVAL {
+            return false;
+        }
+
+        self.last_sent = Some(now);
+        self.retransmits += 1;
+        true
+    }
 }
 
 fn promote_if_ready(
@@ -2273,6 +2393,34 @@ fn now_us() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_exchange(ready_received: bool) -> PeerKeyExchange {
+        PeerKeyExchange {
+            local: Some(LocalKeyOffer {
+                offer_id: 11,
+                private_key: None,
+                public_key: vec![1; X25519_PUBLIC_KEY_LEN],
+                packet: vec![0xaa],
+            }),
+            peer: Some(PeerKeyOffer {
+                offer_id: 13,
+                public_key: vec![2; X25519_PUBLIC_KEY_LEN],
+            }),
+            candidate: Some(KeyCandidate {
+                exchange_id: 17,
+                peer_addr: SocketAddr::from(([127, 0, 0, 1], 64742)),
+                seal_key: [3; 32],
+                open_key: [4; 32],
+                ready_packet: vec![0xbb],
+                ready_received,
+                promoted: false,
+            }),
+            early_ready: Vec::new(),
+            waiters: Vec::new(),
+            local_initiated: true,
+            send_budget: ExchangeSendBudget::default(),
+        }
+    }
+
     #[test]
     fn replay_window_accepts_new_and_rejects_duplicates() {
         let mut replay = ReplayWindow::default();
@@ -2340,37 +2488,124 @@ mod tests {
 
     #[test]
     fn promoted_key_exchange_stops_retransmitting_handshake_packets() {
-        let mut exchange = PeerKeyExchange {
-            local: Some(LocalKeyOffer {
-                offer_id: 11,
-                private_key: None,
-                public_key: vec![1; X25519_PUBLIC_KEY_LEN],
-                packet: vec![0xaa],
-            }),
-            peer: Some(PeerKeyOffer {
-                offer_id: 13,
-                public_key: vec![2; X25519_PUBLIC_KEY_LEN],
-            }),
-            candidate: Some(KeyCandidate {
-                exchange_id: 17,
-                peer_addr: SocketAddr::from(([127, 0, 0, 1], 64742)),
-                seal_key: [3; 32],
-                open_key: [4; 32],
-                ready_packet: vec![0xbb],
-                ready_received: true,
-                promoted: false,
-            }),
-            early_ready: Vec::new(),
-            waiters: Vec::new(),
-            local_initiated: true,
-        };
+        let mut exchange = test_exchange(true);
+        let now = Instant::now();
 
-        assert_eq!(exchange_packets(&exchange), vec![vec![0xaa], vec![0xbb]]);
+        assert_eq!(
+            exchange_packets_due(&mut exchange, now, 1, 2),
+            vec![vec![0xaa], vec![0xbb]]
+        );
 
         let promote = promote_if_ready(&mut exchange, 1, 2);
 
         assert!(promote.is_some());
-        assert!(exchange_packets(&exchange).is_empty());
+        assert!(exchange_packets_due(&mut exchange, now, 1, 2).is_empty());
         assert!(promote_if_ready(&mut exchange, 1, 2).is_none());
+    }
+
+    #[test]
+    fn duplicate_key_exchange_packets_are_paced() {
+        let mut exchange = test_exchange(false);
+        let now = Instant::now();
+
+        assert_eq!(
+            exchange_packets_due(&mut exchange, now, 1, 2),
+            vec![vec![0xaa], vec![0xbb]]
+        );
+        assert!(exchange_packets_due(&mut exchange, now, 1, 2).is_empty());
+        assert_eq!(
+            exchange_packets_due(&mut exchange, now + UDP_KEX_RETRANSMIT_INTERVAL, 1, 2),
+            vec![vec![0xaa], vec![0xbb]]
+        );
+        assert!(
+            exchange_packets_due(&mut exchange, now + UDP_KEX_RETRANSMIT_INTERVAL, 1, 2).is_empty()
+        );
+    }
+
+    #[test]
+    fn key_exchange_retransmit_attempts_are_capped() {
+        let mut exchange = test_exchange(false);
+        let now = Instant::now();
+
+        assert_eq!(
+            exchange_packets_due(&mut exchange, now, 1, 2),
+            vec![vec![0xaa], vec![0xbb]]
+        );
+        for attempt in 1..=UDP_KEX_MAX_RETRANSMITS {
+            assert_eq!(
+                exchange_packets_due(
+                    &mut exchange,
+                    now + UDP_KEX_RETRANSMIT_INTERVAL * attempt,
+                    1,
+                    2
+                ),
+                vec![vec![0xaa], vec![0xbb]]
+            );
+        }
+        assert!(
+            exchange_packets_due(
+                &mut exchange,
+                now + UDP_KEX_RETRANSMIT_INTERVAL * (UDP_KEX_MAX_RETRANSMITS + 1),
+                1,
+                2
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn key_exchange_retransmit_age_is_capped() {
+        let mut exchange = test_exchange(false);
+        let now = Instant::now();
+
+        assert_eq!(
+            exchange_packets_due(&mut exchange, now, 1, 2),
+            vec![vec![0xaa], vec![0xbb]]
+        );
+        assert!(
+            exchange_packets_due(&mut exchange, now + UDP_KEX_MAX_RETRANSMIT_AGE, 1, 2).is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_key_ready_does_not_retransmit_handshake_packets() {
+        let state = Arc::new(
+            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
+                .await
+                .unwrap(),
+        );
+        state.exchanges.lock().await.insert(2, test_exchange(false));
+        let header = UdpPacketHeader {
+            kind: UdpPacketKind::KeyReady,
+            src: 2,
+            dst: 1,
+            seq: 99,
+        };
+        let packet = header.encode();
+
+        let (packets, promote) = accept_key_ready(
+            &state,
+            1,
+            2,
+            SocketAddr::from(([127, 0, 0, 1], 64742)),
+            &packet,
+            header,
+        )
+        .await
+        .unwrap();
+
+        assert!(packets.is_empty());
+        assert!(promote.is_none());
+        assert_eq!(
+            state
+                .exchanges
+                .lock()
+                .await
+                .get(&2)
+                .unwrap()
+                .early_ready
+                .len(),
+            1
+        );
     }
 }
