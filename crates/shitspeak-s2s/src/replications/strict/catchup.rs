@@ -92,7 +92,12 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     };
     let _ = rt
         .net
-        .send_unicast(from, &rt.topic, StrictBody::CatchupResp(resp))
+        .send_bulk_unicast(
+            from,
+            &rt.topic,
+            StrictBody::CatchupResp(resp),
+            rt.cfg.bulk_retry_delay(),
+        )
         .await;
 }
 

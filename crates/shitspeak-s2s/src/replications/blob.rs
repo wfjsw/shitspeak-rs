@@ -9,6 +9,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 use rand::{RngExt, rng};
 use tokio::sync::oneshot;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
@@ -30,6 +31,15 @@ pub(crate) trait BlobNet: Send + Sync + 'static {
         topic: &str,
         body: BlobBody,
     ) -> Result<(), ReplicationError>;
+    async fn send_bulk_unicast(
+        &self,
+        dst: NodeIdentifier,
+        topic: &str,
+        body: BlobBody,
+        _retry_delay: Duration,
+    ) -> Result<(), ReplicationError> {
+        self.send_unicast(dst, topic, body).await
+    }
     async fn send_broadcast(&self, topic: &str, body: BlobBody) -> Result<(), ReplicationError>;
     fn alive_members(&self) -> Vec<NodeIdentifier>;
     fn local_node_id(&self) -> NodeIdentifier;
@@ -67,6 +77,49 @@ impl BlobNet for OverlayBlobNet {
         Ok(())
     }
 
+    async fn send_bulk_unicast(
+        &self,
+        dst: NodeIdentifier,
+        topic: &str,
+        body: BlobBody,
+        retry_delay: Duration,
+    ) -> Result<(), ReplicationError> {
+        let msg = repl_proto::wrap_blob(topic, body);
+        let bytes = repl_proto::encode(&msg)?;
+        let options = OverlaySendOptions::default()
+            .allow_l1_compression()
+            .expire_after(retry_delay);
+        let result = self
+            .overlay
+            .send_unicast_with_options(
+                dst,
+                REPLICATION_SERVICE_TAG,
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+                bytes.clone(),
+                options,
+            )
+            .await;
+        if let Err(error) = result {
+            if replication_bulk_backpressure(&error) {
+                sleep(retry_delay).await;
+                self.overlay
+                    .send_unicast_with_options(
+                        dst,
+                        REPLICATION_SERVICE_TAG,
+                        ServiceLevel::Reliable,
+                        MessageClass::Regular,
+                        bytes,
+                        options,
+                    )
+                    .await?;
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     async fn send_broadcast(&self, topic: &str, body: BlobBody) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_blob(topic, body);
         let bytes = repl_proto::encode(&msg)?;
@@ -97,6 +150,13 @@ impl BlobNet for OverlayBlobNet {
     fn local_node_id(&self) -> NodeIdentifier {
         self.overlay.local_node_id()
     }
+}
+
+fn replication_bulk_backpressure(error: &crate::overlay::OverlayError) -> bool {
+    matches!(
+        error,
+        crate::overlay::OverlayError::Send(shitspeak_s2s_transport::SendError::Backpressure { .. })
+    )
 }
 
 #[async_trait]
@@ -132,6 +192,8 @@ struct BlobReplicationConfig {
     max_parallel_peers: usize,
     decay_interval: Duration,
     unused_grace: Duration,
+    bulk_retry_delay: Duration,
+    bulk_max_in_flight_per_peer: usize,
 }
 
 impl BlobReplicationConfig {
@@ -144,6 +206,8 @@ impl BlobReplicationConfig {
             max_parallel_peers: cfg.blob_max_parallel_peers().max(1),
             decay_interval: cfg.blob_decay_interval(),
             unused_grace: cfg.blob_unused_grace(),
+            bulk_retry_delay: cfg.bulk_retry_delay(),
+            bulk_max_in_flight_per_peer: cfg.bulk_max_in_flight_per_peer().max(1),
         }
     }
 }
@@ -262,7 +326,11 @@ impl BlobFetch {
         indexes
     }
 
-    fn next_requests(&mut self, max_parallel_peers: usize) -> Vec<ChunkRequestPlan> {
+    fn next_requests(
+        &mut self,
+        max_parallel_peers: usize,
+        max_in_flight_per_peer: usize,
+    ) -> Vec<ChunkRequestPlan> {
         let Some(chunk_count) = self.chunk_count else {
             return Vec::new();
         };
@@ -277,14 +345,31 @@ impl BlobFetch {
         let mut providers = providers;
         providers.truncate(providers.len().min(max_parallel_peers.max(1)));
         let providers = providers.as_slice();
+        let max_in_flight_per_peer = max_in_flight_per_peer.max(1);
         let mut out: BTreeMap<NodeIdentifier, Vec<u32>> = BTreeMap::new();
         let mut provider_index = 0usize;
         for index in 0..chunk_count {
             if self.chunks.contains_key(&index) || self.requested.contains(&index) {
                 continue;
             }
-            let provider = providers[provider_index % providers.len()];
-            provider_index += 1;
+            let mut selected = None;
+            for _ in 0..providers.len() {
+                let provider = providers[provider_index % providers.len()];
+                provider_index += 1;
+                let already_requested = self
+                    .requested_by_peer
+                    .get(&provider)
+                    .map(HashSet::len)
+                    .unwrap_or(0);
+                let planned = out.get(&provider).map(Vec::len).unwrap_or(0);
+                if already_requested + planned < max_in_flight_per_peer {
+                    selected = Some(provider);
+                    break;
+                }
+            }
+            let Some(provider) = selected else {
+                break;
+            };
             self.requested.insert(index);
             self.requested_by_peer
                 .entry(provider)
@@ -352,6 +437,7 @@ impl BlobRuntimeState {
         &mut self,
         offer: BlobOffer,
         max_parallel_peers: usize,
+        max_in_flight_per_peer: usize,
         offer_wait: Duration,
     ) -> Vec<ChunkRequestPlan> {
         let Some(fetch) = self.fetches.get_mut(&offer.request_id) else {
@@ -366,7 +452,7 @@ impl BlobRuntimeState {
         {
             return Vec::new();
         }
-        fetch.next_requests(max_parallel_peers)
+        fetch.next_requests(max_parallel_peers, max_in_flight_per_peer)
     }
 
     fn record_chunk(&mut self, chunk: BlobChunk) -> Option<CompletedFetch> {
@@ -541,7 +627,12 @@ impl<R: BlobReplicable> BlobRuntime<R> {
         }
         let requests = {
             let mut state = self.state.lock();
-            state.add_offer(offer, self.cfg.max_parallel_peers, self.cfg.offer_wait)
+            state.add_offer(
+                offer,
+                self.cfg.max_parallel_peers,
+                self.cfg.bulk_max_in_flight_per_peer,
+                self.cfg.offer_wait,
+            )
         };
         self.send_chunk_requests(requests).await;
     }
@@ -577,7 +668,12 @@ impl<R: BlobReplicable> BlobRuntime<R> {
             };
             if let Err(e) = self
                 .net
-                .send_unicast(dst, &self.topic, BlobBody::Chunk(chunk))
+                .send_bulk_unicast(
+                    dst,
+                    &self.topic,
+                    BlobBody::Chunk(chunk),
+                    self.cfg.bulk_retry_delay,
+                )
                 .await
             {
                 trace!(error=%e, %dst, "blob chunk send failed");
@@ -662,14 +758,20 @@ impl<R: BlobReplicable> BlobRuntime<R> {
                 }
                 let stale = fetch.stale_requested_indexes(now, self.cfg.retry_interval);
                 if !stale.is_empty() {
-                    let requests = fetch.next_requests(self.cfg.max_parallel_peers);
+                    let requests = fetch.next_requests(
+                        self.cfg.max_parallel_peers,
+                        self.cfg.bulk_max_in_flight_per_peer,
+                    );
                     to_retry.extend(requests);
                 } else if !fetch.offers.is_empty()
                     && fetch.requested.is_empty()
                     && !fetch.is_complete()
                     && now.duration_since(fetch.started_at) >= self.cfg.offer_wait
                 {
-                    let requests = fetch.next_requests(self.cfg.max_parallel_peers);
+                    let requests = fetch.next_requests(
+                        self.cfg.max_parallel_peers,
+                        self.cfg.bulk_max_in_flight_per_peer,
+                    );
                     to_retry.extend(requests);
                 } else if now.duration_since(fetch.started_at) >= self.cfg.offer_wait
                     && fetch.offers.is_empty()

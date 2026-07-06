@@ -74,6 +74,7 @@ impl Default for ServiceRegistry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OverlaySendOptions {
     allow_l1_compression: bool,
+    transport_ttl: Option<std::time::Duration>,
 }
 
 impl OverlaySendOptions {
@@ -84,6 +85,15 @@ impl OverlaySendOptions {
 
     pub fn l1_compression_allowed(&self) -> bool {
         self.allow_l1_compression
+    }
+
+    pub fn expire_after(mut self, ttl: std::time::Duration) -> Self {
+        self.transport_ttl = Some(ttl);
+        self
+    }
+
+    pub fn transport_ttl(&self) -> Option<std::time::Duration> {
+        self.transport_ttl
     }
 }
 

@@ -47,9 +47,14 @@ pub struct TransportConfig {
     reconnect_check_interval: Duration,
     /// Per-address outbound dial deadline. Zero disables the deadline.
     dial_attempt_timeout: Duration,
+    /// How long to suppress a seed target that resolves back to this node.
+    self_seed_quarantine: Duration,
     /// How often to give an otherwise unselected peer/transport one
     /// exploratory dial while the outgoing cap is full. Set to zero to disable.
     unselected_link_probe_interval: Duration,
+    /// Max address/transport dial attempts spawned for one peer in one
+    /// supervisor tick.
+    max_dial_attempts_per_peer_tick: usize,
     ping_interval: Duration,
     idle_ping_interval: Duration,
     bandwidth_window: Duration,
@@ -130,7 +135,9 @@ impl TransportConfig {
             unconfirmed_address_decay_failures: 5,
             reconnect_check_interval: Duration::from_secs(1),
             dial_attempt_timeout: Duration::from_secs(10),
+            self_seed_quarantine: Duration::from_secs(60 * 60),
             unselected_link_probe_interval: Duration::from_secs(30),
+            max_dial_attempts_per_peer_tick: 1,
             ping_interval: Duration::from_secs(2),
             idle_ping_interval: Duration::from_secs(10),
             bandwidth_window: Duration::from_secs(5),
@@ -290,8 +297,16 @@ impl TransportConfig {
         self.dial_attempt_timeout
     }
 
+    pub fn self_seed_quarantine(&self) -> Duration {
+        self.self_seed_quarantine
+    }
+
     pub fn unselected_link_probe_interval(&self) -> Duration {
         self.unselected_link_probe_interval
+    }
+
+    pub fn max_dial_attempts_per_peer_tick(&self) -> usize {
+        self.max_dial_attempts_per_peer_tick
     }
 
     pub fn ping_interval(&self) -> Duration {
@@ -571,8 +586,18 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_self_seed_quarantine(mut self, d: Duration) -> Self {
+        self.self_seed_quarantine = d;
+        self
+    }
+
     pub fn with_unselected_link_probe_interval(mut self, d: Duration) -> Self {
         self.unselected_link_probe_interval = d;
+        self
+    }
+
+    pub fn with_max_dial_attempts_per_peer_tick(mut self, n: usize) -> Self {
+        self.max_dial_attempts_per_peer_tick = n.max(1);
         self
     }
 
@@ -782,8 +807,12 @@ pub struct TransportTuning {
     /// Per-address outbound dial deadline. Set to zero to disable.
     #[serde(default = "default_dial_attempt_timeout_secs")]
     pub dial_attempt_timeout_secs: u64,
+    #[serde(default = "default_self_seed_quarantine_secs")]
+    pub self_seed_quarantine_secs: u64,
     #[serde(default = "default_unselected_link_probe_interval_secs")]
     pub unselected_link_probe_interval_secs: u64,
+    #[serde(default = "default_max_dial_attempts_per_peer_tick")]
+    pub max_dial_attempts_per_peer_tick: usize,
     #[serde(default = "default_max_outgoing_connections")]
     pub max_outgoing_connections: usize,
     /// Legacy message-count hint used as a minimum adaptive byte budget.
@@ -832,7 +861,9 @@ impl Default for TransportTuning {
             unconfirmed_address_retry_cap_secs: default_unconfirmed_address_retry_cap_secs(),
             unconfirmed_address_decay_failures: default_unconfirmed_address_decay_failures(),
             dial_attempt_timeout_secs: default_dial_attempt_timeout_secs(),
+            self_seed_quarantine_secs: default_self_seed_quarantine_secs(),
             unselected_link_probe_interval_secs: default_unselected_link_probe_interval_secs(),
+            max_dial_attempts_per_peer_tick: default_max_dial_attempts_per_peer_tick(),
             max_outgoing_connections: default_max_outgoing_connections(),
             inbound_control_capacity: default_inbound_control_capacity(),
             inbound_high_capacity: default_inbound_high_capacity(),
@@ -875,9 +906,11 @@ impl TransportTuning {
             ))
             .with_unconfirmed_address_decay_failures(self.unconfirmed_address_decay_failures)
             .with_dial_attempt_timeout(Duration::from_secs(self.dial_attempt_timeout_secs))
+            .with_self_seed_quarantine(Duration::from_secs(self.self_seed_quarantine_secs))
             .with_unselected_link_probe_interval(Duration::from_secs(
                 self.unselected_link_probe_interval_secs,
             ))
+            .with_max_dial_attempts_per_peer_tick(self.max_dial_attempts_per_peer_tick)
             .with_max_outgoing_connections(self.max_outgoing_connections)
             .with_inbound_control_capacity(self.inbound_control_capacity.max(1))
             .with_inbound_high_capacity(self.inbound_high_capacity.max(1))
@@ -957,8 +990,14 @@ fn default_unconfirmed_address_decay_failures() -> u32 {
 fn default_dial_attempt_timeout_secs() -> u64 {
     10
 }
+fn default_self_seed_quarantine_secs() -> u64 {
+    60 * 60
+}
 fn default_unselected_link_probe_interval_secs() -> u64 {
     30
+}
+fn default_max_dial_attempts_per_peer_tick() -> usize {
+    1
 }
 fn default_max_outgoing_connections() -> usize {
     1024

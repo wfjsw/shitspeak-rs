@@ -108,7 +108,12 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
     };
     let _ = rt
         .net
-        .send_unicast(from, &rt.topic, OwnerBody::CatchupResp(resp))
+        .send_bulk_unicast(
+            from,
+            &rt.topic,
+            OwnerBody::CatchupResp(resp),
+            rt.cfg.bulk_retry_delay(),
+        )
         .await;
 }
 

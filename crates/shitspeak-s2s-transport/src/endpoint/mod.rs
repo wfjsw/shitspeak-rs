@@ -25,7 +25,7 @@ use futures_util::future::join_all;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{sleep, timeout};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::types::NodeIdentifier;
 
@@ -807,6 +807,9 @@ async fn try_dial_peer(
             let result = dispatch_dial_with_timeout(inner, peer, addr).await;
             (addr, transport, result)
         });
+        if planned_outgoing >= inner.cfg().max_dial_attempts_per_peer_tick() {
+            break;
+        }
     }
 
     if attempts.is_empty() {
@@ -971,6 +974,10 @@ fn should_remove_failed_address(error: &io::Error) -> bool {
         || message.contains("certificate not valid for name")
 }
 
+fn is_self_loop_error(error: &io::Error) -> bool {
+    error.to_string().contains("self-loop rejected")
+}
+
 async fn dial_resolved_seed_address(
     inner: &Arc<ManagerInner>,
     addr: PeerAddress,
@@ -1038,7 +1045,29 @@ pub(crate) async fn dial_seed_address(
     inner: &Arc<ManagerInner>,
     seed: &SeedAddress,
 ) -> io::Result<NodeIdentifier> {
-    let addrs = resolve_seed_address(seed)?;
+    let resolved_addrs = resolve_seed_address(seed)?;
+    let mut self_addrs = Vec::new();
+    let addrs: Vec<_> = resolved_addrs
+        .into_iter()
+        .filter(|addr| {
+            if seed_address_is_local(inner.cfg(), *addr) {
+                self_addrs.push(*addr);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    if addrs.is_empty() && !self_addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!(
+                "seed address {:?} resolved only to local S2S addresses: {:?}",
+                seed.addr(),
+                self_addrs
+            ),
+        ));
+    }
     let mut last_err = None;
     for addr in addrs {
         match dial_resolved_seed_address(inner, addr).await {
@@ -1046,7 +1075,12 @@ pub(crate) async fn dial_seed_address(
                 inner.mark_seed_successful(seed.clone(), addr);
                 return Ok(node);
             }
-            Err(error) => last_err = Some(error),
+            Err(error) => {
+                if is_self_loop_error(&error) {
+                    return Err(error);
+                }
+                last_err = Some(error);
+            }
         }
     }
     Err(last_err.unwrap_or_else(|| {
@@ -1064,10 +1098,14 @@ pub(crate) async fn probe_seed_address(
     if seed_address_registered(inner, &addr) {
         return None;
     }
+    let now = Instant::now();
+    if inner.self_seed_quarantine_active(&addr, now) {
+        return None;
+    }
     let backoff = inner.seed_backoff(addr.clone());
     {
         let mut bo = backoff.lock();
-        if !bo.ready(Instant::now(), inner.cfg().backoff_cap()) {
+        if !bo.ready(now, inner.cfg().backoff_cap()) {
             return None;
         }
         bo.record_attempt();
@@ -1078,9 +1116,92 @@ pub(crate) async fn probe_seed_address(
         Ok(_) => {
             backoff.lock().record_success();
         }
+        Err(error) if is_self_loop_error(error) || seed_error_resolved_only_to_local(error) => {
+            let should_log = inner.quarantine_self_seed(addr.clone(), Instant::now());
+            if should_log {
+                warn!(
+                    ?addr,
+                    quarantine_secs = inner.cfg().self_seed_quarantine().as_secs(),
+                    error = %error,
+                    "quarantined S2S seed because it resolves back to the local node"
+                );
+            }
+            backoff
+                .lock()
+                .record_failure(inner.cfg().self_seed_quarantine());
+        }
         Err(_) => backoff.lock().record_failure(inner.cfg().backoff_cap()),
     }
     Some(result)
+}
+
+fn seed_error_resolved_only_to_local(error: &io::Error) -> bool {
+    error
+        .to_string()
+        .contains("resolved only to local S2S addresses")
+}
+
+fn seed_address_is_local(cfg: &TransportConfig, addr: PeerAddress) -> bool {
+    let socket = addr.addr();
+    if local_advertised_sockets(cfg, addr.transport()).contains(&socket) {
+        return true;
+    }
+    let listen_ports = local_listen_ports(cfg, addr.transport());
+    if !listen_ports.contains(&socket.port()) {
+        return false;
+    }
+    local_interface_ips(cfg).contains(&socket.ip())
+}
+
+fn local_advertised_sockets(cfg: &TransportConfig, transport: TransportKind) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    let addrs = match transport {
+        TransportKind::Tcp => cfg.tcp_advertise(),
+        TransportKind::Kcp => cfg.kcp_advertise(),
+        TransportKind::Quic => cfg.quic_advertise(),
+        TransportKind::Udp => cfg.udp_advertise(),
+    };
+    out.extend(
+        addrs
+            .iter()
+            .copied()
+            .filter(|addr| !addr.ip().is_unspecified()),
+    );
+    let listen = match transport {
+        TransportKind::Tcp => cfg.tcp_listen_addrs(),
+        TransportKind::Kcp => cfg.kcp_listen_addrs(),
+        TransportKind::Quic => cfg.quic_listen_addrs(),
+        TransportKind::Udp => cfg.udp_listen_addrs(),
+    };
+    out.extend(
+        listen
+            .iter()
+            .copied()
+            .filter(|addr| !addr.ip().is_unspecified()),
+    );
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn local_listen_ports(cfg: &TransportConfig, transport: TransportKind) -> HashSet<u16> {
+    let addrs = match transport {
+        TransportKind::Tcp => cfg.tcp_listen_addrs(),
+        TransportKind::Kcp => cfg.kcp_listen_addrs(),
+        TransportKind::Quic => cfg.quic_listen_addrs(),
+        TransportKind::Udp => cfg.udp_listen_addrs(),
+    };
+    addrs.iter().map(|addr| addr.port()).collect()
+}
+
+fn local_interface_ips(cfg: &TransportConfig) -> HashSet<IpAddr> {
+    let mut ips = super::local_ip::discover_all_interface_ips();
+    ips.extend(super::local_ip::discover_interface_ips(
+        cfg.local_advertise_interfaces(),
+    ));
+    ips.push(IpAddr::from([127, 0, 0, 1]));
+    ips.push(IpAddr::from(std::net::Ipv6Addr::LOCALHOST));
+    ips.into_iter().collect()
 }
 
 fn unconfigured(kind: TransportKind) -> io::Error {

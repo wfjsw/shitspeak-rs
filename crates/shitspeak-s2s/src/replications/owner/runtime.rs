@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
@@ -35,6 +36,15 @@ pub(crate) trait OwnerNet: Send + Sync + 'static {
         topic: &str,
         body: OwnerBody,
     ) -> Result<(), ReplicationError>;
+    async fn send_bulk_unicast(
+        &self,
+        dst: NodeIdentifier,
+        topic: &str,
+        body: OwnerBody,
+        _retry_delay: Duration,
+    ) -> Result<(), ReplicationError> {
+        self.send_unicast(dst, topic, body).await
+    }
     async fn send_broadcast(&self, topic: &str, body: OwnerBody) -> Result<(), ReplicationError>;
     fn alive_members(&self) -> Vec<NodeIdentifier>;
     fn local_node_id(&self) -> NodeIdentifier;
@@ -98,6 +108,49 @@ impl OwnerNet for OverlayOwnerNet {
         Ok(())
     }
 
+    async fn send_bulk_unicast(
+        &self,
+        dst: NodeIdentifier,
+        topic: &str,
+        body: OwnerBody,
+        retry_delay: Duration,
+    ) -> Result<(), ReplicationError> {
+        let msg = repl_proto::wrap_owner(topic, body);
+        let bytes = repl_proto::encode(&msg)?;
+        let options = OverlaySendOptions::default()
+            .allow_l1_compression()
+            .expire_after(retry_delay);
+        let result = self
+            .overlay
+            .send_unicast_with_options(
+                dst,
+                REPLICATION_SERVICE_TAG,
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+                bytes.clone(),
+                options,
+            )
+            .await;
+        if let Err(error) = result {
+            if replication_bulk_backpressure(&error) {
+                sleep(retry_delay).await;
+                self.overlay
+                    .send_unicast_with_options(
+                        dst,
+                        REPLICATION_SERVICE_TAG,
+                        ServiceLevel::Reliable,
+                        MessageClass::Regular,
+                        bytes,
+                        options,
+                    )
+                    .await?;
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.overlay.owner_replication_members()
     }
@@ -109,6 +162,13 @@ impl OwnerNet for OverlayOwnerNet {
     fn member_boot_epoch(&self, node: NodeIdentifier) -> Option<u64> {
         self.overlay.member(node).map(|m| m.boot_epoch())
     }
+}
+
+fn replication_bulk_backpressure(error: &crate::overlay::OverlayError) -> bool {
+    matches!(
+        error,
+        crate::overlay::OverlayError::Send(shitspeak_s2s_transport::SendError::Backpressure { .. })
+    )
 }
 
 /// One pending out-of-order op buffered until the gap fills (or a snapshot

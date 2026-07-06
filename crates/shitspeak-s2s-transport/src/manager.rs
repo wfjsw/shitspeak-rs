@@ -334,6 +334,7 @@ pub(crate) struct ManagerInner {
     peers: Arc<SccMap<NodeIdentifier, Arc<PeerState>>>,
     seed_backoff: Arc<SccMap<SeedAddress, Arc<parking_lot::Mutex<BackoffState>>>>,
     successful_seeds: Arc<SccMap<SeedAddress, PeerAddress>>,
+    quarantined_self_seeds: Arc<SccMap<SeedAddress, Instant>>,
     required_outgoing: Arc<RwLock<HashSet<NodeIdentifier>>>,
     inbound: InboundDispatch,
     shutdown: CancellationToken,
@@ -404,6 +405,7 @@ impl ManagerInner {
             peers: self.peers.clone(),
             seed_backoff: self.seed_backoff.clone(),
             successful_seeds: self.successful_seeds.clone(),
+            quarantined_self_seeds: self.quarantined_self_seeds.clone(),
             required_outgoing: self.required_outgoing.clone(),
             inbound: self.inbound.clone(),
             shutdown: self.shutdown.clone(),
@@ -477,6 +479,33 @@ impl ManagerInner {
             }
         }
     }
+
+    pub fn self_seed_quarantine_active(&self, addr: &SeedAddress, now: Instant) -> bool {
+        let Some(entry) = self.quarantined_self_seeds.get_sync(addr) else {
+            return false;
+        };
+        if *entry.get() > now {
+            return true;
+        }
+        drop(entry);
+        let _ = self.quarantined_self_seeds.remove_sync(addr);
+        false
+    }
+
+    pub fn quarantine_self_seed(&self, addr: SeedAddress, now: Instant) -> bool {
+        let until = now + self.cfg.self_seed_quarantine();
+        match self.quarantined_self_seeds.entry_sync(addr) {
+            scc::hash_map::Entry::Occupied(mut entry) => {
+                let should_log = *entry.get() <= now;
+                *entry.get_mut() = until;
+                should_log
+            }
+            scc::hash_map::Entry::Vacant(entry) => {
+                entry.insert_entry(until);
+                true
+            }
+        }
+    }
 }
 
 /// Public handle.
@@ -524,6 +553,7 @@ impl ConnectionManager {
             peers: Arc::new(SccMap::new()),
             seed_backoff: Arc::new(SccMap::new()),
             successful_seeds: Arc::new(SccMap::new()),
+            quarantined_self_seeds: Arc::new(SccMap::new()),
             required_outgoing: Arc::new(RwLock::new(HashSet::new())),
             inbound,
             shutdown: CancellationToken::new(),
@@ -571,6 +601,7 @@ impl ConnectionManager {
             peers: Arc::new(SccMap::new()),
             seed_backoff: Arc::new(SccMap::new()),
             successful_seeds: Arc::new(SccMap::new()),
+            quarantined_self_seeds: Arc::new(SccMap::new()),
             required_outgoing: Arc::new(RwLock::new(HashSet::new())),
             inbound,
             shutdown: CancellationToken::new(),
@@ -895,7 +926,7 @@ impl ConnectionManager {
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
 
-        if !has_eligible_transport(&peer, level, routing_metric) {
+        if !has_eligible_transport(&peer, level, routing_metric, class) {
             return Err(SendError::NoSuitableTransport { node });
         }
 
@@ -974,10 +1005,15 @@ impl ConnectionManager {
                 Err(SendError::Backpressure {
                     node: peer.node_id(),
                     transport: envelope.target_transport().unwrap_or_else(|| {
-                        pick_transports(peer, envelope.level(), envelope.routing_metric())
-                            .into_iter()
-                            .next()
-                            .unwrap_or(TransportKind::Tcp)
+                        pick_transports(
+                            peer,
+                            envelope.level(),
+                            envelope.routing_metric(),
+                            envelope.class(),
+                        )
+                        .into_iter()
+                        .next()
+                        .unwrap_or(TransportKind::Tcp)
                     }),
                 })
             }
@@ -1144,7 +1180,7 @@ fn pick_transport(
     level: ServiceLevel,
     routing_metric: RoutingMetric,
 ) -> Option<TransportKind> {
-    pick_transports(peer, level, routing_metric)
+    pick_transports(peer, level, routing_metric, MessageClass::Regular)
         .first()
         .copied()
 }
@@ -1153,6 +1189,7 @@ fn pick_transports(
     peer: &PeerState,
     level: ServiceLevel,
     routing_metric: RoutingMetric,
+    class: MessageClass,
 ) -> Vec<TransportKind> {
     let mut candidates: Vec<TransportKind> = peer
         .live_kinds()
@@ -1175,6 +1212,10 @@ fn pick_transports(
         }
     }
 
+    if class == MessageClass::Regular {
+        ranked.sort_by_key(|kind| regular_queue_penalty(peer, *kind));
+    }
+
     ranked
 }
 
@@ -1182,8 +1223,20 @@ fn has_eligible_transport(
     peer: &PeerState,
     level: ServiceLevel,
     routing_metric: RoutingMetric,
+    class: MessageClass,
 ) -> bool {
-    !pick_transports(peer, level, routing_metric).is_empty()
+    !pick_transports(peer, level, routing_metric, class).is_empty()
+}
+
+fn regular_queue_penalty(peer: &PeerState, transport: TransportKind) -> u8 {
+    let Some(status) = peer.outbound_stream_queue_status(transport) else {
+        return 0;
+    };
+    if status.depth() > 0 || status.full_samples() > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 fn spawn_peer_outbound_dispatcher(inner: Arc<ManagerInner>, peer: Arc<PeerState>) {
@@ -1249,7 +1302,12 @@ fn try_dispatch_envelope(
     let choices = if let Some(transport) = envelope.target_transport() {
         vec![transport]
     } else {
-        pick_transports(peer, envelope.level(), envelope.routing_metric())
+        pick_transports(
+            peer,
+            envelope.level(),
+            envelope.routing_metric(),
+            envelope.class(),
+        )
     };
 
     if choices.is_empty() {
@@ -1269,7 +1327,7 @@ fn try_dispatch_envelope(
         let Some(sender) = peer.try_get_stream(transport) else {
             continue;
         };
-        if sender.depth_bytes() > 0 {
+        if class == MessageClass::Regular && sender.depth_bytes() > 0 {
             record_outbound_stream_queue_sample(peer, transport, class, &sender, true);
             continue;
         }

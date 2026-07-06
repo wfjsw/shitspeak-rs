@@ -105,7 +105,13 @@ pub(crate) async fn originate(
             allow_l1_compression: options.l1_compression_allowed(),
         };
         return forward_pb_as(
-            transport, routing, self_id, data, class, /*is_originator=*/ true,
+            transport,
+            routing,
+            self_id,
+            data,
+            class,
+            /*is_originator=*/ true,
+            options.transport_ttl(),
         )
         .await;
     };
@@ -146,7 +152,13 @@ pub(crate) async fn originate(
         ordering.store_pending(lane, data.clone()).await;
         ordering.cache_ordered_packet(&data).await;
         if let Err(err) = forward_pb_as(
-            transport, routing, self_id, data, class, /*is_originator=*/ true,
+            transport,
+            routing,
+            self_id,
+            data,
+            class,
+            /*is_originator=*/ true,
+            options.transport_ttl(),
         )
         .await
         {
@@ -297,7 +309,7 @@ pub(crate) async fn handle_inbound(
     let mut data2 = data;
     data2.dsts = remaining;
     let _ = forward_pb_as(
-        transport, routing, self_id, data2, class, /*is_originator=*/ false,
+        transport, routing, self_id, data2, class, /*is_originator=*/ false, None,
     )
     .await;
 }
@@ -434,6 +446,7 @@ pub(crate) fn spawn_ordered_retransmit_task(
                             data,
                             class,
                             false,
+                            None,
                         ).await;
                     }
                 }
@@ -583,6 +596,7 @@ async fn forward_pb_as(
     data: pb::OverlayData,
     transport_class: MessageClass,
     is_originator: bool,
+    transport_ttl: Option<std::time::Duration>,
 ) -> Result<(), OverlayError> {
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
     let routing_metric = route_metric_from_wire(data.route_metric, level)
@@ -671,7 +685,7 @@ async fn forward_pb_as(
             );
         }
 
-        let send_options = transport_options_for_overlay_data(&pb_msg);
+        let send_options = transport_options_for_overlay_data(&pb_msg, transport_ttl);
         let body = OverlayBody::Data(pb_msg);
         #[cfg(debug_assertions)]
         let packet_kind = crate::debug_io::classify_overlay_body(&body);
@@ -753,13 +767,18 @@ fn reconstruct_forwarded_data(
     }
 }
 
-fn transport_options_for_overlay_data(data: &pb::OverlayData) -> TransportSendOptions {
+fn transport_options_for_overlay_data(
+    data: &pb::OverlayData,
+    transport_ttl: Option<std::time::Duration>,
+) -> TransportSendOptions {
     let mut options = TransportSendOptions::default();
     if data.allow_l1_compression {
         options = options.allow_l1_compression();
     }
     if data.service_tag == VOICE_SERVICE_TAG {
         options = options.expire_after(VOICE_TRANSPORT_TTL);
+    } else if let Some(ttl) = transport_ttl {
+        options = options.expire_after(ttl);
     }
     options
 }
@@ -1029,13 +1048,13 @@ mod tests {
     fn voice_overlay_data_gets_expiring_transport_options() {
         let mut data = test_overlay_data(false);
         assert!(
-            transport_options_for_overlay_data(&data)
+            transport_options_for_overlay_data(&data, None)
                 .expires_at()
                 .is_none()
         );
 
         data.service_tag = VOICE_SERVICE_TAG;
-        let options = transport_options_for_overlay_data(&data);
+        let options = transport_options_for_overlay_data(&data, None);
         assert!(options.expires_at().is_some());
         assert!(!options.is_expired());
     }
@@ -1197,6 +1216,7 @@ mod tests {
                 test_overlay_data(false),
                 MessageClass::Regular,
                 false,
+                None,
             ),
         )
         .await
@@ -1220,6 +1240,7 @@ mod tests {
                 test_overlay_data(false),
                 MessageClass::Regular,
                 true,
+                None,
             ),
         )
         .await
@@ -1254,6 +1275,7 @@ mod tests {
                 overlay_data_for_dsts(&[4, 5]),
                 MessageClass::Regular,
                 true,
+                None,
             ),
         )
         .await

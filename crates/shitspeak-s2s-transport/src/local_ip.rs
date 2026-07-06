@@ -16,6 +16,16 @@ pub(crate) fn discover_interface_ips(allowlist: &[String]) -> Vec<IpAddr> {
     }
 }
 
+pub(crate) fn discover_all_interface_ips() -> Vec<IpAddr> {
+    match discover_interface_ips_inner(None) {
+        Ok(ips) => ips,
+        Err(e) => {
+            debug!(error=%e, "local interface IP discovery failed");
+            Vec::new()
+        }
+    }
+}
+
 pub(crate) fn has_usable_ipv6_address() -> bool {
     match discover_interface_ips_inner(None) {
         Ok(ips) => ips.into_iter().any(|ip| ip.is_ipv6()),

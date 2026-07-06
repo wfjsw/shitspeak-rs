@@ -16,6 +16,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
@@ -94,6 +95,15 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
         topic: &str,
         body: StrictBody,
     ) -> Result<(), ReplicationError>;
+    async fn send_bulk_unicast(
+        &self,
+        dst: NodeIdentifier,
+        topic: &str,
+        body: StrictBody,
+        _retry_delay: Duration,
+    ) -> Result<(), ReplicationError> {
+        self.send_unicast(dst, topic, body).await
+    }
     async fn send_multicast(
         &self,
         dsts: &[NodeIdentifier],
@@ -147,6 +157,51 @@ impl StrictNet for OverlayStrictNet {
         Ok(())
     }
 
+    async fn send_bulk_unicast(
+        &self,
+        dst: NodeIdentifier,
+        topic: &str,
+        body: StrictBody,
+        retry_delay: Duration,
+    ) -> Result<(), ReplicationError> {
+        let msg = repl_proto::wrap_strict(topic, body);
+        let bytes = repl_proto::encode(&msg)?;
+        let options = OverlaySendOptions::default()
+            .allow_l1_compression()
+            .expire_after(retry_delay);
+        let result = self
+            .overlay
+            .send_unicast_unordered_with_routing_metric_and_options(
+                dst,
+                REPLICATION_SERVICE_TAG,
+                ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
+                MessageClass::Regular,
+                bytes.clone(),
+                options,
+            )
+            .await;
+        if let Err(error) = result {
+            if replication_bulk_backpressure(&error) {
+                sleep(retry_delay).await;
+                self.overlay
+                    .send_unicast_unordered_with_routing_metric_and_options(
+                        dst,
+                        REPLICATION_SERVICE_TAG,
+                        ServiceLevel::Reliable,
+                        RoutingMetric::ReliableCost,
+                        MessageClass::Regular,
+                        bytes,
+                        options,
+                    )
+                    .await?;
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     async fn send_multicast(
         &self,
         dsts: &[NodeIdentifier],
@@ -191,6 +246,13 @@ impl StrictNet for OverlayStrictNet {
     fn edge_rtt_snapshot(&self) -> Vec<Duration> {
         self.overlay.edge_rtt_snapshot()
     }
+}
+
+fn replication_bulk_backpressure(error: &crate::overlay::OverlayError) -> bool {
+    matches!(
+        error,
+        crate::overlay::OverlayError::Send(shitspeak_s2s_transport::SendError::Backpressure { .. })
+    )
 }
 
 // ---------- State machine ----------

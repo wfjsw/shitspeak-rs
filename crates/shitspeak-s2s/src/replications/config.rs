@@ -64,6 +64,10 @@ pub struct ReplicationConfig {
     blob_decay_interval: Duration,
     /// Time an unreferenced blob must remain unused before deletion.
     blob_unused_grace: Duration,
+    /// Delay before retrying bulk replication sends that hit backpressure.
+    bulk_retry_delay: Duration,
+    /// Max blob chunk indexes requested from one provider at a time.
+    bulk_max_in_flight_per_peer: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -91,6 +95,8 @@ impl Default for ReplicationConfig {
             blob_max_parallel_peers: 3,
             blob_decay_interval: Duration::from_secs(60),
             blob_unused_grace: Duration::from_secs(600),
+            bulk_retry_delay: Duration::from_millis(250),
+            bulk_max_in_flight_per_peer: 1,
         }
     }
 }
@@ -152,6 +158,12 @@ impl ReplicationConfig {
     }
     pub fn blob_unused_grace(&self) -> Duration {
         self.blob_unused_grace
+    }
+    pub fn bulk_retry_delay(&self) -> Duration {
+        self.bulk_retry_delay
+    }
+    pub fn bulk_max_in_flight_per_peer(&self) -> usize {
+        self.bulk_max_in_flight_per_peer
     }
 
     pub fn with_fallback_clock_tick(mut self, d: Duration) -> Self {
@@ -230,6 +242,14 @@ impl ReplicationConfig {
         self.blob_unused_grace = d;
         self
     }
+    pub fn with_bulk_retry_delay(mut self, d: Duration) -> Self {
+        self.bulk_retry_delay = d;
+        self
+    }
+    pub fn with_bulk_max_in_flight_per_peer(mut self, n: usize) -> Self {
+        self.bulk_max_in_flight_per_peer = n.max(1);
+        self
+    }
 }
 
 /// TOML-deserializable shadow of [`ReplicationConfig`]. Each field maps
@@ -275,6 +295,10 @@ pub struct ReplicationTuning {
     pub blob_decay_interval_ms: u64,
     #[serde(default = "default_blob_unused_grace_ms")]
     pub blob_unused_grace_ms: u64,
+    #[serde(default = "default_bulk_retry_delay_ms")]
+    pub bulk_retry_delay_ms: u64,
+    #[serde(default = "default_bulk_max_in_flight_per_peer")]
+    pub bulk_max_in_flight_per_peer: usize,
 }
 
 impl Default for ReplicationTuning {
@@ -299,6 +323,8 @@ impl Default for ReplicationTuning {
             blob_max_parallel_peers: default_blob_max_parallel_peers(),
             blob_decay_interval_ms: default_blob_decay_interval_ms(),
             blob_unused_grace_ms: default_blob_unused_grace_ms(),
+            bulk_retry_delay_ms: default_bulk_retry_delay_ms(),
+            bulk_max_in_flight_per_peer: default_bulk_max_in_flight_per_peer(),
         }
     }
 }
@@ -327,6 +353,8 @@ impl From<ReplicationTuning> for ReplicationConfig {
             .with_blob_max_parallel_peers(t.blob_max_parallel_peers)
             .with_blob_decay_interval(Duration::from_millis(t.blob_decay_interval_ms))
             .with_blob_unused_grace(Duration::from_millis(t.blob_unused_grace_ms))
+            .with_bulk_retry_delay(Duration::from_millis(t.bulk_retry_delay_ms))
+            .with_bulk_max_in_flight_per_peer(t.bulk_max_in_flight_per_peer)
     }
 }
 
@@ -386,4 +414,10 @@ fn default_blob_decay_interval_ms() -> u64 {
 }
 fn default_blob_unused_grace_ms() -> u64 {
     600_000
+}
+fn default_bulk_retry_delay_ms() -> u64 {
+    250
+}
+fn default_bulk_max_in_flight_per_peer() -> usize {
+    1
 }

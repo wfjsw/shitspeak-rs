@@ -459,6 +459,8 @@ Transport and replication tuning examples:
 [s2s.transport]
 ping_interval_secs = 2
 idle_ping_interval_secs = 10
+self_seed_quarantine_secs = 3600
+max_dial_attempts_per_peer_tick = 1
 max_outgoing_connections = 1024
 # Legacy queue capacity hints. Adaptive byte budgets use available memory;
 # these only raise the per-lane minimum budget.
@@ -483,6 +485,8 @@ propose_ttl_ms = 10000
 propose_semaphore_size = 32
 strict_max_catchup_ops = 256
 blob_chunk_size = 65536
+bulk_retry_delay_ms = 250
+bulk_max_in_flight_per_peer = 1
 ```
 
 S2S inbound and outbound transport queues are adaptive and byte-budgeted. The

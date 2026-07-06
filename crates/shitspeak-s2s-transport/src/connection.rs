@@ -22,7 +22,7 @@ use super::SendOptions;
 use super::adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 use super::metrics::{
     ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
-    MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueWatermark,
+    MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueStatusSnapshot, QueueWatermark,
 };
 use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
 
@@ -973,6 +973,32 @@ impl PeerState {
         }));
         out.sort_by_key(|snapshot| snapshot.queue_key());
         out
+    }
+
+    pub(crate) fn outbound_stream_queue_status(
+        &self,
+        transport: TransportKind,
+    ) -> Option<QueueStatusSnapshot> {
+        let current = {
+            let mut streams = self.streams.lock();
+            prune_dead_streams(&mut streams);
+            streams
+                .values()
+                .filter(|stream| stream.is_alive() && stream.transport() == transport)
+                .map(|stream| (stream.sender.depth_bytes(), stream.sender.capacity_bytes()))
+                .max_by_key(|(depth, _)| *depth)
+        };
+
+        let mut status = self
+            .outbound_stream_queue_watermarks
+            .lock()
+            .get(&transport)
+            .map(QueueWatermark::snapshot)
+            .unwrap_or_default();
+        if let Some((depth, capacity)) = current {
+            status = status.with_current(depth, capacity);
+        }
+        Some(status)
     }
 
     pub(crate) fn record_expired_outbound_drop(
