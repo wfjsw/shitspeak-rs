@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use bytes::Bytes;
@@ -39,6 +40,7 @@ static ADAPTIVE_DICTIONARY_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendOptions {
     allow_l1_compression: bool,
+    expires_at: Option<Instant>,
 }
 
 impl SendOptions {
@@ -47,8 +49,25 @@ impl SendOptions {
         self
     }
 
+    pub fn expire_after(mut self, ttl: Duration) -> Self {
+        self.expires_at = Some(Instant::now() + ttl);
+        self
+    }
+
     pub fn l1_compression_allowed(&self) -> bool {
         self.allow_l1_compression
+    }
+
+    pub fn expires_at(&self) -> Option<Instant> {
+        self.expires_at
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(Instant::now())
+    }
+
+    pub fn is_expired_at(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|deadline| now >= deadline)
     }
 }
 
@@ -56,6 +75,7 @@ impl Default for SendOptions {
     fn default() -> Self {
         Self {
             allow_l1_compression: false,
+            expires_at: None,
         }
     }
 }

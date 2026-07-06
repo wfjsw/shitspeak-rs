@@ -27,6 +27,7 @@ pub(crate) struct TopologySnapshot {
     local_metrics: Vec<TransportMetric>,
     outbound_queues: Vec<OutboundQueueMetric>,
     inbound_queues: Vec<InboundQueueMetric>,
+    expired_outbound_drops: Vec<ExpiredOutboundDropMetric>,
     #[cfg(debug_assertions)]
     debug_packet_io: Vec<crate::debug_io::PacketIoSnapshot>,
 }
@@ -150,6 +151,15 @@ pub(crate) struct InboundQueueMetric {
     capacity: usize,
     samples: u64,
     full_samples: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ExpiredOutboundDropMetric {
+    peer: NodeIdentifier,
+    stage: &'static str,
+    transport: &'static str,
+    class: &'static str,
+    frames: u64,
 }
 
 pub fn spawn_status_server(
@@ -504,6 +514,20 @@ pub(crate) fn build_topology_snapshot(
         .collect::<Vec<_>>();
     inbound_queues.sort_by_key(|queue| queue.class);
 
+    let mut expired_outbound_drops = metrics
+        .expired_outbound_drops()
+        .iter()
+        .map(|entry| ExpiredOutboundDropMetric {
+            peer: entry.peer(),
+            stage: entry.stage().name(),
+            transport: outbound_queue_transport_name(entry.transport()),
+            class: message_class_name(entry.class()),
+            frames: entry.frames(),
+        })
+        .collect::<Vec<_>>();
+    expired_outbound_drops
+        .sort_by_key(|entry| (entry.peer, entry.stage, entry.transport, entry.class));
+
     TopologySnapshot {
         local_node: overlay.local_node_id(),
         generated_at_unix_ms,
@@ -514,6 +538,7 @@ pub(crate) fn build_topology_snapshot(
         local_metrics,
         outbound_queues,
         inbound_queues,
+        expired_outbound_drops,
         #[cfg(debug_assertions)]
         debug_packet_io: crate::debug_io::snapshot(),
     }
@@ -740,6 +765,11 @@ impl<'a> PrometheusWriter<'a> {
             "shitspeak_s2s_inbound_queue_status",
             "Local S2S inbound queue status.",
             "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_expired_outbound_frames_total",
+            "S2S outbound frames dropped because their send deadline expired.",
+            "counter",
         );
         #[cfg(debug_assertions)]
         {
@@ -1169,6 +1199,22 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
             queue.samples,
             queue.full_samples,
         );
+    }
+
+    for entry in &snapshot.expired_outbound_drops {
+        let source = local_node.clone();
+        let peer = entry.peer.to_string();
+        out.push(sample(
+            "shitspeak_s2s_expired_outbound_frames_total",
+            vec![
+                ("source", source.as_str()),
+                ("peer", peer.as_str()),
+                ("stage", entry.stage),
+                ("transport", entry.transport),
+                ("class", entry.class),
+            ],
+            entry.frames as f64,
+        ));
     }
 
     #[cfg(debug_assertions)]
@@ -1875,6 +1921,13 @@ mod tests {
                 samples: 12,
                 full_samples: 3,
             }],
+            expired_outbound_drops: vec![ExpiredOutboundDropMetric {
+                peer: 2,
+                stage: "transport_write",
+                transport: "quic",
+                class: "high_priority",
+                frames: 5,
+            }],
             #[cfg(debug_assertions)]
             debug_packet_io: Vec::new(),
         };
@@ -1923,6 +1976,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_queue_status{source=\"1\",direction=\"incoming\",peer=\"\",transport=\"\",class=\"regular\",metric=\"high_watermark\"} 9"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_expired_outbound_frames_total{source=\"1\",peer=\"2\",stage=\"transport_write\",transport=\"quic\",class=\"high_priority\"} 5"
         ));
     }
 

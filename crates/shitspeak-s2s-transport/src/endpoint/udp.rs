@@ -43,6 +43,7 @@ use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::super::frame::{FrameType, build_frame};
 use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
+use super::super::metrics::ExpiredOutboundDropStage;
 use super::super::service_level::{MessageClass, ServiceLevel, TransportKind};
 use super::super::tls;
 use super::{
@@ -1996,6 +1997,15 @@ async fn run_write(
 
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
+                if out.options().is_expired() {
+                    peer.record_expired_outbound_drop(
+                        ExpiredOutboundDropStage::TransportWrite,
+                        Some(TransportKind::Udp),
+                        out.class(),
+                    );
+                    trace!(peer=%peer.node_id(), "dropping expired outbound udp frame");
+                    continue;
+                }
                 let original_payload_len = out.payload().len();
                 let mut frame = build_frame(
                     inner.self_id(),

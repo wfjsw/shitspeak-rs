@@ -41,6 +41,7 @@ use super::compression::{
 use super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::frame::{FrameType, build_frame, stream_codec};
 use super::manager::InboundDispatch;
+use super::metrics::ExpiredOutboundDropStage;
 use super::native_stats::BoxedNativeLossSampler;
 use super::service_level::{MessageClass, ServiceLevel, TransportKind};
 
@@ -494,6 +495,15 @@ async fn run_pump<S>(
 
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
+                if out.options().is_expired() {
+                    peer.record_expired_outbound_drop(
+                        ExpiredOutboundDropStage::TransportWrite,
+                        Some(cfg.transport),
+                        out.class(),
+                    );
+                    trace!(peer=%peer.node_id(), transport=?cfg.transport, "dropping expired outbound stream frame");
+                    continue;
+                }
                 let original_payload_len = out.payload().len();
                 let mut frame = build_frame(
                     cfg.local_node,

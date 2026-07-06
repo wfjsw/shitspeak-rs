@@ -20,7 +20,10 @@ use crate::types::NodeIdentifier;
 
 use super::SendOptions;
 use super::adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
-use super::metrics::{MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueWatermark};
+use super::metrics::{
+    ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
+    MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueWatermark,
+};
 use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
 
 const MAX_OBSERVED_REMOTE_IPS: usize = 8;
@@ -123,6 +126,14 @@ impl OutboundEnvelope {
 
     pub fn payload(&self) -> &Bytes {
         &self.payload
+    }
+
+    pub fn options(&self) -> SendOptions {
+        self.options
+    }
+
+    pub fn is_expired_at(&self, now: Instant) -> bool {
+        self.options.is_expired_at(now)
     }
 
     pub fn into_frame(self) -> OutboundFrame {
@@ -417,6 +428,7 @@ pub(crate) struct PeerState {
     address_backoffs: Mutex<HashMap<PeerAddress, BackoffState>>,
     outbound_queue_watermark: Mutex<QueueWatermark>,
     outbound_stream_queue_watermarks: Mutex<HashMap<TransportKind, QueueWatermark>>,
+    expired_outbound_drops: ExpiredOutboundDropCounters,
     outbound_dispatch_notify: Notify,
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
@@ -450,6 +462,7 @@ impl PeerState {
             address_backoffs: Mutex::new(HashMap::new()),
             outbound_queue_watermark: Mutex::new(QueueWatermark::new(Instant::now())),
             outbound_stream_queue_watermarks: Mutex::new(HashMap::new()),
+            expired_outbound_drops: ExpiredOutboundDropCounters::default(),
             outbound_dispatch_notify: Notify::new(),
             connecting: AtomicBool::new(false),
         })
@@ -960,6 +973,19 @@ impl PeerState {
         }));
         out.sort_by_key(|snapshot| snapshot.queue_key());
         out
+    }
+
+    pub(crate) fn record_expired_outbound_drop(
+        &self,
+        stage: ExpiredOutboundDropStage,
+        transport: Option<TransportKind>,
+        class: MessageClass,
+    ) {
+        self.expired_outbound_drops.record(stage, transport, class);
+    }
+
+    pub(crate) fn expired_outbound_drop_status(&self) -> Vec<ExpiredOutboundDropSnapshot> {
+        self.expired_outbound_drops.snapshots(self.node_id)
     }
 
     pub fn has_any_live_stream(&self) -> bool {

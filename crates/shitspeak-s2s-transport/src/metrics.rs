@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -39,6 +40,28 @@ const NATIVE_LOSS_EFFECTIVE_CAP_PPM: u32 = 250_000;
 const DATA_HEALTH_EFFECTIVE_CAP_PPM: u32 = 100_000;
 const LOSS_EFFECTIVE_SAMPLE_FLOOR: u64 = 32;
 pub(crate) const QUEUE_WATERMARK_LOG_INTERVAL: Duration = Duration::from_secs(3 * 60);
+const EXPIRED_OUTBOUND_DROP_STAGE_COUNT: usize = 3;
+const EXPIRED_OUTBOUND_DROP_TRANSPORT_COUNT: usize = 5;
+const MESSAGE_CLASS_COUNT: usize = 3;
+
+const EXPIRED_OUTBOUND_DROP_STAGES: [ExpiredOutboundDropStage; EXPIRED_OUTBOUND_DROP_STAGE_COUNT] = [
+    ExpiredOutboundDropStage::PeerQueueEnqueue,
+    ExpiredOutboundDropStage::PeerQueueDispatch,
+    ExpiredOutboundDropStage::TransportWrite,
+];
+const EXPIRED_OUTBOUND_DROP_TRANSPORTS: [Option<TransportKind>;
+    EXPIRED_OUTBOUND_DROP_TRANSPORT_COUNT] = [
+    None,
+    Some(TransportKind::Tcp),
+    Some(TransportKind::Kcp),
+    Some(TransportKind::Quic),
+    Some(TransportKind::Udp),
+];
+const MESSAGE_CLASSES: [MessageClass; MESSAGE_CLASS_COUNT] = [
+    MessageClass::Control,
+    MessageClass::HighPriority,
+    MessageClass::Regular,
+];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueStatusSnapshot {
@@ -1261,6 +1284,7 @@ pub struct MetricsSnapshot {
     per_node: HashMap<NodeIdentifier, HashMap<TransportKind, LinkMetrics>>,
     outbound_queues: Vec<OutboundQueueStatusSnapshot>,
     inbound_queues: Vec<InboundQueueStatusSnapshot>,
+    expired_outbound_drops: Vec<ExpiredOutboundDropSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1321,6 +1345,133 @@ enum OutboundQueueKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiredOutboundDropStage {
+    PeerQueueEnqueue,
+    PeerQueueDispatch,
+    TransportWrite,
+}
+
+impl ExpiredOutboundDropStage {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PeerQueueEnqueue => "peer_queue_enqueue",
+            Self::PeerQueueDispatch => "peer_queue_dispatch",
+            Self::TransportWrite => "transport_write",
+        }
+    }
+}
+
+pub(crate) struct ExpiredOutboundDropCounters {
+    counters: [[[AtomicU64; MESSAGE_CLASS_COUNT]; EXPIRED_OUTBOUND_DROP_TRANSPORT_COUNT];
+        EXPIRED_OUTBOUND_DROP_STAGE_COUNT],
+}
+
+impl Default for ExpiredOutboundDropCounters {
+    fn default() -> Self {
+        Self {
+            counters: std::array::from_fn(|_| {
+                std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
+            }),
+        }
+    }
+}
+
+impl ExpiredOutboundDropCounters {
+    pub(crate) fn record(
+        &self,
+        stage: ExpiredOutboundDropStage,
+        transport: Option<TransportKind>,
+        class: MessageClass,
+    ) {
+        self.counters[expired_outbound_drop_stage_index(stage)]
+            [expired_outbound_drop_transport_index(transport)][message_class_index(class)]
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshots(&self, peer: NodeIdentifier) -> Vec<ExpiredOutboundDropSnapshot> {
+        let mut out = Vec::new();
+        for stage in EXPIRED_OUTBOUND_DROP_STAGES {
+            for transport in EXPIRED_OUTBOUND_DROP_TRANSPORTS {
+                for class in MESSAGE_CLASSES {
+                    let frames = self.counters[expired_outbound_drop_stage_index(stage)]
+                        [expired_outbound_drop_transport_index(transport)]
+                        [message_class_index(class)]
+                    .load(Ordering::Relaxed);
+                    if frames == 0 {
+                        continue;
+                    }
+                    out.push(ExpiredOutboundDropSnapshot {
+                        peer,
+                        stage,
+                        transport,
+                        class,
+                        frames,
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiredOutboundDropSnapshot {
+    peer: NodeIdentifier,
+    stage: ExpiredOutboundDropStage,
+    transport: Option<TransportKind>,
+    class: MessageClass,
+    frames: u64,
+}
+
+impl ExpiredOutboundDropSnapshot {
+    pub fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+
+    pub fn stage(&self) -> ExpiredOutboundDropStage {
+        self.stage
+    }
+
+    pub fn transport(&self) -> Option<TransportKind> {
+        self.transport
+    }
+
+    pub fn class(&self) -> MessageClass {
+        self.class
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+}
+
+fn expired_outbound_drop_stage_index(stage: ExpiredOutboundDropStage) -> usize {
+    match stage {
+        ExpiredOutboundDropStage::PeerQueueEnqueue => 0,
+        ExpiredOutboundDropStage::PeerQueueDispatch => 1,
+        ExpiredOutboundDropStage::TransportWrite => 2,
+    }
+}
+
+fn expired_outbound_drop_transport_index(transport: Option<TransportKind>) -> usize {
+    match transport {
+        None => 0,
+        Some(TransportKind::Tcp) => 1,
+        Some(TransportKind::Kcp) => 2,
+        Some(TransportKind::Quic) => 3,
+        Some(TransportKind::Udp) => 4,
+    }
+}
+
+fn message_class_index(class: MessageClass) -> usize {
+    match class {
+        MessageClass::Control => 0,
+        MessageClass::HighPriority => 1,
+        MessageClass::Regular => 2,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InboundQueueStatusSnapshot {
     class: MessageClass,
     status: QueueStatusSnapshot,
@@ -1356,6 +1507,10 @@ impl MetricsSnapshot {
     pub fn inbound_queues(&self) -> &[InboundQueueStatusSnapshot] {
         &self.inbound_queues
     }
+
+    pub fn expired_outbound_drops(&self) -> &[ExpiredOutboundDropSnapshot] {
+        &self.expired_outbound_drops
+    }
 }
 
 /// Helper for the manager to assemble a `MetricsSnapshot` across all peers.
@@ -1363,6 +1518,7 @@ pub fn assemble_snapshot<I>(
     iter: I,
     outbound_queues: Vec<OutboundQueueStatusSnapshot>,
     inbound_queues: Vec<InboundQueueStatusSnapshot>,
+    expired_outbound_drops: Vec<ExpiredOutboundDropSnapshot>,
 ) -> MetricsSnapshot
 where
     I: IntoIterator<Item = (NodeIdentifier, Arc<PeerMetrics>)>,
@@ -1375,6 +1531,7 @@ where
         per_node,
         outbound_queues,
         inbound_queues,
+        expired_outbound_drops,
     }
 }
 

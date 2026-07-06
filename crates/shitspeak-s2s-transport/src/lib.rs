@@ -86,8 +86,8 @@ pub use identity::node_id_from_cert_file;
 pub use manager::PeerAddressSnapshot;
 pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage};
 pub use metrics::{
-    InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot, OutboundQueueStatusSnapshot,
-    QueueStatusSnapshot,
+    ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics,
+    MetricsSnapshot, OutboundQueueStatusSnapshot, QueueStatusSnapshot,
 };
 pub use metrics::{
     apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,

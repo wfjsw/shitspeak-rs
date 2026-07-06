@@ -38,8 +38,8 @@ use super::endpoint::{
 use super::error::{ConfigError, SendError, TransportError};
 use super::identity::NodeIdentity;
 use super::metrics::{
-    InboundQueueStatusSnapshot, MetricsSnapshot, MetricsTuning, QueueWatermark,
-    QueueWatermarkReport, assemble_snapshot,
+    ExpiredOutboundDropStage, InboundQueueStatusSnapshot, MetricsSnapshot, MetricsTuning,
+    QueueWatermark, QueueWatermarkReport, assemble_snapshot,
 };
 use super::service_level::{
     MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, TransportKind,
@@ -942,6 +942,14 @@ impl ConnectionManager {
         envelope: OutboundEnvelope,
         wait_for_space: bool,
     ) -> Result<(), SendError> {
+        if envelope.options().is_expired() {
+            peer.record_expired_outbound_drop(
+                ExpiredOutboundDropStage::PeerQueueEnqueue,
+                envelope.target_transport(),
+                envelope.class(),
+            );
+            return Ok(());
+        }
         let class = envelope.class();
         let sender = peer.outbound_sender();
         record_outbound_queue_sample(peer, class, &sender, false);
@@ -991,7 +999,26 @@ impl ConnectionManager {
             .flat_map(|(_, peer)| peer.outbound_queue_status())
             .collect::<Vec<_>>();
         outbound_queues.sort_by_key(|queue| (queue.peer(), queue.queue_key()));
-        assemble_snapshot(entries, outbound_queues, self.inner.inbound.queue_status())
+        let mut expired_outbound_drops = self
+            .inner
+            .iter_peers()
+            .into_iter()
+            .flat_map(|(_, peer)| peer.expired_outbound_drop_status())
+            .collect::<Vec<_>>();
+        expired_outbound_drops.sort_by_key(|drop| {
+            (
+                drop.peer(),
+                drop.stage().name(),
+                drop.transport(),
+                drop.class() as u8,
+            )
+        });
+        assemble_snapshot(
+            entries,
+            outbound_queues,
+            self.inner.inbound.queue_status(),
+            expired_outbound_drops,
+        )
     }
 
     pub fn peer_address_snapshot(&self) -> Vec<PeerAddressSnapshot> {
@@ -1209,6 +1236,15 @@ fn try_dispatch_envelope(
     peer: &Arc<PeerState>,
     envelope: OutboundEnvelope,
 ) -> Result<(), OutboundEnvelope> {
+    let now = Instant::now();
+    if envelope.is_expired_at(now) {
+        peer.record_expired_outbound_drop(
+            ExpiredOutboundDropStage::PeerQueueDispatch,
+            envelope.target_transport(),
+            envelope.class(),
+        );
+        return Ok(());
+    }
     let class = envelope.class();
     let choices = if let Some(transport) = envelope.target_transport() {
         vec![transport]
@@ -1222,6 +1258,14 @@ fn try_dispatch_envelope(
 
     let frame = envelope.clone().into_frame();
     for transport in choices {
+        if frame.options().is_expired() {
+            peer.record_expired_outbound_drop(
+                ExpiredOutboundDropStage::PeerQueueDispatch,
+                Some(transport),
+                class,
+            );
+            return Ok(());
+        }
         let Some(sender) = peer.try_get_stream(transport) else {
             continue;
         };
@@ -1810,6 +1854,76 @@ mod tests {
             .expect("dispatcher should retry once handoff space is available")
             .expect("tcp receiver");
         assert_eq!(&forwarded.payload()[..], b"queued-before-routing");
+    }
+
+    #[tokio::test]
+    async fn expired_peer_queue_head_does_not_block_fresh_frame() {
+        let (transport, mut receivers) = ConnectionManager::test_with_live_streams_bytes(
+            1,
+            2,
+            &[TransportKind::Tcp],
+            1024 * 1024,
+        );
+
+        let direct_peer = transport.inner.get_peer(2).expect("peer");
+        let tcp_sender = direct_peer
+            .try_get_stream(TransportKind::Tcp)
+            .expect("tcp sender");
+        tcp_sender
+            .try_send(OutboundFrame::new(
+                MessageClass::Regular,
+                Bytes::from(vec![1; 1024 * 1024 - 512]),
+            ))
+            .unwrap();
+
+        transport
+            .try_send_with_options(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"stale"),
+                SendOptions::default().expire_after(Duration::from_millis(1)),
+            )
+            .await
+            .unwrap();
+        transport
+            .try_send_with_options(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fresh"),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            receivers[0].recv().await.unwrap().payload().len(),
+            1024 * 1024 - 512
+        );
+        let forwarded = tokio::time::timeout(Duration::from_millis(50), receivers[0].recv())
+            .await
+            .expect("fresh frame should dispatch after expired head is dropped")
+            .expect("tcp receiver");
+        assert_eq!(&forwarded.payload()[..], b"fresh");
+        assert!(receivers[0].try_recv().is_err());
+
+        let snapshot = transport.metrics_snapshot();
+        assert!(
+            snapshot.expired_outbound_drops().iter().any(|drop| {
+                drop.peer() == 2
+                    && drop.stage() == ExpiredOutboundDropStage::PeerQueueDispatch
+                    && drop.transport().is_none()
+                    && drop.class() == MessageClass::Regular
+                    && drop.frames() == 1
+            }),
+            "expected one routed stale-frame drop, got {:?}",
+            snapshot.expired_outbound_drops()
+        );
     }
 
     #[test]

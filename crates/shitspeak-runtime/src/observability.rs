@@ -124,7 +124,10 @@ impl ServerMetricsSource {
     }
 
     fn voice_samples(&self) -> Vec<PrometheusSample> {
-        crate::voice::metrics::prometheus_samples()
+        samples_with_node_label(
+            crate::voice::metrics::prometheus_samples(),
+            self.clients.local_node_id(),
+        )
     }
 }
 
@@ -258,6 +261,23 @@ fn consensus_samples_from_snapshot(snapshot: &ConsensusMetricsSnapshot) -> Vec<P
         ));
     }
     samples
+}
+
+fn samples_with_node_label(samples: Vec<PrometheusSample>, node_id: u16) -> Vec<PrometheusSample> {
+    let node_id = node_id.to_string();
+    samples
+        .into_iter()
+        .map(|sample| {
+            if sample.labels().iter().any(|(name, _)| name == "node") {
+                return sample;
+            }
+
+            let mut labels = Vec::with_capacity(sample.labels().len() + 1);
+            labels.extend(sample.labels().iter().cloned());
+            labels.push(("node".to_owned(), node_id.clone()));
+            PrometheusSample::new(sample.name().to_owned(), labels, sample.value())
+        })
+        .collect()
 }
 
 fn serialize_client_version_vector(versions: &[(u16, u64)]) -> String {
@@ -1018,6 +1038,37 @@ mod tests {
             5
         );
         assert!(remote_write_bodies(&[], 123, 2, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn samples_with_node_label_adds_local_node_without_overwriting_existing_label() {
+        let samples = samples_with_node_label(
+            vec![
+                PrometheusSample::new(
+                    "test_without_node",
+                    vec![("kind".to_owned(), "voice".to_owned())],
+                    1.0,
+                ),
+                PrometheusSample::new(
+                    "test_with_node",
+                    vec![("node".to_owned(), "external".to_owned())],
+                    2.0,
+                ),
+            ],
+            31,
+        );
+
+        assert_eq!(
+            samples[0].labels(),
+            &[
+                ("kind".to_owned(), "voice".to_owned()),
+                ("node".to_owned(), "31".to_owned())
+            ]
+        );
+        assert_eq!(
+            samples[1].labels(),
+            &[("node".to_owned(), "external".to_owned())]
+        );
     }
 
     #[test]

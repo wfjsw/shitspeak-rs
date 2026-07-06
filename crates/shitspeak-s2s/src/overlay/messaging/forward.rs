@@ -33,6 +33,7 @@ use super::{OverlaySendOptions, ServiceRegistry};
 const FORWARD_PAYLOAD_LOG_BYTES: usize = 256;
 const CONTROL_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
 const CONTROL_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
+const VOICE_TRANSPORT_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectFallbackReason {
@@ -753,12 +754,14 @@ fn reconstruct_forwarded_data(
 }
 
 fn transport_options_for_overlay_data(data: &pb::OverlayData) -> TransportSendOptions {
-    let options = TransportSendOptions::default();
+    let mut options = TransportSendOptions::default();
     if data.allow_l1_compression {
-        options.allow_l1_compression()
-    } else {
-        options
+        options = options.allow_l1_compression();
     }
+    if data.service_tag == VOICE_SERVICE_TAG {
+        options = options.expire_after(VOICE_TRANSPORT_TTL);
+    }
+    options
 }
 
 fn select_forward_next_hop(
@@ -1020,6 +1023,21 @@ mod tests {
         assert_eq!(forwarded.payload, data.payload);
         assert_eq!(forwarded.dsts, vec![node_to_wire(5), node_to_wire(6)]);
         assert_eq!(forwarded.path_trace, vec![node_to_wire(1), node_to_wire(2)]);
+    }
+
+    #[test]
+    fn voice_overlay_data_gets_expiring_transport_options() {
+        let mut data = test_overlay_data(false);
+        assert!(
+            transport_options_for_overlay_data(&data)
+                .expires_at()
+                .is_none()
+        );
+
+        data.service_tag = VOICE_SERVICE_TAG;
+        let options = transport_options_for_overlay_data(&data);
+        assert!(options.expires_at().is_some());
+        assert!(!options.is_expired());
     }
 
     #[test]
