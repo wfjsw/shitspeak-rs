@@ -1,5 +1,4 @@
 pub mod application;
-#[cfg(debug_assertions)]
 pub mod debug_io;
 pub mod overlay;
 pub mod replications;

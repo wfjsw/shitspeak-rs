@@ -196,7 +196,7 @@ impl OverlayInner {
             cfg.route_transit_messages(),
             replication_services,
         ));
-        let flood_pacer = Arc::new(LsaFloodPacer::new(transport.clone()));
+        let flood_pacer = Arc::new(LsaFloodPacer::new(self_id, transport.clone()));
 
         let shutdown = CancellationToken::new();
         let hello = Arc::new(HelloContext {

@@ -110,11 +110,8 @@ async fn handle(
         ctx.duplicate_detector.record_drop(from, body_kind);
         return;
     }
-    #[cfg(debug_assertions)]
-    {
-        let packet_kind = crate::debug_io::classify_overlay_body(&body);
-        crate::debug_io::record_received(packet_kind, raw.len());
-    }
+    let packet_kind = crate::debug_io::classify_overlay_body(&body);
+    crate::debug_io::record_received(from, ctx.self_id, packet_kind, raw.len());
     let started = Instant::now();
     match body {
         OverlayBody::Hello(h) => respond_to_hello(&ctx.hello, from, h).await,
@@ -135,6 +132,7 @@ async fn handle(
             handle_sync_request(
                 &ctx.lsdb,
                 &ctx.transport,
+                ctx.self_id,
                 from,
                 req,
                 ctx.cfg.lsdb_sync_max_response_lsas(),

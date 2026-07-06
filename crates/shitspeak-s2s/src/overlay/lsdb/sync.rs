@@ -53,11 +53,9 @@ pub async fn send_request(
             })
             .collect(),
     });
-    #[cfg(debug_assertions)]
     let packet_kind = crate::debug_io::classify_overlay_body(&body);
     match encode_message(&wrap(body)) {
         Ok(payload) => {
-            #[cfg(debug_assertions)]
             let payload_len = payload.len();
             match transport
                 .try_send_with_options(
@@ -70,10 +68,7 @@ pub async fn send_request(
                 )
                 .await
             {
-                Ok(()) => {
-                    #[cfg(debug_assertions)]
-                    crate::debug_io::record_sent(packet_kind, payload_len);
-                }
+                Ok(()) => crate::debug_io::record_sent(self_id, dst, packet_kind, payload_len),
                 Err(e) => trace!(peer=%dst, error=%e, "lsdb sync send failed"),
             }
         }
@@ -86,6 +81,7 @@ pub async fn send_request(
 pub async fn handle_request(
     lsdb: &LinkStateDb,
     transport: &ConnectionManager,
+    self_id: NodeIdentifier,
     sender: NodeIdentifier,
     req: pb::LsdbSync,
     max_response_lsas: usize,
@@ -107,11 +103,12 @@ pub async fn handle_request(
         trace!(peer=%sender, "lsdb sync: nothing to send");
         return;
     }
-    send_response_chunks(transport, sender, &delta, max_response_lsas, true).await;
+    send_response_chunks(transport, self_id, sender, &delta, max_response_lsas, true).await;
 }
 
 async fn send_response_chunks(
     transport: &ConnectionManager,
+    self_id: NodeIdentifier,
     dst: NodeIdentifier,
     entries: &[LsaEntry],
     max_response_lsas: usize,
@@ -121,7 +118,6 @@ async fn send_response_chunks(
         let body = OverlayBody::LsdbSyncResp(pb::LsdbSyncResp {
             delta: chunk.iter().map(|e| e.to_pb()).collect(),
         });
-        #[cfg(debug_assertions)]
         let packet_kind = crate::debug_io::classify_overlay_body(&body);
         let payload = match encode_message(&wrap(body)) {
             Ok(b) => b,
@@ -130,7 +126,6 @@ async fn send_response_chunks(
                 return;
             }
         };
-        #[cfg(debug_assertions)]
         let payload_len = payload.len();
         let result = if nonblocking {
             transport
@@ -156,10 +151,7 @@ async fn send_response_chunks(
                 .await
         };
         match result {
-            Ok(()) => {
-                #[cfg(debug_assertions)]
-                crate::debug_io::record_sent(packet_kind, payload_len);
-            }
+            Ok(()) => crate::debug_io::record_sent(self_id, dst, packet_kind, payload_len),
             Err(e) => {
                 trace!(peer=%dst, error=%e, "lsdb sync resp send failed");
                 return;
@@ -178,6 +170,7 @@ async fn send_response_chunks(
 pub async fn push_snapshot(
     lsdb: &LinkStateDb,
     transport: &ConnectionManager,
+    self_id: NodeIdentifier,
     dst: NodeIdentifier,
     max_response_lsas: usize,
 ) {
@@ -185,7 +178,7 @@ pub async fn push_snapshot(
     if entries.is_empty() {
         return;
     }
-    send_response_chunks(transport, dst, &entries, max_response_lsas, true).await;
+    send_response_chunks(transport, self_id, dst, &entries, max_response_lsas, true).await;
 }
 
 /// Handle an inbound `LsdbSyncResp`. Each LSA goes through the normal
@@ -297,7 +290,7 @@ mod tests {
 
         timeout(
             Duration::from_millis(50),
-            handle_request(&lsdb, &transport, 2, req, 1),
+            handle_request(&lsdb, &transport, 1, 2, req, 1),
         )
         .await
         .expect("inbound LSDB sync handler should not wait for outbound queue space");

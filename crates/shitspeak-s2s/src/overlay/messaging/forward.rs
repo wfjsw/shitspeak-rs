@@ -542,10 +542,8 @@ async fn send_control_to(
         return Ok(());
     }
     let body = OverlayBody::Control(control);
-    #[cfg(debug_assertions)]
     let packet_kind = crate::debug_io::classify_overlay_body(&body);
     let payload = encode_message(&wrap(body))?;
-    #[cfg(debug_assertions)]
     let payload_len = payload.len();
     let result = send_encoded_to_target(
         transport,
@@ -559,9 +557,8 @@ async fn send_control_to(
         false,
     )
     .await;
-    #[cfg(debug_assertions)]
     if result.is_ok() {
-        crate::debug_io::record_sent(packet_kind, payload_len);
+        crate::debug_io::record_sent(self_id, target, packet_kind, payload_len);
     }
     result
 }
@@ -687,7 +684,6 @@ async fn forward_pb_as(
 
         let send_options = transport_options_for_overlay_data(&pb_msg, transport_ttl);
         let body = OverlayBody::Data(pb_msg);
-        #[cfg(debug_assertions)]
         let packet_kind = crate::debug_io::classify_overlay_body(&body);
         let payload = match encode_message(&wrap(body)) {
             Ok(b) => b,
@@ -699,7 +695,6 @@ async fn forward_pb_as(
                 continue;
             }
         };
-        #[cfg(debug_assertions)]
         let payload_len = payload.len();
         let transport = transport.clone();
         sends.push(async move {
@@ -713,9 +708,8 @@ async fn forward_pb_as(
                     send_options,
                 )
                 .await;
-            #[cfg(debug_assertions)]
             if result.is_ok() {
-                crate::debug_io::record_sent(packet_kind, payload_len);
+                crate::debug_io::record_sent(self_id, next_hop, packet_kind, payload_len);
             }
             (next_hop, result)
         });

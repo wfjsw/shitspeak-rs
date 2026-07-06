@@ -627,13 +627,15 @@ fn lsa_lists_direct_neighbor(lsa: &pb::LinkStateAdvert, peer: NodeIdentifier) ->
 /// Coalesces LSA floods for a short interval so a burst of accepted LSAs
 /// becomes fewer frames without changing LSDB admission semantics.
 pub struct LsaFloodPacer {
+    self_id: NodeIdentifier,
     transport: ConnectionManager,
     pending: parking_lot::Mutex<LsaFloodPending>,
 }
 
 impl LsaFloodPacer {
-    pub fn new(transport: ConnectionManager) -> Self {
+    pub fn new(self_id: NodeIdentifier, transport: ConnectionManager) -> Self {
         Self {
+            self_id,
             transport,
             pending: parking_lot::Mutex::new(LsaFloodPending::default()),
         }
@@ -693,13 +695,14 @@ impl LsaFloodPacer {
             pending.drain_batches(max_batch_lsas)
         };
         for (peer, lsas) in batches {
-            send_lsa_flood(&self.transport, peer, lsas).await;
+            send_lsa_flood(&self.transport, self.self_id, peer, lsas).await;
         }
     }
 }
 
 async fn send_lsa_flood(
     transport: &ConnectionManager,
+    self_id: NodeIdentifier,
     dst: NodeIdentifier,
     lsas: Vec<pb::LinkStateAdvert>,
 ) {
@@ -709,7 +712,6 @@ async fn send_lsa_flood(
     let body = OverlayBody::LsaFlood(pb::LsaFlood {
         advertisements: lsas,
     });
-    #[cfg(debug_assertions)]
     let packet_kind = crate::debug_io::classify_overlay_body(&body);
     let payload = match encode_message(&wrap(body)) {
         Ok(b) => b,
@@ -718,7 +720,6 @@ async fn send_lsa_flood(
             return;
         }
     };
-    #[cfg(debug_assertions)]
     let payload_len = payload.len();
     match transport
         .try_send_with_options(
@@ -731,10 +732,7 @@ async fn send_lsa_flood(
         )
         .await
     {
-        Ok(()) => {
-            #[cfg(debug_assertions)]
-            crate::debug_io::record_sent(packet_kind, payload_len);
-        }
+        Ok(()) => crate::debug_io::record_sent(self_id, dst, packet_kind, payload_len),
         Err(e) => trace!(peer=%dst, error=%e, "lsa flood send failed"),
     }
 }
@@ -743,6 +741,7 @@ async fn send_lsa_flood(
 /// This bypasses pacing and is used for shutdown tombstones.
 pub async fn flood_to_neighbors(
     transport: &ConnectionManager,
+    self_id: NodeIdentifier,
     snap: &[NeighborSnapshot],
     lsas: Vec<pb::LinkStateAdvert>,
     exclude: Option<NodeIdentifier>,
@@ -754,7 +753,7 @@ pub async fn flood_to_neighbors(
         if Some(n.node_id) == exclude {
             continue;
         }
-        send_lsa_flood(transport, n.node_id, lsas.clone()).await;
+        send_lsa_flood(transport, self_id, n.node_id, lsas.clone()).await;
     }
 }
 
@@ -916,7 +915,7 @@ async fn emit_once_with_reason(
     record_published(emitter, &snap, cfg);
     record_emitted_content(emitter, fingerprint);
     if tombstone {
-        flood_to_neighbors(transport, &snap, vec![pb_lsa], None).await;
+        flood_to_neighbors(transport, emitter.self_id, &snap, vec![pb_lsa], None).await;
     } else {
         pacer.enqueue_to_neighbors(&snap, vec![pb_lsa], None);
     }

@@ -28,7 +28,6 @@ pub(crate) struct TopologySnapshot {
     outbound_queues: Vec<OutboundQueueMetric>,
     inbound_queues: Vec<InboundQueueMetric>,
     expired_outbound_drops: Vec<ExpiredOutboundDropMetric>,
-    #[cfg(debug_assertions)]
     debug_packet_io: Vec<crate::debug_io::PacketIoSnapshot>,
 }
 
@@ -539,7 +538,6 @@ pub(crate) fn build_topology_snapshot(
         outbound_queues,
         inbound_queues,
         expired_outbound_drops,
-        #[cfg(debug_assertions)]
         debug_packet_io: crate::debug_io::snapshot(),
     }
 }
@@ -771,24 +769,21 @@ impl<'a> PrometheusWriter<'a> {
             "S2S outbound frames dropped because their send deadline expired.",
             "counter",
         );
-        #[cfg(debug_assertions)]
-        {
-            self.header(
-                "shitspeak_s2s_debug_packet_io_bytes_total",
-                "Debug S2S packet IO bytes by packet kind and direction.",
-                "counter",
-            );
-            self.header(
-                "shitspeak_s2s_debug_packet_io_packets_total",
-                "Debug S2S packet IO packets by packet kind and direction.",
-                "counter",
-            );
-            self.header(
-                "shitspeak_s2s_debug_packet_io_avg_bps",
-                "Debug S2S packet IO average bytes per second by packet kind and direction.",
-                "gauge",
-            );
-        }
+        self.header(
+            "shitspeak_s2s_debug_packet_io_bytes_total",
+            "Debug S2S packet IO bytes by packet kind and direction.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_debug_packet_io_packets_total",
+            "Debug S2S packet IO packets by packet kind and direction.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_debug_packet_io_avg_bps",
+            "Debug S2S packet IO average bytes per second by packet kind and direction.",
+            "gauge",
+        );
 
         for sample in samples_from_snapshot(snapshot) {
             self.sample(sample);
@@ -1217,9 +1212,8 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
         ));
     }
 
-    #[cfg(debug_assertions)]
     for packet in &snapshot.debug_packet_io {
-        add_debug_packet_samples(&mut out, local_node.as_str(), packet);
+        add_debug_packet_samples(&mut out, packet);
     }
 
     out
@@ -1248,14 +1242,14 @@ fn add_queue_status_samples(
     }
 }
 
-#[cfg(debug_assertions)]
 fn add_debug_packet_samples(
     out: &mut Vec<PrometheusSample>,
-    source: &str,
     packet: &crate::debug_io::PacketIoSnapshot,
 ) {
     #[derive(serde::Deserialize)]
     struct PacketView {
+        source: u16,
+        destination: u16,
         kind: String,
         sent_bytes: u64,
         recv_bytes: u64,
@@ -1269,6 +1263,8 @@ fn add_debug_packet_samples(
     else {
         return;
     };
+    let source = view.source.to_string();
+    let destination = view.destination.to_string();
     for (direction, bytes, count, avg_bps) in [
         ("sent", view.sent_bytes, view.sent_count, view.avg_sent_bps),
         ("recv", view.recv_bytes, view.recv_count, view.avg_recv_bps),
@@ -1276,7 +1272,8 @@ fn add_debug_packet_samples(
         out.push(sample(
             "shitspeak_s2s_debug_packet_io_bytes_total",
             vec![
-                ("source", source),
+                ("source", source.as_str()),
+                ("destination", destination.as_str()),
                 ("packet_kind", view.kind.as_str()),
                 ("direction", direction),
             ],
@@ -1285,7 +1282,8 @@ fn add_debug_packet_samples(
         out.push(sample(
             "shitspeak_s2s_debug_packet_io_packets_total",
             vec![
-                ("source", source),
+                ("source", source.as_str()),
+                ("destination", destination.as_str()),
                 ("packet_kind", view.kind.as_str()),
                 ("direction", direction),
             ],
@@ -1294,7 +1292,8 @@ fn add_debug_packet_samples(
         out.push(sample(
             "shitspeak_s2s_debug_packet_io_avg_bps",
             vec![
-                ("source", source),
+                ("source", source.as_str()),
+                ("destination", destination.as_str()),
                 ("packet_kind", view.kind.as_str()),
                 ("direction", direction),
             ],
@@ -1526,7 +1525,7 @@ th { color: var(--muted); font-weight: 600; background: #fafbfc; }
   </section>
   <section class="tables">
     <div class="panel"><h2>Nodes</h2><table><thead><tr><th>Node</th><th>Status</th><th>LSA</th><th>Addresses</th></tr></thead><tbody id="nodes"></tbody></table></div>
-    <div class="panel"><h2>Packet IO</h2><table><thead><tr><th>Kind</th><th>Total</th><th>Sent</th><th>Recv</th><th>Count</th><th>Avg</th></tr></thead><tbody id="packet-io"></tbody></table></div>
+    <div class="panel"><h2>Packet IO</h2><table><thead><tr><th>Path</th><th>Kind</th><th>Total</th><th>Sent</th><th>Recv</th><th>Count</th><th>Avg</th></tr></thead><tbody id="packet-io"></tbody></table></div>
     <div class="panel"><h2>S2S Queues</h2><table><thead><tr><th>Direction</th><th>Target</th><th>Depth</th><th>High</th><th>Capacity</th><th>Full</th></tr></thead><tbody id="queues"></tbody></table></div>
     <div class="panel"><h2>Direct Metrics</h2><table><thead><tr><th>Peer</th><th>Transport</th><th>RTT</th><th>Jitter</th><th>Loss</th><th>Payload Traffic</th><th>Wire Traffic</th><th>Compression</th></tr></thead><tbody id="metrics"></tbody></table></div>
   </section>
@@ -1727,8 +1726,8 @@ function renderTables(data) {
   nodesTbody.innerHTML = data.nodes.map(n => `<tr><td>${n.node_id}</td><td><span class="pill ${n.status}">${n.status}</span></td><td>seq ${n.lsa_seq ?? '-'}<br>${n.lsa_age_ms ?? '-'} ms</td><td>${n.addresses.map(a => `<span class="transport">${esc(a.transport)}</span> ${esc(a.addr)}`).join('<br>')}</td></tr>`).join('');
   const packetRows = data.debug_packet_io || [];
   packetIoTbody.innerHTML = packetRows.length
-    ? packetRows.map(p => `<tr><td>${esc(p.kind)}</td><td>${fmtBytes(p.total_bytes)}</td><td>${fmtBytes(p.sent_bytes)}<br><span class="transport">${p.sent_count}</span></td><td>${fmtBytes(p.recv_bytes)}<br><span class="transport">${p.recv_count}</span></td><td>${p.total_count}</td><td>${fmtBps(p.avg_total_bps)}</td></tr>`).join('')
-    : `<tr><td colspan="6" class="transport">-</td></tr>`;
+    ? packetRows.map(p => `<tr><td>${p.source} -> ${p.destination}</td><td>${esc(p.kind)}</td><td>${fmtBytes(p.total_bytes)}</td><td>${fmtBytes(p.sent_bytes)}<br><span class="transport">${p.sent_count}</span></td><td>${fmtBytes(p.recv_bytes)}<br><span class="transport">${p.recv_count}</span></td><td>${p.total_count}</td><td>${fmtBps(p.avg_total_bps)}</td></tr>`).join('')
+    : `<tr><td colspan="7" class="transport">-</td></tr>`;
   const queues = queueRows(data);
   queuesTbody.innerHTML = queues.length
     ? queues.map(q => `<tr><td>${esc(q.direction)}</td><td>${q.target}</td><td>${q.depth}</td><td>${q.high}</td><td>${q.capacity}</td><td>${q.full}</td></tr>`).join('')
@@ -1928,7 +1927,6 @@ mod tests {
                 class: "high_priority",
                 frames: 5,
             }],
-            #[cfg(debug_assertions)]
             debug_packet_io: Vec::new(),
         };
 
