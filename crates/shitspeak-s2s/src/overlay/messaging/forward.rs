@@ -36,18 +36,11 @@ const CONTROL_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
 const VOICE_TRANSPORT_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectFallbackReason {
-    NoRoute,
-    Loop { next_hop: NodeIdentifier },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForwardNextHop {
-    Send {
-        next_hop: NodeIdentifier,
-        fallback: Option<DirectFallbackReason>,
-    },
+    Send { next_hop: NodeIdentifier },
     DropAlreadyVisited,
+    DropNoRoute,
+    DropLoop { next_hop: NodeIdentifier },
 }
 
 fn payload_hex_preview(payload: &[u8]) -> String {
@@ -472,6 +465,7 @@ async fn send_ack(
         final_dst: node_to_wire(self_id),
         lane_id: lane.get(),
         requester: node_to_wire(self_id),
+        path_trace: vec![node_to_wire(self_id)],
         body: Some(OverlayControlBody::Ack(pb::OverlayAck { next_seq })),
     };
     let _ = send_control_to(transport, routing, self_id, origin, control).await;
@@ -495,6 +489,7 @@ async fn send_repair_request(
         final_dst: node_to_wire(self_id),
         lane_id: lane.get(),
         requester: node_to_wire(self_id),
+        path_trace: vec![node_to_wire(self_id)],
         body: Some(OverlayControlBody::RepairRequest(
             pb::OverlayRepairRequest {
                 first_seq,
@@ -524,6 +519,7 @@ async fn send_repair_response(
         final_dst: node_to_wire(final_dst),
         lane_id: lane.get(),
         requester: node_to_wire(requester),
+        path_trace: vec![node_to_wire(self_id)],
         body: Some(OverlayControlBody::RepairResponse(
             pb::OverlayRepairResponse { packets, not_found },
         )),
@@ -536,29 +532,77 @@ async fn send_control_to(
     routing: &RoutingHandle,
     self_id: NodeIdentifier,
     target: NodeIdentifier,
-    control: pb::OverlayControl,
+    mut control: pb::OverlayControl,
 ) -> Result<(), OverlayError> {
     if target == self_id {
         return Ok(());
     }
-    let body = OverlayBody::Control(control);
-    let packet_kind = crate::debug_io::classify_overlay_body(&body);
-    let payload = encode_message(&wrap(body))?;
-    let payload_len = payload.len();
-    let result = send_encoded_to_target(
-        transport,
-        routing,
+    let tables = routing.load();
+    let path_trace_set = path_trace_set(&control.path_trace);
+    let next_hop = match select_forward_next_hop(
+        &tables,
         self_id,
         target,
         CONTROL_LEVEL,
         CONTROL_METRIC,
-        MessageClass::Control,
-        payload,
+        &path_trace_set,
         false,
-    )
-    .await;
+    )? {
+        ForwardNextHop::Send { next_hop } => next_hop,
+        ForwardNextHop::DropAlreadyVisited => {
+            debug!(
+                self_id = %self_id,
+                target = %target,
+                origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
+                final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
+                requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
+                path_trace = ?control.path_trace,
+                "dropping overlay control because target is already in path_trace"
+            );
+            return Ok(());
+        }
+        ForwardNextHop::DropNoRoute => {
+            debug!(
+                self_id = %self_id,
+                target = %target,
+                origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
+                final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
+                requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
+                path_trace = ?control.path_trace,
+                "dropping overlay control because no route exists"
+            );
+            return Ok(());
+        }
+        ForwardNextHop::DropLoop { next_hop } => {
+            debug!(
+                self_id = %self_id,
+                target = %target,
+                %next_hop,
+                origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
+                final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
+                requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
+                path_trace = ?control.path_trace,
+                "dropping overlay control because no loop-free route exists"
+            );
+            return Ok(());
+        }
+    };
+    append_path_trace(&mut control.path_trace, self_id);
+    let body = OverlayBody::Control(control);
+    let packet_kind = crate::debug_io::classify_overlay_body(&body);
+    let payload = encode_message(&wrap(body))?;
+    let payload_len = payload.len();
+    let result = transport
+        .try_send(
+            next_hop,
+            CONTROL_LEVEL,
+            Some(CONTROL_METRIC),
+            MessageClass::Control,
+            payload,
+        )
+        .await;
     if result.is_ok() {
-        crate::debug_io::record_sent(self_id, target, packet_kind, payload_len);
+        crate::debug_io::record_sent(self_id, next_hop, packet_kind, payload_len);
     }
     result
 }
@@ -585,6 +629,20 @@ fn preflight_routes(
     Ok(())
 }
 
+fn path_trace_set(path_trace: &[u32]) -> HashSet<NodeIdentifier> {
+    path_trace
+        .iter()
+        .filter_map(|node| NodeIdentifier::try_from(*node).ok())
+        .collect()
+}
+
+fn append_path_trace(path_trace: &mut Vec<u32>, self_id: NodeIdentifier) {
+    let self_wire = node_to_wire(self_id);
+    if !path_trace.contains(&self_wire) {
+        path_trace.push(self_wire);
+    }
+}
+
 /// Forward an `OverlayData` whose `dsts` may contain multiple final destinations.
 async fn forward_pb_as(
     transport: &ConnectionManager,
@@ -600,11 +658,7 @@ async fn forward_pb_as(
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let tables = routing.load();
 
-    let path_trace_set: HashSet<NodeIdentifier> = data
-        .path_trace
-        .iter()
-        .filter_map(|node| NodeIdentifier::try_from(*node).ok())
-        .collect();
+    let path_trace_set = path_trace_set(&data.path_trace);
     let mut buckets: HashMap<NodeIdentifier, Vec<u32>> = HashMap::new();
     for dst_wire in &data.dsts {
         let Ok(dst) = NodeIdentifier::try_from(*dst_wire) else {
@@ -622,23 +676,42 @@ async fn forward_pb_as(
             &path_trace_set,
             is_originator,
         )? {
-            ForwardNextHop::Send { next_hop, fallback } => {
-                if let Some(reason) = fallback {
-                    debug!(
-                        self_id = %self_id,
-                        src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
-                        %dst,
-                        %next_hop,
-                        ?reason,
-                        ?level,
-                        ?routing_metric,
-                        "routing snapshot unstable; falling back to direct next hop"
-                    );
-                }
+            ForwardNextHop::Send { next_hop } => {
                 buckets.entry(next_hop).or_default().push(*dst_wire);
             }
             ForwardNextHop::DropAlreadyVisited => {
-                warn!(%dst, "destination already in path_trace; dropping");
+                debug!(
+                    self_id = %self_id,
+                    src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
+                    %dst,
+                    ?level,
+                    ?routing_metric,
+                    path_trace = ?data.path_trace,
+                    "dropping overlay data because destination is already in path_trace"
+                );
+            }
+            ForwardNextHop::DropNoRoute => {
+                debug!(
+                    self_id = %self_id,
+                    src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
+                    %dst,
+                    ?level,
+                    ?routing_metric,
+                    path_trace = ?data.path_trace,
+                    "dropping overlay data because no route exists"
+                );
+            }
+            ForwardNextHop::DropLoop { next_hop } => {
+                debug!(
+                    self_id = %self_id,
+                    src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
+                    %dst,
+                    %next_hop,
+                    ?level,
+                    ?routing_metric,
+                    path_trace = ?data.path_trace,
+                    "dropping overlay data because no loop-free route exists"
+                );
             }
         }
     }
@@ -647,10 +720,7 @@ async fn forward_pb_as(
     }
 
     let mut new_trace = data.path_trace.clone();
-    let self_wire = node_to_wire(self_id);
-    if !new_trace.contains(&self_wire) {
-        new_trace.push(self_wire);
-    }
+    append_path_trace(&mut new_trace, self_id);
     let mut sends = Vec::with_capacity(buckets.len());
     for (next_hop, bucket_dsts) in buckets {
         let pb_msg = reconstruct_forwarded_data(&data, bucket_dsts, new_trace.clone());
@@ -786,11 +856,15 @@ fn select_forward_next_hop(
     path_trace_set: &HashSet<NodeIdentifier>,
     is_originator: bool,
 ) -> Result<ForwardNextHop, OverlayError> {
+    if path_trace_set.contains(&dst) {
+        return Ok(ForwardNextHop::DropAlreadyVisited);
+    }
+
     let Some(entry) = tables.lookup_with_metric(dst, level, routing_metric) else {
         if is_originator {
             return Err(OverlayError::NoRoute { dst, level });
         }
-        return direct_fallback(dst, path_trace_set, DirectFallbackReason::NoRoute);
+        return Ok(ForwardNextHop::DropNoRoute);
     };
 
     if path_trace_set.contains(&entry.next_hop) {
@@ -803,71 +877,16 @@ fn select_forward_next_hop(
         ) {
             return Ok(ForwardNextHop::Send {
                 next_hop: alternate.next_hop,
-                fallback: None,
             });
         }
-        return direct_fallback(
-            dst,
-            path_trace_set,
-            DirectFallbackReason::Loop {
-                next_hop: entry.next_hop,
-            },
-        );
-    }
-
-    if path_trace_set.contains(&dst) {
-        return Ok(ForwardNextHop::DropAlreadyVisited);
+        return Ok(ForwardNextHop::DropLoop {
+            next_hop: entry.next_hop,
+        });
     }
 
     Ok(ForwardNextHop::Send {
         next_hop: entry.next_hop,
-        fallback: None,
     })
-}
-
-fn direct_fallback(
-    dst: NodeIdentifier,
-    path_trace_set: &HashSet<NodeIdentifier>,
-    reason: DirectFallbackReason,
-) -> Result<ForwardNextHop, OverlayError> {
-    if path_trace_set.contains(&dst) {
-        return Ok(ForwardNextHop::DropAlreadyVisited);
-    }
-    Ok(ForwardNextHop::Send {
-        next_hop: dst,
-        fallback: Some(reason),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn send_encoded_to_target(
-    transport: &ConnectionManager,
-    routing: &RoutingHandle,
-    _self_id: NodeIdentifier,
-    target: NodeIdentifier,
-    level: ServiceLevel,
-    routing_metric: RoutingMetric,
-    class: MessageClass,
-    payload: Bytes,
-    is_originator: bool,
-) -> Result<(), OverlayError> {
-    let tables = routing.load();
-    let Some(entry) = tables.lookup_with_metric(target, level, routing_metric) else {
-        if is_originator {
-            return Err(OverlayError::NoRoute { dst: target, level });
-        }
-        return Ok(());
-    };
-    if is_originator {
-        transport
-            .try_send(entry.next_hop, level, Some(routing_metric), class, payload)
-            .await?;
-    } else {
-        transport
-            .try_send(entry.next_hop, level, Some(routing_metric), class, payload)
-            .await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -941,10 +960,31 @@ mod tests {
         routing
     }
 
+    fn control_routing_with_route(dst: NodeIdentifier, next_hop: NodeIdentifier) -> RoutingHandle {
+        let routing = new_handle();
+        let mut tables = RoutingTables::empty();
+        let table = HashMap::from([(dst, RouteEntry { next_hop, cost: 1 })]);
+        tables.insert_table(CONTROL_METRIC, CONTROL_LEVEL, table);
+        routing.store(Arc::new(tables));
+        routing
+    }
+
     fn overlay_data_for_dsts(dsts: &[NodeIdentifier]) -> pb::OverlayData {
         let mut data = test_overlay_data(false);
         data.dsts = dsts.iter().map(|dst| node_to_wire(*dst)).collect();
         data
+    }
+
+    fn test_control(path_trace: Vec<u32>) -> pb::OverlayControl {
+        pb::OverlayControl {
+            origin: node_to_wire(1),
+            origin_boot_epoch: 11,
+            final_dst: node_to_wire(4),
+            lane_id: 7,
+            requester: node_to_wire(2),
+            path_trace,
+            body: Some(OverlayControlBody::Ack(pb::OverlayAck { next_seq: 5 })),
+        }
     }
 
     struct CaptureService {
@@ -1054,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn transit_no_route_uses_direct_fallback() {
+    fn transit_no_route_drops_instead_of_direct_fallback() {
         let tables = RoutingTables::empty();
         let path_trace = HashSet::from([1]);
 
@@ -1069,13 +1109,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            selected,
-            ForwardNextHop::Send {
-                next_hop: 4,
-                fallback: Some(DirectFallbackReason::NoRoute),
-            }
-        );
+        assert_eq!(selected, ForwardNextHop::DropNoRoute);
     }
 
     #[test]
@@ -1098,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn transit_loop_uses_direct_fallback() {
+    fn transit_loop_drops_when_no_path_aware_alternate_exists() {
         let mut tables = RoutingTables::empty();
         tables.insert_table(
             RoutingMetric::ReliableCost,
@@ -1124,13 +1158,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            selected,
-            ForwardNextHop::Send {
-                next_hop: 4,
-                fallback: Some(DirectFallbackReason::Loop { next_hop: 1 }),
-            }
-        );
+        assert_eq!(selected, ForwardNextHop::DropLoop { next_hop: 1 });
     }
 
     #[test]
@@ -1168,10 +1196,7 @@ mod tests {
 
         assert_eq!(
             selected,
-            ForwardNextHop::Send {
-                next_hop: 3,
-                fallback: None,
-            }
+            ForwardNextHop::Send { next_hop: 3 }
         );
     }
 
@@ -1192,6 +1217,130 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected, ForwardNextHop::DropAlreadyVisited);
+    }
+
+    #[tokio::test]
+    async fn overlay_control_appends_self_to_path_trace() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
+        let mut to_four = receivers.pop().unwrap();
+        let routing = control_routing_with_route(4, 4);
+
+        send_control_to(
+            &transport,
+            &routing,
+            2,
+            4,
+            test_control(vec![node_to_wire(1)]),
+        )
+        .await
+        .expect("control should send");
+
+        let forwarded = timeout(Duration::from_millis(50), to_four.recv())
+            .await
+            .expect("destination 4 should receive control")
+            .expect("receiver should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay control");
+        let Some(OverlayBody::Control(control)) = decoded.body else {
+            panic!("not overlay control");
+        };
+        assert_eq!(control.path_trace, vec![node_to_wire(1), node_to_wire(2)]);
+    }
+
+    #[tokio::test]
+    async fn overlay_control_drops_when_target_already_visited() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
+        let mut to_four = receivers.pop().unwrap();
+        let routing = control_routing_with_route(4, 4);
+
+        send_control_to(
+            &transport,
+            &routing,
+            2,
+            4,
+            test_control(vec![node_to_wire(1), node_to_wire(4)]),
+        )
+        .await
+        .expect("drop is not an error");
+
+        assert!(
+            timeout(Duration::from_millis(20), to_four.recv())
+                .await
+                .is_err(),
+            "visited control target should not receive a frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_control_uses_path_aware_alternate_when_next_hop_was_visited() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(13, 3, &[TransportKind::Tcp]);
+        let mut to_three = receivers.pop().unwrap();
+        let routing = new_handle();
+        let mut tables = RoutingTables::empty();
+        tables.insert_table_with_adjacency(
+            CONTROL_METRIC,
+            CONTROL_LEVEL,
+            HashMap::from([(
+                4,
+                RouteEntry {
+                    next_hop: 1,
+                    cost: 2,
+                },
+            )]),
+            HashMap::from([
+                (13, vec![(1, edge(1)), (3, edge(5))]),
+                (1, vec![(4, edge(1))]),
+                (3, vec![(4, edge(5))]),
+            ]),
+        );
+        routing.store(Arc::new(tables));
+
+        send_control_to(
+            &transport,
+            &routing,
+            13,
+            4,
+            test_control(vec![node_to_wire(1)]),
+        )
+        .await
+        .expect("control should use alternate next hop");
+
+        let forwarded = timeout(Duration::from_millis(50), to_three.recv())
+            .await
+            .expect("alternate next hop should receive control")
+            .expect("receiver should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay control");
+        let Some(OverlayBody::Control(control)) = decoded.body else {
+            panic!("not overlay control");
+        };
+        assert_eq!(control.path_trace, vec![node_to_wire(1), node_to_wire(13)]);
+    }
+
+    #[tokio::test]
+    async fn overlay_control_drops_when_no_loop_free_route_exists() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(13, 1, &[TransportKind::Tcp]);
+        let mut to_one = receivers.pop().unwrap();
+        let routing = control_routing_with_route(4, 1);
+
+        send_control_to(
+            &transport,
+            &routing,
+            13,
+            4,
+            test_control(vec![node_to_wire(1)]),
+        )
+        .await
+        .expect("drop is not an error");
+
+        assert!(
+            timeout(Duration::from_millis(20), to_one.recv())
+                .await
+                .is_err(),
+            "looped control next hop should not receive a frame"
+        );
     }
 
     #[tokio::test]

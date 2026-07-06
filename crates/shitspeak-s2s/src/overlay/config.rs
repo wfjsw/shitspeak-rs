@@ -108,6 +108,8 @@ pub struct OverlayConfig {
     ordered_ack_timeout: Duration,
     ordered_retry_initial: Duration,
     ordered_retry_max: Duration,
+    ordered_retry_max_age: Duration,
+    ordered_retry_max_attempts: u32,
 }
 
 impl OverlayConfig {
@@ -154,6 +156,8 @@ impl OverlayConfig {
             ordered_ack_timeout: Duration::from_millis(250),
             ordered_retry_initial: Duration::from_millis(250),
             ordered_retry_max: Duration::from_secs(2),
+            ordered_retry_max_age: Duration::from_secs(30),
+            ordered_retry_max_attempts: 16,
         }
     }
 
@@ -269,6 +273,12 @@ impl OverlayConfig {
 
     pub fn ordered_retry_max(&self) -> Duration {
         self.ordered_retry_max
+    }
+    pub fn ordered_retry_max_age(&self) -> Duration {
+        self.ordered_retry_max_age
+    }
+    pub fn ordered_retry_max_attempts(&self) -> u32 {
+        self.ordered_retry_max_attempts
     }
 
     // ── Builder setters ──
@@ -406,6 +416,14 @@ impl OverlayConfig {
         self.ordered_retry_max = d;
         self
     }
+    pub fn with_ordered_retry_max_age(mut self, d: Duration) -> Self {
+        self.ordered_retry_max_age = d;
+        self
+    }
+    pub fn with_ordered_retry_max_attempts(mut self, n: u32) -> Self {
+        self.ordered_retry_max_attempts = n;
+        self
+    }
 }
 
 /// Bootstrap peer entry from operator config. The node id is required so the
@@ -490,6 +508,10 @@ pub struct OverlayTuning {
     pub ordered_retry_initial_ms: u64,
     #[serde(default = "default_ordered_retry_max_ms")]
     pub ordered_retry_max_ms: u64,
+    #[serde(default = "default_ordered_retry_max_age_ms")]
+    pub ordered_retry_max_age_ms: u64,
+    #[serde(default = "default_ordered_retry_max_attempts")]
+    pub ordered_retry_max_attempts: u32,
 }
 
 impl Default for OverlayTuning {
@@ -514,6 +536,8 @@ impl Default for OverlayTuning {
             ordered_ack_timeout_ms: default_ordered_ack_timeout_ms(),
             ordered_retry_initial_ms: default_ordered_retry_initial_ms(),
             ordered_retry_max_ms: default_ordered_retry_max_ms(),
+            ordered_retry_max_age_ms: default_ordered_retry_max_age_ms(),
+            ordered_retry_max_attempts: default_ordered_retry_max_attempts(),
         }
     }
 }
@@ -548,6 +572,8 @@ impl OverlayTuning {
             .with_ordered_ack_timeout(Duration::from_millis(self.ordered_ack_timeout_ms))
             .with_ordered_retry_initial(Duration::from_millis(self.ordered_retry_initial_ms))
             .with_ordered_retry_max(Duration::from_millis(self.ordered_retry_max_ms))
+            .with_ordered_retry_max_age(Duration::from_millis(self.ordered_retry_max_age_ms))
+            .with_ordered_retry_max_attempts(self.ordered_retry_max_attempts)
     }
 }
 
@@ -618,4 +644,10 @@ fn default_ordered_retry_initial_ms() -> u64 {
 }
 fn default_ordered_retry_max_ms() -> u64 {
     2_000
+}
+fn default_ordered_retry_max_age_ms() -> u64 {
+    30_000
+}
+fn default_ordered_retry_max_attempts() -> u32 {
+    16
 }

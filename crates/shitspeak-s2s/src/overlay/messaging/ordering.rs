@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, MutexGuard};
+use tracing::warn;
 
 use crate::overlay::LaneId;
 use crate::overlay::config::OverlayConfig;
@@ -68,8 +69,10 @@ struct UnorderedForwardKey {
 #[derive(Debug, Clone)]
 struct PendingPacket {
     data: pb::OverlayData,
+    first_sent_at: Instant,
     next_retry_at: Instant,
     retry_delay: Duration,
+    retry_attempts: u32,
 }
 
 #[derive(Debug, Default)]
@@ -204,6 +207,8 @@ pub(crate) struct OverlayOrdering {
     reorder_buffer_packets: usize,
     retry_initial: Duration,
     retry_max: Duration,
+    retry_max_age: Duration,
+    retry_max_attempts: u32,
 }
 
 impl OverlayOrdering {
@@ -225,6 +230,8 @@ impl OverlayOrdering {
             reorder_buffer_packets: cfg.ordered_reorder_buffer_packets(),
             retry_initial: cfg.ordered_retry_initial(),
             retry_max: cfg.ordered_retry_max(),
+            retry_max_age: cfg.ordered_retry_max_age(),
+            retry_max_attempts: cfg.ordered_retry_max_attempts(),
         }
     }
 
@@ -309,8 +316,10 @@ impl OverlayOrdering {
             data.ordering_seq,
             PendingPacket {
                 data,
+                first_sent_at: Instant::now(),
                 next_retry_at: Instant::now() + self.retry_initial,
                 retry_delay: self.retry_initial,
+                retry_attempts: 0,
             },
         );
     }
@@ -364,14 +373,45 @@ impl OverlayOrdering {
     pub(crate) async fn due_retransmits(&self, now: Instant) -> Vec<pb::OverlayData> {
         let mut pending = self.pending.lock().await;
         let mut due = Vec::new();
-        for packets in pending.values_mut() {
-            for packet in packets.values_mut() {
+        let mut empty_keys = Vec::new();
+        for (key, packets) in pending.iter_mut() {
+            let mut expired = Vec::new();
+            for (seq, packet) in packets.iter_mut() {
+                let age = now.saturating_duration_since(packet.first_sent_at);
+                let expired_by_age = age >= self.retry_max_age;
+                let expired_by_attempts = packet.retry_attempts >= self.retry_max_attempts;
+                if expired_by_age || expired_by_attempts {
+                    warn!(
+                        dst = %key.dst,
+                        lane = key.lane.get(),
+                        seq,
+                        age_ms = age.as_millis(),
+                        attempts = packet.retry_attempts,
+                        max_age_ms = self.retry_max_age.as_millis(),
+                        max_attempts = self.retry_max_attempts,
+                        expired_by_age,
+                        expired_by_attempts,
+                        "ordered overlay pending packet retry limit reached; dropping"
+                    );
+                    expired.push(*seq);
+                    continue;
+                }
                 if now >= packet.next_retry_at {
                     due.push(packet.data.clone());
+                    packet.retry_attempts = packet.retry_attempts.saturating_add(1);
                     packet.retry_delay = packet.retry_delay.saturating_mul(2).min(self.retry_max);
                     packet.next_retry_at = now + packet.retry_delay;
                 }
             }
+            for seq in expired {
+                packets.remove(&seq);
+            }
+            if packets.is_empty() {
+                empty_keys.push(*key);
+            }
+        }
+        for key in empty_keys {
+            pending.remove(&key);
         }
         due
     }
@@ -673,6 +713,8 @@ mod tests {
 
         assert_eq!(cfg.ordered_lane_cap().get(), 64);
         assert_eq!(cfg.ordered_repair_cache_packets(), 1024);
+        assert_eq!(cfg.ordered_retry_max_age(), Duration::from_secs(30));
+        assert_eq!(cfg.ordered_retry_max_attempts(), 16);
     }
 
     #[tokio::test]
@@ -766,6 +808,81 @@ mod tests {
             Err((1, lane()))
         );
         assert_eq!(ordering.can_store_pending(&[2], lane()).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn ordered_pending_retries_until_attempt_cap_then_drops() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_retry_initial(Duration::from_millis(1))
+            .with_ordered_retry_max(Duration::from_millis(1))
+            .with_ordered_retry_max_age(Duration::from_secs(30))
+            .with_ordered_retry_max_attempts(2);
+        let ordering = OverlayOrdering::new(&cfg);
+        ordering.store_pending(lane(), data(0, b"pending")).await;
+
+        let first_due = Instant::now() + Duration::from_millis(5);
+        assert_eq!(ordering.due_retransmits(first_due).await.len(), 1);
+        assert_eq!(
+            ordering
+                .due_retransmits(first_due + Duration::from_millis(1))
+                .await
+                .len(),
+            1
+        );
+        assert!(
+            ordering
+                .due_retransmits(first_due + Duration::from_millis(2))
+                .await
+                .is_empty()
+        );
+        assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordered_pending_drops_when_retry_age_expires() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_retry_initial(Duration::from_millis(1))
+            .with_ordered_retry_max_age(Duration::from_millis(1))
+            .with_ordered_retry_max_attempts(16);
+        let ordering = OverlayOrdering::new(&cfg);
+        ordering.store_pending(lane(), data(0, b"pending")).await;
+
+        assert!(
+            ordering
+                .due_retransmits(Instant::now() + Duration::from_millis(5))
+                .await
+                .is_empty()
+        );
+        assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ack_removes_pending_before_retry_caps() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_retry_max_age(Duration::from_millis(1))
+            .with_ordered_retry_max_attempts(0);
+        let ordering = OverlayOrdering::new(&cfg);
+        ordering.store_pending(lane(), data(0, b"pending")).await;
+
+        ordering.apply_ack(1, lane(), 1).await;
+
+        assert!(
+            ordering
+                .due_retransmits(Instant::now() + Duration::from_secs(1))
+                .await
+                .is_empty()
+        );
+        assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_peer_clears_pending_packets() {
+        let ordering = OverlayOrdering::default();
+        ordering.store_pending(lane(), data(0, b"pending")).await;
+
+        ordering.reset_peer(1).await;
+
+        assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
     }
 
     #[tokio::test]
