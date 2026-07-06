@@ -58,7 +58,9 @@ const TAG_LEN: usize = 16;
 const X25519_PUBLIC_KEY_LEN: usize = 32;
 const MAX_HANDSHAKE_DATAGRAM: usize = 16 * 1024;
 const UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD: usize = 3;
-const UDP_KEX_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(250);
+const UDP_KEX_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(750);
+const UDP_KEX_RETRANSMIT_MAX_INTERVAL: Duration = Duration::from_secs(8);
+const UDP_KEX_RETRANSMIT_JITTER_DIVISOR: u32 = 4;
 const UDP_KEX_MAX_RETRANSMIT_AGE: Duration = Duration::from_secs(30);
 const UDP_KEX_MAX_RETRANSMITS: u32 = 16;
 const KEX_TRANSCRIPT_DOMAIN: &[u8] = b"shitspeak-s2s-udp-kex-v1";
@@ -881,6 +883,28 @@ async fn collect_exchange_retransmits(
         }
     }
 
+    let exhausted: Vec<_> = exchanges
+        .iter()
+        .filter_map(|(&peer_node, exchange)| {
+            exchange_retransmit_exhausted(exchange, now).then_some(peer_node)
+        })
+        .collect();
+    for peer_node in exhausted {
+        if let Some(mut exchange) = exchanges.remove(&peer_node) {
+            for waiter in std::mem::take(&mut exchange.waiters) {
+                let _ = waiter.send(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "udp key exchange retransmit budget exhausted",
+                )));
+            }
+            debug!(
+                local = %local_node,
+                peer = %peer_node,
+                "removed exhausted udp key exchange"
+            );
+        }
+    }
+
     (batches, keep_armed)
 }
 
@@ -912,6 +936,25 @@ fn exchange_retransmit_active(exchange: &PeerKeyExchange, now: Instant) -> bool 
     let ready_active =
         exchange.candidate.is_some() && exchange.send_budget.ready.should_tick_again(now);
     offer_active || ready_active
+}
+
+fn exchange_retransmit_exhausted(exchange: &PeerKeyExchange, now: Instant) -> bool {
+    if exchange
+        .candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.promoted)
+    {
+        return false;
+    }
+
+    let has_offer = exchange.local.is_some();
+    let has_ready = exchange.candidate.is_some();
+    if !has_offer && !has_ready {
+        return false;
+    }
+
+    (!has_offer || exchange.send_budget.offer.is_exhausted(now))
+        && (!has_ready || exchange.send_budget.ready.is_exhausted(now))
 }
 
 async fn handle_udp_datagram(
@@ -1575,6 +1618,15 @@ impl HandshakePacketBudget {
             || !self.exhausted_logged
     }
 
+    fn is_exhausted(&self, now: Instant) -> bool {
+        let Some(first_sent) = self.first_sent else {
+            return false;
+        };
+        self.exhausted_logged
+            && (now.saturating_duration_since(first_sent) >= UDP_KEX_MAX_RETRANSMIT_AGE
+                || self.retransmits >= UDP_KEX_MAX_RETRANSMITS)
+    }
+
     fn should_send(
         &mut self,
         now: Instant,
@@ -1594,7 +1646,7 @@ impl HandshakePacketBudget {
         if age >= UDP_KEX_MAX_RETRANSMIT_AGE || self.retransmits >= UDP_KEX_MAX_RETRANSMITS {
             if !self.exhausted_logged {
                 self.exhausted_logged = true;
-                warn!(
+                debug!(
                     local = %local_node,
                     peer = %peer_node,
                     kind = ?kind,
@@ -1608,7 +1660,8 @@ impl HandshakePacketBudget {
         }
 
         let last_sent = self.last_sent.unwrap_or(first_sent);
-        if now.saturating_duration_since(last_sent) < UDP_KEX_RETRANSMIT_INTERVAL {
+        let delay = kex_retransmit_delay(kind, local_node, peer_node, seq, self.retransmits);
+        if now.saturating_duration_since(last_sent) < delay {
             return false;
         }
 
@@ -1616,6 +1669,71 @@ impl HandshakePacketBudget {
         self.retransmits += 1;
         true
     }
+}
+
+fn kex_retransmit_delay(
+    kind: UdpPacketKind,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+    seq: u64,
+    retransmits: u32,
+) -> Duration {
+    let shift = retransmits.min(30);
+    let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+    let base = UDP_KEX_RETRANSMIT_INTERVAL
+        .saturating_mul(factor)
+        .min(UDP_KEX_RETRANSMIT_MAX_INTERVAL);
+    let jitter_window = duration_div(base, UDP_KEX_RETRANSMIT_JITTER_DIVISOR);
+    if jitter_window.is_zero() || base >= UDP_KEX_RETRANSMIT_MAX_INTERVAL {
+        return base;
+    }
+
+    base.saturating_add(kex_retransmit_jitter(
+        jitter_window,
+        kind,
+        local_node,
+        peer_node,
+        seq,
+        retransmits,
+    ))
+    .min(UDP_KEX_RETRANSMIT_MAX_INTERVAL)
+}
+
+fn kex_retransmit_jitter(
+    window: Duration,
+    kind: UdpPacketKind,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+    seq: u64,
+    retransmits: u32,
+) -> Duration {
+    let window_nanos = window.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if window_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let mut value = seq
+        ^ (u64::from(local_node) << 48)
+        ^ (u64::from(peer_node) << 32)
+        ^ (u64::from(retransmits) << 16)
+        ^ match kind {
+            UdpPacketKind::Data => 0x9e37,
+            UdpPacketKind::KeyOffer => 0xbf58,
+            UdpPacketKind::KeyReady => 0x94d0,
+        };
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    Duration::from_nanos(value % window_nanos)
+}
+
+fn duration_div(duration: Duration, divisor: u32) -> Duration {
+    if divisor == 0 {
+        return duration;
+    }
+    let nanos = duration.as_nanos() / u128::from(divisor);
+    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
 }
 
 fn promote_if_ready(
@@ -2743,11 +2861,12 @@ mod tests {
         );
         assert!(exchange_packets_due(&mut exchange, now, 1, 2).is_empty());
         assert_eq!(
-            exchange_packets_due(&mut exchange, now + UDP_KEX_RETRANSMIT_INTERVAL, 1, 2),
+            exchange_packets_due(&mut exchange, now + UDP_KEX_RETRANSMIT_MAX_INTERVAL, 1, 2),
             vec![vec![0xaa], vec![0xbb]]
         );
         assert!(
-            exchange_packets_due(&mut exchange, now + UDP_KEX_RETRANSMIT_INTERVAL, 1, 2).is_empty()
+            exchange_packets_due(&mut exchange, now + UDP_KEX_RETRANSMIT_MAX_INTERVAL, 1, 2)
+                .is_empty()
         );
     }
 
@@ -2760,26 +2879,34 @@ mod tests {
             exchange_packets_due(&mut exchange, now, 1, 2),
             vec![vec![0xaa], vec![0xbb]]
         );
-        for attempt in 1..=UDP_KEX_MAX_RETRANSMITS {
-            assert_eq!(
-                exchange_packets_due(
-                    &mut exchange,
-                    now + UDP_KEX_RETRANSMIT_INTERVAL * attempt,
-                    1,
-                    2
-                ),
-                vec![vec![0xaa], vec![0xbb]]
-            );
-        }
+        exchange.send_budget.offer.retransmits = UDP_KEX_MAX_RETRANSMITS;
+        exchange.send_budget.offer.last_sent = Some(now - UDP_KEX_RETRANSMIT_MAX_INTERVAL);
+        exchange.send_budget.ready.retransmits = UDP_KEX_MAX_RETRANSMITS;
+        exchange.send_budget.ready.last_sent = Some(now - UDP_KEX_RETRANSMIT_MAX_INTERVAL);
+
         assert!(
-            exchange_packets_due(
-                &mut exchange,
-                now + UDP_KEX_RETRANSMIT_INTERVAL * (UDP_KEX_MAX_RETRANSMITS + 1),
-                1,
-                2
-            )
-            .is_empty()
+            exchange_packets_due(&mut exchange, now + UDP_KEX_RETRANSMIT_MAX_INTERVAL, 1, 2)
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn key_exchange_retransmit_delay_backs_off_and_caps() {
+        let first = kex_retransmit_delay(UdpPacketKind::KeyOffer, 1, 2, 11, 0);
+        let second = kex_retransmit_delay(UdpPacketKind::KeyOffer, 1, 2, 11, 1);
+        let capped = kex_retransmit_delay(UdpPacketKind::KeyOffer, 1, 2, 11, 10);
+
+        assert!(first >= UDP_KEX_RETRANSMIT_INTERVAL);
+        assert!(
+            first
+                <= UDP_KEX_RETRANSMIT_INTERVAL
+                    + duration_div(
+                        UDP_KEX_RETRANSMIT_INTERVAL,
+                        UDP_KEX_RETRANSMIT_JITTER_DIVISOR
+                    )
+        );
+        assert!(second > first);
+        assert_eq!(capped, UDP_KEX_RETRANSMIT_MAX_INTERVAL);
     }
 
     #[test]
@@ -2817,7 +2944,7 @@ mod tests {
         {
             let mut exchanges = state.exchanges.lock().await;
             let exchange = exchanges.get_mut(&2).unwrap();
-            let due = Instant::now() - UDP_KEX_RETRANSMIT_INTERVAL;
+            let due = Instant::now() - UDP_KEX_RETRANSMIT_MAX_INTERVAL;
             exchange.send_budget.offer.last_sent = Some(due);
             exchange.send_budget.ready.last_sent = Some(due);
         }
