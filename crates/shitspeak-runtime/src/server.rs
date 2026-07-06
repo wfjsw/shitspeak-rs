@@ -793,7 +793,6 @@ impl Server {
                             ping.timestamp,
                             ping.format
                         );
-                        tracing::debug!("UDP ping from {}: timestamp={}", src_addr, ping.timestamp);
                         let cleartext = match ping.encode_authenticated_echo() {
                             Ok(reply) => reply,
                             Err(e) => {
