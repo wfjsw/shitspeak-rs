@@ -242,6 +242,7 @@ pub async fn handle_acl(
             return Err(super::channel_op_propose_failed(
                 u32::from(sender.get_session_id()),
                 Some(channel_id),
+                proposed_s2s.failure_reason(),
             ));
         }
 

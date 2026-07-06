@@ -52,15 +52,22 @@ use crate::{
     server::Server,
 };
 
-fn channel_op_propose_failed(session: u32, channel_id: Option<u32>) -> MessageHandlerError {
+fn channel_op_propose_failed(
+    session: u32,
+    channel_id: Option<u32>,
+    reason: Option<&str>,
+) -> MessageHandlerError {
+    let reason = reason
+        .map(|reason| format!("S2S channel operation failed: {reason}"))
+        .unwrap_or_else(|| {
+            "Channel operation failed because the S2S commit could not complete; please try again"
+                .to_owned()
+        });
     MessageHandlerError::PermissionDenied(crate::messages::encoder::PermissionDenied {
         r#type: crate::messages::encoder::DenyType::Permission,
         session,
         channel_id,
-        reason: Some(
-            "Channel operation failed because the S2S commit could not complete; please try again"
-                .into(),
-        ),
+        reason: Some(reason.into()),
         name: None,
         permission: None,
     })

@@ -10,6 +10,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
+use crate::application::proto::VOICE_SERVICE_TAG;
 use crate::overlay::LaneId;
 use crate::overlay::config::OverlayConfig;
 use shitspeak_core::NodeIdentifier;
@@ -99,7 +100,7 @@ pub(crate) async fn originate(
             ordering_dst: 0,
             lane_id: None,
             origin_boot_epoch: boot_epoch,
-            origin_message_id: 0,
+            origin_message_id: ordering.next_origin_message_id(),
             allow_l1_compression: options.l1_compression_allowed(),
         };
         return forward_pb_as(
@@ -175,13 +176,14 @@ pub(crate) async fn handle_inbound(
     let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
     let src = NodeIdentifier::try_from(data.src).unwrap_or(0);
+    let lane = data.lane_id.and_then(|id| LaneId::try_from(id).ok());
     let is_for_self = data
         .dsts
         .iter()
         .any(|d| NodeIdentifier::try_from(*d).ok() == Some(self_id));
 
     if is_for_self {
-        if let Some(lane) = data.lane_id.and_then(|id| LaneId::try_from(id).ok()) {
+        if let Some(lane) = lane {
             if NodeIdentifier::try_from(data.ordering_dst).ok() == Some(self_id) {
                 if let Some(outcome) = ordering.accept_inbound(self_id, &data, level, class).await {
                     send_ack(
@@ -209,7 +211,15 @@ pub(crate) async fn handle_inbound(
                     }
                 }
             }
-        } else {
+        } else if ordering
+            .should_deliver_unordered(
+                src,
+                data.origin_boot_epoch,
+                data.origin_message_id,
+                data.service_tag,
+            )
+            .await
+        {
             delivery::deliver(
                 services,
                 data.service_tag,
@@ -219,15 +229,26 @@ pub(crate) async fn handle_inbound(
                 data.payload.clone(),
             );
         }
-    } else if data.process_on_transit {
-        let should_deliver = ordering
-            .should_deliver_transit(
-                src,
-                data.origin_boot_epoch,
-                data.origin_message_id,
-                data.service_tag,
-            )
-            .await;
+    } else if data.process_on_transit && transit_local_processing_allowed(data.service_tag) {
+        let should_deliver = if lane.is_some() {
+            ordering
+                .should_deliver_transit(
+                    src,
+                    data.origin_boot_epoch,
+                    data.origin_message_id,
+                    data.service_tag,
+                )
+                .await
+        } else {
+            ordering
+                .should_deliver_unordered(
+                    src,
+                    data.origin_boot_epoch,
+                    data.origin_message_id,
+                    data.service_tag,
+                )
+                .await
+        };
         if should_deliver {
             delivery::deliver(
                 services,
@@ -256,12 +277,32 @@ pub(crate) async fn handle_inbound(
         );
         return;
     }
+    let remaining = if lane.is_none() {
+        ordering
+            .filter_unforwarded_unordered(
+                src,
+                data.origin_boot_epoch,
+                data.origin_message_id,
+                data.service_tag,
+                remaining,
+            )
+            .await
+    } else {
+        remaining
+    };
+    if remaining.is_empty() {
+        return;
+    }
     let mut data2 = data;
     data2.dsts = remaining;
     let _ = forward_pb_as(
         transport, routing, self_id, data2, class, /*is_originator=*/ false,
     )
     .await;
+}
+
+fn transit_local_processing_allowed(service_tag: u32) -> bool {
+    service_tag != VOICE_SERVICE_TAG
 }
 
 pub(crate) async fn handle_control(
@@ -817,8 +858,10 @@ async fn send_encoded_to_target(
 mod tests {
     use super::super::super::proto::decode_message;
     use super::super::super::routing::{RouteEntry, dijkstra::EdgeCost, new_handle};
+    use super::super::{OverlayInboundMessage, ServiceInbound};
     use super::*;
     use shitspeak_s2s_transport::{SendError, TransportKind};
+    use tokio::sync::mpsc;
     use tokio::time::timeout;
 
     fn edge(cost: u64) -> EdgeCost {
@@ -886,6 +929,35 @@ mod tests {
         let mut data = test_overlay_data(false);
         data.dsts = dsts.iter().map(|dst| node_to_wire(*dst)).collect();
         data
+    }
+
+    struct CaptureService {
+        tx: mpsc::UnboundedSender<OverlayInboundMessage>,
+    }
+
+    impl ServiceInbound for CaptureService {
+        fn handle(&self, msg: OverlayInboundMessage) {
+            let _ = self.tx.send(msg);
+        }
+    }
+
+    fn capture_services_for(
+        tag: u32,
+    ) -> (
+        ServiceRegistry,
+        mpsc::UnboundedReceiver<OverlayInboundMessage>,
+    ) {
+        let services = ServiceRegistry::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        services.register(tag, Arc::new(CaptureService { tx }));
+        (services, rx)
+    }
+
+    fn capture_services() -> (
+        ServiceRegistry,
+        mpsc::UnboundedReceiver<OverlayInboundMessage>,
+    ) {
+        capture_services_for(7)
     }
 
     async fn fill_outbound_queue(transport: &ConnectionManager, peer: NodeIdentifier) {
@@ -1187,5 +1259,218 @@ mod tests {
             panic!("not overlay data");
         };
         assert_eq!(data.dsts, vec![node_to_wire(5)]);
+    }
+
+    #[tokio::test]
+    async fn originated_unordered_overlay_data_has_message_identity() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        let mut to_four = receivers.pop().unwrap();
+        let routing = routing_with_route(4, 4);
+        let ordering = OverlayOrdering::default();
+
+        originate(
+            &transport,
+            &routing,
+            1,
+            1234,
+            &ordering,
+            vec![4],
+            7,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::Regular,
+            Bytes::from_static(b"payload"),
+            None,
+            false,
+            OverlaySendOptions::default(),
+        )
+        .await
+        .expect("originated unordered overlay send");
+
+        let forwarded = timeout(Duration::from_millis(50), to_four.recv())
+            .await
+            .expect("destination 4 should receive originated packet")
+            .expect("receiver 4 should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert!(!data.ordered_delivery);
+        assert_eq!(data.origin_boot_epoch, 1234);
+        assert_ne!(data.origin_message_id, 0);
+    }
+
+    #[tokio::test]
+    async fn unordered_final_and_transit_duplicate_delivers_and_forwards_once() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
+        let mut forwarded_to_four = receivers.pop().unwrap();
+        let routing = routing_with_route(4, 4);
+        let (services, mut delivered) = capture_services();
+        let ordering = OverlayOrdering::default();
+
+        let mut data = overlay_data_for_dsts(&[2, 4]);
+        data.process_on_transit = true;
+        data.origin_boot_epoch = 77;
+        data.origin_message_id = 9001;
+
+        handle_inbound(
+            &transport,
+            &routing,
+            &services,
+            &ordering,
+            2,
+            1,
+            data.clone(),
+            true,
+        )
+        .await;
+
+        let msg = timeout(Duration::from_millis(50), delivered.recv())
+            .await
+            .expect("local service should receive final delivery")
+            .expect("capture receiver should stay open");
+        assert_eq!(msg.from, 1);
+        assert_eq!(msg.body, Bytes::from_static(b"payload"));
+
+        let forwarded = timeout(Duration::from_millis(50), forwarded_to_four.recv())
+            .await
+            .expect("first copy should forward destination 4")
+            .expect("forward receiver should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(forwarded_data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(forwarded_data.dsts, vec![node_to_wire(4)]);
+
+        let mut duplicate = data;
+        duplicate.dsts = vec![node_to_wire(4)];
+        duplicate.path_trace = vec![node_to_wire(1), node_to_wire(3)];
+        handle_inbound(
+            &transport, &routing, &services, &ordering, 2, 3, duplicate, true,
+        )
+        .await;
+
+        assert!(
+            timeout(Duration::from_millis(20), delivered.recv())
+                .await
+                .is_err(),
+            "duplicate unordered transit copy should not be delivered locally"
+        );
+        assert!(
+            timeout(Duration::from_millis(20), forwarded_to_four.recv())
+                .await
+                .is_err(),
+            "duplicate unordered transit copy should not forward destination 4 again"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_transit_processing_is_ignored_even_for_legacy_unordered_packets() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
+        let mut forwarded_to_four = receivers.pop().unwrap();
+        let routing = routing_with_route(4, 4);
+        let (services, mut delivered) = capture_services_for(VOICE_SERVICE_TAG);
+        let ordering = OverlayOrdering::default();
+
+        let mut data = overlay_data_for_dsts(&[4]);
+        data.service_tag = VOICE_SERVICE_TAG;
+        data.process_on_transit = true;
+        data.origin_message_id = 0;
+
+        handle_inbound(&transport, &routing, &services, &ordering, 2, 1, data, true).await;
+
+        assert!(
+            timeout(Duration::from_millis(20), delivered.recv())
+                .await
+                .is_err(),
+            "pure relay should not locally process transit voice frames"
+        );
+
+        let forwarded = timeout(Duration::from_millis(50), forwarded_to_four.recv())
+            .await
+            .expect("legacy voice transit packet should still be forwarded")
+            .expect("forward receiver should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(forwarded_data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(forwarded_data.dsts, vec![node_to_wire(4)]);
+        assert_eq!(forwarded_data.service_tag, VOICE_SERVICE_TAG);
+    }
+
+    #[tokio::test]
+    async fn unordered_overlapping_transit_copy_forwards_only_new_destinations() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
+        let mut to_four = receivers.pop().unwrap();
+        let mut to_five = transport.test_install_live_stream(5, TransportKind::Tcp);
+        let mut to_six = transport.test_install_live_stream(6, TransportKind::Tcp);
+        let routing = routing_with_routes(&[(4, 4), (5, 5), (6, 6)]);
+        let services = ServiceRegistry::new();
+        let ordering = OverlayOrdering::default();
+
+        let mut first = overlay_data_for_dsts(&[4, 5]);
+        first.origin_boot_epoch = 88;
+        first.origin_message_id = 4242;
+        handle_inbound(
+            &transport, &routing, &services, &ordering, 2, 1, first, true,
+        )
+        .await;
+
+        let forwarded_four = timeout(Duration::from_millis(50), to_four.recv())
+            .await
+            .expect("destination 4 should be forwarded")
+            .expect("receiver 4 should stay open");
+        let decoded = decode_message(forwarded_four.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(forwarded_four_data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(forwarded_four_data.dsts, vec![node_to_wire(4)]);
+
+        let forwarded_five = timeout(Duration::from_millis(50), to_five.recv())
+            .await
+            .expect("destination 5 should be forwarded")
+            .expect("receiver 5 should stay open");
+        let decoded = decode_message(forwarded_five.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(forwarded_five_data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(forwarded_five_data.dsts, vec![node_to_wire(5)]);
+
+        let mut overlapping = overlay_data_for_dsts(&[5, 6]);
+        overlapping.origin_boot_epoch = 88;
+        overlapping.origin_message_id = 4242;
+        overlapping.path_trace = vec![node_to_wire(1), node_to_wire(3)];
+        handle_inbound(
+            &transport,
+            &routing,
+            &services,
+            &ordering,
+            2,
+            3,
+            overlapping,
+            true,
+        )
+        .await;
+
+        assert!(
+            timeout(Duration::from_millis(20), to_five.recv())
+                .await
+                .is_err(),
+            "destination 5 should already be marked forwarded"
+        );
+
+        let forwarded_six = timeout(Duration::from_millis(50), to_six.recv())
+            .await
+            .expect("new destination 6 should still be forwarded")
+            .expect("receiver 6 should stay open");
+        let decoded = decode_message(forwarded_six.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(forwarded_six_data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(forwarded_six_data.dsts, vec![node_to_wire(6)]);
     }
 }

@@ -1,6 +1,7 @@
 //! End-to-end ordered overlay lanes and repair bookkeeping.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +15,8 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
-const TRANSIT_DEDUPE_CAP: usize = 4096;
+const UNORDERED_DELIVERY_DEDUPE_CAP: usize = 4096;
+const UNORDERED_FORWARD_DEDUPE_CAP: usize = 16384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OutboundKey {
@@ -47,11 +49,20 @@ pub(crate) struct RepairKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct TransitKey {
+struct DeliveryKey {
     origin: NodeIdentifier,
     boot_epoch: u64,
     message_id: u64,
     service_tag: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UnorderedForwardKey {
+    origin: NodeIdentifier,
+    boot_epoch: u64,
+    message_id: u64,
+    service_tag: u32,
+    final_dst: NodeIdentifier,
 }
 
 #[derive(Debug, Clone)]
@@ -138,18 +149,33 @@ impl RepairCache {
     }
 }
 
-#[derive(Debug, Default)]
-struct TransitDedupe {
-    order: VecDeque<TransitKey>,
-    seen: HashSet<TransitKey>,
+#[derive(Debug)]
+struct BoundedDedupe<K> {
+    cap: usize,
+    order: VecDeque<K>,
+    seen: HashSet<K>,
 }
 
-impl TransitDedupe {
-    fn insert(&mut self, key: TransitKey) -> bool {
+impl<K> BoundedDedupe<K>
+where
+    K: Copy + Eq + Hash,
+{
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            order: VecDeque::with_capacity(cap),
+            seen: HashSet::with_capacity(cap),
+        }
+    }
+
+    fn insert(&mut self, key: K) -> bool {
+        if self.cap == 0 {
+            return true;
+        }
         if self.seen.contains(&key) {
             return false;
         }
-        while self.order.len() >= TRANSIT_DEDUPE_CAP {
+        while self.order.len() >= self.cap {
             if let Some(old) = self.order.pop_front() {
                 self.seen.remove(&old);
             }
@@ -169,7 +195,9 @@ pub(crate) struct OverlayOrdering {
     local_lanes: Mutex<HashSet<LaneId>>,
     remote_lanes: Mutex<HashMap<RemoteLaneKey, HashSet<LaneId>>>,
     repair_cache: Mutex<RepairCache>,
-    transit_seen: Mutex<TransitDedupe>,
+    unordered_delivered_seen: Mutex<BoundedDedupe<DeliveryKey>>,
+    ordered_transit_seen: Mutex<BoundedDedupe<DeliveryKey>>,
+    unordered_forwarded_seen: Mutex<BoundedDedupe<UnorderedForwardKey>>,
     origin_message_id: AtomicU64,
     lane_cap: NonZeroUsize,
     pending_window_packets: usize,
@@ -188,7 +216,9 @@ impl OverlayOrdering {
             local_lanes: Mutex::new(HashSet::new()),
             remote_lanes: Mutex::new(HashMap::new()),
             repair_cache: Mutex::new(RepairCache::new(cfg.ordered_repair_cache_packets())),
-            transit_seen: Mutex::new(TransitDedupe::default()),
+            unordered_delivered_seen: Mutex::new(BoundedDedupe::new(UNORDERED_DELIVERY_DEDUPE_CAP)),
+            ordered_transit_seen: Mutex::new(BoundedDedupe::new(UNORDERED_DELIVERY_DEDUPE_CAP)),
+            unordered_forwarded_seen: Mutex::new(BoundedDedupe::new(UNORDERED_FORWARD_DEDUPE_CAP)),
             origin_message_id: AtomicU64::new(1),
             lane_cap: cfg.ordered_lane_cap(),
             pending_window_packets: cfg.ordered_pending_window_packets(),
@@ -452,6 +482,27 @@ impl OverlayOrdering {
         })
     }
 
+    pub(crate) async fn should_deliver_unordered(
+        &self,
+        origin: NodeIdentifier,
+        boot_epoch: u64,
+        message_id: u64,
+        service_tag: u32,
+    ) -> bool {
+        if message_id == 0 {
+            return true;
+        }
+        self.unordered_delivered_seen
+            .lock()
+            .await
+            .insert(DeliveryKey {
+                origin,
+                boot_epoch,
+                message_id,
+                service_tag,
+            })
+    }
+
     pub(crate) async fn should_deliver_transit(
         &self,
         origin: NodeIdentifier,
@@ -462,12 +513,41 @@ impl OverlayOrdering {
         if message_id == 0 {
             return true;
         }
-        self.transit_seen.lock().await.insert(TransitKey {
+        self.ordered_transit_seen.lock().await.insert(DeliveryKey {
             origin,
             boot_epoch,
             message_id,
             service_tag,
         })
+    }
+
+    pub(crate) async fn filter_unforwarded_unordered(
+        &self,
+        origin: NodeIdentifier,
+        boot_epoch: u64,
+        message_id: u64,
+        service_tag: u32,
+        dsts: Vec<u32>,
+    ) -> Vec<u32> {
+        if message_id == 0 {
+            return dsts;
+        }
+
+        let mut seen = self.unordered_forwarded_seen.lock().await;
+        dsts.into_iter()
+            .filter(|dst_wire| {
+                let Ok(final_dst) = NodeIdentifier::try_from(*dst_wire) else {
+                    return true;
+                };
+                seen.insert(UnorderedForwardKey {
+                    origin,
+                    boot_epoch,
+                    message_id,
+                    service_tag,
+                    final_dst,
+                })
+            })
+            .collect()
     }
 
     pub(crate) async fn reset_peer(&self, peer: NodeIdentifier) {

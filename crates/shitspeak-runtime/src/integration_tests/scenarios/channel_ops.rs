@@ -649,6 +649,51 @@ async fn simultaneous_temporary_channels_get_distinct_ids() {
 }
 
 #[tokio::test]
+async fn removed_temporary_channel_id_is_reused() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    let first_temp = create_channel_and_wait(&alice, 0, "ReusableTemp", true).await;
+    wait_for_user_in_channel(&alice, alice.session_id, first_temp).await;
+
+    alice.move_to_channel(0).await;
+    let removed = alice
+        .recv_until(
+            |m| matches!(m, Message::ChannelRemove(cr) if cr.channel_id == first_temp),
+            Duration::from_secs(3),
+        )
+        .await;
+    assert!(
+        removed.is_some(),
+        "precondition: empty temporary channel should be removed before reuse"
+    );
+
+    let second_temp = create_channel_and_wait(&alice, 0, "ReusedTemp", true).await;
+    wait_for_user_in_channel(&alice, alice.session_id, second_temp).await;
+
+    assert_eq!(
+        second_temp, first_temp,
+        "temporary channel ids should be recycled once the old channel has been removed"
+    );
+    assert_eq!(
+        server
+            .server
+            .get_channels()
+            .get_channel_in_server(DEFAULT_SERVER_ID, second_temp)
+            .await
+            .expect("reused temporary channel should exist")
+            .name,
+        "ReusedTemp"
+    );
+}
+
+#[tokio::test]
 async fn channel_dependency_gap_replays_missing_create_before_user_move() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

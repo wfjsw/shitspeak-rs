@@ -107,6 +107,7 @@ pub async fn handle_channel_remove(
             return Err(super::channel_op_propose_failed(
                 u32::from(sender.get_session_id()),
                 Some(channel_id),
+                s2s_marked.failure_reason(),
             ));
         };
     if !deleting_subtree.is_empty() {
@@ -148,6 +149,7 @@ pub async fn handle_channel_remove(
             return Err(super::channel_op_propose_failed(
                 u32::from(sender.get_session_id()),
                 Some(channel_id),
+                s2s_cancelled.failure_reason(),
             ));
         }
         return Ok(());
@@ -182,6 +184,7 @@ pub async fn handle_channel_remove(
         return Err(super::channel_op_propose_failed(
             u32::from(sender.get_session_id()),
             Some(channel_id),
+            s2s_deleted.failure_reason(),
         ));
     }
 

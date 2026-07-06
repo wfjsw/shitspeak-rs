@@ -48,7 +48,7 @@ pub struct OverlayVoiceTransport {
 impl VoiceTransport for OverlayVoiceTransport {
     async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
-            .send_unicast_with_routing_metric_and_transit_processing(
+            .send_unicast_with_routing_metric(
                 dst,
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
@@ -69,7 +69,7 @@ impl VoiceTransport for OverlayVoiceTransport {
             return Ok(());
         }
         self.overlay
-            .send_multicast_with_routing_metric_and_transit_processing(
+            .send_multicast_with_routing_metric(
                 dsts,
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
@@ -83,7 +83,7 @@ impl VoiceTransport for OverlayVoiceTransport {
 
     async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError> {
         self.overlay
-            .send_broadcast_with_routing_metric_and_transit_processing(
+            .send_broadcast_with_routing_metric(
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
                 VOICE_ROUTING_METRIC,

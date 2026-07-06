@@ -169,6 +169,7 @@ pub async fn handle_channel_state(
                     return Err(super::channel_op_propose_failed(
                         u32::from(session),
                         Some(parent_id),
+                        None,
                     ));
                 };
                 let accepted = proposal.accepted().await;
@@ -176,6 +177,7 @@ pub async fn handle_channel_state(
                     return Err(super::channel_op_propose_failed(
                         u32::from(session),
                         Some(parent_id),
+                        accepted.failure_reason(),
                     ));
                 }
                 match wait_accepted_channel_op_commit_grace(sender, proposal).await? {
@@ -184,6 +186,7 @@ pub async fn handle_channel_state(
                             return Err(super::channel_op_propose_failed(
                                 u32::from(session),
                                 Some(parent_id),
+                                result.failure_reason(),
                             ));
                         }
                         if is_temp {
@@ -386,6 +389,7 @@ pub async fn handle_channel_state(
                     return Err(super::channel_op_propose_failed(
                         u32::from(session),
                         Some(channel_id),
+                        None,
                     ));
                 };
                 let accepted = proposal.accepted().await;
@@ -393,6 +397,7 @@ pub async fn handle_channel_state(
                     return Err(super::channel_op_propose_failed(
                         u32::from(session),
                         Some(channel_id),
+                        accepted.failure_reason(),
                     ));
                 }
                 match wait_accepted_channel_op_commit_grace(sender, proposal).await? {
@@ -401,6 +406,7 @@ pub async fn handle_channel_state(
                             return Err(super::channel_op_propose_failed(
                                 u32::from(session),
                                 Some(channel_id),
+                                result.failure_reason(),
                             ));
                         }
                     }

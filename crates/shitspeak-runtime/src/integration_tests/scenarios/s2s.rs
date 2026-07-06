@@ -52,6 +52,17 @@ const S2S_SHOUT_AUTH_FINALIZATION_CONCURRENCY: usize = 64;
 const S2S_SHOUT_FRAME_LATENCY_BUDGET: Duration = Duration::from_secs(2);
 const S2S_SHOUT_STREAM_GAP_BUDGET: Duration = Duration::from_millis(250);
 const S2S_SHOUT_ROUTE_CPU_BUDGET: f64 = 0.40;
+const S2S_ROOT_SHOUT_TRAFFIC_CHANNELS: &[(u32, u32, &str)] = &[
+    (10, 0, "General"),
+    (11, 10, "General East"),
+    (12, 10, "General West"),
+    (20, 0, "Operations"),
+    (21, 20, "Operations East"),
+    (22, 20, "Operations West"),
+    (30, 0, "Support"),
+    (31, 30, "Support East"),
+    (32, 30, "Support West"),
+];
 const CONVERGENCE_NODE_COUNT: u16 = 6;
 const CONVERGENCE_USERS_PER_NODE: usize = 800;
 const CONVERGENCE_LIGHT_USERS_PER_NODE: usize = 20;
@@ -896,6 +907,55 @@ impl S2SRouteResourceMeasurement {
     }
 }
 
+#[cfg(debug_assertions)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct S2SDebugVoiceIoSnapshot {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    sent_bytes: u64,
+    #[serde(default)]
+    recv_bytes: u64,
+    #[serde(default)]
+    total_bytes: u64,
+    #[serde(default)]
+    sent_count: u64,
+    #[serde(default)]
+    recv_count: u64,
+    #[serde(default)]
+    total_count: u64,
+}
+
+#[cfg(debug_assertions)]
+impl S2SDebugVoiceIoSnapshot {
+    fn capture() -> Self {
+        shitspeak_s2s::debug_io::snapshot()
+            .into_iter()
+            .filter_map(|row| {
+                serde_json::to_value(row)
+                    .ok()
+                    .and_then(|value| serde_json::from_value::<Self>(value).ok())
+            })
+            .find(|row| row.kind == "application.voice.frame")
+            .unwrap_or_else(|| Self {
+                kind: "application.voice.frame".to_owned(),
+                ..Self::default()
+            })
+    }
+
+    fn saturating_sub(&self, before: &Self) -> Self {
+        Self {
+            kind: self.kind.clone(),
+            sent_bytes: self.sent_bytes.saturating_sub(before.sent_bytes),
+            recv_bytes: self.recv_bytes.saturating_sub(before.recv_bytes),
+            total_bytes: self.total_bytes.saturating_sub(before.total_bytes),
+            sent_count: self.sent_count.saturating_sub(before.sent_count),
+            recv_count: self.recv_count.saturating_sub(before.recv_count),
+            total_count: self.total_count.saturating_sub(before.total_count),
+        }
+    }
+}
+
 fn s2s_shout_route_busy_cores(route_duration: Duration, wall: Duration) -> Option<f64> {
     let wall_secs = wall.as_secs_f64();
     if wall_secs <= f64::EPSILON {
@@ -1015,6 +1075,58 @@ async fn wait_for_s2s_voice_target_installed(
             "voice target slot {slot} was not installed before cross-node shout"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn create_s2s_root_shout_traffic_tree(server: &TestServer) -> Vec<u32> {
+    let mut channel_ids = Vec::with_capacity(S2S_ROOT_SHOUT_TRAFFIC_CHANNELS.len());
+    for &(channel_id, parent_id, name) in S2S_ROOT_SHOUT_TRAFFIC_CHANNELS {
+        server
+            .server
+            .get_channels()
+            .create_channel(Channel::new(
+                channel_id,
+                name.to_owned(),
+                0,
+                0,
+                Some(parent_id),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("create traffic channel {channel_id}: {err:?}"));
+        channel_ids.push(channel_id);
+    }
+    channel_ids
+}
+
+async fn wait_for_s2s_channels_on_servers(
+    servers: &[&TestServer],
+    channel_ids: &[u32],
+    deadline: Duration,
+) {
+    let started = Instant::now();
+    loop {
+        let mut missing = Vec::new();
+        for (server_idx, server) in servers.iter().enumerate() {
+            for &channel_id in channel_ids {
+                if server
+                    .server
+                    .get_channels()
+                    .get_channel(channel_id)
+                    .await
+                    .is_none()
+                {
+                    missing.push((server_idx, channel_id));
+                }
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            started.elapsed() < deadline,
+            "S2S channel replication did not converge; missing={missing:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -1801,6 +1913,183 @@ async fn s2s_broadcast_shout_to_all_clients_survives_bad_node() {
         route_busy_cores,
         wall,
         S2S_SHOUT_ROUTE_CPU_BUDGET
+    );
+}
+
+/// Measures cross-node traffic amplification for a root shout that includes
+/// subchannels.
+/// Expected: the current broadcast path sends one voice overlay packet per
+/// frame to every other S2S node, regardless of whether that node has matching
+/// clients. This test keeps the upper bound at "broadcast once per peer" and
+/// prints the excess over the minimum nodes that actually need the stream.
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2s_root_children_shout_reports_cross_node_traffic_amplification() {
+    let _guard = s2s_network_test_guard().await;
+    let cluster = spawn_s2s_convergence_cluster().await;
+    cluster.connect_full_mesh().await;
+    wait_for_convergence_cluster(&cluster).await;
+    let servers = cluster.servers.iter().collect::<Vec<_>>();
+
+    let speaker_server = servers[0];
+    let first_listener_server = servers[1];
+    let second_listener_server = servers[2];
+    speaker_server
+        .authenticator
+        .register_superuser("speaker", None, Some(1), vec!["admin".into()]);
+    first_listener_server.authenticator.register_user(
+        "traffic-listener-a",
+        None,
+        Some(31_001),
+        Vec::new(),
+    );
+    second_listener_server.authenticator.register_user(
+        "traffic-listener-b",
+        None,
+        Some(31_002),
+        Vec::new(),
+    );
+
+    let channel_ids = create_s2s_root_shout_traffic_tree(speaker_server).await;
+    wait_for_s2s_channels_on_servers(&servers, &channel_ids, S2S_DEADLINE).await;
+    first_listener_server
+        .server
+        .get_user_channel_cache()
+        .remember_last_channel("31001", 11)
+        .await
+        .expect("remember first listener channel");
+    second_listener_server
+        .server
+        .get_user_channel_cache()
+        .remember_last_channel("31002", 21)
+        .await
+        .expect("remember second listener channel");
+
+    let first_listener = connect_s2s_shout_listener(first_listener_server, "traffic-listener-a")
+        .await
+        .expect("first traffic listener");
+    let second_listener = connect_s2s_shout_listener(second_listener_server, "traffic-listener-b")
+        .await
+        .expect("second traffic listener");
+    assert!(
+        wait_for_server_sessions_in_channel(
+            first_listener_server,
+            &[first_listener.session_id],
+            11,
+            S2S_DEADLINE,
+        )
+        .await
+        .is_some(),
+        "first traffic listener should enter the target subtree"
+    );
+    assert!(
+        wait_for_server_sessions_in_channel(
+            second_listener_server,
+            &[second_listener.session_id],
+            21,
+            S2S_DEADLINE,
+        )
+        .await
+        .is_some(),
+        "second traffic listener should enter the target subtree"
+    );
+
+    let alice = TestClient::connect_and_authenticate_with_deadline(
+        speaker_server,
+        "speaker",
+        None,
+        S2S_SHOUT_CONNECT_DEADLINE,
+    )
+    .await
+    .expect("traffic speaker");
+    wait_for_server_to_track_client(first_listener_server, alice.server_session).await;
+    wait_for_server_to_track_client(second_listener_server, alice.server_session).await;
+    alice
+        .set_voice_target(s2s_voice_target(
+            S2S_SHOUT_TARGET_SLOT,
+            vec![s2s_voice_target_channel(0, true, false, None)],
+        ))
+        .await;
+    wait_for_s2s_voice_target_installed(speaker_server, &alice, S2S_SHOUT_TARGET_SLOT).await;
+    alice.drain_now().await;
+    first_listener.drain_now().await;
+    second_listener.drain_now().await;
+
+    let frames = s2s_shout_voice_segment(52_000);
+    assert!(
+        s2s_shout_segment_send_span(&frames) >= S2S_SHOUT_MIN_SPEAK_SPAN,
+        "traffic amplification measurement should continuously speak for at least {:?}",
+        S2S_SHOUT_MIN_SPEAK_SPAN
+    );
+
+    let voice_before = S2SDebugVoiceIoSnapshot::capture();
+    let speak_start = Instant::now();
+    let send_task = async {
+        send_s2s_shout_voice_segment(&alice, S2S_SHOUT_TARGET_SLOT, &frames).await;
+        Instant::now()
+    };
+    let receive_task = async {
+        join_all(
+            [&first_listener, &second_listener]
+                .into_iter()
+                .enumerate()
+                .map(|(idx, listener)| {
+                    receive_s2s_shout_stream(listener, &alice, idx, speak_start, &frames)
+                }),
+        )
+        .await
+    };
+    let (_send_end, _deliveries) = tokio::join!(send_task, receive_task);
+    let voice_after = S2SDebugVoiceIoSnapshot::capture();
+    let voice_delta = voice_after.saturating_sub(&voice_before);
+
+    let frame_count = frames.len() as u64;
+    let remote_nodes = (servers.len() - 1) as u64;
+    let needed_remote_nodes = 2u64;
+    let broadcast_packet_budget = frame_count * remote_nodes;
+    let minimum_packet_budget = frame_count * needed_remote_nodes;
+    let duplicate_packets = voice_delta.sent_count.saturating_sub(minimum_packet_budget);
+    let amplification = if minimum_packet_budget == 0 {
+        0.0
+    } else {
+        voice_delta.sent_count as f64 / minimum_packet_budget as f64
+    };
+    let average_packet_bytes = if voice_delta.sent_count == 0 {
+        0.0
+    } else {
+        voice_delta.sent_bytes as f64 / voice_delta.sent_count as f64
+    };
+    let estimated_minimum_bytes = average_packet_bytes * minimum_packet_budget as f64;
+    let estimated_duplicate_bytes =
+        (voice_delta.sent_bytes as f64 - estimated_minimum_bytes).max(0.0);
+    eprintln!(
+        "s2s_root_children_shout_traffic frames={} remote_nodes={} needed_remote_nodes={} sent_packets={} minimum_packets={} duplicate_packets={} amplification={:.2}x sent_bytes={} estimated_minimum_bytes={:.0} estimated_duplicate_bytes={:.0} avg_packet_bytes={:.1} recv_packets={} recv_bytes={}",
+        frame_count,
+        remote_nodes,
+        needed_remote_nodes,
+        voice_delta.sent_count,
+        minimum_packet_budget,
+        duplicate_packets,
+        amplification,
+        voice_delta.sent_bytes,
+        estimated_minimum_bytes,
+        estimated_duplicate_bytes,
+        average_packet_bytes,
+        voice_delta.recv_count,
+        voice_delta.recv_bytes,
+    );
+
+    assert!(
+        voice_delta.sent_count >= minimum_packet_budget,
+        "root+children shout sent fewer packets than the required remote receiver nodes"
+    );
+    assert!(
+        voice_delta.sent_count <= broadcast_packet_budget,
+        "root+children shout should not exceed one cross-node voice packet per remote peer per frame"
+    );
+    assert!(
+        voice_delta.recv_count <= broadcast_packet_budget,
+        "root+children shout should not receive more than one cross-node voice packet per remote peer per frame"
     );
 }
 

@@ -789,21 +789,32 @@ fn parse_cgroup_memory_available() -> Option<u64> {
     max.checked_sub(current)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub enum ChannelOpProposeResult {
     Proposed,
     Unavailable,
-    Failed,
+    Failed(String),
 }
 
 impl ChannelOpProposeResult {
-    pub fn is_proposed(self) -> bool {
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self::Failed(reason.into())
+    }
+
+    pub fn is_proposed(&self) -> bool {
         matches!(self, Self::Proposed)
     }
 
-    pub fn should_apply_locally(self) -> bool {
+    pub fn should_apply_locally(&self) -> bool {
         matches!(self, Self::Unavailable)
+    }
+
+    pub fn failure_reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed(reason) => Some(reason),
+            Self::Proposed | Self::Unavailable => None,
+        }
     }
 }
 
@@ -817,20 +828,24 @@ pub struct ChannelOpProposal {
 impl ChannelOpProposal {
     pub async fn accepted(&mut self) -> ChannelOpProposeResult {
         let Some(accepted) = self.accepted.take() else {
-            return ChannelOpProposeResult::Failed;
+            return ChannelOpProposeResult::failed(
+                "s2s channel proposal acceptance was unavailable",
+            );
         };
         match tokio::time::timeout(self.timeout, accepted).await {
             Ok(Ok(())) => ChannelOpProposeResult::Proposed,
             Ok(Err(_)) => match self.wait_completed(self.timeout).await {
                 ChannelOpCompletion::Completed(result) => result,
                 ChannelOpCompletion::Pending => {
-                    error!("s2s channel proposal timed out waiting for gateway response");
-                    ChannelOpProposeResult::Failed
+                    let reason = "s2s channel proposal timed out waiting for gateway response";
+                    error!(reason);
+                    ChannelOpProposeResult::failed(reason)
                 }
             },
             Err(_) => {
-                error!("s2s channel proposal timed out waiting for acceptance");
-                ChannelOpProposeResult::Failed
+                let reason = "s2s channel proposal timed out waiting for acceptance";
+                error!(reason);
+                ChannelOpProposeResult::failed(reason)
             }
         }
     }
@@ -839,21 +854,23 @@ impl ChannelOpProposal {
         match self.wait_completed(self.timeout).await {
             ChannelOpCompletion::Completed(result) => result,
             ChannelOpCompletion::Pending => {
-                error!("s2s channel proposal timed out waiting for gateway response");
-                ChannelOpProposeResult::Failed
+                let reason = "s2s channel proposal timed out waiting for gateway response";
+                error!(reason);
+                ChannelOpProposeResult::failed(reason)
             }
         }
     }
 
     pub async fn completed_after_acceptance(mut self) -> ChannelOpProposeResult {
         let Some(completed) = self.completed.take() else {
-            return ChannelOpProposeResult::Failed;
+            return ChannelOpProposeResult::failed("s2s channel proposal response was unavailable");
         };
         match completed.await {
             Ok(result) => result,
             Err(_) => {
-                error!("s2s gateway dropped accepted channel proposal response");
-                ChannelOpProposeResult::Failed
+                let reason = "s2s gateway dropped accepted channel proposal response";
+                error!(reason);
+                ChannelOpProposeResult::failed(reason)
             }
         }
     }
@@ -864,7 +881,9 @@ impl ChannelOpProposal {
 
     async fn wait_completed(&mut self, timeout: Duration) -> ChannelOpCompletion {
         let Some(completed) = self.completed.as_mut() else {
-            return ChannelOpCompletion::Completed(ChannelOpProposeResult::Failed);
+            return ChannelOpCompletion::Completed(ChannelOpProposeResult::failed(
+                "s2s channel proposal response was unavailable",
+            ));
         };
         match tokio::time::timeout(timeout, completed).await {
             Ok(Ok(result)) => {
@@ -873,8 +892,9 @@ impl ChannelOpProposal {
             }
             Ok(Err(_)) => {
                 self.completed = None;
-                error!("s2s gateway dropped channel proposal response");
-                ChannelOpCompletion::Completed(ChannelOpProposeResult::Failed)
+                let reason = "s2s gateway dropped channel proposal response";
+                error!(reason);
+                ChannelOpCompletion::Completed(ChannelOpProposeResult::failed(reason))
             }
             Err(_) => ChannelOpCompletion::Pending,
         }
@@ -1226,7 +1246,9 @@ impl S2SManager {
                     channel_id = ?channel_id,
                     "s2s channel op propose failed: replication handle unavailable"
                 );
-                return ChannelOpProposeResult::Failed;
+                return ChannelOpProposeResult::failed(
+                    "s2s channel replication handle unavailable",
+                );
             }
         };
         let operation = ChannelOperation {
@@ -1300,6 +1322,7 @@ impl S2SManager {
                         ChannelOpProposeResult::Proposed
                     }
                     Err(e) => {
+                        let reason = e.to_string();
                         error!(
                             server_id,
                             op_kind,
@@ -1308,11 +1331,12 @@ impl S2SManager {
                             error = %e,
                             "s2s channel op propose failed"
                         );
-                        ChannelOpProposeResult::Failed
+                        ChannelOpProposeResult::failed(reason)
                     }
                 }
             }
             Err(e) => {
+                let reason = e.to_string();
                 error!(
                     server_id,
                     op_kind,
@@ -1321,7 +1345,7 @@ impl S2SManager {
                     error = %e,
                     "s2s channel op propose failed"
                 );
-                ChannelOpProposeResult::Failed
+                ChannelOpProposeResult::failed(reason)
             }
         }
     }
