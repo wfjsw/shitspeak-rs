@@ -22,3 +22,4 @@ deploy/*
 examples/docker-compose-16node/.transport-survey
 codex-target/
 /target-*/
+/tmp/
