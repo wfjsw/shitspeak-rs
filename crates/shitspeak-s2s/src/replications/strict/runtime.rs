@@ -1081,8 +1081,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let dsts = p
             .target_set
             .iter()
+            .filter(|node| **node != self.self_id && !p.acks.contains_key(*node))
             .copied()
-            .filter(|node| *node != self.self_id && !p.acks.contains_key(node))
             .collect();
         Some(PendingProposeRetry {
             op_msgpack: p.op_msgpack.clone(),
@@ -1215,8 +1215,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 dsts = p
                     .target_set
                     .iter()
+                    .filter(|n| **n != self.self_id)
                     .copied()
-                    .filter(|n| *n != self.self_id)
                     .collect();
             }
 
@@ -1606,8 +1606,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
         let dsts: Vec<NodeIdentifier> = target
             .iter()
+            .filter(|n| **n != self.self_id)
             .copied()
-            .filter(|n| *n != self.self_id)
             .collect();
         let body = StrictBody::RecoveryCommit(StrictRecoveryCommit {
             takeover_node: self.self_id as u32,
@@ -1701,8 +1701,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .collect();
         let takeover = alive_with_self
             .iter()
+            .filter(|n| **n != failed_coord)
             .copied()
-            .filter(|n| *n != failed_coord)
             .min();
         if takeover != Some(self.self_id) {
             return;
@@ -1778,8 +1778,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             // Broadcast Prepare to everyone in target_set except self.
             let dsts: Vec<NodeIdentifier> = target_set
                 .iter()
+                .filter(|n| **n != self.self_id)
                 .copied()
-                .filter(|n| *n != self.self_id)
                 .collect();
             let src_clock = {
                 let s = self.state.lock();
@@ -2475,9 +2475,8 @@ fn clock_tick_needed_for_state(
     }
     alive
         .iter()
-        .copied()
-        .filter(|node| *node != self_id)
-        .any(|node| !state.peer_clocks.contains_key(&node))
+        .filter(|node| **node != self_id)
+        .any(|node| !state.peer_clocks.contains_key(node))
 }
 
 async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {

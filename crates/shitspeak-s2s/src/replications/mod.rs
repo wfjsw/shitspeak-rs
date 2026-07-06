@@ -209,7 +209,7 @@ impl ReplicationManager {
         let strict_for_ev = strict_topics.clone();
         let owner_for_ev = owner_topics.clone();
         let blob_for_ev = blob_topics.clone();
-        let shutdown_for_ev = shutdown.clone();
+        let shutdown_for_ev = shutdown;
         tokio::spawn(async move {
             loop {
                 tokio::select! {

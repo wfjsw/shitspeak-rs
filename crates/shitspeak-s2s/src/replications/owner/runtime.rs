@@ -635,8 +635,8 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         // Prefer a non-origin alive peer; fall back to origin.
         let mut candidates: Vec<NodeIdentifier> = alive
             .iter()
+            .filter(|n| **n != self.self_id && **n != origin)
             .copied()
-            .filter(|n| *n != self.self_id && *n != origin)
             .collect();
         let pick = if !candidates.is_empty() {
             use rand::seq::SliceRandom;

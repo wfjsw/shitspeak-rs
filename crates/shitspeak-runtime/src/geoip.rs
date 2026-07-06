@@ -97,8 +97,8 @@ impl GeoIpResolver {
         }
         let ips = ips
             .iter()
+            .filter(|ip| is_public_geoip_candidate(ip))
             .copied()
-            .filter(is_public_geoip_candidate)
             .collect::<Vec<_>>();
         if ips.is_empty() {
             return None;

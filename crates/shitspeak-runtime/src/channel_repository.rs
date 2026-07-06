@@ -885,11 +885,11 @@ impl ChannelRepository {
         }
         let channels = self.channels.read();
         let Some(channels) = channels.get(server_id) else {
-            return ids.iter().copied().filter(|id| *id == 0).collect();
+            return ids.iter().filter(|id| **id == 0).copied().collect();
         };
         ids.iter()
+            .filter(|id| **id == 0 || channels.contains_key(*id))
             .copied()
-            .filter(|id| *id == 0 || channels.contains_key(id))
             .collect()
     }
 
@@ -2440,8 +2440,8 @@ impl ChannelRepository {
                 removed_channel_ids.extend(
                     old_ids
                         .difference(&ids)
-                        .copied()
-                        .filter(|channel_id| *channel_id != 0),
+                        .filter(|channel_id| **channel_id != 0)
+                        .copied(),
                 );
                 self.versions.write().insert(server_id.to_owned(), version);
                 self.log

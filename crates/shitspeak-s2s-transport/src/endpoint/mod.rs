@@ -335,8 +335,8 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
         let mandatory_targets = mandatory_backbone_targets(&inner);
         candidates.sort_by(|a, b| compare_dial_candidates(a, b, &mandatory_targets));
 
-        for (node, peer) in candidates.iter().cloned() {
-            let mandatory = mandatory_targets.contains(&node);
+        for (node, peer) in candidates.iter() {
+            let mandatory = mandatory_targets.contains(node);
             let cap_reached =
                 inner.outgoing_connection_count() >= inner.cfg().max_outgoing_connections();
             if cap_reached && !mandatory {
@@ -1164,8 +1164,8 @@ fn local_advertised_sockets(cfg: &TransportConfig, transport: TransportKind) -> 
     out.extend(
         addrs
             .iter()
-            .copied()
-            .filter(|addr| !addr.ip().is_unspecified()),
+            .filter(|addr| !addr.ip().is_unspecified())
+            .copied(),
     );
     let listen = match transport {
         TransportKind::Tcp => cfg.tcp_listen_addrs(),
@@ -1176,8 +1176,8 @@ fn local_advertised_sockets(cfg: &TransportConfig, transport: TransportKind) -> 
     out.extend(
         listen
             .iter()
-            .copied()
-            .filter(|addr| !addr.ip().is_unspecified()),
+            .filter(|addr| !addr.ip().is_unspecified())
+            .copied(),
     );
     out.sort_unstable();
     out.dedup();

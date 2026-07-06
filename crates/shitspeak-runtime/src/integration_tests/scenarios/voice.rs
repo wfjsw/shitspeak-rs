@@ -328,8 +328,8 @@ fn large_tree_server_roots(
         .get(&root_id)
         .expect("fixture root has top-level branches")
         .iter()
+        .filter(|id| !large_tree_leaves_under(tree, **id).is_empty())
         .copied()
-        .filter(|id| !large_tree_leaves_under(tree, *id).is_empty())
         .collect::<Vec<_>>();
     roots.sort_by_key(|id| {
         (
@@ -395,13 +395,13 @@ fn large_tree_shout_cases(
         .expect("selected branches have linked channels");
     let recursive_linked = server_roots
         .iter()
-        .copied()
         .find(|root| {
-            let subtree = large_tree_subtree_ids(tree, *root);
+            let subtree = large_tree_subtree_ids(tree, **root);
             link_groups
                 .iter()
                 .any(|group| group.iter().any(|id| subtree.contains(id)))
         })
+        .copied()
         .unwrap_or(recursive);
     let second_recursive = server_roots.get(1).copied();
 

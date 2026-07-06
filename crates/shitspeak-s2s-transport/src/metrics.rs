@@ -1229,8 +1229,8 @@ impl PeerMetrics {
         let snapshot = self.snapshot_per_transport();
         let mut ranked: Vec<(TransportKind, f64)> = candidates
             .iter()
+            .filter(|&&transport| transport.is_acceptable_for(requested))
             .copied()
-            .filter(|transport| transport.is_acceptable_for(requested))
             .filter_map(|transport| {
                 snapshot
                     .get(&transport)
@@ -1742,7 +1742,7 @@ mod tests {
                 0,
                 0,
             ),
-            ..clean.clone()
+            ..clean
         };
         let current_loss = LinkMetrics {
             loss: LossBreakdown::from_components(
@@ -1760,7 +1760,7 @@ mod tests {
                 0,
                 0,
             ),
-            ..clean.clone()
+            ..clean
         };
 
         assert_eq!(clean.effective_packet_loss_ppm(), 0);

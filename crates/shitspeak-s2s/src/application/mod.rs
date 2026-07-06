@@ -78,7 +78,7 @@ impl ApplicationLayer {
         let plugin_data = PluginDataService::new(overlay.clone(), shutdown.child_token());
         let text_message = TextMessageService::new(overlay.clone(), shutdown.child_token());
         let user_stats = UserStatsService::new(overlay.clone(), shutdown.child_token());
-        let voice = VoiceService::new(overlay.clone(), cfg.voice.clone(), shutdown.child_token());
+        let voice = VoiceService::new(overlay.clone(), cfg.voice, shutdown.child_token());
 
         overlay.register_service(MODERATION_SERVICE_TAG, moderation.inbound_handler());
         overlay.register_service(PLUGIN_DATA_SERVICE_TAG, plugin_data.inbound_handler());

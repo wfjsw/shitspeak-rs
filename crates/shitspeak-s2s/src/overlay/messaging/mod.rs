@@ -562,7 +562,7 @@ async fn send_multicast_with_routing_metric_lane_and_transit_processing(
     process_on_transit: bool,
     options: OverlaySendOptions,
 ) -> Result<(), OverlayError> {
-    let dsts: Vec<NodeIdentifier> = dsts.iter().copied().filter(|n| *n != self_id).collect();
+    let dsts: Vec<NodeIdentifier> = dsts.iter().filter(|n| **n != self_id).copied().collect();
     forward::originate(
         transport,
         routing,
@@ -805,7 +805,7 @@ async fn send_broadcast_with_routing_metric_lane_and_transit_processing(
     process_on_transit: bool,
     options: OverlaySendOptions,
 ) -> Result<(), OverlayError> {
-    let dsts: Vec<NodeIdentifier> = alive.iter().copied().filter(|n| *n != self_id).collect();
+    let dsts: Vec<NodeIdentifier> = alive.iter().filter(|n| **n != self_id).copied().collect();
     if dsts.is_empty() {
         return Ok(());
     }

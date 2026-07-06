@@ -528,12 +528,12 @@ async fn deleted_subtree_from_shadow(
 
     shadow
         .values()
-        .copied()
         .filter(|channel_id| {
-            *channel_id == id
-                || !channels_by_id.contains_key(channel_id)
-                || has_ancestor(&channels_by_id, *channel_id, id)
+            **channel_id == id
+                || !channels_by_id.contains_key(*channel_id)
+                || has_ancestor(&channels_by_id, **channel_id, id)
         })
+        .copied()
         .collect()
 }
 

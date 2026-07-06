@@ -782,8 +782,8 @@ impl Server {
                 };
 
                 // After decryption, check if this is a ping or audio packet.
-                match crate::voice::codec::IncomingUdpPacket::decode(
-                    &decrypted,
+                match crate::voice::codec::IncomingUdpPacket::decode_owned(
+                    decrypted.freeze(),
                     Some(client.get_session_id()),
                 ) {
                     Ok(crate::voice::codec::IncomingUdpPacket::Ping(ping)) => {

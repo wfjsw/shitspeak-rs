@@ -205,13 +205,13 @@ fn describe_address_delta(
 
     let added = current
         .iter()
+        .filter(|addr| !previous_set.contains(*addr))
         .copied()
-        .filter(|addr| !previous_set.contains(addr))
         .collect::<Vec<_>>();
     let removed = previous
         .iter()
+        .filter(|addr| !current_set.contains(*addr))
         .copied()
-        .filter(|addr| !current_set.contains(addr))
         .collect::<Vec<_>>();
 
     if added.is_empty() && removed.is_empty() {
@@ -235,13 +235,13 @@ fn describe_link_delta(
 
     let added = current_by_neighbor
         .keys()
+        .filter(|neighbor| !previous_by_neighbor.contains_key(*neighbor))
         .copied()
-        .filter(|neighbor| !previous_by_neighbor.contains_key(neighbor))
         .collect::<Vec<_>>();
     let removed = previous_by_neighbor
         .keys()
+        .filter(|neighbor| !current_by_neighbor.contains_key(*neighbor))
         .copied()
-        .filter(|neighbor| !current_by_neighbor.contains_key(neighbor))
         .collect::<Vec<_>>();
 
     if !added.is_empty() || !removed.is_empty() {

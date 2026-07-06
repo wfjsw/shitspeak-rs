@@ -391,6 +391,52 @@ impl IncomingUdpPacket {
         }
     }
 
+    /// Decode an owned UDP packet.
+    ///
+    /// Legacy Opus packets keep their payload as a slice of the owned packet
+    /// backing instead of copying the frame into a fresh allocation.
+    pub fn decode_owned(
+        data: Bytes,
+        from_session: Option<ClientSessionIdentifier>,
+    ) -> Result<IncomingUdpPacket, DecodeError> {
+        if data.is_empty() {
+            return Err(DecodeError::TooShort);
+        }
+
+        if data[0] == 0x01 {
+            if let Ok(packet) = Self::try_decode_protobuf(&data, from_session) {
+                return Ok(packet);
+            }
+        }
+
+        if data.len() == 12 || data.len() == 24 {
+            if let Ok(ping) = super::ping::PingRequest::decode_legacy(&data) {
+                return Ok(IncomingUdpPacket::Ping(ping));
+            }
+        }
+
+        if data[0] == 0x00 {
+            match Self::try_decode_protobuf(&data, from_session) {
+                Ok(packet) => return Ok(packet),
+                Err(DecodeError::ProtobufDecode(_)) | Err(DecodeError::NotVoice) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let legacy_type = (data[0] >> 5) & 0x07;
+        match legacy_type {
+            0 | 2 | 3 => Err(DecodeError::UnsupportedCodec),
+            1 => Ok(IncomingUdpPacket::Ping(
+                super::ping::PingRequest::decode_legacy(&data[1..])?,
+            )),
+            4 => Ok(IncomingUdpPacket::Audio(Audio::decode_legacy_owned(
+                data,
+                from_session,
+            )?)),
+            _ => Err(DecodeError::NotVoice),
+        }
+    }
+
     /// Try to decode as protobuf. Returns `Err` if it is not actually protobuf.
     fn try_decode_protobuf(
         data: &[u8],
@@ -528,6 +574,21 @@ impl Audio {
         data: &[u8],
         from_session: Option<ClientSessionIdentifier>,
     ) -> Result<Self, DecodeError> {
+        Self::decode_legacy_impl(data, None, from_session)
+    }
+
+    fn decode_legacy_owned(
+        data: Bytes,
+        from_session: Option<ClientSessionIdentifier>,
+    ) -> Result<Self, DecodeError> {
+        Self::decode_legacy_impl(&data, Some(data.clone()), from_session)
+    }
+
+    fn decode_legacy_impl(
+        data: &[u8],
+        backing: Option<Bytes>,
+        from_session: Option<ClientSessionIdentifier>,
+    ) -> Result<Self, DecodeError> {
         if data.len() < 2 {
             return Err(DecodeError::TooShort);
         }
@@ -574,7 +635,10 @@ impl Audio {
                     }
                 }
                 let end = data_reader.position() as usize;
-                let frame = Bytes::copy_from_slice(&data[start..end]);
+                let frame = backing
+                    .as_ref()
+                    .map(|bytes| bytes.slice(start..end))
+                    .unwrap_or_else(|| Bytes::copy_from_slice(&data[start..end]));
                 match udp_message_type {
                     LegacyUdpMessageType::VoiceCELTAlpha => AudioPayload::CELTAlpha(frame),
                     LegacyUdpMessageType::VoiceSpeex => AudioPayload::Speex(frame),
@@ -592,7 +656,13 @@ impl Audio {
                     return Err(DecodeError::MalformedPacket);
                 }
 
-                let frame = data_reader.copy_to_bytes(payload_size);
+                let start = data_reader.position() as usize;
+                data_reader.advance(payload_size);
+                let end = data_reader.position() as usize;
+                let frame = backing
+                    .as_ref()
+                    .map(|bytes| bytes.slice(start..end))
+                    .unwrap_or_else(|| Bytes::copy_from_slice(&data[start..end]));
                 AudioPayload::Opus(OpusPayload {
                     frame,
                     is_terminator,
@@ -852,6 +922,22 @@ mod tests {
             })
         );
         assert_eq!(decoded.format, PacketFormat::Legacy);
+    }
+
+    #[test]
+    fn owned_legacy_udp_decode_slices_opus_payload() {
+        let packet = build_legacy_client_packet(0, 42, &[0x01, 0x02, 0x03], false).freeze();
+        let payload_ptr = unsafe { packet.as_ptr().add(3) };
+        let decoded = IncomingUdpPacket::decode_owned(packet, None).expect("decode legacy c→s");
+        let IncomingUdpPacket::Audio(audio) = decoded else {
+            panic!("expected audio packet");
+        };
+        let AudioPayload::Opus(opus) = audio.audio_payload else {
+            panic!("expected opus payload");
+        };
+
+        assert_eq!(opus.frame.as_ref(), &[0x01, 0x02, 0x03]);
+        assert_eq!(opus.frame.as_ptr(), payload_ptr);
     }
 
     #[test]

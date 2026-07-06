@@ -224,10 +224,7 @@ impl RoutingTables {
         if dst == self_id || path_trace.contains(&dst) {
             return None;
         }
-        for key in Self::metric_lookup_keys(metric, level)
-            .iter()
-            .flatten()
-        {
+        for key in Self::metric_lookup_keys(metric, level).iter().flatten() {
             if let Some(entry) = self.lookup_path_aware_for_key(self_id, dst, key, path_trace, None)
             {
                 return Some(entry);
@@ -248,10 +245,7 @@ impl RoutingTables {
         if dst == self_id || path_trace.contains(&dst) {
             return None;
         }
-        for key in Self::metric_lookup_keys(metric, level)
-            .iter()
-            .flatten()
-        {
+        for key in Self::metric_lookup_keys(metric, level).iter().flatten() {
             if let Some(entry) =
                 self.lookup_path_aware_for_key(self_id, dst, key, path_trace, Some(avoid_next_hop))
             {

@@ -91,8 +91,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // immediately commits).
         let dsts: Vec<_> = target_set
             .iter()
+            .filter(|n| **n != self.self_id)
             .copied()
-            .filter(|n| *n != self.self_id)
             .collect();
         let body = StrictBody::Propose(StrictPropose {
             coord_node: self.self_id as u32,

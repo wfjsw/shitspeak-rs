@@ -334,8 +334,8 @@ impl OverlayOrdering {
         if let Some(packets) = pending.get_mut(&key) {
             let remove: Vec<u64> = packets
                 .keys()
+                .take_while(|seq| **seq < next_seq)
                 .copied()
-                .take_while(|seq| *seq < next_seq)
                 .collect();
             for seq in remove {
                 packets.remove(&seq);

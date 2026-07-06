@@ -266,8 +266,8 @@ fn ja4_from_client_hello(hello: &ClientHelloData) -> String {
         &hello
             .extensions
             .iter()
+            .filter(|extension| **extension != TLS_EXTENSION_SERVER_NAME)
             .copied()
-            .filter(|extension| *extension != TLS_EXTENSION_SERVER_NAME)
             .collect::<Vec<_>>(),
     );
     let signature_algorithms = non_grease_sorted(&hello.signature_algorithms);
@@ -296,8 +296,8 @@ fn ja4_tls_version(hello: &ClientHelloData) -> String {
     let version = hello
         .supported_versions
         .iter()
+        .filter(|version| !is_grease(**version))
         .copied()
-        .filter(|version| !is_grease(*version))
         .max()
         .unwrap_or(hello.legacy_version);
 
@@ -316,8 +316,8 @@ fn ja4_alpn(protocols: &[Vec<u8>]) -> String {
     };
     let alnum: Vec<char> = protocol
         .iter()
+        .filter(|byte| byte.is_ascii_alphanumeric())
         .copied()
-        .filter(u8::is_ascii_alphanumeric)
         .map(|byte| (byte as char).to_ascii_lowercase())
         .collect();
 
@@ -331,8 +331,8 @@ fn ja4_alpn(protocols: &[Vec<u8>]) -> String {
 fn non_grease_sorted(values: &[u16]) -> Vec<u16> {
     let mut values = values
         .iter()
+        .filter(|value| !is_grease(**value))
         .copied()
-        .filter(|value| !is_grease(*value))
         .collect::<Vec<_>>();
     values.sort_unstable();
     values

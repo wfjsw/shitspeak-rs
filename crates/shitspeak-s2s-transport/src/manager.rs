@@ -1742,8 +1742,8 @@ fn build_endpoints(
     });
     let quic = if !cfg.quic_listen_addrs().is_empty() || has_seed(TransportKind::Quic) {
         let endpoint = QuicEndpoint::new(
-            server_tls.clone(),
-            client_tls.clone(),
+            server_tls,
+            client_tls,
             cfg.quic_listen_addrs().iter().copied(),
             mux.clone(),
         )

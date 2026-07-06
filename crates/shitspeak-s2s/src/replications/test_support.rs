@@ -401,8 +401,11 @@ impl OwnerReplicable for CountingOwnerRepo {
         let s = self.state.lock();
         match s.get(&origin) {
             Some((_, _, log)) => {
-                let out: Vec<(u64, u64)> =
-                    log.iter().copied().filter(|(v, _)| *v > since).collect();
+                let out: Vec<(u64, u64)> = log
+                    .iter()
+                    .filter(|entry| entry.0 > since)
+                    .copied()
+                    .collect();
                 OwnerLog::Available(out)
             }
             None => OwnerLog::Available(Vec::new()),
