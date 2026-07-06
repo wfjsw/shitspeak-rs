@@ -1,10 +1,11 @@
 //! Voice routing logic — determines recipients and dispatches audio packets.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
+use scc::HashCache;
 use tracing::Instrument;
 
 use super::codec::{self, Audio, PacketFormat};
@@ -37,6 +38,35 @@ use shitspeak_s2s::application::proto::{
 /// 256 recipients; rayon starts paying off around 512.
 const RAYON_FANOUT_THRESHOLD: usize = 512;
 const RAYON_FANOUT_BATCH_MIN_LEN: usize = 256;
+const S2S_TARGET_RECIPIENT_CACHE_MAX_CAPACITY: usize = 4096;
+
+static S2S_TARGET_RECIPIENT_CACHE: LazyLock<
+    HashCache<S2SVoiceTargetResolutionCacheKey, Arc<[ResolvedVoiceTargetRecipient]>>,
+> = LazyLock::new(|| HashCache::with_capacity(0, S2S_TARGET_RECIPIENT_CACHE_MAX_CAPACITY));
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct S2SVoiceTargetResolutionCacheKey {
+    server_identity: usize,
+    local_node_id: u16,
+    server_id: String,
+    sender_session: ClientSessionIdentifier,
+    sender_instance_id: Option<ClientInstanceId>,
+    channel_version: u64,
+    channel_acl_generation: u64,
+    client_version: u64,
+    hide_users_without_traverse: bool,
+    source_channel: u32,
+    sessions: Vec<u32>,
+    channels: Vec<S2SVoiceTargetChannelCacheKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct S2SVoiceTargetChannelCacheKey {
+    id: u32,
+    children: bool,
+    links: bool,
+    group: String,
+}
 
 /// Pluck the recipient's preferred wire format. Lock-free read backed by
 /// the per-client `AtomicU64` protocol version on `Client`.
@@ -355,6 +385,86 @@ async fn resolve_voice_intent(
         None,
     )
     .await
+}
+
+fn s2s_target_resolution_cache_key(
+    server: &Arc<Box<Server>>,
+    sender: Option<&Arc<Box<Client>>>,
+    server_id: &str,
+    sender_id: ClientSessionIdentifier,
+    intent: &VoiceIntent,
+) -> Option<S2SVoiceTargetResolutionCacheKey> {
+    let target = match intent.kind.as_ref()? {
+        VoiceIntentKind::Target(target) => target,
+        _ => return None,
+    };
+
+    Some(S2SVoiceTargetResolutionCacheKey {
+        server_identity: Arc::as_ptr(server) as usize,
+        local_node_id: server.get_clients().local_node_id(),
+        server_id: server_id.to_owned(),
+        sender_session: sender_id,
+        sender_instance_id: sender.map(|sender| sender.client_instance_id()),
+        channel_version: server.get_channels().current_version_in_server(server_id),
+        channel_acl_generation: server.get_channels().channel_acl_generation(),
+        client_version: server.get_clients().current_version_in_server(server_id),
+        hide_users_without_traverse: server.get_hide_users_without_traverse(),
+        source_channel: target.source_channel,
+        sessions: target.sessions.clone(),
+        channels: target
+            .channels
+            .iter()
+            .map(|channel| S2SVoiceTargetChannelCacheKey {
+                id: channel.id,
+                children: channel.children,
+                links: channel.links,
+                group: channel.group.clone(),
+            })
+            .collect(),
+    })
+}
+
+async fn resolve_s2s_voice_intent(
+    server: &Arc<Box<Server>>,
+    sender: Option<&Arc<Box<Client>>>,
+    server_id: &str,
+    sender_id: ClientSessionIdentifier,
+    intent: &VoiceIntent,
+    default_context: AudioContext,
+) -> Vec<(Arc<Box<Client>>, AudioContext)> {
+    let Some(cache_key) =
+        s2s_target_resolution_cache_key(server, sender, server_id, sender_id, intent)
+    else {
+        return resolve_voice_intent(
+            server,
+            sender,
+            server_id,
+            sender_id,
+            intent,
+            default_context,
+        )
+        .await;
+    };
+
+    if let Some(recipients) =
+        S2S_TARGET_RECIPIENT_CACHE.read_sync(&cache_key, |_, recipients| recipients.clone())
+    {
+        return live_targets_from_cached_recipients(server, server_id, &recipients).await;
+    }
+
+    let targets = resolve_voice_intent(
+        server,
+        sender,
+        server_id,
+        sender_id,
+        intent,
+        default_context,
+    )
+    .await;
+    S2S_TARGET_RECIPIENT_CACHE
+        .entry_sync(cache_key)
+        .put_entry(cacheable_recipients_from_targets(&targets));
+    targets
 }
 
 async fn resolve_voice_intent_with_resolved_channels(
@@ -1057,7 +1167,7 @@ pub(crate) async fn route_s2s_voice_frame(
         }
     };
 
-    let targets = resolve_voice_intent(
+    let targets = resolve_s2s_voice_intent(
         server,
         replicated_sender.as_ref(),
         &server_id,
