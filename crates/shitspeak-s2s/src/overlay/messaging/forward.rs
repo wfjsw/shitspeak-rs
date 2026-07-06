@@ -556,6 +556,7 @@ async fn send_control_to(
                 origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
                 final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
                 requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
+                lane = control.lane_id,
                 path_trace = ?control.path_trace,
                 "dropping overlay control because target is already in path_trace"
             );
@@ -568,6 +569,7 @@ async fn send_control_to(
                 origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
                 final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
                 requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
+                lane = control.lane_id,
                 path_trace = ?control.path_trace,
                 "dropping overlay control because no route exists"
             );
@@ -581,6 +583,7 @@ async fn send_control_to(
                 origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
                 final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
                 requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
+                lane = control.lane_id,
                 path_trace = ?control.path_trace,
                 "dropping overlay control because no loop-free route exists"
             );
@@ -604,7 +607,7 @@ async fn send_control_to(
     if result.is_ok() {
         crate::debug_io::record_sent(self_id, next_hop, packet_kind, payload_len);
     }
-    result
+    Ok(result?)
 }
 
 fn preflight_routes(
@@ -686,6 +689,7 @@ async fn forward_pb_as(
                     %dst,
                     ?level,
                     ?routing_metric,
+                    lane = ?data.lane_id,
                     path_trace = ?data.path_trace,
                     "dropping overlay data because destination is already in path_trace"
                 );
@@ -697,6 +701,7 @@ async fn forward_pb_as(
                     %dst,
                     ?level,
                     ?routing_metric,
+                    lane = ?data.lane_id,
                     path_trace = ?data.path_trace,
                     "dropping overlay data because no route exists"
                 );
@@ -709,6 +714,7 @@ async fn forward_pb_as(
                     %next_hop,
                     ?level,
                     ?routing_metric,
+                    lane = ?data.lane_id,
                     path_trace = ?data.path_trace,
                     "dropping overlay data because no loop-free route exists"
                 );
@@ -1194,10 +1200,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            selected,
-            ForwardNextHop::Send { next_hop: 3 }
-        );
+        assert_eq!(selected, ForwardNextHop::Send { next_hop: 3 });
     }
 
     #[test]

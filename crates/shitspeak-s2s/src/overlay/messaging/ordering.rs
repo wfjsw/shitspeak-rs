@@ -312,12 +312,13 @@ impl OverlayOrdering {
         let key = OutboundKey { dst, lane };
         let mut pending = self.pending.lock().await;
         let packets = pending.entry(key).or_default();
+        let now = Instant::now();
         packets.insert(
             data.ordering_seq,
             PendingPacket {
                 data,
-                first_sent_at: Instant::now(),
-                next_retry_at: Instant::now() + self.retry_initial,
+                first_sent_at: now,
+                next_retry_at: now + self.retry_initial,
                 retry_delay: self.retry_initial,
                 retry_attempts: 0,
             },
@@ -811,27 +812,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_pending_retries_until_attempt_cap_then_drops() {
+    async fn ordered_pending_retries_up_to_sixteen_attempt_cap_then_drops() {
         let cfg = OverlayConfig::new(Vec::new())
             .with_ordered_retry_initial(Duration::from_millis(1))
             .with_ordered_retry_max(Duration::from_millis(1))
             .with_ordered_retry_max_age(Duration::from_secs(30))
-            .with_ordered_retry_max_attempts(2);
+            .with_ordered_retry_max_attempts(16);
         let ordering = OverlayOrdering::new(&cfg);
         ordering.store_pending(lane(), data(0, b"pending")).await;
 
         let first_due = Instant::now() + Duration::from_millis(5);
-        assert_eq!(ordering.due_retransmits(first_due).await.len(), 1);
-        assert_eq!(
-            ordering
-                .due_retransmits(first_due + Duration::from_millis(1))
-                .await
-                .len(),
-            1
-        );
+        for attempt in 0..16 {
+            assert_eq!(
+                ordering
+                    .due_retransmits(first_due + Duration::from_millis(attempt))
+                    .await
+                    .len(),
+                1,
+                "attempt {attempt} should retransmit"
+            );
+        }
         assert!(
             ordering
-                .due_retransmits(first_due + Duration::from_millis(2))
+                .due_retransmits(first_due + Duration::from_millis(16))
                 .await
                 .is_empty()
         );
