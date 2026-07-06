@@ -27,7 +27,7 @@ use rustls::SignatureScheme;
 use rustls_pki_types::CertificateDer;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify, oneshot};
-use tokio::time::{Instant as TokioInstant, Interval, interval_at};
+use tokio::time::{Instant as TokioInstant, Interval, interval_at, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -115,11 +115,13 @@ impl UdpEndpoint {
             },
         );
         sockets.insert(addr, ipv6_only, state.clone());
+        let local_node = inner.self_id();
         tokio::spawn(run_socket_read_loop(
             state.clone(),
-            inner,
+            inner.clone(),
             self.identity.clone(),
         ));
+        tokio::spawn(run_exchange_retransmit_loop(state.clone(), local_node));
         Ok(state)
     }
 
@@ -147,11 +149,13 @@ impl UdpEndpoint {
             )
         };
         sockets.insert(bind.addr, bind.ipv6_only, state.clone());
+        let local_node = inner.self_id();
         tokio::spawn(run_socket_read_loop(
             state.clone(),
-            inner,
+            inner.clone(),
             self.identity.clone(),
         ));
+        tokio::spawn(run_exchange_retransmit_loop(state.clone(), local_node));
         Ok(state)
     }
 }
@@ -283,6 +287,7 @@ struct UdpSocketState {
     socket: UdpIo,
     sessions: Mutex<HashMap<NodeIdentifier, Arc<UdpCryptoSession>>>,
     exchanges: Mutex<HashMap<NodeIdentifier, PeerKeyExchange>>,
+    exchange_retransmit: Notify,
     shutdown: CancellationToken,
 }
 
@@ -294,6 +299,7 @@ impl UdpSocketState {
             )),
             sessions: Mutex::new(HashMap::new()),
             exchanges: Mutex::new(HashMap::new()),
+            exchange_retransmit: Notify::new(),
             shutdown: CancellationToken::new(),
         })
     }
@@ -303,6 +309,7 @@ impl UdpSocketState {
             socket: UdpIo::Mux(Arc::new(handle)),
             sessions: Mutex::new(HashMap::new()),
             exchanges: Mutex::new(HashMap::new()),
+            exchange_retransmit: Notify::new(),
             shutdown: CancellationToken::new(),
         }
     }
@@ -312,12 +319,17 @@ impl UdpSocketState {
             socket: UdpIo::Prefixed(Arc::new(socket)),
             sessions: Mutex::new(HashMap::new()),
             exchanges: Mutex::new(HashMap::new()),
+            exchange_retransmit: Notify::new(),
             shutdown: CancellationToken::new(),
         }
     }
 
     async fn session(&self, node: NodeIdentifier) -> Option<Arc<UdpCryptoSession>> {
         self.sessions.lock().await.get(&node).cloned()
+    }
+
+    fn notify_exchange_retransmit(&self) {
+        self.exchange_retransmit.notify_one();
     }
 
     async fn insert_session(&self, session: Arc<UdpCryptoSession>) {
@@ -414,6 +426,7 @@ struct PeerKeyExchange {
     local: Option<LocalKeyOffer>,
     peer: Option<PeerKeyOffer>,
     candidate: Option<KeyCandidate>,
+    peer_addr: Option<SocketAddr>,
     early_ready: Vec<Vec<u8>>,
     waiters: Vec<oneshot::Sender<io::Result<()>>>,
     local_initiated: bool,
@@ -799,6 +812,108 @@ async fn run_socket_read_loop(
     }
 }
 
+struct ExchangeRetransmitBatch {
+    peer_node: NodeIdentifier,
+    peer_addr: SocketAddr,
+    packets: Vec<Vec<u8>>,
+}
+
+async fn run_exchange_retransmit_loop(state: Arc<UdpSocketState>, local_node: NodeIdentifier) {
+    loop {
+        tokio::select! {
+            _ = state.shutdown.cancelled() => return,
+            _ = state.exchange_retransmit.notified() => {}
+        }
+
+        loop {
+            tokio::select! {
+                _ = state.shutdown.cancelled() => return,
+                _ = sleep(UDP_KEX_RETRANSMIT_INTERVAL) => {}
+            }
+
+            let (batches, keep_armed) = collect_exchange_retransmits(&state, local_node).await;
+            for batch in batches {
+                if let Err(e) =
+                    send_exchange_packets(&state, batch.peer_node, batch.peer_addr, batch.packets)
+                        .await
+                {
+                    debug!(
+                        peer = %batch.peer_node,
+                        peer_addr = %batch.peer_addr,
+                        error = %e,
+                        "udp key exchange retransmit failed"
+                    );
+                }
+            }
+
+            if !keep_armed {
+                break;
+            }
+        }
+    }
+}
+
+async fn collect_exchange_retransmits(
+    state: &Arc<UdpSocketState>,
+    local_node: NodeIdentifier,
+) -> (Vec<ExchangeRetransmitBatch>, bool) {
+    let now = Instant::now();
+    let mut exchanges = state.exchanges.lock().await;
+    let mut batches = Vec::new();
+    let mut keep_armed = false;
+
+    for (&peer_node, exchange) in exchanges.iter_mut() {
+        let Some(peer_addr) = exchange_retransmit_addr(exchange) else {
+            continue;
+        };
+        if !exchange_retransmit_active(exchange, now) {
+            continue;
+        }
+
+        keep_armed = true;
+        let packets = exchange_packets_due(exchange, now, local_node, peer_node);
+        if !packets.is_empty() {
+            batches.push(ExchangeRetransmitBatch {
+                peer_node,
+                peer_addr,
+                packets,
+            });
+        }
+    }
+
+    (batches, keep_armed)
+}
+
+fn exchange_retransmit_addr(exchange: &PeerKeyExchange) -> Option<SocketAddr> {
+    if exchange
+        .candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.promoted)
+    {
+        return None;
+    }
+    exchange
+        .candidate
+        .as_ref()
+        .map(|candidate| candidate.peer_addr)
+        .or(exchange.peer_addr)
+}
+
+fn exchange_retransmit_active(exchange: &PeerKeyExchange, now: Instant) -> bool {
+    if exchange
+        .candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.promoted)
+    {
+        return false;
+    }
+    let offer_active =
+        exchange.local.is_some() && exchange.send_budget.offer.should_tick_again(now);
+    let ready_active =
+        exchange.candidate.is_some() && exchange.send_budget.ready.should_tick_again(now);
+    offer_active || ready_active
+}
+
 async fn handle_udp_datagram(
     state: &Arc<UdpSocketState>,
     inner: &Arc<ManagerInner>,
@@ -829,7 +944,7 @@ async fn handle_udp_datagram(
             return handle_key_offer(state, inner, identity, packet, header, peer_addr).await;
         }
         UdpPacketKind::KeyReady => {
-            return handle_key_ready(state, inner, packet, header, peer_addr).await;
+            return handle_key_ready(state, inner, identity, packet, header, peer_addr).await;
         }
         UdpPacketKind::Data => {}
     }
@@ -948,6 +1063,7 @@ async fn handle_key_offer(
 async fn handle_key_ready(
     state: &Arc<UdpSocketState>,
     inner: &Arc<ManagerInner>,
+    identity: &Arc<NodeIdentity>,
     packet: &[u8],
     header: UdpPacketHeader,
     peer_addr: SocketAddr,
@@ -959,6 +1075,7 @@ async fn handle_key_ready(
     }
     let (packets, promote) = accept_key_ready(
         state,
+        identity,
         inner.self_id(),
         header.src,
         peer_addr,
@@ -1052,20 +1169,18 @@ async fn begin_symmetric_exchange(
     identity: &NodeIdentity,
     state: &Arc<UdpSocketState>,
     peer_node: NodeIdentifier,
-    _peer_addr: SocketAddr,
+    peer_addr: SocketAddr,
     waiter: oneshot::Sender<io::Result<()>>,
 ) -> io::Result<Vec<Vec<u8>>> {
     let mut exchanges = state.exchanges.lock().await;
     let exchange = exchanges.entry(peer_node).or_default();
+    exchange.peer_addr = Some(peer_addr);
     exchange.local_initiated = true;
     exchange.waiters.push(waiter);
     ensure_local_offer(exchange, identity, peer_node)?;
-    Ok(exchange_packets_due(
-        exchange,
-        Instant::now(),
-        identity.node_id(),
-        peer_node,
-    ))
+    let packets = exchange_packets_due(exchange, Instant::now(), identity.node_id(), peer_node);
+    state.notify_exchange_retransmit();
+    Ok(packets)
 }
 
 async fn accept_peer_offer(
@@ -1078,6 +1193,7 @@ async fn accept_peer_offer(
 ) -> io::Result<(Vec<Vec<u8>>, Option<PromoteSession>)> {
     let mut exchanges = state.exchanges.lock().await;
     let exchange = exchanges.entry(peer_node).or_default();
+    exchange.peer_addr = Some(peer_addr);
     ensure_local_offer(exchange, identity, peer_node)?;
 
     let offer_changed = exchange
@@ -1085,6 +1201,19 @@ async fn accept_peer_offer(
         .as_ref()
         .is_none_or(|existing| !existing.matches(&peer_offer));
     if offer_changed {
+        if should_defer_higher_peer_offer(exchange, local_node, peer_node) {
+            debug!(
+                local = %local_node,
+                peer = %peer_node,
+                "deferring changed udp key offer from higher peer while current exchange is active"
+            );
+            let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
+            let promote = promote_if_ready(exchange, local_node, peer_node);
+            if promote.is_none() {
+                state.notify_exchange_retransmit();
+            }
+            return Ok((packets, promote));
+        }
         if exchange
             .local
             .as_ref()
@@ -1113,11 +1242,15 @@ async fn accept_peer_offer(
 
     let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
     let promote = promote_if_ready(exchange, local_node, peer_node);
+    if promote.is_none() {
+        state.notify_exchange_retransmit();
+    }
     Ok((packets, promote))
 }
 
 async fn accept_key_ready(
     state: &Arc<UdpSocketState>,
+    identity: &NodeIdentity,
     local_node: NodeIdentifier,
     peer_node: NodeIdentifier,
     peer_addr: SocketAddr,
@@ -1126,6 +1259,7 @@ async fn accept_key_ready(
 ) -> io::Result<(Vec<Vec<u8>>, Option<PromoteSession>)> {
     let mut exchanges = state.exchanges.lock().await;
     let exchange = exchanges.entry(peer_node).or_default();
+    exchange.peer_addr = Some(peer_addr);
     let Some(exchange_id) = exchange
         .candidate
         .as_ref()
@@ -1140,10 +1274,25 @@ async fn accept_key_ready(
             received_exchange_id = header.seq,
             "buffering udp key ready before a candidate exists"
         );
-        return Ok((Vec::new(), None));
+        let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
+        state.notify_exchange_retransmit();
+        return Ok((packets, None));
     };
 
     if exchange_id != header.seq {
+        if local_node < peer_node {
+            restart_lower_node_exchange(exchange, identity, peer_node)?;
+            debug!(
+                local = %local_node,
+                peer = %peer_node,
+                previous_exchange_id = exchange_id,
+                received_exchange_id = header.seq,
+                "restarting udp key exchange after stale key ready"
+            );
+            let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
+            state.notify_exchange_retransmit();
+            return Ok((packets, None));
+        }
         if exchange.early_ready.len() < 4 {
             exchange.early_ready.push(packet.to_vec());
         }
@@ -1154,6 +1303,7 @@ async fn accept_key_ready(
             received_exchange_id = header.seq,
             "ignoring udp key ready for a stale exchange"
         );
+        state.notify_exchange_retransmit();
         return Ok((Vec::new(), None));
     }
 
@@ -1163,6 +1313,9 @@ async fn accept_key_ready(
     }
     let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
     let promote = promote_if_ready(exchange, local_node, peer_node);
+    if promote.is_none() {
+        state.notify_exchange_retransmit();
+    }
     Ok((packets, promote))
 }
 
@@ -1178,6 +1331,7 @@ async fn decrypt_with_candidate_data(
         let Some(exchange) = exchanges.get_mut(&header.src) else {
             return Ok(None);
         };
+        exchange.peer_addr = Some(peer_addr);
         let Some(candidate) = exchange.candidate.as_mut() else {
             return Ok(None);
         };
@@ -1227,6 +1381,30 @@ fn replace_local_offer(
     exchange.send_budget.offer.reset();
     exchange.send_budget.ready.reset();
     Ok(())
+}
+
+fn restart_lower_node_exchange(
+    exchange: &mut PeerKeyExchange,
+    identity: &NodeIdentity,
+    peer_node: NodeIdentifier,
+) -> io::Result<()> {
+    exchange.peer = None;
+    exchange.candidate = None;
+    exchange.early_ready.clear();
+    exchange.local_initiated = true;
+    replace_local_offer(exchange, identity, peer_node)
+}
+
+fn should_defer_higher_peer_offer(
+    exchange: &PeerKeyExchange,
+    local_node: NodeIdentifier,
+    peer_node: NodeIdentifier,
+) -> bool {
+    local_node < peer_node
+        && exchange
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| !candidate.promoted)
 }
 
 fn new_local_offer(
@@ -1386,6 +1564,15 @@ fn exchange_packets_due(
 impl HandshakePacketBudget {
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn should_tick_again(&self, now: Instant) -> bool {
+        let Some(first_sent) = self.first_sent else {
+            return true;
+        };
+        let age = now.saturating_duration_since(first_sent);
+        (age < UDP_KEX_MAX_RETRANSMIT_AGE && self.retransmits < UDP_KEX_MAX_RETRANSMITS)
+            || !self.exhausted_logged
     }
 
     fn should_send(
@@ -2392,6 +2579,10 @@ fn now_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::TempDir;
 
     fn test_exchange(ready_received: bool) -> PeerKeyExchange {
         PeerKeyExchange {
@@ -2414,11 +2605,49 @@ mod tests {
                 ready_received,
                 promoted: false,
             }),
+            peer_addr: Some(SocketAddr::from(([127, 0, 0, 1], 64742))),
             early_ready: Vec::new(),
             waiters: Vec::new(),
             local_initiated: true,
             send_budget: ExchangeSendBudget::default(),
         }
+    }
+
+    fn test_identity(node_cn: &str) -> NodeIdentity {
+        let dir = TempDir::new().unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["s2s-udp-test-ca".to_string()]).unwrap();
+        let mut ca_dn = DistinguishedName::new();
+        ca_dn.push(DnType::CommonName, "s2s-udp-test-ca");
+        ca_params.distinguished_name = ca_dn;
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert: Certificate = ca_params.self_signed(&ca_key).unwrap();
+
+        let node_key = KeyPair::generate().unwrap();
+        let mut node_params = CertificateParams::new(vec![format!("node-{node_cn}")]).unwrap();
+        let mut node_dn = DistinguishedName::new();
+        node_dn.push(DnType::CommonName, node_cn);
+        node_params.distinguished_name = node_dn;
+        let node_cert = node_params.signed_by(&node_key, &ca_cert, &ca_key).unwrap();
+
+        let ca_path = dir.path().join("ca.pem");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+
+        File::create(&ca_path)
+            .unwrap()
+            .write_all(ca_cert.pem().as_bytes())
+            .unwrap();
+        File::create(&cert_path)
+            .unwrap()
+            .write_all(node_cert.pem().as_bytes())
+            .unwrap();
+        File::create(&key_path)
+            .unwrap()
+            .write_all(node_key.serialize_pem().as_bytes())
+            .unwrap();
+
+        NodeIdentity::load(&ca_path, &cert_path, &key_path).unwrap()
     }
 
     #[test]
@@ -2568,7 +2797,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_key_ready_does_not_retransmit_handshake_packets() {
+    async fn exchange_retransmit_collector_respects_packet_pacing() {
+        let state = Arc::new(
+            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
+                .await
+                .unwrap(),
+        );
+        let mut exchange = test_exchange(false);
+        assert_eq!(
+            exchange_packets_due(&mut exchange, Instant::now(), 1, 2),
+            vec![vec![0xaa], vec![0xbb]]
+        );
+        state.exchanges.lock().await.insert(2, exchange);
+
+        let (batches, keep_armed) = collect_exchange_retransmits(&state, 1).await;
+        assert!(batches.is_empty());
+        assert!(keep_armed);
+
+        {
+            let mut exchanges = state.exchanges.lock().await;
+            let exchange = exchanges.get_mut(&2).unwrap();
+            let due = Instant::now() - UDP_KEX_RETRANSMIT_INTERVAL;
+            exchange.send_budget.offer.last_sent = Some(due);
+            exchange.send_budget.ready.last_sent = Some(due);
+        }
+
+        let (batches, keep_armed) = collect_exchange_retransmits(&state, 1).await;
+        assert!(keep_armed);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].peer_node, 2);
+        assert_eq!(batches[0].packets, vec![vec![0xaa], vec![0xbb]]);
+
+        let (batches, keep_armed) = collect_exchange_retransmits(&state, 1).await;
+        assert!(batches.is_empty());
+        assert!(keep_armed);
+    }
+
+    #[tokio::test]
+    async fn exchange_retransmit_collector_stops_after_budget_exhaustion() {
+        let state = Arc::new(
+            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
+                .await
+                .unwrap(),
+        );
+        let mut exchange = test_exchange(false);
+        let first_sent = Instant::now() - UDP_KEX_RETRANSMIT_INTERVAL;
+        exchange.send_budget.offer.first_sent = Some(first_sent);
+        exchange.send_budget.offer.last_sent = Some(first_sent);
+        exchange.send_budget.offer.retransmits = UDP_KEX_MAX_RETRANSMITS;
+        exchange.send_budget.ready.first_sent = Some(first_sent);
+        exchange.send_budget.ready.last_sent = Some(first_sent);
+        exchange.send_budget.ready.retransmits = UDP_KEX_MAX_RETRANSMITS;
+        state.exchanges.lock().await.insert(2, exchange);
+
+        let (batches, keep_armed) = collect_exchange_retransmits(&state, 1).await;
+        assert!(batches.is_empty());
+        assert!(keep_armed);
+
+        let (batches, keep_armed) = collect_exchange_retransmits(&state, 1).await;
+        assert!(batches.is_empty());
+        assert!(!keep_armed);
+    }
+
+    #[tokio::test]
+    async fn higher_node_buffers_stale_key_ready_for_lower_restart() {
+        let identity = test_identity("2");
+        let state = Arc::new(
+            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
+                .await
+                .unwrap(),
+        );
+        state.exchanges.lock().await.insert(1, test_exchange(false));
+        let header = UdpPacketHeader {
+            kind: UdpPacketKind::KeyReady,
+            src: 1,
+            dst: 2,
+            seq: 99,
+        };
+        let packet = header.encode();
+
+        let (packets, promote) = accept_key_ready(
+            &state,
+            &identity,
+            2,
+            1,
+            SocketAddr::from(([127, 0, 0, 1], 64742)),
+            &packet,
+            header,
+        )
+        .await
+        .unwrap();
+
+        assert!(packets.is_empty());
+        assert!(promote.is_none());
+        assert_eq!(
+            state
+                .exchanges
+                .lock()
+                .await
+                .get(&1)
+                .unwrap()
+                .early_ready
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_node_restarts_key_exchange_on_stale_ready() {
+        let identity = test_identity("1");
         let state = Arc::new(
             UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
                 .await
@@ -2585,6 +2922,7 @@ mod tests {
 
         let (packets, promote) = accept_key_ready(
             &state,
+            &identity,
             1,
             2,
             SocketAddr::from(([127, 0, 0, 1], 64742)),
@@ -2594,18 +2932,57 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(packets.is_empty());
         assert!(promote.is_none());
-        assert_eq!(
-            state
-                .exchanges
-                .lock()
+        assert_eq!(packets.len(), 1);
+        let offer_header = UdpPacketHeader::decode(&packets[0]).unwrap();
+        assert_eq!(offer_header.kind, UdpPacketKind::KeyOffer);
+        assert_eq!(offer_header.src, 1);
+        assert_eq!(offer_header.dst, 2);
+        assert_ne!(offer_header.seq, 11);
+
+        let exchanges = state.exchanges.lock().await;
+        let exchange = exchanges.get(&2).unwrap();
+        let local = exchange.local.as_ref().unwrap();
+        assert_eq!(local.offer_id, offer_header.seq);
+        assert!(local.private_key.is_some());
+        assert!(exchange.peer.is_none());
+        assert!(exchange.candidate.is_none());
+        assert!(exchange.early_ready.is_empty());
+        assert!(exchange.local_initiated);
+    }
+
+    #[tokio::test]
+    async fn lower_node_defers_changed_higher_offer_while_candidate_active() {
+        let identity = test_identity("1");
+        let state = Arc::new(
+            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
                 .await
-                .get(&2)
-                .unwrap()
-                .early_ready
-                .len(),
-            1
+                .unwrap(),
         );
+        state.exchanges.lock().await.insert(2, test_exchange(false));
+        let (_, public_key) = generate_ephemeral_keypair().unwrap();
+
+        let (packets, promote) = accept_peer_offer(
+            &state,
+            &identity,
+            1,
+            2,
+            SocketAddr::from(([127, 0, 0, 1], 64742)),
+            PeerKeyOffer {
+                offer_id: 99,
+                public_key,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(packets, vec![vec![0xaa], vec![0xbb]]);
+        assert!(promote.is_none());
+
+        let exchanges = state.exchanges.lock().await;
+        let exchange = exchanges.get(&2).unwrap();
+        assert_eq!(exchange.local.as_ref().unwrap().offer_id, 11);
+        assert_eq!(exchange.peer.as_ref().unwrap().offer_id, 13);
+        assert_eq!(exchange.candidate.as_ref().unwrap().exchange_id, 17);
     }
 }
