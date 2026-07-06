@@ -227,9 +227,34 @@ impl RoutingTables {
         for key in Self::metric_lookup_keys(metric, level)
             .iter()
             .flatten()
-            .copied()
         {
-            if let Some(entry) = self.lookup_path_aware_for_key(self_id, dst, key, path_trace) {
+            if let Some(entry) = self.lookup_path_aware_for_key(self_id, dst, key, path_trace, None)
+            {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn lookup_avoiding_first_hop_with_metric(
+        &self,
+        self_id: NodeIdentifier,
+        dst: NodeIdentifier,
+        level: ServiceLevel,
+        metric: RoutingMetric,
+        path_trace: &HashSet<NodeIdentifier>,
+        avoid_next_hop: NodeIdentifier,
+    ) -> Option<RouteEntry> {
+        if dst == self_id || path_trace.contains(&dst) {
+            return None;
+        }
+        for key in Self::metric_lookup_keys(metric, level)
+            .iter()
+            .flatten()
+        {
+            if let Some(entry) =
+                self.lookup_path_aware_for_key(self_id, dst, key, path_trace, Some(avoid_next_hop))
+            {
                 return Some(entry);
             }
         }
@@ -272,10 +297,11 @@ impl RoutingTables {
         &self,
         self_id: NodeIdentifier,
         dst: NodeIdentifier,
-        key: RoutingTableKey,
+        key: &RoutingTableKey,
         path_trace: &HashSet<NodeIdentifier>,
+        avoid_first_hop: Option<NodeIdentifier>,
     ) -> Option<RouteEntry> {
-        let adjacency = self.adjacency.get(&key)?;
+        let adjacency = self.adjacency.get(key)?;
         if adjacency.is_empty() {
             return None;
         }
@@ -300,6 +326,9 @@ impl RoutingTables {
                 continue;
             };
             for (neighbor, edge_cost) in edges {
+                if node == self_id && avoid_first_hop == Some(*neighbor) {
+                    continue;
+                }
                 if *neighbor == self_id || path_trace.contains(neighbor) {
                     continue;
                 }

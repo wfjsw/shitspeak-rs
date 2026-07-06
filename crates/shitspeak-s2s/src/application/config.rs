@@ -39,6 +39,27 @@ pub struct VoiceConfig {
     /// doesn't reorder.
     #[serde(default)]
     pub reorder_disabled: bool,
+
+    /// Use per-sender adaptive jitter delay instead of the fixed
+    /// `reorder_max_delay_ms` gap deadline.
+    #[serde(default = "default_adaptive_jitter_enabled")]
+    pub adaptive_jitter_enabled: bool,
+
+    /// Lower bound for the adaptive per-sender reorder delay.
+    #[serde(default = "default_adaptive_jitter_min_delay_ms")]
+    pub adaptive_jitter_min_delay_ms: u64,
+
+    /// Upper bound for the adaptive per-sender reorder delay.
+    #[serde(default = "default_adaptive_jitter_max_delay_ms")]
+    pub adaptive_jitter_max_delay_ms: u64,
+
+    /// Amount added after observed jitter/loss pressure.
+    #[serde(default = "default_adaptive_jitter_growth_step_ms")]
+    pub adaptive_jitter_growth_step_ms: u64,
+
+    /// Amount removed after sustained in-order delivery.
+    #[serde(default = "default_adaptive_jitter_decay_step_ms")]
+    pub adaptive_jitter_decay_step_ms: u64,
 }
 
 impl Default for VoiceConfig {
@@ -50,6 +71,11 @@ impl Default for VoiceConfig {
             reorder_max_drop_lag_frames: default_reorder_max_drop_lag_frames(),
             reorder_max_total_buffer: default_reorder_max_total_buffer(),
             reorder_disabled: false,
+            adaptive_jitter_enabled: default_adaptive_jitter_enabled(),
+            adaptive_jitter_min_delay_ms: default_adaptive_jitter_min_delay_ms(),
+            adaptive_jitter_max_delay_ms: default_adaptive_jitter_max_delay_ms(),
+            adaptive_jitter_growth_step_ms: default_adaptive_jitter_growth_step_ms(),
+            adaptive_jitter_decay_step_ms: default_adaptive_jitter_decay_step_ms(),
         }
     }
 }
@@ -84,4 +110,19 @@ fn default_reorder_max_drop_lag_frames() -> u64 {
 }
 fn default_reorder_max_total_buffer() -> usize {
     1024
+}
+fn default_adaptive_jitter_enabled() -> bool {
+    true
+}
+fn default_adaptive_jitter_min_delay_ms() -> u64 {
+    40
+}
+fn default_adaptive_jitter_max_delay_ms() -> u64 {
+    600
+}
+fn default_adaptive_jitter_growth_step_ms() -> u64 {
+    80
+}
+fn default_adaptive_jitter_decay_step_ms() -> u64 {
+    20
 }

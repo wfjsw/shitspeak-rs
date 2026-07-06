@@ -47,6 +47,8 @@ use super::service_level::{
 use super::tls::build_tls_configs;
 
 const OUTBOUND_DISPATCH_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC: f64 = 16.0 * 1024.0;
+const DEADLINE_NEAR_EXPIRED_TTL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 pub struct PeerAddressSnapshot {
@@ -926,7 +928,7 @@ impl ConnectionManager {
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
 
-        if !has_eligible_transport(&peer, level, routing_metric, class) {
+        if !has_eligible_transport(&peer, level, routing_metric, class, options) {
             return Err(SendError::NoSuitableTransport { node });
         }
 
@@ -1010,6 +1012,7 @@ impl ConnectionManager {
                             envelope.level(),
                             envelope.routing_metric(),
                             envelope.class(),
+                            envelope.options(),
                         )
                         .into_iter()
                         .next()
@@ -1149,6 +1152,25 @@ impl ConnectionManager {
         ranked
     }
 
+    /// Best queue-pressure penalty the sender would see for this peer now.
+    /// Lower is better; expiring sends use adaptive deadline pressure while
+    /// non-expiring regular sends use the existing queued-stream penalty.
+    pub fn best_send_queue_pressure(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        options: SendOptions,
+    ) -> Option<u8> {
+        let peer = self.inner.get_peer(node)?;
+        let now = Instant::now();
+        pick_transports(&peer, level, routing_metric, class, options)
+            .first()
+            .copied()
+            .map(|transport| send_queue_penalty(&peer, transport, class, options, now))
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         // Drop streams.
@@ -1180,9 +1202,15 @@ fn pick_transport(
     level: ServiceLevel,
     routing_metric: RoutingMetric,
 ) -> Option<TransportKind> {
-    pick_transports(peer, level, routing_metric, MessageClass::Regular)
-        .first()
-        .copied()
+    pick_transports(
+        peer,
+        level,
+        routing_metric,
+        MessageClass::Regular,
+        SendOptions::default(),
+    )
+    .first()
+    .copied()
 }
 
 fn pick_transports(
@@ -1190,6 +1218,7 @@ fn pick_transports(
     level: ServiceLevel,
     routing_metric: RoutingMetric,
     class: MessageClass,
+    options: SendOptions,
 ) -> Vec<TransportKind> {
     let mut candidates: Vec<TransportKind> = peer
         .live_kinds()
@@ -1212,7 +1241,10 @@ fn pick_transports(
         }
     }
 
-    if class == MessageClass::Regular {
+    let now = Instant::now();
+    if options.expires_at().is_some() {
+        ranked.sort_by_key(|kind| deadline_queue_penalty(peer, *kind, options, now));
+    } else if class == MessageClass::Regular {
         ranked.sort_by_key(|kind| regular_queue_penalty(peer, *kind));
     }
 
@@ -1224,8 +1256,80 @@ fn has_eligible_transport(
     level: ServiceLevel,
     routing_metric: RoutingMetric,
     class: MessageClass,
+    options: SendOptions,
 ) -> bool {
-    !pick_transports(peer, level, routing_metric, class).is_empty()
+    !pick_transports(peer, level, routing_metric, class, options).is_empty()
+}
+
+fn send_queue_penalty(
+    peer: &PeerState,
+    transport: TransportKind,
+    class: MessageClass,
+    options: SendOptions,
+    now: Instant,
+) -> u8 {
+    if options.expires_at().is_some() {
+        deadline_queue_penalty(peer, transport, options, now)
+    } else if class == MessageClass::Regular {
+        regular_queue_penalty(peer, transport)
+    } else {
+        0
+    }
+}
+
+fn deadline_queue_penalty(
+    peer: &PeerState,
+    transport: TransportKind,
+    options: SendOptions,
+    now: Instant,
+) -> u8 {
+    let Some(expires_at) = options.expires_at() else {
+        return 0;
+    };
+    let remaining = expires_at.saturating_duration_since(now);
+    if remaining.is_zero() || remaining <= DEADLINE_NEAR_EXPIRED_TTL {
+        return 3;
+    }
+
+    let Some(status) = peer.outbound_stream_queue_status(transport) else {
+        return 0;
+    };
+    if status.full_samples() > 0 {
+        return 3;
+    }
+
+    let depth_bytes = status.depth();
+    if depth_bytes == 0 {
+        return 0;
+    }
+
+    let drain_bytes_per_ms = estimated_drain_bytes_per_ms(peer, transport);
+    if !drain_bytes_per_ms.is_finite() || drain_bytes_per_ms <= 0.0 {
+        return 3;
+    }
+
+    let queue_delay_ms = depth_bytes as f64 / drain_bytes_per_ms;
+    let remaining_ms = remaining.as_secs_f64() * 1_000.0;
+    if queue_delay_ms <= remaining_ms * 0.25 {
+        0
+    } else if queue_delay_ms <= remaining_ms * 0.50 {
+        1
+    } else if queue_delay_ms <= remaining_ms * 0.90 {
+        2
+    } else {
+        3
+    }
+}
+
+fn estimated_drain_bytes_per_ms(peer: &PeerState, transport: TransportKind) -> f64 {
+    let drain_bytes_per_sec = peer
+        .metrics()
+        .snapshot_per_transport()
+        .get(&transport)
+        .map(|link| link.estimated_throughput_bps())
+        .filter(|rate| rate.is_finite() && *rate >= DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC)
+        .unwrap_or(DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC);
+    drain_bytes_per_sec / 1_000.0
 }
 
 fn regular_queue_penalty(peer: &PeerState, transport: TransportKind) -> u8 {
@@ -1307,6 +1411,7 @@ fn try_dispatch_envelope(
             envelope.level(),
             envelope.routing_metric(),
             envelope.class(),
+            envelope.options(),
         )
     };
 
@@ -1721,6 +1826,16 @@ mod tests {
         (peer, receivers)
     }
 
+    fn fill_stream_queue(peer: &PeerState, kind: TransportKind, bytes: usize) {
+        let sender = peer.try_get_stream(kind).expect("live stream");
+        sender
+            .try_send(OutboundFrame::new(
+                MessageClass::Regular,
+                Bytes::from(vec![0; bytes]),
+            ))
+            .expect("stream queue should accept test payload");
+    }
+
     #[tokio::test]
     async fn inbound_dispatch_routes_control_to_control_queue() {
         let (dispatch, inbound) = test_inbound_dispatch();
@@ -2045,6 +2160,77 @@ mod tests {
             ),
             Some(TransportKind::Quic)
         );
+    }
+
+    #[test]
+    fn expiring_high_priority_avoids_stream_that_cannot_drain_before_ttl() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        fill_stream_queue(&peer, TransportKind::Tcp, 64 * 1024);
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+        );
+
+        assert_eq!(ranked.first().copied(), Some(TransportKind::Kcp));
+    }
+
+    #[test]
+    fn faster_draining_stream_with_more_bytes_can_beat_slower_shallower_stream() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        fill_stream_queue(&peer, TransportKind::Tcp, 4 * 1024);
+        fill_stream_queue(&peer, TransportKind::Kcp, 32 * 1024);
+        peer.metrics().record_payload_sent(TransportKind::Tcp, 128);
+        peer.metrics()
+            .record_payload_sent(TransportKind::Kcp, 1024 * 1024);
+        std::thread::sleep(Duration::from_millis(20));
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_millis(200)),
+        );
+
+        assert_eq!(ranked.first().copied(), Some(TransportKind::Kcp));
+    }
+
+    #[test]
+    fn unknown_deadline_throughput_uses_conservative_floor() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        fill_stream_queue(&peer, TransportKind::Tcp, 20 * 1024);
+
+        let penalty = deadline_queue_penalty(
+            &peer,
+            TransportKind::Tcp,
+            SendOptions::default().expire_after(Duration::from_secs(1)),
+            Instant::now(),
+        );
+
+        assert_eq!(penalty, 3);
+    }
+
+    #[test]
+    fn non_expiring_high_priority_keeps_existing_metric_order() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        fill_stream_queue(&peer, TransportKind::Tcp, 64 * 1024);
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::HighPriority,
+            SendOptions::default(),
+        );
+
+        assert_eq!(ranked.first().copied(), Some(TransportKind::Tcp));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Sits between the dispatch task (which decodes inbound `OverlayData`
 //! frames) and the [`AudioSink`] (which runs local fan-out). Holds back
-//! out-of-order frames for at most `reorder_max_delay_ms` to give a
-//! late-arriving in-sequence frame time to land; on deadline, emits
+//! out-of-order frames for a fixed or adaptive per-sender jitter delay
+//! to give a late-arriving in-sequence frame time to land; on deadline, emits
 //! pending in sequence order and skips past the gap.
 //!
 //! All emit decisions are made under a single `parking_lot::Mutex`;
@@ -30,6 +30,8 @@ use crate::application::config::VoiceConfig;
 use crate::application::proto::VoiceFrame;
 use shitspeak_core::NodeIdentifier;
 
+const ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN: u32 = 16;
+
 /// One emit decision: forward the bundled `(from_immediate, frame)` to
 /// the audio sink.
 pub type Emission = (NodeIdentifier, VoiceFrame);
@@ -52,6 +54,8 @@ struct SenderState {
     next_seq: u64,
     pending: BTreeMap<u64, (NodeIdentifier, VoiceFrame)>,
     deadline: Option<Instant>,
+    adaptive_delay_ms: u64,
+    in_order_run: u32,
 }
 
 impl Reorderer {
@@ -82,6 +86,58 @@ impl Reorderer {
         self.state.lock().deadlines.peek().map(|Reverse((d, _))| *d)
     }
 
+    fn adaptive_delay_bounds_ms(&self) -> (u64, u64) {
+        let min = self.cfg.adaptive_jitter_min_delay_ms;
+        let max = self.cfg.adaptive_jitter_max_delay_ms.max(min);
+        (min, max)
+    }
+
+    fn initial_adaptive_delay_ms(&self) -> u64 {
+        let (min, max) = self.adaptive_delay_bounds_ms();
+        self.cfg.reorder_max_delay_ms.clamp(min, max)
+    }
+
+    fn effective_delay_ms(&self, entry: &SenderState) -> u64 {
+        if self.cfg.adaptive_jitter_enabled {
+            entry.adaptive_delay_ms
+        } else {
+            self.cfg.reorder_max_delay_ms
+        }
+    }
+
+    fn reset_adaptive_delay(&self, entry: &mut SenderState) {
+        entry.adaptive_delay_ms = self.initial_adaptive_delay_ms();
+        entry.in_order_run = 0;
+    }
+
+    fn grow_adaptive_delay(&self, entry: &mut SenderState) {
+        if !self.cfg.adaptive_jitter_enabled {
+            return;
+        }
+        let (_, max) = self.adaptive_delay_bounds_ms();
+        entry.adaptive_delay_ms = entry
+            .adaptive_delay_ms
+            .saturating_add(self.cfg.adaptive_jitter_growth_step_ms)
+            .min(max);
+        entry.in_order_run = 0;
+    }
+
+    fn record_clean_in_order(&self, entry: &mut SenderState) {
+        if !self.cfg.adaptive_jitter_enabled {
+            return;
+        }
+        entry.in_order_run = entry.in_order_run.saturating_add(1);
+        if entry.in_order_run < ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN {
+            return;
+        }
+        let (min, _) = self.adaptive_delay_bounds_ms();
+        entry.adaptive_delay_ms = entry
+            .adaptive_delay_ms
+            .saturating_sub(self.cfg.adaptive_jitter_decay_step_ms)
+            .max(min);
+        entry.in_order_run = 0;
+    }
+
     /// Push an inbound delivery through the gate. Returns the sequence
     /// of frames the caller should hand to the audio sink, in the order
     /// they're returned. May be empty (frame is buffered) or contain
@@ -97,6 +153,7 @@ impl Reorderer {
         let arrived_epoch = frame.sender_epoch;
 
         // Make sure the per-sender entry exists.
+        let initial_adaptive_delay_ms = self.initial_adaptive_delay_ms();
         let entry = state
             .per_sender
             .entry(session)
@@ -105,6 +162,8 @@ impl Reorderer {
                 next_seq: 0,
                 pending: BTreeMap::new(),
                 deadline: None,
+                adaptive_delay_ms: initial_adaptive_delay_ms,
+                in_order_run: 0,
             });
 
         // ── 1. Sender restart (strictly greater epoch) ────────────────
@@ -122,6 +181,7 @@ impl Reorderer {
             entry.epoch = arrived_epoch;
             entry.next_seq = 0;
             entry.deadline = None;
+            self.reset_adaptive_delay(entry);
         } else if arrived_epoch < entry.epoch {
             // Old-epoch frame; drop silently.
             return emit;
@@ -144,11 +204,13 @@ impl Reorderer {
                 next = entry.next_seq,
                 "voice reorder: dropping too-late frame"
             );
+            self.grow_adaptive_delay(entry);
             return emit;
         }
         // Strictly-less but within lag: still drop (duplicate or out-of-
         // order older). next_seq has already advanced; we can't unwind.
         if frame.s2s_seq < entry.next_seq {
+            self.grow_adaptive_delay(entry);
             return emit;
         }
 
@@ -172,6 +234,11 @@ impl Reorderer {
             if entry.pending.is_empty() {
                 entry.deadline = None;
             }
+            if drained_count > 0 {
+                self.grow_adaptive_delay(entry);
+            } else if entry.pending.is_empty() {
+                self.record_clean_in_order(entry);
+            }
             state.total_pending = state.total_pending.saturating_sub(drained_count);
         } else {
             // ── 4. Gap: insert into pending. ───────────────────────────
@@ -191,13 +258,26 @@ impl Reorderer {
                 );
                 return emit;
             }
-            let entry = state.per_sender.get_mut(&session).unwrap();
-            let was_empty_before_insert = entry.pending.is_empty();
-            entry.pending.insert(frame.s2s_seq, (from, frame.clone()));
-            state.total_pending = state.total_pending.saturating_add(1);
-            if was_empty_before_insert {
-                let deadline =
-                    Instant::now() + Duration::from_millis(self.cfg.reorder_max_delay_ms);
+            let (inserted_new, deadline_delay_ms) = {
+                let entry = state.per_sender.get_mut(&session).unwrap();
+                let was_empty_before_insert = entry.pending.is_empty();
+                let inserted_new = entry
+                    .pending
+                    .insert(frame.s2s_seq, (from, frame.clone()))
+                    .is_none();
+                if inserted_new {
+                    self.grow_adaptive_delay(entry);
+                }
+                (
+                    inserted_new,
+                    was_empty_before_insert.then(|| self.effective_delay_ms(entry)),
+                )
+            };
+            if inserted_new {
+                state.total_pending = state.total_pending.saturating_add(1);
+            }
+            if let Some(delay_ms) = deadline_delay_ms {
+                let deadline = Instant::now() + Duration::from_millis(delay_ms);
                 let entry = state.per_sender.get_mut(&session).unwrap();
                 entry.deadline = Some(deadline);
                 state.deadlines.push(Reverse((deadline, session)));
@@ -262,6 +342,9 @@ impl Reorderer {
                         .map(|(s, (f, fr))| (s, f, fr))
                         .collect();
                 entry.deadline = None;
+                if !drained.is_empty() {
+                    self.grow_adaptive_delay(entry);
+                }
                 if let Some((max_seq, _, _)) = drained.last() {
                     entry.next_seq = max_seq.saturating_add(1);
                 }
@@ -278,6 +361,15 @@ impl Reorderer {
     #[cfg(test)]
     pub fn pending_total(&self) -> usize {
         self.state.lock().total_pending
+    }
+
+    #[cfg(test)]
+    pub fn adaptive_delay_ms_for(&self, session: u32) -> Option<u64> {
+        self.state
+            .lock()
+            .per_sender
+            .get(&session)
+            .map(|entry| entry.adaptive_delay_ms)
     }
 }
 
@@ -368,6 +460,7 @@ mod tests {
     fn deadline_fire_skips_gap() {
         let mut c = cfg();
         c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_enabled = false;
         let r = Reorderer::new(c);
         // 0 emits, 2 buffers (gap at 1), wait, deadline drains 2 and
         // jumps next_seq to 3.
@@ -472,6 +565,85 @@ mod tests {
         // terminator-flush path).
         assert_eq!(seqs, vec![1, 2, 4]);
         assert_eq!(r.pending_total(), 0);
+    }
+
+    #[test]
+    fn adaptive_delay_grows_after_gap_and_deadline_flush() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 25;
+        c.adaptive_jitter_growth_step_ms = 10;
+        let r = Reorderer::new(c);
+
+        r.push(11, frame(0xABC, 1, 0, false));
+        r.push(11, frame(0xABC, 1, 2, false));
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(15));
+
+        std::thread::sleep(Duration::from_millis(20));
+        let drained = r.drain_expired();
+        let seqs: Vec<u64> = drained.iter().map(|(_, f)| f.s2s_seq).collect();
+        assert_eq!(seqs, vec![2]);
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(25));
+    }
+
+    #[test]
+    fn adaptive_delay_decays_after_sustained_in_order_frames() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 25;
+        c.adaptive_jitter_growth_step_ms = 10;
+        c.adaptive_jitter_decay_step_ms = 5;
+        let r = Reorderer::new(c);
+
+        r.push(11, frame(0xABC, 1, 0, false));
+        r.push(11, frame(0xABC, 1, 2, false));
+        r.push(11, frame(0xABC, 1, 1, false));
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(25));
+
+        for seq in 3..19 {
+            r.push(11, frame(0xABC, 1, seq, false));
+        }
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(20));
+    }
+
+    #[test]
+    fn adaptive_delay_stays_within_bounds() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 10;
+        c.adaptive_jitter_min_delay_ms = 10;
+        c.adaptive_jitter_max_delay_ms = 20;
+        c.adaptive_jitter_growth_step_ms = 50;
+        c.adaptive_jitter_decay_step_ms = 50;
+        let r = Reorderer::new(c);
+
+        r.push(11, frame(0xABC, 1, 0, false));
+        r.push(11, frame(0xABC, 1, 2, false));
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(20));
+
+        for seq in 1..19 {
+            r.push(11, frame(0xABC, 1, seq, false));
+        }
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(10));
+    }
+
+    #[test]
+    fn adaptive_disabled_preserves_fixed_deadline_delay() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_enabled = false;
+        c.adaptive_jitter_min_delay_ms = 100;
+        c.adaptive_jitter_max_delay_ms = 120;
+        let r = Reorderer::new(c);
+
+        r.push(11, frame(0xABC, 1, 0, false));
+        r.push(11, frame(0xABC, 1, 2, false));
+        std::thread::sleep(Duration::from_millis(10));
+
+        let drained = r.drain_expired();
+        let seqs: Vec<u64> = drained.iter().map(|(_, f)| f.s2s_seq).collect();
+        assert_eq!(seqs, vec![2]);
     }
 
     #[test]

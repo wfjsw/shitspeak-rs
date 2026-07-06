@@ -660,6 +660,7 @@ async fn forward_pb_as(
     let routing_metric = route_metric_from_wire(data.route_metric, level)
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let tables = routing.load();
+    let send_options = transport_options_for_overlay_data(&data, transport_ttl);
 
     let path_trace_set = path_trace_set(&data.path_trace);
     let mut buckets: HashMap<NodeIdentifier, Vec<u32>> = HashMap::new();
@@ -670,7 +671,7 @@ async fn forward_pb_as(
         if dst == self_id {
             continue;
         }
-        match select_forward_next_hop(
+        match select_forward_next_hop_for_send(
             &tables,
             self_id,
             dst,
@@ -678,6 +679,9 @@ async fn forward_pb_as(
             routing_metric,
             &path_trace_set,
             is_originator,
+            Some(transport),
+            transport_class,
+            send_options,
         )? {
             ForwardNextHop::Send { next_hop } => {
                 buckets.entry(next_hop).or_default().push(*dst_wire);
@@ -758,7 +762,6 @@ async fn forward_pb_as(
             );
         }
 
-        let send_options = transport_options_for_overlay_data(&pb_msg, transport_ttl);
         let body = OverlayBody::Data(pb_msg);
         let packet_kind = crate::debug_io::classify_overlay_body(&body);
         let payload = match encode_message(&wrap(body)) {
@@ -862,6 +865,32 @@ fn select_forward_next_hop(
     path_trace_set: &HashSet<NodeIdentifier>,
     is_originator: bool,
 ) -> Result<ForwardNextHop, OverlayError> {
+    select_forward_next_hop_for_send(
+        tables,
+        self_id,
+        dst,
+        level,
+        routing_metric,
+        path_trace_set,
+        is_originator,
+        None,
+        MessageClass::Regular,
+        TransportSendOptions::default(),
+    )
+}
+
+fn select_forward_next_hop_for_send(
+    tables: &RoutingTables,
+    self_id: NodeIdentifier,
+    dst: NodeIdentifier,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    path_trace_set: &HashSet<NodeIdentifier>,
+    is_originator: bool,
+    transport: Option<&ConnectionManager>,
+    transport_class: MessageClass,
+    send_options: TransportSendOptions,
+) -> Result<ForwardNextHop, OverlayError> {
     if path_trace_set.contains(&dst) {
         return Ok(ForwardNextHop::DropAlreadyVisited);
     }
@@ -890,9 +919,68 @@ fn select_forward_next_hop(
         });
     }
 
-    Ok(ForwardNextHop::Send {
-        next_hop: entry.next_hop,
-    })
+    let next_hop = deadline_pressure_alternate(
+        tables,
+        self_id,
+        dst,
+        level,
+        routing_metric,
+        path_trace_set,
+        transport,
+        transport_class,
+        send_options,
+        entry.next_hop,
+    )
+    .unwrap_or(entry.next_hop);
+
+    Ok(ForwardNextHop::Send { next_hop })
+}
+
+fn deadline_pressure_alternate(
+    tables: &RoutingTables,
+    self_id: NodeIdentifier,
+    dst: NodeIdentifier,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    path_trace_set: &HashSet<NodeIdentifier>,
+    transport: Option<&ConnectionManager>,
+    transport_class: MessageClass,
+    send_options: TransportSendOptions,
+    current_next_hop: NodeIdentifier,
+) -> Option<NodeIdentifier> {
+    if send_options.expires_at().is_none() {
+        return None;
+    }
+    let transport = transport?;
+    let current_pressure = transport.best_send_queue_pressure(
+        current_next_hop,
+        level,
+        routing_metric,
+        transport_class,
+        send_options,
+    )?;
+    if current_pressure < 2 {
+        return None;
+    }
+    let alternate = tables.lookup_avoiding_first_hop_with_metric(
+        self_id,
+        dst,
+        level,
+        routing_metric,
+        path_trace_set,
+        current_next_hop,
+    )?;
+    if alternate.next_hop == current_next_hop {
+        return None;
+    }
+    let alternate_pressure = transport.best_send_queue_pressure(
+        alternate.next_hop,
+        level,
+        routing_metric,
+        transport_class,
+        send_options,
+    )?;
+    (alternate_pressure < current_pressure).then_some(alternate.next_hop)
 }
 
 #[cfg(test)]
@@ -963,6 +1051,32 @@ mod tests {
             tables.insert_table(RoutingMetric::ReliableCost, level, table.clone());
         }
         routing.store(Arc::new(tables));
+        routing
+    }
+
+    fn tables_with_direct_and_indirect_route() -> RoutingTables {
+        let mut tables = RoutingTables::empty();
+        tables.insert_table_with_adjacency(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            HashMap::from([(
+                4,
+                RouteEntry {
+                    next_hop: 4,
+                    cost: 1,
+                },
+            )]),
+            HashMap::from([
+                (1, vec![(4, edge(1)), (3, edge(5))]),
+                (3, vec![(4, edge(1))]),
+            ]),
+        );
+        tables
+    }
+
+    fn routing_with_direct_and_indirect_route() -> RoutingHandle {
+        let routing = new_handle();
+        routing.store(Arc::new(tables_with_direct_and_indirect_route()));
         routing
     }
 
@@ -1044,6 +1158,35 @@ mod tests {
             }
         }
         panic!("outbound test queue did not report backpressure");
+    }
+
+    async fn build_deadline_stream_pressure(transport: &ConnectionManager, peer: NodeIdentifier) {
+        transport
+            .try_send_with_options(
+                peer,
+                ServiceLevel::Reliable,
+                Some(RoutingMetric::ReliableCost),
+                MessageClass::Regular,
+                Bytes::from(vec![0; 512 * 1024]),
+                TransportSendOptions::default(),
+            )
+            .await
+            .expect("stream pressure seed should enqueue");
+
+        for _ in 0..20 {
+            if transport.best_send_queue_pressure(
+                peer,
+                ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
+                MessageClass::HighPriority,
+                TransportSendOptions::default().expire_after(VOICE_TRANSPORT_TTL),
+            ) == Some(3)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("stream queue pressure did not become visible");
     }
 
     #[test]
@@ -1220,6 +1363,86 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected, ForwardNextHop::DropAlreadyVisited);
+    }
+
+    #[test]
+    fn avoiding_first_hop_still_allows_indirect_route_to_that_destination() {
+        let tables = tables_with_direct_and_indirect_route();
+        let path_trace = HashSet::from([1]);
+
+        let alternate = tables
+            .lookup_avoiding_first_hop_with_metric(
+                1,
+                4,
+                ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
+                &path_trace,
+                4,
+            )
+            .expect("indirect route should remain available");
+
+        assert_eq!(alternate.next_hop, 3);
+    }
+
+    #[tokio::test]
+    async fn deadline_sensitive_forward_chooses_less_pressured_alternate_first_hop() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        let _direct_rx = receivers.pop().unwrap();
+        let mut alternate_rx = transport.test_install_live_stream(3, TransportKind::Tcp);
+        build_deadline_stream_pressure(&transport, 4).await;
+        let routing = routing_with_direct_and_indirect_route();
+        let mut data = test_overlay_data(false);
+        data.service_tag = VOICE_SERVICE_TAG;
+
+        forward_pb_as(
+            &transport,
+            &routing,
+            1,
+            data,
+            MessageClass::HighPriority,
+            true,
+            None,
+        )
+        .await
+        .expect("voice forward should use alternate");
+
+        let forwarded = timeout(Duration::from_millis(50), alternate_rx.recv())
+            .await
+            .expect("alternate first hop should receive forwarded voice")
+            .expect("alternate receiver should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(data.dsts, vec![node_to_wire(4)]);
+    }
+
+    #[tokio::test]
+    async fn deadline_sensitive_forward_keeps_direct_when_alternate_is_not_better() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        let _alternate_rx = transport.test_install_live_stream(3, TransportKind::Tcp);
+        build_deadline_stream_pressure(&transport, 4).await;
+        build_deadline_stream_pressure(&transport, 3).await;
+        let tables = tables_with_direct_and_indirect_route();
+        let path_trace = HashSet::from([1]);
+
+        let selected = select_forward_next_hop_for_send(
+            &tables,
+            1,
+            4,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            true,
+            Some(&transport),
+            MessageClass::HighPriority,
+            TransportSendOptions::default().expire_after(VOICE_TRANSPORT_TTL),
+        )
+        .expect("route should be selectable");
+
+        assert_eq!(selected, ForwardNextHop::Send { next_hop: 4 });
     }
 
     #[tokio::test]
