@@ -317,6 +317,7 @@ pub struct LinkMetrics {
     samples: u64,
     last_update: Option<Instant>,
     throughput_confidence_ppm: u32,
+    unmatched_probe_pongs: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -549,6 +550,10 @@ impl LinkMetrics {
 
     pub fn lost_probe_packets(&self) -> u64 {
         self.loss.lost_probe_sample_count()
+    }
+
+    pub fn unmatched_probe_pongs(&self) -> u64 {
+        self.unmatched_probe_pongs
     }
 
     pub fn samples(&self) -> u64 {
@@ -904,6 +909,7 @@ struct LinkInner {
     native_loss_ewma_ppm: f64,
     native_loss_ewma_samples: u64,
     data_health: LossWindow,
+    unmatched_probe_pongs: u64,
 }
 
 impl LinkInner {
@@ -929,6 +935,7 @@ impl LinkInner {
             native_loss_ewma_ppm: 0.0,
             native_loss_ewma_samples: 0,
             data_health: LossWindow::new(window),
+            unmatched_probe_pongs: 0,
         }
     }
 
@@ -1099,6 +1106,15 @@ impl PeerMetrics {
         entry.record_probe_loss_sample(true, self.tuning.packet_loss_alpha);
     }
 
+    pub fn record_unmatched_probe_pong(&self, transport: TransportKind) {
+        let mut g = self.inner.lock();
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
+        entry.unmatched_probe_pongs = entry.unmatched_probe_pongs.saturating_add(1);
+        entry.last_update = Some(Instant::now());
+    }
+
     pub fn record_native_loss_sample(
         &self,
         transport: TransportKind,
@@ -1210,6 +1226,7 @@ impl PeerMetrics {
                     samples: inner.samples,
                     last_update: inner.last_update,
                     throughput_confidence_ppm,
+                    unmatched_probe_pongs: inner.unmatched_probe_pongs,
                 };
                 (*t, m)
             })

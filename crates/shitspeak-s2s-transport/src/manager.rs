@@ -1244,6 +1244,9 @@ fn pick_transports(
     let now = Instant::now();
     if options.expires_at().is_some() {
         ranked.sort_by_key(|kind| deadline_queue_penalty(peer, *kind, options, now));
+        if class == MessageClass::HighPriority {
+            ranked.retain(|kind| deadline_queue_penalty(peer, *kind, options, now) < 3);
+        }
     } else if class == MessageClass::Regular {
         ranked.sort_by_key(|kind| regular_queue_penalty(peer, *kind));
     }
@@ -1738,6 +1741,7 @@ fn build_endpoints(
             client_tls.clone(),
             cfg.kcp_listen_addrs().iter().copied(),
             mux.clone(),
+            cfg.kcp_tuning(),
         ))
     });
     let quic = if !cfg.quic_listen_addrs().is_empty() || has_seed(TransportKind::Quic) {
@@ -2199,6 +2203,51 @@ mod tests {
         );
 
         assert_eq!(ranked.first().copied(), Some(TransportKind::Kcp));
+    }
+
+    #[test]
+    fn expiring_high_priority_skips_saturated_kcp_when_alternative_exists() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        peer.record_outbound_stream_queue_sample(
+            TransportKind::Kcp,
+            MessageClass::HighPriority,
+            1024 * 1024,
+            1024 * 1024,
+            true,
+        );
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+        );
+
+        assert_eq!(ranked, vec![TransportKind::Tcp]);
+    }
+
+    #[test]
+    fn expiring_high_priority_reports_no_choice_when_only_kcp_is_saturated() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Kcp]);
+        peer.record_outbound_stream_queue_sample(
+            TransportKind::Kcp,
+            MessageClass::HighPriority,
+            1024 * 1024,
+            1024 * 1024,
+            true,
+        );
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::ReliableLowLatency,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+        );
+
+        assert!(ranked.is_empty());
     }
 
     #[test]

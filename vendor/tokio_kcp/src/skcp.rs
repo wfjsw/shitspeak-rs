@@ -7,8 +7,7 @@ use std::{
 
 use futures_util::future;
 use kcp::{Error as KcpError, Kcp, KcpResult, KcpStats};
-use log::{error, trace};
-use tokio::sync::mpsc;
+use log::trace;
 
 use crate::{udp_io::SharedUdpIo, utils::now_millis, KcpConfig};
 
@@ -16,30 +15,12 @@ use crate::{udp_io::SharedUdpIo, utils::now_millis, KcpConfig};
 struct UdpOutput {
     socket: SharedUdpIo,
     target_addr: SocketAddr,
-    delay_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl UdpOutput {
     /// Create a new Writer for writing packets to UdpSocket
     pub fn new(socket: SharedUdpIo, target_addr: SocketAddr) -> UdpOutput {
-        let (delay_tx, mut delay_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        {
-            let socket = socket.clone();
-            tokio::spawn(async move {
-                while let Some(buf) = delay_rx.recv().await {
-                    if let Err(err) = socket.send_to(&buf, target_addr).await {
-                        error!("[SEND] UDP delayed send failed, error: {}", err);
-                    }
-                }
-            });
-        }
-
-        UdpOutput {
-            socket,
-            target_addr,
-            delay_tx,
-        }
+        UdpOutput { socket, target_addr }
     }
 }
 
@@ -49,11 +30,8 @@ impl Write for UdpOutput {
             Ok(n) => Ok(n),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 // send return EAGAIN
-                // ignored as packet was lost in transmission
-                trace!("[SEND] UDP send EAGAIN, packet.size: {} bytes, delayed send", buf.len());
-
-                self.delay_tx.send(buf.to_owned()).expect("channel closed unexpectedly");
-
+                // treated as packet loss/backpressure; KCP may retransmit.
+                trace!("[SEND] UDP send EAGAIN, packet.size: {} bytes, dropped", buf.len());
                 Ok(buf.len())
             }
             Err(err) => Err(err),
@@ -62,6 +40,63 @@ impl Write for UdpOutput {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use crate::udp_io::KcpUdpIo;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct BlockingUdpIo {
+        async_send_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl KcpUdpIo for BlockingUdpIo {
+        async fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::WouldBlock))
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            Err(io::Error::from(ErrorKind::WouldBlock))
+        }
+
+        async fn send_to(&self, buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+            self.async_send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(buf.len())
+        }
+
+        fn try_send_to(&self, _buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::WouldBlock))
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().expect("socket addr"))
+        }
+    }
+
+    #[tokio::test]
+    async fn would_block_send_is_dropped_instead_of_deferred() {
+        let async_send_calls = Arc::new(AtomicUsize::new(0));
+        let socket: SharedUdpIo = Arc::new(BlockingUdpIo {
+            async_send_calls: async_send_calls.clone(),
+        });
+        let target = "127.0.0.1:9".parse().expect("socket addr");
+        let mut output = UdpOutput::new(socket, target);
+
+        assert_eq!(output.write(b"kcp packet").expect("write"), 10);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(async_send_calls.load(Ordering::SeqCst), 0);
     }
 }
 

@@ -78,7 +78,7 @@ mod tls;
 
 pub use adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 pub use compression::SendOptions;
-pub use config::{TransportConfig, TransportTuning};
+pub use config::{KcpTuning, TransportConfig, TransportTuning};
 pub use connection::AddressBackoffSnapshot;
 pub use error::{ConfigError, SendError, TransportError};
 pub use frame::{Frame, FrameType, build_frame, decode_frame, encode_frame, encode_frame_to_bytes};

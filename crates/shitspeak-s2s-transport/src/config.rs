@@ -71,6 +71,7 @@ pub struct TransportConfig {
 
     max_frame_bytes: usize,
     udp_mtu: usize,
+    kcp_tuning: KcpTuning,
     compression: CompressionConfig,
 
     // ── Per-link metrics smoothing ──
@@ -149,6 +150,7 @@ impl TransportConfig {
             outbound_capacity: 256,
             max_frame_bytes: 1 << 20,
             udp_mtu: 1200,
+            kcp_tuning: KcpTuning::default(),
             compression: CompressionConfig::default(),
             latency_ewma_alpha: 0.2,
             jitter_ewma_alpha: 1.0 / 16.0,
@@ -350,6 +352,10 @@ impl TransportConfig {
 
     pub fn udp_mtu(&self) -> usize {
         self.udp_mtu
+    }
+
+    pub fn kcp_tuning(&self) -> KcpTuning {
+        self.kcp_tuning
     }
 
     pub fn compression_enabled(&self) -> bool {
@@ -658,6 +664,11 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_kcp_tuning(mut self, tuning: KcpTuning) -> Self {
+        self.kcp_tuning = tuning;
+        self
+    }
+
     pub fn with_compression_enabled(mut self, enabled: bool) -> Self {
         self.compression = self.compression.with_enabled(enabled);
         self
@@ -772,6 +783,61 @@ fn push_unique_socket_addr(out: &mut Vec<SocketAddr>, addr: SocketAddr) {
     }
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KcpTuning {
+    #[serde(default = "default_kcp_nodelay")]
+    nodelay: bool,
+    #[serde(default = "default_kcp_interval_ms")]
+    interval_ms: u32,
+    #[serde(default = "default_kcp_fast_resend")]
+    fast_resend: u32,
+    #[serde(default = "default_kcp_no_congestion")]
+    no_congestion: bool,
+    #[serde(default = "default_kcp_flush_write")]
+    flush_write: bool,
+    #[serde(default = "default_kcp_flush_acks_input")]
+    flush_acks_input: bool,
+}
+
+impl Default for KcpTuning {
+    fn default() -> Self {
+        Self {
+            nodelay: default_kcp_nodelay(),
+            interval_ms: default_kcp_interval_ms(),
+            fast_resend: default_kcp_fast_resend(),
+            no_congestion: default_kcp_no_congestion(),
+            flush_write: default_kcp_flush_write(),
+            flush_acks_input: default_kcp_flush_acks_input(),
+        }
+    }
+}
+
+impl KcpTuning {
+    pub fn nodelay(&self) -> bool {
+        self.nodelay
+    }
+
+    pub fn interval_ms(&self) -> u32 {
+        self.interval_ms
+    }
+
+    pub fn fast_resend(&self) -> u32 {
+        self.fast_resend
+    }
+
+    pub fn no_congestion(&self) -> bool {
+        self.no_congestion
+    }
+
+    pub fn flush_write(&self) -> bool {
+        self.flush_write
+    }
+
+    pub fn flush_acks_input(&self) -> bool {
+        self.flush_acks_input
+    }
+}
+
 /// TOML-deserializable shadow of the per-link metrics smoothing, ping-cap,
 /// adaptive queue floor hints, and connection-selection knobs. Listener,
 /// advertise, PKI, and seed fields stay on the higher-level S2S config because
@@ -815,6 +881,8 @@ pub struct TransportTuning {
     pub max_dial_attempts_per_peer_tick: usize,
     #[serde(default = "default_max_outgoing_connections")]
     pub max_outgoing_connections: usize,
+    #[serde(default)]
+    kcp: KcpTuning,
     /// Legacy message-count hint used as a minimum adaptive byte budget.
     #[serde(default = "default_inbound_control_capacity")]
     inbound_control_capacity: usize,
@@ -865,6 +933,7 @@ impl Default for TransportTuning {
             unselected_link_probe_interval_secs: default_unselected_link_probe_interval_secs(),
             max_dial_attempts_per_peer_tick: default_max_dial_attempts_per_peer_tick(),
             max_outgoing_connections: default_max_outgoing_connections(),
+            kcp: KcpTuning::default(),
             inbound_control_capacity: default_inbound_control_capacity(),
             inbound_high_capacity: default_inbound_high_capacity(),
             inbound_regular_capacity: default_inbound_regular_capacity(),
@@ -912,6 +981,7 @@ impl TransportTuning {
             ))
             .with_max_dial_attempts_per_peer_tick(self.max_dial_attempts_per_peer_tick)
             .with_max_outgoing_connections(self.max_outgoing_connections)
+            .with_kcp_tuning(self.kcp)
             .with_inbound_control_capacity(self.inbound_control_capacity.max(1))
             .with_inbound_high_capacity(self.inbound_high_capacity.max(1))
             .with_inbound_regular_capacity(self.inbound_regular_capacity.max(1))
@@ -1014,6 +1084,24 @@ fn default_inbound_regular_capacity() -> usize {
 fn default_outbound_capacity() -> usize {
     131072
 }
+fn default_kcp_nodelay() -> bool {
+    true
+}
+fn default_kcp_interval_ms() -> u32 {
+    10
+}
+fn default_kcp_fast_resend() -> u32 {
+    2
+}
+fn default_kcp_no_congestion() -> bool {
+    false
+}
+fn default_kcp_flush_write() -> bool {
+    true
+}
+fn default_kcp_flush_acks_input() -> bool {
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -1076,5 +1164,47 @@ mod tests {
         assert_eq!(cfg.inbound_high_capacity(), 4096);
         assert_eq!(cfg.inbound_regular_capacity(), 65_536);
         assert_eq!(cfg.outbound_capacity(), 8192);
+    }
+
+    #[test]
+    fn transport_tuning_applies_nested_kcp_tuning() {
+        let tuning: TransportTuning = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    [kcp]
+                    nodelay = false
+                    interval_ms = 20
+                    fast_resend = 3
+                    no_congestion = true
+                    flush_write = false
+                    flush_acks_input = false
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("transport tuning parses");
+        let cfg = tuning.apply(base_config());
+        let kcp = cfg.kcp_tuning();
+
+        assert!(!kcp.nodelay());
+        assert_eq!(kcp.interval_ms(), 20);
+        assert_eq!(kcp.fast_resend(), 3);
+        assert!(kcp.no_congestion());
+        assert!(!kcp.flush_write());
+        assert!(!kcp.flush_acks_input());
+    }
+
+    #[test]
+    fn kcp_tuning_defaults_are_realtime_stable() {
+        let kcp = base_config().kcp_tuning();
+
+        assert!(kcp.nodelay());
+        assert_eq!(kcp.interval_ms(), 10);
+        assert_eq!(kcp.fast_resend(), 2);
+        assert!(!kcp.no_congestion());
+        assert!(kcp.flush_write());
+        assert!(kcp.flush_acks_input());
     }
 }

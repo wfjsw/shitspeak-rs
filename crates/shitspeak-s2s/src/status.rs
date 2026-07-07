@@ -122,6 +122,7 @@ pub(crate) struct TransportMetric {
     loss_sample_count: u64,
     probe_packets: u64,
     lost_probe_packets: u64,
+    unmatched_probe_pongs: u64,
     native_loss_samples: u64,
     native_lost_samples: u64,
     data_health_samples: u64,
@@ -464,6 +465,7 @@ pub(crate) fn build_topology_snapshot(
                 loss_sample_count: metric.loss_sample_count(),
                 probe_packets: metric.probe_packets(),
                 lost_probe_packets: metric.lost_probe_packets(),
+                unmatched_probe_pongs: metric.unmatched_probe_pongs(),
                 native_loss_samples: metric.native_loss_samples(),
                 native_lost_samples: metric.native_lost_samples(),
                 data_health_samples: metric.data_health_samples(),
@@ -737,6 +739,11 @@ impl<'a> PrometheusWriter<'a> {
         self.header(
             "shitspeak_s2s_direct_metric_loss_ppm",
             "Local direct peer loss by kind.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_direct_metric_unmatched_probe_pongs",
+            "Local direct peer probe pongs that did not match pending pings.",
             "gauge",
         );
         self.header(
@@ -1101,6 +1108,11 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
                 value as f64,
             ));
         }
+        out.push(sample_with_base(
+            "shitspeak_s2s_direct_metric_unmatched_probe_pongs",
+            &base,
+            metric.unmatched_probe_pongs as f64,
+        ));
         for (direction, value) in [
             ("recv", metric.compression_recv_ratio),
             ("sent", metric.compression_sent_ratio),
@@ -1732,7 +1744,7 @@ function renderTables(data) {
   queuesTbody.innerHTML = queues.length
     ? queues.map(q => `<tr><td>${esc(q.direction)}</td><td>${q.target}</td><td>${q.depth}</td><td>${q.high}</td><td>${q.capacity}</td><td>${q.full}</td></tr>`).join('')
     : `<tr><td colspan="6" class="transport">-</td></tr>`;
-  metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${compressionCell(m)}</td></tr>`).join('');
+  metricsTbody.innerHTML = data.local_metrics.map(m => `<tr><td>${m.peer}</td><td>${esc(m.transport)}</td><td>${fmtUs(m.rtt_us)}</td><td>${fmtUs(m.jitter_us)}</td><td>${lossBreakdown(m)}<br><span class="transport">probe ${m.lost_probe_packets}/${m.probe_packets} &middot; unmatched ${m.unmatched_probe_pongs} &middot; native ${m.native_lost_samples}/${m.native_loss_samples} &middot; data ${m.data_health_failures}/${m.data_health_samples}</span></td><td>${fmtPair(m.recv_bps, m.sent_bps)}</td><td>${fmtPair(m.wire_recv_bps, m.wire_sent_bps)}</td><td>${compressionCell(m)}</td></tr>`).join('');
   routesTbody.innerHTML = data.routes.map(r => `<tr><td>${esc(r.metric)}</td><td>${esc(r.level)}</td><td>${r.dst}</td><td>${r.next_hop}</td><td>${esc(r.transport)}</td><td><span class="pill ${esc(r.service_fit)}">${esc(r.service_fit)}</span></td><td>${r.cost}</td><td>${r.transport_cost ?? '-'}</td></tr>`).join('');
 }
 async function refresh() {
@@ -1895,6 +1907,7 @@ mod tests {
                 loss_sample_count: 12,
                 probe_packets: 100,
                 lost_probe_packets: 1,
+                unmatched_probe_pongs: 4,
                 native_loss_samples: 50,
                 native_lost_samples: 2,
                 data_health_samples: 40,
@@ -1947,6 +1960,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_link_health_ppm{source=\"1\",target=\"2\",transport=\"tcp,quic\",metric=\"data_health\"} 5000"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_direct_metric_unmatched_probe_pongs{source=\"1\",peer=\"2\",transport=\"quic\"} 4"
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_route_service_fit{source=\"1\",target=\"3\",dst=\"3\",next_hop=\"2\",metric=\"conversational\",level=\"reliable\",transport=\"quic\",service_fit=\"chosen\"} 1"

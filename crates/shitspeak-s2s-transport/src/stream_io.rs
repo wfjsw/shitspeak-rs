@@ -977,14 +977,13 @@ where
             encode_and_send(framed, &pong, cfg.transport, peer).await?;
         }
         pb::FrameType::FramePong => {
-            let now = now_us();
-            if now > frame.ts_us {
-                let rtt = Duration::from_micros(now - frame.ts_us);
+            if let Some(ping) = pending.take(frame.ts_us) {
+                let rtt = ping.sent_at.elapsed();
                 peer.metrics().record_rtt(cfg.transport, rtt);
-                if pending.take(frame.ts_us).is_some() {
-                    peer.metrics().record_probe_delivered(cfg.transport);
-                    transport_link_stable = true;
-                }
+                peer.metrics().record_probe_delivered(cfg.transport);
+                transport_link_stable = true;
+            } else {
+                peer.metrics().record_unmatched_probe_pong(cfg.transport);
             }
         }
         pb::FrameType::FrameHello => {
@@ -1362,5 +1361,26 @@ mod tests {
         assert!(pending.insert(1).is_none());
 
         assert!(pending.insert(2).is_some());
+    }
+
+    #[test]
+    fn matched_pong_rtt_uses_monotonic_pending_instant() {
+        let mut pending = PendingPings::new(4);
+        pending.insert(u64::MAX);
+        std::thread::sleep(Duration::from_millis(1));
+
+        let pong = pending.take(u64::MAX).expect("pending ping");
+        let rtt = pong.sent_at.elapsed();
+
+        assert!(rtt >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn unmatched_pong_does_not_consume_pending_ping() {
+        let mut pending = PendingPings::new(4);
+        pending.insert(1);
+
+        assert!(pending.take(2).is_none());
+        assert!(pending.take(1).is_some());
     }
 }

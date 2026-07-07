@@ -1636,6 +1636,49 @@ mod tests {
     }
 
     #[test]
+    fn full_config_parses_s2s_transport_kcp_tuning_path() {
+        let raw = r#"
+            listen = "127.0.0.1:0"
+            register_name = "test"
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            send_version = true
+            send_build_info = true
+            send_os_info = true
+            allowed_proxies = []
+            min_client_version = 0
+            max_users = 10
+
+            [s2s.transport.kcp]
+            nodelay = true
+            interval_ms = 10
+            fast_resend = 2
+            no_congestion = false
+            flush_write = true
+            flush_acks_input = true
+        "#;
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+        let kcp = cfg.s2s.transport.apply(TransportConfig::new(
+            "ca.pem".into(),
+            "cert.pem".into(),
+            "key.pem".into(),
+        ));
+        let kcp = kcp.kcp_tuning();
+
+        assert!(kcp.nodelay());
+        assert_eq!(kcp.interval_ms(), 10);
+        assert_eq!(kcp.fast_resend(), 2);
+        assert!(!kcp.no_congestion());
+        assert!(kcp.flush_write());
+        assert!(kcp.flush_acks_input());
+    }
+
+    #[test]
     fn s2s_geo_manual_coordinates_parse_and_validate_bounds() {
         let cfg = parse_s2s(
             r#"
@@ -2352,6 +2395,14 @@ mod tests {
             compression_level = 3
             compression_adaptive_dictionary_enabled = true
             compression_dictionary_path = '__DICT__'
+
+            [transport.kcp]
+            nodelay = true
+            interval_ms = 10
+            fast_resend = 2
+            no_congestion = false
+            flush_write = true
+            flush_acks_input = true
         "#
         .replace("__DICT__", &dictionary_path.display().to_string());
         let cfg: S2sConfig = parse_s2s(&raw).expect("s2s config parses");
@@ -2445,6 +2496,13 @@ mod tests {
         assert_eq!(transport.compression_min_savings_percent(), 25);
         assert_eq!(transport.compression_level(), 3);
         assert!(transport.compression_adaptive_dictionary_enabled());
+        let kcp = transport.kcp_tuning();
+        assert!(kcp.nodelay());
+        assert_eq!(kcp.interval_ms(), 10);
+        assert_eq!(kcp.fast_resend(), 2);
+        assert!(!kcp.no_congestion());
+        assert!(kcp.flush_write());
+        assert!(kcp.flush_acks_input());
         assert_eq!(
             transport.compression_dictionary_len(),
             Some(dictionary.len())
