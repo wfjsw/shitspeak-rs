@@ -4,9 +4,15 @@
 //! owner-scoped. The defaults mirror the historical hard-coded values
 //! the runtimes used before these knobs were exposed.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use serde::Deserialize;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use super::metrics::{self, CatchupMode};
 
 /// Operator-tunable knobs for [`super::ReplicationManager`].
 #[derive(Debug, Clone)]
@@ -35,6 +41,8 @@ pub struct ReplicationConfig {
     /// this throttle dedupes burst events so we don't fan out duplicate
     /// requests when several peers join in quick succession after a heal.
     strict_bootstrap_retry_interval: Duration,
+    /// Minimum interval between steady-state catchup probes after bootstrap.
+    strict_steady_state_catchup_interval: Duration,
     /// Pending propose entries are GC'd after this period. Must be longer
     /// than `propose_ttl` so a proposer's caller-visible timeout fires
     /// before the remote-side state evaporates.
@@ -46,8 +54,22 @@ pub struct ReplicationConfig {
     // ── Owner-scoped ──
     /// Suppress duplicate per-origin catchup requests within this window.
     owner_catchup_timeout: Duration,
+    /// Cadence for owner-mode anti-entropy scans of alive origins.
+    owner_anti_entropy_interval: Duration,
     /// Cap on `CatchupOp`s returned per `OwnerCatchupResp` chunk.
     owner_max_catchup_ops: usize,
+
+    // ── Shared catchup / gateway protection ──
+    /// Maximum catchup responses that may be built/sent concurrently across
+    /// this replication manager.
+    catchup_max_in_flight_total: usize,
+    /// Maximum catchup responses that may be built/sent concurrently for one
+    /// `(topic, peer)` pair.
+    catchup_max_in_flight_per_peer: usize,
+    /// Cap on concurrent client owner-replication proposals issued by the
+    /// runtime gateway.
+    client_replication_max_in_flight: usize,
+    catchup_limiter: Arc<CatchupLimiter>,
 
     // ── Content-addressed blobs ──
     /// Max bytes per blob chunk carried inside a replication frame.
@@ -81,12 +103,18 @@ impl Default for ReplicationConfig {
             propose_ttl: Duration::from_secs(10),
             propose_semaphore_size: 32,
             strict_max_catchup_ops: 256,
-            strict_bootstrap_retry_interval: Duration::from_millis(200),
+            strict_bootstrap_retry_interval: Duration::from_millis(500),
+            strict_steady_state_catchup_interval: Duration::from_secs(5),
             pending_propose_ttl: Duration::from_secs(20),
             recovery_ttl: Duration::from_secs(10),
 
             owner_catchup_timeout: Duration::from_secs(5),
+            owner_anti_entropy_interval: Duration::from_secs(30),
             owner_max_catchup_ops: 256,
+            catchup_max_in_flight_total: 8,
+            catchup_max_in_flight_per_peer: 1,
+            client_replication_max_in_flight: 32,
+            catchup_limiter: Arc::new(CatchupLimiter::new(8, 1)),
 
             blob_chunk_size: 64 * 1024,
             blob_request_timeout: Duration::from_secs(10),
@@ -126,6 +154,9 @@ impl ReplicationConfig {
     pub fn strict_bootstrap_retry_interval(&self) -> Duration {
         self.strict_bootstrap_retry_interval
     }
+    pub fn strict_steady_state_catchup_interval(&self) -> Duration {
+        self.strict_steady_state_catchup_interval
+    }
     pub fn pending_propose_ttl(&self) -> Duration {
         self.pending_propose_ttl
     }
@@ -135,8 +166,28 @@ impl ReplicationConfig {
     pub fn owner_catchup_timeout(&self) -> Duration {
         self.owner_catchup_timeout
     }
+    pub fn owner_anti_entropy_interval(&self) -> Duration {
+        self.owner_anti_entropy_interval
+    }
     pub fn owner_max_catchup_ops(&self) -> usize {
         self.owner_max_catchup_ops
+    }
+    pub fn catchup_max_in_flight_total(&self) -> usize {
+        self.catchup_max_in_flight_total
+    }
+    pub fn catchup_max_in_flight_per_peer(&self) -> usize {
+        self.catchup_max_in_flight_per_peer
+    }
+    pub fn client_replication_max_in_flight(&self) -> usize {
+        self.client_replication_max_in_flight
+    }
+    pub(crate) fn try_begin_catchup(
+        &self,
+        mode: CatchupMode,
+        topic: &str,
+        peer: u16,
+    ) -> Option<CatchupPermit> {
+        self.catchup_limiter.try_begin(mode, topic, peer)
     }
     pub fn blob_chunk_size(&self) -> usize {
         self.blob_chunk_size
@@ -198,6 +249,10 @@ impl ReplicationConfig {
         self.strict_bootstrap_retry_interval = d;
         self
     }
+    pub fn with_strict_steady_state_catchup_interval(mut self, d: Duration) -> Self {
+        self.strict_steady_state_catchup_interval = d;
+        self
+    }
     pub fn with_pending_propose_ttl(mut self, d: Duration) -> Self {
         self.pending_propose_ttl = d;
         self
@@ -210,8 +265,26 @@ impl ReplicationConfig {
         self.owner_catchup_timeout = d;
         self
     }
+    pub fn with_owner_anti_entropy_interval(mut self, d: Duration) -> Self {
+        self.owner_anti_entropy_interval = d;
+        self
+    }
     pub fn with_owner_max_catchup_ops(mut self, n: usize) -> Self {
         self.owner_max_catchup_ops = n;
+        self
+    }
+    pub fn with_catchup_max_in_flight_total(mut self, n: usize) -> Self {
+        self.catchup_max_in_flight_total = n.max(1);
+        self.rebuild_catchup_limiter();
+        self
+    }
+    pub fn with_catchup_max_in_flight_per_peer(mut self, n: usize) -> Self {
+        self.catchup_max_in_flight_per_peer = n.max(1);
+        self.rebuild_catchup_limiter();
+        self
+    }
+    pub fn with_client_replication_max_in_flight(mut self, n: usize) -> Self {
+        self.client_replication_max_in_flight = n.max(1);
         self
     }
     pub fn with_blob_chunk_size(mut self, n: usize) -> Self {
@@ -250,6 +323,74 @@ impl ReplicationConfig {
         self.bulk_max_in_flight_per_peer = n.max(1);
         self
     }
+
+    fn rebuild_catchup_limiter(&mut self) {
+        self.catchup_limiter = Arc::new(CatchupLimiter::new(
+            self.catchup_max_in_flight_total,
+            self.catchup_max_in_flight_per_peer,
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct CatchupLimiter {
+    total: Arc<Semaphore>,
+    per_peer_limit: usize,
+    by_pair: Mutex<HashMap<CatchupKey, Arc<Semaphore>>>,
+}
+
+impl CatchupLimiter {
+    fn new(total_limit: usize, per_peer_limit: usize) -> Self {
+        Self {
+            total: Arc::new(Semaphore::new(total_limit.max(1))),
+            per_peer_limit: per_peer_limit.max(1),
+            by_pair: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_begin(&self, mode: CatchupMode, topic: &str, peer: u16) -> Option<CatchupPermit> {
+        let key = CatchupKey {
+            topic: topic.to_owned(),
+            peer,
+        };
+        let pair = {
+            let mut by_pair = self.by_pair.lock();
+            by_pair
+                .entry(key)
+                .or_insert_with(|| Arc::new(Semaphore::new(self.per_peer_limit)))
+                .clone()
+        };
+        let Ok(pair_permit) = pair.try_acquire_owned() else {
+            metrics::record_catchup_suppressed(mode);
+            return None;
+        };
+        let Ok(total_permit) = self.total.clone().try_acquire_owned() else {
+            metrics::record_catchup_suppressed(mode);
+            return None;
+        };
+        metrics::record_catchup_active_delta(1);
+        Some(CatchupPermit {
+            _total_permit: total_permit,
+            _pair_permit: pair_permit,
+        })
+    }
+}
+
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct CatchupKey {
+    topic: String,
+    peer: u16,
+}
+
+pub(crate) struct CatchupPermit {
+    _total_permit: OwnedSemaphorePermit,
+    _pair_permit: OwnedSemaphorePermit,
+}
+
+impl Drop for CatchupPermit {
+    fn drop(&mut self) {
+        metrics::record_catchup_active_delta(-1);
+    }
 }
 
 /// TOML-deserializable shadow of [`ReplicationConfig`]. Each field maps
@@ -273,14 +414,24 @@ pub struct ReplicationTuning {
     pub strict_max_catchup_ops: usize,
     #[serde(default = "default_strict_bootstrap_retry_interval_ms")]
     pub strict_bootstrap_retry_interval_ms: u64,
+    #[serde(default = "default_strict_steady_state_catchup_interval_ms")]
+    pub strict_steady_state_catchup_interval_ms: u64,
     #[serde(default = "default_pending_propose_ttl_ms")]
     pub pending_propose_ttl_ms: u64,
     #[serde(default = "default_recovery_ttl_ms")]
     pub recovery_ttl_ms: u64,
     #[serde(default = "default_owner_catchup_timeout_ms")]
     pub owner_catchup_timeout_ms: u64,
+    #[serde(default = "default_owner_anti_entropy_interval_ms")]
+    pub owner_anti_entropy_interval_ms: u64,
     #[serde(default = "default_owner_max_catchup_ops")]
     pub owner_max_catchup_ops: usize,
+    #[serde(default = "default_catchup_max_in_flight_total")]
+    pub catchup_max_in_flight_total: usize,
+    #[serde(default = "default_catchup_max_in_flight_per_peer")]
+    pub catchup_max_in_flight_per_peer: usize,
+    #[serde(default = "default_client_replication_max_in_flight")]
+    pub client_replication_max_in_flight: usize,
     #[serde(default = "default_blob_chunk_size")]
     pub blob_chunk_size: usize,
     #[serde(default = "default_blob_request_timeout_ms")]
@@ -312,10 +463,16 @@ impl Default for ReplicationTuning {
             propose_semaphore_size: default_propose_semaphore_size(),
             strict_max_catchup_ops: default_strict_max_catchup_ops(),
             strict_bootstrap_retry_interval_ms: default_strict_bootstrap_retry_interval_ms(),
+            strict_steady_state_catchup_interval_ms:
+                default_strict_steady_state_catchup_interval_ms(),
             pending_propose_ttl_ms: default_pending_propose_ttl_ms(),
             recovery_ttl_ms: default_recovery_ttl_ms(),
             owner_catchup_timeout_ms: default_owner_catchup_timeout_ms(),
+            owner_anti_entropy_interval_ms: default_owner_anti_entropy_interval_ms(),
             owner_max_catchup_ops: default_owner_max_catchup_ops(),
+            catchup_max_in_flight_total: default_catchup_max_in_flight_total(),
+            catchup_max_in_flight_per_peer: default_catchup_max_in_flight_per_peer(),
+            client_replication_max_in_flight: default_client_replication_max_in_flight(),
             blob_chunk_size: default_blob_chunk_size(),
             blob_request_timeout_ms: default_blob_request_timeout_ms(),
             blob_offer_wait_ms: default_blob_offer_wait_ms(),
@@ -342,10 +499,19 @@ impl From<ReplicationTuning> for ReplicationConfig {
             .with_strict_bootstrap_retry_interval(Duration::from_millis(
                 t.strict_bootstrap_retry_interval_ms,
             ))
+            .with_strict_steady_state_catchup_interval(Duration::from_millis(
+                t.strict_steady_state_catchup_interval_ms,
+            ))
             .with_pending_propose_ttl(Duration::from_millis(t.pending_propose_ttl_ms))
             .with_recovery_ttl(Duration::from_millis(t.recovery_ttl_ms))
             .with_owner_catchup_timeout(Duration::from_millis(t.owner_catchup_timeout_ms))
+            .with_owner_anti_entropy_interval(Duration::from_millis(
+                t.owner_anti_entropy_interval_ms,
+            ))
             .with_owner_max_catchup_ops(t.owner_max_catchup_ops)
+            .with_catchup_max_in_flight_total(t.catchup_max_in_flight_total)
+            .with_catchup_max_in_flight_per_peer(t.catchup_max_in_flight_per_peer)
+            .with_client_replication_max_in_flight(t.client_replication_max_in_flight)
             .with_blob_chunk_size(t.blob_chunk_size)
             .with_blob_request_timeout(Duration::from_millis(t.blob_request_timeout_ms))
             .with_blob_offer_wait(Duration::from_millis(t.blob_offer_wait_ms))
@@ -380,7 +546,10 @@ fn default_strict_max_catchup_ops() -> usize {
     256
 }
 fn default_strict_bootstrap_retry_interval_ms() -> u64 {
-    200
+    500
+}
+fn default_strict_steady_state_catchup_interval_ms() -> u64 {
+    5_000
 }
 fn default_pending_propose_ttl_ms() -> u64 {
     20_000
@@ -391,8 +560,20 @@ fn default_recovery_ttl_ms() -> u64 {
 fn default_owner_catchup_timeout_ms() -> u64 {
     5_000
 }
+fn default_owner_anti_entropy_interval_ms() -> u64 {
+    30_000
+}
 fn default_owner_max_catchup_ops() -> usize {
     256
+}
+fn default_catchup_max_in_flight_total() -> usize {
+    8
+}
+fn default_catchup_max_in_flight_per_peer() -> usize {
+    1
+}
+fn default_client_replication_max_in_flight() -> usize {
+    32
 }
 fn default_blob_chunk_size() -> usize {
     64 * 1024
@@ -420,4 +601,42 @@ fn default_bulk_retry_delay_ms() -> u64 {
 }
 fn default_bulk_max_in_flight_per_peer() -> usize {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catchup_limiter_enforces_per_peer_and_total_limits() {
+        let cfg = ReplicationConfig::default()
+            .with_catchup_max_in_flight_total(2)
+            .with_catchup_max_in_flight_per_peer(1);
+
+        let first = cfg
+            .try_begin_catchup(CatchupMode::Owner, "clients", 11)
+            .expect("first catchup permit");
+        assert!(
+            cfg.try_begin_catchup(CatchupMode::Owner, "clients", 11)
+                .is_none(),
+            "same topic/peer should be limited to one active catchup"
+        );
+
+        let second = cfg
+            .try_begin_catchup(CatchupMode::Owner, "clients", 12)
+            .expect("second peer catchup permit");
+        assert!(
+            cfg.try_begin_catchup(CatchupMode::Owner, "clients", 13)
+                .is_none(),
+            "total catchup limit should cap concurrent catchups across peers"
+        );
+
+        drop(first);
+        let third = cfg
+            .try_begin_catchup(CatchupMode::Owner, "clients", 13)
+            .expect("total permit released");
+
+        drop(second);
+        drop(third);
+    }
 }

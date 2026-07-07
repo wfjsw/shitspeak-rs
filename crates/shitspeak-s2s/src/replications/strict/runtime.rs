@@ -22,6 +22,7 @@ use tracing::{debug, error, trace, warn};
 
 use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
+use super::super::metrics::{self, CatchupMode};
 use super::super::proto::{
     self as repl_proto, REPLICATION_SERVICE_TAG, StrictBody, StrictCatchupReq, StrictCatchupResp,
     StrictClockTick, StrictCommit, StrictPropose, StrictProposeAck, StrictRecoveryAck,
@@ -1000,6 +1001,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 chunk_token: HISTORY_ELECTION_SNAPSHOT_TOKEN,
                 force_snapshot: true,
             });
+            metrics::record_catchup_request(CatchupMode::Strict);
             match self.net.send_unicast(dst, &self.topic, body).await {
                 Ok(()) => {}
                 Err(e) => {
@@ -2556,7 +2558,7 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
         let Some(rt) = weak.upgrade() else {
             return;
         };
-        let mut ticker = tokio::time::interval(rt.cfg.strict_bootstrap_retry_interval());
+        let mut ticker = tokio::time::interval(rt.cfg.strict_steady_state_catchup_interval());
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -2592,6 +2594,7 @@ async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntim
         chunk_token: 0,
         force_snapshot: false,
     };
+    metrics::record_catchup_request(CatchupMode::Strict);
     let _ = rt
         .net
         .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))

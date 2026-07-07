@@ -1166,6 +1166,9 @@ pub struct Config {
     /// Default floor: 2048 (~2 MB of buffered packets).
     #[serde(default = "default_udp_channel_size")]
     pub udp_channel_size: usize,
+    /// Realtime voice-path protections and retry budgets.
+    #[serde(default)]
+    pub voice: VoiceTuning,
 
     // ── Idle timeout ──────────────────────────────────────────────────────
     /// Seconds of inactivity (no ping) before a client is disconnected.
@@ -1219,6 +1222,40 @@ pub struct Config {
     // ── Browser WebRTC gateway ──────────────────────────────────────────
     #[serde(default)]
     pub web: WebConfig,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VoiceTuning {
+    #[serde(default = "default_voice_max_udp_packet_age_ms")]
+    max_udp_packet_age_ms: u64,
+    #[serde(default = "default_voice_max_routing_queue_age_ms")]
+    max_routing_queue_age_ms: u64,
+    #[serde(default = "default_voice_udp_send_retry_budget_ms")]
+    udp_send_retry_budget_ms: u64,
+}
+
+impl Default for VoiceTuning {
+    fn default() -> Self {
+        Self {
+            max_udp_packet_age_ms: default_voice_max_udp_packet_age_ms(),
+            max_routing_queue_age_ms: default_voice_max_routing_queue_age_ms(),
+            udp_send_retry_budget_ms: default_voice_udp_send_retry_budget_ms(),
+        }
+    }
+}
+
+impl VoiceTuning {
+    pub fn max_udp_packet_age(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.max_udp_packet_age_ms)
+    }
+
+    pub fn max_routing_queue_age(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.max_routing_queue_age_ms)
+    }
+
+    pub fn udp_send_retry_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.udp_send_retry_budget_ms)
+    }
 }
 
 impl AuthenticatorConfigSource for Config {
@@ -1419,6 +1456,15 @@ fn default_root_channel_name() -> String {
 }
 fn default_udp_channel_size() -> usize {
     2048
+}
+fn default_voice_max_udp_packet_age_ms() -> u64 {
+    120
+}
+fn default_voice_max_routing_queue_age_ms() -> u64 {
+    120
+}
+fn default_voice_udp_send_retry_budget_ms() -> u64 {
+    2
 }
 fn default_udp_ping_user_count_scope() -> UdpPingUserCountScope {
     UdpPingUserCountScope::Cluster

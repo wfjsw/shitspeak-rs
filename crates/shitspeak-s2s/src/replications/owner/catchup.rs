@@ -7,6 +7,7 @@ use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
+use super::super::metrics::{self, CatchupMode};
 use super::super::proto::{CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp};
 use super::runtime::OwnerRuntime;
 use super::{LogSlice, OwnerReplicable};
@@ -19,6 +20,12 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
 ) {
     let Some(origin) = node_from_u32(req.origin_node) else {
         warn!("owner catchup req has invalid origin_node");
+        return;
+    };
+    let Some(_permit) = rt
+        .cfg
+        .try_begin_catchup(CatchupMode::Owner, &rt.topic, from)
+    else {
         return;
     };
 
@@ -56,7 +63,8 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
     let mut snapshot_msgpack: Bytes = Bytes::new();
     let mut too_old_use_snapshot = false;
 
-    let effective_ops: Vec<(u64, R::Op)> = match rt.repo.log_for_origin(origin, req.since_version) {
+    let request_since = req.since_version.max(req.chunk_token);
+    let effective_ops: Vec<(u64, R::Op)> = match rt.repo.log_for_origin(origin, request_since) {
         LogSlice::Available(ops) => ops,
         LogSlice::TooOld => {
             too_old_use_snapshot = true;
@@ -94,7 +102,13 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
     let next_chunk_token = catchup_ops
         .last()
         .map(|c| c.version)
-        .unwrap_or(req.since_version);
+        .unwrap_or(request_since);
+    let response_bytes = snapshot_msgpack.len()
+        + catchup_ops
+            .iter()
+            .map(|op| op.op_msgpack.len())
+            .sum::<usize>();
+    metrics::record_catchup_response(CatchupMode::Owner, catchup_ops.len(), response_bytes);
 
     let resp = OwnerCatchupResp {
         origin_node: origin as u32,

@@ -10,6 +10,8 @@ S2S topology metrics.
 - `provisioning/datasources/mimir.yaml`: configurable Prometheus/Mimir
   datasource.
 - `prometheus/prometheus.yml`: example scrape plus remote_write config.
+- `prometheus/shitspeak-alerts.yml`: example alert rules for S2S queue
+  pressure, slow local voice routing, and stale realtime voice drops.
 
 The dashboard's topology globe uses the `volkovlabs-echarts-panel` Grafana
 plugin, also published as Business Charts. Install that plugin before

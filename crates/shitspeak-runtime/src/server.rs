@@ -566,7 +566,7 @@ impl Server {
 
                 if voice_enabled {
                     let packet = buf.split().freeze();
-                    match tx.try_send((packet, src_addr, local_addr)) {
+                    match tx.try_send(UdpPacket::new(packet, src_addr, local_addr)) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             crate::voice::metrics::record_udp_drain_drop(
@@ -604,13 +604,30 @@ impl Server {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let (packet, src_addr, local_addr) = tokio::select! {
+                let udp_packet = tokio::select! {
                     msg = rx.recv() => match msg {
                         Some(m) => m,
                         None => break,
                     },
                     _ = shutdown.changed() => break,
                 };
+                let packet_age = udp_packet.enqueue_age();
+                crate::voice::metrics::record_packet_age(
+                    crate::voice::metrics::VoiceAgeStage::UdpPacket,
+                    packet_age,
+                );
+                crate::voice::metrics::record_scheduler_delay(
+                    crate::voice::metrics::VoiceSchedulerStage::UdpProcessing,
+                    packet_age,
+                );
+                if packet_age > server.read_config().voice.max_udp_packet_age() {
+                    crate::voice::metrics::record_stale_drop(
+                        crate::voice::metrics::VoiceAgeStage::UdpPacket,
+                    );
+                    continue;
+                }
+                let (packet, src_addr, local_addr) = udp_packet.into_parts();
+
                 // Try address-based match first.  If the cached entry exists but
                 // decrypt fails (stale NAT binding, crypt state re-keyed, etc.)
                 // the binding is removed and we fall through to IP-based candidate

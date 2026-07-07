@@ -92,6 +92,7 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         udp_ping_enabled: false,
         udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
         udp_channel_size: 2_048,
+        voice: crate::config::VoiceTuning::default(),
         client_idle_timeout_secs: 30,
         authenticate_timeout_ms: 30_000,
         auth_finalization_concurrency: 4,

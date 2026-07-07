@@ -1347,6 +1347,10 @@ impl Client {
         self.crypt_state.lock()
     }
 
+    pub fn try_crypt_state(&self) -> Option<ParkingMutexGuard<'_, Option<CryptState>>> {
+        self.crypt_state.try_lock()
+    }
+
     pub fn create_crypt_state(&self, mode: &str) -> Result<(), crate::client::crypt::CryptError> {
         let mut state = self.crypt_state.lock();
         let rng = aws_lc_rs::rand::SystemRandom::new();
@@ -1363,7 +1367,7 @@ impl Client {
     }
 
     pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) -> bool {
-        let payload = VoiceRoutingPayload { decoded_audio };
+        let payload = VoiceRoutingPayload::new(decoded_audio);
         if self.voice_routing_tx.try_send(payload).is_err() {
             crate::voice::metrics::record_queue_drop(
                 crate::voice::metrics::VoiceQueueDropReason::RoutingQueueFullOrClosed,

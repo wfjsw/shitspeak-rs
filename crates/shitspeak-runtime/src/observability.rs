@@ -364,6 +364,16 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "counter",
     ),
     (
+        "shitspeak_voice_packet_age_ms_bucket_total",
+        "Bucketed age of realtime voice packets before processing by stage.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_stale_drops_total",
+        "Total realtime voice packets dropped because they exceeded the configured age budget.",
+        "counter",
+    ),
+    (
         "shitspeak_voice_routed_frames_total",
         "Total voice frames routed by source and route kind.",
         "counter",
@@ -379,6 +389,16 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "counter",
     ),
     (
+        "shitspeak_voice_route_resolution_duration_us_total",
+        "Total local recipient resolution duration in microseconds by source and route kind.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_scheduler_delay_us_bucket_total",
+        "Bucketed scheduler delay in microseconds before voice work ran by stage.",
+        "counter",
+    ),
+    (
         "shitspeak_voice_dispatch_frames_total",
         "Total voice fanout flushes by dispatch mode.",
         "counter",
@@ -391,6 +411,16 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
     (
         "shitspeak_voice_egress_bytes_total",
         "Total outbound voice bytes by transport and result.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_crypt_lock_contention_drops_total",
+        "Total outbound UDP recipient frames dropped because the recipient crypt lock was contended.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_send_events_total",
+        "Total UDP batch send events by result.",
         "counter",
     ),
     (

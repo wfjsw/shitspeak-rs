@@ -1,0 +1,42 @@
+groups:
+  - name: shitspeak-realtime
+    rules:
+      - alert: ShitSpeakS2SRoutedQueueHigh
+        expr: |
+          max by (job, source, peer, transport) (
+            shitspeak_s2s_queue_status{direction="outgoing",metric="depth"}
+            / ignoring(metric)
+            shitspeak_s2s_queue_status{direction="outgoing",metric="capacity"}
+          ) > 0.8
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "S2S routed queue is above 80%"
+          description: "Outgoing S2S queue {{ $labels.source }} -> {{ $labels.peer }} over {{ $labels.transport }} has stayed above 80% capacity for 2 minutes."
+
+      - alert: ShitSpeakLocalVoiceRouteSlow
+        expr: |
+          sum by (job) (
+            rate(shitspeak_voice_route_duration_us_bucket_total{source="local",bucket="gt_10000"}[2m])
+          ) > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Local voice routing is slower than 10 ms"
+          description: "Local voice route duration gt_10000 bucket is above 5 frames/sec for 2 minutes."
+
+      - alert: ShitSpeakStaleVoiceDropsHigh
+        expr: |
+          (
+            sum by (job) (rate(shitspeak_voice_stale_drops_total[2m]))
+            /
+            clamp_min(sum by (job) (rate(shitspeak_voice_ingress_packets_total[2m])), 1)
+          ) > 0.01
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Realtime voice stale-drop rate is above 1%"
+          description: "Stale voice drops exceeded 1% of decoded voice ingress for 2 minutes."

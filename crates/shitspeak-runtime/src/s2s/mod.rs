@@ -45,7 +45,6 @@ use shitspeak_s2s_transport as s2s_transport;
 use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
 
 const S2S_CLIENT_REPLICATION_WORKER_CAPACITY: usize = 4096;
-const S2S_CLIENT_REPLICATION_MAX_IN_FLIGHT: usize = 256;
 const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const STRICT_PROPOSAL_GATEWAY_SLACK_TICKS: u32 = 4;
 const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
@@ -2038,6 +2037,7 @@ impl S2SManager {
                 application,
                 Some(handle),
                 recipient_index.clone(),
+                self.replication_config.client_replication_max_in_flight(),
             ));
         } else {
             bridge_tasks.push(spawn_s2s_gateway_receiver(
@@ -2046,6 +2046,7 @@ impl S2SManager {
                 application,
                 None,
                 recipient_index.clone(),
+                self.replication_config.client_replication_max_in_flight(),
             ));
         }
         if voice_delivery_strategy == s2s_application::DeliveryStrategy::Targeted {
@@ -2287,11 +2288,13 @@ fn spawn_s2s_gateway_receiver(
     application: Arc<s2s_application::ApplicationLayer>,
     client_handle: Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
     recipient_index: Arc<RecipientIndex>,
+    client_replication_max_in_flight: usize,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let client_proposal_tx = spawn_client_replication_proposal_worker(
             client_handle,
             S2S_CLIENT_REPLICATION_WORKER_CAPACITY,
+            client_replication_max_in_flight,
         );
         let S2SGatewayRx {
             control,
@@ -2381,7 +2384,7 @@ async fn run_s2s_control_gateway(
 
 async fn run_s2s_replication_gateway(
     mut rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
-    client_proposal_tx: mpsc::Sender<QueuedClientReplicationProposal>,
+    client_proposal_tx: ClientReplicationProposalQueue,
 ) {
     while let Some(command) = rx.recv().await {
         match command {
@@ -2557,15 +2560,57 @@ struct QueuedClientReplicationProposal {
     enqueued_at: Instant,
 }
 
+#[derive(Clone)]
+struct ClientReplicationProposalQueue {
+    tx: mpsc::Sender<QueuedClientReplicationProposal>,
+    depth: Arc<AtomicUsize>,
+}
+
+impl ClientReplicationProposalQueue {
+    fn try_send(
+        &self,
+        proposal: QueuedClientReplicationProposal,
+    ) -> Result<(), mpsc::error::TrySendError<QueuedClientReplicationProposal>> {
+        let depth = self.depth.fetch_add(1, Ordering::Relaxed) + 1;
+        s2s_replications::metrics::set_client_replication_queue_depth(depth);
+        match self.tx.try_send(proposal) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.mark_dequeued();
+                Err(error)
+            }
+        }
+    }
+
+    fn mark_dequeued(&self) {
+        let depth = self
+            .depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            })
+            .unwrap_or(0)
+            .saturating_sub(1);
+        s2s_replications::metrics::set_client_replication_queue_depth(depth);
+    }
+}
+
 fn spawn_client_replication_proposal_worker(
     client_handle: Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
     capacity: usize,
-) -> mpsc::Sender<QueuedClientReplicationProposal> {
+    max_in_flight: usize,
+) -> ClientReplicationProposalQueue {
     let (tx, mut rx) = mpsc::channel::<QueuedClientReplicationProposal>(capacity.max(1));
+    let queue = ClientReplicationProposalQueue {
+        tx,
+        depth: Arc::new(AtomicUsize::new(0)),
+    };
+    let worker_queue = queue.clone();
     tokio::spawn(async move {
-        let permits = Arc::new(Semaphore::new(S2S_CLIENT_REPLICATION_MAX_IN_FLIGHT));
+        let permits = Arc::new(Semaphore::new(max_in_flight.max(1)));
         while let Some(proposal) = rx.recv().await {
+            worker_queue.mark_dequeued();
             let queue_wait = proposal.enqueued_at.elapsed();
+            s2s_replications::metrics::record_client_replication_queue_wait(queue_wait);
             if queue_wait >= S2S_CLIENT_REPLICATION_SLOW_QUEUE_WAIT {
                 warn!(
                     version = proposal.entry.version,
@@ -2605,7 +2650,7 @@ fn spawn_client_replication_proposal_worker(
             });
         }
     });
-    tx
+    queue
 }
 
 async fn run_native_gateway(

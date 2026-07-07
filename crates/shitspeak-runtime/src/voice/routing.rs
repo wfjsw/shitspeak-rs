@@ -10,7 +10,8 @@ use tracing::Instrument;
 
 use super::codec::{self, Audio, PacketFormat};
 use super::metrics::{
-    VoiceDispatchMode, VoiceEgressResult, VoiceEgressTransport, VoiceRouteKind, VoiceRouteSource,
+    VoiceAgeStage, VoiceDispatchMode, VoiceEgressResult, VoiceEgressTransport, VoiceRouteKind,
+    VoiceRouteSource, VoiceSchedulerStage, VoiceUdpSendResult,
 };
 use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, DatagramBatch};
@@ -1234,6 +1235,14 @@ impl VoiceTcpEgressTally {
     }
 }
 
+fn record_udp_flush_stats(stats: udp_batch::FlushStats) {
+    super::metrics::record_udp_send_result(
+        VoiceUdpSendResult::WouldBlock,
+        stats.would_block_count(),
+    );
+    super::metrics::record_udp_send_result(VoiceUdpSendResult::Partial, stats.partial_count());
+}
+
 pub(crate) async fn flush_voice_batch(
     server: &Arc<Box<Server>>,
     audio: &Audio,
@@ -1254,6 +1263,7 @@ pub(crate) async fn flush_voice_batch(
     // and dispatch the encrypt work to rayon inside spawn_blocking so
     // multiple cores share the load.
     let server_protocol_version = server.get_server_protocol_version();
+    let udp_send_retry_budget = server.read_config().voice.udp_send_retry_budget();
 
     if targets.len() < RAYON_FANOUT_THRESHOLD {
         super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
@@ -1282,7 +1292,16 @@ pub(crate) async fn flush_voice_batch(
                 continue;
             };
 
-            let mut crypt = client.crypt_state();
+            let Some(mut crypt) = client.try_crypt_state() else {
+                super::metrics::record_crypt_lock_contention_drop(1);
+                super::metrics::record_egress(
+                    VoiceEgressTransport::Udp,
+                    VoiceEgressResult::Dropped,
+                    1,
+                    entry.bytes.len(),
+                );
+                continue;
+            };
             let Some(state) = crypt.as_mut() else {
                 continue;
             };
@@ -1328,21 +1347,32 @@ pub(crate) async fn flush_voice_batch(
                 );
                 continue;
             };
-            if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &udp_batch).await {
-                tracing::warn!("UDP batch send error: {e}");
-                super::metrics::record_egress(
-                    VoiceEgressTransport::Udp,
-                    VoiceEgressResult::Failed,
-                    packet_count,
-                    byte_count,
-                );
-            } else {
-                super::metrics::record_egress(
-                    VoiceEgressTransport::Udp,
-                    VoiceEgressResult::Sent,
-                    packet_count,
-                    byte_count,
-                );
+            match udp_batch::flush_batch_with_retry_budget(
+                socket.as_ref(),
+                &udp_batch,
+                udp_send_retry_budget,
+            )
+            .await
+            {
+                Err(e) => {
+                    tracing::warn!("UDP batch send error: {e}");
+                    super::metrics::record_egress(
+                        VoiceEgressTransport::Udp,
+                        VoiceEgressResult::Failed,
+                        packet_count,
+                        byte_count,
+                    );
+                    super::metrics::record_udp_send_result(VoiceUdpSendResult::Failed, 1);
+                }
+                Ok(stats) => {
+                    record_udp_flush_stats(stats);
+                    super::metrics::record_egress(
+                        VoiceEgressTransport::Udp,
+                        VoiceEgressResult::Sent,
+                        packet_count,
+                        byte_count,
+                    );
+                }
             }
         }
         return;
@@ -1424,7 +1454,16 @@ pub(crate) async fn flush_voice_batch(
                         else {
                             return batches;
                         };
-                        let mut crypt = client.crypt_state();
+                        let Some(mut crypt) = client.try_crypt_state() else {
+                            super::metrics::record_crypt_lock_contention_drop(1);
+                            super::metrics::record_egress(
+                                VoiceEgressTransport::Udp,
+                                VoiceEgressResult::Dropped,
+                                1,
+                                entry.bytes.len(),
+                            );
+                            return batches;
+                        };
                         let Some(state) = crypt.as_mut() else {
                             return batches;
                         };
@@ -1477,21 +1516,32 @@ pub(crate) async fn flush_voice_batch(
             );
             continue;
         };
-        if let Err(e) = udp_batch::flush_batch(socket.as_ref(), &batch).await {
-            tracing::warn!("UDP batch send error: {e}");
-            super::metrics::record_egress(
-                VoiceEgressTransport::Udp,
-                VoiceEgressResult::Failed,
-                packet_count,
-                byte_count,
-            );
-        } else {
-            super::metrics::record_egress(
-                VoiceEgressTransport::Udp,
-                VoiceEgressResult::Sent,
-                packet_count,
-                byte_count,
-            );
+        match udp_batch::flush_batch_with_retry_budget(
+            socket.as_ref(),
+            &batch,
+            udp_send_retry_budget,
+        )
+        .await
+        {
+            Err(e) => {
+                tracing::warn!("UDP batch send error: {e}");
+                super::metrics::record_egress(
+                    VoiceEgressTransport::Udp,
+                    VoiceEgressResult::Failed,
+                    packet_count,
+                    byte_count,
+                );
+                super::metrics::record_udp_send_result(VoiceUdpSendResult::Failed, 1);
+            }
+            Ok(stats) => {
+                record_udp_flush_stats(stats);
+                super::metrics::record_egress(
+                    VoiceEgressTransport::Udp,
+                    VoiceEgressResult::Sent,
+                    packet_count,
+                    byte_count,
+                );
+            }
         }
     }
 }
@@ -1523,7 +1573,14 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
                 let Some(sender) = weak_sender.upgrade() else {
                     break;
                 };
-                route_voice(&server, &sender, &payload.decoded_audio).await;
+                let queue_age = payload.enqueue_age();
+                super::metrics::record_packet_age(VoiceAgeStage::RoutingQueue, queue_age);
+                super::metrics::record_scheduler_delay(VoiceSchedulerStage::RoutingTask, queue_age);
+                if queue_age > server.read_config().voice.max_routing_queue_age() {
+                    super::metrics::record_stale_drop(VoiceAgeStage::RoutingQueue);
+                    continue;
+                }
+                route_voice(&server, &sender, payload.decoded_audio()).await;
             }
         }
         .instrument(span),

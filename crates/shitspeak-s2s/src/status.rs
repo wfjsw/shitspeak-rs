@@ -791,6 +791,56 @@ impl<'a> PrometheusWriter<'a> {
             "Debug S2S packet IO average bytes per second by packet kind and direction.",
             "gauge",
         );
+        self.header(
+            "shitspeak_s2s_replication_catchup_requests_total",
+            "S2S replication catchup requests sent by mode.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_replication_catchup_responses_total",
+            "S2S replication catchup responses built by mode.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_replication_catchup_response_ops_total",
+            "S2S replication catchup operations encoded by mode.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_replication_catchup_response_bytes_total",
+            "S2S replication catchup response payload bytes encoded by mode.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_replication_catchup_suppressed_total",
+            "S2S replication catchup responses suppressed by local limiter.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_replication_catchup_active",
+            "S2S replication catchup responses currently active.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_client_replication_worker_queue_depth",
+            "S2S client replication worker queue depth.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_client_replication_worker_queue_wait_us_total",
+            "Total time spent waiting in the S2S client replication worker queue.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_client_replication_worker_queue_wait_samples_total",
+            "S2S client replication worker queue wait samples.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_client_replication_worker_queue_wait_us_bucket_total",
+            "S2S client replication worker queue wait buckets.",
+            "counter",
+        );
 
         for sample in samples_from_snapshot(snapshot) {
             self.sample(sample);
@@ -833,6 +883,7 @@ impl<'a> PrometheusWriter<'a> {
 
 fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
     let mut out = Vec::new();
+    out.extend(crate::replications::metrics::prometheus_samples());
     let local_node = snapshot.local_node.to_string();
     for node in snapshot
         .nodes

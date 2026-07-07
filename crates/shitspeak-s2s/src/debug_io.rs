@@ -7,12 +7,14 @@
 //! field keys so release builds avoid extra full-message decodes on the hot
 //! path.
 
-use std::collections::BTreeMap;
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use bytes::{Buf, Bytes};
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use serde::Serialize;
 
 use shitspeak_core::NodeIdentifier;
@@ -21,8 +23,9 @@ use crate::application::proto as app_proto;
 use crate::overlay::proto::{OverlayBody, OverlayControlBody, OverlayData};
 use crate::replications::proto as repl_proto;
 
-static COUNTERS: LazyLock<Mutex<PacketCounters>> =
-    LazyLock::new(|| Mutex::new(PacketCounters::new()));
+const COUNTER_SHARDS: usize = 64;
+
+static COUNTERS: LazyLock<PacketCounters> = LazyLock::new(PacketCounters::new);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PacketKind {
@@ -45,18 +48,26 @@ impl PacketKind {
     }
 }
 
-#[derive(Default)]
 struct DirectionCounters {
-    bytes: u64,
-    count: u64,
+    bytes: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Default for DirectionCounters {
+    fn default() -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
 }
 
 impl DirectionCounters {
-    fn record(&mut self, bytes: usize) {
+    fn record(&self, bytes: usize) {
         // Prometheus counters can handle wraps as resets; saturating here would
         // pin a maxed counter forever.
-        self.bytes = self.bytes.wrapping_add(bytes as u64);
-        self.count = self.count.wrapping_add(1);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -66,7 +77,7 @@ struct PacketCounter {
     recv: DirectionCounters,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct PacketKey {
     source: NodeIdentifier,
     destination: NodeIdentifier,
@@ -85,52 +96,74 @@ impl PacketKey {
 
 struct PacketCounters {
     started_at: Instant,
-    by_packet: BTreeMap<PacketKey, PacketCounter>,
+    shards: Vec<RwLock<HashMap<PacketKey, Arc<PacketCounter>>>>,
 }
 
 impl PacketCounters {
     fn new() -> Self {
         Self {
             started_at: Instant::now(),
-            by_packet: BTreeMap::new(),
+            shards: (0..COUNTER_SHARDS)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
         }
     }
 
     fn record_sent(
-        &mut self,
+        &self,
         source: NodeIdentifier,
         destination: NodeIdentifier,
         kind: PacketKind,
         bytes: usize,
     ) {
-        self.by_packet
-            .entry(PacketKey::new(source, destination, kind))
-            .or_default()
-            .sent
-            .record(bytes);
+        let counter = self.counter_for(PacketKey::new(source, destination, kind));
+        counter.sent.record(bytes);
     }
 
     fn record_received(
-        &mut self,
+        &self,
         source: NodeIdentifier,
         destination: NodeIdentifier,
         kind: PacketKind,
         bytes: usize,
     ) {
-        self.by_packet
-            .entry(PacketKey::new(source, destination, kind))
-            .or_default()
-            .recv
-            .record(bytes);
+        let counter = self.counter_for(PacketKey::new(source, destination, kind));
+        counter.recv.record(bytes);
+    }
+
+    fn counter_for(&self, key: PacketKey) -> Arc<PacketCounter> {
+        let shard_index = self.shard_index(&key);
+        {
+            let shard = self.shards[shard_index].read();
+            if let Some(counter) = shard.get(&key) {
+                return Arc::clone(counter);
+            }
+        }
+        let mut shard = self.shards[shard_index].write();
+        Arc::clone(
+            shard
+                .entry(key)
+                .or_insert_with(|| Arc::new(PacketCounter::default())),
+        )
+    }
+
+    fn shard_index(&self, key: &PacketKey) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len()
     }
 
     fn snapshot(&self) -> Vec<PacketIoSnapshot> {
         let elapsed_secs = self.started_at.elapsed().as_secs_f64().max(0.001);
-        let mut out = self
-            .by_packet
-            .iter()
-            .map(|(key, counter)| PacketIoSnapshot::new(key, counter, elapsed_secs))
-            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.read();
+            out.extend(
+                shard
+                    .iter()
+                    .map(|(key, counter)| PacketIoSnapshot::new(key, counter, elapsed_secs)),
+            );
+        }
         out.sort_by(|a, b| {
             b.total_bytes
                 .cmp(&a.total_bytes)
@@ -160,11 +193,11 @@ pub struct PacketIoSnapshot {
 
 impl PacketIoSnapshot {
     fn new(key: &PacketKey, counter: &PacketCounter, elapsed_secs: f64) -> Self {
-        let sent_bytes = counter.sent.bytes;
-        let recv_bytes = counter.recv.bytes;
+        let sent_bytes = counter.sent.bytes.load(Ordering::Relaxed);
+        let recv_bytes = counter.recv.bytes.load(Ordering::Relaxed);
         let total_bytes = sent_bytes.saturating_add(recv_bytes);
-        let sent_count = counter.sent.count;
-        let recv_count = counter.recv.count;
+        let sent_count = counter.sent.count.load(Ordering::Relaxed);
+        let recv_count = counter.recv.count.load(Ordering::Relaxed);
         let total_count = sent_count.saturating_add(recv_count);
         Self {
             source: key.source,
@@ -190,6 +223,11 @@ impl PacketIoSnapshot {
     #[cfg(test)]
     fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    #[cfg(test)]
+    fn total_count(&self) -> u64 {
+        self.total_count
     }
 }
 
@@ -220,9 +258,7 @@ pub fn record_sent(
     kind: PacketKind,
     bytes: usize,
 ) {
-    COUNTERS
-        .lock()
-        .record_sent(source, destination, kind, bytes);
+    COUNTERS.record_sent(source, destination, kind, bytes);
 }
 
 pub fn record_received(
@@ -231,9 +267,7 @@ pub fn record_received(
     kind: PacketKind,
     bytes: usize,
 ) {
-    COUNTERS
-        .lock()
-        .record_received(source, destination, kind, bytes);
+    COUNTERS.record_received(source, destination, kind, bytes);
 }
 
 pub fn record_named_sent(
@@ -255,7 +289,7 @@ pub fn record_named_received(
 }
 
 pub fn snapshot() -> Vec<PacketIoSnapshot> {
-    COUNTERS.lock().snapshot()
+    COUNTERS.snapshot()
 }
 
 fn classify_overlay_data(data: &OverlayData) -> PacketKind {
@@ -474,6 +508,9 @@ fn skip_bytes(payload: &mut &[u8], len: usize) -> Result<(), ()> {
 mod tests {
     use super::*;
 
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use crate::overlay::proto::{OverlayData, level_to_wire, node_to_wire};
     use crate::replications::proto::{StrictBody, StrictClockTick, wrap_strict};
     use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
@@ -518,7 +555,7 @@ mod tests {
 
     #[test]
     fn snapshots_sort_by_total_bytes() {
-        let mut counters = PacketCounters::new();
+        let counters = PacketCounters::new();
         counters.record_sent(1, 2, PacketKind::from_static("small"), 10);
         counters.record_received(3, 1, PacketKind::from_static("large"), 20);
         counters.record_received(3, 1, PacketKind::from_static("large"), 30);
@@ -529,5 +566,42 @@ mod tests {
         assert_eq!(snapshot[0].total_bytes(), 50);
         assert_eq!(snapshot[1].kind(), "small");
         assert_eq!(snapshot[1].total_bytes(), 10);
+    }
+
+    #[test]
+    fn concurrent_record_and_snapshot_remain_consistent() {
+        const THREADS: usize = 8;
+        const ITERS: usize = 1_000;
+
+        let counters = Arc::new(PacketCounters::new());
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+
+        for _ in 0..THREADS {
+            let counters = Arc::clone(&counters);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for i in 0..ITERS {
+                    counters.record_sent(1, 2, PacketKind::from_static("stress"), 5);
+                    counters.record_received(1, 2, PacketKind::from_static("stress"), 7);
+                    if i % 128 == 0 {
+                        let _ = counters.snapshot();
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("record thread");
+        }
+
+        let snapshot = counters.snapshot();
+        let stress = snapshot
+            .iter()
+            .find(|entry| entry.kind() == "stress")
+            .expect("stress counter");
+        assert_eq!(stress.total_count(), (THREADS * ITERS * 2) as u64);
+        assert_eq!(stress.total_bytes(), (THREADS * ITERS * (5 + 7)) as u64);
     }
 }

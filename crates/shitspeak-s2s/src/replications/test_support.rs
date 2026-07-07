@@ -453,7 +453,7 @@ mod e2e_tests {
     use super::super::config::ReplicationConfig;
     use super::super::owner::runtime::OwnerRuntime;
     use super::super::proto::{
-        CatchupOp, OwnerBody, OwnerCatchupResp, OwnerOp, StrictBody, StrictPropose,
+        CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp, StrictBody, StrictPropose,
     };
     use super::super::strict::runtime::StrictRuntime;
     use super::*;
@@ -732,6 +732,57 @@ mod e2e_tests {
                 assert_eq!(req.src_node, 1);
             }
             _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_catchup_request_uses_chunk_token_as_continuation() {
+        let net = MockNet::new(2, vec![1, 2]);
+        let repo = CountingOwnerRepo::new();
+        repo.state.lock().insert(
+            2,
+            (
+                200,
+                5,
+                (1u64..=5).map(|version| (version, 700 + version)).collect(),
+            ),
+        );
+        let rt = OwnerRuntime::new(
+            repo,
+            2,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default().with_owner_max_catchup_ops(2)),
+        );
+
+        rt.recv_catchup_req(
+            1,
+            OwnerCatchupReq {
+                src_node: 1,
+                origin_node: 2,
+                known_epoch: 200,
+                since_version: 0,
+                chunk_token: 2,
+            },
+        )
+        .await;
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        match &captures[0] {
+            CapturedFrame::OwnerUnicast { dst, body, .. } => {
+                assert_eq!(*dst, 1);
+                let OwnerBody::CatchupResp(resp) = body else {
+                    panic!("expected owner catchup response, got {body:?}");
+                };
+                let versions: Vec<u64> = resp.ops.iter().map(|op| op.version).collect();
+                assert_eq!(versions, vec![3, 4]);
+                assert!(resp.has_more);
+                assert_eq!(resp.next_chunk_token, 4);
+            }
+            other => panic!("unexpected capture: {other:?}"),
         }
     }
 

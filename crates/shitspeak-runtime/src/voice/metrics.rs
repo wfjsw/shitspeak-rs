@@ -171,6 +171,53 @@ impl VoiceEgressResult {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum VoiceAgeStage {
+    UdpPacket,
+    RoutingQueue,
+}
+
+impl VoiceAgeStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UdpPacket => "udp_packet",
+            Self::RoutingQueue => "routing_queue",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VoiceSchedulerStage {
+    UdpProcessing,
+    RoutingTask,
+}
+
+impl VoiceSchedulerStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UdpProcessing => "udp_processing",
+            Self::RoutingTask => "routing_task",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VoiceUdpSendResult {
+    WouldBlock,
+    Partial,
+    Failed,
+}
+
+impl VoiceUdpSendResult {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WouldBlock => "would_block",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 const INGRESS_TRANSPORT_COUNT: usize = 2;
 const UDP_DECRYPT_PATH_COUNT: usize = 2;
 const UDP_DECRYPT_RESULT_COUNT: usize = 3;
@@ -181,6 +228,9 @@ const VOICE_ROUTE_KIND_COUNT: usize = 3;
 const VOICE_DISPATCH_MODE_COUNT: usize = 2;
 const VOICE_EGRESS_TRANSPORT_COUNT: usize = 2;
 const VOICE_EGRESS_RESULT_COUNT: usize = 4;
+const VOICE_AGE_STAGE_COUNT: usize = 2;
+const VOICE_SCHEDULER_STAGE_COUNT: usize = 2;
+const VOICE_UDP_SEND_RESULT_COUNT: usize = 3;
 
 const ROUTE_DIMENSIONS: [(VoiceRouteSource, VoiceRouteKind); 5] = [
     (VoiceRouteSource::Local, VoiceRouteKind::Normal),
@@ -219,6 +269,26 @@ const UDP_FALLBACK_CANDIDATE_BUCKETS: [(&str, u64); 7] = [
     ("17_32", 32),
     ("33_plus", u64::MAX),
 ];
+const PACKET_AGE_BUCKETS_MS: [(&str, u64); 8] = [
+    ("le_10", 10),
+    ("le_20", 20),
+    ("le_50", 50),
+    ("le_100", 100),
+    ("le_120", 120),
+    ("le_250", 250),
+    ("le_500", 500),
+    ("gt_500", u64::MAX),
+];
+const SCHEDULER_DELAY_BUCKETS_US: [(&str, u64); 8] = [
+    ("le_100", 100),
+    ("le_250", 250),
+    ("le_500", 500),
+    ("le_1000", 1_000),
+    ("le_2500", 2_500),
+    ("le_5000", 5_000),
+    ("le_10000", 10_000),
+    ("gt_10000", u64::MAX),
+];
 
 static INGRESS_PACKETS: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
 static INGRESS_BYTES: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
@@ -255,6 +325,17 @@ static EGRESS_BYTES: [[AtomicU64; VOICE_EGRESS_RESULT_COUNT]; VOICE_EGRESS_TRANS
     [const { [const { AtomicU64::new(0) }; VOICE_EGRESS_RESULT_COUNT] };
         VOICE_EGRESS_TRANSPORT_COUNT];
 static S2S_FORWARD_ATTEMPTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static PACKET_AGE_BUCKETS: [[AtomicU64; PACKET_AGE_BUCKETS_MS.len()]; VOICE_AGE_STAGE_COUNT] =
+    [const { [const { AtomicU64::new(0) }; PACKET_AGE_BUCKETS_MS.len()] }; VOICE_AGE_STAGE_COUNT];
+static STALE_DROPS: [AtomicU64; VOICE_AGE_STAGE_COUNT] =
+    [const { AtomicU64::new(0) }; VOICE_AGE_STAGE_COUNT];
+static SCHEDULER_DELAY_BUCKETS: [[AtomicU64; SCHEDULER_DELAY_BUCKETS_US.len()];
+    VOICE_SCHEDULER_STAGE_COUNT] =
+    [const { [const { AtomicU64::new(0) }; SCHEDULER_DELAY_BUCKETS_US.len()] };
+        VOICE_SCHEDULER_STAGE_COUNT];
+static CRYPT_LOCK_CONTENTION_DROPS: AtomicU64 = AtomicU64::new(0);
+static UDP_SEND_EVENTS: [AtomicU64; VOICE_UDP_SEND_RESULT_COUNT] =
+    [const { AtomicU64::new(0) }; VOICE_UDP_SEND_RESULT_COUNT];
 
 fn transport_index(transport: VoiceIngressTransport) -> usize {
     match transport {
@@ -339,6 +420,28 @@ fn egress_result_index(result: VoiceEgressResult) -> usize {
     }
 }
 
+fn age_stage_index(stage: VoiceAgeStage) -> usize {
+    match stage {
+        VoiceAgeStage::UdpPacket => 0,
+        VoiceAgeStage::RoutingQueue => 1,
+    }
+}
+
+fn scheduler_stage_index(stage: VoiceSchedulerStage) -> usize {
+    match stage {
+        VoiceSchedulerStage::UdpProcessing => 0,
+        VoiceSchedulerStage::RoutingTask => 1,
+    }
+}
+
+fn udp_send_result_index(result: VoiceUdpSendResult) -> usize {
+    match result {
+        VoiceUdpSendResult::WouldBlock => 0,
+        VoiceUdpSendResult::Partial => 1,
+        VoiceUdpSendResult::Failed => 2,
+    }
+}
+
 fn increment(value: &AtomicU64, amount: u64) {
     value.fetch_add(amount, Ordering::Relaxed);
 }
@@ -381,6 +484,28 @@ pub(crate) fn record_udp_drain_drop(reason: UdpDrainDropReason) {
 
 pub(crate) fn record_queue_drop(reason: VoiceQueueDropReason) {
     increment(&QUEUE_DROPS[queue_drop_index(reason)], 1);
+}
+
+pub(crate) fn record_packet_age(stage: VoiceAgeStage, age: Duration) {
+    let age_ms = age.as_millis().min(u64::MAX as u128) as u64;
+    observe_bucket(
+        &PACKET_AGE_BUCKETS[age_stage_index(stage)],
+        &PACKET_AGE_BUCKETS_MS,
+        age_ms,
+    );
+}
+
+pub(crate) fn record_stale_drop(stage: VoiceAgeStage) {
+    increment(&STALE_DROPS[age_stage_index(stage)], 1);
+}
+
+pub(crate) fn record_scheduler_delay(stage: VoiceSchedulerStage, delay: Duration) {
+    let delay_us = delay.as_micros().min(u64::MAX as u128) as u64;
+    observe_bucket(
+        &SCHEDULER_DELAY_BUCKETS[scheduler_stage_index(stage)],
+        &SCHEDULER_DELAY_BUCKETS_US,
+        delay_us,
+    );
 }
 
 pub(crate) fn record_route(
@@ -484,6 +609,17 @@ pub(crate) fn record_egress(
     increment(&EGRESS_BYTES[transport_index][result_index], bytes as u64);
 }
 
+pub(crate) fn record_crypt_lock_contention_drop(packets: usize) {
+    increment(&CRYPT_LOCK_CONTENTION_DROPS, packets as u64);
+}
+
+pub(crate) fn record_udp_send_result(result: VoiceUdpSendResult, events: u64) {
+    if events == 0 {
+        return;
+    }
+    increment(&UDP_SEND_EVENTS[udp_send_result_index(result)], events);
+}
+
 pub(crate) fn record_s2s_forward(sent: bool) {
     increment(&S2S_FORWARD_ATTEMPTS[usize::from(sent)], 1);
 }
@@ -563,6 +699,25 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         ));
     }
 
+    for stage in [VoiceAgeStage::UdpPacket, VoiceAgeStage::RoutingQueue] {
+        for (bucket_index, (bucket, _)) in PACKET_AGE_BUCKETS_MS.iter().enumerate() {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_packet_age_ms_bucket_total",
+                vec![
+                    ("stage".to_owned(), stage.label().to_owned()),
+                    ("bucket".to_owned(), (*bucket).to_owned()),
+                ],
+                PACKET_AGE_BUCKETS[age_stage_index(stage)][bucket_index].load(Ordering::Relaxed)
+                    as f64,
+            ));
+        }
+        samples.push(PrometheusSample::new(
+            "shitspeak_voice_stale_drops_total",
+            vec![("stage".to_owned(), stage.label().to_owned())],
+            STALE_DROPS[age_stage_index(stage)].load(Ordering::Relaxed) as f64,
+        ));
+    }
+
     for (source, kind) in ROUTE_DIMENSIONS {
         let index = route_index(source, kind);
         let labels = vec![
@@ -590,6 +745,28 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
                 "shitspeak_voice_route_duration_us_bucket_total",
                 labels,
                 ROUTE_DURATION_BUCKETS[index][bucket_index].load(Ordering::Relaxed) as f64,
+            ));
+        }
+        samples.push(PrometheusSample::new(
+            "shitspeak_voice_route_resolution_duration_us_total",
+            labels,
+            ROUTE_RESOLUTION_DURATION_TOTAL_US[index].load(Ordering::Relaxed) as f64,
+        ));
+    }
+
+    for stage in [
+        VoiceSchedulerStage::UdpProcessing,
+        VoiceSchedulerStage::RoutingTask,
+    ] {
+        for (bucket_index, (bucket, _)) in SCHEDULER_DELAY_BUCKETS_US.iter().enumerate() {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_scheduler_delay_us_bucket_total",
+                vec![
+                    ("stage".to_owned(), stage.label().to_owned()),
+                    ("bucket".to_owned(), (*bucket).to_owned()),
+                ],
+                SCHEDULER_DELAY_BUCKETS[scheduler_stage_index(stage)][bucket_index]
+                    .load(Ordering::Relaxed) as f64,
             ));
         }
     }
@@ -626,6 +803,23 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
                 EGRESS_BYTES[transport_index][result_index].load(Ordering::Relaxed) as f64,
             ));
         }
+    }
+
+    samples.push(PrometheusSample::new(
+        "shitspeak_voice_crypt_lock_contention_drops_total",
+        Vec::new(),
+        CRYPT_LOCK_CONTENTION_DROPS.load(Ordering::Relaxed) as f64,
+    ));
+    for result in [
+        VoiceUdpSendResult::WouldBlock,
+        VoiceUdpSendResult::Partial,
+        VoiceUdpSendResult::Failed,
+    ] {
+        samples.push(PrometheusSample::new(
+            "shitspeak_voice_udp_send_events_total",
+            vec![("result".to_owned(), result.label().to_owned())],
+            UDP_SEND_EVENTS[udp_send_result_index(result)].load(Ordering::Relaxed) as f64,
+        ));
     }
 
     for sent in [false, true] {

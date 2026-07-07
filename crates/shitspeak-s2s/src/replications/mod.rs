@@ -30,6 +30,7 @@
 pub mod blob;
 pub mod config;
 pub mod error;
+pub mod metrics;
 pub mod owner;
 pub mod proto;
 pub mod strict;

@@ -223,6 +223,7 @@ async fn spawn_test_server_with_pki(
         udp_ping_enabled: opts.udp_ping_enabled,
         udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
         udp_channel_size: 2_048,
+        voice: crate::config::VoiceTuning::default(),
         client_idle_timeout_secs: opts.client_idle_timeout_secs,
         authenticate_timeout_ms: opts.authenticate_timeout_ms,
         auth_finalization_concurrency: opts.auth_finalization_concurrency,

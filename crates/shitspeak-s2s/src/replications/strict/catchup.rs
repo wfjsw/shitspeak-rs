@@ -12,6 +12,7 @@ use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
+use super::super::metrics::{self, CatchupMode};
 use super::super::proto::{CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp};
 use super::runtime::{
     HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryElectionCandidate, HistoryRank, StrictRuntime,
@@ -26,6 +27,13 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     from: NodeIdentifier,
     req: StrictCatchupReq,
 ) {
+    let Some(_permit) = rt
+        .cfg
+        .try_begin_catchup(CatchupMode::Strict, &rt.topic, from)
+    else {
+        return;
+    };
+
     let mut snapshot_version = 0u64;
     let mut snapshot_msgpack: Bytes = Bytes::new();
     let mut too_old_use_snapshot = false;
@@ -76,6 +84,12 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         .last()
         .map(|c| c.version)
         .unwrap_or(request_since);
+    let response_bytes = snapshot_msgpack.len()
+        + catchup_ops
+            .iter()
+            .map(|op| op.op_msgpack.len())
+            .sum::<usize>();
+    metrics::record_catchup_response(CatchupMode::Strict, catchup_ops.len(), response_bytes);
 
     let rank = HistoryRank::local(rt);
     let resp = StrictCatchupResp {
@@ -219,6 +233,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             chunk_token: resp.next_chunk_token,
             force_snapshot: false,
         };
+        metrics::record_catchup_request(CatchupMode::Strict);
         let _ = rt
             .net
             .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))

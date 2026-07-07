@@ -19,6 +19,7 @@ use tracing::{trace, warn};
 
 use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
+use super::super::metrics::{self, CatchupMode};
 use super::super::proto::{
     self as repl_proto, OwnerBody, OwnerCatchupReq, OwnerOp, REPLICATION_SERVICE_TAG,
 };
@@ -363,7 +364,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         });
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(runtime.cfg.fallback_clock_tick());
+            let mut ticker = tokio::time::interval(runtime.cfg.owner_anti_entropy_interval());
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
@@ -677,6 +678,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             since_version,
             chunk_token,
         };
+        metrics::record_catchup_request(CatchupMode::Owner);
         self.net
             .send_unicast(dst, &self.topic, OwnerBody::CatchupReq(req))
             .await

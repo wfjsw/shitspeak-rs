@@ -1,13 +1,38 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rand::RngExt;
 
 use crate::config::{Config, ServerEntrypointConfig};
 
-pub(super) type UdpPacket = (Bytes, std::net::SocketAddr, std::net::SocketAddr);
+pub(super) struct UdpPacket {
+    packet: Bytes,
+    src_addr: SocketAddr,
+    local_addr: SocketAddr,
+    enqueued_at: Instant,
+}
+
+impl UdpPacket {
+    pub(super) fn new(packet: Bytes, src_addr: SocketAddr, local_addr: SocketAddr) -> Self {
+        Self {
+            packet,
+            src_addr,
+            local_addr,
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    pub(super) fn enqueue_age(&self) -> Duration {
+        self.enqueued_at.elapsed()
+    }
+
+    pub(super) fn into_parts(self) -> (Bytes, SocketAddr, SocketAddr) {
+        (self.packet, self.src_addr, self.local_addr)
+    }
+}
 
 const DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS: usize = 128;
 pub(super) const DYNAMIC_ENTRYPOINT_MIN_PORT: u16 = 49152;
