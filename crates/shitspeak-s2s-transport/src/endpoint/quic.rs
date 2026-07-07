@@ -72,7 +72,8 @@ impl QuicEndpoint {
         let qcc: QuicClientConfig = client_tls
             .try_into()
             .map_err(|e| quic_config_error(SocketAddr::from(([0, 0, 0, 0], 0)), e))?;
-        let client_cfg = QuinnClientConfig::new(Arc::new(qcc));
+        let mut client_cfg = QuinnClientConfig::new(Arc::new(qcc));
+        client_cfg.transport_config(quic_transport_config(false));
 
         let qsc: QuicServerConfig = server_tls
             .try_into()
@@ -114,6 +115,12 @@ impl QuicEndpoint {
             socket_addr_supports_remote(local, accept.ipv6_only, addr)
                 .then_some(accept.handle.clone())
         })
+    }
+
+    fn client_config_for_path(&self, muxed: bool) -> QuinnClientConfig {
+        let mut cfg = self.client_cfg.clone();
+        cfg.transport_config(quic_transport_config(muxed));
+        cfg
     }
 }
 
@@ -288,7 +295,7 @@ impl Endpoint for QuicEndpoint {
                 .client_handle(addr, muxed)
                 .await?
                 .connect_with(
-                    self.client_cfg.clone(),
+                    self.client_config_for_path(muxed),
                     addr,
                     &format!("node-{}", peer.node_id()),
                 )
@@ -345,7 +352,7 @@ impl Endpoint for QuicEndpoint {
             let connecting = self
                 .client_handle(addr, muxed)
                 .await?
-                .connect_with(self.client_cfg.clone(), addr, "s2s-seed.local")
+                .connect_with(self.client_config_for_path(muxed), addr, "s2s-seed.local")
                 .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
             let conn = connecting
                 .await
