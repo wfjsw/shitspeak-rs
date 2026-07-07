@@ -854,10 +854,10 @@ fn transport_options_for_overlay_data(
     if data.allow_l1_compression {
         options = options.allow_l1_compression();
     }
-    if data.service_tag == VOICE_SERVICE_TAG {
-        options = options.expire_after(VOICE_TRANSPORT_TTL);
-    } else if let Some(ttl) = transport_ttl {
+    if let Some(ttl) = transport_ttl {
         options = options.expire_after(ttl);
+    } else if data.service_tag == VOICE_SERVICE_TAG {
+        options = options.expire_after(VOICE_TRANSPORT_TTL);
     }
     options
 }
@@ -1284,6 +1284,17 @@ mod tests {
         let options = transport_options_for_overlay_data(&data, None);
         assert!(options.expires_at().is_some());
         assert!(!options.is_expired());
+    }
+
+    #[test]
+    fn voice_overlay_data_honors_explicit_transport_ttl() {
+        let mut data = test_overlay_data(false);
+        data.service_tag = VOICE_SERVICE_TAG;
+
+        let options = transport_options_for_overlay_data(&data, Some(Duration::ZERO));
+
+        assert!(options.expires_at().is_some());
+        assert!(options.is_expired());
     }
 
     #[test]

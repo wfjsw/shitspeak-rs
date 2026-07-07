@@ -35,6 +35,7 @@ type AudioSinkSlot = Arc<RwLock<Option<Arc<dyn AudioSink>>>>;
 type RecipientIndexSlot = Arc<RwLock<Option<Arc<RecipientIndex>>>>;
 
 const ADAPTIVE_REPAIR_CACHE_MARGIN_MS: u64 = 80;
+const DISTANT_REPAIR_PATH_LATENCY_US: u64 = 150_000;
 
 /// Decoded inbound voice frame along with the immediate sender (next-hop
 /// peer that delivered the overlay frame, not necessarily the originator).
@@ -540,25 +541,53 @@ impl VoiceService {
         if quality.loss_ppm() >= self.cfg.repair_full_dup_loss_ppm {
             return true;
         }
+        let distant_path = quality.path_latency_us() >= DISTANT_REPAIR_PATH_LATENCY_US;
+        let distant_loss_start_ppm = self.cfg.repair_loss_start_ppm.saturating_div(4).max(1);
+        let distant_full_dup_loss_ppm = self
+            .cfg
+            .repair_loss_start_ppm
+            .saturating_div(2)
+            .max(distant_loss_start_ppm)
+            .min(self.cfg.repair_full_dup_loss_ppm.max(1));
+        if distant_path && quality.loss_ppm() >= distant_full_dup_loss_ppm {
+            return true;
+        }
         let jitter_start_us = self.cfg.repair_jitter_start_ms.saturating_mul(1_000);
-        if quality.loss_ppm() < self.cfg.repair_loss_start_ppm
-            && quality.jitter_us() < jitter_start_us
-        {
+        let distant_jitter_start_us = jitter_start_us.saturating_div(2).max(1);
+        let normal_trigger = quality.loss_ppm() >= self.cfg.repair_loss_start_ppm
+            || quality.jitter_us() >= jitter_start_us;
+        let distant_trigger = distant_path
+            && (quality.loss_ppm() >= distant_loss_start_ppm
+                || quality.jitter_us() >= distant_jitter_start_us);
+        if !normal_trigger && !distant_trigger {
             return false;
         }
 
-        let full_loss = self.cfg.repair_full_dup_loss_ppm.max(1);
+        let full_loss = if distant_trigger {
+            distant_full_dup_loss_ppm
+        } else {
+            self.cfg.repair_full_dup_loss_ppm.max(1)
+        };
         let loss_score = (u64::from(quality.loss_ppm()).saturating_mul(1_000_000))
             .saturating_div(u64::from(full_loss));
+        let jitter_denominator = if distant_trigger {
+            distant_jitter_start_us.saturating_mul(2).max(1)
+        } else {
+            jitter_start_us.saturating_mul(3).max(1)
+        };
         let jitter_score = if jitter_start_us == 0 {
             1_000_000
         } else {
             quality
                 .jitter_us()
                 .saturating_mul(1_000_000)
-                .saturating_div(jitter_start_us.saturating_mul(3).max(1))
+                .saturating_div(jitter_denominator)
         };
-        let score = loss_score.max(jitter_score).clamp(1, 1_000_000);
+        let distant_score = if distant_trigger { 500_000 } else { 0 };
+        let score = loss_score
+            .max(jitter_score)
+            .max(distant_score)
+            .clamp(1, 1_000_000);
         let sample = proactive_repair_sample(dst, s2s_seq);
         sample < score
     }
@@ -947,6 +976,67 @@ mod tests {
 
         assert!(transport_ttl > Duration::from_millis(cfg.repair_transport_ttl_ms));
         assert!(cache_ttl > Duration::from_millis(cfg.repair_cache_ms));
+    }
+
+    #[tokio::test]
+    async fn distant_lossy_udp_path_gets_proactive_repair_below_generic_threshold() {
+        let transport = FakeVoiceTransport::new(7, vec![2]);
+        transport.set_voice_route_quality(
+            2,
+            crate::overlay::VoiceRouteQuality::new(2, TransportKind::Udp, 200_000, 5_000, 0),
+        );
+        let svc = make_service(transport.clone());
+
+        svc.send_unicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"opus"),
+            normal_intent(5),
+            2,
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(calls[0], FakeCall::Unicast { .. }));
+        match &calls[1] {
+            FakeCall::RepairFrame {
+                dst,
+                avoid_first_hop,
+                ..
+            } => {
+                assert_eq!(*dst, 2);
+                assert_eq!(*avoid_first_hop, Some(2));
+            }
+            other => panic!("expected proactive repair frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nearby_subthreshold_udp_loss_stays_primary_only() {
+        let transport = FakeVoiceTransport::new(7, vec![2]);
+        transport.set_voice_route_quality(
+            2,
+            crate::overlay::VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 5_000, 0),
+        );
+        let svc = make_service(transport.clone());
+
+        svc.send_unicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"opus"),
+            normal_intent(5),
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transport.calls().len(), 1);
     }
 
     #[tokio::test]

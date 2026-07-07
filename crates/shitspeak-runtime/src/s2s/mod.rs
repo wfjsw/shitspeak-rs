@@ -23,6 +23,9 @@ use crate::client_repository::ClientRepository;
 use crate::geoip::NodeGeo;
 use crate::server::Server;
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier, StrictReplicationMetadata};
+use crate::voice::metrics::{
+    S2SVoiceGatewayDropDirection, S2SVoiceGatewayDropReason, record_s2s_gateway_drop,
+};
 
 use shitspeak_s2s::application as s2s_application;
 use shitspeak_s2s::application::error::ApplicationError;
@@ -1504,15 +1507,26 @@ impl S2SManager {
     ) -> bool {
         let Some(tx) = self.state.read().gateway_tx.clone() else {
             trace!(label = "voice", "s2s gateway unavailable; dropping command");
+            record_s2s_gateway_drop(
+                S2SVoiceGatewayDropDirection::NativeToS2s,
+                S2SVoiceGatewayDropReason::Unavailable,
+            );
             return false;
         };
-        tx.try_send_voice(NativeToS2SCommand::SendVoiceForChannel {
+        let sent = tx.try_send_voice(NativeToS2SCommand::SendVoiceForChannel {
             sender_session,
             server_id,
             source_channel,
             is_terminator,
             payload,
-        })
+        });
+        if !sent {
+            record_s2s_gateway_drop(
+                S2SVoiceGatewayDropDirection::NativeToS2s,
+                S2SVoiceGatewayDropReason::FullOrClosed,
+            );
+        }
+        sent
     }
 
     pub fn send_voice_for_target_channels(
@@ -1527,9 +1541,13 @@ impl S2SManager {
     ) -> bool {
         let Some(tx) = self.state.read().gateway_tx.clone() else {
             trace!(label = "voice", "s2s gateway unavailable; dropping command");
+            record_s2s_gateway_drop(
+                S2SVoiceGatewayDropDirection::NativeToS2s,
+                S2SVoiceGatewayDropReason::Unavailable,
+            );
             return false;
         };
-        tx.try_send_voice(NativeToS2SCommand::SendVoiceForTargetChannels {
+        let sent = tx.try_send_voice(NativeToS2SCommand::SendVoiceForTargetChannels {
             sender_session,
             server_id,
             target_channels,
@@ -1537,7 +1555,14 @@ impl S2SManager {
             is_terminator,
             payload,
             intent,
-        })
+        });
+        if !sent {
+            record_s2s_gateway_drop(
+                S2SVoiceGatewayDropDirection::NativeToS2s,
+                S2SVoiceGatewayDropReason::FullOrClosed,
+            );
+        }
+        sent
     }
 
     pub fn send_voice_broadcast(
@@ -1551,16 +1576,27 @@ impl S2SManager {
     ) -> bool {
         let Some(tx) = self.state.read().gateway_tx.clone() else {
             trace!(label = "voice", "s2s gateway unavailable; dropping command");
+            record_s2s_gateway_drop(
+                S2SVoiceGatewayDropDirection::NativeToS2s,
+                S2SVoiceGatewayDropReason::Unavailable,
+            );
             return false;
         };
-        tx.try_send_voice(NativeToS2SCommand::SendVoiceBroadcast {
+        let sent = tx.try_send_voice(NativeToS2SCommand::SendVoiceBroadcast {
             sender_session,
             server_id,
             target_kind,
             is_terminator,
             payload,
             intent,
-        })
+        });
+        if !sent {
+            record_s2s_gateway_drop(
+                S2SVoiceGatewayDropDirection::NativeToS2s,
+                S2SVoiceGatewayDropReason::FullOrClosed,
+            );
+        }
+        sent
     }
 
     pub async fn get_channel_blob(&self, server_id: Option<&str>, key: &str) -> Option<Bytes> {
@@ -2687,6 +2723,10 @@ impl S2SNativeGatewaySink {
     fn try_send_voice(&self, command: S2SNativeCommand) {
         let label = command.label();
         if !self.tx.try_send_voice(command) {
+            record_s2s_gateway_drop(
+                S2SVoiceGatewayDropDirection::S2sToNative,
+                S2SVoiceGatewayDropReason::FullOrClosed,
+            );
             warn!(label, "s2s native gateway full; dropping command");
         }
     }

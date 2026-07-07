@@ -197,6 +197,7 @@ pub fn build_envelope(
 
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -208,6 +209,7 @@ pub(crate) mod testing {
         pub local_node: NodeIdentifier,
         pub alive: Vec<NodeIdentifier>,
         pub calls: Mutex<Vec<FakeCall>>,
+        route_qualities: Mutex<HashMap<NodeIdentifier, VoiceRouteQuality>>,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -240,11 +242,16 @@ pub(crate) mod testing {
                 local_node,
                 alive,
                 calls: Mutex::new(Vec::new()),
+                route_qualities: Mutex::new(HashMap::new()),
             })
         }
 
         pub fn calls(&self) -> Vec<FakeCall> {
             self.calls.lock().unwrap().clone()
+        }
+
+        pub fn set_voice_route_quality(&self, dst: NodeIdentifier, quality: VoiceRouteQuality) {
+            self.route_qualities.lock().unwrap().insert(dst, quality);
         }
     }
 
@@ -317,8 +324,8 @@ pub(crate) mod testing {
             self.local_node
         }
 
-        fn voice_route_quality(&self, _dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
-            None
+        fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+            self.route_qualities.lock().unwrap().get(&dst).copied()
         }
     }
 }

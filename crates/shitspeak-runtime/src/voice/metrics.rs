@@ -218,6 +218,36 @@ impl VoiceUdpSendResult {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum S2SVoiceGatewayDropDirection {
+    NativeToS2s,
+    S2sToNative,
+}
+
+impl S2SVoiceGatewayDropDirection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NativeToS2s => "native_to_s2s",
+            Self::S2sToNative => "s2s_to_native",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum S2SVoiceGatewayDropReason {
+    Unavailable,
+    FullOrClosed,
+}
+
+impl S2SVoiceGatewayDropReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::FullOrClosed => "full_or_closed",
+        }
+    }
+}
+
 const INGRESS_TRANSPORT_COUNT: usize = 2;
 const UDP_DECRYPT_PATH_COUNT: usize = 2;
 const UDP_DECRYPT_RESULT_COUNT: usize = 3;
@@ -231,6 +261,8 @@ const VOICE_EGRESS_RESULT_COUNT: usize = 4;
 const VOICE_AGE_STAGE_COUNT: usize = 2;
 const VOICE_SCHEDULER_STAGE_COUNT: usize = 2;
 const VOICE_UDP_SEND_RESULT_COUNT: usize = 3;
+const S2S_VOICE_GATEWAY_DROP_DIRECTION_COUNT: usize = 2;
+const S2S_VOICE_GATEWAY_DROP_REASON_COUNT: usize = 2;
 
 const ROUTE_DIMENSIONS: [(VoiceRouteSource, VoiceRouteKind); 5] = [
     (VoiceRouteSource::Local, VoiceRouteKind::Normal),
@@ -325,6 +357,10 @@ static EGRESS_BYTES: [[AtomicU64; VOICE_EGRESS_RESULT_COUNT]; VOICE_EGRESS_TRANS
     [const { [const { AtomicU64::new(0) }; VOICE_EGRESS_RESULT_COUNT] };
         VOICE_EGRESS_TRANSPORT_COUNT];
 static S2S_FORWARD_ATTEMPTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static S2S_GATEWAY_DROPS: [[AtomicU64; S2S_VOICE_GATEWAY_DROP_REASON_COUNT];
+    S2S_VOICE_GATEWAY_DROP_DIRECTION_COUNT] =
+    [const { [const { AtomicU64::new(0) }; S2S_VOICE_GATEWAY_DROP_REASON_COUNT] };
+        S2S_VOICE_GATEWAY_DROP_DIRECTION_COUNT];
 static PACKET_AGE_BUCKETS: [[AtomicU64; PACKET_AGE_BUCKETS_MS.len()]; VOICE_AGE_STAGE_COUNT] =
     [const { [const { AtomicU64::new(0) }; PACKET_AGE_BUCKETS_MS.len()] }; VOICE_AGE_STAGE_COUNT];
 static STALE_DROPS: [AtomicU64; VOICE_AGE_STAGE_COUNT] =
@@ -439,6 +475,20 @@ fn udp_send_result_index(result: VoiceUdpSendResult) -> usize {
         VoiceUdpSendResult::WouldBlock => 0,
         VoiceUdpSendResult::Partial => 1,
         VoiceUdpSendResult::Failed => 2,
+    }
+}
+
+fn s2s_gateway_drop_direction_index(direction: S2SVoiceGatewayDropDirection) -> usize {
+    match direction {
+        S2SVoiceGatewayDropDirection::NativeToS2s => 0,
+        S2SVoiceGatewayDropDirection::S2sToNative => 1,
+    }
+}
+
+fn s2s_gateway_drop_reason_index(reason: S2SVoiceGatewayDropReason) -> usize {
+    match reason {
+        S2SVoiceGatewayDropReason::Unavailable => 0,
+        S2SVoiceGatewayDropReason::FullOrClosed => 1,
     }
 }
 
@@ -622,6 +672,17 @@ pub(crate) fn record_udp_send_result(result: VoiceUdpSendResult, events: u64) {
 
 pub(crate) fn record_s2s_forward(sent: bool) {
     increment(&S2S_FORWARD_ATTEMPTS[usize::from(sent)], 1);
+}
+
+pub(crate) fn record_s2s_gateway_drop(
+    direction: S2SVoiceGatewayDropDirection,
+    reason: S2SVoiceGatewayDropReason,
+) {
+    increment(
+        &S2S_GATEWAY_DROPS[s2s_gateway_drop_direction_index(direction)]
+            [s2s_gateway_drop_reason_index(reason)],
+        1,
+    );
 }
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
@@ -828,6 +889,26 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             vec![("sent".to_owned(), sent.to_string())],
             S2S_FORWARD_ATTEMPTS[usize::from(sent)].load(Ordering::Relaxed) as f64,
         ));
+    }
+    for direction in [
+        S2SVoiceGatewayDropDirection::NativeToS2s,
+        S2SVoiceGatewayDropDirection::S2sToNative,
+    ] {
+        for reason in [
+            S2SVoiceGatewayDropReason::Unavailable,
+            S2SVoiceGatewayDropReason::FullOrClosed,
+        ] {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_s2s_gateway_drops_total",
+                vec![
+                    ("direction".to_owned(), direction.label().to_owned()),
+                    ("reason".to_owned(), reason.label().to_owned()),
+                ],
+                S2S_GATEWAY_DROPS[s2s_gateway_drop_direction_index(direction)]
+                    [s2s_gateway_drop_reason_index(reason)]
+                .load(Ordering::Relaxed) as f64,
+            ));
+        }
     }
 
     samples

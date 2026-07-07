@@ -428,6 +428,11 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "Total voice S2S forward attempts by send result.",
         "counter",
     ),
+    (
+        "shitspeak_voice_s2s_gateway_drops_total",
+        "Total S2S voice gateway drops by bridge direction and reason.",
+        "counter",
+    ),
 ];
 
 fn render_prometheus_header(out: &mut String, name: &str, help: &str, kind: &str) {
