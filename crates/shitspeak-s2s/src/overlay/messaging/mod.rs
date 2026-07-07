@@ -75,6 +75,7 @@ impl Default for ServiceRegistry {
 pub struct OverlaySendOptions {
     allow_l1_compression: bool,
     transport_ttl: Option<std::time::Duration>,
+    avoid_first_hop: Option<NodeIdentifier>,
 }
 
 impl OverlaySendOptions {
@@ -94,6 +95,15 @@ impl OverlaySendOptions {
 
     pub fn transport_ttl(&self) -> Option<std::time::Duration> {
         self.transport_ttl
+    }
+
+    pub fn avoid_first_hop(mut self, node: NodeIdentifier) -> Self {
+        self.avoid_first_hop = Some(node);
+        self
+    }
+
+    pub fn avoided_first_hop(&self) -> Option<NodeIdentifier> {
+        self.avoid_first_hop
     }
 }
 

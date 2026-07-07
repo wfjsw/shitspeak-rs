@@ -25,7 +25,7 @@ use shitspeak_s2s_transport::{ConnectionManager, Inbound, PeerAddress};
 use super::config::OverlayConfig;
 use super::duplicate::DuplicateDetector;
 use super::error::OverlayError;
-use super::lsdb::advert::cost_changed_significantly;
+use super::lsdb::advert::{cost_changed_significantly, voice_cost_changed_significantly};
 use super::lsdb::{
     LinkStateDb, LsaEmitter, LsaFloodPacer, LsaFloor, ReplicationServices, capture_boot_epoch,
     emit_once, spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
@@ -37,6 +37,7 @@ use super::neighbor::monitor::NeighborMonitor;
 use super::routing::{RoutingHandle, new_handle as new_routing_handle, spawn_recomputer};
 
 const METRIC_CHANGE_STABLE_CHECKS: u8 = 3;
+const VOICE_METRIC_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(500);
 static LAST_PROCESS_BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -264,7 +265,7 @@ impl OverlayInner {
             let em = self.emitter.clone();
             let shutdown = self.shutdown.clone();
             let on_metric_change = mon.on_metric_change();
-            let min_interval = self.cfg.cost_rerun_min_interval();
+            let normal_min_interval = self.cfg.cost_rerun_min_interval();
             let cfg = self.cfg.clone();
             tokio::spawn(async move {
                 let mut last_poke = Instant::now();
@@ -275,6 +276,13 @@ impl OverlayInner {
                         _ = on_metric_change.notified() => {}
                     }
 
+                    let initial_snap = mon.snapshot();
+                    let initial_urgent = voice_cost_changed_significantly(&em, &initial_snap, &cfg);
+                    let min_interval = if initial_urgent {
+                        VOICE_METRIC_CHANGE_MIN_INTERVAL
+                    } else {
+                        normal_min_interval
+                    };
                     let remaining = min_interval
                         .checked_sub(last_poke.elapsed())
                         .unwrap_or(Duration::ZERO);
@@ -286,7 +294,10 @@ impl OverlayInner {
                     }
 
                     let snap = mon.snapshot();
-                    if cost_changed_significantly(&em, &snap, &cfg) {
+                    if voice_cost_changed_significantly(&em, &snap, &cfg) {
+                        em.poke();
+                        stable_checks = 0;
+                    } else if cost_changed_significantly(&em, &snap, &cfg) {
                         stable_checks = stable_checks.saturating_add(1);
                         if stable_checks >= METRIC_CHANGE_STABLE_CHECKS {
                             em.poke();

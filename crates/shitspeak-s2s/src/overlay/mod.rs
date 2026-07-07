@@ -46,7 +46,8 @@ use tokio::time::{Instant, timeout};
 
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{
-    AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage, MessageClass, ServiceLevel,
+    AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage, MessageClass,
+    ServiceLevel, TransportKind,
 };
 
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
@@ -57,6 +58,53 @@ pub use lsdb::ReplicationServices;
 pub use membership::{MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{OverlayInboundMessage, OverlaySendOptions, ServiceInbound};
 pub use routing::{RouteEntry, RoutingMetric};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoiceRouteQuality {
+    next_hop: NodeIdentifier,
+    transport: TransportKind,
+    path_latency_us: u64,
+    loss_ppm: u32,
+    jitter_us: u64,
+}
+
+impl VoiceRouteQuality {
+    pub fn new(
+        next_hop: NodeIdentifier,
+        transport: TransportKind,
+        path_latency_us: u64,
+        loss_ppm: u32,
+        jitter_us: u64,
+    ) -> Self {
+        Self {
+            next_hop,
+            transport,
+            path_latency_us,
+            loss_ppm,
+            jitter_us,
+        }
+    }
+
+    pub fn next_hop(self) -> NodeIdentifier {
+        self.next_hop
+    }
+
+    pub fn transport(self) -> TransportKind {
+        self.transport
+    }
+
+    pub fn path_latency_us(self) -> u64 {
+        self.path_latency_us
+    }
+
+    pub fn loss_ppm(self) -> u32 {
+        self.loss_ppm
+    }
+
+    pub fn jitter_us(self) -> u64 {
+        self.jitter_us
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StartupDuplicateEvidence {
@@ -1273,6 +1321,32 @@ impl OverlayNetwork {
             .load()
             .lookup_with_metric(dst, level, routing_metric)
             .map(|e| e.next_hop)
+    }
+
+    pub fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+        let level = ServiceLevel::BestEffort;
+        let routing_metric = RoutingMetric::ConversationalQuality;
+        let entry = self
+            .inner
+            .routing
+            .load()
+            .lookup_with_metric(dst, level, routing_metric)?;
+        let next_hop = entry.next_hop;
+        let transport = self
+            .inner
+            .transport
+            .ranked_live_transports_for(next_hop, level, routing_metric)
+            .into_iter()
+            .next()?;
+        let metrics = self.inner.transport.metrics_snapshot();
+        let link = metrics.for_node(next_hop)?.get(&transport)?;
+        Some(VoiceRouteQuality::new(
+            next_hop,
+            transport,
+            entry.latency_us,
+            link.effective_packet_loss_ppm(),
+            link.jitter_us().max(0.0) as u64,
+        ))
     }
 
     /// Returns true if any route can satisfy `level` for `dst`.

@@ -11,7 +11,7 @@ use shitspeak_proto::s2s_application_proto as pb;
 pub use pb::{
     ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope, UserRemovePatch, UserStatePatch,
     UserStatsEnvelope, UserStatsReply, UserStatsRequest, VoiceFrame, VoiceIntent,
-    VoiceIntentNormal, VoiceIntentTarget, VoiceTargetChannel,
+    VoiceIntentNormal, VoiceIntentTarget, VoiceRepairRequest, VoiceTargetChannel,
     moderation_envelope::Command as ModerationCommand, user_stats_envelope::Kind as UserStatsKind,
     voice_intent::Kind as VoiceIntentKind,
 };
@@ -21,6 +21,9 @@ pub const MODERATION_SERVICE_TAG: u32 = 2;
 
 /// Reserved overlay service tag for voice frames.
 pub const VOICE_SERVICE_TAG: u32 = 3;
+
+/// Reserved overlay service tag for S2S voice repair requests.
+pub const VOICE_REPAIR_SERVICE_TAG: u32 = 7;
 
 /// Reserved overlay service tag for the UserStats request/reply RPC.
 pub const USER_STATS_SERVICE_TAG: u32 = 4;
@@ -49,6 +52,18 @@ pub fn encode_voice(frame: &VoiceFrame) -> Result<Bytes, prost::EncodeError> {
 
 pub fn decode_voice(src: &[u8]) -> Result<VoiceFrame, prost::DecodeError> {
     VoiceFrame::decode(src)
+}
+
+pub fn encode_voice_repair_request(
+    request: &VoiceRepairRequest,
+) -> Result<Bytes, prost::EncodeError> {
+    let mut buf = BytesMut::with_capacity(request.encoded_len());
+    request.encode(&mut buf)?;
+    Ok(buf.freeze())
+}
+
+pub fn decode_voice_repair_request(src: &[u8]) -> Result<VoiceRepairRequest, prost::DecodeError> {
+    VoiceRepairRequest::decode(src)
 }
 
 pub fn encode_user_stats(env: &UserStatsEnvelope) -> Result<Bytes, prost::EncodeError> {

@@ -7,10 +7,11 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::time::Duration;
 
 use crate::application::error::ApplicationError;
-use crate::application::proto::{self, VOICE_SERVICE_TAG, VoiceIntent};
-use crate::overlay::{OverlayNetwork, RoutingMetric};
+use crate::application::proto::{self, VOICE_REPAIR_SERVICE_TAG, VOICE_SERVICE_TAG, VoiceIntent};
+use crate::overlay::{OverlayNetwork, OverlaySendOptions, RoutingMetric, VoiceRouteQuality};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
@@ -19,6 +20,9 @@ use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 pub const VOICE_LEVEL: ServiceLevel = ServiceLevel::BestEffort;
 pub const VOICE_CLASS: MessageClass = MessageClass::HighPriority;
 pub const VOICE_ROUTING_METRIC: RoutingMetric = RoutingMetric::ConversationalQuality;
+pub const VOICE_REPAIR_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
+pub const VOICE_REPAIR_CLASS: MessageClass = MessageClass::HighPriority;
+pub const VOICE_REPAIR_ROUTING_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
 
 /// Narrow send-only interface used by the voice service. Production
 /// impl: [`OverlayVoiceTransport`]. Test impl: see the unit tests below.
@@ -34,9 +38,25 @@ pub trait VoiceTransport: Send + Sync + 'static {
 
     async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError>;
 
+    async fn send_repair_request(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+    ) -> Result<(), ApplicationError>;
+
+    async fn send_repair_frame(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        avoid_first_hop: Option<NodeIdentifier>,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError>;
+
     fn alive_members(&self) -> Vec<NodeIdentifier>;
 
     fn local_node_id(&self) -> NodeIdentifier;
+
+    fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality>;
 }
 
 /// Production `VoiceTransport` impl backed by the overlay network.
@@ -94,12 +114,59 @@ impl VoiceTransport for OverlayVoiceTransport {
         Ok(())
     }
 
+    async fn send_repair_request(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+    ) -> Result<(), ApplicationError> {
+        self.overlay
+            .send_unicast_unordered_with_routing_metric(
+                dst,
+                VOICE_REPAIR_SERVICE_TAG,
+                VOICE_REPAIR_LEVEL,
+                VOICE_REPAIR_ROUTING_METRIC,
+                VOICE_REPAIR_CLASS,
+                body,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn send_repair_frame(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        avoid_first_hop: Option<NodeIdentifier>,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        let mut options = OverlaySendOptions::default().expire_after(ttl);
+        if let Some(first_hop) = avoid_first_hop {
+            options = options.avoid_first_hop(first_hop);
+        }
+        self.overlay
+            .send_unicast_unordered_with_routing_metric_and_options(
+                dst,
+                VOICE_SERVICE_TAG,
+                VOICE_LEVEL,
+                VOICE_ROUTING_METRIC,
+                VOICE_CLASS,
+                body,
+                options,
+            )
+            .await?;
+        Ok(())
+    }
+
     fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.overlay.alive_members()
     }
 
     fn local_node_id(&self) -> NodeIdentifier {
         self.overlay.local_node_id()
+    }
+
+    fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+        self.overlay.voice_route_quality(dst)
     }
 }
 
@@ -156,6 +223,15 @@ pub(crate) mod testing {
         Broadcast {
             body: Bytes,
         },
+        RepairRequest {
+            dst: NodeIdentifier,
+            body: Bytes,
+        },
+        RepairFrame {
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+        },
     }
 
     impl FakeVoiceTransport {
@@ -206,12 +282,43 @@ pub(crate) mod testing {
             Ok(())
         }
 
+        async fn send_repair_request(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+        ) -> Result<(), ApplicationError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(FakeCall::RepairRequest { dst, body });
+            Ok(())
+        }
+
+        async fn send_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            _ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.calls.lock().unwrap().push(FakeCall::RepairFrame {
+                dst,
+                body,
+                avoid_first_hop,
+            });
+            Ok(())
+        }
+
         fn alive_members(&self) -> Vec<NodeIdentifier> {
             self.alive.clone()
         }
 
         fn local_node_id(&self) -> NodeIdentifier {
             self.local_node
+        }
+
+        fn voice_route_quality(&self, _dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+            None
         }
     }
 }

@@ -33,9 +33,9 @@ use tokio::sync::Notify;
 use tracing::{Level, debug, trace, warn};
 
 use shitspeak_core::NodeIdentifier;
-use shitspeak_s2s_transport::PeerAddress;
+use shitspeak_s2s_transport::{PeerAddress, TransportKind};
 
-use super::super::proto::{address_from_pb, address_to_pb};
+use super::super::proto::{address_from_pb, address_to_pb, kind_to_u32, u32_to_kind};
 use shitspeak_proto::s2s_overlay_proto as pb;
 
 /// Replication service kinds advertised by one overlay member.
@@ -126,6 +126,54 @@ pub struct LinkAdvertised {
     pub native_loss_ppm: u32,
     pub data_health_ppm: u32,
     pub loss_sample_count: u64,
+    pub transport_metrics: Vec<LinkTransportAdvertised>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LinkTransportAdvertised {
+    transport: TransportKind,
+    rtt_us: u64,
+    jitter_us: u64,
+    loss_ppm: u32,
+    loss_sample_count: u64,
+}
+
+impl LinkTransportAdvertised {
+    pub fn new(
+        transport: TransportKind,
+        rtt_us: u64,
+        jitter_us: u64,
+        loss_ppm: u32,
+        loss_sample_count: u64,
+    ) -> Self {
+        Self {
+            transport,
+            rtt_us,
+            jitter_us,
+            loss_ppm,
+            loss_sample_count,
+        }
+    }
+
+    pub fn transport(self) -> TransportKind {
+        self.transport
+    }
+
+    pub fn rtt_us(self) -> u64 {
+        self.rtt_us
+    }
+
+    pub fn jitter_us(self) -> u64 {
+        self.jitter_us
+    }
+
+    pub fn loss_ppm(self) -> u32 {
+        self.loss_ppm
+    }
+
+    pub fn loss_sample_count(self) -> u64 {
+        self.loss_sample_count
+    }
 }
 
 const MAX_LINK_DELTAS_IN_LOG: usize = 16;
@@ -360,6 +408,12 @@ fn describe_single_link_delta(
         previous.loss_sample_count,
         current.loss_sample_count,
     );
+    if previous.transport_metrics != current.transport_metrics {
+        fields.push(format!(
+            "transport_metrics {:?}->{:?}",
+            previous.transport_metrics, current.transport_metrics
+        ));
+    }
 
     if fields.is_empty() {
         None
@@ -408,6 +462,19 @@ impl LsaEntry {
                     native_loss_ppm: l.native_loss_ppm,
                     data_health_ppm: l.data_health_ppm,
                     loss_sample_count: l.loss_sample_count,
+                    transport_metrics: l
+                        .transport_metrics
+                        .iter()
+                        .filter_map(|metric| {
+                            Some(LinkTransportAdvertised::new(
+                                u32_to_kind(metric.transport)?,
+                                metric.rtt_us,
+                                metric.jitter_us,
+                                metric.loss_ppm,
+                                metric.loss_sample_count,
+                            ))
+                        })
+                        .collect(),
                 })
             })
             .collect();
@@ -455,6 +522,17 @@ impl LsaEntry {
                     native_loss_ppm: l.native_loss_ppm,
                     data_health_ppm: l.data_health_ppm,
                     loss_sample_count: l.loss_sample_count,
+                    transport_metrics: l
+                        .transport_metrics
+                        .iter()
+                        .map(|metric| pb::LinkTransportMetric {
+                            transport: kind_to_u32(metric.transport()),
+                            rtt_us: metric.rtt_us(),
+                            jitter_us: metric.jitter_us(),
+                            loss_ppm: metric.loss_ppm(),
+                            loss_sample_count: metric.loss_sample_count(),
+                        })
+                        .collect(),
                 })
                 .collect(),
             max_users: self.max_users,
@@ -954,6 +1032,7 @@ mod tests {
             native_loss_ppm: 0,
             data_health_ppm: 0,
             loss_sample_count: 0,
+            transport_metrics: Vec::new(),
         }
     }
 
@@ -985,6 +1064,13 @@ mod tests {
             native_loss_ppm: 40_000,
             data_health_ppm: 5_000,
             loss_sample_count: 123,
+            transport_metrics: vec![LinkTransportAdvertised::new(
+                TransportKind::Udp,
+                1_250,
+                150,
+                30_000,
+                64,
+            )],
         }];
         let pb = lsa.to_pb();
         assert_eq!(pb.max_users, 250);
@@ -1002,6 +1088,17 @@ mod tests {
         assert_eq!(wire_link.observed_recv_bps, 4_000);
         assert_eq!(wire_link.observed_sent_bps, 10_000);
         assert_eq!(wire_link.throughput_confidence_ppm, 750_000);
+        assert_eq!(wire_link.transport_metrics.len(), 1);
+        assert_eq!(
+            wire_link.transport_metrics[0],
+            pb::LinkTransportMetric {
+                transport: kind_to_u32(TransportKind::Udp),
+                rtt_us: 1_250,
+                jitter_us: 150,
+                loss_ppm: 30_000,
+                loss_sample_count: 64,
+            }
+        );
         let roundtrip = LsaEntry::from_pb(&pb).unwrap();
         assert_eq!(roundtrip.max_users, 250);
         assert!(roundtrip.transit_disabled);
@@ -1019,6 +1116,16 @@ mod tests {
         assert_eq!(link.observed_recv_bps, 4_000);
         assert_eq!(link.observed_sent_bps, 10_000);
         assert_eq!(link.throughput_confidence_ppm, 750_000);
+        assert_eq!(
+            link.transport_metrics,
+            vec![LinkTransportAdvertised::new(
+                TransportKind::Udp,
+                1_250,
+                150,
+                30_000,
+                64,
+            )]
+        );
     }
 
     #[test]

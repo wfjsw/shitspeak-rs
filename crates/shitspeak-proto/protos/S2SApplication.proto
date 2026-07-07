@@ -143,6 +143,15 @@ message VoiceFrame {
   string server_id      = 8;   // empty/absent means "default" for legacy peers
 }
 
+// Best-effort request for the origin node to replay recently-sent voice
+// frames. Responses are ordinary VoiceFrame payloads on VOICE_SERVICE_TAG.
+message VoiceRepairRequest {
+  uint32 sender_session = 1;
+  uint64 sender_epoch   = 2;
+  uint64 first_seq      = 3;
+  uint64 last_seq       = 4;
+}
+
 message VoiceIntent {
   oneof kind {
     VoiceIntentNormal normal = 1;

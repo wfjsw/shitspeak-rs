@@ -25,6 +25,7 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{ConnectionManager, TransportKind};
 
 use super::super::config::OverlayConfig;
+use super::super::config::kind_to_idx;
 use super::super::duplicate::DuplicateDetector;
 use super::super::membership::MembershipEvent;
 use super::super::proto::transports_to_mask;
@@ -46,6 +47,54 @@ pub struct NeighborSnapshot {
     pub native_loss_ppm: u32,
     pub data_health_ppm: u32,
     pub loss_sample_count: u64,
+    pub transport_metrics: Vec<NeighborTransportMetric>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeighborTransportMetric {
+    transport: TransportKind,
+    rtt_us: u64,
+    jitter_us: u64,
+    loss_ppm: u32,
+    loss_sample_count: u64,
+}
+
+impl NeighborTransportMetric {
+    pub fn new(
+        transport: TransportKind,
+        rtt_us: u64,
+        jitter_us: u64,
+        loss_ppm: u32,
+        loss_sample_count: u64,
+    ) -> Self {
+        Self {
+            transport,
+            rtt_us,
+            jitter_us,
+            loss_ppm,
+            loss_sample_count,
+        }
+    }
+
+    pub fn transport(self) -> TransportKind {
+        self.transport
+    }
+
+    pub fn rtt_us(self) -> u64 {
+        self.rtt_us
+    }
+
+    pub fn jitter_us(self) -> u64 {
+        self.jitter_us
+    }
+
+    pub fn loss_ppm(self) -> u32 {
+        self.loss_ppm
+    }
+
+    pub fn loss_sample_count(self) -> u64 {
+        self.loss_sample_count
+    }
 }
 
 #[derive(Debug)]
@@ -267,6 +316,7 @@ impl NeighborMonitor {
             let mut loss_sample_count = hello_loss_samples;
             let mut best_reliable_loss = None;
             let mut best_any_loss = None;
+            let mut transport_metrics = Vec::new();
             let kinds = self.transport.live_transport_kinds(*nid);
             let (
                 rtt_us,
@@ -285,6 +335,13 @@ impl NeighborMonitor {
                         if !kinds.contains(k) {
                             continue;
                         }
+                        transport_metrics.push(NeighborTransportMetric::new(
+                            *k,
+                            m.rtt_us().max(0.0) as u64,
+                            m.jitter_us().max(0.0) as u64,
+                            m.effective_packet_loss_ppm(),
+                            m.loss_sample_count(),
+                        ));
                         probe_loss_ppm = probe_loss_ppm.max(m.probe_loss_ppm());
                         native_loss_ppm = native_loss_ppm.max(m.native_loss_ppm());
                         data_health_ppm = data_health_ppm.max(m.data_health_ppm());
@@ -327,6 +384,7 @@ impl NeighborMonitor {
                 }
                 None => (0, 0, 0, 0, 0),
             };
+            transport_metrics.sort_by_key(|metric| kind_to_idx(metric.transport()));
             let throughput_bps = observed_recv_bps.max(observed_sent_bps);
             let transports_mask = transports_to_mask(&kinds);
             st.transports_mask = transports_mask;
@@ -344,6 +402,7 @@ impl NeighborMonitor {
                 native_loss_ppm,
                 data_health_ppm,
                 loss_sample_count,
+                transport_metrics,
             });
         }
         out.sort_by_key(|n| n.node_id);

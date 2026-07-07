@@ -105,6 +105,7 @@ pub(crate) async fn originate(
             class,
             /*is_originator=*/ true,
             options.transport_ttl(),
+            options.avoided_first_hop(),
         )
         .await;
     };
@@ -152,6 +153,7 @@ pub(crate) async fn originate(
             class,
             /*is_originator=*/ true,
             options.transport_ttl(),
+            options.avoided_first_hop(),
         )
         .await
         {
@@ -302,7 +304,7 @@ pub(crate) async fn handle_inbound(
     let mut data2 = data;
     data2.dsts = remaining;
     let _ = forward_pb_as(
-        transport, routing, self_id, data2, class, /*is_originator=*/ false, None,
+        transport, routing, self_id, data2, class, /*is_originator=*/ false, None, None,
     )
     .await;
 }
@@ -440,7 +442,9 @@ pub(crate) fn spawn_ordered_retransmit_task(
                             class,
                             false,
                             None,
-                        ).await;
+                            None,
+                        )
+                        .await;
                     }
                 }
             }
@@ -655,6 +659,7 @@ async fn forward_pb_as(
     transport_class: MessageClass,
     is_originator: bool,
     transport_ttl: Option<std::time::Duration>,
+    avoid_first_hop: Option<NodeIdentifier>,
 ) -> Result<(), OverlayError> {
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
     let routing_metric = route_metric_from_wire(data.route_metric, level)
@@ -682,6 +687,7 @@ async fn forward_pb_as(
             Some(transport),
             transport_class,
             send_options,
+            avoid_first_hop,
         )? {
             ForwardNextHop::Send { next_hop } => {
                 buckets.entry(next_hop).or_default().push(*dst_wire);
@@ -876,6 +882,7 @@ fn select_forward_next_hop(
         None,
         MessageClass::Regular,
         TransportSendOptions::default(),
+        None,
     )
 }
 
@@ -890,6 +897,7 @@ fn select_forward_next_hop_for_send(
     transport: Option<&ConnectionManager>,
     transport_class: MessageClass,
     send_options: TransportSendOptions,
+    avoid_first_hop: Option<NodeIdentifier>,
 ) -> Result<ForwardNextHop, OverlayError> {
     if path_trace_set.contains(&dst) {
         return Ok(ForwardNextHop::DropAlreadyVisited);
@@ -917,6 +925,22 @@ fn select_forward_next_hop_for_send(
         return Ok(ForwardNextHop::DropLoop {
             next_hop: entry.next_hop,
         });
+    }
+
+    if Some(entry.next_hop) == avoid_first_hop {
+        if let Some(alternate) = tables.lookup_avoiding_first_hop_with_metric(
+            self_id,
+            dst,
+            level,
+            routing_metric,
+            path_trace_set,
+            entry.next_hop,
+        ) {
+            return Ok(ForwardNextHop::Send {
+                next_hop: alternate.next_hop,
+            });
+        }
+        return Ok(ForwardNextHop::DropNoRoute);
     }
 
     let next_hop = deadline_pressure_alternate(
@@ -952,13 +976,15 @@ fn deadline_pressure_alternate(
         return None;
     }
     let transport = transport?;
-    let current_pressure = transport.best_send_queue_pressure(
-        current_next_hop,
-        level,
-        routing_metric,
-        transport_class,
-        send_options,
-    )?;
+    let current_pressure = transport
+        .best_send_queue_pressure(
+            current_next_hop,
+            level,
+            routing_metric,
+            transport_class,
+            send_options,
+        )
+        .unwrap_or(3);
     if current_pressure < 2 {
         return None;
     }
@@ -1024,7 +1050,14 @@ mod tests {
     fn routing_with_route(dst: NodeIdentifier, next_hop: NodeIdentifier) -> RoutingHandle {
         let routing = new_handle();
         let mut tables = RoutingTables::empty();
-        let table = HashMap::from([(dst, RouteEntry { next_hop, cost: 1 })]);
+        let table = HashMap::from([(
+            dst,
+            RouteEntry {
+                next_hop,
+                cost: 1,
+                latency_us: 1,
+            },
+        )]);
         for level in ServiceLevel::ALL {
             tables.insert_table(RoutingMetric::ReliableCost, level, table.clone());
         }
@@ -1043,6 +1076,7 @@ mod tests {
                     RouteEntry {
                         next_hop: *next_hop,
                         cost: 1,
+                        latency_us: 1,
                     },
                 )
             })
@@ -1064,6 +1098,7 @@ mod tests {
                 RouteEntry {
                     next_hop: 4,
                     cost: 1,
+                    latency_us: 1,
                 },
             )]),
             HashMap::from([
@@ -1083,7 +1118,14 @@ mod tests {
     fn control_routing_with_route(dst: NodeIdentifier, next_hop: NodeIdentifier) -> RoutingHandle {
         let routing = new_handle();
         let mut tables = RoutingTables::empty();
-        let table = HashMap::from([(dst, RouteEntry { next_hop, cost: 1 })]);
+        let table = HashMap::from([(
+            dst,
+            RouteEntry {
+                next_hop,
+                cost: 1,
+                latency_us: 1,
+            },
+        )]);
         tables.insert_table(CONTROL_METRIC, CONTROL_LEVEL, table);
         routing.store(Arc::new(tables));
         routing
@@ -1174,13 +1216,15 @@ mod tests {
             .expect("stream pressure seed should enqueue");
 
         for _ in 0..20 {
-            if transport.best_send_queue_pressure(
-                peer,
-                ServiceLevel::Reliable,
-                RoutingMetric::ReliableCost,
-                MessageClass::HighPriority,
-                TransportSendOptions::default().expire_after(VOICE_TRANSPORT_TTL),
-            ) == Some(3)
+            if transport
+                .best_send_queue_pressure(
+                    peer,
+                    ServiceLevel::Reliable,
+                    RoutingMetric::ReliableCost,
+                    MessageClass::HighPriority,
+                    TransportSendOptions::default().expire_after(VOICE_TRANSPORT_TTL),
+                )
+                .is_none_or(|pressure| pressure == 3)
             {
                 return;
             }
@@ -1291,6 +1335,7 @@ mod tests {
                 RouteEntry {
                     next_hop: 1,
                     cost: 1,
+                    latency_us: 1,
                 },
             )]),
         );
@@ -1321,6 +1366,7 @@ mod tests {
                 RouteEntry {
                     next_hop: 1,
                     cost: 2,
+                    latency_us: 2,
                 },
             )]),
             HashMap::from([
@@ -1384,6 +1430,65 @@ mod tests {
         assert_eq!(alternate.next_hop, 3);
     }
 
+    #[test]
+    fn avoid_first_hop_option_selects_loop_free_alternate() {
+        let tables = tables_with_direct_and_indirect_route();
+        let path_trace = HashSet::from([1]);
+
+        let selected = select_forward_next_hop_for_send(
+            &tables,
+            1,
+            4,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            true,
+            None,
+            MessageClass::Regular,
+            TransportSendOptions::default(),
+            Some(4),
+        )
+        .expect("alternate should be selectable");
+
+        assert_eq!(selected, ForwardNextHop::Send { next_hop: 3 });
+    }
+
+    #[test]
+    fn avoid_first_hop_option_drops_when_no_alternate_exists() {
+        let mut tables = RoutingTables::empty();
+        tables.insert_table_with_adjacency(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            HashMap::from([(
+                4,
+                RouteEntry {
+                    next_hop: 4,
+                    cost: 1,
+                    latency_us: 1,
+                },
+            )]),
+            HashMap::from([(1, vec![(4, edge(1))])]),
+        );
+        let path_trace = HashSet::from([1]);
+
+        let selected = select_forward_next_hop_for_send(
+            &tables,
+            1,
+            4,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            true,
+            None,
+            MessageClass::Regular,
+            TransportSendOptions::default(),
+            Some(4),
+        )
+        .expect("selection should complete");
+
+        assert_eq!(selected, ForwardNextHop::DropNoRoute);
+    }
+
     #[tokio::test]
     async fn deadline_sensitive_forward_chooses_less_pressured_alternate_first_hop() {
         let (transport, mut receivers) =
@@ -1402,6 +1507,7 @@ mod tests {
             data,
             MessageClass::HighPriority,
             true,
+            None,
             None,
         )
         .await
@@ -1439,6 +1545,7 @@ mod tests {
             Some(&transport),
             MessageClass::HighPriority,
             TransportSendOptions::default().expire_after(VOICE_TRANSPORT_TTL),
+            None,
         )
         .expect("route should be selectable");
 
@@ -1513,6 +1620,7 @@ mod tests {
                 RouteEntry {
                     next_hop: 1,
                     cost: 2,
+                    latency_us: 2,
                 },
             )]),
             HashMap::from([
@@ -1586,6 +1694,7 @@ mod tests {
                 MessageClass::Regular,
                 false,
                 None,
+                None,
             ),
         )
         .await
@@ -1609,6 +1718,7 @@ mod tests {
                 test_overlay_data(false),
                 MessageClass::Regular,
                 true,
+                None,
                 None,
             ),
         )
@@ -1644,6 +1754,7 @@ mod tests {
                 overlay_data_for_dsts(&[4, 5]),
                 MessageClass::Regular,
                 true,
+                None,
                 None,
             ),
         )

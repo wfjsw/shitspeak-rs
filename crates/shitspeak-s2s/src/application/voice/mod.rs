@@ -5,6 +5,7 @@
 
 pub mod ingress;
 pub mod reorder;
+pub mod repair;
 pub mod send;
 pub mod sink;
 pub mod targeted;

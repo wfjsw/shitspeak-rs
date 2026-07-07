@@ -35,16 +35,21 @@ use shitspeak_s2s_transport::{ConnectionManager, MessageClass, SendOptions, Serv
 use super::super::config::OverlayConfig;
 use super::super::discovery::learn_from_lsa;
 use super::super::duplicate::{DuplicateDetector, DuplicateEvidenceKind};
-use super::super::neighbor::monitor::{NeighborMonitor, NeighborSnapshot};
+use super::super::neighbor::monitor::{NeighborMonitor, NeighborSnapshot, NeighborTransportMetric};
 use super::super::proto::{OverlayBody, encode_message, wrap};
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 use super::store::{
-    AdmissionResult, LinkAdvertised, LinkStateDb, LsaEntry, ReplicationServices, is_strictly_newer,
+    AdmissionResult, LinkAdvertised, LinkStateDb, LinkTransportAdvertised, LsaEntry,
+    ReplicationServices, is_strictly_newer,
 };
 
 const RTT_GATE_BUCKET_US: u64 = 25_000;
 const JITTER_GATE_BUCKET_US: u64 = 10_000;
 const LOSS_GATE_BUCKET_PPM: u32 = 50_000;
+const VOICE_UDP_LOSS_GATE_BUCKET_PPM: u32 = 10_000;
+const VOICE_UDP_REPAIR_LOSS_START_PPM: u32 = 10_000;
+const VOICE_UDP_FULL_DUP_LOSS_PPM: u32 = 30_000;
+const VOICE_UDP_REPAIR_JITTER_START_US: u64 = 40_000;
 
 /// Local-LSA emitter state.
 pub struct LsaEmitter {
@@ -176,6 +181,19 @@ fn build_local_lsa_content(
                 native_loss_ppm: n.native_loss_ppm,
                 data_health_ppm: n.data_health_ppm,
                 loss_sample_count: n.loss_sample_count,
+                transport_metrics: n
+                    .transport_metrics
+                    .iter()
+                    .map(|metric| {
+                        LinkTransportAdvertised::new(
+                            metric.transport(),
+                            metric.rtt_us(),
+                            metric.jitter_us(),
+                            metric.loss_ppm(),
+                            metric.loss_sample_count(),
+                        )
+                    })
+                    .collect(),
             })
             .collect()
     };
@@ -231,6 +249,7 @@ struct LinkGate {
     loss_ppm: u32,
     loss_confident: bool,
     excessive_loss: bool,
+    voice_udp: VoiceUdpGate,
 }
 
 impl LinkGate {
@@ -244,6 +263,7 @@ impl LinkGate {
             n.transports_mask,
             n.loss_ppm,
             n.loss_sample_count,
+            voice_udp_gate_from_neighbor_metrics(&n.transport_metrics),
             cfg,
         )
     }
@@ -258,6 +278,7 @@ impl LinkGate {
             link.transports_mask,
             link.loss_ppm,
             link.loss_sample_count,
+            voice_udp_gate_from_link_metrics(&link.transport_metrics),
             cfg,
         )
     }
@@ -271,6 +292,7 @@ impl LinkGate {
         transports_mask: u32,
         loss_ppm: u32,
         loss_sample_count: u64,
+        voice_udp: VoiceUdpGate,
         cfg: &OverlayConfig,
     ) -> Self {
         let loss_ppm = round_up_u32(loss_ppm, LOSS_GATE_BUCKET_PPM).min(1_000_000);
@@ -289,8 +311,61 @@ impl LinkGate {
             loss_ppm,
             loss_confident,
             excessive_loss: loss_confident && loss_ppm >= cfg.max_route_packet_loss_ppm(),
+            voice_udp,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+struct VoiceUdpGate {
+    loss_ppm: u32,
+    jitter_us: u64,
+    loss_confident: bool,
+    repair_loss_active: bool,
+    full_dup_loss_active: bool,
+    repair_jitter_active: bool,
+}
+
+fn voice_udp_gate(loss_ppm: u32, jitter_us: u64, loss_sample_count: u64) -> VoiceUdpGate {
+    let loss_ppm = round_up_u32(loss_ppm, VOICE_UDP_LOSS_GATE_BUCKET_PPM).min(1_000_000);
+    let jitter_us = round_up_u64(jitter_us, JITTER_GATE_BUCKET_US);
+    let loss_confident = loss_sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+    VoiceUdpGate {
+        loss_ppm,
+        jitter_us,
+        loss_confident,
+        repair_loss_active: loss_ppm >= VOICE_UDP_REPAIR_LOSS_START_PPM,
+        full_dup_loss_active: loss_ppm >= VOICE_UDP_FULL_DUP_LOSS_PPM,
+        repair_jitter_active: jitter_us >= VOICE_UDP_REPAIR_JITTER_START_US,
+    }
+}
+
+fn voice_udp_gate_from_neighbor_metrics(metrics: &[NeighborTransportMetric]) -> VoiceUdpGate {
+    metrics
+        .iter()
+        .find(|metric| metric.transport() == shitspeak_s2s_transport::TransportKind::Udp)
+        .map(|metric| {
+            voice_udp_gate(
+                metric.loss_ppm(),
+                metric.jitter_us(),
+                metric.loss_sample_count(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn voice_udp_gate_from_link_metrics(metrics: &[LinkTransportAdvertised]) -> VoiceUdpGate {
+    metrics
+        .iter()
+        .find(|metric| metric.transport() == shitspeak_s2s_transport::TransportKind::Udp)
+        .map(|metric| {
+            voice_udp_gate(
+                metric.loss_ppm(),
+                metric.jitter_us(),
+                metric.loss_sample_count(),
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn round_up_u64(value: u64, bucket: u64) -> u64 {
@@ -515,6 +590,32 @@ pub fn cost_changed_significantly(
                 current = current.loss_ppm,
                 threshold_ppm = cfg.cost_rerun_loss_ppm(),
                 "local lsa change gate crossed: loss"
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// Has UDP voice quality shifted enough to bypass the normal stable metric
+/// gate? Reliable transport movement continues to use the regular gate.
+pub fn voice_cost_changed_significantly(
+    emitter: &LsaEmitter,
+    snap: &[NeighborSnapshot],
+    cfg: &OverlayConfig,
+) -> bool {
+    let last = emitter.last_published.lock();
+    for n in snap {
+        let Some(previous) = last.get(&n.node_id).copied() else {
+            continue;
+        };
+        let current = LinkGate::from_snapshot(n, cfg);
+        if previous.voice_udp != current.voice_udp {
+            trace!(
+                peer = %n.node_id,
+                previous = ?previous.voice_udp,
+                current = ?current.voice_udp,
+                "local lsa urgent voice metric gate crossed: udp quality"
             );
             return true;
         }
@@ -1001,6 +1102,7 @@ mod tests {
                 native_loss_ppm: 0,
                 data_health_ppm: 0,
                 loss_sample_count: 0,
+                transport_metrics: Vec::new(),
             })
             .collect()
     }
@@ -1239,6 +1341,34 @@ mod tests {
 
         let mut changed = base.clone();
         changed[0].loss_ppm = 1;
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn udp_voice_loss_bucket_triggers_urgent_gate_only() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.transport_metrics = vec![NeighborTransportMetric::new(
+            shitspeak_s2s_transport::TransportKind::Udp,
+            1_000,
+            0,
+            0,
+            MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+        )];
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].transport_metrics = vec![NeighborTransportMetric::new(
+            shitspeak_s2s_transport::TransportKind::Udp,
+            1_000,
+            0,
+            10_000,
+            MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+        )];
+
+        assert!(voice_cost_changed_significantly(&emitter, &changed, &cfg));
         assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
     }
 

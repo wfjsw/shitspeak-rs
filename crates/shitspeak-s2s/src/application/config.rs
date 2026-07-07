@@ -60,6 +60,38 @@ pub struct VoiceConfig {
     /// Amount removed after sustained in-order delivery.
     #[serde(default = "default_adaptive_jitter_decay_step_ms")]
     pub adaptive_jitter_decay_step_ms: u64,
+
+    /// Enable bounded best-effort repair for S2S voice gaps.
+    #[serde(default = "default_repair_enabled")]
+    pub repair_enabled: bool,
+
+    /// Delay before requesting repair for a still-open sequence gap.
+    #[serde(default = "default_repair_nack_delay_ms")]
+    pub repair_nack_delay_ms: u64,
+
+    /// How long the origin keeps encoded voice frames available for replay.
+    #[serde(default = "default_repair_cache_ms")]
+    pub repair_cache_ms: u64,
+
+    /// Short transport TTL for replayed/alternate voice repair frames.
+    #[serde(default = "default_repair_transport_ttl_ms")]
+    pub repair_transport_ttl_ms: u64,
+
+    /// Start sending proactive alternate copies when UDP loss reaches this.
+    #[serde(default = "default_repair_loss_start_ppm")]
+    pub repair_loss_start_ppm: u32,
+
+    /// Send one alternate copy for every frame when UDP loss reaches this.
+    #[serde(default = "default_repair_full_dup_loss_ppm")]
+    pub repair_full_dup_loss_ppm: u32,
+
+    /// Start proactive alternate copies when UDP jitter reaches this many ms.
+    #[serde(default = "default_repair_jitter_start_ms")]
+    pub repair_jitter_start_ms: u64,
+
+    /// Extra repair copies allowed per voice frame.
+    #[serde(default = "default_repair_max_extra_copies_per_frame")]
+    pub repair_max_extra_copies_per_frame: usize,
 }
 
 impl Default for VoiceConfig {
@@ -76,6 +108,14 @@ impl Default for VoiceConfig {
             adaptive_jitter_max_delay_ms: default_adaptive_jitter_max_delay_ms(),
             adaptive_jitter_growth_step_ms: default_adaptive_jitter_growth_step_ms(),
             adaptive_jitter_decay_step_ms: default_adaptive_jitter_decay_step_ms(),
+            repair_enabled: default_repair_enabled(),
+            repair_nack_delay_ms: default_repair_nack_delay_ms(),
+            repair_cache_ms: default_repair_cache_ms(),
+            repair_transport_ttl_ms: default_repair_transport_ttl_ms(),
+            repair_loss_start_ppm: default_repair_loss_start_ppm(),
+            repair_full_dup_loss_ppm: default_repair_full_dup_loss_ppm(),
+            repair_jitter_start_ms: default_repair_jitter_start_ms(),
+            repair_max_extra_copies_per_frame: default_repair_max_extra_copies_per_frame(),
         }
     }
 }
@@ -125,4 +165,46 @@ fn default_adaptive_jitter_growth_step_ms() -> u64 {
 }
 fn default_adaptive_jitter_decay_step_ms() -> u64 {
     20
+}
+fn default_repair_enabled() -> bool {
+    true
+}
+fn default_repair_nack_delay_ms() -> u64 {
+    8
+}
+fn default_repair_cache_ms() -> u64 {
+    300
+}
+fn default_repair_transport_ttl_ms() -> u64 {
+    120
+}
+fn default_repair_loss_start_ppm() -> u32 {
+    10_000
+}
+fn default_repair_full_dup_loss_ppm() -> u32 {
+    30_000
+}
+fn default_repair_jitter_start_ms() -> u64 {
+    40
+}
+fn default_repair_max_extra_copies_per_frame() -> usize {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_repair_defaults_deserialize_enabled() {
+        let cfg: ApplicationConfig = serde_json::from_str(r#"{"voice":{}}"#).unwrap();
+        assert!(cfg.voice.repair_enabled);
+        assert_eq!(cfg.voice.repair_nack_delay_ms, 8);
+        assert_eq!(cfg.voice.repair_cache_ms, 300);
+        assert_eq!(cfg.voice.repair_transport_ttl_ms, 120);
+        assert_eq!(cfg.voice.repair_loss_start_ppm, 10_000);
+        assert_eq!(cfg.voice.repair_full_dup_loss_ppm, 30_000);
+        assert_eq!(cfg.voice.repair_jitter_start_ms, 40);
+        assert_eq!(cfg.voice.repair_max_extra_copies_per_frame, 1);
+    }
 }

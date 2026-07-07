@@ -22,7 +22,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{
-    ServiceLevel, apply_packet_loss_penalty, conversational_effective_delay_us,
+    ServiceLevel, TransportKind, apply_packet_loss_penalty, conversational_effective_delay_us,
     conversational_impairment,
 };
 
@@ -36,6 +36,7 @@ pub(crate) const MIN_ROUTE_LOSS_EXCLUSION_SAMPLES: u64 = 32;
 pub struct RouteEntry {
     pub next_hop: NodeIdentifier,
     pub cost: u64,
+    pub latency_us: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -219,13 +220,18 @@ pub(crate) fn adjacency_for(
     for (origin, links) in graph.links_by_origin() {
         let mut edges = Vec::new();
         for link in links {
+            let metric_inputs = edge_metric_inputs(link, metric);
             if !graph.is_active(link.neighbor)
                 || link.transports_mask & mask == 0
-                || has_confident_excessive_loss(link, cfg.max_route_packet_loss_ppm())
+                || has_confident_excessive_loss(
+                    metric_inputs.loss_ppm,
+                    metric_inputs.loss_sample_count,
+                    cfg.max_route_packet_loss_ppm(),
+                )
             {
                 continue;
             }
-            let cost = compute_cost(link, metric, cfg);
+            let cost = compute_cost(link, metric, cfg, metric_inputs);
             edges.push((link.neighbor, cost));
         }
         adj.insert(origin, edges);
@@ -293,6 +299,7 @@ pub(crate) fn route_table_from_tree(
                         RouteEntry {
                             next_hop: cur,
                             cost: cost.primary,
+                            latency_us: cost.latency_us,
                         },
                     );
                     break;
@@ -305,28 +312,75 @@ pub(crate) fn route_table_from_tree(
     out
 }
 
-fn has_confident_excessive_loss(link: &LinkAdvertised, max_loss_ppm: u32) -> bool {
-    route_loss_is_confident(link) && link.loss_ppm >= max_loss_ppm
+#[derive(Debug, Clone, Copy)]
+struct EdgeMetricInputs {
+    rtt_us: u64,
+    jitter_us: u64,
+    loss_ppm: u32,
+    loss_sample_count: u64,
 }
 
-fn compute_cost(link: &LinkAdvertised, metric: RoutingMetric, cfg: &OverlayConfig) -> EdgeCost {
+fn edge_metric_inputs(link: &LinkAdvertised, metric: RoutingMetric) -> EdgeMetricInputs {
+    if metric == RoutingMetric::ConversationalQuality {
+        if let Some(udp) = link
+            .transport_metrics
+            .iter()
+            .find(|metric| metric.transport() == TransportKind::Udp)
+        {
+            return EdgeMetricInputs {
+                rtt_us: if udp.rtt_us() > 0 {
+                    udp.rtt_us()
+                } else {
+                    link.rtt_us
+                },
+                jitter_us: udp.jitter_us(),
+                loss_ppm: udp.loss_ppm(),
+                loss_sample_count: udp.loss_sample_count(),
+            };
+        }
+    }
+    EdgeMetricInputs {
+        rtt_us: link.rtt_us,
+        jitter_us: link.jitter_us,
+        loss_ppm: link.loss_ppm,
+        loss_sample_count: link.loss_sample_count,
+    }
+}
+
+fn has_confident_excessive_loss(loss_ppm: u32, loss_sample_count: u64, max_loss_ppm: u32) -> bool {
+    route_loss_is_confident(loss_sample_count) && loss_ppm >= max_loss_ppm
+}
+
+fn compute_cost(
+    link: &LinkAdvertised,
+    metric: RoutingMetric,
+    cfg: &OverlayConfig,
+    metric_inputs: EdgeMetricInputs,
+) -> EdgeCost {
     let route_throughput_bps =
         confidence_weighted_throughput_bps(link.observed_sent_bps, link.throughput_confidence_ppm);
     let primary = match metric {
-        RoutingMetric::ReliableCost => {
-            compute_reliable_cost(link.rtt_us, route_throughput_bps, link.loss_ppm, cfg)
-        }
-        RoutingMetric::ReliableLowLatencyCost => {
-            compute_reliable_low_latency_cost(link.rtt_us, link.jitter_us, link.loss_ppm, cfg)
-        }
+        RoutingMetric::ReliableCost => compute_reliable_cost(
+            metric_inputs.rtt_us,
+            route_throughput_bps,
+            metric_inputs.loss_ppm,
+            cfg,
+        ),
+        RoutingMetric::ReliableLowLatencyCost => compute_reliable_low_latency_cost(
+            metric_inputs.rtt_us,
+            metric_inputs.jitter_us,
+            metric_inputs.loss_ppm,
+            cfg,
+        ),
         RoutingMetric::BestEffortCost => {
-            apply_packet_loss_penalty(link.rtt_us.max(1) as f64, link.loss_ppm).ceil() as u64
+            apply_packet_loss_penalty(metric_inputs.rtt_us.max(1) as f64, metric_inputs.loss_ppm)
+                .ceil() as u64
         }
         RoutingMetric::ConversationalQuality => (conversational_impairment(
-            link.rtt_us as f64,
-            link.jitter_us as f64,
+            metric_inputs.rtt_us as f64,
+            metric_inputs.jitter_us as f64,
             route_throughput_bps as f64,
-            link.loss_ppm,
+            metric_inputs.loss_ppm,
         ) * 10_000.0)
             .ceil()
             .max(1.0) as u64,
@@ -334,10 +388,12 @@ fn compute_cost(link: &LinkAdvertised, metric: RoutingMetric, cfg: &OverlayConfi
     let latency_us = match metric {
         RoutingMetric::ReliableCost
         | RoutingMetric::ReliableLowLatencyCost
-        | RoutingMetric::BestEffortCost => link.rtt_us.max(1),
-        RoutingMetric::ConversationalQuality => {
-            conversational_effective_delay_us(link.rtt_us as f64, link.jitter_us as f64).max(1)
-        }
+        | RoutingMetric::BestEffortCost => metric_inputs.rtt_us.max(1),
+        RoutingMetric::ConversationalQuality => conversational_effective_delay_us(
+            metric_inputs.rtt_us as f64,
+            metric_inputs.jitter_us as f64,
+        )
+        .max(1),
     };
     EdgeCost {
         primary: primary.max(1),
@@ -355,8 +411,8 @@ fn confidence_weighted_throughput_bps(observed_sent_bps: u64, confidence_ppm: u3
         .saturating_div(1_000_000)
 }
 
-fn route_loss_is_confident(link: &LinkAdvertised) -> bool {
-    link.loss_sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES
+fn route_loss_is_confident(loss_sample_count: u64) -> bool {
+    loss_sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES
 }
 
 fn compute_reliable_low_latency_cost(
@@ -385,7 +441,11 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use super::super::super::lsdb::{LsaEntry, LsaFloor, ReplicationServices};
+    use super::super::super::config::transport_bit;
+    use super::super::super::lsdb::{
+        LinkTransportAdvertised, LsaEntry, LsaFloor, ReplicationServices,
+    };
+    use shitspeak_s2s_transport::TransportKind;
 
     fn cfg() -> OverlayConfig {
         OverlayConfig::new(vec![])
@@ -449,6 +509,7 @@ mod tests {
                     native_loss_ppm: 0,
                     data_health_ppm: 0,
                     loss_sample_count,
+                    transport_metrics: Vec::new(),
                 })
                 .collect(),
             max_users: 0,
@@ -499,6 +560,7 @@ mod tests {
                         native_loss_ppm,
                         data_health_ppm,
                         loss_sample_count,
+                        transport_metrics: Vec::new(),
                     },
                 )
                 .collect(),
@@ -515,6 +577,55 @@ mod tests {
             db.admit(l);
         }
         db
+    }
+
+    fn entry_with_udp_metrics(
+        origin: NodeIdentifier,
+        links: Vec<(NodeIdentifier, u64, u32, Option<(u64, u64, u32, u64)>)>,
+    ) -> LsaEntry {
+        LsaEntry {
+            origin,
+            boot_epoch: 100,
+            seq: 1,
+            ts_local_received: std::time::Instant::now(),
+            tombstone: false,
+            addresses: vec![],
+            links: links
+                .into_iter()
+                .map(
+                    |(neighbor, rtt_us, aggregate_loss_ppm, udp)| LinkAdvertised {
+                        neighbor,
+                        rtt_us,
+                        jitter_us: 0,
+                        throughput_bps: 1_000_000,
+                        observed_recv_bps: 1_000_000,
+                        observed_sent_bps: 1_000_000,
+                        throughput_confidence_ppm: 1_000_000,
+                        transports_mask: transport_bit(TransportKind::Tcp)
+                            | transport_bit(TransportKind::Udp),
+                        loss_ppm: aggregate_loss_ppm,
+                        probe_loss_ppm: aggregate_loss_ppm,
+                        native_loss_ppm: 0,
+                        data_health_ppm: 0,
+                        loss_sample_count: MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+                        transport_metrics: udp
+                            .map(|(udp_rtt, udp_jitter, udp_loss, samples)| {
+                                vec![LinkTransportAdvertised::new(
+                                    TransportKind::Udp,
+                                    udp_rtt,
+                                    udp_jitter,
+                                    udp_loss,
+                                    samples,
+                                )]
+                            })
+                            .unwrap_or_default(),
+                    },
+                )
+                .collect(),
+            max_users: 0,
+            transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
+        }
     }
 
     #[test]
@@ -614,6 +725,81 @@ mod tests {
             &cfg(),
         );
         assert_eq!(conversational[&2].next_hop, 2);
+    }
+
+    #[test]
+    fn conversational_metric_uses_udp_specific_loss_without_penalizing_reliable_cost() {
+        let db = build_db(vec![
+            entry_with_udp_metrics(
+                1,
+                vec![
+                    (
+                        2,
+                        5_000,
+                        0,
+                        Some((5_000, 0, 300_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                    (
+                        3,
+                        12_000,
+                        0,
+                        Some((12_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                ],
+            ),
+            entry_with_udp_metrics(
+                2,
+                vec![
+                    (
+                        1,
+                        5_000,
+                        0,
+                        Some((5_000, 0, 300_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                    (
+                        3,
+                        1_000,
+                        0,
+                        Some((1_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                ],
+            ),
+            entry_with_udp_metrics(
+                3,
+                vec![
+                    (
+                        1,
+                        12_000,
+                        0,
+                        Some((12_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                    (
+                        2,
+                        1_000,
+                        0,
+                        Some((1_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                ],
+            ),
+        ]);
+
+        let reliable = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &cfg(),
+        );
+        assert_eq!(reliable[&2].next_hop, 2);
+
+        let conversational = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            &cfg(),
+        );
+        assert_eq!(conversational[&2].next_hop, 3);
     }
 
     #[test]

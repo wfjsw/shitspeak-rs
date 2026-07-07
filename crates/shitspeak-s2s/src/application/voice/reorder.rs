@@ -31,10 +31,38 @@ use crate::application::proto::VoiceFrame;
 use shitspeak_core::NodeIdentifier;
 
 const ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN: u32 = 16;
+const ADAPTIVE_REPAIR_DELAY_MARGIN_MS: u64 = 20;
+const ADAPTIVE_REPAIR_LOSS_BONUS_MAX_MS: u64 = 200;
 
 /// One emit decision: forward the bundled `(from_immediate, frame)` to
 /// the audio sink.
 pub type Emission = (NodeIdentifier, VoiceFrame);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapReport {
+    pub from: NodeIdentifier,
+    pub sender_session: u32,
+    pub sender_epoch: u64,
+    pub first_seq: u64,
+    pub last_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceRouteHint {
+    path_latency_us: u64,
+    jitter_us: u64,
+    loss_ppm: u32,
+}
+
+impl VoiceRouteHint {
+    pub fn new(path_latency_us: u64, jitter_us: u64, loss_ppm: u32) -> Self {
+        Self {
+            path_latency_us,
+            jitter_us,
+            loss_ppm,
+        }
+    }
+}
 
 /// Public reorder gate. Cheap to clone — internally `Arc`-wrapped.
 pub struct Reorderer {
@@ -55,6 +83,7 @@ struct SenderState {
     pending: BTreeMap<u64, (NodeIdentifier, VoiceFrame)>,
     deadline: Option<Instant>,
     adaptive_delay_ms: u64,
+    route_repair_delay_ms: u64,
     in_order_run: u32,
 }
 
@@ -97,12 +126,33 @@ impl Reorderer {
         self.cfg.reorder_max_delay_ms.clamp(min, max)
     }
 
+    pub fn route_repair_delay_ms_for_config(cfg: &VoiceConfig, hint: VoiceRouteHint) -> u64 {
+        let path_ms = hint.path_latency_us.saturating_add(999) / 1_000;
+        let jitter_ms = hint.jitter_us.saturating_add(999) / 1_000;
+        let loss_bonus_ms =
+            (u64::from(hint.loss_ppm).saturating_div(1_000)).min(ADAPTIVE_REPAIR_LOSS_BONUS_MAX_MS);
+        let computed = cfg
+            .repair_nack_delay_ms
+            .saturating_add(path_ms.saturating_mul(2))
+            .saturating_add(jitter_ms.saturating_mul(3))
+            .saturating_add(loss_bonus_ms)
+            .saturating_add(ADAPTIVE_REPAIR_DELAY_MARGIN_MS);
+        let min = cfg.adaptive_jitter_min_delay_ms;
+        let max = cfg.adaptive_jitter_max_delay_ms.max(min);
+        computed.clamp(min, max)
+    }
+
+    pub fn route_repair_delay_ms(&self, hint: VoiceRouteHint) -> u64 {
+        Self::route_repair_delay_ms_for_config(&self.cfg, hint)
+    }
+
     fn effective_delay_ms(&self, entry: &SenderState) -> u64 {
-        if self.cfg.adaptive_jitter_enabled {
+        let base = if self.cfg.adaptive_jitter_enabled {
             entry.adaptive_delay_ms
         } else {
             self.cfg.reorder_max_delay_ms
-        }
+        };
+        base.max(entry.route_repair_delay_ms)
     }
 
     fn reset_adaptive_delay(&self, entry: &mut SenderState) {
@@ -143,6 +193,18 @@ impl Reorderer {
     /// they're returned. May be empty (frame is buffered) or contain
     /// multiple entries (the frame closed a gap and drained pending).
     pub fn push(&self, from: NodeIdentifier, frame: VoiceFrame) -> Vec<Emission> {
+        self.push_with_route_hint(from, frame, None)
+    }
+
+    /// Push an inbound delivery with an optional route-quality hint. When
+    /// present, the hint raises the per-sender deadline enough to leave room
+    /// for a NACK round trip and repair copy on farther or lossier paths.
+    pub fn push_with_route_hint(
+        &self,
+        from: NodeIdentifier,
+        frame: VoiceFrame,
+        route_hint: Option<VoiceRouteHint>,
+    ) -> Vec<Emission> {
         if self.cfg.reorder_disabled {
             return vec![(from, frame)];
         }
@@ -163,8 +225,14 @@ impl Reorderer {
                 pending: BTreeMap::new(),
                 deadline: None,
                 adaptive_delay_ms: initial_adaptive_delay_ms,
+                route_repair_delay_ms: route_hint
+                    .map(|hint| self.route_repair_delay_ms(hint))
+                    .unwrap_or(0),
                 in_order_run: 0,
             });
+        if let Some(hint) = route_hint {
+            entry.route_repair_delay_ms = self.route_repair_delay_ms(hint);
+        }
 
         // ── 1. Sender restart (strictly greater epoch) ────────────────
         if arrived_epoch > entry.epoch {
@@ -182,6 +250,9 @@ impl Reorderer {
             entry.next_seq = 0;
             entry.deadline = None;
             self.reset_adaptive_delay(entry);
+            if let Some(hint) = route_hint {
+                entry.route_repair_delay_ms = self.route_repair_delay_ms(hint);
+            }
         } else if arrived_epoch < entry.epoch {
             // Old-epoch frame; drop silently.
             return emit;
@@ -358,6 +429,37 @@ impl Reorderer {
         emit
     }
 
+    pub fn gap_for_frame(&self, from: NodeIdentifier, frame: &VoiceFrame) -> Option<GapReport> {
+        if self.cfg.reorder_disabled || frame.s2s_seq == 0 {
+            return None;
+        }
+        let state = self.state.lock();
+        let entry = state.per_sender.get(&frame.sender_session)?;
+        if entry.epoch != frame.sender_epoch
+            || entry.next_seq >= frame.s2s_seq
+            || !entry.pending.contains_key(&frame.s2s_seq)
+        {
+            return None;
+        }
+        Some(GapReport {
+            from,
+            sender_session: frame.sender_session,
+            sender_epoch: frame.sender_epoch,
+            first_seq: entry.next_seq,
+            last_seq: frame.s2s_seq.saturating_sub(1),
+        })
+    }
+
+    pub fn gap_still_missing(&self, gap: GapReport) -> bool {
+        let state = self.state.lock();
+        let Some(entry) = state.per_sender.get(&gap.sender_session) else {
+            return false;
+        };
+        entry.epoch == gap.sender_epoch
+            && entry.next_seq <= gap.last_seq
+            && !entry.pending.is_empty()
+    }
+
     #[cfg(test)]
     pub fn pending_total(&self) -> usize {
         self.state.lock().total_pending
@@ -370,6 +472,15 @@ impl Reorderer {
             .per_sender
             .get(&session)
             .map(|entry| entry.adaptive_delay_ms)
+    }
+
+    #[cfg(test)]
+    pub fn route_repair_delay_ms_for(&self, session: u32) -> Option<u64> {
+        self.state
+            .lock()
+            .per_sender
+            .get(&session)
+            .map(|entry| entry.route_repair_delay_ms)
     }
 }
 
@@ -454,6 +565,37 @@ mod tests {
         let seqs: Vec<u64> = emits.iter().map(|(_, f)| f.s2s_seq).collect();
         assert_eq!(seqs, vec![1, 2]);
         assert_eq!(r.pending_total(), 0);
+    }
+
+    #[test]
+    fn duplicate_repair_frame_does_not_double_emit() {
+        let r = Reorderer::new(cfg());
+        assert_eq!(r.push(11, frame(0xABC, 1, 0, false)).len(), 1);
+        assert!(r.push(11, frame(0xABC, 1, 0, false)).is_empty());
+        assert_eq!(r.push(11, frame(0xABC, 1, 1, false)).len(), 1);
+        assert!(r.push(11, frame(0xABC, 1, 1, false)).is_empty());
+    }
+
+    #[test]
+    fn gap_remains_missing_after_partial_fill() {
+        let r = Reorderer::new(cfg());
+        assert_eq!(r.push(11, frame(0xABC, 1, 0, false)).len(), 1);
+        let out_of_order = frame(0xABC, 1, 3, false);
+        assert!(r.push(11, out_of_order.clone()).is_empty());
+        let gap = r.gap_for_frame(11, &out_of_order).unwrap();
+        assert_eq!(gap.first_seq, 1);
+        assert_eq!(gap.last_seq, 2);
+
+        assert_eq!(r.push(11, frame(0xABC, 1, 1, false)).len(), 1);
+        assert!(r.gap_still_missing(gap));
+
+        let seqs: Vec<u64> = r
+            .push(11, frame(0xABC, 1, 2, false))
+            .into_iter()
+            .map(|(_, frame)| frame.s2s_seq)
+            .collect();
+        assert_eq!(seqs, vec![2, 3]);
+        assert!(!r.gap_still_missing(gap));
     }
 
     #[test]
@@ -626,6 +768,29 @@ mod tests {
             r.push(11, frame(0xABC, 1, seq, false));
         }
         assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(10));
+    }
+
+    #[test]
+    fn route_hint_holds_gap_for_far_lossy_repair() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_enabled = false;
+        c.adaptive_jitter_min_delay_ms = 40;
+        c.adaptive_jitter_max_delay_ms = 600;
+        c.repair_nack_delay_ms = 8;
+        let r = Reorderer::new(c);
+
+        r.push(11, frame(0xABC, 1, 0, false));
+        let hint = VoiceRouteHint::new(90_000, 30_000, 20_000);
+        assert!(
+            r.push_with_route_hint(11, frame(0xABC, 1, 2, false), Some(hint))
+                .is_empty()
+        );
+
+        let route_delay = r.route_repair_delay_ms_for(0xABC).unwrap();
+        assert!(route_delay >= 300, "route delay was {route_delay}ms");
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(r.drain_expired().is_empty());
     }
 
     #[test]

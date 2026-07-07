@@ -68,6 +68,15 @@ message LinkAdvert {
   uint64 observed_recv_bps = 11; // Passive payload bytes/sec received by origin from neighbor.
   uint64 observed_sent_bps = 12; // Passive payload bytes/sec sent by origin to neighbor.
   uint32 throughput_confidence_ppm = 13; // Confidence in observed throughput, parts per million.
+  repeated LinkTransportMetric transport_metrics = 14; // Per-transport quality for service-specific routing.
+}
+
+message LinkTransportMetric {
+  uint32 transport = 1; // 0=Tcp, 1=Kcp, 2=Quic, 3=Udp
+  uint64 rtt_us = 2;
+  uint64 jitter_us = 3;
+  uint32 loss_ppm = 4;
+  uint64 loss_sample_count = 5;
 }
 
 // Address entry (kept compatible with Phase 1's existing AddressEntry).

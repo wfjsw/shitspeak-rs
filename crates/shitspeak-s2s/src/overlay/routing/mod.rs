@@ -343,6 +343,7 @@ impl RoutingTables {
                     return Some(RouteEntry {
                         next_hop: cur,
                         cost: cost.primary,
+                        latency_us: cost.latency_us,
                     });
                 }
                 Some(parent) => cur = *parent,
@@ -391,6 +392,7 @@ mod tests {
                 RouteEntry {
                     next_hop: 2,
                     cost: 10,
+                    latency_us: 10,
                 },
             );
         tables
@@ -405,6 +407,7 @@ mod tests {
                 RouteEntry {
                     next_hop: 3,
                     cost: 1,
+                    latency_us: 1,
                 },
             );
 
