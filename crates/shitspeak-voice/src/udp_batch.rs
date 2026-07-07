@@ -215,6 +215,7 @@ async fn send_each(
 async fn sendmmsg_linux(
     socket: &tokio::net::UdpSocket,
     batch: &DatagramBatch,
+    retry_budget: Duration,
 ) -> std::io::Result<FlushStats> {
     use std::os::fd::AsRawFd;
 
