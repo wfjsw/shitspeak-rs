@@ -157,6 +157,7 @@ async fn build_user_stats_payload(
     let onlinesecs = (now - login_time).num_seconds().max(0) as u32;
     let idlesecs = target.idle_duration().num_seconds().max(0) as u32;
     let bandwidth = average_bandwidth_bits_per_second(stats.total_volume(), onlinesecs);
+    let (from_client, from_server) = udp_network_stats(target);
 
     let version = target.protocol_version().map(|v| {
         crate::messages::encoder::Version {
@@ -182,8 +183,8 @@ async fn build_user_stats_payload(
         } else {
             target.get_certificate_chain().to_vec()
         },
-        from_client: None,
-        from_server: None,
+        from_client,
+        from_server,
         udp_packets: Some(stats.udp_packets()),
         tcp_packets: Some(stats.tcp_packets()),
         udp_ping_avg: Some(stats.udp_ping_avg()),
@@ -198,6 +199,35 @@ async fn build_user_stats_payload(
         idlesecs: Some(idlesecs),
         strong_certificate: Some(target.is_verified()),
         opus: Some(true),
+    }
+}
+
+fn udp_network_stats(
+    target: &Arc<Box<Client>>,
+) -> (
+    Option<crate::mumble_proto::user_stats::Stats>,
+    Option<crate::mumble_proto::user_stats::Stats>,
+) {
+    let crypt_state = target.crypt_state();
+    crypt_state
+        .as_ref()
+        .map(|state| {
+            (
+                Some(packet_stats_to_proto(state.local_packet_stats())),
+                Some(packet_stats_to_proto(state.remote_packet_stats())),
+            )
+        })
+        .unwrap_or((None, None))
+}
+
+fn packet_stats_to_proto(
+    (good, late, lost, resync): (u32, u32, u32, u32),
+) -> crate::mumble_proto::user_stats::Stats {
+    crate::mumble_proto::user_stats::Stats {
+        good: Some(good),
+        late: Some(late),
+        lost: Some(lost),
+        resync: Some(resync),
     }
 }
 

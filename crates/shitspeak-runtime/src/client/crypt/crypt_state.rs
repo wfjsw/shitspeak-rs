@@ -364,6 +364,19 @@ impl CryptState {
         self.remote_resync = ping_message.resync;
     }
 
+    pub(crate) fn local_packet_stats(&self) -> (u32, u32, u32, u32) {
+        (self.good, self.late, self.lost, self.resync)
+    }
+
+    pub(crate) fn remote_packet_stats(&self) -> (u32, u32, u32, u32) {
+        (
+            self.remote_good,
+            self.remote_late,
+            self.remote_lost,
+            self.remote_resync,
+        )
+    }
+
     pub fn create_ping_response(&self, ping_message: &Ping) -> Ping {
         Ping {
             good: self.good,

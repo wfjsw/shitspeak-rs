@@ -161,6 +161,91 @@ async fn user_stats_reports_bandwidth_and_idle_time() {
 }
 
 #[tokio::test]
+async fn user_stats_reports_udp_network_statistics() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let mut alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    alice.open_udp().await.expect("alice udp bind");
+    alice.udp_handshake().await.expect("alice udp handshake");
+    alice
+        .recv_udp_ping(Duration::from_secs(2))
+        .await
+        .expect("encrypted UDP ping response");
+
+    alice
+        .send(
+            Ping {
+                timestamp: 42,
+                good: 7,
+                late: 2,
+                lost: 3,
+                resync: 4,
+                ..Ping::default()
+            }
+            .into(),
+        )
+        .await;
+    alice
+        .recv_until(
+            |m| matches!(m, Message::Ping(ping) if ping.timestamp == Some(42)),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Alice should receive her Ping response");
+
+    alice
+        .send(
+            UserStats {
+                session: Some(alice.session_id),
+                stats_only: Some(true),
+                ..UserStats::default()
+            }
+            .into(),
+        )
+        .await;
+
+    let msg = alice
+        .recv_until(
+            |m| matches!(m, Message::UserStats(us) if us.session == Some(alice.session_id)),
+            Duration::from_secs(2),
+        )
+        .await;
+
+    let Some(Message::UserStats(stats)) = msg else {
+        panic!("Alice should receive her UserStats response");
+    };
+
+    let from_client = stats
+        .from_client
+        .expect("UserStats should include UDP stats for packets from the client");
+    assert!(
+        from_client.good.unwrap_or_default() >= 1,
+        "server-side UDP stats should include the authenticated handshake packet"
+    );
+    assert_eq!(from_client.late, Some(0));
+    assert_eq!(from_client.lost, Some(0));
+    assert_eq!(from_client.resync, Some(0));
+
+    let from_server = stats
+        .from_server
+        .expect("UserStats should include UDP stats reported by the client");
+    assert_eq!(from_server.good, Some(7));
+    assert_eq!(from_server.late, Some(2));
+    assert_eq!(from_server.lost, Some(3));
+    assert_eq!(from_server.resync, Some(4));
+    assert!(
+        stats.udp_packets.unwrap_or_default() >= 1,
+        "UserStats UDP packet count should include observed encrypted UDP traffic"
+    );
+}
+
+#[tokio::test]
 async fn user_stats_requires_enter_on_target_channel_without_root_ban() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
