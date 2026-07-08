@@ -29,11 +29,83 @@ pub struct KcpSession {
     socket: Mutex<KcpSocket>,
     closed: AtomicBool,
     session_expire: Duration,
+    no_progress_timeout: Duration,
     session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
     input_tx: mpsc::Sender<Vec<u8>>,
     notifier: Notify,
     socket_waker: AtomicWaker,
     stats: KcpStatsSnapshot,
+    created_at: Instant,
+    runtime: KcpRuntimeState,
+}
+
+#[derive(Debug, Default)]
+struct KcpRuntimeState {
+    last_input_ms: AtomicU64,
+    outstanding_since_ms: AtomicU64,
+    wait_snd: AtomicU64,
+    snd_wnd: AtomicU64,
+    rmt_wnd: AtomicU64,
+    pending_sender: AtomicBool,
+    waiting_conv: AtomicBool,
+    input_queue_drops: AtomicU64,
+    no_progress_closes: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KcpRuntimeSnapshot {
+    closed: bool,
+    pending_sender: bool,
+    waiting_conv: bool,
+    wait_snd: u64,
+    snd_wnd: u64,
+    rmt_wnd: u64,
+    input_queue_drops: u64,
+    no_progress_closes: u64,
+    last_input_age_ms: Option<u64>,
+    outstanding_no_progress_age_ms: Option<u64>,
+}
+
+impl KcpRuntimeSnapshot {
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn pending_sender(&self) -> bool {
+        self.pending_sender
+    }
+
+    pub fn waiting_conv(&self) -> bool {
+        self.waiting_conv
+    }
+
+    pub fn wait_snd(&self) -> u64 {
+        self.wait_snd
+    }
+
+    pub fn snd_wnd(&self) -> u64 {
+        self.snd_wnd
+    }
+
+    pub fn rmt_wnd(&self) -> u64 {
+        self.rmt_wnd
+    }
+
+    pub fn input_queue_drops(&self) -> u64 {
+        self.input_queue_drops
+    }
+
+    pub fn no_progress_closes(&self) -> u64 {
+        self.no_progress_closes
+    }
+
+    pub fn last_input_age_ms(&self) -> Option<u64> {
+        self.last_input_age_ms
+    }
+
+    pub fn outstanding_no_progress_age_ms(&self) -> Option<u64> {
+        self.outstanding_no_progress_age_ms
+    }
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +193,10 @@ impl KcpStatsHandle {
     pub fn rtt_sample_count(&self) -> u64 {
         self.session.rtt_sample_count()
     }
+
+    pub fn runtime_snapshot(&self) -> KcpRuntimeSnapshot {
+        self.session.runtime_snapshot()
+    }
 }
 
 impl Drop for KcpSession {
@@ -150,26 +226,33 @@ impl KcpSession {
     fn new(
         socket: KcpSocket,
         session_expire: Duration,
+        no_progress_timeout: Duration,
         session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
         input_tx: mpsc::Sender<Vec<u8>>,
     ) -> KcpSession {
         let stats = KcpStatsSnapshot::default();
         stats.update(&socket.stats());
+        let now = Instant::now();
+        let runtime = KcpRuntimeState::default();
         KcpSession {
             socket: Mutex::new(socket),
             closed: AtomicBool::new(false),
             session_expire,
+            no_progress_timeout,
             session_close_notifier,
             input_tx,
             notifier: Notify::new(),
             socket_waker: AtomicWaker::new(),
             stats,
+            created_at: now,
+            runtime,
         }
     }
 
     pub fn new_shared(
         socket: KcpSocket,
         session_expire: Duration,
+        no_progress_timeout: Duration,
         session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
     ) -> Arc<KcpSession> {
         let is_client = session_close_notifier.is_none();
@@ -181,6 +264,7 @@ impl KcpSession {
         let session = Arc::new(KcpSession::new(
             socket,
             session_expire,
+            no_progress_timeout,
             session_close_notifier,
             input_tx,
         ));
@@ -232,6 +316,7 @@ impl KcpSession {
                                         }
                                     }
                                     session.update_stats(&socket);
+                                    session.note_input_and_refresh_runtime(&socket);
                                     session.wake_socket_waiters();
                                     session.notify();
                                 }
@@ -256,6 +341,7 @@ impl KcpSession {
                                         }
                                     }
                                     session.update_stats(&socket);
+                                    session.note_input_and_refresh_runtime(&socket);
                                     session.wake_socket_waiters();
                                     session.notify();
                                 }
@@ -280,6 +366,27 @@ impl KcpSession {
                         if is_closed && socket.can_close() {
                             trace!("[SESSION] KCP session closing");
                             break;
+                        }
+
+                        if !is_closed && !session.no_progress_timeout.is_zero() && socket.has_outstanding_send_work() {
+                            session.refresh_runtime_state(&socket);
+                            if session
+                                .outstanding_no_progress_elapsed()
+                                .is_some_and(|elapsed| elapsed >= session.no_progress_timeout)
+                            {
+                                trace!(
+                                    "[SESSION] closing no-progress KCP session, conv: {}, timeout_ms: {}, wait_snd: {}, snd_wnd: {}, rmt_wnd: {}, pending_sender: {}, waiting_conv: {}",
+                                    socket.conv(),
+                                    session.no_progress_timeout.as_millis(),
+                                    socket.wait_snd(),
+                                    socket.snd_wnd(),
+                                    socket.rmt_wnd(),
+                                    socket.pending_sender(),
+                                    socket.waiting_conv()
+                                );
+                                session.runtime.no_progress_closes.fetch_add(1, Ordering::Relaxed);
+                                session.closed.store(true, Ordering::Release);
+                            }
                         }
 
                         // server socket expires
@@ -348,6 +455,7 @@ impl KcpSession {
                             });
                         }
                         session.update_stats(&socket);
+                        session.refresh_runtime_state(&socket);
                         session.wake_socket_waiters();
                         next
                     };
@@ -372,6 +480,7 @@ impl KcpSession {
                     let mut socket = session.socket.lock().await;
                     socket.close();
                     session.update_stats(&socket);
+                    session.refresh_runtime_state(&socket);
                     session.wake_socket_waiters();
                 }
 
@@ -395,6 +504,25 @@ impl KcpSession {
 
     pub fn snapshot_stats(&self) -> KcpStats {
         self.stats.get()
+    }
+
+    pub fn runtime_snapshot(&self) -> KcpRuntimeSnapshot {
+        let now_ms = self.elapsed_ms();
+        let last_input_ms = self.runtime.last_input_ms.load(Ordering::Relaxed);
+        let outstanding_since_ms = self.runtime.outstanding_since_ms.load(Ordering::Relaxed);
+        KcpRuntimeSnapshot {
+            closed: self.closed.load(Ordering::Acquire),
+            pending_sender: self.runtime.pending_sender.load(Ordering::Relaxed),
+            waiting_conv: self.runtime.waiting_conv.load(Ordering::Relaxed),
+            wait_snd: self.runtime.wait_snd.load(Ordering::Relaxed),
+            snd_wnd: self.runtime.snd_wnd.load(Ordering::Relaxed),
+            rmt_wnd: self.runtime.rmt_wnd.load(Ordering::Relaxed),
+            input_queue_drops: self.runtime.input_queue_drops.load(Ordering::Relaxed),
+            no_progress_closes: self.runtime.no_progress_closes.load(Ordering::Relaxed),
+            last_input_age_ms: (last_input_ms > 0).then_some(now_ms.saturating_sub(last_input_ms)),
+            outstanding_no_progress_age_ms: (outstanding_since_ms > 0)
+                .then_some(now_ms.saturating_sub(outstanding_since_ms)),
+        }
     }
 
     pub async fn stats(&self) -> KcpStats {
@@ -429,6 +557,48 @@ impl KcpSession {
         self.stats.update(&stats);
     }
 
+    pub(crate) fn refresh_runtime_state(&self, socket: &KcpSocket) {
+        self.runtime.wait_snd.store(socket.wait_snd() as u64, Ordering::Relaxed);
+        self.runtime
+            .snd_wnd
+            .store(u64::from(socket.snd_wnd()), Ordering::Relaxed);
+        self.runtime
+            .rmt_wnd
+            .store(u64::from(socket.rmt_wnd()), Ordering::Relaxed);
+        self.runtime
+            .pending_sender
+            .store(socket.pending_sender(), Ordering::Relaxed);
+        self.runtime
+            .waiting_conv
+            .store(socket.waiting_conv(), Ordering::Relaxed);
+
+        if socket.has_outstanding_send_work() {
+            let now_ms = self.elapsed_ms();
+            let _ = self
+                .runtime
+                .outstanding_since_ms
+                .compare_exchange(0, now_ms, Ordering::Relaxed, Ordering::Relaxed);
+        } else {
+            self.runtime.outstanding_since_ms.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn note_input_and_refresh_runtime(&self, socket: &KcpSocket) {
+        let now_ms = self.elapsed_ms();
+        self.runtime.last_input_ms.store(now_ms, Ordering::Relaxed);
+        self.runtime.outstanding_since_ms.store(0, Ordering::Relaxed);
+        self.refresh_runtime_state(socket);
+    }
+
+    fn outstanding_no_progress_elapsed(&self) -> Option<Duration> {
+        let since = self.runtime.outstanding_since_ms.load(Ordering::Relaxed);
+        (since > 0).then(|| Duration::from_millis(self.elapsed_ms().saturating_sub(since)))
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.created_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
     pub(crate) fn register_socket_waker(&self, waker: &std::task::Waker) {
         self.socket_waker.register(waker);
     }
@@ -450,7 +620,10 @@ impl KcpSession {
         match self.input_tx.try_send(buf.to_owned()) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(SessionInputError::Closed),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(SessionInputError::Full),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.runtime.input_queue_drops.fetch_add(1, Ordering::Relaxed);
+                Err(SessionInputError::Full)
+            }
         }
     }
 
@@ -563,6 +736,7 @@ impl KcpSessionManager {
                     let session = KcpSession::new_shared(
                         socket,
                         config.session_expire,
+                        config.no_progress_timeout,
                         Some((session_close_notifier.clone(), peer_addr)),
                     );
 
@@ -585,6 +759,7 @@ impl KcpSessionManager {
                 let session = KcpSession::new_shared(
                     socket,
                     config.session_expire,
+                    config.no_progress_timeout,
                     Some((session_close_notifier.clone(), peer_addr)),
                 );
                 trace!("created session for conv: {}, peer: {}", conv, peer_addr);
@@ -647,7 +822,12 @@ mod tests {
         let target = "127.0.0.1:9".parse().expect("socket addr");
         let socket = KcpSocket::new(&KcpConfig::default(), 7, udp, target, false).expect("kcp socket");
         let (close_tx, _close_rx) = mpsc::channel(1);
-        let session = KcpSession::new_shared(socket, Duration::from_secs(90), Some((close_tx, target)));
+        let session = KcpSession::new_shared(
+            socket,
+            Duration::from_secs(90),
+            Duration::from_millis(1500),
+            Some((close_tx, target)),
+        );
         let _socket_guard = session.kcp_socket().lock().await;
         let packet = packet();
 

@@ -150,6 +150,8 @@ message VoiceRepairRequest {
   uint64 sender_epoch   = 2;
   uint64 first_seq      = 3;
   uint64 last_seq       = 4;
+  uint64 request_sent_unix_ms = 5;
+  uint32 request_ttl_ms       = 6;
 }
 
 message VoiceIntent {

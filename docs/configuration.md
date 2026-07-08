@@ -461,6 +461,7 @@ Transport and replication tuning examples:
 [s2s.transport]
 ping_interval_secs = 2
 idle_ping_interval_secs = 10
+stream_write_timeout_ms = 1000
 self_seed_quarantine_secs = 3600
 max_dial_attempts_per_peer_tick = 1
 max_outgoing_connections = 1024
@@ -474,6 +475,7 @@ lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
 bulk_backlog_threshold_bytes = 262144
 transport_switch_improvement_pct = 15
+transport_metric_stale_after_ms = 1500
 # Legacy queue capacity hints. Adaptive byte budgets use available memory;
 # these only raise the per-lane minimum budget.
 inbound_control_capacity = 16384
@@ -485,6 +487,23 @@ compression_min_bytes = 1024
 compression_min_savings_percent = 10
 compression_level = 1
 compression_adaptive_dictionary_enabled = true
+
+[s2s.transport.kcp]
+nodelay = true
+interval_ms = 10
+fast_resend = 2
+no_congestion = false
+flush_write = true
+flush_acks_input = true
+failaway_with_alternative_ms = 250
+failaway_without_alternative_ms = 750
+no_progress_close_ms = 1500
+
+[s2s.application.voice]
+repair_enabled = true
+repair_transport_ttl_ms = 120
+# Defaults to repair_transport_ttl_ms when omitted.
+repair_request_ttl_ms = 120
 
 [s2s.overlay]
 hello_interval_ms = 1000

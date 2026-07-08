@@ -69,6 +69,9 @@ pub struct KcpConfig {
     pub wnd_size: (u16, u16),
     /// Session expire duration, default is 90 seconds
     pub session_expire: Duration,
+    /// Close sessions with outstanding send work after this much time without
+    /// inbound KCP progress. Set to zero to disable.
+    pub no_progress_timeout: Duration,
     /// Flush KCP state immediately after write
     pub flush_write: bool,
     /// Flush ACKs immediately after input
@@ -88,6 +91,7 @@ impl Default for KcpConfig {
             nodelay: KcpNoDelayConfig::normal(),
             wnd_size: (256, 256),
             session_expire: Duration::from_secs(90),
+            no_progress_timeout: Duration::from_millis(1500),
             flush_write: false,
             flush_acks_input: false,
             stream: false,

@@ -24,7 +24,7 @@ use super::adaptive_queue::{
     AdaptiveQueueBudget, AdaptiveQueueItem, AdaptiveQueueReceiver, AdaptiveQueueSender,
     SendAdaptiveError, TryAdaptiveSendError,
 };
-use super::config::{TransportConfig, TransportRoutingPolicy};
+use super::config::{KcpTuning, TransportConfig, TransportRoutingPolicy};
 use super::connection::OutboundEnvelope;
 use super::connection::{AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerState};
 use super::endpoint::{
@@ -39,7 +39,8 @@ use super::error::{ConfigError, SendError, TransportError};
 use super::identity::NodeIdentity;
 use super::metrics::{
     ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
-    MetricsTuning, QueueWatermark, QueueWatermarkReport, assemble_snapshot,
+    MetricsTuning, QueueWatermark, QueueWatermarkReport, TransportHealthExclusionReason,
+    assemble_snapshot,
 };
 use super::service_level::{
     MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, TransportKind,
@@ -49,6 +50,30 @@ use super::tls::build_tls_configs;
 const OUTBOUND_DISPATCH_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC: f64 = 16.0 * 1024.0;
 const DEADLINE_NEAR_EXPIRED_TTL: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Clone, Copy)]
+struct TransportSelectionConfig {
+    routing: TransportRoutingPolicy,
+    kcp: KcpTuning,
+}
+
+impl TransportSelectionConfig {
+    fn from_config(cfg: &TransportConfig) -> Self {
+        Self {
+            routing: cfg.routing_policy(),
+            kcp: cfg.kcp_tuning(),
+        }
+    }
+}
+
+impl From<TransportRoutingPolicy> for TransportSelectionConfig {
+    fn from(routing: TransportRoutingPolicy) -> Self {
+        Self {
+            routing,
+            kcp: KcpTuning::default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerAddressSnapshot {
@@ -935,7 +960,7 @@ impl ConnectionManager {
             class,
             options,
             payload.len(),
-            self.inner.cfg().routing_policy(),
+            TransportSelectionConfig::from_config(self.inner.cfg()),
         ) {
             return Err(SendError::NoSuitableTransport { node });
         }
@@ -1022,7 +1047,7 @@ impl ConnectionManager {
                             envelope.class(),
                             envelope.options(),
                             envelope.payload().len(),
-                            self.inner.cfg().routing_policy(),
+                            TransportSelectionConfig::from_config(self.inner.cfg()),
                         )
                         .into_iter()
                         .next()
@@ -1062,11 +1087,20 @@ impl ConnectionManager {
                 drop.class() as u8,
             )
         });
+        let mut transport_health_exclusions = self
+            .inner
+            .iter_peers()
+            .into_iter()
+            .flat_map(|(_, peer)| peer.transport_health_exclusion_status())
+            .collect::<Vec<_>>();
+        transport_health_exclusions
+            .sort_by_key(|exclusion| (exclusion.peer(), exclusion.transport(), exclusion.reason()));
         assemble_snapshot(
             entries,
             outbound_queues,
             self.inner.inbound.queue_status(),
             expired_outbound_drops,
+            transport_health_exclusions,
         )
     }
 
@@ -1106,6 +1140,18 @@ impl ConnectionManager {
             .unwrap_or_default()
     }
 
+    pub fn advertisable_transport_kinds(&self, node: NodeIdentifier) -> Vec<TransportKind> {
+        self.inner
+            .get_peer(node)
+            .map(|peer| {
+                advertisable_transport_kinds(
+                    &peer,
+                    TransportSelectionConfig::from_config(self.inner.cfg()),
+                )
+            })
+            .unwrap_or_default()
+    }
+
     pub fn has_live_transport_kind(&self, node: NodeIdentifier, kind: TransportKind) -> bool {
         self.live_transport_kinds(node).contains(&kind)
     }
@@ -1117,6 +1163,18 @@ impl ConnectionManager {
             .filter_map(|(node, peer)| {
                 peer.has_any_live_stream()
                     .then(|| (node, peer.live_kinds()))
+            })
+            .collect()
+    }
+
+    pub fn advertisable_peers(&self) -> Vec<(NodeIdentifier, Vec<TransportKind>)> {
+        let selection = TransportSelectionConfig::from_config(self.inner.cfg());
+        self.inner
+            .iter_peers()
+            .into_iter()
+            .filter_map(|(node, peer)| {
+                let kinds = advertisable_transport_kinds(&peer, selection);
+                (!kinds.is_empty()).then_some((node, kinds))
             })
             .collect()
     }
@@ -1157,7 +1215,7 @@ impl ConnectionManager {
             MessageClass::HighPriority,
             SendOptions::default(),
             0,
-            self.inner.cfg().routing_policy(),
+            TransportSelectionConfig::from_config(self.inner.cfg()),
         )
     }
 
@@ -1181,7 +1239,7 @@ impl ConnectionManager {
             class,
             options,
             0,
-            self.inner.cfg().routing_policy(),
+            TransportSelectionConfig::from_config(self.inner.cfg()),
         )
         .first()
         .copied()
@@ -1239,13 +1297,41 @@ fn pick_transports(
     class: MessageClass,
     options: SendOptions,
     payload_len: usize,
-    policy: TransportRoutingPolicy,
+    selection: impl Into<TransportSelectionConfig>,
 ) -> Vec<TransportKind> {
+    let selection = selection.into();
+    let now = Instant::now();
+    let snapshot = peer.metrics().snapshot_per_transport();
     let mut candidates: Vec<TransportKind> = peer
         .live_kinds()
         .into_iter()
         .filter(|k| accepts(*k, level))
         .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let has_viable_kcp_alternative = candidates.iter().copied().any(|transport| {
+        transport != TransportKind::Kcp
+            && transport_is_viable_alternative(peer, transport, &snapshot, selection.routing, now)
+    });
+    candidates.retain(|transport| {
+        if let Some(reason) = transport_candidate_exclusion_reason(
+            peer,
+            *transport,
+            level,
+            class,
+            options,
+            &snapshot,
+            selection,
+            has_viable_kcp_alternative,
+            now,
+        ) {
+            peer.record_transport_health_exclusion(*transport, reason);
+            false
+        } else {
+            true
+        }
+    });
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -1270,10 +1356,9 @@ fn pick_transports(
         class,
         options,
         payload_len,
-        policy,
+        selection.routing,
     );
 
-    let now = Instant::now();
     if options.expires_at().is_some() {
         ranked.sort_by_key(|kind| deadline_queue_penalty(peer, *kind, options, now));
         if class == MessageClass::HighPriority {
@@ -1293,7 +1378,7 @@ fn has_eligible_transport(
     class: MessageClass,
     options: SendOptions,
     payload_len: usize,
-    policy: TransportRoutingPolicy,
+    selection: impl Into<TransportSelectionConfig>,
 ) -> bool {
     !pick_transports(
         peer,
@@ -1302,9 +1387,161 @@ fn has_eligible_transport(
         class,
         options,
         payload_len,
-        policy,
+        selection,
     )
     .is_empty()
+}
+
+fn advertisable_transport_kinds(
+    peer: &PeerState,
+    selection: TransportSelectionConfig,
+) -> Vec<TransportKind> {
+    let now = Instant::now();
+    let snapshot = peer.metrics().snapshot_per_transport();
+    let live = peer.live_kinds();
+    let has_viable_kcp_alternative = live.iter().copied().any(|transport| {
+        transport != TransportKind::Kcp
+            && transport_is_viable_alternative(peer, transport, &snapshot, selection.routing, now)
+    });
+    live.into_iter()
+        .filter(|transport| {
+            transport_candidate_health_allows(
+                peer,
+                *transport,
+                ServiceLevel::BestEffort,
+                MessageClass::HighPriority,
+                SendOptions::default(),
+                &snapshot,
+                selection,
+                has_viable_kcp_alternative,
+                now,
+            )
+        })
+        .collect()
+}
+
+fn transport_candidate_health_allows(
+    peer: &PeerState,
+    transport: TransportKind,
+    level: ServiceLevel,
+    class: MessageClass,
+    options: SendOptions,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    selection: TransportSelectionConfig,
+    has_viable_kcp_alternative: bool,
+    now: Instant,
+) -> bool {
+    transport_candidate_exclusion_reason(
+        peer,
+        transport,
+        level,
+        class,
+        options,
+        snapshot,
+        selection,
+        has_viable_kcp_alternative,
+        now,
+    )
+    .is_none()
+}
+
+fn transport_candidate_exclusion_reason(
+    peer: &PeerState,
+    transport: TransportKind,
+    level: ServiceLevel,
+    class: MessageClass,
+    options: SendOptions,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    selection: TransportSelectionConfig,
+    has_viable_kcp_alternative: bool,
+    now: Instant,
+) -> Option<TransportHealthExclusionReason> {
+    if kcp_should_fail_away(
+        peer,
+        transport,
+        snapshot.get(&transport),
+        selection,
+        has_viable_kcp_alternative,
+        now,
+    ) {
+        return Some(TransportHealthExclusionReason::KcpFailaway);
+    }
+
+    if (level == ServiceLevel::BestEffort
+        || class == MessageClass::HighPriority
+        || options.expires_at().is_some())
+        && transport_queue_known_dead(
+            peer,
+            transport,
+            snapshot.get(&transport),
+            selection.routing,
+            now,
+        )
+    {
+        return Some(TransportHealthExclusionReason::StaleQueue);
+    }
+
+    None
+}
+
+fn transport_is_viable_alternative(
+    peer: &PeerState,
+    transport: TransportKind,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    policy: TransportRoutingPolicy,
+    now: Instant,
+) -> bool {
+    !transport_queue_known_dead(peer, transport, snapshot.get(&transport), policy, now)
+}
+
+fn kcp_should_fail_away(
+    peer: &PeerState,
+    transport: TransportKind,
+    link: Option<&LinkMetrics>,
+    selection: TransportSelectionConfig,
+    has_viable_alternative: bool,
+    now: Instant,
+) -> bool {
+    if transport != TransportKind::Kcp || !transport_has_outstanding_queue_work(peer, transport) {
+        return false;
+    }
+    let Some(last_update) = link.and_then(LinkMetrics::last_update) else {
+        return false;
+    };
+    let no_progress_for = now.saturating_duration_since(last_update);
+    let threshold = if has_viable_alternative {
+        selection.kcp.failaway_with_alternative()
+    } else {
+        selection.kcp.failaway_without_alternative()
+    };
+    no_progress_for >= threshold
+}
+
+fn transport_queue_known_dead(
+    peer: &PeerState,
+    transport: TransportKind,
+    link: Option<&LinkMetrics>,
+    policy: TransportRoutingPolicy,
+    now: Instant,
+) -> bool {
+    if !transport.is_stream() || !transport_has_outstanding_queue_work(peer, transport) {
+        return false;
+    }
+    let Some(link) = link else {
+        return false;
+    };
+    let Some(last_update) = link.last_update() else {
+        return false;
+    };
+    if now.saturating_duration_since(last_update) < policy.transport_metric_stale_after() {
+        return false;
+    }
+    link.wire_sent_bps() <= f64::EPSILON && link.wire_recv_bps() <= f64::EPSILON
+}
+
+fn transport_has_outstanding_queue_work(peer: &PeerState, transport: TransportKind) -> bool {
+    peer.outbound_stream_queue_status(transport)
+        .is_some_and(|status| status.depth() > 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1647,7 +1884,11 @@ async fn run_peer_outbound_dispatcher(
             if inner.shutdown().is_cancelled() {
                 return;
             }
-            match try_dispatch_envelope(&peer, envelope, inner.cfg().routing_policy()) {
+            match try_dispatch_envelope(
+                &peer,
+                envelope,
+                TransportSelectionConfig::from_config(inner.cfg()),
+            ) {
                 Ok(()) => break,
                 Err(envelope_back) => {
                     envelope = envelope_back;
@@ -1667,9 +1908,10 @@ async fn run_peer_outbound_dispatcher(
 fn try_dispatch_envelope(
     peer: &Arc<PeerState>,
     envelope: OutboundEnvelope,
-    policy: TransportRoutingPolicy,
+    selection: impl Into<TransportSelectionConfig>,
 ) -> Result<(), OutboundEnvelope> {
     let now = Instant::now();
+    let selection = selection.into();
     if envelope.is_expired_at(now) {
         peer.record_expired_outbound_drop(
             ExpiredOutboundDropStage::PeerQueueDispatch,
@@ -1680,7 +1922,36 @@ fn try_dispatch_envelope(
     }
     let class = envelope.class();
     let choices = if let Some(transport) = envelope.target_transport() {
-        vec![transport]
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let live = peer.live_kinds();
+        let has_viable_alternative = live.iter().copied().any(|candidate| {
+            candidate != transport
+                && candidate != TransportKind::Kcp
+                && candidate.is_acceptable_for(envelope.level())
+                && transport_is_viable_alternative(
+                    peer,
+                    candidate,
+                    &snapshot,
+                    selection.routing,
+                    now,
+                )
+        });
+        if let Some(reason) = transport_candidate_exclusion_reason(
+            peer,
+            transport,
+            envelope.level(),
+            class,
+            envelope.options(),
+            &snapshot,
+            selection,
+            has_viable_alternative,
+            now,
+        ) {
+            peer.record_transport_health_exclusion(transport, reason);
+            Vec::new()
+        } else {
+            vec![transport]
+        }
     } else {
         pick_transports(
             peer,
@@ -1689,7 +1960,7 @@ fn try_dispatch_envelope(
             envelope.class(),
             envelope.options(),
             envelope.payload().len(),
-            policy,
+            selection,
         )
     };
 
@@ -2116,6 +2387,11 @@ mod tests {
                 Bytes::from(vec![0; bytes]),
             ))
             .expect("stream queue should accept test payload");
+    }
+
+    fn age_zero_wire_metric(peer: &PeerState, kind: TransportKind, age: Duration) {
+        peer.metrics().record_rtt(kind, Duration::from_millis(40));
+        std::thread::sleep(age);
     }
 
     #[tokio::test]
@@ -2641,6 +2917,75 @@ mod tests {
         );
 
         assert_eq!(ranked, vec![TransportKind::Tcp]);
+    }
+
+    #[test]
+    fn stale_kcp_with_backlog_fails_away_fast_when_alternative_exists() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        fill_stream_queue(&peer, TransportKind::Kcp, 64 * 1024);
+        age_zero_wire_metric(&peer, TransportKind::Kcp, Duration::from_millis(275));
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default(),
+            0,
+            TransportRoutingPolicy::default(),
+        );
+
+        assert_eq!(ranked, vec![TransportKind::Tcp]);
+    }
+
+    #[test]
+    fn stale_kcp_without_alternative_keeps_short_grace_then_excludes() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Kcp]);
+        fill_stream_queue(&peer, TransportKind::Kcp, 64 * 1024);
+        age_zero_wire_metric(&peer, TransportKind::Kcp, Duration::from_millis(275));
+
+        let during_grace = pick_transports(
+            &peer,
+            ServiceLevel::ReliableLowLatency,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default(),
+            0,
+            TransportRoutingPolicy::default(),
+        );
+        assert_eq!(during_grace, vec![TransportKind::Kcp]);
+
+        std::thread::sleep(Duration::from_millis(525));
+        let after_grace = pick_transports(
+            &peer,
+            ServiceLevel::ReliableLowLatency,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default(),
+            0,
+            TransportRoutingPolicy::default(),
+        );
+        assert!(after_grace.is_empty());
+    }
+
+    #[test]
+    fn idle_stale_kcp_is_not_penalized() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        age_zero_wire_metric(&peer, TransportKind::Kcp, Duration::from_millis(275));
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::ReliableLowLatency,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default(),
+            0,
+            TransportRoutingPolicy::default(),
+        );
+
+        assert!(ranked.contains(&TransportKind::Kcp));
     }
 
     #[test]

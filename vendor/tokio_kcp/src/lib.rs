@@ -3,7 +3,7 @@
 pub use self::{
     config::{KcpConfig, KcpNoDelayConfig},
     listener::KcpListener,
-    session::KcpStatsHandle,
+    session::{KcpRuntimeSnapshot, KcpStatsHandle},
     stream::KcpStream,
     udp_io::{KcpUdpIo, SharedUdpIo},
 };

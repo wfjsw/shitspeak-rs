@@ -15,6 +15,40 @@ groups:
           summary: "S2S routed queue is above 80%"
           description: "Outgoing S2S queue {{ $labels.source }} -> {{ $labels.peer }} over {{ $labels.transport }} has stayed above 80% capacity for 2 minutes."
 
+      - alert: ShitSpeakS2SKcpQueueStuck
+        expr: |
+          (
+            max by (job, source, peer, transport) (
+              shitspeak_s2s_queue_status{direction="outgoing",transport="kcp",metric="depth"}
+              / ignoring(metric)
+              shitspeak_s2s_queue_status{direction="outgoing",transport="kcp",metric="capacity"}
+            ) > 0.9
+          )
+          and on (job, source, peer, transport)
+          (
+            max by (job, source, peer, transport) (
+              shitspeak_s2s_direct_metric_traffic_bps{transport="kcp",direction="wire_sent"}
+            ) == 0
+          )
+          and on (job, source, peer, transport)
+          (
+            max by (job, source, peer, transport) (
+              shitspeak_s2s_direct_metric_traffic_bps{transport="kcp",direction="wire_recv"}
+            ) == 0
+          )
+          and on (job, source, peer, transport)
+          (
+            max by (job, source, peer, transport) (
+              shitspeak_s2s_direct_metric_last_update_age_ms{transport="kcp"}
+            ) > 1500
+          )
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "KCP queue is stuck with zero wire traffic"
+          description: "KCP queue {{ $labels.source }} -> {{ $labels.peer }} is above 90% while wire traffic is zero and transport metrics are stale."
+
       - alert: ShitSpeakLocalVoiceRouteSlow
         expr: |
           sum by (job) (

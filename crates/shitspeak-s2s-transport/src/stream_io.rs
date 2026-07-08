@@ -24,7 +24,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tokio::time::{Instant as TokioInstant, Interval, interval_at};
+use tokio::time::{Instant as TokioInstant, Interval, interval_at, timeout};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -121,6 +121,7 @@ pub(crate) struct StreamPumpConfig {
     ping_interval: Duration,
     idle_ping_interval: Duration,
     native_stats_interval: Duration,
+    stream_write_timeout: Duration,
     compression: CompressionConfig,
     /// Cap on how many in-flight pings we remember. Older entries are
     /// dropped when the buffer fills, preventing unbounded memory if pongs
@@ -139,6 +140,7 @@ impl StreamPumpConfig {
         ping_interval: Duration,
         idle_ping_interval: Duration,
         native_stats_interval: Duration,
+        stream_write_timeout: Duration,
         compression: CompressionConfig,
         max_pending_pings: usize,
     ) -> Self {
@@ -150,6 +152,7 @@ impl StreamPumpConfig {
             ping_interval,
             idle_ping_interval,
             native_stats_interval,
+            stream_write_timeout,
             compression,
             max_pending_pings,
         }
@@ -354,7 +357,7 @@ async fn run_pump<S>(
         biased;
 
         _ = closed.cancelled() => return,
-        result = encode_and_send(&mut framed, &hello, cfg.transport, &peer) => result,
+        result = encode_and_send(&mut framed, &hello, &cfg, &peer, None) => result,
     };
     if let Err(e) = hello_result {
         if is_peer_closed_initial_write(&e) {
@@ -505,7 +508,7 @@ async fn run_pump<S>(
                     ts,
                     Bytes::new(),
                 );
-                match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
+                match encode_and_send_returning_size(&mut framed, &frame, &cfg, &peer, None).await {
                     Ok(_) => {
                         record_evicted_pending(
                             pending.insert(ts),
@@ -530,6 +533,21 @@ async fn run_pump<S>(
                             cfg.transport,
                             sample.sent_units(),
                             sample.lost_units(),
+                        );
+                    }
+                    if let Some(runtime) = sampler.kcp_runtime_sample() {
+                        peer.metrics().record_kcp_runtime_sample(
+                            cfg.transport,
+                            runtime.closed(),
+                            runtime.pending_sender(),
+                            runtime.waiting_conv(),
+                            runtime.wait_snd(),
+                            runtime.snd_wnd(),
+                            runtime.rmt_wnd(),
+                            runtime.input_queue_drops(),
+                            runtime.no_progress_closes(),
+                            runtime.last_input_age_ms(),
+                            runtime.outstanding_no_progress_age_ms(),
                         );
                     }
                 }
@@ -573,7 +591,13 @@ async fn run_pump<S>(
                     break;
                 }
                 let encoded_payload_len = frame.payload.len();
-                match encode_and_send(&mut framed, &frame, cfg.transport, &peer).await {
+                match encode_and_send(
+                    &mut framed,
+                    &frame,
+                    &cfg,
+                    &peer,
+                    out.options().expires_at(),
+                ).await {
                     Ok(()) => {
                         peer
                             .metrics()
@@ -595,6 +619,7 @@ async fn run_pump<S>(
     }
 
     closed.cancel();
+    peer.notify_outbound_dispatch();
     trace!(peer=%peer.node_id(), transport=?cfg.transport, "stream pump exiting");
 }
 
@@ -681,7 +706,7 @@ where
 
     let dictionary_id = dictionary.wire_id();
     let frame = dictionary_advertisement_frame(cfg, dictionary);
-    encode_and_send(framed, &frame, cfg.transport, peer).await?;
+    encode_and_send(framed, &frame, cfg, peer, None).await?;
     *pending_adaptive_dictionary_id = Some(dictionary_id);
     trace!(peer=%cfg.peer_node, transport=?cfg.transport, dictionary_id, "advertised adaptive dictionary");
     Ok(())
@@ -809,7 +834,7 @@ where
 
     peer_adaptive_dictionaries.insert(dictionary);
     let ack = dictionary_ack_frame(cfg, dictionary_id);
-    encode_and_send(framed, &ack, cfg.transport, peer).await?;
+    encode_and_send(framed, &ack, cfg, peer, None).await?;
     trace!(peer=%cfg.peer_node, transport=?cfg.transport, dictionary_id, "accepted adaptive dictionary");
     Ok(())
 }
@@ -817,21 +842,23 @@ where
 async fn encode_and_send<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     frame: &pb::Frame,
-    transport: TransportKind,
+    cfg: &StreamPumpConfig,
     peer: &PeerState,
+    expires_at: Option<Instant>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
-    let _ = encode_and_send_returning_size(framed, frame, transport, peer).await?;
+    let _ = encode_and_send_returning_size(framed, frame, cfg, peer, expires_at).await?;
     Ok(())
 }
 
 async fn encode_and_send_returning_size<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     frame: &pb::Frame,
-    transport: TransportKind,
+    cfg: &StreamPumpConfig,
     peer: &PeerState,
+    expires_at: Option<Instant>,
 ) -> std::io::Result<usize>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
@@ -841,15 +868,38 @@ where
         .encode(&mut buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let len = buf.len();
-    if let Err(error) = framed.send(buf.freeze()).await {
-        peer.metrics().record_data_health_failure(transport);
+    let send = framed.send(buf.freeze());
+    let send_result = match stream_write_deadline(&cfg, expires_at) {
+        Some(deadline) => match timeout(deadline, send).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "stream write timed out",
+            )),
+        },
+        None => send.await,
+    };
+    if let Err(error) = send_result {
+        peer.metrics().record_data_health_failure(cfg.transport);
         return Err(error);
     }
-    peer.metrics().record_sent(transport, len);
+    peer.metrics().record_sent(cfg.transport, len);
     #[cfg(debug_assertions)]
-    crate::debug_io::record_named_sent(stream_frame_kind_name(transport, frame.frame_type), len);
-    peer.metrics().record_data_health_success(transport);
+    crate::debug_io::record_named_sent(
+        stream_frame_kind_name(cfg.transport, frame.frame_type),
+        len,
+    );
+    peer.metrics().record_data_health_success(cfg.transport);
     Ok(len)
+}
+
+fn stream_write_deadline(cfg: &StreamPumpConfig, expires_at: Option<Instant>) -> Option<Duration> {
+    let mut deadline = (!cfg.stream_write_timeout.is_zero()).then_some(cfg.stream_write_timeout);
+    if let Some(expires_at) = expires_at {
+        let remaining = expires_at.saturating_duration_since(Instant::now());
+        deadline = Some(deadline.map_or(remaining, |deadline| deadline.min(remaining)));
+    }
+    deadline
 }
 
 #[cfg(debug_assertions)]
@@ -977,7 +1027,7 @@ where
                 frame.ts_us,
                 echo_payload,
             );
-            encode_and_send(framed, &pong, cfg.transport, peer).await?;
+            encode_and_send(framed, &pong, cfg, peer, None).await?;
         }
         pb::FrameType::FramePong => {
             if let Some(ping) = pending.take(frame.ts_us) {

@@ -2464,6 +2464,7 @@ mod tests {
             ping_interval_secs = 7
             idle_ping_interval_secs = 19
             native_stats_interval_secs = 11
+            stream_write_timeout_ms = 444
             recent_probe_retry_cap_secs = 31
             stale_probe_retry_cap_secs = 601
             stale_probe_age_secs = 3601
@@ -2481,6 +2482,7 @@ mod tests {
             bulk_payload_threshold_bytes = 49152
             bulk_backlog_threshold_bytes = 196608
             transport_switch_improvement_pct = 22
+            transport_metric_stale_after_ms = 1555
             compression_enabled = false
             compression_min_bytes = 2048
             compression_min_savings_percent = 25
@@ -2495,6 +2497,12 @@ mod tests {
             no_congestion = false
             flush_write = true
             flush_acks_input = true
+            failaway_with_alternative_ms = 123
+            failaway_without_alternative_ms = 456
+            no_progress_close_ms = 789
+
+            [application.voice]
+            repair_transport_ttl_ms = 300
         "#
         .replace("__DICT__", &dictionary_path.display().to_string());
         let cfg: S2sConfig = parse_s2s(&raw).expect("s2s config parses");
@@ -2581,6 +2589,7 @@ mod tests {
         assert_eq!(transport.ping_interval(), Duration::from_secs(7));
         assert_eq!(transport.idle_ping_interval(), Duration::from_secs(19));
         assert_eq!(transport.native_stats_interval(), Duration::from_secs(11));
+        assert_eq!(transport.stream_write_timeout(), Duration::from_millis(444));
         assert_eq!(transport.max_outgoing_connections(), 777);
         let routing_policy = transport.routing_policy();
         assert_eq!(routing_policy.udp_family_min_samples(), 9);
@@ -2592,6 +2601,10 @@ mod tests {
         assert_eq!(routing_policy.bulk_payload_threshold_bytes(), 49_152);
         assert_eq!(routing_policy.bulk_backlog_threshold_bytes(), 196_608);
         assert_eq!(routing_policy.transport_switch_improvement_pct(), 22);
+        assert_eq!(
+            routing_policy.transport_metric_stale_after(),
+            Duration::from_millis(1555)
+        );
         assert_eq!(transport.max_users(), 432);
         assert!(!transport.compression_enabled());
         assert_eq!(transport.compression_min_bytes(), 2048);
@@ -2605,6 +2618,14 @@ mod tests {
         assert!(!kcp.no_congestion());
         assert!(kcp.flush_write());
         assert!(kcp.flush_acks_input());
+        assert_eq!(kcp.failaway_with_alternative(), Duration::from_millis(123));
+        assert_eq!(
+            kcp.failaway_without_alternative(),
+            Duration::from_millis(456)
+        );
+        assert_eq!(kcp.no_progress_close(), Duration::from_millis(789));
+        assert_eq!(cfg.application.voice.repair_transport_ttl_ms, 300);
+        assert_eq!(cfg.application.voice.repair_request_ttl_ms, 300);
         assert_eq!(
             transport.compression_dictionary_len(),
             Some(dictionary.len())

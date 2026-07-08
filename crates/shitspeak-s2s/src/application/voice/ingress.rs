@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -707,6 +707,10 @@ impl ServiceInbound for VoiceRepairInbound {
                 return;
             }
         };
+        if repair_request_is_stale(&request) {
+            trace!(from=%msg.from, "voice repair: dropping stale request");
+            return;
+        }
         let frames = self.repair_cache.lookup_range(
             msg.from,
             request.sender_session,
@@ -763,6 +767,7 @@ fn spawn_dispatch_task(
                                     reorderer.clone(),
                                     transport.clone(),
                                     cfg.repair_nack_delay_ms,
+                                    cfg.repair_request_ttl_ms,
                                     gap,
                                 );
                             }
@@ -795,6 +800,7 @@ fn schedule_gap_repair(
     reorderer: Arc<Reorderer>,
     transport: Arc<dyn VoiceTransport>,
     delay_ms: u64,
+    request_ttl_ms: u64,
     gap: GapReport,
 ) {
     if gap.from == transport.local_node_id() {
@@ -812,14 +818,36 @@ fn schedule_gap_repair(
             sender_epoch: gap.sender_epoch,
             first_seq: gap.first_seq,
             last_seq: gap.last_seq,
+            request_sent_unix_ms: unix_time_ms(),
+            request_ttl_ms: request_ttl_ms.min(u64::from(u32::MAX)) as u32,
         };
         match proto::encode_voice_repair_request(&request) {
             Ok(body) => {
-                let _ = transport.send_repair_request(gap.from, body).await;
+                let _ = transport
+                    .send_repair_request(gap.from, body, Duration::from_millis(request_ttl_ms))
+                    .await;
             }
             Err(e) => trace!(error=%e, "voice repair: encode request failed"),
         }
     });
+}
+
+fn repair_request_is_stale(request: &VoiceRepairRequest) -> bool {
+    if request.request_sent_unix_ms == 0 || request.request_ttl_ms == 0 {
+        return false;
+    }
+    let deadline = request
+        .request_sent_unix_ms
+        .saturating_add(u64::from(request.request_ttl_ms));
+    unix_time_ms() > deadline
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -1441,13 +1469,22 @@ mod tests {
 
         let calls = wait_for_call_count(&transport, 1).await;
         match &calls[0] {
-            FakeCall::RepairRequest { dst, body } => {
+            FakeCall::RepairRequest { dst, body, ttl } => {
                 assert_eq!(*dst, 11);
+                assert_eq!(
+                    *ttl,
+                    Duration::from_millis(VoiceConfig::default().repair_request_ttl_ms)
+                );
                 let request = proto::decode_voice_repair_request(body.as_ref()).unwrap();
                 assert_eq!(request.sender_session, 0xABC);
                 assert_eq!(request.sender_epoch, 42);
                 assert_eq!(request.first_seq, 1);
                 assert_eq!(request.last_seq, 1);
+                assert!(request.request_sent_unix_ms > 0);
+                assert_eq!(
+                    request.request_ttl_ms,
+                    VoiceConfig::default().repair_request_ttl_ms as u32
+                );
             }
             other => panic!("expected RepairRequest, got {other:?}"),
         }
@@ -1515,6 +1552,8 @@ mod tests {
             sender_epoch: 42,
             first_seq: 0,
             last_seq: 0,
+            request_sent_unix_ms: 0,
+            request_ttl_ms: 0,
         };
         let request_body = proto::encode_voice_repair_request(&request).unwrap();
         svc.repair_inbound_handler().handle(OverlayInboundMessage {
@@ -1532,6 +1571,41 @@ mod tests {
             }
             other => panic!("expected RepairFrame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn repair_handler_drops_stale_timestamped_request() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service(transport.clone());
+        svc.send_unicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"opus-exact"),
+            normal_intent(5),
+            2,
+        )
+        .await
+        .unwrap();
+        let request = VoiceRepairRequest {
+            sender_session: 0xABC,
+            sender_epoch: 42,
+            first_seq: 0,
+            last_seq: 0,
+            request_sent_unix_ms: unix_time_ms().saturating_sub(10_000),
+            request_ttl_ms: 1,
+        };
+        let request_body = proto::encode_voice_repair_request(&request).unwrap();
+        svc.repair_inbound_handler().handle(OverlayInboundMessage {
+            from: 2,
+            level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+            class: shitspeak_s2s_transport::MessageClass::HighPriority,
+            body: request_body,
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(transport.calls().len(), 1);
     }
 
     #[tokio::test]

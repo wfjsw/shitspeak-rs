@@ -28,6 +28,7 @@ pub(crate) struct TopologySnapshot {
     outbound_queues: Vec<OutboundQueueMetric>,
     inbound_queues: Vec<InboundQueueMetric>,
     expired_outbound_drops: Vec<ExpiredOutboundDropMetric>,
+    transport_health_exclusions: Vec<TransportHealthExclusionMetric>,
     debug_packet_io: Vec<crate::debug_io::PacketIoSnapshot>,
 }
 
@@ -130,6 +131,21 @@ pub(crate) struct TransportMetric {
     estimated_throughput_bps: f64,
     samples: u64,
     last_update_age_ms: Option<u128>,
+    kcp_runtime: Option<KcpRuntimeMetric>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct KcpRuntimeMetric {
+    closed: bool,
+    pending_sender: bool,
+    waiting_conv: bool,
+    wait_snd: u64,
+    snd_wnd: u64,
+    rmt_wnd: u64,
+    input_queue_drops: u64,
+    no_progress_closes: u64,
+    last_input_age_ms: Option<u64>,
+    outstanding_no_progress_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +176,14 @@ pub(crate) struct ExpiredOutboundDropMetric {
     transport: &'static str,
     class: &'static str,
     frames: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TransportHealthExclusionMetric {
+    peer: NodeIdentifier,
+    transport: &'static str,
+    reason: &'static str,
+    exclusions: u64,
 }
 
 pub fn spawn_status_server(
@@ -475,6 +499,18 @@ pub(crate) fn build_topology_snapshot(
                 last_update_age_ms: metric
                     .last_update()
                     .map(|ts| now.duration_since(ts).as_millis()),
+                kcp_runtime: metric.kcp_runtime().map(|runtime| KcpRuntimeMetric {
+                    closed: runtime.closed(),
+                    pending_sender: runtime.pending_sender(),
+                    waiting_conv: runtime.waiting_conv(),
+                    wait_snd: runtime.wait_snd(),
+                    snd_wnd: runtime.snd_wnd(),
+                    rmt_wnd: runtime.rmt_wnd(),
+                    input_queue_drops: runtime.input_queue_drops(),
+                    no_progress_closes: runtime.no_progress_closes(),
+                    last_input_age_ms: runtime.last_input_age_ms(),
+                    outstanding_no_progress_age_ms: runtime.outstanding_no_progress_age_ms(),
+                }),
             });
         }
     }
@@ -529,6 +565,18 @@ pub(crate) fn build_topology_snapshot(
     expired_outbound_drops
         .sort_by_key(|entry| (entry.peer, entry.stage, entry.transport, entry.class));
 
+    let mut transport_health_exclusions = metrics
+        .transport_health_exclusions()
+        .iter()
+        .map(|entry| TransportHealthExclusionMetric {
+            peer: entry.peer(),
+            transport: transport_kind_name(entry.transport()),
+            reason: entry.reason().name(),
+            exclusions: entry.exclusions(),
+        })
+        .collect::<Vec<_>>();
+    transport_health_exclusions.sort_by_key(|entry| (entry.peer, entry.transport, entry.reason));
+
     TopologySnapshot {
         local_node: overlay.local_node_id(),
         generated_at_unix_ms,
@@ -540,6 +588,7 @@ pub(crate) fn build_topology_snapshot(
         outbound_queues,
         inbound_queues,
         expired_outbound_drops,
+        transport_health_exclusions,
         debug_packet_io: crate::debug_io::snapshot(),
     }
 }
@@ -755,6 +804,41 @@ impl<'a> PrometheusWriter<'a> {
             "shitspeak_s2s_direct_metric_last_update_age_ms",
             "Local direct peer metric update age.",
             "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_kcp_runtime_state",
+            "Local KCP runtime boolean state.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_kcp_runtime_window",
+            "Local KCP pending and window state.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_kcp_input_queue_drops_total",
+            "Local KCP input queue drops.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_kcp_no_progress_closes_total",
+            "Local KCP sessions closed for no progress.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_kcp_last_input_age_ms",
+            "Local KCP last input age.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_kcp_outstanding_no_progress_age_ms",
+            "Local KCP outstanding send no-progress age.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_transport_health_exclusions_total",
+            "Local transport sender exclusions due to health checks.",
+            "counter",
         );
         self.header(
             "shitspeak_s2s_queue_status",
@@ -1186,6 +1270,73 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
                 age as f64,
             ));
         }
+        if let Some(runtime) = &metric.kcp_runtime {
+            for (state, active) in [
+                ("closed", runtime.closed),
+                ("pending_sender", runtime.pending_sender),
+                ("waiting_conv", runtime.waiting_conv),
+            ] {
+                let mut labels = base.clone();
+                labels.push(("state", state));
+                out.push(sample(
+                    "shitspeak_s2s_kcp_runtime_state",
+                    labels,
+                    if active { 1.0 } else { 0.0 },
+                ));
+            }
+            for (metric_name, value) in [
+                ("wait_snd", runtime.wait_snd),
+                ("snd_wnd", runtime.snd_wnd),
+                ("rmt_wnd", runtime.rmt_wnd),
+            ] {
+                let mut labels = base.clone();
+                labels.push(("metric", metric_name));
+                out.push(sample(
+                    "shitspeak_s2s_kcp_runtime_window",
+                    labels,
+                    value as f64,
+                ));
+            }
+            out.push(sample_with_base(
+                "shitspeak_s2s_kcp_input_queue_drops_total",
+                &base,
+                runtime.input_queue_drops as f64,
+            ));
+            out.push(sample_with_base(
+                "shitspeak_s2s_kcp_no_progress_closes_total",
+                &base,
+                runtime.no_progress_closes as f64,
+            ));
+            if let Some(age) = runtime.last_input_age_ms {
+                out.push(sample_with_base(
+                    "shitspeak_s2s_kcp_last_input_age_ms",
+                    &base,
+                    age as f64,
+                ));
+            }
+            if let Some(age) = runtime.outstanding_no_progress_age_ms {
+                out.push(sample_with_base(
+                    "shitspeak_s2s_kcp_outstanding_no_progress_age_ms",
+                    &base,
+                    age as f64,
+                ));
+            }
+        }
+    }
+
+    for entry in &snapshot.transport_health_exclusions {
+        let source = local_node.clone();
+        let peer = entry.peer.to_string();
+        out.push(sample(
+            "shitspeak_s2s_transport_health_exclusions_total",
+            vec![
+                ("source", source.as_str()),
+                ("peer", peer.as_str()),
+                ("transport", entry.transport),
+                ("reason", entry.reason),
+            ],
+            entry.exclusions as f64,
+        ));
     }
 
     for queue in &snapshot.outbound_queues {
@@ -1966,6 +2117,7 @@ mod tests {
                 estimated_throughput_bps: 50_000.0,
                 samples: 9,
                 last_update_age_ms: Some(1234),
+                kcp_runtime: None,
             }],
             outbound_queues: vec![OutboundQueueMetric {
                 peer: 2,
@@ -1990,6 +2142,12 @@ mod tests {
                 transport: "quic",
                 class: "high_priority",
                 frames: 5,
+            }],
+            transport_health_exclusions: vec![TransportHealthExclusionMetric {
+                peer: 2,
+                transport: "kcp",
+                reason: "kcp_failaway",
+                exclusions: 7,
             }],
             debug_packet_io: Vec::new(),
         };
@@ -2044,6 +2202,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_expired_outbound_frames_total{source=\"1\",peer=\"2\",stage=\"transport_write\",transport=\"quic\",class=\"high_priority\"} 5"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_transport_health_exclusions_total{source=\"1\",peer=\"2\",transport=\"kcp\",reason=\"kcp_failaway\"} 7"
         ));
     }
 

@@ -317,7 +317,7 @@ impl NeighborMonitor {
             let mut best_reliable_loss = None;
             let mut best_any_loss = None;
             let mut transport_metrics = Vec::new();
-            let kinds = self.transport.live_transport_kinds(*nid);
+            let kinds = self.transport.advertisable_transport_kinds(*nid);
             let (
                 rtt_us,
                 jitter_us,
@@ -615,7 +615,7 @@ impl NeighborMonitor {
     /// `has_any_live_stream`.
     fn live_peers(&self) -> Vec<(NodeIdentifier, Vec<TransportKind>)> {
         let mut out = Vec::new();
-        for (nid, kinds) in self.transport.live_peers() {
+        for (nid, kinds) in self.transport.advertisable_peers() {
             if nid == self.self_id {
                 continue;
             }

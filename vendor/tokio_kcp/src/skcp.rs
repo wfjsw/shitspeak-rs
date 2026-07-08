@@ -396,6 +396,26 @@ impl KcpSocket {
         self.kcp.wait_snd() == 0
     }
 
+    pub fn has_outstanding_send_work(&self) -> bool {
+        self.pending_sender.is_some() || self.kcp.wait_snd() > 0 || self.kcp.waiting_conv()
+    }
+
+    pub fn pending_sender(&self) -> bool {
+        self.pending_sender.is_some()
+    }
+
+    pub fn wait_snd(&self) -> usize {
+        self.kcp.wait_snd()
+    }
+
+    pub fn snd_wnd(&self) -> u16 {
+        self.kcp.snd_wnd()
+    }
+
+    pub fn rmt_wnd(&self) -> u16 {
+        self.kcp.rmt_wnd()
+    }
+
     pub fn conv(&self) -> u32 {
         self.kcp.conv()
     }
@@ -687,7 +707,7 @@ mod test {
         let config = realtime_test_config();
         let capture = Arc::new(CapturingUdpIo::with_fail_sends(usize::MAX / 2));
         let socket = capturing_socket_with_io(&config, capture.clone());
-        let session = KcpSession::new_shared(socket, Duration::from_secs(90), None);
+        let session = KcpSession::new_shared(socket, Duration::from_secs(90), Duration::from_millis(1500), None);
         let mut stream = KcpStream::with_session(session);
         let waker = noop_waker_ref();
         let mut cx = Context::from_waker(waker);

@@ -289,6 +289,7 @@ pub(crate) fn install_stream_session<S>(
         inner.cfg().ping_interval(),
         inner.cfg().idle_ping_interval(),
         inner.cfg().native_stats_interval(),
+        inner.cfg().stream_write_timeout(),
         inner.cfg().compression_config().clone(),
         inner.cfg().max_pending_pings(),
     );

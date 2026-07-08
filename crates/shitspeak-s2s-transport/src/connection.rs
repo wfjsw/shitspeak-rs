@@ -23,6 +23,7 @@ use super::adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, Adaptive
 use super::metrics::{
     ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
     MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueStatusSnapshot, QueueWatermark,
+    TransportHealthExclusionReason, TransportHealthExclusionSnapshot,
 };
 use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
 
@@ -429,6 +430,8 @@ pub(crate) struct PeerState {
     outbound_queue_watermark: Mutex<QueueWatermark>,
     outbound_stream_queue_watermarks: Mutex<HashMap<TransportKind, QueueWatermark>>,
     expired_outbound_drops: ExpiredOutboundDropCounters,
+    transport_health_exclusions:
+        Mutex<HashMap<(TransportKind, TransportHealthExclusionReason), u64>>,
     outbound_dispatch_notify: Notify,
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
@@ -463,6 +466,7 @@ impl PeerState {
             outbound_queue_watermark: Mutex::new(QueueWatermark::new(Instant::now())),
             outbound_stream_queue_watermarks: Mutex::new(HashMap::new()),
             expired_outbound_drops: ExpiredOutboundDropCounters::default(),
+            transport_health_exclusions: Mutex::new(HashMap::new()),
             outbound_dispatch_notify: Notify::new(),
             connecting: AtomicBool::new(false),
         })
@@ -1025,6 +1029,38 @@ impl PeerState {
 
     pub(crate) fn expired_outbound_drop_status(&self) -> Vec<ExpiredOutboundDropSnapshot> {
         self.expired_outbound_drops.snapshots(self.node_id)
+    }
+
+    pub(crate) fn record_transport_health_exclusion(
+        &self,
+        transport: TransportKind,
+        reason: TransportHealthExclusionReason,
+    ) {
+        let mut counters = self.transport_health_exclusions.lock();
+        let counter = counters.entry((transport, reason)).or_insert(0);
+        *counter = counter.saturating_add(1);
+    }
+
+    pub(crate) fn transport_health_exclusion_status(
+        &self,
+    ) -> Vec<TransportHealthExclusionSnapshot> {
+        let mut out = self
+            .transport_health_exclusions
+            .lock()
+            .iter()
+            .filter_map(|((transport, reason), exclusions)| {
+                (*exclusions > 0).then(|| {
+                    TransportHealthExclusionSnapshot::new(
+                        self.node_id,
+                        *transport,
+                        *reason,
+                        *exclusions,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        out.sort_by_key(|snapshot| (snapshot.peer(), snapshot.transport(), snapshot.reason()));
+        out
     }
 
     pub fn has_any_live_stream(&self) -> bool {

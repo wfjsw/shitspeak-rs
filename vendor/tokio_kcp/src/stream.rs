@@ -117,7 +117,7 @@ impl KcpStream {
     ) -> KcpResult<KcpStream> {
         let socket = KcpSocket::new(config, conv, udp, addr, config.stream)?;
 
-        let session = KcpSession::new_shared(socket, config.session_expire, None);
+        let session = KcpSession::new_shared(socket, config.session_expire, config.no_progress_timeout, None);
 
         Ok(KcpStream::with_session(session))
     }
@@ -143,6 +143,7 @@ impl KcpStream {
         match kcp.poll_send(cx, buf) {
             Poll::Ready(result) => {
                 self.session.update_stats(&kcp);
+                self.session.refresh_runtime_state(&kcp);
                 drop(kcp);
                 self.session.wake_socket_waiters();
                 self.session.notify();
@@ -150,6 +151,7 @@ impl KcpStream {
             }
             Poll::Pending => {
                 self.session.update_stats(&kcp);
+                self.session.refresh_runtime_state(&kcp);
                 drop(kcp);
                 self.session.wake_socket_waiters();
                 Poll::Pending
@@ -303,6 +305,7 @@ impl AsyncWrite for KcpStream {
         match kcp.flush() {
             Ok(..) => {
                 self.session.update_stats(&kcp);
+                self.session.refresh_runtime_state(&kcp);
                 drop(kcp);
                 self.session.wake_socket_waiters();
                 self.session.notify();
@@ -312,12 +315,14 @@ impl AsyncWrite for KcpStream {
                 if err.kind() == ErrorKind::WouldBlock {
                     self.session.register_socket_waker(cx.waker());
                     self.session.update_stats(&kcp);
+                    self.session.refresh_runtime_state(&kcp);
                     drop(kcp);
                     self.session.wake_socket_waiters();
                     self.session.notify();
                     return Poll::Pending;
                 }
                 self.session.update_stats(&kcp);
+                self.session.refresh_runtime_state(&kcp);
                 drop(kcp);
                 self.session.wake_socket_waiters();
                 Err(err).into()
@@ -326,12 +331,14 @@ impl AsyncWrite for KcpStream {
                 if is_would_block(&err) {
                     self.session.register_socket_waker(cx.waker());
                     self.session.update_stats(&kcp);
+                    self.session.refresh_runtime_state(&kcp);
                     drop(kcp);
                     self.session.wake_socket_waiters();
                     self.session.notify();
                     return Poll::Pending;
                 }
                 self.session.update_stats(&kcp);
+                self.session.refresh_runtime_state(&kcp);
                 drop(kcp);
                 self.session.wake_socket_waiters();
                 Err(io::Error::new(ErrorKind::Other, err)).into()

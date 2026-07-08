@@ -203,6 +203,7 @@ fn kcp_config_for_mode(mode: UdpDialMode, tuning: KcpTuning) -> KcpConfig {
     };
     cfg.flush_write = tuning.flush_write();
     cfg.flush_acks_input = tuning.flush_acks_input();
+    cfg.no_progress_timeout = tuning.no_progress_close();
     if mode == UdpDialMode::Muxed {
         cfg.mtu = cfg.mtu.saturating_sub(DISCRIMINATOR_LEN);
     }

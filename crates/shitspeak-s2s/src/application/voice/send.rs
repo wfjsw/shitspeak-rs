@@ -20,9 +20,9 @@ use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 pub const VOICE_LEVEL: ServiceLevel = ServiceLevel::BestEffort;
 pub const VOICE_CLASS: MessageClass = MessageClass::HighPriority;
 pub const VOICE_ROUTING_METRIC: RoutingMetric = RoutingMetric::ConversationalQuality;
-pub const VOICE_REPAIR_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
+pub const VOICE_REPAIR_LEVEL: ServiceLevel = ServiceLevel::BestEffort;
 pub const VOICE_REPAIR_CLASS: MessageClass = MessageClass::HighPriority;
-pub const VOICE_REPAIR_ROUTING_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
+pub const VOICE_REPAIR_ROUTING_METRIC: RoutingMetric = RoutingMetric::ConversationalQuality;
 
 /// Narrow send-only interface used by the voice service. Production
 /// impl: [`OverlayVoiceTransport`]. Test impl: see the unit tests below.
@@ -42,6 +42,7 @@ pub trait VoiceTransport: Send + Sync + 'static {
         &self,
         dst: NodeIdentifier,
         body: Bytes,
+        ttl: Duration,
     ) -> Result<(), ApplicationError>;
 
     async fn send_repair_frame(
@@ -118,15 +119,18 @@ impl VoiceTransport for OverlayVoiceTransport {
         &self,
         dst: NodeIdentifier,
         body: Bytes,
+        ttl: Duration,
     ) -> Result<(), ApplicationError> {
+        let options = OverlaySendOptions::default().expire_after(ttl);
         self.overlay
-            .send_unicast_unordered_with_routing_metric(
+            .send_unicast_unordered_with_routing_metric_and_options(
                 dst,
                 VOICE_REPAIR_SERVICE_TAG,
                 VOICE_REPAIR_LEVEL,
                 VOICE_REPAIR_ROUTING_METRIC,
                 VOICE_REPAIR_CLASS,
                 body,
+                options,
             )
             .await?;
         Ok(())
@@ -228,6 +232,7 @@ pub(crate) mod testing {
         RepairRequest {
             dst: NodeIdentifier,
             body: Bytes,
+            ttl: Duration,
         },
         RepairFrame {
             dst: NodeIdentifier,
@@ -293,11 +298,12 @@ pub(crate) mod testing {
             &self,
             dst: NodeIdentifier,
             body: Bytes,
+            ttl: Duration,
         ) -> Result<(), ApplicationError> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(FakeCall::RepairRequest { dst, body });
+                .push(FakeCall::RepairRequest { dst, body, ttl });
             Ok(())
         }
 

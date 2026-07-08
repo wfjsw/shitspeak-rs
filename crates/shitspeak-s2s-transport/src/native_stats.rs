@@ -33,6 +33,77 @@ impl NativeLossSample {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KcpRuntimeSample {
+    closed: bool,
+    pending_sender: bool,
+    waiting_conv: bool,
+    wait_snd: u64,
+    snd_wnd: u64,
+    rmt_wnd: u64,
+    input_queue_drops: u64,
+    no_progress_closes: u64,
+    last_input_age_ms: Option<u64>,
+    outstanding_no_progress_age_ms: Option<u64>,
+}
+
+impl KcpRuntimeSample {
+    pub(crate) fn from_snapshot(snapshot: tokio_kcp::KcpRuntimeSnapshot) -> Self {
+        Self {
+            closed: snapshot.closed(),
+            pending_sender: snapshot.pending_sender(),
+            waiting_conv: snapshot.waiting_conv(),
+            wait_snd: snapshot.wait_snd(),
+            snd_wnd: snapshot.snd_wnd(),
+            rmt_wnd: snapshot.rmt_wnd(),
+            input_queue_drops: snapshot.input_queue_drops(),
+            no_progress_closes: snapshot.no_progress_closes(),
+            last_input_age_ms: snapshot.last_input_age_ms(),
+            outstanding_no_progress_age_ms: snapshot.outstanding_no_progress_age_ms(),
+        }
+    }
+
+    pub(crate) fn closed(&self) -> bool {
+        self.closed
+    }
+
+    pub(crate) fn pending_sender(&self) -> bool {
+        self.pending_sender
+    }
+
+    pub(crate) fn waiting_conv(&self) -> bool {
+        self.waiting_conv
+    }
+
+    pub(crate) fn wait_snd(&self) -> u64 {
+        self.wait_snd
+    }
+
+    pub(crate) fn snd_wnd(&self) -> u64 {
+        self.snd_wnd
+    }
+
+    pub(crate) fn rmt_wnd(&self) -> u64 {
+        self.rmt_wnd
+    }
+
+    pub(crate) fn input_queue_drops(&self) -> u64 {
+        self.input_queue_drops
+    }
+
+    pub(crate) fn no_progress_closes(&self) -> u64 {
+        self.no_progress_closes
+    }
+
+    pub(crate) fn last_input_age_ms(&self) -> Option<u64> {
+        self.last_input_age_ms
+    }
+
+    pub(crate) fn outstanding_no_progress_age_ms(&self) -> Option<u64> {
+        self.outstanding_no_progress_age_ms
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RawNativeCounters {
     sent_units: u64,
     lost_units: u64,
@@ -59,6 +130,10 @@ pub(crate) trait NativeLossSampler: Send + 'static {
     fn sample(&mut self) -> Option<NativeLossSample>;
 
     fn sample_rtt(&mut self) -> Option<Duration> {
+        None
+    }
+
+    fn kcp_runtime_sample(&mut self) -> Option<KcpRuntimeSample> {
         None
     }
 }
@@ -150,6 +225,12 @@ impl NativeLossSampler for KcpNativeLossSampler {
         self.handle
             .srtt_ms()
             .map(|srtt_ms| Duration::from_millis(u64::from(srtt_ms)))
+    }
+
+    fn kcp_runtime_sample(&mut self) -> Option<KcpRuntimeSample> {
+        Some(KcpRuntimeSample::from_snapshot(
+            self.handle.runtime_snapshot(),
+        ))
     }
 }
 

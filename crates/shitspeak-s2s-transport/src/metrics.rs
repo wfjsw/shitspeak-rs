@@ -287,6 +287,89 @@ impl Default for MetricsTuning {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KcpRuntimeMetricsSnapshot {
+    closed: bool,
+    pending_sender: bool,
+    waiting_conv: bool,
+    wait_snd: u64,
+    snd_wnd: u64,
+    rmt_wnd: u64,
+    input_queue_drops: u64,
+    no_progress_closes: u64,
+    last_input_age_ms: Option<u64>,
+    outstanding_no_progress_age_ms: Option<u64>,
+}
+
+impl KcpRuntimeMetricsSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        closed: bool,
+        pending_sender: bool,
+        waiting_conv: bool,
+        wait_snd: u64,
+        snd_wnd: u64,
+        rmt_wnd: u64,
+        input_queue_drops: u64,
+        no_progress_closes: u64,
+        last_input_age_ms: Option<u64>,
+        outstanding_no_progress_age_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            closed,
+            pending_sender,
+            waiting_conv,
+            wait_snd,
+            snd_wnd,
+            rmt_wnd,
+            input_queue_drops,
+            no_progress_closes,
+            last_input_age_ms,
+            outstanding_no_progress_age_ms,
+        }
+    }
+
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn pending_sender(&self) -> bool {
+        self.pending_sender
+    }
+
+    pub fn waiting_conv(&self) -> bool {
+        self.waiting_conv
+    }
+
+    pub fn wait_snd(&self) -> u64 {
+        self.wait_snd
+    }
+
+    pub fn snd_wnd(&self) -> u64 {
+        self.snd_wnd
+    }
+
+    pub fn rmt_wnd(&self) -> u64 {
+        self.rmt_wnd
+    }
+
+    pub fn input_queue_drops(&self) -> u64 {
+        self.input_queue_drops
+    }
+
+    pub fn no_progress_closes(&self) -> u64 {
+        self.no_progress_closes
+    }
+
+    pub fn last_input_age_ms(&self) -> Option<u64> {
+        self.last_input_age_ms
+    }
+
+    pub fn outstanding_no_progress_age_ms(&self) -> Option<u64> {
+        self.outstanding_no_progress_age_ms
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LinkMetrics {
     /// Smoothed round-trip time in microseconds.
@@ -319,6 +402,7 @@ pub struct LinkMetrics {
     throughput_confidence_ppm: u32,
     unmatched_probe_pongs: u64,
     consecutive_probe_losses: u32,
+    kcp_runtime: Option<KcpRuntimeMetricsSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -559,6 +643,10 @@ impl LinkMetrics {
 
     pub fn consecutive_probe_losses(&self) -> u32 {
         self.consecutive_probe_losses
+    }
+
+    pub fn kcp_runtime(&self) -> Option<&KcpRuntimeMetricsSnapshot> {
+        self.kcp_runtime.as_ref()
     }
 
     pub fn samples(&self) -> u64 {
@@ -916,6 +1004,7 @@ struct LinkInner {
     native_loss_ewma_samples: u64,
     data_health: LossWindow,
     unmatched_probe_pongs: u64,
+    kcp_runtime: Option<KcpRuntimeMetricsSnapshot>,
 }
 
 impl LinkInner {
@@ -943,6 +1032,7 @@ impl LinkInner {
             native_loss_ewma_samples: 0,
             data_health: LossWindow::new(window),
             unmatched_probe_pongs: 0,
+            kcp_runtime: None,
         }
     }
 
@@ -1157,6 +1247,39 @@ impl PeerMetrics {
         self.record_data_health_sample(transport, true);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_kcp_runtime_sample(
+        &self,
+        transport: TransportKind,
+        closed: bool,
+        pending_sender: bool,
+        waiting_conv: bool,
+        wait_snd: u64,
+        snd_wnd: u64,
+        rmt_wnd: u64,
+        input_queue_drops: u64,
+        no_progress_closes: u64,
+        last_input_age_ms: Option<u64>,
+        outstanding_no_progress_age_ms: Option<u64>,
+    ) {
+        let mut g = self.inner.lock();
+        let entry = g
+            .entry(transport)
+            .or_insert_with(|| LinkInner::new(self.window));
+        entry.kcp_runtime = Some(KcpRuntimeMetricsSnapshot::new(
+            closed,
+            pending_sender,
+            waiting_conv,
+            wait_snd,
+            snd_wnd,
+            rmt_wnd,
+            input_queue_drops,
+            no_progress_closes,
+            last_input_age_ms,
+            outstanding_no_progress_age_ms,
+        ));
+    }
+
     fn record_data_health_sample(&self, transport: TransportKind, failed: bool) {
         let mut g = self.inner.lock();
         let entry = g
@@ -1245,6 +1368,7 @@ impl PeerMetrics {
                     throughput_confidence_ppm,
                     unmatched_probe_pongs: inner.unmatched_probe_pongs,
                     consecutive_probe_losses: inner.consecutive_probe_losses,
+                    kcp_runtime: inner.kcp_runtime.clone(),
                 };
                 (*t, m)
             })
@@ -1320,6 +1444,7 @@ pub struct MetricsSnapshot {
     outbound_queues: Vec<OutboundQueueStatusSnapshot>,
     inbound_queues: Vec<InboundQueueStatusSnapshot>,
     expired_outbound_drops: Vec<ExpiredOutboundDropSnapshot>,
+    transport_health_exclusions: Vec<TransportHealthExclusionSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1393,6 +1518,61 @@ impl ExpiredOutboundDropStage {
             Self::PeerQueueDispatch => "peer_queue_dispatch",
             Self::TransportWrite => "transport_write",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TransportHealthExclusionReason {
+    KcpFailaway,
+    StaleQueue,
+}
+
+impl TransportHealthExclusionReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::KcpFailaway => "kcp_failaway",
+            Self::StaleQueue => "stale_queue",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportHealthExclusionSnapshot {
+    peer: NodeIdentifier,
+    transport: TransportKind,
+    reason: TransportHealthExclusionReason,
+    exclusions: u64,
+}
+
+impl TransportHealthExclusionSnapshot {
+    pub(crate) fn new(
+        peer: NodeIdentifier,
+        transport: TransportKind,
+        reason: TransportHealthExclusionReason,
+        exclusions: u64,
+    ) -> Self {
+        Self {
+            peer,
+            transport,
+            reason,
+            exclusions,
+        }
+    }
+
+    pub fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+
+    pub fn transport(&self) -> TransportKind {
+        self.transport
+    }
+
+    pub fn reason(&self) -> TransportHealthExclusionReason {
+        self.reason
+    }
+
+    pub fn exclusions(&self) -> u64 {
+        self.exclusions
     }
 }
 
@@ -1546,6 +1726,10 @@ impl MetricsSnapshot {
     pub fn expired_outbound_drops(&self) -> &[ExpiredOutboundDropSnapshot] {
         &self.expired_outbound_drops
     }
+
+    pub fn transport_health_exclusions(&self) -> &[TransportHealthExclusionSnapshot] {
+        &self.transport_health_exclusions
+    }
 }
 
 /// Helper for the manager to assemble a `MetricsSnapshot` across all peers.
@@ -1554,6 +1738,7 @@ pub fn assemble_snapshot<I>(
     outbound_queues: Vec<OutboundQueueStatusSnapshot>,
     inbound_queues: Vec<InboundQueueStatusSnapshot>,
     expired_outbound_drops: Vec<ExpiredOutboundDropSnapshot>,
+    transport_health_exclusions: Vec<TransportHealthExclusionSnapshot>,
 ) -> MetricsSnapshot
 where
     I: IntoIterator<Item = (NodeIdentifier, Arc<PeerMetrics>)>,
@@ -1567,6 +1752,7 @@ where
         outbound_queues,
         inbound_queues,
         expired_outbound_drops,
+        transport_health_exclusions,
     }
 }
 

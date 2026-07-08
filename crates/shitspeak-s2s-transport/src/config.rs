@@ -72,6 +72,7 @@ pub struct TransportConfig {
     max_frame_bytes: usize,
     udp_mtu: usize,
     kcp_tuning: KcpTuning,
+    stream_write_timeout: Duration,
     compression: CompressionConfig,
     routing_policy: TransportRoutingPolicy,
 
@@ -152,6 +153,7 @@ impl TransportConfig {
             max_frame_bytes: 1 << 20,
             udp_mtu: 1200,
             kcp_tuning: KcpTuning::default(),
+            stream_write_timeout: Duration::from_millis(default_stream_write_timeout_ms()),
             compression: CompressionConfig::default(),
             routing_policy: TransportRoutingPolicy::default(),
             latency_ewma_alpha: 0.2,
@@ -358,6 +360,10 @@ impl TransportConfig {
 
     pub fn kcp_tuning(&self) -> KcpTuning {
         self.kcp_tuning
+    }
+
+    pub fn stream_write_timeout(&self) -> Duration {
+        self.stream_write_timeout
     }
 
     pub fn compression_enabled(&self) -> bool {
@@ -675,6 +681,11 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_stream_write_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_write_timeout = timeout;
+        self
+    }
+
     pub fn with_compression_enabled(mut self, enabled: bool) -> Self {
         self.compression = self.compression.with_enabled(enabled);
         self
@@ -808,6 +819,21 @@ pub struct KcpTuning {
     flush_write: bool,
     #[serde(default = "default_kcp_flush_acks_input")]
     flush_acks_input: bool,
+    #[serde(
+        default = "default_kcp_failaway_with_alternative_ms",
+        alias = "kcp_failaway_with_alternative_ms"
+    )]
+    failaway_with_alternative_ms: u64,
+    #[serde(
+        default = "default_kcp_failaway_without_alternative_ms",
+        alias = "kcp_failaway_without_alternative_ms"
+    )]
+    failaway_without_alternative_ms: u64,
+    #[serde(
+        default = "default_kcp_no_progress_close_ms",
+        alias = "kcp_no_progress_close_ms"
+    )]
+    no_progress_close_ms: u64,
 }
 
 impl Default for KcpTuning {
@@ -819,6 +845,9 @@ impl Default for KcpTuning {
             no_congestion: default_kcp_no_congestion(),
             flush_write: default_kcp_flush_write(),
             flush_acks_input: default_kcp_flush_acks_input(),
+            failaway_with_alternative_ms: default_kcp_failaway_with_alternative_ms(),
+            failaway_without_alternative_ms: default_kcp_failaway_without_alternative_ms(),
+            no_progress_close_ms: default_kcp_no_progress_close_ms(),
         }
     }
 }
@@ -847,6 +876,18 @@ impl KcpTuning {
     pub fn flush_acks_input(&self) -> bool {
         self.flush_acks_input
     }
+
+    pub fn failaway_with_alternative(&self) -> Duration {
+        Duration::from_millis(self.failaway_with_alternative_ms)
+    }
+
+    pub fn failaway_without_alternative(&self) -> Duration {
+        Duration::from_millis(self.failaway_without_alternative_ms)
+    }
+
+    pub fn no_progress_close(&self) -> Duration {
+        Duration::from_millis(self.no_progress_close_ms)
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,6 +910,8 @@ pub struct TransportRoutingPolicy {
     bulk_backlog_threshold_bytes: usize,
     #[serde(default = "default_transport_switch_improvement_pct")]
     transport_switch_improvement_pct: u32,
+    #[serde(default = "default_transport_metric_stale_after_ms")]
+    transport_metric_stale_after_ms: u64,
 }
 
 impl Default for TransportRoutingPolicy {
@@ -883,6 +926,7 @@ impl Default for TransportRoutingPolicy {
             bulk_payload_threshold_bytes: default_bulk_payload_threshold_bytes(),
             bulk_backlog_threshold_bytes: default_bulk_backlog_threshold_bytes(),
             transport_switch_improvement_pct: default_transport_switch_improvement_pct(),
+            transport_metric_stale_after_ms: default_transport_metric_stale_after_ms(),
         }
     }
 }
@@ -922,6 +966,10 @@ impl TransportRoutingPolicy {
 
     pub fn transport_switch_improvement_pct(&self) -> u32 {
         self.transport_switch_improvement_pct
+    }
+
+    pub fn transport_metric_stale_after(&self) -> Duration {
+        Duration::from_millis(self.transport_metric_stale_after_ms)
     }
 
     pub fn with_udp_family_min_samples(mut self, samples: u64) -> Self {
@@ -968,6 +1016,12 @@ impl TransportRoutingPolicy {
         self.transport_switch_improvement_pct = pct;
         self
     }
+
+    pub fn with_transport_metric_stale_after(mut self, duration: Duration) -> Self {
+        self.transport_metric_stale_after_ms =
+            duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self
+    }
 }
 
 /// TOML-deserializable shadow of the per-link metrics smoothing, ping-cap,
@@ -988,6 +1042,8 @@ pub struct TransportTuning {
     pub idle_ping_interval_secs: u64,
     #[serde(default = "default_native_stats_interval_secs")]
     pub native_stats_interval_secs: u64,
+    #[serde(default = "default_stream_write_timeout_ms")]
+    pub stream_write_timeout_ms: u64,
     #[serde(default = "default_max_pending_pings")]
     pub max_pending_pings: usize,
     #[serde(default = "default_recent_probe_retry_cap_secs")]
@@ -1055,6 +1111,7 @@ impl Default for TransportTuning {
             ping_interval_secs: default_ping_interval_secs(),
             idle_ping_interval_secs: default_idle_ping_interval_secs(),
             native_stats_interval_secs: default_native_stats_interval_secs(),
+            stream_write_timeout_ms: default_stream_write_timeout_ms(),
             max_pending_pings: default_max_pending_pings(),
             recent_probe_retry_cap_secs: default_recent_probe_retry_cap_secs(),
             stale_probe_retry_cap_secs: default_stale_probe_retry_cap_secs(),
@@ -1102,6 +1159,7 @@ impl TransportTuning {
             .with_ping_interval(Duration::from_secs(self.ping_interval_secs))
             .with_idle_ping_interval(Duration::from_secs(self.idle_ping_interval_secs))
             .with_native_stats_interval(Duration::from_secs(self.native_stats_interval_secs))
+            .with_stream_write_timeout(Duration::from_millis(self.stream_write_timeout_ms))
             .with_max_pending_pings(self.max_pending_pings)
             .with_backoff_cap(Duration::from_secs(self.recent_probe_retry_cap_secs))
             .with_stale_backoff_cap(Duration::from_secs(self.stale_probe_retry_cap_secs))
@@ -1176,6 +1234,9 @@ fn default_idle_ping_interval_secs() -> u64 {
 fn default_native_stats_interval_secs() -> u64 {
     1
 }
+fn default_stream_write_timeout_ms() -> u64 {
+    1_000
+}
 fn default_max_pending_pings() -> usize {
     64
 }
@@ -1242,6 +1303,15 @@ fn default_kcp_flush_write() -> bool {
 fn default_kcp_flush_acks_input() -> bool {
     true
 }
+fn default_kcp_failaway_with_alternative_ms() -> u64 {
+    250
+}
+fn default_kcp_failaway_without_alternative_ms() -> u64 {
+    750
+}
+fn default_kcp_no_progress_close_ms() -> u64 {
+    1_500
+}
 fn default_udp_family_min_samples() -> u64 {
     32
 }
@@ -1268,6 +1338,9 @@ fn default_bulk_backlog_threshold_bytes() -> usize {
 }
 fn default_transport_switch_improvement_pct() -> u32 {
     15
+}
+fn default_transport_metric_stale_after_ms() -> u64 {
+    1_500
 }
 
 #[cfg(test)]
@@ -1346,6 +1419,10 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 65_536);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 262_144);
         assert_eq!(policy.transport_switch_improvement_pct(), 15);
+        assert_eq!(
+            policy.transport_metric_stale_after(),
+            Duration::from_millis(1_500)
+        );
     }
 
     #[test]
@@ -1359,7 +1436,8 @@ mod tests {
             .with_lossy_link_threshold_ppm(30_000)
             .with_bulk_payload_threshold_bytes(32_768)
             .with_bulk_backlog_threshold_bytes(131_072)
-            .with_transport_switch_improvement_pct(25);
+            .with_transport_switch_improvement_pct(25)
+            .with_transport_metric_stale_after(Duration::from_millis(900));
 
         assert_eq!(policy.udp_family_min_samples(), 12);
         assert_eq!(policy.udp_family_probe_loss_block_count(), 4);
@@ -1370,6 +1448,10 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 131_072);
         assert_eq!(policy.transport_switch_improvement_pct(), 25);
+        assert_eq!(
+            policy.transport_metric_stale_after(),
+            Duration::from_millis(900)
+        );
     }
 
     #[test]
@@ -1386,6 +1468,7 @@ mod tests {
                     bulk_payload_threshold_bytes = 32768
                     bulk_backlog_threshold_bytes = 98304
                     transport_switch_improvement_pct = 20
+                    transport_metric_stale_after_ms = 800
                 "#,
                 ::config::FileFormat::Toml,
             ))
@@ -1406,6 +1489,10 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 98_304);
         assert_eq!(policy.transport_switch_improvement_pct(), 20);
+        assert_eq!(
+            policy.transport_metric_stale_after(),
+            Duration::from_millis(800)
+        );
     }
 
     #[test]
@@ -1420,6 +1507,9 @@ mod tests {
                     no_congestion = true
                     flush_write = false
                     flush_acks_input = false
+                    failaway_with_alternative_ms = 111
+                    failaway_without_alternative_ms = 222
+                    no_progress_close_ms = 333
                 "#,
                 ::config::FileFormat::Toml,
             ))
@@ -1436,6 +1526,12 @@ mod tests {
         assert!(kcp.no_congestion());
         assert!(!kcp.flush_write());
         assert!(!kcp.flush_acks_input());
+        assert_eq!(kcp.failaway_with_alternative(), Duration::from_millis(111));
+        assert_eq!(
+            kcp.failaway_without_alternative(),
+            Duration::from_millis(222)
+        );
+        assert_eq!(kcp.no_progress_close(), Duration::from_millis(333));
     }
 
     #[test]
@@ -1448,5 +1544,11 @@ mod tests {
         assert!(!kcp.no_congestion());
         assert!(kcp.flush_write());
         assert!(kcp.flush_acks_input());
+        assert_eq!(kcp.failaway_with_alternative(), Duration::from_millis(250));
+        assert_eq!(
+            kcp.failaway_without_alternative(),
+            Duration::from_millis(750)
+        );
+        assert_eq!(kcp.no_progress_close(), Duration::from_millis(1_500));
     }
 }
