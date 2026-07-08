@@ -12,7 +12,7 @@ use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
-use super::super::metrics::{self, CatchupMode};
+use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
 use super::super::proto::{CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp};
 use super::runtime::{
     HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryProbeResponseOutcome, HistoryRank,
@@ -34,6 +34,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     else {
         return;
     };
+    let build_started_at = std::time::Instant::now();
 
     if req.history_probe_only {
         let rank = HistoryRank::local(rt);
@@ -49,6 +50,11 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
             runtime_started_at: rank.runtime_started_at,
             history_node: u32::from(rank.node_id),
         };
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::CatchupBuild,
+            build_started_at.elapsed(),
+        );
         metrics::record_catchup_response(CatchupMode::Strict, 0, 0);
         let _ = rt
             .net
@@ -94,6 +100,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     let take = total.min(rt.cfg.strict_max_catchup_ops().max(1));
     let mut catchup_ops: Vec<CatchupOp> = Vec::with_capacity(take);
     for (v, entry) in effective_ops.iter().take(take) {
+        let encode_started_at = std::time::Instant::now();
         match rmp_serde::to_vec(&entry.op) {
             Ok(b) => catchup_ops.push(CatchupOp {
                 version: *v,
@@ -106,6 +113,11 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
                 warn!(error=%e, "catchup op msgpack encode failed; skipping");
             }
         }
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::MsgpackEncode,
+            encode_started_at.elapsed(),
+        );
     }
     let has_more = total > take;
     let next_chunk_token = catchup_ops
@@ -118,6 +130,11 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
             .map(|op| op.op_msgpack.len())
             .sum::<usize>();
     metrics::record_catchup_response(CatchupMode::Strict, catchup_ops.len(), response_bytes);
+    metrics::record_pipeline_stage(
+        ReplicationPipelineKind::Strict,
+        ReplicationPipelineStage::CatchupBuild,
+        build_started_at.elapsed(),
+    );
 
     let rank = HistoryRank::local(rt);
     let resp = StrictCatchupResp {
@@ -151,10 +168,16 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     _from: NodeIdentifier,
     resp: StrictCatchupResp,
 ) {
+    let apply_started_at = std::time::Instant::now();
     let Some(remote_node) = super::runtime::node_from_u32(resp.history_node) else {
         warn!(
             node = resp.history_node,
             "strict catchup response has invalid history_node"
+        );
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
         );
         return;
     };
@@ -185,6 +208,11 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                     rt.state.lock().request_history_election();
                 }
             }
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Strict,
+                ReplicationPipelineStage::CatchupApply,
+                apply_started_at.elapsed(),
+            );
             return;
         }
     }
@@ -203,21 +231,42 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         };
         match outcome {
             HistorySnapshotResponseOutcome::Install(winner) => {
+                let snapshot_started_at = std::time::Instant::now();
                 rt.repo
                     .install_snapshot(winner.snapshot_version, winner.snapshot_msgpack)
                     .await;
+                metrics::record_pipeline_stage(
+                    ReplicationPipelineKind::Strict,
+                    ReplicationPipelineStage::SnapshotInstall,
+                    snapshot_started_at.elapsed(),
+                );
                 rt.state.lock().finish_history_election();
             }
             HistorySnapshotResponseOutcome::Retry | HistorySnapshotResponseOutcome::Ignored => {}
         }
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
+        );
         return;
     }
 
     if can_bootstrap && rt.repo.current_version() > 0 {
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
+        );
         return;
     }
 
     if resp.ops.is_empty() {
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
+        );
         return;
     }
 
@@ -230,21 +279,53 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         if cop.version <= rt.repo.current_version() {
             continue;
         }
+        let decode_started_at = std::time::Instant::now();
         let op: R::Op = match rmp_serde::from_slice(&cop.op_msgpack) {
             Ok(o) => o,
             Err(e) => {
+                metrics::record_pipeline_stage(
+                    ReplicationPipelineKind::Strict,
+                    ReplicationPipelineStage::MsgpackDecode,
+                    decode_started_at.elapsed(),
+                );
                 warn!(error=%e, "catchup op decode failed; aborting chunk");
+                metrics::record_pipeline_stage(
+                    ReplicationPipelineKind::Strict,
+                    ReplicationPipelineStage::CatchupApply,
+                    apply_started_at.elapsed(),
+                );
                 return;
             }
         };
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::MsgpackDecode,
+            decode_started_at.elapsed(),
+        );
         if let Some(metadata) = strict_metadata(&cop) {
+            let encode_started_at = std::time::Instant::now();
             let op_msgpack = match rmp_serde::to_vec(&op) {
                 Ok(bytes) => Bytes::from(bytes),
                 Err(e) => {
+                    metrics::record_pipeline_stage(
+                        ReplicationPipelineKind::Strict,
+                        ReplicationPipelineStage::MsgpackEncode,
+                        encode_started_at.elapsed(),
+                    );
                     warn!(error=%e, "catchup op re-encode failed; aborting chunk");
+                    metrics::record_pipeline_stage(
+                        ReplicationPipelineKind::Strict,
+                        ReplicationPipelineStage::CatchupApply,
+                        apply_started_at.elapsed(),
+                    );
                     return;
                 }
             };
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Strict,
+                ReplicationPipelineStage::MsgpackEncode,
+                encode_started_at.elapsed(),
+            );
             let op_id = (metadata.op_id_hi, metadata.op_id_lo);
             let mut should_wake = false;
             {
@@ -258,7 +339,13 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 rt.deliver_signal.notify_one();
             }
         } else if can_bootstrap {
+            let repo_apply_started_at = std::time::Instant::now();
             rt.repo.apply_committed(cop.version, op).await;
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Strict,
+                ReplicationPipelineStage::RepoApply,
+                repo_apply_started_at.elapsed(),
+            );
         }
     }
     if resp.has_more {
@@ -268,6 +355,11 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             .filter(|n| *n != rt.self_id && rt.net.has_route(*n, ServiceLevel::Reliable))
             .collect();
         if peers.is_empty() {
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Strict,
+                ReplicationPipelineStage::CatchupApply,
+                apply_started_at.elapsed(),
+            );
             return;
         }
         let dst = {
@@ -288,6 +380,11 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))
             .await;
     }
+    metrics::record_pipeline_stage(
+        ReplicationPipelineKind::Strict,
+        ReplicationPipelineStage::CatchupApply,
+        apply_started_at.elapsed(),
+    );
 }
 
 fn strict_metadata(op: &CatchupOp) -> Option<StrictLogMetadata> {

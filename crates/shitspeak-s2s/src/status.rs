@@ -861,6 +861,21 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_transport_pipeline_stage_events_total",
+            "S2S transport pipeline stage observations by transport and stage.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_transport_pipeline_stage_duration_us_total",
+            "S2S transport pipeline stage wall-clock duration in microseconds by transport and stage.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_transport_pipeline_stage_duration_us_bucket_total",
+            "Bucketed S2S transport pipeline stage wall-clock duration in microseconds by transport and stage.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_debug_packet_io_bytes_total",
             "Debug S2S packet IO bytes by packet kind and direction.",
             "counter",
@@ -904,6 +919,21 @@ impl<'a> PrometheusWriter<'a> {
             "shitspeak_s2s_replication_catchup_active",
             "S2S replication catchup responses currently active.",
             "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_replication_pipeline_stage_events_total",
+            "S2S replication pipeline stage observations by replication kind and stage.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_replication_pipeline_stage_duration_us_total",
+            "Total S2S replication pipeline stage wall-clock duration in microseconds by replication kind and stage.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_replication_pipeline_stage_duration_us_bucket_total",
+            "Bucketed S2S replication pipeline stage wall-clock duration in microseconds by replication kind and stage.",
+            "counter",
         );
         self.header(
             "shitspeak_s2s_client_replication_worker_queue_depth",
@@ -1426,6 +1456,10 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
         ));
     }
 
+    for stage in shitspeak_s2s_transport::transport_pipeline_stage_snapshots() {
+        add_transport_pipeline_stage_samples(&mut out, &local_node, stage);
+    }
+
     for packet in &snapshot.debug_packet_io {
         add_debug_packet_samples(&mut out, packet);
     }
@@ -1453,6 +1487,39 @@ fn add_queue_status_samples(
         let mut labels = base.to_vec();
         labels.push(("metric", metric));
         out.push(sample(name, labels, value));
+    }
+}
+
+fn add_transport_pipeline_stage_samples(
+    out: &mut Vec<PrometheusSample>,
+    local_node: &str,
+    stage: shitspeak_s2s_transport::TransportPipelineStageSnapshot,
+) {
+    let transport = transport_kind_name(stage.transport());
+    let stage_name = stage.stage().name();
+    let labels = vec![
+        ("source", local_node),
+        ("transport", transport),
+        ("stage", stage_name),
+    ];
+    out.push(sample(
+        "shitspeak_s2s_transport_pipeline_stage_events_total",
+        labels.clone(),
+        stage.events() as f64,
+    ));
+    out.push(sample(
+        "shitspeak_s2s_transport_pipeline_stage_duration_us_total",
+        labels.clone(),
+        stage.duration_us() as f64,
+    ));
+    for (bucket, count) in stage.buckets() {
+        let mut bucket_labels = labels.clone();
+        bucket_labels.push(("bucket", bucket));
+        out.push(sample(
+            "shitspeak_s2s_transport_pipeline_stage_duration_us_bucket_total",
+            bucket_labels,
+            count as f64,
+        ));
     }
 }
 

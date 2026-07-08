@@ -19,7 +19,7 @@ use tracing::{trace, warn};
 
 use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
-use super::super::metrics::{self, CatchupMode};
+use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
 use super::super::proto::{
     self as repl_proto, OwnerBody, OwnerCatchupReq, OwnerOp, REPLICATION_SERVICE_TAG,
 };
@@ -72,7 +72,14 @@ impl OwnerNet for OverlayOwnerNet {
             OverlaySendOptions::default()
         };
         let msg = repl_proto::wrap_owner(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         self.overlay
             .send_unicast_with_options(
                 dst,
@@ -88,7 +95,14 @@ impl OwnerNet for OverlayOwnerNet {
 
     async fn send_broadcast(&self, topic: &str, body: OwnerBody) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_owner(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         let dsts = self
             .alive_members()
             .into_iter()
@@ -117,7 +131,14 @@ impl OwnerNet for OverlayOwnerNet {
         retry_delay: Duration,
     ) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_owner(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         let options = OverlaySendOptions::default()
             .allow_l1_compression()
             .expire_after(retry_delay);
@@ -468,7 +489,14 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
     /// Local-side propose. Broadcasts first, then applies locally — see
     /// the trait doc for why.
     pub async fn propose_local(self: Arc<Self>, op: R::Op) -> Result<u64, ReplicationError> {
-        let op_msgpack = Bytes::from(rmp_serde::to_vec(&op)?);
+        let encode_started_at = Instant::now();
+        let encoded = rmp_serde::to_vec(&op);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::MsgpackEncode,
+            encode_started_at.elapsed(),
+        );
+        let op_msgpack = Bytes::from(encoded?);
         let version = match self.repo.local_version_hint(&op) {
             Some(version) => {
                 let mut current = self.local_counter.load(Ordering::Relaxed);
@@ -502,9 +530,15 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         // Now apply locally. This anchors the chosen ordering: the network
         // commit precedes the local apply.
         if !self.repo.local_op_already_applied(&op) {
+            let apply_started_at = Instant::now();
             self.repo
                 .apply_remote(self.self_id, self.self_epoch, version, op)
                 .await;
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Owner,
+                ReplicationPipelineStage::RepoApply,
+                apply_started_at.elapsed(),
+            );
         }
         let mut s = self.state.lock();
         s.record_applied(self.self_id, self.self_epoch, version);
@@ -609,14 +643,31 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         let op_msgpack = op.op_msgpack;
         let epoch = op.origin_epoch;
         let version = op.origin_version;
+        let decode_started_at = Instant::now();
         let typed: R::Op = match rmp_serde::from_slice(&op_msgpack) {
             Ok(o) => o,
             Err(e) => {
+                metrics::record_pipeline_stage(
+                    ReplicationPipelineKind::Owner,
+                    ReplicationPipelineStage::MsgpackDecode,
+                    decode_started_at.elapsed(),
+                );
                 warn!(error=%e, "owner op msgpack decode failed");
                 return;
             }
         };
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::MsgpackDecode,
+            decode_started_at.elapsed(),
+        );
+        let apply_started_at = Instant::now();
         self.repo.apply_remote(origin, epoch, version, typed).await;
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::RepoApply,
+            apply_started_at.elapsed(),
+        );
         let drained = {
             let mut s = self.state.lock();
             s.record_applied(origin, epoch, version);
@@ -625,14 +676,31 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         // Drain contiguous buffered ops, applying each in turn.
         let mut prev_v = version;
         for (v, bytes) in drained {
+            let decode_started_at = Instant::now();
             let typed: R::Op = match rmp_serde::from_slice(&bytes) {
                 Ok(o) => o,
                 Err(e) => {
+                    metrics::record_pipeline_stage(
+                        ReplicationPipelineKind::Owner,
+                        ReplicationPipelineStage::MsgpackDecode,
+                        decode_started_at.elapsed(),
+                    );
                     warn!(error=%e, "buffered owner op decode failed");
                     return;
                 }
             };
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Owner,
+                ReplicationPipelineStage::MsgpackDecode,
+                decode_started_at.elapsed(),
+            );
+            let apply_started_at = Instant::now();
             self.repo.apply_remote(origin, epoch, v, typed).await;
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Owner,
+                ReplicationPipelineStage::RepoApply,
+                apply_started_at.elapsed(),
+            );
             let mut s = self.state.lock();
             s.record_applied(origin, epoch, v);
             prev_v = v;

@@ -40,6 +40,7 @@ mod topic;
 pub mod test_support;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use scc::HashMap as SccMap;
@@ -58,6 +59,7 @@ pub use proto::REPLICATION_SERVICE_TAG;
 pub use strict::{StrictHandle, StrictReplicable};
 
 use self::blob::{BlobNet, BlobRuntime, OverlayBlobNet};
+use self::metrics::{ReplicationPipelineKind, ReplicationPipelineStage};
 use self::owner::runtime::{OverlayOwnerNet, OwnerNet, OwnerRuntime};
 use self::proto::ReplBody;
 use self::strict::runtime::{OverlayStrictNet, StrictNet, StrictRuntime};
@@ -423,9 +425,15 @@ impl ReplicationManager {
 /// or carry no body. Shared by the production handler and the test-only
 /// filtered handler.
 fn decode_to_frame(msg: OverlayInboundMessage) -> Option<InboundFrame> {
+    let decode_started_at = Instant::now();
     let decoded = match proto::decode(&msg.body) {
         Ok(d) => d,
         Err(e) => {
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Unknown,
+                ReplicationPipelineStage::InboundDecode,
+                decode_started_at.elapsed(),
+            );
             trace!(error=%e, "replications: decode failed");
             return None;
         }
@@ -436,11 +444,24 @@ fn decode_to_frame(msg: OverlayInboundMessage) -> Option<InboundFrame> {
         ReplBody::Owner(owner) => InboundBody::Owner(owner.body?),
         ReplBody::Blob(blob) => InboundBody::Blob(blob.body?),
     };
+    metrics::record_pipeline_stage(
+        inbound_pipeline_kind(&body),
+        ReplicationPipelineStage::InboundDecode,
+        decode_started_at.elapsed(),
+    );
     Some(InboundFrame {
         from: msg.from,
         topic,
         body,
     })
+}
+
+fn inbound_pipeline_kind(body: &InboundBody) -> ReplicationPipelineKind {
+    match body {
+        InboundBody::Strict(_) => ReplicationPipelineKind::Strict,
+        InboundBody::Owner(_) => ReplicationPipelineKind::Owner,
+        InboundBody::Blob(_) => ReplicationPipelineKind::Blob,
+    }
 }
 
 /// `ServiceInbound` impl that decodes the overlay payload and pushes onto
@@ -520,6 +541,8 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                 _ = inner.shutdown.cancelled() => return,
                 next = rx.recv() => {
                     let Some(frame) = next else { return };
+                    let kind = inbound_pipeline_kind(&frame.body);
+                    let dispatch_started_at = Instant::now();
                     match frame.body {
                         InboundBody::Strict(b) => {
                             let mut rt = inner.strict_topics
@@ -578,6 +601,11 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                             }
                         }
                     }
+                    metrics::record_pipeline_stage(
+                        kind,
+                        ReplicationPipelineStage::Dispatch,
+                        dispatch_started_at.elapsed(),
+                    );
                 }
             }
         }

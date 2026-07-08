@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use tracing::trace;
 
 use super::super::error::ReplicationError;
+use super::super::metrics::{self, ReplicationPipelineKind, ReplicationPipelineStage};
 use super::super::proto::{StrictBody, StrictPropose, StrictProposeAck};
 use super::StrictReplicable;
 use super::runtime::{Proposal, STRICT_REPLICATION_SLOW_STAGE, StrictRuntime};
@@ -44,7 +45,14 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .await
             .map_err(|_| ReplicationError::Shutdown)?;
 
-        let op_msgpack = Bytes::from(rmp_serde::to_vec(&op)?);
+        let encode_started_at = Instant::now();
+        let encoded = rmp_serde::to_vec(&op);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::MsgpackEncode,
+            encode_started_at.elapsed(),
+        );
+        let op_msgpack = Bytes::from(encoded?);
         let op_id = self.next_op_id();
         let op_bytes = op_msgpack.len();
         let (target_set, fq) = self.snapshot_target_set();

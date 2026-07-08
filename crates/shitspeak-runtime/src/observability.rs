@@ -444,6 +444,21 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "counter",
     ),
     (
+        "shitspeak_voice_pipeline_stage_events_total",
+        "Total voice pipeline stage observations by path and stage.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_pipeline_stage_duration_us_total",
+        "Total voice pipeline stage wall-clock duration in microseconds by path and stage.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_pipeline_stage_duration_us_bucket_total",
+        "Bucketed voice pipeline stage wall-clock duration in microseconds by path and stage.",
+        "counter",
+    ),
+    (
         "shitspeak_voice_egress_packets_total",
         "Total outbound voice packets by transport and result.",
         "counter",

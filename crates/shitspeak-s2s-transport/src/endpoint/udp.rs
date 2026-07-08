@@ -43,7 +43,9 @@ use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::super::frame::{FrameType, build_frame};
 use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
-use super::super::metrics::ExpiredOutboundDropStage;
+use super::super::metrics::{
+    ExpiredOutboundDropStage, TransportPipelineStage, record_transport_pipeline_stage,
+};
 use super::super::service_level::{MessageClass, ServiceLevel, TransportKind};
 use super::super::tls;
 use super::{
@@ -540,11 +542,17 @@ impl UdpCryptoSession {
     ) -> io::Result<usize> {
         let datagram = self.encrypt_frame(frame, self.socket.payload_mtu(udp_mtu))?;
         let addr = *self.peer_addr.lock();
+        let write_started_at = Instant::now();
         let n = self
             .socket
             .send_to(&datagram, addr)
             .await
             .map_err(|e| io::Error::other(format!("udp send: {e}")))?;
+        record_transport_pipeline_stage(
+            TransportKind::Udp,
+            TransportPipelineStage::SocketWrite,
+            write_started_at.elapsed(),
+        );
         peer.metrics().record_sent(TransportKind::Udp, n);
         #[cfg(debug_assertions)]
         crate::debug_io::record_named_sent(udp_frame_kind_name(frame.frame_type), n);
@@ -553,9 +561,15 @@ impl UdpCryptoSession {
 
     fn encrypt_frame(&self, frame: &pb::Frame, udp_mtu: usize) -> io::Result<Vec<u8>> {
         let mut plaintext = Vec::with_capacity(frame.encoded_len());
+        let encode_started_at = Instant::now();
         frame
             .encode(&mut plaintext)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        record_transport_pipeline_stage(
+            TransportKind::Udp,
+            TransportPipelineStage::FrameEncode,
+            encode_started_at.elapsed(),
+        );
 
         let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
         let header = UdpPacketHeader {
@@ -577,9 +591,17 @@ impl UdpCryptoSession {
         }
         let mut ciphertext = plaintext;
         let nonce = packet_nonce(header.kind, header.src, header.dst, header.seq)?;
-        self.seal_key
+        let encrypt_started_at = Instant::now();
+        let encrypt_result = self
+            .seal_key
             .seal_in_place_append_tag(nonce, Aad::from(header_bytes), &mut ciphertext)
-            .map_err(|_| io::Error::other("udp packet encryption failed"))?;
+            .map_err(|_| io::Error::other("udp packet encryption failed"));
+        record_transport_pipeline_stage(
+            TransportKind::Udp,
+            TransportPipelineStage::UdpEncrypt,
+            encrypt_started_at.elapsed(),
+        );
+        encrypt_result?;
         let mut datagram = Vec::with_capacity(HEADER_LEN + ciphertext.len());
         datagram.extend_from_slice(&header_bytes);
         datagram.extend_from_slice(&ciphertext);
@@ -601,10 +623,17 @@ impl UdpCryptoSession {
         }
         let mut ciphertext = packet[HEADER_LEN..].to_vec();
         let nonce = packet_nonce(header.kind, header.src, header.dst, header.seq)?;
-        let plaintext = self
+        let decrypt_started_at = Instant::now();
+        let decrypt_result = self
             .open_key
             .open_in_place(nonce, Aad::from(&packet[..HEADER_LEN]), &mut ciphertext)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "udp decrypt failed"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "udp decrypt failed"));
+        record_transport_pipeline_stage(
+            TransportKind::Udp,
+            TransportPipelineStage::UdpDecrypt,
+            decrypt_started_at.elapsed(),
+        );
+        let plaintext = decrypt_result?;
         if !self.replay.lock().accept(header.seq) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -1032,8 +1061,14 @@ async fn handle_udp_datagram(
         },
     };
 
-    let frame = pb::Frame::decode(&plaintext[..])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let decode_started_at = Instant::now();
+    let decoded_frame = pb::Frame::decode(&plaintext[..]);
+    record_transport_pipeline_stage(
+        TransportKind::Udp,
+        TransportPipelineStage::FrameDecode,
+        decode_started_at.elapsed(),
+    );
+    let frame = decoded_frame.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     #[cfg(debug_assertions)]
     crate::debug_io::record_named_received(udp_frame_kind_name(frame.frame_type), packet.len());
     if frame.src_node != u32::from(header.src) || frame.dst_node != u32::from(inner.self_id()) {
@@ -2077,9 +2112,16 @@ fn decrypt_packet_with_key(
     let key = aead_key(open_key)?;
     let mut ciphertext = packet[HEADER_LEN..].to_vec();
     let nonce = packet_nonce(header.kind, header.src, header.dst, header.seq)?;
-    let plaintext = key
+    let decrypt_started_at = Instant::now();
+    let decrypt_result = key
         .open_in_place(nonce, Aad::from(&packet[..HEADER_LEN]), &mut ciphertext)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "udp decrypt failed"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "udp decrypt failed"));
+    record_transport_pipeline_stage(
+        TransportKind::Udp,
+        TransportPipelineStage::UdpDecrypt,
+        decrypt_started_at.elapsed(),
+    );
+    let plaintext = decrypt_result?;
     Ok(plaintext.to_vec())
 }
 
@@ -2441,12 +2483,19 @@ async fn run_write(
                     now_us(),
                     out.payload().clone(),
                 );
-                if let Err(e) = maybe_compress_frame_payload(
+                let compress_started_at = Instant::now();
+                let compress_result = maybe_compress_frame_payload(
                     &mut frame,
                     out.options(),
                     inner.cfg().compression_config(),
                     inner.cfg().max_frame_bytes(),
-                ) {
+                );
+                record_transport_pipeline_stage(
+                    TransportKind::Udp,
+                    TransportPipelineStage::L1Compress,
+                    compress_started_at.elapsed(),
+                );
+                if let Err(e) = compress_result {
                     warn!(peer=%peer.node_id(), error=%e, "udp payload compression failed");
                     remove_session_on_exit = true;
                     break;
@@ -2539,7 +2588,14 @@ async fn handle_frame(
     compression: &super::super::compression::CompressionConfig,
     udp_mtu: usize,
 ) -> io::Result<()> {
-    validate_and_decode_payload(&mut frame, max_frame_bytes, compression)?;
+    let decompress_started_at = Instant::now();
+    let decompress_result = validate_and_decode_payload(&mut frame, max_frame_bytes, compression);
+    record_transport_pipeline_stage(
+        TransportKind::Udp,
+        TransportPipelineStage::L1Decompress,
+        decompress_started_at.elapsed(),
+    );
+    decompress_result?;
     let ty = match pb::FrameType::try_from(frame.frame_type) {
         Ok(v) => v,
         Err(_) => return Ok(()),

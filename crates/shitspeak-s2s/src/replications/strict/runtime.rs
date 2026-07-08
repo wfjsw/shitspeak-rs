@@ -22,7 +22,7 @@ use tracing::{debug, error, trace, warn};
 
 use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
-use super::super::metrics::{self, CatchupMode};
+use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
 use super::super::proto::{
     self as repl_proto, REPLICATION_SERVICE_TAG, StrictBody, StrictCatchupReq, StrictCatchupResp,
     StrictClockTick, StrictCommit, StrictPropose, StrictProposeAck, StrictRecoveryAck,
@@ -143,7 +143,14 @@ impl StrictNet for OverlayStrictNet {
             OverlaySendOptions::default()
         };
         let msg = repl_proto::wrap_strict(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         self.overlay
             .send_unicast_unordered_with_routing_metric_and_options(
                 dst,
@@ -166,7 +173,14 @@ impl StrictNet for OverlayStrictNet {
         retry_delay: Duration,
     ) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_strict(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         let options = OverlaySendOptions::default()
             .allow_l1_compression()
             .expire_after(retry_delay);
@@ -213,7 +227,14 @@ impl StrictNet for OverlayStrictNet {
             return Ok(());
         }
         let msg = repl_proto::wrap_strict(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         self.overlay
             .send_multicast_unordered_with_routing_metric(
                 dsts,
@@ -2238,9 +2259,15 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     }
     for buf in to_apply {
         let buffered_for = buf.buffered_at.elapsed();
+        let decode_started_at = Instant::now();
         let op: R::Op = match rmp_serde::from_slice(&buf.op_msgpack) {
             Ok(o) => o,
             Err(e) => {
+                metrics::record_pipeline_stage(
+                    ReplicationPipelineKind::Strict,
+                    ReplicationPipelineStage::MsgpackDecode,
+                    decode_started_at.elapsed(),
+                );
                 warn!(
                     error = %e,
                     topic = %rt.topic,
@@ -2253,6 +2280,11 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
                 continue;
             }
         };
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::MsgpackDecode,
+            decode_started_at.elapsed(),
+        );
         let version = rt.repo.current_version() + 1;
         debug!(
             topic = %rt.topic,
@@ -2277,6 +2309,11 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             )
             .await;
         let apply_elapsed = apply_started.elapsed();
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::RepoApply,
+            apply_elapsed,
+        );
         // Fire local proposer's waker, if any, and clear the proposal.
         let (waker, local_proposal_elapsed) = {
             let mut s = rt.state.lock();

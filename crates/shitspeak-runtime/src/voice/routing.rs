@@ -10,8 +10,8 @@ use tracing::Instrument;
 
 use super::codec::{self, Audio, PacketFormat};
 use super::metrics::{
-    VoiceAgeStage, VoiceDispatchMode, VoiceEgressResult, VoiceEgressTransport, VoiceRouteKind,
-    VoiceRouteSource, VoiceSchedulerStage, VoiceUdpSendResult,
+    VoiceAgeStage, VoiceDispatchMode, VoiceEgressResult, VoiceEgressTransport, VoicePipelinePath,
+    VoicePipelineStage, VoiceRouteKind, VoiceRouteSource, VoiceSchedulerStage, VoiceUdpSendResult,
 };
 use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, DatagramBatch};
@@ -1069,11 +1069,18 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
     );
 
     if send_s2s {
+        let encode_started_at = Instant::now();
         let payload = encode_s2s_voice_payload(audio);
+        record_pipeline_stage(
+            VoicePipelinePath::S2sForward,
+            VoicePipelineStage::S2sPayloadEncode,
+            encode_started_at,
+        );
         let is_terminator = matches!(
             &audio.audio_payload,
             codec::AudioPayload::Opus(payload) if payload.is_terminator
         );
+        let enqueue_started_at = Instant::now();
         let sent = if let Some(target_channels) = s2s_target_channels {
             server.s2s_manager().send_voice_for_target_channels(
                 u32::from(sender_id),
@@ -1105,6 +1112,11 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
                 ),
             }
         };
+        record_pipeline_stage(
+            VoicePipelinePath::S2sForward,
+            VoicePipelineStage::S2sGatewayEnqueue,
+            enqueue_started_at,
+        );
         super::metrics::record_s2s_forward(sent);
         if !sent {
             tracing::trace!("voice s2s send dropped: S2S gateway unavailable");
@@ -1243,6 +1255,21 @@ fn record_udp_flush_stats(stats: udp_batch::FlushStats) {
     super::metrics::record_udp_send_result(VoiceUdpSendResult::Partial, stats.partial_count());
 }
 
+fn record_pipeline_stage(path: VoicePipelinePath, stage: VoicePipelineStage, started_at: Instant) {
+    super::metrics::record_pipeline_stage(path, stage, started_at.elapsed());
+}
+
+fn enqueue_voice_tcp_timed(
+    path: VoicePipelinePath,
+    tally: &mut VoiceTcpEgressTally,
+    client: &Client,
+    bytes: &Bytes,
+) {
+    let started_at = Instant::now();
+    tally.enqueue(client, bytes);
+    record_pipeline_stage(path, VoicePipelineStage::TcpEnqueue, started_at);
+}
+
 pub(crate) async fn flush_voice_batch(
     server: &Arc<Box<Server>>,
     audio: &Audio,
@@ -1267,30 +1294,38 @@ pub(crate) async fn flush_voice_batch(
 
     if targets.len() < RAYON_FANOUT_THRESHOLD {
         super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
+        let path = VoicePipelinePath::LocalSequential;
         let mut cache = EncodeCache::new();
         let mut udp_batches: HashMap<std::net::SocketAddr, DatagramBatch> = HashMap::new();
         let mut tcp_tally = VoiceTcpEgressTally::default();
 
         for (client, context) in targets {
             let format = client_packet_format(client, server_protocol_version);
+            let encode_started_at = Instant::now();
             let entry = cache.get_or_encode(audio, *context, format);
+            record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
 
+            let lookup_started_at = Instant::now();
             if client.prefers_tcp_tunnel() {
-                tcp_tally.enqueue(client, &entry.bytes);
+                record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
+                enqueue_voice_tcp_timed(path, &mut tcp_tally, client, &entry.bytes);
                 continue;
             }
 
             let Some(addr) = client.get_udp_address() else {
-                tcp_tally.enqueue(client, &entry.bytes);
+                record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
+                enqueue_voice_tcp_timed(path, &mut tcp_tally, client, &entry.bytes);
                 continue;
             };
             let Some(local_addr) = server
                 .udp_socket_for_client(client)
                 .and_then(|socket| socket.local_addr().ok())
             else {
-                tcp_tally.enqueue(client, &entry.bytes);
+                record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
+                enqueue_voice_tcp_timed(path, &mut tcp_tally, client, &entry.bytes);
                 continue;
             };
+            record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
 
             let Some(mut crypt) = client.try_crypt_state() else {
                 super::metrics::record_crypt_lock_contention_drop(1);
@@ -1309,17 +1344,21 @@ pub(crate) async fn flush_voice_batch(
             let udp_batch = udp_batches
                 .entry(local_addr)
                 .or_insert_with(|| DatagramBatch::with_capacity(targets.len()));
-            if udp_batch
-                .try_push_zeroed(addr, encrypted_len, |buf| {
-                    state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
-                })
-                .is_err()
-            {
+            let encrypt_started_at = Instant::now();
+            let encrypt_result = udp_batch.try_push_zeroed(addr, encrypted_len, |buf| {
+                state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
+            });
+            record_pipeline_stage(
+                path,
+                VoicePipelineStage::UdpEncryptQueue,
+                encrypt_started_at,
+            );
+            if encrypt_result.is_err() {
                 tracing::trace!(
                     session = u32::from(client.get_session_id()),
                     "encryption failed for client, falling back to TCP tunnel"
                 );
-                tcp_tally.enqueue(client, &entry.bytes);
+                enqueue_voice_tcp_timed(path, &mut tcp_tally, client, &entry.bytes);
                 continue;
             }
         }
@@ -1347,6 +1386,7 @@ pub(crate) async fn flush_voice_batch(
                 );
                 continue;
             };
+            let flush_started_at = Instant::now();
             match udp_batch::flush_batch_with_retry_budget(
                 socket.as_ref(),
                 &udp_batch,
@@ -1374,11 +1414,13 @@ pub(crate) async fn flush_voice_batch(
                     );
                 }
             }
+            record_pipeline_stage(path, VoicePipelineStage::UdpFlush, flush_started_at);
         }
         return;
     }
 
     super::metrics::record_dispatch(VoiceDispatchMode::Rayon);
+    let path = VoicePipelinePath::LocalRayon;
 
     // Large-fanout path: bucket recipients while collecting unique
     // (format, context) keys, pre-encode each unique key once, then dispatch
@@ -1396,9 +1438,13 @@ pub(crate) async fn flush_voice_batch(
     for (client, context) in targets {
         let format = client_packet_format(client, server_protocol_version);
         // Touch the cache so every (format, context) seen is pre-encoded.
+        let encode_started_at = Instant::now();
         let _ = cache.get_or_encode(audio, *context, format);
+        record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
 
+        let lookup_started_at = Instant::now();
         if client.prefers_tcp_tunnel() {
+            record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
             tcp_items.push((client.clone(), format, *context));
             continue;
         }
@@ -1408,20 +1454,35 @@ pub(crate) async fn flush_voice_batch(
                     .udp_socket_for_client(client)
                     .and_then(|socket| socket.local_addr().ok())
                 {
+                    record_pipeline_stage(
+                        path,
+                        VoicePipelineStage::RecipientLookup,
+                        lookup_started_at,
+                    );
                     udp_items.push((client.clone(), local_addr, addr, format, *context));
                 } else {
+                    record_pipeline_stage(
+                        path,
+                        VoicePipelineStage::RecipientLookup,
+                        lookup_started_at,
+                    );
                     tcp_items.push((client.clone(), format, *context));
                 }
             }
-            None => tcp_items.push((client.clone(), format, *context)),
+            None => {
+                record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
+                tcp_items.push((client.clone(), format, *context));
+            }
         }
     }
 
     // TCP fallback recipients — enqueue using the cached plaintext, do not await.
     let mut tcp_tally = VoiceTcpEgressTally::default();
     for (client, format, context) in &tcp_items {
+        let encode_started_at = Instant::now();
         let entry = cache.get_or_encode(audio, *context, *format);
-        tcp_tally.enqueue(client, &entry.bytes);
+        record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
+        enqueue_voice_tcp_timed(path, &mut tcp_tally, client, &entry.bytes);
     }
     tcp_tally.record();
 
@@ -1439,6 +1500,7 @@ pub(crate) async fn flush_voice_batch(
         .chain(cache.overflow.into_iter())
         .collect();
 
+    let rayon_started_at = Instant::now();
     let batches: HashMap<std::net::SocketAddr, DatagramBatch> =
         tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
@@ -1469,6 +1531,7 @@ pub(crate) async fn flush_voice_batch(
                         };
                         let encrypted_len = entry.bytes.len() + state.overhead();
                         let batch = batches.entry(local_addr).or_insert_with(DatagramBatch::new);
+                        let encrypt_started_at = Instant::now();
                         let _ = batch.try_push_zeroed(addr, encrypted_len, |buf| {
                             state.encrypt_with_precomputed_checksum(
                                 buf,
@@ -1476,6 +1539,11 @@ pub(crate) async fn flush_voice_batch(
                                 &entry.checksum,
                             )
                         });
+                        super::metrics::record_pipeline_stage(
+                            path,
+                            VoicePipelineStage::UdpEncryptQueue,
+                            encrypt_started_at.elapsed(),
+                        );
                         batches
                     },
                 )
@@ -1493,6 +1561,7 @@ pub(crate) async fn flush_voice_batch(
             tracing::warn!("voice encrypt task join error: {e}");
             HashMap::new()
         });
+    record_pipeline_stage(path, VoicePipelineStage::RayonEncryptJoin, rayon_started_at);
 
     for (local_addr, batch) in batches {
         if batch.is_empty() {
@@ -1516,6 +1585,7 @@ pub(crate) async fn flush_voice_batch(
             );
             continue;
         };
+        let flush_started_at = Instant::now();
         match udp_batch::flush_batch_with_retry_budget(
             socket.as_ref(),
             &batch,
@@ -1543,6 +1613,7 @@ pub(crate) async fn flush_voice_batch(
                 );
             }
         }
+        record_pipeline_stage(path, VoicePipelineStage::UdpFlush, flush_started_at);
     }
 }
 

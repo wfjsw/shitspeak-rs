@@ -138,6 +138,58 @@ impl VoiceDispatchMode {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum VoicePipelinePath {
+    UdpIngress,
+    LocalSequential,
+    LocalRayon,
+    S2sForward,
+}
+
+impl VoicePipelinePath {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UdpIngress => "udp_ingress",
+            Self::LocalSequential => "local_sequential",
+            Self::LocalRayon => "local_rayon",
+            Self::S2sForward => "s2s_forward",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VoicePipelineStage {
+    UdpClientLookup,
+    UdpDecrypt,
+    UdpPacketDecode,
+    Encode,
+    RecipientLookup,
+    TcpEnqueue,
+    UdpEncryptQueue,
+    UdpFlush,
+    RayonEncryptJoin,
+    S2sPayloadEncode,
+    S2sGatewayEnqueue,
+}
+
+impl VoicePipelineStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UdpClientLookup => "udp_client_lookup",
+            Self::UdpDecrypt => "udp_decrypt",
+            Self::UdpPacketDecode => "udp_packet_decode",
+            Self::Encode => "encode",
+            Self::RecipientLookup => "recipient_lookup",
+            Self::TcpEnqueue => "tcp_enqueue",
+            Self::UdpEncryptQueue => "udp_encrypt_queue",
+            Self::UdpFlush => "udp_flush",
+            Self::RayonEncryptJoin => "rayon_encrypt_join",
+            Self::S2sPayloadEncode => "s2s_payload_encode",
+            Self::S2sGatewayEnqueue => "s2s_gateway_enqueue",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum VoiceEgressTransport {
     Udp,
     TcpTunnel,
@@ -256,6 +308,8 @@ const VOICE_QUEUE_DROP_REASON_COUNT: usize = 3;
 const VOICE_ROUTE_SOURCE_COUNT: usize = 3;
 const VOICE_ROUTE_KIND_COUNT: usize = 3;
 const VOICE_DISPATCH_MODE_COUNT: usize = 2;
+const VOICE_PIPELINE_PATH_COUNT: usize = 4;
+const VOICE_PIPELINE_STAGE_COUNT: usize = 11;
 const VOICE_EGRESS_TRANSPORT_COUNT: usize = 2;
 const VOICE_EGRESS_RESULT_COUNT: usize = 4;
 const VOICE_AGE_STAGE_COUNT: usize = 2;
@@ -270,6 +324,25 @@ const ROUTE_DIMENSIONS: [(VoiceRouteSource, VoiceRouteKind); 5] = [
     (VoiceRouteSource::S2s, VoiceRouteKind::Normal),
     (VoiceRouteSource::S2s, VoiceRouteKind::Target),
     (VoiceRouteSource::Loopback, VoiceRouteKind::Loopback),
+];
+const PIPELINE_PATHS: [VoicePipelinePath; VOICE_PIPELINE_PATH_COUNT] = [
+    VoicePipelinePath::UdpIngress,
+    VoicePipelinePath::LocalSequential,
+    VoicePipelinePath::LocalRayon,
+    VoicePipelinePath::S2sForward,
+];
+const PIPELINE_STAGES: [VoicePipelineStage; VOICE_PIPELINE_STAGE_COUNT] = [
+    VoicePipelineStage::UdpClientLookup,
+    VoicePipelineStage::UdpDecrypt,
+    VoicePipelineStage::UdpPacketDecode,
+    VoicePipelineStage::Encode,
+    VoicePipelineStage::RecipientLookup,
+    VoicePipelineStage::TcpEnqueue,
+    VoicePipelineStage::UdpEncryptQueue,
+    VoicePipelineStage::UdpFlush,
+    VoicePipelineStage::RayonEncryptJoin,
+    VoicePipelineStage::S2sPayloadEncode,
+    VoicePipelineStage::S2sGatewayEnqueue,
 ];
 
 const FANOUT_BUCKETS: [(&str, u64); 8] = [
@@ -350,6 +423,17 @@ static FANOUT_BUCKETS_TOTAL: [[AtomicU64; FANOUT_BUCKETS.len()];
         VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
 static DISPATCH_FRAMES: [AtomicU64; VOICE_DISPATCH_MODE_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_DISPATCH_MODE_COUNT];
+static PIPELINE_STAGE_EVENTS: [[AtomicU64; VOICE_PIPELINE_STAGE_COUNT]; VOICE_PIPELINE_PATH_COUNT] =
+    [const { [const { AtomicU64::new(0) }; VOICE_PIPELINE_STAGE_COUNT] }; VOICE_PIPELINE_PATH_COUNT];
+static PIPELINE_STAGE_DURATION_TOTAL_US: [[AtomicU64; VOICE_PIPELINE_STAGE_COUNT];
+    VOICE_PIPELINE_PATH_COUNT] = [const { [const { AtomicU64::new(0) }; VOICE_PIPELINE_STAGE_COUNT] };
+    VOICE_PIPELINE_PATH_COUNT];
+static PIPELINE_STAGE_DURATION_BUCKETS: [[[AtomicU64; ROUTE_DURATION_BUCKETS_US.len()];
+    VOICE_PIPELINE_STAGE_COUNT];
+    VOICE_PIPELINE_PATH_COUNT] = [const {
+    [const { [const { AtomicU64::new(0) }; ROUTE_DURATION_BUCKETS_US.len()] };
+        VOICE_PIPELINE_STAGE_COUNT]
+}; VOICE_PIPELINE_PATH_COUNT];
 static EGRESS_PACKETS: [[AtomicU64; VOICE_EGRESS_RESULT_COUNT]; VOICE_EGRESS_TRANSPORT_COUNT] =
     [const { [const { AtomicU64::new(0) }; VOICE_EGRESS_RESULT_COUNT] };
         VOICE_EGRESS_TRANSPORT_COUNT];
@@ -437,6 +521,31 @@ fn dispatch_mode_index(mode: VoiceDispatchMode) -> usize {
     match mode {
         VoiceDispatchMode::Sequential => 0,
         VoiceDispatchMode::Rayon => 1,
+    }
+}
+
+fn pipeline_path_index(path: VoicePipelinePath) -> usize {
+    match path {
+        VoicePipelinePath::UdpIngress => 0,
+        VoicePipelinePath::LocalSequential => 1,
+        VoicePipelinePath::LocalRayon => 2,
+        VoicePipelinePath::S2sForward => 3,
+    }
+}
+
+fn pipeline_stage_index(stage: VoicePipelineStage) -> usize {
+    match stage {
+        VoicePipelineStage::UdpClientLookup => 0,
+        VoicePipelineStage::UdpDecrypt => 1,
+        VoicePipelineStage::UdpPacketDecode => 2,
+        VoicePipelineStage::Encode => 3,
+        VoicePipelineStage::RecipientLookup => 4,
+        VoicePipelineStage::TcpEnqueue => 5,
+        VoicePipelineStage::UdpEncryptQueue => 6,
+        VoicePipelineStage::UdpFlush => 7,
+        VoicePipelineStage::RayonEncryptJoin => 8,
+        VoicePipelineStage::S2sPayloadEncode => 9,
+        VoicePipelineStage::S2sGatewayEnqueue => 10,
     }
 }
 
@@ -641,6 +750,26 @@ pub(crate) fn record_dispatch(mode: VoiceDispatchMode) {
     increment(&DISPATCH_FRAMES[dispatch_mode_index(mode)], 1);
 }
 
+pub(crate) fn record_pipeline_stage(
+    path: VoicePipelinePath,
+    stage: VoicePipelineStage,
+    duration: Duration,
+) {
+    let path_index = pipeline_path_index(path);
+    let stage_index = pipeline_stage_index(stage);
+    let duration_us = duration.as_micros().min(u64::MAX as u128) as u64;
+    increment(&PIPELINE_STAGE_EVENTS[path_index][stage_index], 1);
+    increment(
+        &PIPELINE_STAGE_DURATION_TOTAL_US[path_index][stage_index],
+        duration_us,
+    );
+    observe_bucket(
+        &PIPELINE_STAGE_DURATION_BUCKETS[path_index][stage_index],
+        &ROUTE_DURATION_BUCKETS_US,
+        duration_us,
+    );
+}
+
 pub(crate) fn record_egress(
     transport: VoiceEgressTransport,
     result: VoiceEgressResult,
@@ -838,6 +967,38 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             vec![("mode".to_owned(), mode.label().to_owned())],
             DISPATCH_FRAMES[dispatch_mode_index(mode)].load(Ordering::Relaxed) as f64,
         ));
+    }
+
+    for path in PIPELINE_PATHS {
+        for stage in PIPELINE_STAGES {
+            let path_index = pipeline_path_index(path);
+            let stage_index = pipeline_stage_index(stage);
+            let labels = vec![
+                ("path".to_owned(), path.label().to_owned()),
+                ("stage".to_owned(), stage.label().to_owned()),
+            ];
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_pipeline_stage_events_total",
+                labels.clone(),
+                PIPELINE_STAGE_EVENTS[path_index][stage_index].load(Ordering::Relaxed) as f64,
+            ));
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_pipeline_stage_duration_us_total",
+                labels.clone(),
+                PIPELINE_STAGE_DURATION_TOTAL_US[path_index][stage_index].load(Ordering::Relaxed)
+                    as f64,
+            ));
+            for (bucket_index, (bucket, _)) in ROUTE_DURATION_BUCKETS_US.iter().enumerate() {
+                let mut labels = labels.clone();
+                labels.push(("bucket".to_owned(), (*bucket).to_owned()));
+                samples.push(PrometheusSample::new(
+                    "shitspeak_voice_pipeline_stage_duration_us_bucket_total",
+                    labels,
+                    PIPELINE_STAGE_DURATION_BUCKETS[path_index][stage_index][bucket_index]
+                        .load(Ordering::Relaxed) as f64,
+                ));
+            }
+        }
     }
 
     for transport in [VoiceEgressTransport::Udp, VoiceEgressTransport::TcpTunnel] {

@@ -41,7 +41,9 @@ use super::compression::{
 use super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::frame::{FrameType, build_frame, stream_codec};
 use super::manager::InboundDispatch;
-use super::metrics::ExpiredOutboundDropStage;
+use super::metrics::{
+    ExpiredOutboundDropStage, TransportPipelineStage, record_transport_pipeline_stage,
+};
 use super::native_stats::BoxedNativeLossSampler;
 use super::service_level::{MessageClass, ServiceLevel, TransportKind};
 
@@ -404,7 +406,14 @@ async fn run_pump<S>(
                 peer.metrics().record_data_health_success(cfg.transport);
                 let recv_size = buf.len();
                 peer.metrics().record_recv(cfg.transport, recv_size);
-                match pb::Frame::decode(buf.as_ref()) {
+                let decode_started_at = Instant::now();
+                let decoded_frame = pb::Frame::decode(buf.as_ref());
+                record_transport_pipeline_stage(
+                    cfg.transport,
+                    TransportPipelineStage::FrameDecode,
+                    decode_started_at.elapsed(),
+                );
+                match decoded_frame {
                     Ok(frame) => {
                         #[cfg(debug_assertions)]
                         crate::debug_io::record_named_received(
@@ -580,13 +589,20 @@ async fn run_pump<S>(
                     active_adaptive_dictionary_id,
                     peer_dictionary_support,
                 );
-                if let Err(e) = maybe_compress_frame_payload_with_dictionary(
+                let compress_started_at = Instant::now();
+                let compress_result = maybe_compress_frame_payload_with_dictionary(
                     &mut frame,
                     out.options(),
                     outbound_compression.config(),
                     dictionary,
                     cfg.max_frame_bytes,
-                ) {
+                );
+                record_transport_pipeline_stage(
+                    cfg.transport,
+                    TransportPipelineStage::L1Compress,
+                    compress_started_at.elapsed(),
+                );
+                if let Err(e) = compress_result {
                     warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream payload compression failed");
                     break;
                 }
@@ -864,11 +880,18 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
     let mut buf = BytesMut::with_capacity(frame.encoded_len());
+    let encode_started_at = Instant::now();
     frame
         .encode(&mut buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    record_transport_pipeline_stage(
+        cfg.transport,
+        TransportPipelineStage::FrameEncode,
+        encode_started_at.elapsed(),
+    );
     let len = buf.len();
     let send = framed.send(buf.freeze());
+    let write_started_at = Instant::now();
     let send_result = match stream_write_deadline(&cfg, expires_at) {
         Some(deadline) => match timeout(deadline, send).await {
             Ok(result) => result,
@@ -879,6 +902,11 @@ where
         },
         None => send.await,
     };
+    record_transport_pipeline_stage(
+        cfg.transport,
+        TransportPipelineStage::StreamWrite,
+        write_started_at.elapsed(),
+    );
     if let Err(error) = send_result {
         peer.metrics().record_data_health_failure(cfg.transport);
         return Err(error);
@@ -978,12 +1006,19 @@ where
             inbound_compression.config(),
             peer_adaptive_dictionaries,
         );
-        validate_and_decode_payload_with_dictionary(
+        let decompress_started_at = Instant::now();
+        let decompress_result = validate_and_decode_payload_with_dictionary(
             &mut frame,
             cfg.max_frame_bytes,
             inbound_compression.config(),
             dictionary,
-        )?;
+        );
+        record_transport_pipeline_stage(
+            cfg.transport,
+            TransportPipelineStage::L1Decompress,
+            decompress_started_at.elapsed(),
+        );
+        decompress_result?;
     }
     let mut transport_link_stable = false;
     let ty = match pb::FrameType::try_from(frame.frame_type) {

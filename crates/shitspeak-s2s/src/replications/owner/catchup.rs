@@ -7,7 +7,7 @@ use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::warn;
 
-use super::super::metrics::{self, CatchupMode};
+use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
 use super::super::proto::{CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp};
 use super::runtime::OwnerRuntime;
 use super::{LogSlice, OwnerReplicable};
@@ -28,6 +28,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
     else {
         return;
     };
+    let build_started_at = std::time::Instant::now();
 
     let repo_known = rt.repo.known_versions();
     let runtime_known = {
@@ -55,6 +56,11 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
                     }),
                 )
                 .await;
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Owner,
+                ReplicationPipelineStage::CatchupBuild,
+                build_started_at.elapsed(),
+            );
             return;
         }
     };
@@ -87,6 +93,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
     let take = total.min(rt.cfg.owner_max_catchup_ops());
     let mut catchup_ops: Vec<CatchupOp> = Vec::with_capacity(take);
     for (v, op) in effective_ops.iter().take(take) {
+        let encode_started_at = std::time::Instant::now();
         match rmp_serde::to_vec(op) {
             Ok(b) => catchup_ops.push(CatchupOp {
                 version: *v,
@@ -97,6 +104,11 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
             }),
             Err(e) => warn!(error=%e, "owner catchup op encode failed; skipping"),
         }
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::MsgpackEncode,
+            encode_started_at.elapsed(),
+        );
     }
     let has_more = total > take;
     let next_chunk_token = catchup_ops
@@ -109,6 +121,11 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
             .map(|op| op.op_msgpack.len())
             .sum::<usize>();
     metrics::record_catchup_response(CatchupMode::Owner, catchup_ops.len(), response_bytes);
+    metrics::record_pipeline_stage(
+        ReplicationPipelineKind::Owner,
+        ReplicationPipelineStage::CatchupBuild,
+        build_started_at.elapsed(),
+    );
 
     let resp = OwnerCatchupResp {
         origin_node: origin as u32,
@@ -136,8 +153,14 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
     from: NodeIdentifier,
     resp: OwnerCatchupResp,
 ) {
+    let apply_started_at = std::time::Instant::now();
     let Some(origin) = node_from_u32(resp.origin_node) else {
         warn!("owner catchup resp has invalid origin_node");
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
+        );
         return;
     };
     let resp_epoch = resp.origin_epoch;
@@ -150,6 +173,11 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         .map(|known_epoch| resp_epoch < known_epoch)
         .unwrap_or(false)
     {
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
+        );
         return;
     }
 
@@ -157,7 +185,13 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         .map(|known_epoch| resp_epoch > known_epoch)
         .unwrap_or(false);
     if needs_restart_reset {
+        let snapshot_started_at = std::time::Instant::now();
         rt.repo.reset_origin(origin, resp_epoch).await;
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::SnapshotInstall,
+            snapshot_started_at.elapsed(),
+        );
         let mut s = rt.state.lock();
         s.known.insert(origin, (resp_epoch, 0));
         s.pending_buffers.remove(&origin);
@@ -177,6 +211,7 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             }
         };
         if should_install {
+            let snapshot_started_at = std::time::Instant::now();
             rt.repo
                 .install_snapshot_for_origin(
                     origin,
@@ -185,6 +220,11 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
                     resp.snapshot_msgpack,
                 )
                 .await;
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Owner,
+                ReplicationPipelineStage::SnapshotInstall,
+                snapshot_started_at.elapsed(),
+            );
             let mut s = rt.state.lock();
             s.known.insert(origin, (resp_epoch, resp.snapshot_version));
             // Wipe pending under the new epoch root.
@@ -240,6 +280,11 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         let _ = rt
             .send_catchup_req_to(dst, origin, resp_epoch, since, resp.next_chunk_token)
             .await;
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Owner,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
+        );
         return;
     }
 
@@ -253,6 +298,11 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             .send_catchup_req_to(origin, origin, known_epoch, version_after, 0)
             .await;
     }
+    metrics::record_pipeline_stage(
+        ReplicationPipelineKind::Owner,
+        ReplicationPipelineStage::CatchupApply,
+        apply_started_at.elapsed(),
+    );
 }
 
 #[inline]

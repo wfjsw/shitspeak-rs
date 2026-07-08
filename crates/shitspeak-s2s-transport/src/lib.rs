@@ -88,10 +88,11 @@ pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMe
 pub use metrics::{
     ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics,
     MetricsSnapshot, OutboundQueueStatusSnapshot, QueueStatusSnapshot,
+    TransportPipelineStageSnapshot,
 };
 pub use metrics::{
     apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,
-    conversational_quality_score,
+    conversational_quality_score, transport_pipeline_stage_snapshots,
 };
 pub use public_ip::discover_public_geo;
 pub use service_level::{

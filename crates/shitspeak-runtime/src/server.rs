@@ -636,10 +636,16 @@ impl Server {
                 let mut matched_via_ip_fallback = false;
 
                 let client = {
+                    let lookup_started_at = std::time::Instant::now();
                     let address_match = server
                         .clients
                         .get_client_by_udp_endpoint(local_addr, src_addr)
                         .await;
+                    crate::voice::metrics::record_pipeline_stage(
+                        crate::voice::metrics::VoicePipelinePath::UdpIngress,
+                        crate::voice::metrics::VoicePipelineStage::UdpClientLookup,
+                        lookup_started_at.elapsed(),
+                    );
                     let mut found = None;
 
                     if let Some(c) = address_match {
@@ -647,7 +653,14 @@ impl Server {
                             let mut crypt = c.crypt_state();
                             crypt.as_mut().map(|state| {
                                 let mut dec = BytesMut::new();
-                                state.decrypt(&mut dec, &packet).map(|_| dec)
+                                let decrypt_started_at = std::time::Instant::now();
+                                let result = state.decrypt(&mut dec, &packet).map(|_| dec);
+                                crate::voice::metrics::record_pipeline_stage(
+                                    crate::voice::metrics::VoicePipelinePath::UdpIngress,
+                                    crate::voice::metrics::VoicePipelineStage::UdpDecrypt,
+                                    decrypt_started_at.elapsed(),
+                                );
+                                result
                             })
                         };
 
@@ -697,7 +710,13 @@ impl Server {
                     }
 
                     if found.is_none() {
+                        let lookup_started_at = std::time::Instant::now();
                         let candidates = server.clients.get_clients_by_ip(&src_addr.ip()).await;
+                        crate::voice::metrics::record_pipeline_stage(
+                            crate::voice::metrics::VoicePipelinePath::UdpIngress,
+                            crate::voice::metrics::VoicePipelineStage::UdpClientLookup,
+                            lookup_started_at.elapsed(),
+                        );
                         crate::voice::metrics::record_udp_ip_fallback(candidates.len());
                         let mut matched = None;
                         for c in &candidates {
@@ -706,7 +725,14 @@ impl Server {
                                 match crypt.as_mut() {
                                     Some(state) => {
                                         let mut decrypted = BytesMut::new();
-                                        match state.decrypt(&mut decrypted, &packet) {
+                                        let decrypt_started_at = std::time::Instant::now();
+                                        let decrypt_result = state.decrypt(&mut decrypted, &packet);
+                                        crate::voice::metrics::record_pipeline_stage(
+                                            crate::voice::metrics::VoicePipelinePath::UdpIngress,
+                                            crate::voice::metrics::VoicePipelineStage::UdpDecrypt,
+                                            decrypt_started_at.elapsed(),
+                                        );
+                                        match decrypt_result {
                                             Ok(()) => {
                                                 crate::voice::metrics::record_udp_decrypt(
                                                     crate::voice::metrics::UdpDecryptPath::IpFallback,
@@ -799,10 +825,17 @@ impl Server {
                 };
 
                 // After decryption, check if this is a ping or audio packet.
-                match crate::voice::codec::IncomingUdpPacket::decode_owned(
+                let decode_started_at = std::time::Instant::now();
+                let decoded_packet = crate::voice::codec::IncomingUdpPacket::decode_owned(
                     decrypted.freeze(),
                     Some(client.get_session_id()),
-                ) {
+                );
+                crate::voice::metrics::record_pipeline_stage(
+                    crate::voice::metrics::VoicePipelinePath::UdpIngress,
+                    crate::voice::metrics::VoicePipelineStage::UdpPacketDecode,
+                    decode_started_at.elapsed(),
+                );
+                match decoded_packet {
                     Ok(crate::voice::codec::IncomingUdpPacket::Ping(ping)) => {
                         tracing::trace!(
                             "UDP ping from {}: timestamp={}, format={}",

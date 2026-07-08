@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use super::error::ReplicationError;
+use super::metrics::{self, ReplicationPipelineKind, ReplicationPipelineStage};
 use super::proto::{
     self as repl_proto, BlobBody, BlobChunk, BlobChunkReq, BlobFind, BlobOffer,
     REPLICATION_SERVICE_TAG,
@@ -63,7 +64,14 @@ impl BlobNet for OverlayBlobNet {
             OverlaySendOptions::default()
         };
         let msg = repl_proto::wrap_blob(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Blob,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         self.overlay
             .send_unicast_with_options(
                 dst,
@@ -85,7 +93,14 @@ impl BlobNet for OverlayBlobNet {
         retry_delay: Duration,
     ) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_blob(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Blob,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         let options = OverlaySendOptions::default()
             .allow_l1_compression()
             .expire_after(retry_delay);
@@ -122,7 +137,14 @@ impl BlobNet for OverlayBlobNet {
 
     async fn send_broadcast(&self, topic: &str, body: BlobBody) -> Result<(), ReplicationError> {
         let msg = repl_proto::wrap_blob(topic, body);
-        let bytes = repl_proto::encode(&msg)?;
+        let encode_started_at = Instant::now();
+        let encoded = repl_proto::encode(&msg);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Blob,
+            ReplicationPipelineStage::ProtobufEncode,
+            encode_started_at.elapsed(),
+        );
+        let bytes = encoded?;
         let dsts = self
             .alive_members()
             .into_iter()
@@ -303,12 +325,33 @@ impl BlobFetch {
             return None;
         }
 
-        let total_size = self.total_size? as usize;
+        let reassemble_started_at = Instant::now();
+        let Some(total_size) = self.total_size else {
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Blob,
+                ReplicationPipelineStage::BlobReassemble,
+                reassemble_started_at.elapsed(),
+            );
+            return None;
+        };
+        let total_size = total_size as usize;
         let mut out = BytesMut::with_capacity(total_size);
         for index in 0..expected_count {
-            let chunk = self.chunks.get(&index)?;
+            let Some(chunk) = self.chunks.get(&index) else {
+                metrics::record_pipeline_stage(
+                    ReplicationPipelineKind::Blob,
+                    ReplicationPipelineStage::BlobReassemble,
+                    reassemble_started_at.elapsed(),
+                );
+                return None;
+            };
             out.put_slice(chunk);
         }
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Blob,
+            ReplicationPipelineStage::BlobReassemble,
+            reassemble_started_at.elapsed(),
+        );
         if out.len() == total_size {
             Some(out.freeze())
         } else {
@@ -695,13 +738,25 @@ impl<R: BlobReplicable> BlobRuntime<R> {
             state.record_chunk(chunk)
         };
         if let Some(completed) = completed {
+            let hash_started_at = Instant::now();
             let computed = sha1_hex(&completed.bytes);
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Blob,
+                ReplicationPipelineStage::BlobHash,
+                hash_started_at.elapsed(),
+            );
             let result = if computed == completed.key {
-                match self
+                let store_started_at = Instant::now();
+                let stored = self
                     .repo
                     .put_blob(&completed.key, completed.bytes.clone())
-                    .await
-                {
+                    .await;
+                metrics::record_pipeline_stage(
+                    ReplicationPipelineKind::Blob,
+                    ReplicationPipelineStage::BlobStore,
+                    store_started_at.elapsed(),
+                );
+                match stored {
                     Ok(()) => Some(completed.bytes),
                     Err(e) => {
                         warn!(error=%e, key=%completed.key, "blob store write failed");

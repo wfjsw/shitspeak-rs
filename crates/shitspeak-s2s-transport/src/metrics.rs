@@ -43,6 +43,8 @@ pub(crate) const QUEUE_WATERMARK_LOG_INTERVAL: Duration = Duration::from_secs(3 
 const EXPIRED_OUTBOUND_DROP_STAGE_COUNT: usize = 3;
 const EXPIRED_OUTBOUND_DROP_TRANSPORT_COUNT: usize = 5;
 const MESSAGE_CLASS_COUNT: usize = 3;
+const TRANSPORT_KIND_COUNT: usize = 4;
+const TRANSPORT_PIPELINE_STAGE_COUNT: usize = 8;
 
 const EXPIRED_OUTBOUND_DROP_STAGES: [ExpiredOutboundDropStage; EXPIRED_OUTBOUND_DROP_STAGE_COUNT] = [
     ExpiredOutboundDropStage::PeerQueueEnqueue,
@@ -62,6 +64,155 @@ const MESSAGE_CLASSES: [MessageClass; MESSAGE_CLASS_COUNT] = [
     MessageClass::HighPriority,
     MessageClass::Regular,
 ];
+const TRANSPORT_KINDS: [TransportKind; TRANSPORT_KIND_COUNT] = [
+    TransportKind::Tcp,
+    TransportKind::Kcp,
+    TransportKind::Quic,
+    TransportKind::Udp,
+];
+const TRANSPORT_PIPELINE_STAGES: [TransportPipelineStage; TRANSPORT_PIPELINE_STAGE_COUNT] = [
+    TransportPipelineStage::FrameEncode,
+    TransportPipelineStage::FrameDecode,
+    TransportPipelineStage::L1Compress,
+    TransportPipelineStage::L1Decompress,
+    TransportPipelineStage::UdpEncrypt,
+    TransportPipelineStage::UdpDecrypt,
+    TransportPipelineStage::StreamWrite,
+    TransportPipelineStage::SocketWrite,
+];
+const TRANSPORT_PIPELINE_DURATION_BUCKETS_US: [(&str, u64); 8] = [
+    ("le_100", 100),
+    ("le_250", 250),
+    ("le_500", 500),
+    ("le_1000", 1_000),
+    ("le_2500", 2_500),
+    ("le_5000", 5_000),
+    ("le_10000", 10_000),
+    ("gt_10000", u64::MAX),
+];
+
+static TRANSPORT_PIPELINE_STAGE_EVENTS: [[AtomicU64; TRANSPORT_PIPELINE_STAGE_COUNT];
+    TRANSPORT_KIND_COUNT] =
+    [const { [const { AtomicU64::new(0) }; TRANSPORT_PIPELINE_STAGE_COUNT] }; TRANSPORT_KIND_COUNT];
+static TRANSPORT_PIPELINE_STAGE_DURATION_TOTAL_US: [[AtomicU64; TRANSPORT_PIPELINE_STAGE_COUNT];
+    TRANSPORT_KIND_COUNT] =
+    [const { [const { AtomicU64::new(0) }; TRANSPORT_PIPELINE_STAGE_COUNT] }; TRANSPORT_KIND_COUNT];
+static TRANSPORT_PIPELINE_STAGE_DURATION_BUCKETS: [[[AtomicU64;
+    TRANSPORT_PIPELINE_DURATION_BUCKETS_US.len()];
+    TRANSPORT_PIPELINE_STAGE_COUNT];
+    TRANSPORT_KIND_COUNT] = [const {
+    [const { [const { AtomicU64::new(0) }; TRANSPORT_PIPELINE_DURATION_BUCKETS_US.len()] };
+        TRANSPORT_PIPELINE_STAGE_COUNT]
+}; TRANSPORT_KIND_COUNT];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportPipelineStage {
+    FrameEncode,
+    FrameDecode,
+    L1Compress,
+    L1Decompress,
+    UdpEncrypt,
+    UdpDecrypt,
+    StreamWrite,
+    SocketWrite,
+}
+
+impl TransportPipelineStage {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FrameEncode => "frame_encode",
+            Self::FrameDecode => "frame_decode",
+            Self::L1Compress => "l1_compress",
+            Self::L1Decompress => "l1_decompress",
+            Self::UdpEncrypt => "udp_encrypt",
+            Self::UdpDecrypt => "udp_decrypt",
+            Self::StreamWrite => "stream_write",
+            Self::SocketWrite => "socket_write",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportPipelineStageSnapshot {
+    transport: TransportKind,
+    stage: TransportPipelineStage,
+    events: u64,
+    duration_us: u64,
+    buckets: [u64; TRANSPORT_PIPELINE_DURATION_BUCKETS_US.len()],
+}
+
+impl TransportPipelineStageSnapshot {
+    pub fn transport(&self) -> TransportKind {
+        self.transport
+    }
+
+    pub fn stage(&self) -> TransportPipelineStage {
+        self.stage
+    }
+
+    pub fn events(&self) -> u64 {
+        self.events
+    }
+
+    pub fn duration_us(&self) -> u64 {
+        self.duration_us
+    }
+
+    pub fn buckets(&self) -> [(&'static str, u64); TRANSPORT_PIPELINE_DURATION_BUCKETS_US.len()] {
+        std::array::from_fn(|index| {
+            (
+                TRANSPORT_PIPELINE_DURATION_BUCKETS_US[index].0,
+                self.buckets[index],
+            )
+        })
+    }
+}
+
+pub fn record_transport_pipeline_stage(
+    transport: TransportKind,
+    stage: TransportPipelineStage,
+    duration: Duration,
+) {
+    let transport_index = transport_pipeline_kind_index(transport);
+    let stage_index = transport_pipeline_stage_index(stage);
+    let duration_us = duration.as_micros().min(u64::MAX as u128) as u64;
+    TRANSPORT_PIPELINE_STAGE_EVENTS[transport_index][stage_index].fetch_add(1, Ordering::Relaxed);
+    TRANSPORT_PIPELINE_STAGE_DURATION_TOTAL_US[transport_index][stage_index]
+        .fetch_add(duration_us, Ordering::Relaxed);
+    if let Some((bucket_index, _)) = TRANSPORT_PIPELINE_DURATION_BUCKETS_US
+        .iter()
+        .enumerate()
+        .find(|(_, (_, upper_bound))| duration_us <= *upper_bound)
+    {
+        TRANSPORT_PIPELINE_STAGE_DURATION_BUCKETS[transport_index][stage_index][bucket_index]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn transport_pipeline_stage_snapshots() -> Vec<TransportPipelineStageSnapshot> {
+    let mut out = Vec::new();
+    for transport in TRANSPORT_KINDS {
+        for stage in TRANSPORT_PIPELINE_STAGES {
+            let transport_index = transport_pipeline_kind_index(transport);
+            let stage_index = transport_pipeline_stage_index(stage);
+            out.push(TransportPipelineStageSnapshot {
+                transport,
+                stage,
+                events: TRANSPORT_PIPELINE_STAGE_EVENTS[transport_index][stage_index]
+                    .load(Ordering::Relaxed),
+                duration_us: TRANSPORT_PIPELINE_STAGE_DURATION_TOTAL_US[transport_index]
+                    [stage_index]
+                    .load(Ordering::Relaxed),
+                buckets: std::array::from_fn(|bucket_index| {
+                    TRANSPORT_PIPELINE_STAGE_DURATION_BUCKETS[transport_index][stage_index]
+                        [bucket_index]
+                        .load(Ordering::Relaxed)
+                }),
+            });
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueStatusSnapshot {
@@ -1683,6 +1834,28 @@ fn message_class_index(class: MessageClass) -> usize {
         MessageClass::Control => 0,
         MessageClass::HighPriority => 1,
         MessageClass::Regular => 2,
+    }
+}
+
+fn transport_pipeline_kind_index(transport: TransportKind) -> usize {
+    match transport {
+        TransportKind::Tcp => 0,
+        TransportKind::Kcp => 1,
+        TransportKind::Quic => 2,
+        TransportKind::Udp => 3,
+    }
+}
+
+fn transport_pipeline_stage_index(stage: TransportPipelineStage) -> usize {
+    match stage {
+        TransportPipelineStage::FrameEncode => 0,
+        TransportPipelineStage::FrameDecode => 1,
+        TransportPipelineStage::L1Compress => 2,
+        TransportPipelineStage::L1Decompress => 3,
+        TransportPipelineStage::UdpEncrypt => 4,
+        TransportPipelineStage::UdpDecrypt => 5,
+        TransportPipelineStage::StreamWrite => 6,
+        TransportPipelineStage::SocketWrite => 7,
     }
 }
 
