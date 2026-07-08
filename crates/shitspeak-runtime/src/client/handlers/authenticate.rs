@@ -422,7 +422,7 @@ pub async fn handle_authenticate(
     let mut session_channel_shadow = SessionChannelShadow::new();
     let mut user_visibility = crate::client::visibility::UserVisibilityState::default();
     let viewer_independent_user_state =
-        crate::client::visibility::user_state_projection_is_viewer_independent(server);
+        crate::client::visibility::user_state_projection_is_viewer_independent(server, sender);
 
     let mut burst: Vec<Message> = Vec::new();
     let mut push_burst = |message: Message| {
@@ -457,10 +457,7 @@ pub async fn handle_authenticate(
             if viewer_independent_user_state {
                 push_burst(client.build_user_state_for_broadcast().into());
             } else {
-                let us: Message =
-                    crate::client::visibility::build_visible_user_state(server, sender, client)
-                        .await
-                        .into();
+                let us: Message = client.build_user_state_for_broadcast().into();
                 let projected = crate::client::visibility::project_message_with_shadow(
                     server,
                     sender,
@@ -483,10 +480,7 @@ pub async fn handle_authenticate(
         if viewer_independent_user_state {
             push_burst(sender.build_user_state_for_broadcast().into());
         } else {
-            let self_us: Message =
-                crate::client::visibility::build_visible_user_state(server, sender, sender)
-                    .await
-                    .into();
+            let self_us: Message = sender.build_user_state_for_broadcast().into();
             let projected = crate::client::visibility::project_message_with_shadow(
                 server,
                 sender,

@@ -33,6 +33,7 @@ pub struct TestServerOpts {
     pub default_channel: u32,
     pub send_permission_info: bool,
     pub hide_users_without_traverse: bool,
+    pub show_node_id_for_superusers: bool,
     pub debug_acl_enter: bool,
     pub explicit_enter_deny_overrides_write: bool,
     pub preserve_write_acl_on_edit: bool,
@@ -58,6 +59,7 @@ impl Default for TestServerOpts {
             default_channel: 0,
             send_permission_info: false,
             hide_users_without_traverse: false,
+            show_node_id_for_superusers: true,
             debug_acl_enter: true,
             explicit_enter_deny_overrides_write: false,
             preserve_write_acl_on_edit: true,
@@ -231,6 +233,7 @@ async fn spawn_test_server_with_pki(
         required_groups: Vec::new(),
         send_permission_info: opts.send_permission_info,
         hide_users_without_traverse: opts.hide_users_without_traverse,
+        show_node_id_for_superusers: opts.show_node_id_for_superusers,
         acl: crate::config::AclConfig::with_acl_behavior_and_speak_reevaluation(
             opts.debug_acl_enter,
             opts.explicit_enter_deny_overrides_write,

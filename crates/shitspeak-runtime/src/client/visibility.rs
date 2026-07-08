@@ -14,6 +14,7 @@ use crate::server::Server;
 use parking_lot::RwLock as ParkingRwLock;
 
 const DELETE_FANOUT_CACHE_MAX_ENTRIES: usize = 128;
+const SUPERUSER_NODE_DISPLAY_TRAIT_PREFIX: &str = " [n";
 
 #[derive(Debug)]
 pub struct UserVisibilityState {
@@ -401,6 +402,7 @@ pub struct VisibilityRefreshScope {
     listener_channel_removals: HashMap<ClientSessionIdentifier, HashSet<u32>>,
     include_all_channels: bool,
     include_known_users: bool,
+    include_user_state_names: bool,
 }
 
 impl VisibilityRefreshScope {
@@ -452,12 +454,17 @@ impl VisibilityRefreshScope {
         self.include_known_users = true;
     }
 
+    pub fn include_user_state_names(&mut self) {
+        self.include_user_state_names = true;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
             && self.channels.is_empty()
             && self.listener_channel_removals.is_empty()
             && !self.include_all_channels
             && !self.include_known_users
+            && !self.include_user_state_names
     }
 
     pub fn merge(&mut self, other: VisibilityRefreshScope) {
@@ -471,6 +478,7 @@ impl VisibilityRefreshScope {
         }
         self.include_all_channels |= other.include_all_channels;
         self.include_known_users |= other.include_known_users;
+        self.include_user_state_names |= other.include_user_state_names;
     }
 }
 
@@ -770,12 +778,17 @@ pub async fn build_visible_user_state(
         state.listening_channel_add = sorted_channels(&listener_channels);
         state.listening_channel_remove.clear();
     }
-    protect_user_state_hash_for_viewer(server, viewer, &mut state);
+    project_user_state_fields_for_viewer(server, viewer, &mut state);
     state
 }
 
-pub fn user_state_projection_is_viewer_independent(server: &Arc<Box<Server>>) -> bool {
-    !server.get_hide_users_without_traverse() && server.get_certificate_hash_privacy().is_none()
+pub fn user_state_projection_is_viewer_independent(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+) -> bool {
+    (!viewer.is_superuser() || !server.get_show_node_id_for_superusers())
+        && !server.get_hide_users_without_traverse()
+        && server.get_certificate_hash_privacy().is_none()
 }
 
 pub async fn initialize(
@@ -839,7 +852,7 @@ pub async fn project_message(
                 project_user_state(server, viewer, visibility, &user_state, session).await
             } else {
                 let mut projected = user_state;
-                protect_user_state_hash_for_viewer(server, viewer, &mut projected);
+                project_user_state_fields_for_viewer(server, viewer, &mut projected);
                 vec![projected.into()]
             }
         }
@@ -936,15 +949,31 @@ pub async fn visibility_refresh_messages(
     visibility: &mut UserVisibilityState,
     mut scope: VisibilityRefreshScope,
 ) -> Vec<Message> {
-    if !server.get_hide_users_without_traverse() || scope.is_empty() {
+    let hide_users_without_traverse = server.get_hide_users_without_traverse();
+    let include_user_state_names = scope.include_user_state_names;
+    if scope.is_empty() || (!hide_users_without_traverse && !include_user_state_names) {
         return Vec::new();
     }
 
     let server_id = viewer.server_id();
-    visibility.ensure_registered_for_server(server, &server_id);
+    if hide_users_without_traverse {
+        visibility.ensure_registered_for_server(server, &server_id);
+    }
     let mut sessions = std::mem::take(&mut scope.sessions);
     if scope.include_known_users {
-        sessions.extend(visibility.known_sessions());
+        if hide_users_without_traverse {
+            sessions.extend(visibility.known_sessions());
+        } else if include_user_state_names {
+            sessions.extend(
+                server
+                    .get_clients()
+                    .get_all_clients_in_server(&server_id)
+                    .await
+                    .into_iter()
+                    .filter(|target| target.is_authenticated() && target.is_published())
+                    .map(|target| target.get_session_id()),
+            );
+        }
     }
 
     let mut channels = std::mem::take(&mut scope.channels);
@@ -960,7 +989,9 @@ pub async fn visibility_refresh_messages(
     }
 
     if !channels.is_empty() {
-        sessions.extend(visibility.known_sessions_in_channels(&channels));
+        if hide_users_without_traverse {
+            sessions.extend(visibility.known_sessions_in_channels(&channels));
+        }
         sessions.extend(
             server
                 .get_clients()
@@ -973,22 +1004,24 @@ pub async fn visibility_refresh_messages(
     }
 
     let mut messages = Vec::new();
-    for (session, channel_ids) in scope.listener_channel_removals {
-        if sessions.contains(&session) {
-            continue;
-        }
-        let removed = visibility.remove_visible_listener_channels(session, &channel_ids);
-        if removed.is_empty() {
-            continue;
-        }
-        messages.push(
-            UserState {
-                session: Some(session),
-                listening_channel_remove: removed,
-                ..Default::default()
+    if hide_users_without_traverse {
+        for (session, channel_ids) in scope.listener_channel_removals {
+            if sessions.contains(&session) {
+                continue;
             }
-            .into(),
-        );
+            let removed = visibility.remove_visible_listener_channels(session, &channel_ids);
+            if removed.is_empty() {
+                continue;
+            }
+            messages.push(
+                UserState {
+                    session: Some(session),
+                    listening_channel_remove: removed,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
     }
 
     let mut sessions = sessions.into_iter().collect::<Vec<_>>();
@@ -1002,10 +1035,27 @@ pub async fn visibility_refresh_messages(
             .await
         {
             Some(target) if target.is_authenticated() => {
-                messages
-                    .extend(refresh_target_visibility(server, viewer, visibility, &target).await);
+                if hide_users_without_traverse {
+                    messages.extend(
+                        refresh_target_visibility(
+                            server,
+                            viewer,
+                            visibility,
+                            &target,
+                            include_user_state_names,
+                        )
+                        .await,
+                    );
+                } else if include_user_state_names
+                    && let Some(message) =
+                        user_state_name_refresh_for_viewer(server, viewer, &target)
+                {
+                    messages.push(message);
+                }
             }
-            _ if visibility.remove(session) => messages.push(hidden_user_remove(session)),
+            _ if hide_users_without_traverse && visibility.remove(session) => {
+                messages.push(hidden_user_remove(session));
+            }
             _ => {}
         }
     }
@@ -1214,6 +1264,9 @@ async fn visibility_refresh_scope_for_viewer_delta(
     {
         scope.include_all_channels();
         scope.include_known_users();
+        if delta.is_superuser.is_some() && server.get_show_node_id_for_superusers() {
+            scope.include_user_state_names();
+        }
     } else if let Some(new_channel_id) = delta.current_channel_id {
         scope.include_channels(
             crate::channel_handler::home_channel_dependent_channel_ids(
@@ -1265,7 +1318,7 @@ async fn project_user_state(
         let mut state = target.build_user_state_for_broadcast();
         state.listening_channel_add = sorted_channels(&new_listeners);
         state.listening_channel_remove.clear();
-        protect_user_state_hash_for_viewer(server, viewer, &mut state);
+        project_user_state_fields_for_viewer(server, viewer, &mut state);
         return vec![state.into()];
     }
 
@@ -1275,7 +1328,7 @@ async fn project_user_state(
     projected.actor = visible_actor(server, viewer, raw.actor).await;
     projected.listening_channel_add = sorted_difference(&new_listeners, &old.listener_channels);
     projected.listening_channel_remove = sorted_difference(&old.listener_channels, &new_listeners);
-    protect_user_state_hash_for_viewer(server, viewer, &mut projected);
+    project_user_state_fields_for_viewer(server, viewer, &mut projected);
 
     if user_state_delta_empty(&projected) {
         Vec::new()
@@ -1289,6 +1342,7 @@ async fn refresh_target_visibility(
     viewer: &Arc<Box<Client>>,
     visibility: &mut UserVisibilityState,
     target: &Arc<Box<Client>>,
+    include_user_state_name: bool,
 ) -> Vec<Message> {
     let session = target.get_session_id();
     let known_before = visibility.get(session).cloned();
@@ -1311,42 +1365,44 @@ async fn refresh_target_visibility(
             let mut state = target.build_user_state_for_broadcast();
             state.listening_channel_add = sorted_channels(&new_listeners);
             state.listening_channel_remove.clear();
-            protect_user_state_hash_for_viewer(server, viewer, &mut state);
+            project_user_state_fields_for_viewer(server, viewer, &mut state);
             vec![state.into()]
         }
         Some(old) => {
             visibility.insert(session, current_channel, new_listeners.clone());
-            if old.channel_id != current_channel {
-                let mut state = UserState {
-                    session: Some(session),
-                    channel_id: Some(current_channel),
-                    ..Default::default()
-                };
-                state.listening_channel_add =
-                    sorted_difference(&new_listeners, &old.listener_channels);
-                state.listening_channel_remove =
-                    sorted_difference(&old.listener_channels, &new_listeners);
-                protect_user_state_hash_for_viewer(server, viewer, &mut state);
-                vec![state.into()]
+            let mut state = UserState {
+                session: Some(session),
+                channel_id: (old.channel_id != current_channel).then_some(current_channel),
+                ..Default::default()
+            };
+            state.listening_channel_add = sorted_difference(&new_listeners, &old.listener_channels);
+            state.listening_channel_remove =
+                sorted_difference(&old.listener_channels, &new_listeners);
+            if include_user_state_name {
+                state.name = target.display_name_opt();
+            }
+            project_user_state_fields_for_viewer(server, viewer, &mut state);
+            if user_state_delta_empty(&state) {
+                Vec::new()
             } else {
-                let adds = sorted_difference(&new_listeners, &old.listener_channels);
-                let removes = sorted_difference(&old.listener_channels, &new_listeners);
-                if adds.is_empty() && removes.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![
-                        UserState {
-                            session: Some(session),
-                            listening_channel_add: adds,
-                            listening_channel_remove: removes,
-                            ..Default::default()
-                        }
-                        .into(),
-                    ]
-                }
+                vec![state.into()]
             }
         }
     }
+}
+
+fn user_state_name_refresh_for_viewer(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    target: &Arc<Box<Client>>,
+) -> Option<Message> {
+    let mut state = UserState {
+        session: Some(target.get_session_id()),
+        name: target.display_name_opt(),
+        ..Default::default()
+    };
+    project_user_state_fields_for_viewer(server, viewer, &mut state);
+    (!user_state_delta_empty(&state)).then(|| state.into())
 }
 
 async fn visible_actor(
@@ -1380,6 +1436,39 @@ fn protect_user_state_hash_for_viewer(
         protection,
         Some(secret.as_str()),
     );
+}
+
+fn project_user_state_fields_for_viewer(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    state: &mut UserState,
+) {
+    protect_user_state_hash_for_viewer(server, viewer, state);
+    apply_superuser_node_display_trait(server, viewer, state);
+}
+
+fn apply_superuser_node_display_trait(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    state: &mut UserState,
+) {
+    if !server.get_show_node_id_for_superusers() || !viewer.is_superuser() {
+        return;
+    }
+    let Some(session) = state.session else {
+        return;
+    };
+    let Some(name) = state.name.as_mut() else {
+        return;
+    };
+    append_node_display_trait(name, session.get_node_id());
+}
+
+fn append_node_display_trait(name: &mut String, node_id: u16) {
+    let suffix = format!("{SUPERUSER_NODE_DISPLAY_TRAIT_PREFIX}{node_id}]");
+    if !name.ends_with(&suffix) {
+        name.push_str(&suffix);
+    }
 }
 
 fn hidden_user_remove(session: ClientSessionIdentifier) -> Message {
@@ -1439,6 +1528,33 @@ mod tests {
 
     fn channels(ids: &[u32]) -> HashSet<u32> {
         ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn node_display_trait_appends_node_id() {
+        let mut name = "alice".to_owned();
+
+        append_node_display_trait(&mut name, 42);
+
+        assert_eq!(name, "alice [n42]");
+    }
+
+    #[test]
+    fn node_display_trait_does_not_duplicate_matching_suffix() {
+        let mut name = "alice [n42]".to_owned();
+
+        append_node_display_trait(&mut name, 42);
+
+        assert_eq!(name, "alice [n42]");
+    }
+
+    #[test]
+    fn user_state_name_refresh_keeps_scope_non_empty() {
+        let mut scope = VisibilityRefreshScope::new();
+
+        scope.include_user_state_names();
+
+        assert!(!scope.is_empty());
     }
 
     #[test]

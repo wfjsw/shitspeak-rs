@@ -2935,6 +2935,7 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
+            show_node_id_for_superusers: true,
             acl: shitspeak_runtime::config::AclConfig::default(),
             privacy: shitspeak_runtime::config::PrivacyConfig::default(),
             s2s: shitspeak_runtime::config::S2sConfig::default(),

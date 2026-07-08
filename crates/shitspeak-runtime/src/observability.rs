@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use crate::channel_repository::ChannelRepository;
 use crate::client_repository::ClientRepository;
 use crate::config::{MetricsConfig, RemoteWriteConfig};
+use crate::constants;
 use crate::geoip::NodeGeo;
 use crate::http_client;
 use crate::s2s::S2SManager;
@@ -69,16 +70,23 @@ impl S2sTopologyMetricsSource {
             local_geo,
         }
     }
+
+    fn build_info_samples(&self) -> Vec<PrometheusSample> {
+        app_build_info_samples(self.transport.local_node_id())
+    }
 }
 
 #[async_trait]
 impl S2sMetricsSource for S2sTopologyMetricsSource {
     async fn prometheus_metrics_text(&self) -> Option<String> {
-        Some(status::render_prometheus_metrics(
+        let mut body = status::render_prometheus_metrics(
             &self.overlay,
             &self.transport,
             self.local_geo.clone(),
-        ))
+        );
+        append_prometheus_metrics_separator(&mut body);
+        render_app_build_info_metrics_into(&mut body, &self.build_info_samples());
+        Some(body)
     }
 
     async fn prometheus_remote_write_requests(
@@ -86,8 +94,9 @@ impl S2sMetricsSource for S2sTopologyMetricsSource {
         batch_size: usize,
         external_labels: &HashMap<String, String>,
     ) -> Option<Vec<Vec<u8>>> {
-        let samples =
+        let mut samples =
             status::prometheus_samples(&self.overlay, &self.transport, self.local_geo.clone());
+        samples.extend(self.build_info_samples());
         let timestamp_ms = now_unix_ms();
         Some(remote_write_bodies(
             &samples,
@@ -129,15 +138,18 @@ impl ServerMetricsSource {
             self.clients.local_node_id(),
         )
     }
+
+    fn build_info_samples(&self) -> Vec<PrometheusSample> {
+        app_build_info_samples(self.clients.local_node_id())
+    }
 }
 
 #[async_trait]
 impl S2sMetricsSource for ServerMetricsSource {
     async fn prometheus_metrics_text(&self) -> Option<String> {
         let mut body = self.s2s.prometheus_metrics_text().unwrap_or_default();
-        if !body.is_empty() && !body.ends_with('\n') {
-            body.push('\n');
-        }
+        append_prometheus_metrics_separator(&mut body);
+        render_app_build_info_metrics_into(&mut body, &self.build_info_samples());
         render_consensus_metrics_into(&mut body, &self.consensus_samples().await);
         render_voice_metrics_into(&mut body, &self.voice_samples());
         Some(body)
@@ -149,6 +161,7 @@ impl S2sMetricsSource for ServerMetricsSource {
         external_labels: &HashMap<String, String>,
     ) -> Option<Vec<Vec<u8>>> {
         let mut samples = self.s2s.prometheus_samples().unwrap_or_default();
+        samples.extend(self.build_info_samples());
         samples.extend(self.consensus_samples().await);
         samples.extend(self.voice_samples());
         let timestamp_ms = now_unix_ms();
@@ -158,6 +171,33 @@ impl S2sMetricsSource for ServerMetricsSource {
             batch_size,
             external_labels,
         ))
+    }
+}
+
+fn app_build_info_samples(node_id: u16) -> Vec<PrometheusSample> {
+    vec![PrometheusSample::new(
+        "shitspeak_build_info",
+        vec![
+            ("node".to_owned(), node_id.to_string()),
+            ("app_name".to_owned(), constants::app_name().to_owned()),
+            ("version".to_owned(), constants::app_version().to_owned()),
+            ("commit_hash".to_owned(), constants::COMMIT_HASH.to_owned()),
+            ("commit_date".to_owned(), constants::COMMIT_DATE.to_owned()),
+            ("build_date".to_owned(), constants::BUILD_DATE.to_owned()),
+        ],
+        1.0,
+    )]
+}
+
+fn render_app_build_info_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
+    render_prometheus_header(
+        out,
+        "shitspeak_build_info",
+        "Build metadata for the running ShitSpeak binary.",
+        "gauge",
+    );
+    for sample in samples {
+        render_prometheus_sample(out, sample);
     }
 }
 
@@ -488,6 +528,12 @@ fn escape_prometheus_label_value(out: &mut String, value: &str) {
             '\n' => out.push_str("\\n"),
             _ => out.push(ch),
         }
+    }
+}
+
+fn append_prometheus_metrics_separator(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
     }
 }
 
@@ -1172,5 +1218,21 @@ mod tests {
         assert!(
             rendered.contains("shitspeak_consensus_channels_by_server{server_id=\"default\"} 7")
         );
+    }
+
+    #[test]
+    fn app_build_info_metric_renders_version_metadata() {
+        let samples = app_build_info_samples(9);
+        let mut rendered = String::new();
+        render_app_build_info_metrics_into(&mut rendered, &samples);
+        let labels = samples[0].labels();
+
+        assert!(rendered.contains("# TYPE shitspeak_build_info gauge\n"));
+        assert!(labels.contains(&("node".to_owned(), "9".to_owned())));
+        assert!(labels.contains(&("app_name".to_owned(), constants::app_name().to_owned())));
+        assert!(labels.contains(&("version".to_owned(), constants::app_version().to_owned())));
+        assert!(labels.iter().any(|(name, _)| name == "commit_hash"));
+        assert!(labels.iter().any(|(name, _)| name == "build_date"));
+        assert!(rendered.ends_with(" 1\n"));
     }
 }

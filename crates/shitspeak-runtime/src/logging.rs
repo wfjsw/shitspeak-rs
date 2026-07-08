@@ -22,7 +22,9 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::config::S2sConfig;
 use crate::http_client;
+use crate::types::NodeIdentifier;
 
 const DEFAULT_LOKI_BATCH_SIZE: usize = 128;
 const DEFAULT_LOKI_FILTER_TARGET: &str = "shitspeak_rs";
@@ -41,6 +43,8 @@ static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 struct LoggingRootConfig {
     #[serde(default)]
     logging: LoggingConfig,
+    #[serde(default)]
+    s2s: S2sConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -219,12 +223,14 @@ pub fn init(service_name: &'static str) -> Result<LoggingGuard, Box<dyn Error>> 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_line_number(true);
-    let config = load_logging_config()?;
+    let root = load_logging_config()?;
 
-    if config.loki.enabled() {
-        let loki_metadata_filter = config.loki.event_filter()?;
-        let loki_event_filter = config.loki.event_filter()?;
-        let (loki_formatter, flush_handle) = LokiEventFormatter::spawn(config.loki, service_name)?;
+    if root.logging.loki.enabled() {
+        let node_id = logging_node_id(&root.s2s);
+        let loki_metadata_filter = root.logging.loki.event_filter()?;
+        let loki_event_filter = root.logging.loki.event_filter()?;
+        let (loki_formatter, flush_handle) =
+            LokiEventFormatter::spawn(root.logging.loki, service_name, node_id)?;
         let loki_layer = tracing_subscriber::fmt::layer()
             .with_ansi(true)
             .with_writer(NoopMakeWriter)
@@ -254,13 +260,22 @@ pub fn flush() {
     }
 }
 
-fn load_logging_config() -> Result<LoggingConfig, config::ConfigError> {
+fn load_logging_config() -> Result<LoggingRootConfig, config::ConfigError> {
     ConfigCrate::builder()
         .add_source(File::with_name("config").required(false))
         .add_source(Environment::with_prefix("SHITSPEAK").separator("_"))
         .build()?
         .try_deserialize::<LoggingRootConfig>()
-        .map(|root| root.logging)
+}
+
+fn logging_node_id(s2s: &S2sConfig) -> NodeIdentifier {
+    match s2s.local_node_id() {
+        Ok(node_id) => node_id,
+        Err(error) => {
+            eprintln!("loki logging: failed to resolve local S2S node id label; using 0: {error}");
+            0
+        }
+    }
 }
 
 fn default_loki_batch_size() -> usize {
@@ -339,6 +354,7 @@ impl LokiEventFormatter {
     fn spawn(
         config: LokiConfig,
         service_name: &'static str,
+        node_id: NodeIdentifier,
     ) -> Result<(Self, LokiFlushHandle), Box<dyn Error>> {
         let push_url = config
             .push_url()
@@ -350,7 +366,7 @@ impl LokiEventFormatter {
         let retry_cache_capacity = config.retry_cache_capacity();
         let retry_initial_interval = config.retry_initial_interval();
         let retry_max_interval = config.retry_max_interval();
-        let labels = base_labels(service_name, &config.labels);
+        let labels = base_labels(service_name, &config.labels, node_id);
         let client = http_client::build_with_webpki_fallback(request_timeout, "loki logging")?;
         let (tx, rx) = mpsc::channel(queue_capacity);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -875,6 +891,7 @@ fn build_push_request(
 fn base_labels(
     service_name: &str,
     configured: &HashMap<String, String>,
+    node_id: NodeIdentifier,
 ) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert("service".to_string(), service_name.to_string());
@@ -896,6 +913,8 @@ fn base_labels(
             eprintln!("loki logging: ignoring invalid Loki label name {key:?}");
         }
     }
+
+    labels.insert("node_id".to_string(), node_id.to_string());
 
     labels
 }
@@ -1422,10 +1441,20 @@ mod tests {
         configured.insert("valid_label".to_string(), "yes".to_string());
         configured.insert("not-valid".to_string(), "no".to_string());
 
-        let labels = base_labels("svc", &configured);
+        let labels = base_labels("svc", &configured, 7);
 
         assert_eq!(labels.get("valid_label").map(String::as_str), Some("yes"));
         assert!(!labels.contains_key("not-valid"));
+    }
+
+    #[test]
+    fn base_labels_include_node_id() {
+        let mut configured = HashMap::new();
+        configured.insert("node_id".to_string(), "configured".to_string());
+
+        let labels = base_labels("svc", &configured, 42);
+
+        assert_eq!(labels.get("node_id").map(String::as_str), Some("42"));
     }
 
     fn test_loki_sender(retry_cache_capacity: usize) -> LokiSender {

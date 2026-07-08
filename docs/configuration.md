@@ -107,6 +107,7 @@ blob_storage_dir = "/var/lib/shitspeak-rs"
 required_groups = ["member"]
 send_permission_info = true
 hide_users_without_traverse = true
+show_node_id_for_superusers = true
 
 [authenticator]
 backend = "wasm"
@@ -308,9 +309,10 @@ If this list is empty, any authenticated user can connect. If it is non-empty, t
 ```toml
 send_permission_info = true
 hide_users_without_traverse = true
+show_node_id_for_superusers = true
 ```
 
-`send_permission_info` includes per-client channel enter hints in `ChannelState` messages. `hide_users_without_traverse` hides users whose current channel the viewer cannot traverse.
+`send_permission_info` includes per-client channel enter hints in `ChannelState` messages. `hide_users_without_traverse` hides users whose current channel the viewer cannot traverse. `show_node_id_for_superusers` appends a compact node marker such as `[n2]` to display names in `UserState` messages sent to superusers.
 
 ### ACL Behavior Toggles
 
@@ -567,7 +569,7 @@ retry_initial_interval_ms = 1000
 retry_max_interval_ms = 30000
 ```
 
-`url` can be a Loki base URL or the full `/loki/api/v1/push` endpoint. If `filter` is omitted, Loki shipping defaults to this crate's logs instead of all dependency logs.
+`url` can be a Loki base URL or the full `/loki/api/v1/push` endpoint. If `filter` is omitted, Loki shipping defaults to this crate's logs instead of all dependency logs. Loki streams automatically include `node_id`, the resolved S2S node id.
 
 ## Metrics And Remote Write
 
@@ -622,6 +624,7 @@ Reloaded successfully at runtime:
 - `geoip`
 - `send_permission_info`
 - `hide_users_without_traverse`
+- `show_node_id_for_superusers`
 - `[acl]` behavior toggles
 - `[privacy]` certificate hash protection and secret
 - additions to `server_entrypoints`

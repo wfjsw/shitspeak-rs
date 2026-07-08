@@ -100,6 +100,7 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         required_groups: Vec::new(),
         send_permission_info: false,
         hide_users_without_traverse: false,
+        show_node_id_for_superusers: true,
         acl: crate::config::AclConfig::default(),
         s2s: crate::config::S2sConfig::default(),
         web: crate::config::WebConfig::default(),

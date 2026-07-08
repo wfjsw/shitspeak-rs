@@ -25,7 +25,7 @@ filter = "shitspeak_rs=debug"
 labels = { environment = "dev" }
 ```
 
-If `filter` is omitted, Loki shipping defaults to `shitspeak_rs=<level>`, so dependency logs are not sent unless the directive is widened. Failed pushes are retried from a bounded in-memory cache.
+If `filter` is omitted, Loki shipping defaults to `shitspeak_rs=<level>`, so dependency logs are not sent unless the directive is widened. Failed pushes are retried from a bounded in-memory cache. Loki streams automatically include a `node_id` label with the resolved S2S node id.
 
 Useful tuning:
 
@@ -69,9 +69,13 @@ path = "/metrics"
 
 `/health` returns a simple health response.
 
+The endpoint also emits `shitspeak_build_info`, a gauge with value `1` and
+labels for the local node, app name, app version, commit hash, commit date, and
+build date. Use it to compare deployed binary versions across scraped nodes.
+
 ## Remote Write
 
-Remote write can send the S2S topology samples to Prometheus-compatible receivers such as Grafana Mimir:
+Remote write can send the metrics samples to Prometheus-compatible receivers such as Grafana Mimir:
 
 ```toml
 [observability.metrics.remote_write]

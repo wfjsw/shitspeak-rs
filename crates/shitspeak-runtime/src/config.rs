@@ -1207,6 +1207,11 @@ pub struct Config {
     #[serde(default)]
     pub hide_users_without_traverse: bool,
 
+    /// When `true`, superusers see the hosting S2S node id appended to each
+    /// user's display name in outgoing `UserState` messages. Default: `true`.
+    #[serde(default = "default_true")]
+    pub show_node_id_for_superusers: bool,
+
     // ── ACL behavior toggles ─────────────────────────────────────────────
     #[serde(default)]
     pub acl: AclConfig,
@@ -1584,6 +1589,13 @@ mod tests {
             .try_deserialize()
     }
 
+    fn parse_config(raw: &str) -> Result<Config, ::config::ConfigError> {
+        ::config::Config::builder()
+            .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
+            .build()?
+            .try_deserialize()
+    }
+
     fn cert_with_cn(dir: &Path, cn: &str) -> PathBuf {
         let mut params =
             rcgen::CertificateParams::new(vec!["s2s-node.local".to_owned()]).expect("cert params");
@@ -1679,6 +1691,29 @@ mod tests {
         assert!(!cfg.observability.metrics.enabled);
         assert_eq!(cfg.observability.metrics.path, "/metrics");
         assert!(!cfg.observability.metrics.remote_write.enabled);
+        assert!(cfg.show_node_id_for_superusers);
+    }
+
+    #[test]
+    fn show_node_id_for_superusers_defaults_on_and_parses_false() {
+        let base = r#"
+            listen = "127.0.0.1:64738"
+            register_name = "test"
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            send_version = true
+            send_build_info = true
+            send_os_info = true
+            allowed_proxies = []
+            min_client_version = 0
+            max_users = 100
+        "#;
+        let default_cfg = parse_config(base).expect("config deserialize");
+        assert!(default_cfg.show_node_id_for_superusers);
+
+        let disabled_cfg = parse_config(&format!("{base}\nshow_node_id_for_superusers = false\n"))
+            .expect("config deserialize");
+        assert!(!disabled_cfg.show_node_id_for_superusers);
     }
 
     #[test]

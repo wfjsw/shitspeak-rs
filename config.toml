@@ -35,6 +35,8 @@ cert_required = false
 send_permission_info = false
 # When enabled, clients only see users in channels they can Traverse.
 hide_users_without_traverse = false
+# When enabled, superusers see each user's hosting node id appended to display names.
+show_node_id_for_superusers = true
 
 # UDP
 udp_voice_enabled = true

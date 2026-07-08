@@ -1395,6 +1395,14 @@ impl Server {
                             new_config.hide_users_without_traverse
                         );
                     }
+                    if current.show_node_id_for_superusers != new_config.show_node_id_for_superusers
+                    {
+                        tracing::info!(
+                            "config reload: show_node_id_for_superusers {} -> {}",
+                            current.show_node_id_for_superusers,
+                            new_config.show_node_id_for_superusers
+                        );
+                    }
                     if current.acl.debug_acl_enter() != new_config.acl.debug_acl_enter() {
                         tracing::info!(
                             "config reload: acl.debug_acl_enter {} -> {}",
@@ -1590,6 +1598,10 @@ impl Server {
 
     pub fn get_hide_users_without_traverse(&self) -> bool {
         self.read_config().hide_users_without_traverse
+    }
+
+    pub fn get_show_node_id_for_superusers(&self) -> bool {
+        self.read_config().show_node_id_for_superusers
     }
 
     pub fn get_debug_acl_enter(&self) -> bool {
