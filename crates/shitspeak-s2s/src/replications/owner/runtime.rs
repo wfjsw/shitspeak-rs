@@ -360,7 +360,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
     pub fn start(self: &Arc<Self>) {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
-            runtime.catchup_alive_members().await;
+            runtime.bootstrap_catchup_alive_members().await;
         });
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
@@ -377,15 +377,31 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         });
     }
 
-    async fn catchup_alive_members(&self) {
+    async fn bootstrap_catchup_alive_members(&self) {
+        let deadline =
+            Instant::now() + self.cfg.owner_catchup_timeout().max(Duration::from_secs(1));
+        let retry_delay = owner_bootstrap_retry_delay(self.cfg.owner_catchup_timeout());
+        loop {
+            if self.catchup_alive_members().await || Instant::now() >= deadline {
+                return;
+            }
+            sleep(retry_delay).await;
+        }
+    }
+
+    async fn catchup_alive_members(&self) -> bool {
         let members = self.net.alive_members();
+        let mut saw_remote = false;
+        let mut requests_ready = true;
         for origin in members {
             if origin == self.self_id {
                 continue;
             }
+            saw_remote = true;
             let known_epoch = self.known_epoch_for_origin(origin);
-            self.request_catchup(origin, known_epoch, None).await;
+            requests_ready &= self.request_catchup(origin, known_epoch, None).await;
         }
+        saw_remote && requests_ready
     }
 
     fn known_epoch_for_origin(&self, origin: NodeIdentifier) -> u64 {
@@ -406,17 +422,24 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         origin: NodeIdentifier,
         known_epoch: u64,
         since_version: Option<u64>,
-    ) {
+    ) -> bool {
         if origin == self.self_id {
-            return;
+            return true;
         }
         let should_send = {
             let mut state = self.state.lock();
             state.arm_catchup(origin, Instant::now(), self.cfg.owner_catchup_timeout())
         };
         if should_send {
-            self.send_catchup_req_since(origin, known_epoch, since_version)
+            let sent = self
+                .send_catchup_req_since(origin, known_epoch, since_version)
                 .await;
+            if !sent {
+                self.state.lock().catchup_in_flight.remove(&origin);
+            }
+            sent
+        } else {
+            true
         }
     }
 
@@ -617,8 +640,8 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         let _ = prev_v;
     }
 
-    async fn send_catchup_req(&self, origin: NodeIdentifier, known_epoch: u64) {
-        self.send_catchup_req_since(origin, known_epoch, None).await;
+    async fn send_catchup_req(&self, origin: NodeIdentifier, known_epoch: u64) -> bool {
+        self.send_catchup_req_since(origin, known_epoch, None).await
     }
 
     async fn send_catchup_req_since(
@@ -626,7 +649,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         origin: NodeIdentifier,
         known_epoch: u64,
         since_version: Option<u64>,
-    ) {
+    ) -> bool {
         let alive = self.net.alive_members();
         let since = since_version.unwrap_or_else(|| {
             let s = self.state.lock();
@@ -648,19 +671,21 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             origin
         } else {
             // No one to ask.
-            return;
+            return false;
         };
-        if self
+        let first = self
             .send_catchup_req_to(pick, origin, known_epoch, since, 0)
-            .await
-            .is_err()
-            && pick != origin
-            && alive.contains(&origin)
-        {
-            let _ = self
-                .send_catchup_req_to(origin, origin, known_epoch, since, 0)
-                .await;
+            .await;
+        if first.is_ok() {
+            return true;
         }
+        if pick != origin && alive.contains(&origin) {
+            return self
+                .send_catchup_req_to(origin, origin, known_epoch, since, 0)
+                .await
+                .is_ok();
+        }
+        false
     }
 
     pub(super) async fn send_catchup_req_to(
@@ -757,6 +782,13 @@ impl<R: OwnerReplicable> ErasedOwnerRuntime for OwnerRuntime<R> {
     fn shutdown(&self) {
         self.shutdown.cancel();
     }
+}
+
+fn owner_bootstrap_retry_delay(catchup_timeout: Duration) -> Duration {
+    catchup_timeout
+        .checked_div(10)
+        .unwrap_or(Duration::from_millis(100))
+        .clamp(Duration::from_millis(50), Duration::from_millis(500))
 }
 
 #[inline]

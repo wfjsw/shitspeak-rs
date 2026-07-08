@@ -73,6 +73,7 @@ pub struct TransportConfig {
     udp_mtu: usize,
     kcp_tuning: KcpTuning,
     compression: CompressionConfig,
+    routing_policy: TransportRoutingPolicy,
 
     // ── Per-link metrics smoothing ──
     /// EWMA coefficient for the latency estimate.
@@ -152,6 +153,7 @@ impl TransportConfig {
             udp_mtu: 1200,
             kcp_tuning: KcpTuning::default(),
             compression: CompressionConfig::default(),
+            routing_policy: TransportRoutingPolicy::default(),
             latency_ewma_alpha: 0.2,
             jitter_ewma_alpha: 1.0 / 16.0,
             packet_loss_ewma_alpha: 0.02,
@@ -391,6 +393,10 @@ impl TransportConfig {
 
     pub fn compression_dictionary_id(&self) -> Option<u32> {
         self.compression.dictionary_id()
+    }
+
+    pub fn routing_policy(&self) -> TransportRoutingPolicy {
+        self.routing_policy
     }
 
     pub(crate) fn compression_config(&self) -> &CompressionConfig {
@@ -717,6 +723,11 @@ impl TransportConfig {
         self
     }
 
+    pub fn with_routing_policy(mut self, policy: TransportRoutingPolicy) -> Self {
+        self.routing_policy = policy;
+        self
+    }
+
     pub fn with_latency_ewma_alpha(mut self, v: f64) -> Self {
         self.latency_ewma_alpha = v;
         self
@@ -838,6 +849,127 @@ impl KcpTuning {
     }
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportRoutingPolicy {
+    #[serde(default = "default_udp_family_min_samples")]
+    udp_family_min_samples: u64,
+    #[serde(default = "default_udp_family_probe_loss_block_count")]
+    udp_family_probe_loss_block_count: u32,
+    #[serde(default = "default_udp_family_block_loss_ppm")]
+    udp_family_block_loss_ppm: u32,
+    #[serde(default = "default_udp_family_loss_excess_over_tcp_ppm")]
+    udp_family_loss_excess_over_tcp_ppm: u32,
+    #[serde(default = "default_large_rtt_threshold_ms")]
+    large_rtt_threshold_ms: u64,
+    #[serde(default = "default_lossy_link_threshold_ppm")]
+    lossy_link_threshold_ppm: u32,
+    #[serde(default = "default_bulk_payload_threshold_bytes")]
+    bulk_payload_threshold_bytes: usize,
+    #[serde(default = "default_bulk_backlog_threshold_bytes")]
+    bulk_backlog_threshold_bytes: usize,
+    #[serde(default = "default_transport_switch_improvement_pct")]
+    transport_switch_improvement_pct: u32,
+}
+
+impl Default for TransportRoutingPolicy {
+    fn default() -> Self {
+        Self {
+            udp_family_min_samples: default_udp_family_min_samples(),
+            udp_family_probe_loss_block_count: default_udp_family_probe_loss_block_count(),
+            udp_family_block_loss_ppm: default_udp_family_block_loss_ppm(),
+            udp_family_loss_excess_over_tcp_ppm: default_udp_family_loss_excess_over_tcp_ppm(),
+            large_rtt_threshold_ms: default_large_rtt_threshold_ms(),
+            lossy_link_threshold_ppm: default_lossy_link_threshold_ppm(),
+            bulk_payload_threshold_bytes: default_bulk_payload_threshold_bytes(),
+            bulk_backlog_threshold_bytes: default_bulk_backlog_threshold_bytes(),
+            transport_switch_improvement_pct: default_transport_switch_improvement_pct(),
+        }
+    }
+}
+
+impl TransportRoutingPolicy {
+    pub fn udp_family_min_samples(&self) -> u64 {
+        self.udp_family_min_samples
+    }
+
+    pub fn udp_family_probe_loss_block_count(&self) -> u32 {
+        self.udp_family_probe_loss_block_count
+    }
+
+    pub fn udp_family_block_loss_ppm(&self) -> u32 {
+        self.udp_family_block_loss_ppm
+    }
+
+    pub fn udp_family_loss_excess_over_tcp_ppm(&self) -> u32 {
+        self.udp_family_loss_excess_over_tcp_ppm
+    }
+
+    pub fn large_rtt_threshold_ms(&self) -> u64 {
+        self.large_rtt_threshold_ms
+    }
+
+    pub fn lossy_link_threshold_ppm(&self) -> u32 {
+        self.lossy_link_threshold_ppm
+    }
+
+    pub fn bulk_payload_threshold_bytes(&self) -> usize {
+        self.bulk_payload_threshold_bytes
+    }
+
+    pub fn bulk_backlog_threshold_bytes(&self) -> usize {
+        self.bulk_backlog_threshold_bytes
+    }
+
+    pub fn transport_switch_improvement_pct(&self) -> u32 {
+        self.transport_switch_improvement_pct
+    }
+
+    pub fn with_udp_family_min_samples(mut self, samples: u64) -> Self {
+        self.udp_family_min_samples = samples;
+        self
+    }
+
+    pub fn with_udp_family_probe_loss_block_count(mut self, count: u32) -> Self {
+        self.udp_family_probe_loss_block_count = count;
+        self
+    }
+
+    pub fn with_udp_family_block_loss_ppm(mut self, ppm: u32) -> Self {
+        self.udp_family_block_loss_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_udp_family_loss_excess_over_tcp_ppm(mut self, ppm: u32) -> Self {
+        self.udp_family_loss_excess_over_tcp_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_large_rtt_threshold_ms(mut self, ms: u64) -> Self {
+        self.large_rtt_threshold_ms = ms;
+        self
+    }
+
+    pub fn with_lossy_link_threshold_ppm(mut self, ppm: u32) -> Self {
+        self.lossy_link_threshold_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_bulk_payload_threshold_bytes(mut self, bytes: usize) -> Self {
+        self.bulk_payload_threshold_bytes = bytes;
+        self
+    }
+
+    pub fn with_bulk_backlog_threshold_bytes(mut self, bytes: usize) -> Self {
+        self.bulk_backlog_threshold_bytes = bytes;
+        self
+    }
+
+    pub fn with_transport_switch_improvement_pct(mut self, pct: u32) -> Self {
+        self.transport_switch_improvement_pct = pct;
+        self
+    }
+}
+
 /// TOML-deserializable shadow of the per-link metrics smoothing, ping-cap,
 /// adaptive queue floor hints, and connection-selection knobs. Listener,
 /// advertise, PKI, and seed fields stay on the higher-level S2S config because
@@ -910,6 +1042,8 @@ pub struct TransportTuning {
     /// dictionary frames are sent; UDP has no dictionary negotiation.
     #[serde(default)]
     compression_dictionary_path: Option<PathBuf>,
+    #[serde(default, flatten)]
+    routing_policy: TransportRoutingPolicy,
 }
 
 impl Default for TransportTuning {
@@ -945,6 +1079,7 @@ impl Default for TransportTuning {
             compression_adaptive_dictionary_enabled:
                 default_compression_adaptive_dictionary_enabled(),
             compression_dictionary_path: None,
+            routing_policy: TransportRoutingPolicy::default(),
         }
     }
 }
@@ -953,6 +1088,10 @@ impl TransportTuning {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_outbound_capacity_for_test(&mut self, n: usize) {
         self.outbound_capacity = n.max(1);
+    }
+
+    pub fn routing_policy(&self) -> TransportRoutingPolicy {
+        self.routing_policy
     }
 
     /// Apply the tunables on top of an existing `TransportConfig`.
@@ -993,6 +1132,7 @@ impl TransportTuning {
             .with_compression_adaptive_dictionary_enabled(
                 self.compression_adaptive_dictionary_enabled,
             )
+            .with_routing_policy(self.routing_policy)
     }
 
     /// Apply tunables and load the optional compression dictionary from disk.
@@ -1102,6 +1242,33 @@ fn default_kcp_flush_write() -> bool {
 fn default_kcp_flush_acks_input() -> bool {
     true
 }
+fn default_udp_family_min_samples() -> u64 {
+    32
+}
+fn default_udp_family_probe_loss_block_count() -> u32 {
+    3
+}
+fn default_udp_family_block_loss_ppm() -> u32 {
+    250_000
+}
+fn default_udp_family_loss_excess_over_tcp_ppm() -> u32 {
+    50_000
+}
+fn default_large_rtt_threshold_ms() -> u64 {
+    100
+}
+fn default_lossy_link_threshold_ppm() -> u32 {
+    20_000
+}
+fn default_bulk_payload_threshold_bytes() -> usize {
+    65_536
+}
+fn default_bulk_backlog_threshold_bytes() -> usize {
+    262_144
+}
+fn default_transport_switch_improvement_pct() -> u32 {
+    15
+}
 
 #[cfg(test)]
 mod tests {
@@ -1164,6 +1331,81 @@ mod tests {
         assert_eq!(cfg.inbound_high_capacity(), 4096);
         assert_eq!(cfg.inbound_regular_capacity(), 65_536);
         assert_eq!(cfg.outbound_capacity(), 8192);
+    }
+
+    #[test]
+    fn transport_routing_policy_defaults_are_conservative() {
+        let policy = TransportRoutingPolicy::default();
+
+        assert_eq!(policy.udp_family_min_samples(), 32);
+        assert_eq!(policy.udp_family_probe_loss_block_count(), 3);
+        assert_eq!(policy.udp_family_block_loss_ppm(), 250_000);
+        assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 50_000);
+        assert_eq!(policy.large_rtt_threshold_ms(), 100);
+        assert_eq!(policy.lossy_link_threshold_ppm(), 20_000);
+        assert_eq!(policy.bulk_payload_threshold_bytes(), 65_536);
+        assert_eq!(policy.bulk_backlog_threshold_bytes(), 262_144);
+        assert_eq!(policy.transport_switch_improvement_pct(), 15);
+    }
+
+    #[test]
+    fn transport_routing_policy_builders_update_private_fields() {
+        let policy = TransportRoutingPolicy::default()
+            .with_udp_family_min_samples(12)
+            .with_udp_family_probe_loss_block_count(4)
+            .with_udp_family_block_loss_ppm(2_000_000)
+            .with_udp_family_loss_excess_over_tcp_ppm(70_000)
+            .with_large_rtt_threshold_ms(80)
+            .with_lossy_link_threshold_ppm(30_000)
+            .with_bulk_payload_threshold_bytes(32_768)
+            .with_bulk_backlog_threshold_bytes(131_072)
+            .with_transport_switch_improvement_pct(25);
+
+        assert_eq!(policy.udp_family_min_samples(), 12);
+        assert_eq!(policy.udp_family_probe_loss_block_count(), 4);
+        assert_eq!(policy.udp_family_block_loss_ppm(), 1_000_000);
+        assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 70_000);
+        assert_eq!(policy.large_rtt_threshold_ms(), 80);
+        assert_eq!(policy.lossy_link_threshold_ppm(), 30_000);
+        assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
+        assert_eq!(policy.bulk_backlog_threshold_bytes(), 131_072);
+        assert_eq!(policy.transport_switch_improvement_pct(), 25);
+    }
+
+    #[test]
+    fn transport_tuning_parses_and_applies_routing_policy() {
+        let tuning: TransportTuning = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    udp_family_min_samples = 8
+                    udp_family_probe_loss_block_count = 5
+                    udp_family_block_loss_ppm = 200000
+                    udp_family_loss_excess_over_tcp_ppm = 40000
+                    large_rtt_threshold_ms = 120
+                    lossy_link_threshold_ppm = 15000
+                    bulk_payload_threshold_bytes = 32768
+                    bulk_backlog_threshold_bytes = 98304
+                    transport_switch_improvement_pct = 20
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("transport tuning parses");
+        let cfg = tuning.apply(base_config());
+        let policy = cfg.routing_policy();
+
+        assert_eq!(tuning.routing_policy().udp_family_min_samples(), 8);
+        assert_eq!(policy.udp_family_min_samples(), 8);
+        assert_eq!(policy.udp_family_probe_loss_block_count(), 5);
+        assert_eq!(policy.udp_family_block_loss_ppm(), 200_000);
+        assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 40_000);
+        assert_eq!(policy.large_rtt_threshold_ms(), 120);
+        assert_eq!(policy.lossy_link_threshold_ppm(), 15_000);
+        assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
+        assert_eq!(policy.bulk_backlog_threshold_bytes(), 98_304);
+        assert_eq!(policy.transport_switch_improvement_pct(), 20);
     }
 
     #[test]

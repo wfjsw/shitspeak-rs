@@ -26,8 +26,8 @@ use shitspeak_s2s_transport::{
     conversational_impairment,
 };
 
-use super::super::config::OverlayConfig;
-use super::super::lsdb::{LinkAdvertised, LinkStateDb, LsaEntry};
+use super::super::config::{OverlayConfig, transport_bit};
+use super::super::lsdb::{LinkAdvertised, LinkStateDb, LinkTransportAdvertised, LsaEntry};
 use super::RoutingMetric;
 
 pub(crate) const MIN_ROUTE_LOSS_EXCLUSION_SAMPLES: u64 = 32;
@@ -220,7 +220,7 @@ pub(crate) fn adjacency_for(
     for (origin, links) in graph.links_by_origin() {
         let mut edges = Vec::new();
         for link in links {
-            let metric_inputs = edge_metric_inputs(link, metric);
+            let metric_inputs = edge_metric_inputs(link, level, metric, cfg);
             if !graph.is_active(link.neighbor)
                 || link.transports_mask & mask == 0
                 || has_confident_excessive_loss(
@@ -320,23 +320,38 @@ struct EdgeMetricInputs {
     loss_sample_count: u64,
 }
 
-fn edge_metric_inputs(link: &LinkAdvertised, metric: RoutingMetric) -> EdgeMetricInputs {
-    if metric == RoutingMetric::ConversationalQuality {
-        if let Some(udp) = link
-            .transport_metrics
-            .iter()
-            .find(|metric| metric.transport() == TransportKind::Udp)
-        {
-            return EdgeMetricInputs {
-                rtt_us: if udp.rtt_us() > 0 {
-                    udp.rtt_us()
-                } else {
-                    link.rtt_us
-                },
-                jitter_us: udp.jitter_us(),
-                loss_ppm: udp.loss_ppm(),
-                loss_sample_count: udp.loss_sample_count(),
-            };
+fn edge_metric_inputs(
+    link: &LinkAdvertised,
+    level: ServiceLevel,
+    metric: RoutingMetric,
+    cfg: &OverlayConfig,
+) -> EdgeMetricInputs {
+    match metric {
+        RoutingMetric::ReliableCost => {
+            if let Some(tcp) = transport_metric(link, TransportKind::Tcp) {
+                return edge_metric_inputs_from_transport(link, tcp);
+            }
+        }
+        RoutingMetric::ReliableLowLatencyCost => {
+            if let Some(candidate) = best_viable_reliable_udp_metric(link, metric, cfg) {
+                return edge_metric_inputs_from_transport(link, candidate);
+            }
+        }
+        RoutingMetric::BestEffortCost => {
+            if level == ServiceLevel::BestEffort {
+                if let Some(udp) = transport_metric(link, TransportKind::Udp) {
+                    return edge_metric_inputs_from_transport(link, udp);
+                }
+            }
+        }
+        RoutingMetric::ConversationalQuality => {
+            if level == ServiceLevel::BestEffort {
+                if let Some(udp) = transport_metric(link, TransportKind::Udp) {
+                    return edge_metric_inputs_from_transport(link, udp);
+                }
+            } else if let Some(candidate) = best_viable_reliable_udp_metric(link, metric, cfg) {
+                return edge_metric_inputs_from_transport(link, candidate);
+            }
         }
     }
     EdgeMetricInputs {
@@ -345,6 +360,78 @@ fn edge_metric_inputs(link: &LinkAdvertised, metric: RoutingMetric) -> EdgeMetri
         loss_ppm: link.loss_ppm,
         loss_sample_count: link.loss_sample_count,
     }
+}
+
+fn transport_metric(
+    link: &LinkAdvertised,
+    transport: TransportKind,
+) -> Option<&LinkTransportAdvertised> {
+    link.transport_metrics
+        .iter()
+        .find(|metric| metric.transport() == transport)
+}
+
+fn edge_metric_inputs_from_transport(
+    link: &LinkAdvertised,
+    metric: &LinkTransportAdvertised,
+) -> EdgeMetricInputs {
+    EdgeMetricInputs {
+        rtt_us: if metric.rtt_us() > 0 {
+            metric.rtt_us()
+        } else {
+            link.rtt_us
+        },
+        jitter_us: metric.jitter_us(),
+        loss_ppm: metric.loss_ppm(),
+        loss_sample_count: metric.loss_sample_count(),
+    }
+}
+
+fn best_viable_reliable_udp_metric<'a>(
+    link: &'a LinkAdvertised,
+    routing_metric: RoutingMetric,
+    cfg: &OverlayConfig,
+) -> Option<&'a LinkTransportAdvertised> {
+    link.transport_metrics
+        .iter()
+        .filter(|metric| matches!(metric.transport(), TransportKind::Kcp | TransportKind::Quic))
+        .filter(|metric| link.transports_mask & transport_bit(metric.transport()) != 0)
+        .filter(|metric| reliable_udp_metric_is_viable(link, metric, cfg))
+        .min_by_key(|metric| transport_metric_cost(link, metric, routing_metric, cfg))
+}
+
+fn reliable_udp_metric_is_viable(
+    link: &LinkAdvertised,
+    metric: &LinkTransportAdvertised,
+    cfg: &OverlayConfig,
+) -> bool {
+    let policy = cfg.transport_routing_policy();
+    if metric.loss_sample_count() < policy.udp_family_min_samples() {
+        return false;
+    }
+    if metric.loss_ppm() >= policy.udp_family_block_loss_ppm() {
+        return false;
+    }
+
+    let tcp_loss = transport_metric(link, TransportKind::Tcp)
+        .filter(|tcp| tcp.loss_sample_count() >= policy.udp_family_min_samples())
+        .map(|tcp| tcp.loss_ppm())
+        .or_else(|| {
+            (link.loss_sample_count >= policy.udp_family_min_samples()).then_some(link.loss_ppm)
+        });
+    !tcp_loss.is_some_and(|tcp_loss| {
+        metric.loss_ppm() >= tcp_loss.saturating_add(policy.udp_family_loss_excess_over_tcp_ppm())
+    })
+}
+
+fn transport_metric_cost(
+    link: &LinkAdvertised,
+    metric: &LinkTransportAdvertised,
+    routing_metric: RoutingMetric,
+    cfg: &OverlayConfig,
+) -> u64 {
+    let inputs = edge_metric_inputs_from_transport(link, metric);
+    compute_cost(link, routing_metric, cfg, inputs).primary
 }
 
 fn has_confident_excessive_loss(loss_ppm: u32, loss_sample_count: u64, max_loss_ppm: u32) -> bool {
@@ -445,7 +532,7 @@ mod tests {
     use super::super::super::lsdb::{
         LinkTransportAdvertised, LsaEntry, LsaFloor, ReplicationServices,
     };
-    use shitspeak_s2s_transport::TransportKind;
+    use shitspeak_s2s_transport::{TransportKind, TransportRoutingPolicy};
 
     fn cfg() -> OverlayConfig {
         OverlayConfig::new(vec![])
@@ -628,6 +715,46 @@ mod tests {
         }
     }
 
+    fn entry_with_transport_metrics(
+        origin: NodeIdentifier,
+        links: Vec<(NodeIdentifier, u64, u32, u32, Vec<LinkTransportAdvertised>)>,
+    ) -> LsaEntry {
+        LsaEntry {
+            origin,
+            boot_epoch: 100,
+            seq: 1,
+            ts_local_received: std::time::Instant::now(),
+            tombstone: false,
+            addresses: vec![],
+            links: links
+                .into_iter()
+                .map(
+                    |(neighbor, rtt_us, loss_ppm, transports_mask, transport_metrics)| {
+                        LinkAdvertised {
+                            neighbor,
+                            rtt_us,
+                            jitter_us: 0,
+                            throughput_bps: 1_000_000,
+                            observed_recv_bps: 1_000_000,
+                            observed_sent_bps: 1_000_000,
+                            throughput_confidence_ppm: 1_000_000,
+                            transports_mask,
+                            loss_ppm,
+                            probe_loss_ppm: loss_ppm,
+                            native_loss_ppm: 0,
+                            data_health_ppm: 0,
+                            loss_sample_count: MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+                            transport_metrics,
+                        }
+                    },
+                )
+                .collect(),
+            max_users: 0,
+            transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
+        }
+    }
+
     #[test]
     fn line_topology_routes() {
         // 1 -> 2 -> 3
@@ -800,6 +927,167 @@ mod tests {
             &cfg(),
         );
         assert_eq!(conversational[&2].next_hop, 3);
+    }
+
+    #[test]
+    fn reliable_cost_uses_tcp_specific_advertised_metrics() {
+        let tcp_quic = transport_bit(TransportKind::Tcp) | transport_bit(TransportKind::Quic);
+        let tcp = transport_bit(TransportKind::Tcp);
+        let db = build_db(vec![
+            entry_with_transport_metrics(
+                1,
+                vec![
+                    (
+                        2,
+                        5_000,
+                        0,
+                        tcp_quic,
+                        vec![
+                            LinkTransportAdvertised::new(
+                                TransportKind::Tcp,
+                                100_000,
+                                0,
+                                0,
+                                MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+                            ),
+                            LinkTransportAdvertised::new(
+                                TransportKind::Quic,
+                                1_000,
+                                0,
+                                0,
+                                MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+                            ),
+                        ],
+                    ),
+                    (3, 30_000, 0, tcp, Vec::new()),
+                ],
+            ),
+            entry_with_transport_metrics(2, Vec::new()),
+            entry_with_transport_metrics(3, vec![(2, 30_000, 0, tcp, Vec::new())]),
+        ]);
+
+        let table = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &cfg(),
+        );
+
+        assert_eq!(table[&2].next_hop, 3);
+    }
+
+    #[test]
+    fn reliable_low_latency_uses_kcp_metrics_only_after_viability_floor() {
+        let tcp_kcp = transport_bit(TransportKind::Tcp) | transport_bit(TransportKind::Kcp);
+        let tcp = transport_bit(TransportKind::Tcp);
+        let below_floor = TransportRoutingPolicy::default()
+            .udp_family_min_samples()
+            .saturating_sub(1);
+        let db = build_db(vec![
+            entry_with_transport_metrics(
+                1,
+                vec![
+                    (
+                        2,
+                        200_000,
+                        0,
+                        tcp_kcp,
+                        vec![LinkTransportAdvertised::new(
+                            TransportKind::Kcp,
+                            20_000,
+                            0,
+                            0,
+                            below_floor,
+                        )],
+                    ),
+                    (3, 90_000, 0, tcp, Vec::new()),
+                ],
+            ),
+            entry_with_transport_metrics(2, Vec::new()),
+            entry_with_transport_metrics(3, vec![(2, 90_000, 0, tcp, Vec::new())]),
+        ]);
+
+        let table = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::ReliableLowLatency,
+            RoutingMetric::ReliableLowLatencyCost,
+            &cfg(),
+        );
+        assert_eq!(table[&2].next_hop, 3);
+
+        let db = build_db(vec![
+            entry_with_transport_metrics(
+                1,
+                vec![
+                    (
+                        2,
+                        200_000,
+                        0,
+                        tcp_kcp,
+                        vec![LinkTransportAdvertised::new(
+                            TransportKind::Kcp,
+                            20_000,
+                            0,
+                            0,
+                            TransportRoutingPolicy::default().udp_family_min_samples(),
+                        )],
+                    ),
+                    (3, 90_000, 0, tcp, Vec::new()),
+                ],
+            ),
+            entry_with_transport_metrics(2, Vec::new()),
+            entry_with_transport_metrics(3, vec![(2, 90_000, 0, tcp, Vec::new())]),
+        ]);
+
+        let table = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::ReliableLowLatency,
+            RoutingMetric::ReliableLowLatencyCost,
+            &cfg(),
+        );
+        assert_eq!(table[&2].next_hop, 2);
+    }
+
+    #[test]
+    fn best_effort_cost_uses_raw_udp_metrics() {
+        let tcp_udp = transport_bit(TransportKind::Tcp) | transport_bit(TransportKind::Udp);
+        let tcp = transport_bit(TransportKind::Tcp);
+        let db = build_db(vec![
+            entry_with_transport_metrics(
+                1,
+                vec![
+                    (
+                        2,
+                        100_000,
+                        0,
+                        tcp_udp,
+                        vec![LinkTransportAdvertised::new(
+                            TransportKind::Udp,
+                            5_000,
+                            0,
+                            0,
+                            1,
+                        )],
+                    ),
+                    (3, 30_000, 0, tcp, Vec::new()),
+                ],
+            ),
+            entry_with_transport_metrics(2, Vec::new()),
+            entry_with_transport_metrics(3, vec![(2, 30_000, 0, tcp, Vec::new())]),
+        ]);
+
+        let table = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::BestEffort,
+            RoutingMetric::BestEffortCost,
+            &cfg(),
+        );
+
+        assert_eq!(table[&2].next_hop, 2);
     }
 
     #[test]

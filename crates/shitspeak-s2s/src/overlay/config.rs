@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use shitspeak_core::NodeIdentifier;
-use shitspeak_s2s_transport::{PeerAddress, TransportKind};
+use shitspeak_s2s_transport::{PeerAddress, TransportKind, TransportRoutingPolicy};
 
 /// Bitmask over `TransportKind` values (1 << TransportKind::Tcp etc).
 /// Used as an admission filter on routing edges per service-level.
@@ -82,6 +82,7 @@ pub struct OverlayConfig {
     rll_transports_mask: TransportMask,
     best_effort_transports_mask: TransportMask,
     max_route_packet_loss_ppm: u32,
+    transport_routing_policy: TransportRoutingPolicy,
 
     // ── Cost-change re-emit thresholds ──
     cost_rerun_rtt_pct: f64, // re-emit when RTT shifts >= this fraction
@@ -141,6 +142,7 @@ impl OverlayConfig {
             rll_transports_mask: RELIABLE_TRANSPORTS_DEFAULT,
             best_effort_transports_mask: ALL_TRANSPORTS_DEFAULT,
             max_route_packet_loss_ppm: 500_000,
+            transport_routing_policy: TransportRoutingPolicy::default(),
 
             cost_rerun_rtt_pct: 0.25,
             cost_rerun_throughput_pct: 0.50,
@@ -225,6 +227,9 @@ impl OverlayConfig {
     }
     pub fn max_route_packet_loss_ppm(&self) -> u32 {
         self.max_route_packet_loss_ppm
+    }
+    pub fn transport_routing_policy(&self) -> TransportRoutingPolicy {
+        self.transport_routing_policy
     }
     pub fn cost_rerun_rtt_pct(&self) -> f64 {
         self.cost_rerun_rtt_pct
@@ -361,6 +366,10 @@ impl OverlayConfig {
     }
     pub fn with_max_route_packet_loss_ppm(mut self, ppm: u32) -> Self {
         self.max_route_packet_loss_ppm = ppm.min(1_000_000);
+        self
+    }
+    pub fn with_transport_routing_policy(mut self, policy: TransportRoutingPolicy) -> Self {
+        self.transport_routing_policy = policy;
         self
     }
     pub fn with_cost_rerun_min_interval(mut self, d: Duration) -> Self {

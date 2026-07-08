@@ -1025,7 +1025,9 @@ impl S2SManager {
         &self,
         cfg: s2s_overlay::OverlayConfig,
     ) -> s2s_overlay::OverlayConfig {
-        self.overlay_tuning.apply(cfg)
+        self.overlay_tuning
+            .apply(cfg)
+            .with_transport_routing_policy(self.transport_tuning.routing_policy())
     }
 
     /// Resolved replication tunables, ready to hand to

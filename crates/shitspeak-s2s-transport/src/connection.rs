@@ -780,6 +780,19 @@ impl PeerState {
             .collect()
     }
 
+    pub(crate) fn max_consecutive_failures_for_transports(
+        &self,
+        transports: &[TransportKind],
+    ) -> u32 {
+        self.address_backoffs
+            .lock()
+            .iter()
+            .filter(|(addr, _)| transports.contains(&addr.transport()))
+            .map(|(_, backoff)| backoff.consecutive_failures)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn install_stream(&self, stream: ActiveStream) {
         let key = stream.key();
         let mut g = self.streams.lock();

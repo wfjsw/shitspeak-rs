@@ -188,6 +188,17 @@ unconfirmed_address_decay_failures = 5
 unselected_link_probe_interval_secs = 30
 # Soft cap on live outbound S2S transport sessions. Inbound is still accepted.
 max_outgoing_connections = 1024
+# Conservative routing policy. KCP/QUIC are promoted over TCP only after UDP
+# family health is sampled and latency/loss makes switching materially better.
+udp_family_min_samples = 32
+udp_family_probe_loss_block_count = 3
+udp_family_block_loss_ppm = 250000
+udp_family_loss_excess_over_tcp_ppm = 50000
+large_rtt_threshold_ms = 100
+lossy_link_threshold_ppm = 20000
+bulk_payload_threshold_bytes = 65536
+bulk_backlog_threshold_bytes = 262144
+transport_switch_improvement_pct = 15
 # Legacy queue capacity hints. Inbound and outbound transport queues now use
 # adaptive byte budgets sized from available memory; these values only raise
 # the per-lane minimum budget for compatibility with older configs.

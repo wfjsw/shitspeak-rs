@@ -318,6 +318,7 @@ pub struct LinkMetrics {
     last_update: Option<Instant>,
     throughput_confidence_ppm: u32,
     unmatched_probe_pongs: u64,
+    consecutive_probe_losses: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -554,6 +555,10 @@ impl LinkMetrics {
 
     pub fn unmatched_probe_pongs(&self) -> u64 {
         self.unmatched_probe_pongs
+    }
+
+    pub fn consecutive_probe_losses(&self) -> u32 {
+        self.consecutive_probe_losses
     }
 
     pub fn samples(&self) -> u64 {
@@ -905,6 +910,7 @@ struct LinkInner {
     probe_loss: LossWindow,
     probe_loss_ewma_ppm: f64,
     probe_loss_ewma_samples: u64,
+    consecutive_probe_losses: u32,
     native_loss: LossWindow,
     native_loss_ewma_ppm: f64,
     native_loss_ewma_samples: u64,
@@ -931,6 +937,7 @@ impl LinkInner {
             probe_loss: LossWindow::new(window),
             probe_loss_ewma_ppm: 0.0,
             probe_loss_ewma_samples: 0,
+            consecutive_probe_losses: 0,
             native_loss: LossWindow::new(window),
             native_loss_ewma_ppm: 0.0,
             native_loss_ewma_samples: 0,
@@ -942,8 +949,10 @@ impl LinkInner {
     fn record_probe_loss_sample(&mut self, lost: bool, alpha: f64) {
         if lost {
             self.probe_loss.record_lost();
+            self.consecutive_probe_losses = self.consecutive_probe_losses.saturating_add(1);
         } else {
             self.probe_loss.record_delivered();
+            self.consecutive_probe_losses = 0;
         }
         let sample = if lost { MAX_PACKET_LOSS_PPM } else { 0 };
         update_loss_ewma(
@@ -1235,6 +1244,7 @@ impl PeerMetrics {
                     last_update: inner.last_update,
                     throughput_confidence_ppm,
                     unmatched_probe_pongs: inner.unmatched_probe_pongs,
+                    consecutive_probe_losses: inner.consecutive_probe_losses,
                 };
                 (*t, m)
             })
@@ -1753,6 +1763,30 @@ mod tests {
         assert_eq!(tcp.probe_loss_ppm(), 500_000);
         assert_eq!(tcp.packet_loss_ewma_ppm(), 500_000);
         assert_eq!(tcp.packet_loss_ppm(), 0);
+    }
+
+    #[test]
+    fn consecutive_probe_losses_increment_and_reset() {
+        let m = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+
+        m.record_probe_lost(TransportKind::Quic);
+        m.record_probe_lost(TransportKind::Quic);
+        let snap = m.snapshot_per_transport();
+        assert_eq!(
+            snap.get(&TransportKind::Quic)
+                .unwrap()
+                .consecutive_probe_losses(),
+            2
+        );
+
+        m.record_probe_delivered(TransportKind::Quic);
+        let snap = m.snapshot_per_transport();
+        assert_eq!(
+            snap.get(&TransportKind::Quic)
+                .unwrap()
+                .consecutive_probe_losses(),
+            0
+        );
     }
 
     #[test]

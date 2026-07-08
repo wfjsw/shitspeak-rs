@@ -813,17 +813,26 @@ async fn client_sees_user_state(
     client
         .initial_user_states
         .iter()
-        .any(|us| us.session == Some(session) && us.name.as_deref() == Some(name))
+        .any(|us| us.session == Some(session) && user_state_name_matches(us.name.as_deref(), name))
         || client
             .recv_until(
                 |m| {
                     matches!(m, Message::UserState(us)
-                        if us.session == Some(session) && us.name.as_deref() == Some(name))
+                        if us.session == Some(session) && user_state_name_matches(us.name.as_deref(), name))
                 },
                 S2S_DEADLINE,
             )
             .await
             .is_some()
+}
+
+fn user_state_name_matches(actual: Option<&str>, expected: &str) -> bool {
+    actual.is_some_and(|actual| {
+        actual == expected
+            || actual
+                .strip_prefix(expected)
+                .is_some_and(|suffix| suffix.starts_with(" [n") && suffix.ends_with(']'))
+    })
 }
 
 fn opus_frame(payload: &AudioPayload) -> &[u8] {

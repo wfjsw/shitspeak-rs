@@ -279,7 +279,9 @@ impl S2sConfig {
         if let Some(dir) = self.persistence_dir.clone() {
             cfg = cfg.with_persistence_dir(dir);
         }
-        self.overlay.apply(cfg)
+        self.overlay
+            .apply(cfg)
+            .with_transport_routing_policy(self.transport.routing_policy())
     }
 }
 
@@ -2470,6 +2472,15 @@ mod tests {
             unconfirmed_address_decay_failures = 7
             unselected_link_probe_interval_secs = 41
             max_outgoing_connections = 777
+            udp_family_min_samples = 9
+            udp_family_probe_loss_block_count = 6
+            udp_family_block_loss_ppm = 210000
+            udp_family_loss_excess_over_tcp_ppm = 45000
+            large_rtt_threshold_ms = 130
+            lossy_link_threshold_ppm = 17000
+            bulk_payload_threshold_bytes = 49152
+            bulk_backlog_threshold_bytes = 196608
+            transport_switch_improvement_pct = 22
             compression_enabled = false
             compression_min_bytes = 2048
             compression_min_savings_percent = 25
@@ -2571,6 +2582,16 @@ mod tests {
         assert_eq!(transport.idle_ping_interval(), Duration::from_secs(19));
         assert_eq!(transport.native_stats_interval(), Duration::from_secs(11));
         assert_eq!(transport.max_outgoing_connections(), 777);
+        let routing_policy = transport.routing_policy();
+        assert_eq!(routing_policy.udp_family_min_samples(), 9);
+        assert_eq!(routing_policy.udp_family_probe_loss_block_count(), 6);
+        assert_eq!(routing_policy.udp_family_block_loss_ppm(), 210_000);
+        assert_eq!(routing_policy.udp_family_loss_excess_over_tcp_ppm(), 45_000);
+        assert_eq!(routing_policy.large_rtt_threshold_ms(), 130);
+        assert_eq!(routing_policy.lossy_link_threshold_ppm(), 17_000);
+        assert_eq!(routing_policy.bulk_payload_threshold_bytes(), 49_152);
+        assert_eq!(routing_policy.bulk_backlog_threshold_bytes(), 196_608);
+        assert_eq!(routing_policy.transport_switch_improvement_pct(), 22);
         assert_eq!(transport.max_users(), 432);
         assert!(!transport.compression_enabled());
         assert_eq!(transport.compression_min_bytes(), 2048);
@@ -2588,7 +2609,9 @@ mod tests {
             transport.compression_dictionary_len(),
             Some(dictionary.len())
         );
-        assert!(cfg.overlay_config().persistence_dir().is_some());
+        let overlay = cfg.overlay_config();
+        assert!(overlay.persistence_dir().is_some());
+        assert_eq!(overlay.transport_routing_policy(), routing_policy);
     }
 
     #[test]

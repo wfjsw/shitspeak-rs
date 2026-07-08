@@ -464,6 +464,16 @@ idle_ping_interval_secs = 10
 self_seed_quarantine_secs = 3600
 max_dial_attempts_per_peer_tick = 1
 max_outgoing_connections = 1024
+# Conservative UDP-family routing policy.
+udp_family_min_samples = 32
+udp_family_probe_loss_block_count = 3
+udp_family_block_loss_ppm = 250000
+udp_family_loss_excess_over_tcp_ppm = 50000
+large_rtt_threshold_ms = 100
+lossy_link_threshold_ppm = 20000
+bulk_payload_threshold_bytes = 65536
+bulk_backlog_threshold_bytes = 262144
+transport_switch_improvement_pct = 15
 # Legacy queue capacity hints. Adaptive byte budgets use available memory;
 # these only raise the per-lane minimum budget.
 inbound_control_capacity = 16384
