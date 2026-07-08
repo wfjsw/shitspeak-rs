@@ -484,6 +484,8 @@ route_transit_messages = true
 propose_ttl_ms = 10000
 propose_semaphore_size = 32
 strict_max_catchup_ops = 256
+strict_bootstrap_retry_interval_ms = 500
+strict_steady_state_catchup_interval_ms = 5000
 blob_chunk_size = 65536
 bulk_retry_delay_ms = 250
 bulk_max_in_flight_per_peer = 1
@@ -493,6 +495,10 @@ S2S inbound and outbound transport queues are adaptive and byte-budgeted. The
 old `inbound_*_capacity` and `outbound_capacity` knobs are still accepted for
 compatibility, but they act as minimum budget hints rather than hard message
 counts.
+
+`strict_bootstrap_retry_interval_ms` gates strict startup and partition-heal
+history-election retries. `strict_steady_state_catchup_interval_ms` controls the
+periodic strict catchup interval used after history election has finished.
 
 See [Clustering](clustering.md) for certificate generation, local demos, and S2S operational notes.
 

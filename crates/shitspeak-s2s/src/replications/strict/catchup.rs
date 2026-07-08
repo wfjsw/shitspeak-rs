@@ -15,7 +15,8 @@ use tracing::warn;
 use super::super::metrics::{self, CatchupMode};
 use super::super::proto::{CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp};
 use super::runtime::{
-    HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryElectionCandidate, HistoryRank, StrictRuntime,
+    HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryProbeResponseOutcome, HistoryRank,
+    HistorySnapshotResponseOutcome, StrictRuntime,
 };
 use super::{LogSlice, StrictLogMetadata, StrictReplicable};
 use shitspeak_core::NodeIdentifier;
@@ -33,6 +34,33 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     else {
         return;
     };
+
+    if req.history_probe_only {
+        let rank = HistoryRank::local(rt);
+        let resp = StrictCatchupResp {
+            snapshot_version: 0,
+            snapshot_msgpack: Bytes::new(),
+            ops: Vec::new(),
+            has_more: false,
+            next_chunk_token: 0,
+            too_old_use_snapshot: false,
+            history_version: rank.version,
+            history_freshness: rank.freshness,
+            runtime_started_at: rank.runtime_started_at,
+            history_node: u32::from(rank.node_id),
+        };
+        metrics::record_catchup_response(CatchupMode::Strict, 0, 0);
+        let _ = rt
+            .net
+            .send_bulk_unicast(
+                from,
+                &rt.topic,
+                StrictBody::CatchupResp(resp),
+                rt.cfg.bulk_retry_delay(),
+            )
+            .await;
+        return;
+    }
 
     let mut snapshot_version = 0u64;
     let mut snapshot_msgpack: Bytes = Bytes::new();
@@ -139,28 +167,48 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     let local_rank = HistoryRank::local(rt);
     let can_bootstrap = rt.state.lock().can_bootstrap_catchup();
 
-    if resp.too_old_use_snapshot {
-        if !can_bootstrap {
+    let metadata_only_response =
+        !resp.too_old_use_snapshot && resp.snapshot_msgpack.is_empty() && resp.ops.is_empty();
+    if metadata_only_response {
+        let outcome =
+            rt.state
+                .lock()
+                .record_history_probe_response(remote_node, remote_rank, local_rank);
+        if !outcome.is_ignored() {
+            if let HistoryProbeResponseOutcome::FetchSnapshot(request) = outcome {
+                if let Err(e) = rt.send_history_snapshot_request(request).await {
+                    warn!(
+                        dst = request.peer(),
+                        error = %e,
+                        "strict catchup winning snapshot request failed"
+                    );
+                    rt.state.lock().request_history_election();
+                }
+            }
             return;
         }
-        let candidate = if remote_rank.beats(local_rank) && !resp.snapshot_msgpack.is_empty() {
-            Some(HistoryElectionCandidate {
-                rank: remote_rank,
-                snapshot_version: resp.snapshot_version,
-                snapshot_msgpack: resp.snapshot_msgpack,
-            })
+    }
+
+    if resp.too_old_use_snapshot {
+        let outcome = if can_bootstrap {
+            rt.state.lock().record_history_snapshot_response(
+                remote_node,
+                remote_rank,
+                local_rank,
+                resp.snapshot_version,
+                resp.snapshot_msgpack,
+            )
         } else {
-            None
+            HistorySnapshotResponseOutcome::Ignored
         };
-        let winner = rt
-            .state
-            .lock()
-            .record_history_election_response(remote_node, candidate);
-        if let Some(winner) = winner {
-            rt.repo
-                .install_snapshot(winner.snapshot_version, winner.snapshot_msgpack)
-                .await;
-            rt.state.lock().finish_history_election();
+        match outcome {
+            HistorySnapshotResponseOutcome::Install(winner) => {
+                rt.repo
+                    .install_snapshot(winner.snapshot_version, winner.snapshot_msgpack)
+                    .await;
+                rt.state.lock().finish_history_election();
+            }
+            HistorySnapshotResponseOutcome::Retry | HistorySnapshotResponseOutcome::Ignored => {}
         }
         return;
     }
@@ -232,6 +280,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             since_version: resp.next_chunk_token,
             chunk_token: resp.next_chunk_token,
             force_snapshot: false,
+            history_probe_only: false,
         };
         metrics::record_catchup_request(CatchupMode::Strict);
         let _ = rt

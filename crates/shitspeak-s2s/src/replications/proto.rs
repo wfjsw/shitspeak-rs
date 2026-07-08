@@ -165,6 +165,7 @@ mod tests {
                 since_version: 5,
                 chunk_token: 0,
                 force_snapshot: false,
+                history_probe_only: false,
             }),
         );
         let bytes = encode(&req).unwrap();

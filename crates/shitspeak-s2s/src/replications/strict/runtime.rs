@@ -338,9 +338,69 @@ pub(crate) struct HistoryElectionCandidate {
     pub snapshot_msgpack: Bytes,
 }
 
-impl HistoryElectionCandidate {
-    fn beats(&self, other: &Self) -> bool {
-        self.rank.beats(other.rank)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryElectionSnapshotRequest {
+    peer: NodeIdentifier,
+    expected_rank: HistoryRank,
+}
+
+impl HistoryElectionSnapshotRequest {
+    pub(crate) fn new(peer: NodeIdentifier, expected_rank: HistoryRank) -> Self {
+        Self {
+            peer,
+            expected_rank,
+        }
+    }
+
+    pub(crate) fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+
+    pub(crate) fn expected_rank(&self) -> HistoryRank {
+        self.expected_rank
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistoryElectionPhase {
+    Idle,
+    Probing {
+        pending_peers: HashSet<NodeIdentifier>,
+        best_remote_rank: Option<HistoryRank>,
+        started_at: Instant,
+    },
+    FetchingSnapshot {
+        peer: NodeIdentifier,
+        expected_rank: HistoryRank,
+        started_at: Instant,
+    },
+    Installing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HistoryProbeResponseOutcome {
+    Ignored,
+    Pending,
+    Finished,
+    FetchSnapshot(HistoryElectionSnapshotRequest),
+}
+
+impl HistoryProbeResponseOutcome {
+    pub(crate) fn is_ignored(&self) -> bool {
+        matches!(self, Self::Ignored)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HistorySnapshotResponseOutcome {
+    Ignored,
+    Retry,
+    Install(HistoryElectionCandidate),
+}
+
+impl Default for HistoryElectionPhase {
+    fn default() -> Self {
+        Self::Idle
     }
 }
 
@@ -463,13 +523,10 @@ pub(crate) struct StrictState {
     /// with the original `ts_final` even after the commit_buffer entry
     /// has been drained.
     pub committed_ts_final: HashMap<OpId, u64>,
-    /// True while a startup or partition-heal history election is pending.
-    pub history_election_pending: bool,
-    pub history_election_installing: bool,
-    pub history_election_pending_peers: HashSet<NodeIdentifier>,
-    pub history_election_candidate: Option<HistoryElectionCandidate>,
+    /// True when startup or partition-heal convergence still needs election.
+    history_election_requested: bool,
+    history_election_phase: HistoryElectionPhase,
     pub history_alive_peers: HashSet<NodeIdentifier>,
-    pub history_election_started_at: Option<Instant>,
 }
 
 impl StrictState {
@@ -484,12 +541,9 @@ impl StrictState {
             recovery_promises: HashMap::new(),
             committed_ids: HashSet::new(),
             committed_ts_final: HashMap::new(),
-            history_election_pending: true,
-            history_election_installing: false,
-            history_election_pending_peers: HashSet::new(),
-            history_election_candidate: None,
+            history_election_requested: true,
+            history_election_phase: HistoryElectionPhase::Idle,
             history_alive_peers: HashSet::new(),
-            history_election_started_at: None,
         }
     }
 
@@ -616,46 +670,88 @@ impl StrictState {
     /// Returns true when a history-election snapshot can be installed without
     /// racing active strict traffic.
     pub fn can_bootstrap_catchup(&self) -> bool {
-        self.history_election_pending
-            && !self.history_election_installing
+        self.history_election_requested
+            && !matches!(
+                self.history_election_phase,
+                HistoryElectionPhase::Installing
+            )
             && self.proposals.is_empty()
             && self.commit_buffer.is_empty()
             && self.pending_proposes.is_empty()
             && self.recovery_promises.is_empty()
     }
 
-    pub fn history_election_inflight(&self) -> bool {
-        !self.history_election_pending_peers.is_empty()
+    pub fn can_start_history_election(&self) -> bool {
+        self.can_bootstrap_catchup()
+            && matches!(self.history_election_phase, HistoryElectionPhase::Idle)
+    }
+
+    #[cfg(test)]
+    pub fn history_election_pending(&self) -> bool {
+        self.history_election_requested
+    }
+
+    pub fn history_election_active(&self) -> bool {
+        !matches!(self.history_election_phase, HistoryElectionPhase::Idle)
+    }
+
+    pub fn history_election_blocks_steady_state(&self) -> bool {
+        self.history_election_requested || self.history_election_active()
+    }
+
+    #[cfg(test)]
+    pub fn history_election_installing(&self) -> bool {
+        matches!(
+            self.history_election_phase,
+            HistoryElectionPhase::Installing
+        )
+    }
+
+    #[cfg(test)]
+    pub fn history_election_fetching_snapshot(&self) -> Option<HistoryElectionSnapshotRequest> {
+        match self.history_election_phase {
+            HistoryElectionPhase::FetchingSnapshot {
+                peer,
+                expected_rank,
+                ..
+            } => Some(HistoryElectionSnapshotRequest::new(peer, expected_rank)),
+            _ => None,
+        }
     }
 
     pub fn request_history_election(&mut self) {
-        if self.history_election_installing {
+        if matches!(
+            self.history_election_phase,
+            HistoryElectionPhase::Installing
+        ) {
             return;
         }
-        self.history_election_pending = true;
-        self.history_election_pending_peers.clear();
-        self.history_election_candidate = None;
-        self.history_election_started_at = None;
+        self.history_election_requested = true;
+        self.history_election_phase = HistoryElectionPhase::Idle;
     }
 
     pub fn begin_history_election(&mut self, peers: impl IntoIterator<Item = NodeIdentifier>) {
-        if !self.can_bootstrap_catchup() {
+        if !self.can_start_history_election() {
             return;
         }
         let peers: HashSet<NodeIdentifier> = peers.into_iter().collect();
         self.history_alive_peers = peers.clone();
-        self.history_election_pending_peers = peers;
-        self.history_election_candidate = None;
-        self.history_election_started_at = Some(Instant::now());
+        self.history_election_phase = HistoryElectionPhase::Probing {
+            pending_peers: peers,
+            best_remote_rank: None,
+            started_at: Instant::now(),
+        };
     }
 
     pub fn history_election_timed_out(&self, now: Instant, timeout: Duration) -> bool {
-        self.history_election_pending
-            && !self.history_election_installing
-            && !self.history_election_pending_peers.is_empty()
-            && self
-                .history_election_started_at
-                .is_some_and(|started| now.duration_since(started) >= timeout)
+        self.history_election_requested
+            && match self.history_election_phase {
+                HistoryElectionPhase::Probing { started_at, .. }
+                | HistoryElectionPhase::FetchingSnapshot { started_at, .. } => {
+                    now.duration_since(started_at) >= timeout
+                }
+                HistoryElectionPhase::Idle | HistoryElectionPhase::Installing => false,
+            }
     }
 
     pub fn observe_history_alive_peers(
@@ -667,7 +763,7 @@ impl StrictState {
             .iter()
             .any(|peer| !self.history_alive_peers.contains(peer));
         self.history_alive_peers = peers;
-        if expanded && !self.history_election_pending && !self.history_election_installing {
+        if expanded && !self.history_election_requested && !self.history_election_active() {
             self.request_history_election();
             true
         } else {
@@ -675,48 +771,135 @@ impl StrictState {
         }
     }
 
-    pub fn abandon_history_election_peer(&mut self, peer: NodeIdentifier) {
-        self.history_election_pending_peers.remove(&peer);
-        self.history_alive_peers.remove(&peer);
-    }
-
-    pub fn record_history_election_response(
+    pub fn abandon_history_election_peer(
         &mut self,
         peer: NodeIdentifier,
-        candidate: Option<HistoryElectionCandidate>,
-    ) -> Option<HistoryElectionCandidate> {
-        if !self.history_election_pending_peers.remove(&peer) {
-            return None;
-        }
-        if let Some(candidate) = candidate {
-            let replace = match self.history_election_candidate.as_ref() {
-                Some(current) => candidate.beats(current),
-                None => true,
-            };
-            if replace {
-                self.history_election_candidate = Some(candidate);
+    ) -> Option<HistoryElectionSnapshotRequest> {
+        self.history_alive_peers.remove(&peer);
+        match &mut self.history_election_phase {
+            HistoryElectionPhase::Probing { pending_peers, .. } => {
+                pending_peers.remove(&peer);
+                if !pending_peers.is_empty() {
+                    return None;
+                }
             }
+            _ => return None,
+        }
+        let best_rank = match &self.history_election_phase {
+            HistoryElectionPhase::Probing {
+                best_remote_rank, ..
+            } => *best_remote_rank,
+            _ => None,
+        };
+        let Some(best_rank) = best_rank else {
+            self.history_election_phase = HistoryElectionPhase::Idle;
+            self.history_election_requested = true;
+            return None;
+        };
+
+        let request = HistoryElectionSnapshotRequest::new(best_rank.node_id, best_rank);
+        self.history_election_phase = HistoryElectionPhase::FetchingSnapshot {
+            peer: request.peer(),
+            expected_rank: request.expected_rank(),
+            started_at: Instant::now(),
+        };
+        Some(request)
+    }
+
+    pub fn record_history_probe_response(
+        &mut self,
+        peer: NodeIdentifier,
+        remote_rank: HistoryRank,
+        local_rank: HistoryRank,
+    ) -> HistoryProbeResponseOutcome {
+        match &mut self.history_election_phase {
+            HistoryElectionPhase::Probing {
+                pending_peers,
+                best_remote_rank,
+                ..
+            } => {
+                if !pending_peers.remove(&peer) {
+                    return HistoryProbeResponseOutcome::Ignored;
+                }
+                if remote_rank.beats(local_rank) {
+                    let replace = match best_remote_rank {
+                        Some(current) => remote_rank.beats(*current),
+                        None => true,
+                    };
+                    if replace {
+                        *best_remote_rank = Some(remote_rank);
+                    }
+                }
+            }
+            _ => return HistoryProbeResponseOutcome::Ignored,
+        }
+        self.complete_history_probe_if_ready()
+    }
+
+    fn complete_history_probe_if_ready(&mut self) -> HistoryProbeResponseOutcome {
+        let Some(best_rank) = (match &self.history_election_phase {
+            HistoryElectionPhase::Probing {
+                pending_peers,
+                best_remote_rank,
+                ..
+            } if pending_peers.is_empty() => *best_remote_rank,
+            HistoryElectionPhase::Probing { .. } => return HistoryProbeResponseOutcome::Pending,
+            _ => return HistoryProbeResponseOutcome::Ignored,
+        }) else {
+            self.finish_history_election();
+            return HistoryProbeResponseOutcome::Finished;
+        };
+
+        let request = HistoryElectionSnapshotRequest::new(best_rank.node_id, best_rank);
+        self.history_election_phase = HistoryElectionPhase::FetchingSnapshot {
+            peer: request.peer(),
+            expected_rank: request.expected_rank(),
+            started_at: Instant::now(),
+        };
+        HistoryProbeResponseOutcome::FetchSnapshot(request)
+    }
+
+    pub fn record_history_snapshot_response(
+        &mut self,
+        peer: NodeIdentifier,
+        remote_rank: HistoryRank,
+        local_rank: HistoryRank,
+        snapshot_version: u64,
+        snapshot_msgpack: Bytes,
+    ) -> HistorySnapshotResponseOutcome {
+        let expected_rank = match self.history_election_phase {
+            HistoryElectionPhase::FetchingSnapshot {
+                peer: expected_peer,
+                expected_rank,
+                ..
+            } if expected_peer == peer => expected_rank,
+            HistoryElectionPhase::FetchingSnapshot { .. } => {
+                return HistorySnapshotResponseOutcome::Ignored;
+            }
+            _ => return HistorySnapshotResponseOutcome::Ignored,
+        };
+
+        if !remote_rank.beats(local_rank) {
+            self.finish_history_election();
+            return HistorySnapshotResponseOutcome::Ignored;
         }
 
-        if self.history_election_pending_peers.is_empty() {
-            let winner = self.history_election_candidate.take();
-            if winner.is_some() {
-                self.history_election_installing = true;
-            } else {
-                self.finish_history_election();
-            }
-            winner
-        } else {
-            None
+        if remote_rank == expected_rank && !snapshot_msgpack.is_empty() {
+            self.history_election_phase = HistoryElectionPhase::Installing;
+            return HistorySnapshotResponseOutcome::Install(HistoryElectionCandidate {
+                rank: remote_rank,
+                snapshot_version,
+                snapshot_msgpack,
+            });
         }
+
+        self.request_history_election();
+        HistorySnapshotResponseOutcome::Retry
     }
 
     pub fn finish_history_election(&mut self) {
-        self.history_election_pending = false;
-        self.history_election_installing = false;
-        self.history_election_pending_peers.clear();
-        self.history_election_candidate = None;
-        self.history_election_started_at = None;
+        self.history_election_requested = false;
+        self.history_election_phase = HistoryElectionPhase::Idle;
     }
 
     /// Record a Propose we just ack'd so a takeover can recover it.
@@ -954,14 +1137,30 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.wake_clock_tick_loop();
     }
 
+    pub(crate) async fn send_history_snapshot_request(
+        &self,
+        request: HistoryElectionSnapshotRequest,
+    ) -> Result<(), ReplicationError> {
+        let body = StrictBody::CatchupReq(StrictCatchupReq {
+            src_node: self.self_id as u32,
+            since_version: 0,
+            chunk_token: HISTORY_ELECTION_SNAPSHOT_TOKEN,
+            force_snapshot: true,
+            history_probe_only: false,
+        });
+        metrics::record_catchup_request(CatchupMode::Strict);
+        self.net
+            .send_unicast(request.peer(), &self.topic, body)
+            .await
+    }
+
     /// Send startup election probes while no strict traffic has been
-    /// observed locally. Peers respond with their history rank and snapshot;
-    /// the best rank wins: longest version, freshest timestamp, longest
-    /// runtime, then lowest node id.
+    /// observed locally. Peers first respond with metadata-only history ranks;
+    /// the best rank wins exactly one follow-up snapshot request.
     pub(crate) async fn try_bootstrap_catchup(self: &Arc<Self>) {
         {
             let state = self.state.lock();
-            if !state.can_bootstrap_catchup() || state.history_election_inflight() {
+            if !state.can_start_history_election() {
                 return;
             }
         }
@@ -979,7 +1178,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         {
             let mut state = self.state.lock();
             state.observe_history_alive_peers(peers.iter().copied());
-            if !state.can_bootstrap_catchup() || state.history_election_inflight() {
+            if !state.can_start_history_election() {
                 return;
             }
         }
@@ -998,18 +1197,25 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let body = StrictBody::CatchupReq(StrictCatchupReq {
                 src_node: self.self_id as u32,
                 since_version: 0,
-                chunk_token: HISTORY_ELECTION_SNAPSHOT_TOKEN,
-                force_snapshot: true,
+                chunk_token: 0,
+                force_snapshot: false,
+                history_probe_only: true,
             });
             metrics::record_catchup_request(CatchupMode::Strict);
             match self.net.send_unicast(dst, &self.topic, body).await {
                 Ok(()) => {}
                 Err(e) => {
                     debug!(%dst, error=%e, "strict catchup bootstrap send failed");
-                    let mut state = self.state.lock();
-                    state.abandon_history_election_peer(dst);
-                    if state.history_election_pending_peers.is_empty() {
-                        *self.last_bootstrap_attempt.lock() = None;
+                    let request = self.state.lock().abandon_history_election_peer(dst);
+                    if let Some(request) = request {
+                        if let Err(e) = self.send_history_snapshot_request(request).await {
+                            debug!(
+                                dst = request.peer(),
+                                error = %e,
+                                "strict catchup winning snapshot request failed"
+                            );
+                            self.state.lock().request_history_election();
+                        }
                     }
                 }
             }
@@ -2538,7 +2744,7 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
                 if state.history_election_timed_out(Instant::now(), interval.saturating_mul(5)) {
                     state.request_history_election();
                 }
-                state.can_bootstrap_catchup()
+                state.can_start_history_election()
             };
             if should_probe {
                 rt.try_bootstrap_catchup().await;
@@ -2572,7 +2778,7 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
 }
 
 async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
-    if rt.state.lock().history_election_pending {
+    if rt.state.lock().history_election_blocks_steady_state() {
         return;
     }
     let alive = rt.net.alive_members();
@@ -2593,6 +2799,7 @@ async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntim
         since_version: rt.repo.current_version(),
         chunk_token: 0,
         force_snapshot: false,
+        history_probe_only: false,
     };
     metrics::record_catchup_request(CatchupMode::Strict);
     let _ = rt
@@ -2618,6 +2825,45 @@ pub(crate) fn node_from_u32(v: u32) -> Option<NodeIdentifier> {
 mod tests {
     use super::*;
     use crate::replications::test_support::{CountingStrictRepo, MockNet};
+
+    fn strict_probe_resp(
+        node: NodeIdentifier,
+        version: u64,
+        freshness: i64,
+        runtime_started_at: u64,
+    ) -> StrictCatchupResp {
+        StrictCatchupResp {
+            snapshot_version: 0,
+            snapshot_msgpack: Bytes::new(),
+            ops: Vec::new(),
+            has_more: false,
+            next_chunk_token: 0,
+            too_old_use_snapshot: false,
+            history_version: version,
+            history_freshness: freshness,
+            runtime_started_at,
+            history_node: u32::from(node),
+        }
+    }
+
+    fn strict_snapshot_resp(
+        rank: HistoryRank,
+        snapshot_version: u64,
+        snapshot: Bytes,
+    ) -> StrictCatchupResp {
+        StrictCatchupResp {
+            snapshot_version,
+            snapshot_msgpack: snapshot,
+            ops: Vec::new(),
+            has_more: false,
+            next_chunk_token: 0,
+            too_old_use_snapshot: true,
+            history_version: rank.version,
+            history_freshness: rank.freshness,
+            runtime_started_at: rank.runtime_started_at,
+            history_node: u32::from(rank.node_id),
+        }
+    }
 
     #[test]
     fn p95_clock_tick_returns_fallback_when_empty() {
@@ -3094,7 +3340,7 @@ mod tests {
         s.request_history_election();
 
         assert!(s.can_bootstrap_catchup());
-        assert!(s.history_election_pending);
+        assert!(s.history_election_pending());
     }
 
     #[test]
@@ -3178,12 +3424,73 @@ mod tests {
         let captures = net.captures();
         assert_eq!(captures.len(), 1);
         match &captures[0] {
-            crate::replications::test_support::CapturedFrame::StrictUnicast { dst, .. } => {
+            crate::replications::test_support::CapturedFrame::StrictUnicast {
+                dst, body, ..
+            } => {
                 assert_eq!(*dst, 3);
+                let StrictBody::CatchupReq(req) = body else {
+                    panic!("expected catchup request, got {body:?}");
+                };
+                assert!(req.history_probe_only);
+                assert!(!req.force_snapshot);
+                assert_eq!(req.chunk_token, 0);
             }
             other => panic!("unexpected capture: {other:?}"),
         }
         assert_eq!(rt.state.lock().history_alive_peers, HashSet::from([3]));
+    }
+
+    #[tokio::test]
+    async fn strict_history_probe_only_response_has_no_snapshot_or_ops() {
+        let net = MockNet::new(2, vec![1, 2]);
+        let repo = CountingStrictRepo::new();
+        {
+            let mut state = repo.state.lock();
+            state.0 = 2;
+            state.1 = vec![(1, 101, None), (2, 102, None)];
+        }
+        let rt = StrictRuntime::new(
+            repo,
+            2,
+            77,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        rt.recv_catchup_req(
+            1,
+            StrictCatchupReq {
+                src_node: 1,
+                since_version: 0,
+                chunk_token: HISTORY_ELECTION_SNAPSHOT_TOKEN,
+                force_snapshot: true,
+                history_probe_only: true,
+            },
+        )
+        .await;
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        match &captures[0] {
+            crate::replications::test_support::CapturedFrame::StrictUnicast {
+                dst, body, ..
+            } => {
+                assert_eq!(*dst, 1);
+                let StrictBody::CatchupResp(resp) = body else {
+                    panic!("expected catchup response, got {body:?}");
+                };
+                assert_eq!(resp.snapshot_msgpack.len(), 0);
+                assert_eq!(resp.ops.len(), 0);
+                assert!(!resp.has_more);
+                assert!(!resp.too_old_use_snapshot);
+                assert_eq!(resp.history_version, 2);
+                assert_eq!(resp.runtime_started_at, 77);
+                assert_eq!(resp.history_node, 2);
+            }
+            other => panic!("unexpected capture: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3224,6 +3531,7 @@ mod tests {
                 since_version: 0,
                 chunk_token: 2,
                 force_snapshot: false,
+                history_probe_only: false,
             },
         )
         .await;
@@ -3400,59 +3708,224 @@ mod tests {
     fn history_election_waits_for_all_peers_and_keeps_best_candidate() {
         let mut s = StrictState::new();
         s.begin_history_election([2, 3, 4]);
+        let local_rank = HistoryRank {
+            version: 8,
+            freshness: 0,
+            runtime_started_at: 100,
+            node_id: 1,
+        };
 
-        let candidate_from_3 = HistoryElectionCandidate {
-            rank: HistoryRank {
-                version: 10,
-                freshness: 200,
-                runtime_started_at: 50,
-                node_id: 3,
-            },
-            snapshot_version: 10,
-            snapshot_msgpack: Bytes::from_static(b"node3"),
+        let rank_from_3 = HistoryRank {
+            version: 10,
+            freshness: 200,
+            runtime_started_at: 50,
+            node_id: 3,
         };
-        let candidate_from_4 = HistoryElectionCandidate {
-            rank: HistoryRank {
-                version: 10,
-                freshness: 200,
-                runtime_started_at: 50,
-                node_id: 4,
-            },
-            snapshot_version: 10,
-            snapshot_msgpack: Bytes::from_static(b"node4"),
+        let rank_from_4 = HistoryRank {
+            version: 10,
+            freshness: 200,
+            runtime_started_at: 50,
+            node_id: 4,
         };
-        let candidate_from_2 = HistoryElectionCandidate {
-            rank: HistoryRank {
-                version: 9,
-                freshness: 999,
-                runtime_started_at: 1,
-                node_id: 2,
-            },
-            snapshot_version: 9,
-            snapshot_msgpack: Bytes::from_static(b"node2"),
+        let rank_from_2 = HistoryRank {
+            version: 9,
+            freshness: 999,
+            runtime_started_at: 1,
+            node_id: 2,
         };
 
         assert_eq!(
-            s.record_history_election_response(2, Some(candidate_from_2)),
-            None
+            s.record_history_probe_response(2, rank_from_2, local_rank),
+            HistoryProbeResponseOutcome::Pending
         );
         assert_eq!(
-            s.record_history_election_response(4, Some(candidate_from_4)),
-            None
+            s.record_history_probe_response(4, rank_from_4, local_rank),
+            HistoryProbeResponseOutcome::Pending
         );
-        let winner = s
-            .record_history_election_response(3, Some(candidate_from_3.clone()))
-            .expect("last response should complete election");
+        let outcome = s.record_history_probe_response(3, rank_from_3, local_rank);
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) = outcome else {
+            panic!("last probe should elect a snapshot fetch, got {outcome:?}");
+        };
 
-        assert_eq!(winner, candidate_from_3);
-        assert!(s.history_election_pending);
-        assert!(s.history_election_installing);
-        assert!(s.history_election_pending_peers.is_empty());
-        assert!(s.history_election_candidate.is_none());
+        assert_eq!(request.peer(), 3);
+        assert_eq!(request.expected_rank(), rank_from_3);
+        assert!(s.history_election_pending());
+        assert_eq!(s.history_election_fetching_snapshot(), Some(request));
+
+        let outcome = s.record_history_snapshot_response(
+            3,
+            rank_from_3,
+            local_rank,
+            10,
+            Bytes::from_static(b"node3"),
+        );
+        let HistorySnapshotResponseOutcome::Install(winner) = outcome else {
+            panic!("winning snapshot should enter install phase, got {outcome:?}");
+        };
+
+        assert_eq!(winner.rank, rank_from_3);
+        assert_eq!(winner.snapshot_version, 10);
+        assert!(s.history_election_pending());
+        assert!(s.history_election_installing());
 
         s.finish_history_election();
-        assert!(!s.history_election_pending);
-        assert!(!s.history_election_installing);
+        assert!(!s.history_election_pending());
+        assert!(!s.history_election_installing());
+    }
+
+    #[tokio::test]
+    async fn strict_history_election_fetches_only_best_snapshot() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo,
+            1,
+            100,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        rt.try_bootstrap_catchup().await;
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 2);
+        let mut probe_dsts = Vec::new();
+        for capture in &captures {
+            let crate::replications::test_support::CapturedFrame::StrictUnicast {
+                dst, body, ..
+            } = capture
+            else {
+                panic!("unexpected capture: {capture:?}");
+            };
+            probe_dsts.push(*dst);
+            let StrictBody::CatchupReq(req) = body else {
+                panic!("expected catchup request, got {body:?}");
+            };
+            assert!(req.history_probe_only);
+            assert!(!req.force_snapshot);
+            assert_eq!(req.chunk_token, 0);
+        }
+        probe_dsts.sort_unstable();
+        assert_eq!(probe_dsts, vec![2, 3]);
+
+        rt.recv_catchup_resp(2, strict_probe_resp(2, 10, 100, 40))
+            .await;
+        assert!(net.drain_captures().is_empty());
+
+        rt.recv_catchup_resp(3, strict_probe_resp(3, 8, 999, 1))
+            .await;
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        match &captures[0] {
+            crate::replications::test_support::CapturedFrame::StrictUnicast {
+                dst, body, ..
+            } => {
+                assert_eq!(*dst, 2);
+                let StrictBody::CatchupReq(req) = body else {
+                    panic!("expected catchup request, got {body:?}");
+                };
+                assert!(!req.history_probe_only);
+                assert!(req.force_snapshot);
+                assert_eq!(req.chunk_token, HISTORY_ELECTION_SNAPSHOT_TOKEN);
+            }
+            other => panic!("unexpected capture: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_history_election_local_best_requests_no_snapshot() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let repo = CountingStrictRepo::new();
+        repo.state.lock().0 = 12;
+        let rt = StrictRuntime::new(
+            repo,
+            1,
+            100,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        rt.try_bootstrap_catchup().await;
+        assert_eq!(net.drain_captures().len(), 2);
+
+        rt.recv_catchup_resp(2, strict_probe_resp(2, 10, 100, 40))
+            .await;
+        rt.recv_catchup_resp(3, strict_probe_resp(3, 11, 100, 40))
+            .await;
+
+        assert!(net.drain_captures().is_empty());
+        assert!(!rt.state.lock().history_election_pending());
+    }
+
+    #[tokio::test]
+    async fn strict_history_election_ignores_non_winning_snapshot_response() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            100,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        rt.try_bootstrap_catchup().await;
+        net.drain_captures();
+        rt.recv_catchup_resp(2, strict_probe_resp(2, 10, 100, 40))
+            .await;
+        rt.recv_catchup_resp(3, strict_probe_resp(3, 9, 100, 40))
+            .await;
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+
+        let rank_from_3 = HistoryRank {
+            version: 9,
+            freshness: 100,
+            runtime_started_at: 40,
+            node_id: 3,
+        };
+        let snapshot = Bytes::from(rmp_serde::to_vec(&vec![(9u64, 909u64)]).unwrap());
+        rt.recv_catchup_resp(3, strict_snapshot_resp(rank_from_3, 9, snapshot))
+            .await;
+
+        assert_eq!(repo.current_version(), 0);
+        assert_eq!(repo.log(), Vec::<(u64, u64)>::new());
+        let fetching = rt
+            .state
+            .lock()
+            .history_election_fetching_snapshot()
+            .expect("winning fetch should still be in progress");
+        assert_eq!(fetching.peer(), 2);
+        assert!(net.drain_captures().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_send_failures_keep_retry_throttle() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.fail_strict_unicasts_to([2, 3]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            100,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        rt.try_bootstrap_catchup().await;
+
+        assert!(rt.last_bootstrap_attempt.lock().is_some());
+        assert!(rt.state.lock().history_election_pending());
+        assert!(!rt.state.lock().history_election_active());
+        assert!(net.drain_captures().is_empty());
     }
 
     #[tokio::test]
@@ -3517,7 +3990,7 @@ mod tests {
 
         assert_eq!(repo.current_version(), 1);
         assert_eq!(repo.log(), vec![(1, 101)]);
-        assert!(rt.state.lock().history_election_pending);
+        assert!(rt.state.lock().history_election_pending());
         assert!(net.drain_captures().is_empty());
     }
 
@@ -3568,7 +4041,7 @@ mod tests {
         .await;
 
         assert_eq!(repo.log(), vec![(1, 201), (2, 202)]);
-        assert!(rt.state.lock().history_election_pending);
+        assert!(rt.state.lock().history_election_pending());
     }
 
     #[test]

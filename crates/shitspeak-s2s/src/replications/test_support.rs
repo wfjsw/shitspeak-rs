@@ -58,6 +58,7 @@ pub struct MockNet {
     pub epochs: Mutex<std::collections::HashMap<NodeIdentifier, u64>>,
     routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
     live_routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
+    strict_unicast_failures: Mutex<std::collections::HashSet<NodeIdentifier>>,
     pub captured: Mutex<Vec<CapturedFrame>>,
     pub edge_rtts: Mutex<Vec<Duration>>,
 }
@@ -70,6 +71,7 @@ impl MockNet {
             epochs: Mutex::new(Default::default()),
             routes: Mutex::new(None),
             live_routes: Mutex::new(None),
+            strict_unicast_failures: Mutex::new(Default::default()),
             captured: Mutex::new(Vec::new()),
             edge_rtts: Mutex::new(Vec::new()),
         })
@@ -105,6 +107,10 @@ impl MockNet {
 
     pub fn set_live_reliable_routes(&self, routes: impl IntoIterator<Item = NodeIdentifier>) {
         self.set_live_routes(ServiceLevel::Reliable, routes);
+    }
+
+    pub fn fail_strict_unicasts_to(&self, dsts: impl IntoIterator<Item = NodeIdentifier>) {
+        *self.strict_unicast_failures.lock() = dsts.into_iter().collect();
     }
 
     pub fn set_epoch(&self, node: NodeIdentifier, epoch: u64) {
@@ -152,6 +158,11 @@ impl StrictNet for MockNet {
         topic: &str,
         body: StrictBody,
     ) -> Result<(), ReplicationError> {
+        if self.strict_unicast_failures.lock().contains(&dst) {
+            return Err(ReplicationError::Malformed(
+                "injected strict unicast failure",
+            ));
+        }
         self.captured.lock().push(CapturedFrame::StrictUnicast {
             dst,
             topic: topic.to_owned(),

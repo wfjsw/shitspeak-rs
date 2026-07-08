@@ -252,6 +252,10 @@ propose_ttl_ms = 10000
 propose_semaphore_size = 32
 # Cap on `CatchupOp`s returned per `StrictCatchupResp` chunk.
 strict_max_catchup_ops = 256
+# Minimum spacing between strict startup/heal history-election attempts.
+strict_bootstrap_retry_interval_ms = 500
+# Periodic strict steady-state log catchup interval after history election.
+strict_steady_state_catchup_interval_ms = 5000
 # Pending propose entries are GC'd after this period. Must be longer
 # than `propose_ttl_ms` so a proposer's caller-visible timeout fires
 # before the remote-side state evaporates.

@@ -65,6 +65,7 @@ message StrictCatchupReq {
   uint64 since_version = 2;
   uint64 chunk_token   = 3;   // 0 = first chunk; >0 = continuation
   bool   force_snapshot = 4;  // true for startup history election
+  bool   history_probe_only = 5; // true = return only history rank metadata
 }
 
 message StrictCatchupResp {
