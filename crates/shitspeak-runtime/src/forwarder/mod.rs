@@ -18,7 +18,7 @@ use crate::s2s::{
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
 use serde::Deserialize;
 use serde::de::Error as _;
-use shitspeak_s2s::overlay::{OverlayNetwork, ReplicationServices};
+use shitspeak_s2s::overlay::{ApplicationServices, OverlayNetwork, ReplicationServices};
 use shitspeak_s2s::replications::{ReplicationConfig, ReplicationManager};
 use shitspeak_s2s::status;
 use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
@@ -207,12 +207,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-    let overlay = OverlayNetwork::start_with_max_users_and_replication_services(
+    let overlay = OverlayNetwork::start_with_max_users_replication_and_application_services(
         transport.clone(),
         inbound,
         overlay_config,
         Arc::new(AtomicU64::new(0)),
         replication_config.services,
+        ApplicationServices::NONE,
     )
     .await?;
     let replication_manager = match repositories {

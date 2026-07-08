@@ -228,6 +228,10 @@ impl VoiceService {
         payload: Bytes,
         intent: VoiceIntent,
     ) -> Result<(), ApplicationError> {
+        let dsts = self.remote_voice_members();
+        if dsts.is_empty() {
+            return Ok(());
+        }
         let (bytes, seq) = self.encode(
             sender_session,
             server_id,
@@ -236,8 +240,7 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        self.transport.send_broadcast(bytes.clone()).await?;
-        let dsts = self.remote_alive_members();
+        self.transport.send_multicast(&dsts, bytes.clone()).await?;
         self.cache_and_send_proactive_repairs(sender_session, seq, bytes, &dsts)
             .await;
         Ok(())
@@ -475,10 +478,10 @@ impl VoiceService {
         Ok((bytes, seq))
     }
 
-    fn remote_alive_members(&self) -> Vec<NodeIdentifier> {
+    fn remote_voice_members(&self) -> Vec<NodeIdentifier> {
         let local = self.transport.local_node_id();
         self.transport
-            .alive_members()
+            .voice_members()
             .into_iter()
             .filter(|node| *node != local)
             .collect()
@@ -898,12 +901,18 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(calls.len(), 2);
         let first = match &calls[0] {
-            FakeCall::Broadcast { body } => proto::decode_voice(body.as_ref()).unwrap(),
-            other => panic!("expected Broadcast, got {other:?}"),
+            FakeCall::Multicast { dsts, body } => {
+                assert_eq!(dsts.as_slice(), &[1, 2, 3]);
+                proto::decode_voice(body.as_ref()).unwrap()
+            }
+            other => panic!("expected Multicast, got {other:?}"),
         };
         let second = match &calls[1] {
-            FakeCall::Broadcast { body } => proto::decode_voice(body.as_ref()).unwrap(),
-            other => panic!("expected Broadcast, got {other:?}"),
+            FakeCall::Multicast { dsts, body } => {
+                assert_eq!(dsts.as_slice(), &[1, 2, 3]);
+                proto::decode_voice(body.as_ref()).unwrap()
+            }
+            other => panic!("expected Multicast, got {other:?}"),
         };
         assert_eq!(first.sender_session, 0xABC);
         assert_eq!(first.sender_epoch, 42);
@@ -913,6 +922,31 @@ mod tests {
         assert_eq!(second.s2s_seq, 1);
         assert_eq!(second.payload, b"opus-2".as_ref());
         assert!(second.is_terminator);
+    }
+
+    #[tokio::test]
+    async fn broadcast_uses_voice_members_not_all_alive_members() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3, 4]);
+        transport.set_voice_members(vec![2, 4, 7]);
+        let svc = make_service(transport.clone());
+
+        svc.send_broadcast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"x"),
+            normal_intent(5),
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            FakeCall::Multicast { dsts, .. } => assert_eq!(dsts.as_slice(), &[2, 4]),
+            other => panic!("expected Multicast, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1187,7 +1221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_for_channel_broadcast_strategy_calls_broadcast() {
+    async fn send_for_channel_broadcast_strategy_multicasts_to_voice_members() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service_with_strategy(transport.clone(), "broadcast");
         svc.send_for_channel(
@@ -1201,11 +1235,11 @@ mod tests {
         .unwrap();
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
-        assert!(matches!(calls[0], FakeCall::Broadcast { .. }));
+        assert!(matches!(calls[0], FakeCall::Multicast { .. }));
     }
 
     #[tokio::test]
-    async fn send_for_channel_targeted_falls_back_to_broadcast_when_no_index() {
+    async fn send_for_channel_targeted_falls_back_to_voice_member_multicast_when_no_index() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service_with_strategy(transport.clone(), "targeted");
         svc.send_for_channel(
@@ -1219,7 +1253,7 @@ mod tests {
         .unwrap();
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
-        assert!(matches!(calls[0], FakeCall::Broadcast { .. }));
+        assert!(matches!(calls[0], FakeCall::Multicast { .. }));
     }
 
     #[tokio::test]
@@ -1345,7 +1379,7 @@ mod tests {
 
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
-        assert!(matches!(calls[0], FakeCall::Broadcast { .. }));
+        assert!(matches!(calls[0], FakeCall::Multicast { .. }));
     }
 
     #[tokio::test]
@@ -1631,7 +1665,7 @@ mod tests {
         let seqs: Vec<(u32, u64)> = calls
             .iter()
             .map(|c| match c {
-                FakeCall::Broadcast { body } => {
+                FakeCall::Multicast { body, .. } => {
                     let f = proto::decode_voice(body.as_ref()).unwrap();
                     (f.sender_session, f.s2s_seq)
                 }

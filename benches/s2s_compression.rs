@@ -54,6 +54,7 @@ fn link_ads(count: u32, links_per_ad: u32) -> Vec<overlay_pb::LinkStateAdvert> {
             strict_replication_disabled: false,
             content_replication_disabled: false,
             owner_replication_disabled: false,
+            voice_service_disabled: false,
         })
         .collect()
 }

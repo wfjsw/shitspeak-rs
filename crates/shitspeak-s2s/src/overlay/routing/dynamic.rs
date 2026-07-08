@@ -378,7 +378,9 @@ mod tests {
 
     use super::*;
     use crate::overlay::config::transport_bit;
-    use crate::overlay::lsdb::{LinkAdvertised, LsaEntry, LsaFloor, ReplicationServices};
+    use crate::overlay::lsdb::{
+        ApplicationServices, LinkAdvertised, LsaEntry, LsaFloor, ReplicationServices,
+    };
     use shitspeak_s2s_transport::TransportKind;
 
     fn cfg() -> OverlayConfig {
@@ -416,6 +418,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
         }
     }
 

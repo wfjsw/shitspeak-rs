@@ -530,7 +530,7 @@ mod tests {
 
     use super::super::super::config::transport_bit;
     use super::super::super::lsdb::{
-        LinkTransportAdvertised, LsaEntry, LsaFloor, ReplicationServices,
+        ApplicationServices, LinkTransportAdvertised, LsaEntry, LsaFloor, ReplicationServices,
     };
     use shitspeak_s2s_transport::{TransportKind, TransportRoutingPolicy};
 
@@ -602,6 +602,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
         }
     }
 
@@ -654,6 +655,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
         }
     }
 
@@ -712,6 +714,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
         }
     }
 
@@ -752,6 +755,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
         }
     }
 

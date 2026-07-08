@@ -55,6 +55,10 @@ pub trait VoiceTransport: Send + Sync + 'static {
 
     fn alive_members(&self) -> Vec<NodeIdentifier>;
 
+    fn voice_members(&self) -> Vec<NodeIdentifier> {
+        self.alive_members()
+    }
+
     fn local_node_id(&self) -> NodeIdentifier;
 
     fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality>;
@@ -103,8 +107,19 @@ impl VoiceTransport for OverlayVoiceTransport {
     }
 
     async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError> {
+        let local = self.overlay.local_node_id();
+        let dsts: Vec<NodeIdentifier> = self
+            .overlay
+            .voice_members()
+            .into_iter()
+            .filter(|node| *node != local)
+            .collect();
+        if dsts.is_empty() {
+            return Ok(());
+        }
         self.overlay
-            .send_broadcast_with_routing_metric(
+            .send_multicast_with_routing_metric(
+                &dsts,
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
                 VOICE_ROUTING_METRIC,
@@ -165,6 +180,10 @@ impl VoiceTransport for OverlayVoiceTransport {
         self.overlay.alive_members()
     }
 
+    fn voice_members(&self) -> Vec<NodeIdentifier> {
+        self.overlay.voice_members()
+    }
+
     fn local_node_id(&self) -> NodeIdentifier {
         self.overlay.local_node_id()
     }
@@ -213,6 +232,7 @@ pub(crate) mod testing {
         pub local_node: NodeIdentifier,
         pub alive: Vec<NodeIdentifier>,
         pub calls: Mutex<Vec<FakeCall>>,
+        voice_members: Mutex<Option<Vec<NodeIdentifier>>>,
         route_qualities: Mutex<HashMap<NodeIdentifier, VoiceRouteQuality>>,
     }
 
@@ -247,6 +267,7 @@ pub(crate) mod testing {
                 local_node,
                 alive,
                 calls: Mutex::new(Vec::new()),
+                voice_members: Mutex::new(None),
                 route_qualities: Mutex::new(HashMap::new()),
             })
         }
@@ -257,6 +278,10 @@ pub(crate) mod testing {
 
         pub fn set_voice_route_quality(&self, dst: NodeIdentifier, quality: VoiceRouteQuality) {
             self.route_qualities.lock().unwrap().insert(dst, quality);
+        }
+
+        pub fn set_voice_members(&self, nodes: Vec<NodeIdentifier>) {
+            *self.voice_members.lock().unwrap() = Some(nodes);
         }
     }
 
@@ -324,6 +349,14 @@ pub(crate) mod testing {
 
         fn alive_members(&self) -> Vec<NodeIdentifier> {
             self.alive.clone()
+        }
+
+        fn voice_members(&self) -> Vec<NodeIdentifier> {
+            self.voice_members
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| self.alive.clone())
         }
 
         fn local_node_id(&self) -> NodeIdentifier {

@@ -95,6 +95,35 @@ impl Default for ReplicationServices {
     }
 }
 
+/// Application service kinds advertised by one overlay member.
+///
+/// Missing fields on the wire default to enabled to keep rolling upgrades
+/// compatible with existing full S2S nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApplicationServices {
+    voice: bool,
+}
+
+impl ApplicationServices {
+    pub const ALL: Self = Self { voice: true };
+
+    pub const NONE: Self = Self { voice: false };
+
+    pub fn new(voice: bool) -> Self {
+        Self { voice }
+    }
+
+    pub fn voice(self) -> bool {
+        self.voice
+    }
+}
+
+impl Default for ApplicationServices {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 /// One LSA's domain-side representation.
 #[derive(Clone, Debug)]
 pub struct LsaEntry {
@@ -108,6 +137,7 @@ pub struct LsaEntry {
     pub max_users: u64,
     pub transit_disabled: bool,
     pub replication_services: ReplicationServices,
+    pub application_services: ApplicationServices,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +249,12 @@ fn describe_lsa_entry_delta(previous: Option<&LsaEntry>, current: &LsaEntry) -> 
         "owner_replication",
         previous.replication_services.owner(),
         current.replication_services.owner(),
+    );
+    push_scalar_change(
+        &mut changes,
+        "voice_service",
+        previous.application_services.voice(),
+        current.application_services.voice(),
     );
     describe_address_delta(&mut changes, &previous.addresses, &current.addresses);
     describe_link_delta(&mut changes, &previous.links, &current.links);
@@ -493,6 +529,7 @@ impl LsaEntry {
                 !pb.content_replication_disabled,
                 !pb.owner_replication_disabled,
             ),
+            application_services: ApplicationServices::new(!pb.voice_service_disabled),
         })
     }
 
@@ -540,6 +577,7 @@ impl LsaEntry {
             strict_replication_disabled: !self.replication_services.strict(),
             content_replication_disabled: !self.replication_services.content(),
             owner_replication_disabled: !self.replication_services.owner(),
+            voice_service_disabled: !self.application_services.voice(),
         }
     }
 }
@@ -954,6 +992,21 @@ impl LinkStateDb {
         out
     }
 
+    fn active_origins_by_application_kind(
+        &self,
+        enabled: impl Fn(ApplicationServices) -> bool,
+    ) -> Vec<NodeIdentifier> {
+        let mut out: Vec<_> = self
+            .inner
+            .read()
+            .values()
+            .filter(|e| !e.tombstone && enabled(e.application_services))
+            .map(|e| e.origin)
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Set of active origins that advertise strict replication service.
     pub fn strict_replication_origins(&self) -> Vec<NodeIdentifier> {
         self.active_origins_by_replication_kind(ReplicationServices::strict)
@@ -967,6 +1020,11 @@ impl LinkStateDb {
     /// Set of active origins that advertise owner-scoped replication service.
     pub fn owner_replication_origins(&self) -> Vec<NodeIdentifier> {
         self.active_origins_by_replication_kind(ReplicationServices::owner)
+    }
+
+    /// Set of active origins that advertise application voice service.
+    pub fn voice_origins(&self) -> Vec<NodeIdentifier> {
+        self.active_origins_by_application_kind(ApplicationServices::voice)
     }
 }
 
@@ -1014,6 +1072,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
         }
     }
 
@@ -1050,6 +1109,7 @@ mod tests {
         lsa.max_users = 250;
         lsa.transit_disabled = true;
         lsa.replication_services = ReplicationServices::STRICT_AND_CONTENT;
+        lsa.application_services = ApplicationServices::NONE;
         lsa.links = vec![LinkAdvertised {
             neighbor: 2,
             rtt_us: 1_000,
@@ -1078,6 +1138,7 @@ mod tests {
         assert!(!pb.strict_replication_disabled);
         assert!(!pb.content_replication_disabled);
         assert!(pb.owner_replication_disabled);
+        assert!(pb.voice_service_disabled);
         let wire_link = pb.links.first().unwrap();
         assert_eq!(wire_link.loss_ppm, 25_000);
         assert_eq!(wire_link.probe_loss_ppm, 10_000);
@@ -1106,6 +1167,7 @@ mod tests {
             roundtrip.replication_services,
             ReplicationServices::STRICT_AND_CONTENT
         );
+        assert_eq!(roundtrip.application_services, ApplicationServices::NONE);
         let link = roundtrip.links.first().unwrap();
         assert_eq!(link.loss_ppm, 25_000);
         assert_eq!(link.probe_loss_ppm, 10_000);
@@ -1208,6 +1270,23 @@ mod tests {
         assert_eq!(db.strict_replication_origins(), vec![1]);
         assert_eq!(db.content_replication_origins(), vec![1, 2]);
         assert_eq!(db.owner_replication_origins(), vec![1, 3]);
+    }
+
+    #[test]
+    fn voice_origins_filter_by_enabled_service() {
+        let floor = Arc::new(LsaFloor::new(0, None));
+        let db = LinkStateDb::new(floor);
+        let voice = entry(1, 100, 1, false);
+        let mut forwarder = entry(2, 100, 1, false);
+        forwarder.application_services = ApplicationServices::NONE;
+        let mut left = entry(3, 100, 1, true);
+        left.application_services = ApplicationServices::ALL;
+
+        db.admit(voice);
+        db.admit(forwarder);
+        db.admit(left);
+
+        assert_eq!(db.voice_origins(), vec![1]);
     }
 
     #[test]

@@ -54,7 +54,7 @@ pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use duplicate::{DuplicateDetector, DuplicateEvidenceKind, DuplicateNodeSnapshot};
 pub use error::OverlayError;
 pub use lane::LaneId;
-pub use lsdb::ReplicationServices;
+pub use lsdb::{ApplicationServices, ReplicationServices};
 pub use membership::{MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{OverlayInboundMessage, OverlaySendOptions, ServiceInbound};
 pub use routing::{RouteEntry, RoutingMetric};
@@ -245,8 +245,37 @@ impl OverlayNetwork {
         max_users: Arc<AtomicU64>,
         replication_services: ReplicationServices,
     ) -> Result<Self, OverlayError> {
-        let inner =
-            runtime::start_inner(transport, inbound, cfg, max_users, replication_services).await?;
+        Self::start_with_max_users_replication_and_application_services(
+            transport,
+            inbound,
+            cfg,
+            max_users,
+            replication_services,
+            ApplicationServices::ALL,
+        )
+        .await
+    }
+
+    /// Bring up the overlay with local server capacity, replication service
+    /// capability, and application service capability advertised in this
+    /// node's LSA.
+    pub async fn start_with_max_users_replication_and_application_services(
+        transport: ConnectionManager,
+        inbound: Inbound,
+        cfg: OverlayConfig,
+        max_users: Arc<AtomicU64>,
+        replication_services: ReplicationServices,
+        application_services: ApplicationServices,
+    ) -> Result<Self, OverlayError> {
+        let inner = runtime::start_inner(
+            transport,
+            inbound,
+            cfg,
+            max_users,
+            replication_services,
+            application_services,
+        )
+        .await?;
         Ok(Self { inner })
     }
 
@@ -316,6 +345,16 @@ impl OverlayNetwork {
         self.inner
             .table
             .alive_members()
+            .into_iter()
+            .filter(|node| !self.is_node_quarantined(*node))
+            .collect()
+    }
+
+    /// IDs of active members that advertise application voice service.
+    pub(crate) fn voice_members(&self) -> Vec<NodeIdentifier> {
+        self.inner
+            .table
+            .voice_members()
             .into_iter()
             .filter(|node| !self.is_node_quarantined(*node))
             .collect()

@@ -27,8 +27,8 @@ use super::duplicate::DuplicateDetector;
 use super::error::OverlayError;
 use super::lsdb::advert::{cost_changed_significantly, voice_cost_changed_significantly};
 use super::lsdb::{
-    LinkStateDb, LsaEmitter, LsaFloodPacer, LsaFloor, ReplicationServices, capture_boot_epoch,
-    emit_once, spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
+    ApplicationServices, LinkStateDb, LsaEmitter, LsaFloodPacer, LsaFloor, ReplicationServices,
+    capture_boot_epoch, emit_once, spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
 };
 use super::membership::{MembershipTable, spawn_diff_watcher};
 use super::messaging::{ServiceRegistry, ordering::OverlayOrdering};
@@ -161,6 +161,7 @@ impl OverlayInner {
         cfg: OverlayConfig,
         max_users: Arc<AtomicU64>,
         replication_services: ReplicationServices,
+        application_services: ApplicationServices,
         self_addresses: Vec<PeerAddress>,
     ) -> Self {
         let self_id = transport.local_node_id();
@@ -196,6 +197,7 @@ impl OverlayInner {
             max_users,
             cfg.route_transit_messages(),
             replication_services,
+            application_services,
         ));
         let flood_pacer = Arc::new(LsaFloodPacer::new(self_id, transport.clone()));
 
@@ -444,6 +446,7 @@ pub(crate) async fn start_inner(
     cfg: OverlayConfig,
     max_users: Arc<AtomicU64>,
     replication_services: ReplicationServices,
+    application_services: ApplicationServices,
 ) -> Result<Arc<OverlayInner>, OverlayError> {
     let self_addresses = transport.listen_addresses_with_public_ip_probe().await;
     let inner = Arc::new(OverlayInner::new(
@@ -451,6 +454,7 @@ pub(crate) async fn start_inner(
         cfg,
         max_users,
         replication_services,
+        application_services,
         self_addresses,
     ));
 

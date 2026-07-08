@@ -51,6 +51,7 @@ message LinkStateAdvert {
   bool strict_replication_disabled = 10;  // origin does not run strict replication
   bool content_replication_disabled = 11; // origin does not run content/blob replication
   bool owner_replication_disabled = 12;   // origin does not run owner-scoped replication
+  bool voice_service_disabled = 13;       // origin does not run application voice service
 }
 
 // One advertised edge from `origin` to `neighbor`.

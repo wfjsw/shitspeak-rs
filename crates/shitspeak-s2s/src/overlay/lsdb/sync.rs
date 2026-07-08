@@ -245,6 +245,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: super::super::store::ReplicationServices::ALL,
+            application_services: super::super::store::ApplicationServices::ALL,
         }
     }
 

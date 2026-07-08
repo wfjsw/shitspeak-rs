@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::PeerAddress;
 
-use super::lsdb::{LinkStateDb, ReplicationServices};
+use super::lsdb::{ApplicationServices, LinkStateDb, ReplicationServices};
 pub use view::MemberStatus;
 
 /// Caller-facing snapshot of one cluster member.
@@ -36,6 +36,7 @@ pub struct MemberSnapshot {
     boot_epoch: u64,
     max_users: u64,
     replication_services: ReplicationServices,
+    application_services: ApplicationServices,
 }
 
 impl MemberSnapshot {
@@ -61,6 +62,10 @@ impl MemberSnapshot {
 
     pub fn replication_services(&self) -> ReplicationServices {
         self.replication_services
+    }
+
+    pub fn application_services(&self) -> ApplicationServices {
+        self.application_services
     }
 
     /// Phase-1 compatibility: callers expect an "incarnation"; we map it
@@ -140,6 +145,7 @@ impl MembershipTable {
                 boot_epoch: e.boot_epoch,
                 max_users: e.max_users,
                 replication_services: e.replication_services,
+                application_services: e.application_services,
             })
             .collect();
         out.sort_by_key(|m| m.node_id);
@@ -158,6 +164,7 @@ impl MembershipTable {
             boot_epoch: e.boot_epoch,
             max_users: e.max_users,
             replication_services: e.replication_services,
+            application_services: e.application_services,
         })
     }
 
@@ -179,6 +186,11 @@ impl MembershipTable {
     /// IDs of active origins that advertise owner-scoped replication service.
     pub fn owner_replication_members(&self) -> Vec<NodeIdentifier> {
         self.lsdb.owner_replication_origins()
+    }
+
+    /// IDs of active origins that advertise application voice service.
+    pub fn voice_members(&self) -> Vec<NodeIdentifier> {
+        self.lsdb.voice_origins()
     }
 
     /// Sum max_users advertised by every current non-tombstone LSA.
@@ -286,6 +298,7 @@ mod tests {
             max_users,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
         }
     }
 
@@ -328,6 +341,29 @@ mod tests {
                 .unwrap()
                 .replication_services()
                 .content()
+        );
+    }
+
+    #[test]
+    fn voice_members_filter_by_application_service() {
+        let floor = Arc::new(LsaFloor::new(0, None));
+        let lsdb = Arc::new(LinkStateDb::new(floor));
+        let (table, _) = new_table(1, lsdb.clone(), 8);
+
+        let voice = entry(1, 1, false, 100);
+        let mut forwarder = entry(2, 1, false, 0);
+        forwarder.application_services = ApplicationServices::NONE;
+
+        lsdb.admit(voice);
+        lsdb.admit(forwarder);
+
+        assert_eq!(table.voice_members(), vec![1]);
+        assert!(
+            !table
+                .snapshot_one(2)
+                .unwrap()
+                .application_services()
+                .voice()
         );
     }
 }

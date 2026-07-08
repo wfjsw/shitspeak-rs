@@ -210,7 +210,9 @@ mod tests {
     use super::*;
 
     use super::super::super::config::transport_bit;
-    use super::super::super::lsdb::{LinkAdvertised, LsaEntry, LsaFloor, ReplicationServices};
+    use super::super::super::lsdb::{
+        ApplicationServices, LinkAdvertised, LsaEntry, LsaFloor, ReplicationServices,
+    };
     use shitspeak_s2s_transport::TransportKind;
 
     fn entry(origin: NodeIdentifier, links: Vec<NodeIdentifier>) -> LsaEntry {
@@ -243,6 +245,7 @@ mod tests {
             max_users: 0,
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
         }
     }
 

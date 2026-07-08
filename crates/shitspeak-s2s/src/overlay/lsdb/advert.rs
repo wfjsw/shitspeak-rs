@@ -39,8 +39,8 @@ use super::super::neighbor::monitor::{NeighborMonitor, NeighborSnapshot, Neighbo
 use super::super::proto::{OverlayBody, encode_message, wrap};
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 use super::store::{
-    AdmissionResult, LinkAdvertised, LinkStateDb, LinkTransportAdvertised, LsaEntry,
-    ReplicationServices, is_strictly_newer,
+    AdmissionResult, ApplicationServices, LinkAdvertised, LinkStateDb, LinkTransportAdvertised,
+    LsaEntry, ReplicationServices, is_strictly_newer,
 };
 
 const RTT_GATE_BUCKET_US: u64 = 25_000;
@@ -63,6 +63,7 @@ pub struct LsaEmitter {
     strict_replication_enabled: AtomicBool,
     content_replication_enabled: AtomicBool,
     owner_replication_enabled: AtomicBool,
+    voice_service_enabled: AtomicBool,
     /// Last cost/breakdown tuple per neighbor we published. Used to apply the
     /// cost-change-threshold filter.
     last_published: parking_lot::Mutex<HashMap<NodeIdentifier, LinkGate>>,
@@ -81,6 +82,7 @@ impl LsaEmitter {
         max_users: Arc<AtomicU64>,
         route_transit_messages: bool,
         replication_services: ReplicationServices,
+        application_services: ApplicationServices,
     ) -> Self {
         Self {
             self_id,
@@ -91,6 +93,7 @@ impl LsaEmitter {
             strict_replication_enabled: AtomicBool::new(replication_services.strict()),
             content_replication_enabled: AtomicBool::new(replication_services.content()),
             owner_replication_enabled: AtomicBool::new(replication_services.owner()),
+            voice_service_enabled: AtomicBool::new(application_services.voice()),
             next_seq: AtomicU64::new(1),
             last_published: parking_lot::Mutex::new(HashMap::new()),
             self_addresses,
@@ -131,6 +134,10 @@ impl LsaEmitter {
         )
     }
 
+    pub fn application_services(&self) -> ApplicationServices {
+        ApplicationServices::new(self.voice_service_enabled.load(Ordering::Relaxed))
+    }
+
     pub fn update_replication_services(&self, services: ReplicationServices) {
         self.strict_replication_enabled
             .store(services.strict(), Ordering::Relaxed);
@@ -150,6 +157,7 @@ struct LsaContent {
     max_users: u64,
     transit_disabled: bool,
     replication_services: ReplicationServices,
+    application_services: ApplicationServices,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +228,11 @@ fn build_local_lsa_content(
         } else {
             emitter.replication_services()
         },
+        application_services: if tombstone {
+            ApplicationServices::NONE
+        } else {
+            emitter.application_services()
+        },
     }
 }
 
@@ -235,6 +248,7 @@ fn stamp_local_lsa(emitter: &LsaEmitter, content: LsaContent) -> LsaEntry {
         max_users: content.max_users,
         transit_disabled: content.transit_disabled,
         replication_services: content.replication_services,
+        application_services: content.application_services,
     }
 }
 
@@ -431,6 +445,7 @@ fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     content.replication_services.strict().hash(&mut hasher);
     content.replication_services.content().hash(&mut hasher);
     content.replication_services.owner().hash(&mut hasher);
+    content.application_services.voice().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -449,6 +464,7 @@ fn content_identity_fingerprint(content: &LsaContent) -> u64 {
     content.replication_services.strict().hash(&mut hasher);
     content.replication_services.content().hash(&mut hasher);
     content.replication_services.owner().hash(&mut hasher);
+    content.application_services.voice().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1119,6 +1135,7 @@ mod tests {
             Arc::new(AtomicU64::new(10)),
             true,
             ReplicationServices::ALL,
+            ApplicationServices::ALL,
         )
     }
 
@@ -1427,6 +1444,7 @@ mod tests {
             max_users.clone(),
             true,
             ReplicationServices::ALL,
+            ApplicationServices::ALL,
         );
         let cfg = OverlayConfig::new(vec![])
             .with_lsa_max_age(Duration::from_secs(120))
