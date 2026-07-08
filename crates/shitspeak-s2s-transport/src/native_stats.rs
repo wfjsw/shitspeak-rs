@@ -5,6 +5,8 @@
 //! intentionally report only deltas; the first observation seeds the baseline
 //! and does not affect routing.
 
+use std::time::Duration;
+
 use tokio::net::TcpStream;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,6 +57,10 @@ impl RawNativeCounters {
 
 pub(crate) trait NativeLossSampler: Send + 'static {
     fn sample(&mut self) -> Option<NativeLossSample>;
+
+    fn sample_rtt(&mut self) -> Option<Duration> {
+        None
+    }
 }
 
 pub(crate) type BoxedNativeLossSampler = Box<dyn NativeLossSampler>;
@@ -115,6 +121,7 @@ impl NativeLossSampler for QuicNativeLossSampler {
 struct KcpNativeLossSampler {
     handle: tokio_kcp::KcpStatsHandle,
     previous: Option<RawNativeCounters>,
+    previous_rtt_sample_count: u64,
 }
 
 impl KcpNativeLossSampler {
@@ -122,6 +129,7 @@ impl KcpNativeLossSampler {
         Self {
             handle,
             previous: None,
+            previous_rtt_sample_count: 0,
         }
     }
 }
@@ -131,6 +139,17 @@ impl NativeLossSampler for KcpNativeLossSampler {
         let current =
             RawNativeCounters::new(self.handle.sent_segments(), self.handle.lost_segments());
         delta_from_counters(&mut self.previous, current)
+    }
+
+    fn sample_rtt(&mut self) -> Option<Duration> {
+        let sample_count = self.handle.rtt_sample_count();
+        if sample_count == 0 || sample_count == self.previous_rtt_sample_count {
+            return None;
+        }
+        self.previous_rtt_sample_count = sample_count;
+        self.handle
+            .srtt_ms()
+            .map(|srtt_ms| Duration::from_millis(u64::from(srtt_ms)))
     }
 }
 

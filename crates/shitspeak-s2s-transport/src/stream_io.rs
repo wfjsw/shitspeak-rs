@@ -7,8 +7,8 @@
 //!     local `NodeIdentifier` as `src_node`, then encodes with prost +
 //!     length-prefix via `LengthDelimitedCodec`;
 //!   * decodes incoming length-prefixed frames, dispatches `Data` to the
-//!     appropriate inbound mpsc, generates `Pong` for `Ping`, and updates RTT
-//!     + jitter metrics for `Pong`;
+//!     appropriate inbound mpsc, generates `Pong` for `Ping`, and updates
+//!     stream RTT + jitter metrics for `Pong` when no native RTT is preferred;
 //!   * periodically issues a small keepalive Ping every `ping_interval` for
 //!     latency / jitter and liveness;
 //!   * exits on EOF, write error, or `closed` cancellation.
@@ -493,6 +493,48 @@ async fn run_pump<S>(
                 }
             }
 
+            _ = ping_tick.tick() => {
+                record_expired_pending(&mut pending, pending_timeout, cfg.transport, &peer);
+                let ts = now_us();
+                let frame = build_frame(
+                    cfg.local_node,
+                    cfg.peer_node,
+                    level_for_metrics,
+                    FrameType::KeepAlive,
+                    MessageClass::Regular,
+                    ts,
+                    Bytes::new(),
+                );
+                match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
+                    Ok(_) => {
+                        record_evicted_pending(
+                            pending.insert(ts),
+                            cfg.transport,
+                            &peer,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "keepalive write failed");
+                        break;
+                    }
+                }
+            }
+
+            _ = native_tick.tick() => {
+                if let Some(sampler) = native_sampler.as_mut() {
+                    if let Some(rtt) = sampler.sample_rtt() {
+                        peer.metrics().record_native_rtt(cfg.transport, rtt);
+                    }
+                    if let Some(sample) = sampler.sample() {
+                        peer.metrics().record_native_loss_sample(
+                            cfg.transport,
+                            sample.sent_units(),
+                            sample.lost_units(),
+                        );
+                    }
+                }
+            }
+
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
                 if out.options().is_expired() {
@@ -546,45 +588,6 @@ async fn run_pump<S>(
                     Err(e) => {
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream write failed");
                         break;
-                    }
-                }
-            }
-
-            _ = ping_tick.tick() => {
-                record_expired_pending(&mut pending, pending_timeout, cfg.transport, &peer);
-                let ts = now_us();
-                let frame = build_frame(
-                    cfg.local_node,
-                    cfg.peer_node,
-                    level_for_metrics,
-                    FrameType::KeepAlive,
-                    MessageClass::Regular,
-                    ts,
-                    Bytes::new(),
-                );
-                match encode_and_send_returning_size(&mut framed, &frame, cfg.transport, &peer).await {
-                    Ok(_) => {
-                        record_evicted_pending(
-                            pending.insert(ts),
-                            cfg.transport,
-                            &peer,
-                        );
-                    }
-                    Err(e) => {
-                        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "keepalive write failed");
-                        break;
-                    }
-                }
-            }
-
-            _ = native_tick.tick() => {
-                if let Some(sampler) = native_sampler.as_mut() {
-                    if let Some(sample) = sampler.sample() {
-                        peer.metrics().record_native_loss_sample(
-                            cfg.transport,
-                            sample.sent_units(),
-                            sample.lost_units(),
-                        );
                     }
                 }
             }
@@ -979,7 +982,15 @@ where
         pb::FrameType::FramePong => {
             if let Some(ping) = pending.take(frame.ts_us) {
                 let rtt = ping.sent_at.elapsed();
-                peer.metrics().record_rtt(cfg.transport, rtt);
+                if cfg.transport != TransportKind::Kcp {
+                    peer.metrics().record_rtt(cfg.transport, rtt);
+                } else {
+                    trace!(
+                        peer=%cfg.peer_node,
+                        rtt_us = rtt.as_micros() as u64,
+                        "kcp stream pong observed; native kcp ack rtt drives latency metric"
+                    );
+                }
                 peer.metrics().record_probe_delivered(cfg.transport);
                 transport_link_stable = true;
             } else {

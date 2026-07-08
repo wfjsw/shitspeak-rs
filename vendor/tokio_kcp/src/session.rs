@@ -1,11 +1,11 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{hash_map::Entry, HashMap},
     fmt::{self, Debug},
     net::{IpAddr, SocketAddr},
     ops::Deref,
     sync::{
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -15,11 +15,11 @@ use futures_util::task::AtomicWaker;
 use kcp::{KcpResult, KcpStats};
 use log::{error, trace};
 use tokio::{
-    sync::{Mutex, Notify, mpsc},
+    sync::{mpsc, Mutex, Notify},
     time::{self, Instant},
 };
 
-use crate::{KcpConfig, skcp::KcpSocket, udp_io::SharedUdpIo};
+use crate::{skcp::KcpSocket, udp_io::SharedUdpIo, KcpConfig};
 
 pub struct KcpSession {
     socket: Mutex<KcpSocket>,
@@ -36,12 +36,18 @@ pub struct KcpSession {
 struct KcpStatsSnapshot {
     sent_segments: AtomicU64,
     lost_segments: AtomicU64,
+    srtt_ms: AtomicU32,
+    rto_ms: AtomicU32,
+    rtt_sample_count: AtomicU64,
 }
 
 impl KcpStatsSnapshot {
     fn update(&self, stats: &KcpStats) {
         self.sent_segments.store(stats.sent_segments(), Ordering::Relaxed);
         self.lost_segments.store(stats.lost_segments(), Ordering::Relaxed);
+        self.srtt_ms.store(stats.srtt_ms().unwrap_or(0), Ordering::Relaxed);
+        self.rto_ms.store(stats.rto_ms(), Ordering::Relaxed);
+        self.rtt_sample_count.store(stats.rtt_sample_count(), Ordering::Relaxed);
     }
 
     fn sent_segments(&self) -> u64 {
@@ -52,8 +58,29 @@ impl KcpStatsSnapshot {
         self.lost_segments.load(Ordering::Relaxed)
     }
 
+    fn srtt_ms(&self) -> Option<u32> {
+        match self.srtt_ms.load(Ordering::Relaxed) {
+            0 => None,
+            srtt_ms => Some(srtt_ms),
+        }
+    }
+
+    fn rto_ms(&self) -> u32 {
+        self.rto_ms.load(Ordering::Relaxed)
+    }
+
+    fn rtt_sample_count(&self) -> u64 {
+        self.rtt_sample_count.load(Ordering::Relaxed)
+    }
+
     fn get(&self) -> KcpStats {
-        KcpStats::new(self.sent_segments(), self.lost_segments())
+        KcpStats::with_rtt(
+            self.sent_segments(),
+            self.lost_segments(),
+            self.srtt_ms(),
+            self.rto_ms(),
+            self.rtt_sample_count(),
+        )
     }
 }
 
@@ -77,6 +104,18 @@ impl KcpStatsHandle {
 
     pub fn lost_segments(&self) -> u64 {
         self.session.lost_segments()
+    }
+
+    pub fn srtt_ms(&self) -> Option<u32> {
+        self.session.srtt_ms()
+    }
+
+    pub fn rto_ms(&self) -> u32 {
+        self.session.rto_ms()
+    }
+
+    pub fn rtt_sample_count(&self) -> u64 {
+        self.session.rtt_sample_count()
     }
 }
 
@@ -352,6 +391,18 @@ impl KcpSession {
         self.stats.lost_segments()
     }
 
+    pub fn srtt_ms(&self) -> Option<u32> {
+        self.stats.srtt_ms()
+    }
+
+    pub fn rto_ms(&self) -> u32 {
+        self.stats.rto_ms()
+    }
+
+    pub fn rtt_sample_count(&self) -> u64 {
+        self.stats.rtt_sample_count()
+    }
+
     pub(crate) fn update_stats(&self, socket: &KcpSocket) {
         let stats = socket.stats();
         self.stats.update(&stats);
@@ -484,7 +535,9 @@ impl KcpSessionManager {
                     let old_conv = old_session.conv().await;
                     trace!(
                         "replaced session with conv: {} (old: {}), peer: {}",
-                        conv, old_conv, peer_addr
+                        conv,
+                        old_conv,
+                        peer_addr
                     );
 
                     Ok((session, true))

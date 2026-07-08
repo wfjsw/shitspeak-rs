@@ -146,10 +146,13 @@ impl<O: Write> Write for KcpOutput<O> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KcpStats {
     sent_segments: u64,
     lost_segments: u64,
+    srtt_ms: Option<u32>,
+    rto_ms: u32,
+    rtt_sample_count: u64,
 }
 
 impl KcpStats {
@@ -158,6 +161,26 @@ impl KcpStats {
         Self {
             sent_segments,
             lost_segments,
+            srtt_ms: None,
+            rto_ms: KCP_RTO_DEF,
+            rtt_sample_count: 0,
+        }
+    }
+
+    /// Build a stats snapshot from cumulative segment counters and RTT state.
+    pub fn with_rtt(
+        sent_segments: u64,
+        lost_segments: u64,
+        srtt_ms: Option<u32>,
+        rto_ms: u32,
+        rtt_sample_count: u64,
+    ) -> Self {
+        Self {
+            sent_segments,
+            lost_segments,
+            srtt_ms,
+            rto_ms,
+            rtt_sample_count,
         }
     }
 
@@ -169,6 +192,27 @@ impl KcpStats {
     /// Number of KCP segment transmissions declared lost by timeout or fast ACK.
     pub fn lost_segments(&self) -> u64 {
         self.lost_segments
+    }
+
+    /// Smoothed ACK RTT in milliseconds, if at least one RTT sample exists.
+    pub fn srtt_ms(&self) -> Option<u32> {
+        self.srtt_ms
+    }
+
+    /// Current retransmission timeout in milliseconds.
+    pub fn rto_ms(&self) -> u32 {
+        self.rto_ms
+    }
+
+    /// Number of ACK RTT samples incorporated into the smoothed RTT.
+    pub fn rtt_sample_count(&self) -> u64 {
+        self.rtt_sample_count
+    }
+}
+
+impl Default for KcpStats {
+    fn default() -> Self {
+        Self::new(0, 0)
     }
 }
 
@@ -261,6 +305,7 @@ pub struct Kcp<Output: Write> {
 
     sent_segments: u64,
     lost_segments: u64,
+    rtt_sample_count: u64,
 
     output: KcpOutput<Output>,
 }
@@ -308,6 +353,7 @@ impl<Output: Write> Debug for Kcp<Output> {
             .field("input_conv", &self.input_conv)
             .field("sent_segments", &self.sent_segments)
             .field("lost_segments", &self.lost_segments)
+            .field("rtt_sample_count", &self.rtt_sample_count)
             .finish()
     }
 }
@@ -378,6 +424,7 @@ impl<Output: Write> Kcp<Output> {
             input_conv: false,
             sent_segments: 0,
             lost_segments: 0,
+            rtt_sample_count: 0,
             output: KcpOutput(output),
         }
     }
@@ -554,6 +601,7 @@ impl<Output: Write> Kcp<Output> {
         }
         let rto = self.rx_srtt + cmp::max(self.interval, 4 * self.rx_rttval);
         self.rx_rto = bound(self.rx_minrto, rto, KCP_RTO_MAX);
+        self.rtt_sample_count = self.rtt_sample_count.saturating_add(1);
     }
 
     #[inline]
@@ -1297,10 +1345,13 @@ impl<Output: Write> Kcp<Output> {
     }
 
     pub fn stats(&self) -> KcpStats {
-        KcpStats {
-            sent_segments: self.sent_segments,
-            lost_segments: self.lost_segments,
-        }
+        KcpStats::with_rtt(
+            self.sent_segments,
+            self.lost_segments,
+            (self.rx_srtt > 0).then_some(self.rx_srtt),
+            self.rx_rto,
+            self.rtt_sample_count,
+        )
     }
 
     #[cfg(test)]
@@ -1324,7 +1375,20 @@ impl<Output: Write> Kcp<Output> {
 
 #[cfg(test)]
 mod stats_tests {
-    use super::Kcp;
+    use super::{Kcp, KCP_CMD_ACK};
+
+    fn ack_packet(conv: u32, ts: u32, sn: u32, una: u32) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(super::KCP_OVERHEAD);
+        packet.extend_from_slice(&conv.to_le_bytes());
+        packet.push(KCP_CMD_ACK);
+        packet.push(0);
+        packet.extend_from_slice(&128u16.to_le_bytes());
+        packet.extend_from_slice(&ts.to_le_bytes());
+        packet.extend_from_slice(&sn.to_le_bytes());
+        packet.extend_from_slice(&una.to_le_bytes());
+        packet.extend_from_slice(&0u32.to_le_bytes());
+        packet
+    }
 
     #[test]
     fn stats_report_forced_segment_counters() {
@@ -1355,5 +1419,17 @@ mod stats_tests {
         let stats = kcp.stats();
         assert_eq!(stats.sent_segments(), 3);
         assert_eq!(stats.lost_segments(), 2);
+    }
+
+    #[test]
+    fn stats_report_ack_rtt_state() {
+        let mut kcp = Kcp::new(7, Vec::new());
+        kcp.set_current(137);
+        kcp.input(&ack_packet(7, 100, 0, 0)).unwrap();
+
+        let stats = kcp.stats();
+        assert_eq!(stats.srtt_ms(), Some(37));
+        assert_eq!(stats.rto_ms(), 137);
+        assert_eq!(stats.rtt_sample_count(), 1);
     }
 }

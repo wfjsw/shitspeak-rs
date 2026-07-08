@@ -1006,6 +1006,14 @@ impl PeerMetrics {
     }
 
     pub fn record_rtt(&self, transport: TransportKind, rtt: Duration) {
+        self.record_rtt_sample(transport, rtt);
+    }
+
+    pub fn record_native_rtt(&self, transport: TransportKind, rtt: Duration) {
+        self.record_rtt_sample(transport, rtt);
+    }
+
+    fn record_rtt_sample(&self, transport: TransportKind, rtt: Duration) {
         let sample = rtt.as_micros() as f64;
         let mut g = self.inner.lock();
         let entry = g
@@ -1572,6 +1580,17 @@ mod tests {
         );
         assert!(tcp.jitter_us > 0.0);
         assert_eq!(tcp.samples, 5);
+    }
+
+    #[test]
+    fn native_rtt_feeds_latency_metric() {
+        let m = PeerMetrics::new(Duration::from_secs(5), MetricsTuning::default());
+        m.record_native_rtt(TransportKind::Kcp, Duration::from_millis(18));
+
+        let snap = m.snapshot_per_transport();
+        let kcp = snap.get(&TransportKind::Kcp).unwrap();
+        assert_eq!(kcp.rtt_us(), 18_000.0);
+        assert_eq!(kcp.samples(), 1);
     }
 
     #[test]
