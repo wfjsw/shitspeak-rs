@@ -514,7 +514,16 @@ impl VoiceService {
                 ),
                 cache_ttl,
             );
-            if self.should_send_proactive_repair(dst, s2s_seq, quality) {
+            let extra_copies = proactive_repair_score_micros(&self.cfg, quality)
+                .map(|score| {
+                    proactive_repair_extra_copy_count(
+                        self.cfg.repair_max_extra_copies_per_frame,
+                        score,
+                        proactive_repair_sample(dst, s2s_seq),
+                    )
+                })
+                .unwrap_or(0);
+            for _ in 0..extra_copies {
                 let _ = self
                     .transport
                     .send_repair_frame(dst, body.clone(), avoid_first_hop, transport_ttl)
@@ -522,75 +531,86 @@ impl VoiceService {
             }
         }
     }
+}
 
-    fn should_send_proactive_repair(
-        &self,
-        dst: NodeIdentifier,
-        s2s_seq: u64,
-        quality: Option<crate::overlay::VoiceRouteQuality>,
-    ) -> bool {
-        if self.cfg.repair_max_extra_copies_per_frame == 0 {
-            return false;
-        }
-        let Some(quality) = quality else {
-            return false;
-        };
-        if quality.transport() != TransportKind::Udp {
-            return false;
-        }
-        if quality.loss_ppm() >= self.cfg.repair_full_dup_loss_ppm {
-            return true;
-        }
-        let distant_path = quality.path_latency_us() >= DISTANT_REPAIR_PATH_LATENCY_US;
-        let distant_loss_start_ppm = self.cfg.repair_loss_start_ppm.saturating_div(4).max(1);
-        let distant_full_dup_loss_ppm = self
-            .cfg
-            .repair_loss_start_ppm
-            .saturating_div(2)
-            .max(distant_loss_start_ppm)
-            .min(self.cfg.repair_full_dup_loss_ppm.max(1));
-        if distant_path && quality.loss_ppm() >= distant_full_dup_loss_ppm {
-            return true;
-        }
-        let jitter_start_us = self.cfg.repair_jitter_start_ms.saturating_mul(1_000);
-        let distant_jitter_start_us = jitter_start_us.saturating_div(2).max(1);
-        let normal_trigger = quality.loss_ppm() >= self.cfg.repair_loss_start_ppm
-            || quality.jitter_us() >= jitter_start_us;
-        let distant_trigger = distant_path
-            && (quality.loss_ppm() >= distant_loss_start_ppm
-                || quality.jitter_us() >= distant_jitter_start_us);
-        if !normal_trigger && !distant_trigger {
-            return false;
-        }
+fn proactive_repair_score_micros(
+    cfg: &VoiceConfig,
+    quality: Option<crate::overlay::VoiceRouteQuality>,
+) -> Option<u64> {
+    let quality = quality?;
+    if quality.transport() != TransportKind::Udp {
+        return None;
+    }
+    if quality.loss_ppm() >= cfg.repair_full_dup_loss_ppm {
+        return Some(1_000_000);
+    }
+    let distant_path = quality.path_latency_us() >= DISTANT_REPAIR_PATH_LATENCY_US;
+    let distant_loss_start_ppm = cfg.repair_loss_start_ppm.saturating_div(4).max(1);
+    let distant_full_dup_loss_ppm = cfg
+        .repair_loss_start_ppm
+        .saturating_div(2)
+        .max(distant_loss_start_ppm)
+        .min(cfg.repair_full_dup_loss_ppm.max(1));
+    if distant_path && quality.loss_ppm() >= distant_full_dup_loss_ppm {
+        return Some(1_000_000);
+    }
+    let jitter_start_us = cfg.repair_jitter_start_ms.saturating_mul(1_000);
+    let distant_jitter_start_us = jitter_start_us.saturating_div(2).max(1);
+    let normal_trigger =
+        quality.loss_ppm() >= cfg.repair_loss_start_ppm || quality.jitter_us() >= jitter_start_us;
+    let distant_trigger = distant_path
+        && (quality.loss_ppm() >= distant_loss_start_ppm
+            || quality.jitter_us() >= distant_jitter_start_us);
+    if !normal_trigger && !distant_trigger {
+        return None;
+    }
 
-        let full_loss = if distant_trigger {
-            distant_full_dup_loss_ppm
-        } else {
-            self.cfg.repair_full_dup_loss_ppm.max(1)
-        };
-        let loss_score = (u64::from(quality.loss_ppm()).saturating_mul(1_000_000))
-            .saturating_div(u64::from(full_loss));
-        let jitter_denominator = if distant_trigger {
-            distant_jitter_start_us.saturating_mul(2).max(1)
-        } else {
-            jitter_start_us.saturating_mul(3).max(1)
-        };
-        let jitter_score = if jitter_start_us == 0 {
-            1_000_000
-        } else {
-            quality
-                .jitter_us()
-                .saturating_mul(1_000_000)
-                .saturating_div(jitter_denominator)
-        };
-        let distant_score = if distant_trigger { 500_000 } else { 0 };
-        let score = loss_score
+    let full_loss = if distant_trigger {
+        distant_full_dup_loss_ppm
+    } else {
+        cfg.repair_full_dup_loss_ppm.max(1)
+    };
+    let loss_score = (u64::from(quality.loss_ppm()).saturating_mul(1_000_000))
+        .saturating_div(u64::from(full_loss));
+    let jitter_denominator = if distant_trigger {
+        distant_jitter_start_us.saturating_mul(2).max(1)
+    } else {
+        jitter_start_us.saturating_mul(3).max(1)
+    };
+    let jitter_score = if jitter_start_us == 0 {
+        1_000_000
+    } else {
+        quality
+            .jitter_us()
+            .saturating_mul(1_000_000)
+            .saturating_div(jitter_denominator)
+    };
+    let distant_score = if distant_trigger { 500_000 } else { 0 };
+    Some(
+        loss_score
             .max(jitter_score)
             .max(distant_score)
-            .clamp(1, 1_000_000);
-        let sample = proactive_repair_sample(dst, s2s_seq);
-        sample < score
+            .clamp(1, 1_000_000),
+    )
+}
+
+fn proactive_repair_extra_copy_count(
+    max_extra_copies: usize,
+    score_micros: u64,
+    sample: u64,
+) -> usize {
+    if max_extra_copies == 0 || score_micros == 0 {
+        return 0;
     }
+    let max_extra_copies_u64 = max_extra_copies as u64;
+    let scaled = score_micros
+        .min(1_000_000)
+        .saturating_mul(max_extra_copies_u64);
+    let guaranteed = scaled / 1_000_000;
+    let fractional = u64::from(sample < scaled % 1_000_000);
+    guaranteed
+        .saturating_add(fractional)
+        .min(max_extra_copies_u64) as usize
 }
 
 fn proactive_repair_sample(dst: NodeIdentifier, s2s_seq: u64) -> u64 {
@@ -978,6 +998,30 @@ mod tests {
         assert!(cache_ttl > Duration::from_millis(cfg.repair_cache_ms));
     }
 
+    #[test]
+    fn proactive_repair_copy_count_honors_zero_limit() {
+        assert_eq!(proactive_repair_extra_copy_count(0, 1_000_000, 0), 0);
+        assert_eq!(proactive_repair_extra_copy_count(0, 500_000, 0), 0);
+    }
+
+    #[test]
+    fn proactive_repair_copy_count_matches_old_single_copy_threshold() {
+        assert_eq!(proactive_repair_extra_copy_count(1, 500_000, 499_999), 1);
+        assert_eq!(proactive_repair_extra_copy_count(1, 500_000, 500_000), 0);
+    }
+
+    #[test]
+    fn proactive_repair_copy_count_scales_above_one() {
+        assert_eq!(proactive_repair_extra_copy_count(3, 400_000, 200_000), 1);
+        assert_eq!(proactive_repair_extra_copy_count(3, 400_000, 199_999), 2);
+        assert_eq!(proactive_repair_extra_copy_count(3, 900_000, 699_999), 3);
+    }
+
+    #[test]
+    fn proactive_repair_copy_count_full_score_reaches_limit() {
+        assert_eq!(proactive_repair_extra_copy_count(3, 1_000_000, 999_999), 3);
+    }
+
     #[tokio::test]
     async fn distant_lossy_udp_path_gets_proactive_repair_below_generic_threshold() {
         let transport = FakeVoiceTransport::new(7, vec![2]);
@@ -1013,6 +1057,81 @@ mod tests {
             }
             other => panic!("expected proactive repair frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn high_loss_udp_path_sends_configured_extra_repair_copies() {
+        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let mut cfg = VoiceConfig::default();
+        cfg.repair_max_extra_copies_per_frame = 3;
+        transport.set_voice_route_quality(
+            2,
+            crate::overlay::VoiceRouteQuality::new(
+                2,
+                TransportKind::Udp,
+                20_000,
+                cfg.repair_full_dup_loss_ppm,
+                0,
+            ),
+        );
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
+
+        svc.send_unicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"opus"),
+            normal_intent(5),
+            2,
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 4);
+        assert!(matches!(calls[0], FakeCall::Unicast { .. }));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, FakeCall::RepairFrame { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn high_loss_udp_path_suppresses_proactive_repair_when_limit_is_zero() {
+        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let mut cfg = VoiceConfig::default();
+        cfg.repair_max_extra_copies_per_frame = 0;
+        transport.set_voice_route_quality(
+            2,
+            crate::overlay::VoiceRouteQuality::new(
+                2,
+                TransportKind::Udp,
+                20_000,
+                cfg.repair_full_dup_loss_ppm,
+                0,
+            ),
+        );
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
+
+        svc.send_unicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"opus"),
+            normal_intent(5),
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transport.calls().len(), 1);
     }
 
     #[tokio::test]

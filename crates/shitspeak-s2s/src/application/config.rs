@@ -81,7 +81,7 @@ pub struct VoiceConfig {
     #[serde(default = "default_repair_loss_start_ppm")]
     pub repair_loss_start_ppm: u32,
 
-    /// Send one alternate copy for every frame when UDP loss reaches this.
+    /// Reach the configured proactive copy budget when UDP loss reaches this.
     #[serde(default = "default_repair_full_dup_loss_ppm")]
     pub repair_full_dup_loss_ppm: u32,
 
