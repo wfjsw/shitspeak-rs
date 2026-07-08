@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
@@ -67,6 +70,7 @@ pub struct ClientRepository {
     /// Broadcast channel for per-client subscribers and future S2S peers.
     tx: broadcast::Sender<Arc<ClientStateBroadcastPayload>>,
     deferred_commit_tx: Option<mpsc::UnboundedSender<DeferredClientCommit>>,
+    deferred_commit_pending: Arc<AtomicUsize>,
 }
 
 pub(crate) struct ClientSnapshotWithVersions {
@@ -321,10 +325,12 @@ impl ClientRepository {
             listeners_by_channel: HashMap::new(),
         }));
         let remote_registers = Arc::new(AsyncRwLock::new(HashMap::new()));
+        let deferred_commit_pending = Arc::new(AtomicUsize::new(0));
         let deferred_commit_tx = tokio::runtime::Handle::try_current().ok().map(|handle| {
             let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel::<DeferredClientCommit>();
             let register = Arc::clone(&register);
             let tx = tx.clone();
+            let pending = Arc::clone(&deferred_commit_pending);
             handle.spawn(async move {
                 while let Some(commit) = deferred_rx.recv().await {
                     let broadcast = {
@@ -340,6 +346,7 @@ impl ClientRepository {
                     if let Some(broadcast) = broadcast {
                         let _ = tx.send(broadcast);
                     }
+                    pending.fetch_sub(1, Ordering::AcqRel);
                 }
             });
             deferred_tx
@@ -355,6 +362,7 @@ impl ClientRepository {
             free_ids: ParkingMutex::new(HashMap::new()),
             tx,
             deferred_commit_tx,
+            deferred_commit_pending,
         }
     }
 
@@ -765,6 +773,7 @@ impl ClientRepository {
     }
 
     pub async fn publish_client_in_server(&self, server_id: &str, id: ClientSessionIdentifier) {
+        self.wait_for_deferred_commits().await;
         let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
         let broadcast = {
             let mut register = self.register.write().await;
@@ -877,6 +886,7 @@ impl ClientRepository {
         ban: bool,
         expected_client_instance_id: Option<ClientInstanceId>,
     ) -> Option<Arc<Box<Client>>> {
+        self.wait_for_deferred_commits().await;
         let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
         let local_client = {
             let mut register = self.register.write().await;
@@ -2515,6 +2525,7 @@ impl ClientRepository {
         op: ClientStateOperation,
         channel_version_dep: Option<u64>,
     ) -> Option<Arc<ClientStateBroadcastPayload>> {
+        self.wait_for_deferred_commits().await;
         let broadcast = {
             let mut register = self.register.write().await;
             Self::commit_operation_inner(
@@ -2533,6 +2544,12 @@ impl ClientRepository {
         }
     }
 
+    async fn wait_for_deferred_commits(&self) {
+        while self.deferred_commit_pending.load(Ordering::Acquire) > 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Synchronous version of `commit_operation`.  Safe to call from
     /// `Drop` impls (uses `try_write`).
     pub(crate) fn commit_operation_sync(
@@ -2540,14 +2557,25 @@ impl ClientRepository {
         op: ClientStateOperation,
         channel_version_dep: Option<u64>,
     ) {
+        let mut commit = DeferredClientCommit {
+            op,
+            channel_version_dep,
+        };
+        if self.deferred_commit_pending.load(Ordering::Acquire) > 0 {
+            match self.enqueue_deferred_commit(commit) {
+                Ok(()) => return,
+                Err(returned) => commit = returned,
+            }
+        }
+
         match self.register.try_write() {
             Ok(mut register) => {
                 let Some(broadcast) = Self::commit_operation_inner(
                     &mut register,
                     self.local_node_id,
                     self.log_max_entries,
-                    op,
-                    channel_version_dep,
+                    commit.op,
+                    commit.channel_version_dep,
                 ) else {
                     return;
                 };
@@ -2555,16 +2583,27 @@ impl ClientRepository {
                 let _ = self.tx.send(broadcast);
             }
             Err(_) => {
-                if self.deferred_commit_tx.as_ref().is_some_and(|tx| {
-                    tx.send(DeferredClientCommit {
-                        op,
-                        channel_version_dep,
-                    })
-                    .is_ok()
-                }) {
+                if self.enqueue_deferred_commit(commit).is_ok() {
                     return;
                 }
                 tracing::warn!("client state commit dropped: repository lock contended");
+            }
+        }
+    }
+
+    fn enqueue_deferred_commit(
+        &self,
+        commit: DeferredClientCommit,
+    ) -> Result<(), DeferredClientCommit> {
+        let Some(tx) = self.deferred_commit_tx.as_ref() else {
+            return Err(commit);
+        };
+        self.deferred_commit_pending.fetch_add(1, Ordering::AcqRel);
+        match tx.send(commit) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.deferred_commit_pending.fetch_sub(1, Ordering::AcqRel);
+                Err(error.0)
             }
         }
     }
@@ -3695,7 +3734,6 @@ mod tests {
             gs.set_user_id(Some(7));
         }
         drop(write_guard);
-        tokio::task::yield_now().await;
 
         assert_eq!(repo.current_version(), 0);
         assert!(rx.try_recv().is_err());
@@ -3719,6 +3757,96 @@ mod tests {
         let log = repo.get_log_since(0).await;
         assert_eq!(log.len(), 1);
         assert!(matches!(log[0].op, ClientStateOperation::AddClient { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_commits_wait_for_deferred_global_state_commits() {
+        let repo = Arc::new(ClientRepository::new(1, 128));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30004);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+
+        let client = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, tx)
+            .await;
+        let session = client.get_session_id();
+        repo.publish_client_in_server("alpha", session).await;
+        let base_version = repo.current_version_in_server("alpha");
+
+        let write_guard = repo.register.write().await;
+        {
+            let mut gs = client.write_global_state(&repo);
+            gs.set_current_channel_id(10);
+        }
+        drop(write_guard);
+
+        repo.remove_client_in_server("alpha", session).await;
+
+        let ops: Vec<&'static str> = repo
+            .get_log_since(base_version)
+            .await
+            .iter()
+            .filter_map(|entry| match &entry.op {
+                ClientStateOperation::UpdateGlobalState { delta, .. } => {
+                    assert_eq!(delta.current_channel_id, Some(10));
+                    Some("move")
+                }
+                ClientStateOperation::RemoveClient { .. } => Some("remove"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ops, vec!["move", "remove"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_global_state_commits_keep_fifo_order_after_contention() {
+        let repo = Arc::new(ClientRepository::new(1, 128));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30004);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+
+        let client = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, tx)
+            .await;
+        let session = client.get_session_id();
+        repo.publish_client_in_server("alpha", session).await;
+        let base_version = repo.current_version_in_server("alpha");
+
+        let write_guard = repo.register.write().await;
+        {
+            let mut gs = client.write_global_state(&repo);
+            gs.set_current_channel_id(10);
+        }
+        drop(write_guard);
+        {
+            let mut gs = client.write_global_state(&repo);
+            gs.set_current_channel_id(20);
+        }
+
+        assert_eq!(
+            repo.current_version_in_server("alpha"),
+            base_version,
+            "newer synchronous commits must queue behind a deferred older commit"
+        );
+
+        for _ in 0..10 {
+            if repo.current_version_in_server("alpha") >= base_version + 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(repo.current_version_in_server("alpha"), base_version + 2);
+
+        let moves: Vec<u32> = repo
+            .get_log_since(base_version)
+            .await
+            .into_iter()
+            .filter_map(|entry| match &entry.op {
+                ClientStateOperation::UpdateGlobalState { delta, .. } => delta.current_channel_id,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(moves, vec![10, 20]);
     }
 
     #[tokio::test]
