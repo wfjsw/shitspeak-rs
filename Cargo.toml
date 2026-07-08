@@ -11,6 +11,8 @@ members = [
     "crates/shitspeak-voice",
     "crates/shitspeak-web",
     "crates/message_macro",
+    "vendor/kcp",
+    "vendor/tokio_kcp",
 ]
 resolver = "3"
 
@@ -32,6 +34,7 @@ enumflags2 = { version = "0", features = ["serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 hang = "0.16"
 hex = "0"
+kcp = { path = "vendor/kcp" }
 libc = "0"
 maxminddb = { version = "0", features = ["mmap", "simdutf8"] }
 message_macro = { path = "crates/message_macro" }
@@ -67,7 +70,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0"
 tokio-util = { version = "0.7", features = ["codec"] }
-tokio_kcp = "0"
+tokio_kcp = { path = "vendor/tokio_kcp" }
 tracing = "0.1"
 tracing-appender = { version = "0", features = ["parking_lot"] }
 tracing-subscriber = { version = "0", features = ["parking_lot", "serde", "env-filter", "registry"] }
@@ -120,10 +123,6 @@ zstd = { workspace = true }
 default = []
 web = ["dep:shitspeak-web"]
 moq = ["web", "shitspeak-web/moq"]
-
-[patch.crates-io]
-kcp = { path = "vendor/kcp" }
-tokio_kcp = { path = "vendor/tokio_kcp" }
 
 [[bin]]
 name = "shitspeak-rs"

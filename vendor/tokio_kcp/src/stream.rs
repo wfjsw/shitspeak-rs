@@ -18,7 +18,7 @@ use tokio::{
 use crate::{
     config::KcpConfig,
     session::{KcpSession, KcpStatsHandle},
-    skcp::KcpSocket,
+    skcp::{is_would_block, KcpSocket},
     udp_io::SharedUdpIo,
 };
 
@@ -309,12 +309,28 @@ impl AsyncWrite for KcpStream {
                 Ok(()).into()
             }
             Err(KcpError::IoError(err)) => {
+                if err.kind() == ErrorKind::WouldBlock {
+                    self.session.register_socket_waker(cx.waker());
+                    self.session.update_stats(&kcp);
+                    drop(kcp);
+                    self.session.wake_socket_waiters();
+                    self.session.notify();
+                    return Poll::Pending;
+                }
                 self.session.update_stats(&kcp);
                 drop(kcp);
                 self.session.wake_socket_waiters();
                 Err(err).into()
             }
             Err(err) => {
+                if is_would_block(&err) {
+                    self.session.register_socket_waker(cx.waker());
+                    self.session.update_stats(&kcp);
+                    drop(kcp);
+                    self.session.wake_socket_waiters();
+                    self.session.notify();
+                    return Poll::Pending;
+                }
                 self.session.update_stats(&kcp);
                 drop(kcp);
                 self.session.wake_socket_waiters();

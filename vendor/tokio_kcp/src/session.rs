@@ -19,7 +19,11 @@ use tokio::{
     time::{self, Instant},
 };
 
-use crate::{skcp::KcpSocket, udp_io::SharedUdpIo, KcpConfig};
+use crate::{
+    skcp::{is_would_block, KcpSocket},
+    udp_io::SharedUdpIo,
+    KcpConfig,
+};
 
 pub struct KcpSession {
     socket: Mutex<KcpSocket>,
@@ -313,13 +317,30 @@ impl KcpSession {
                         }
 
                         // If window is full, flush it immediately
+                        let mut retry_soon = false;
                         if socket.need_flush() {
-                            let _ = socket.flush();
+                            match socket.flush() {
+                                Ok(()) => {}
+                                Err(err) if is_would_block(&err) => {
+                                    trace!("[SESSION] KCP flush backpressured; retry scheduled");
+                                    retry_soon = true;
+                                }
+                                Err(err) => {
+                                    error!("[SESSION] KCP flush failed, error: {}", err);
+                                    retry_soon = true;
+                                }
+                            }
                         }
 
-                        if socket.needs_update() {
+                        if retry_soon {
+                            next = Some(Instant::now() + Duration::from_millis(10));
+                        } else if socket.needs_update() {
                             next = Some(match socket.update() {
                                 Ok(next_next) => Instant::from_std(next_next),
+                                Err(err) if is_would_block(&err) => {
+                                    trace!("[SESSION] KCP update backpressured; retry scheduled");
+                                    Instant::now() + Duration::from_millis(10)
+                                }
                                 Err(err) => {
                                     error!("[SESSION] KCP update failed, error: {}", err);
                                     Instant::now() + Duration::from_millis(10)
@@ -425,6 +446,14 @@ impl KcpSession {
         self.input_tx.send(buf.to_owned()).await.map_err(|_| SessionClosedError)
     }
 
+    pub(crate) fn try_input(&self, buf: &[u8]) -> Result<(), SessionInputError> {
+        match self.input_tx.try_send(buf.to_owned()) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SessionInputError::Closed),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SessionInputError::Full),
+        }
+    }
+
     pub async fn conv(&self) -> u32 {
         let socket = self.socket.lock().await;
         socket.conv()
@@ -436,6 +465,12 @@ impl KcpSession {
 }
 
 pub struct SessionClosedError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionInputError {
+    Closed,
+    Full,
+}
 
 struct KcpSessionUniq(Arc<KcpSession>);
 
@@ -558,5 +593,76 @@ impl KcpSessionManager {
                 Ok((session, true))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+
+    use tokio::sync::mpsc;
+
+    use super::{KcpSession, SessionInputError};
+    use crate::{
+        skcp::KcpSocket,
+        udp_io::{KcpUdpIo, SharedUdpIo},
+        KcpConfig,
+    };
+
+    #[derive(Debug)]
+    struct NoopUdpIo;
+
+    #[async_trait::async_trait]
+    impl KcpUdpIo for NoopUdpIo {
+        async fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            std::future::pending().await
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+
+        async fn send_to(&self, buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn try_send_to(&self, buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().expect("socket addr"))
+        }
+    }
+
+    fn packet() -> Vec<u8> {
+        let mut packet = vec![0u8; kcp::KCP_OVERHEAD];
+        kcp::set_conv(&mut packet, 7);
+        packet
+    }
+
+    #[tokio::test]
+    async fn try_input_reports_full_without_waiting() {
+        let udp: SharedUdpIo = Arc::new(NoopUdpIo);
+        let target = "127.0.0.1:9".parse().expect("socket addr");
+        let socket = KcpSocket::new(&KcpConfig::default(), 7, udp, target, false).expect("kcp socket");
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        let session = KcpSession::new_shared(socket, Duration::from_secs(90), Some((close_tx, target)));
+        let _socket_guard = session.kcp_socket().lock().await;
+        let packet = packet();
+
+        let mut saw_full = false;
+        for _ in 0..128 {
+            match session.try_input(&packet) {
+                Ok(()) => {}
+                Err(SessionInputError::Full) => {
+                    saw_full = true;
+                    break;
+                }
+                Err(SessionInputError::Closed) => panic!("session closed unexpectedly"),
+            }
+        }
+
+        assert!(saw_full, "bounded session input queue should report Full");
     }
 }

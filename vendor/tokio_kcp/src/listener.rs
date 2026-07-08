@@ -16,7 +16,12 @@ use tokio::{
     time,
 };
 
-use crate::{config::KcpConfig, session::KcpSessionManager, stream::KcpStream, udp_io::SharedUdpIo};
+use crate::{
+    config::KcpConfig,
+    session::{KcpSessionManager, SessionInputError},
+    stream::KcpStream,
+    udp_io::SharedUdpIo,
+};
 
 #[derive(Debug)]
 pub struct KcpListener {
@@ -64,6 +69,11 @@ impl KcpListener {
 
                     recv_res = udp.recv_from(&mut packet_buffer) => {
                         match recv_res {
+                            Err(err)
+                                if matches!(err.kind(), ErrorKind::ConnectionReset | ErrorKind::Interrupted) =>
+                            {
+                                trace!("udp.recv_from transient failure, error: {}", err);
+                            }
                             Err(err) => {
                                 error!("udp.recv_from failed, error: {}", err);
                                 time::sleep(Duration::from_secs(1)).await;
@@ -146,8 +156,14 @@ impl KcpListener {
                                 // if let Err(err) = kcp.input(packet) {
                                 //     error!("kcp.input failed, peer: {}, conv: {}, error: {}, packet: {:?}", peer_addr, conv, err, ByteStr::new(packet));
                                 // }
-                                if session.input(packet).await.is_err() {
-                                    trace!("[SESSION] KCP session is closing while listener tries to input");
+                                match session.try_input(packet) {
+                                    Ok(()) => {}
+                                    Err(SessionInputError::Closed) => {
+                                        trace!("[SESSION] KCP session is closing while listener tries to input");
+                                    }
+                                    Err(SessionInputError::Full) => {
+                                        trace!("[SESSION] KCP session input queue full; dropping datagram");
+                                    }
                                 }
                             }
                         }
@@ -193,15 +209,21 @@ mod test {
     use futures_util::future;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UdpSocket;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     use super::KcpListener;
-    use crate::{config::KcpConfig, stream::KcpStream};
+    use crate::{
+        config::{KcpConfig, KcpNoDelayConfig},
+        stream::KcpStream,
+    };
 
     async fn send_open_packet(server_addr: std::net::SocketAddr, conv: u32) -> std::io::Result<()> {
+        const KCP_CMD_PUSH: u8 = 81;
+
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let mut packet = vec![0u8; kcp::KCP_OVERHEAD as usize];
         kcp::set_conv(&mut packet, conv);
+        packet[4] = KCP_CMD_PUSH;
         socket.send_to(&packet, server_addr).await?;
         Ok(())
     }
@@ -210,7 +232,10 @@ mod test {
     async fn multi_echo() {
         let _ = env_logger::try_init();
 
-        let config = KcpConfig::default();
+        let mut config = KcpConfig::default();
+        config.nodelay = KcpNoDelayConfig::fastest();
+        config.flush_write = true;
+        config.flush_acks_input = true;
 
         let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -236,23 +261,32 @@ mod test {
 
         let mut vfut = Vec::new();
 
-        for _ in 0..100 {
+        const CLIENTS: usize = 32;
+        const ROUNDS: usize = 10;
+
+        for _ in 0..CLIENTS {
             vfut.push(async move {
-                let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+                timeout(Duration::from_secs(10), async move {
+                    let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
 
-                for _ in 0..20 {
-                    const SEND_BUFFER: &[u8] = b"HELLO WORLD";
-                    stream.write_all(SEND_BUFFER).await.unwrap();
-                    stream.flush().await.unwrap();
+                    for _ in 0..ROUNDS {
+                        const SEND_BUFFER: &[u8] = b"HELLO WORLD";
+                        stream.write_all(SEND_BUFFER).await.unwrap();
+                        stream.flush().await.unwrap();
 
-                    let mut buffer = [0u8; 1024];
-                    let n = stream.recv(&mut buffer).await.unwrap();
-                    assert_eq!(SEND_BUFFER, &buffer[..n]);
-                }
+                        let mut buffer = [0u8; 1024];
+                        let n = stream.recv(&mut buffer).await.unwrap();
+                        assert_eq!(SEND_BUFFER, &buffer[..n]);
+                    }
+                })
+                .await
+                .expect("multi_echo client timed out");
             });
         }
 
-        future::join_all(vfut).await;
+        timeout(Duration::from_secs(20), future::join_all(vfut))
+            .await
+            .expect("multi_echo timed out");
     }
 
     #[tokio::test]

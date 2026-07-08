@@ -130,6 +130,13 @@ impl KcpSegment {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FlushSendReason {
+    Initial,
+    Timeout,
+    FastAck,
+}
+
 #[derive(Default)]
 struct KcpOutput<O: Write>(O);
 
@@ -630,6 +637,22 @@ impl<Output: Write> Kcp<Output> {
         }
     }
 
+    fn contains_unacked_segment(&self, sn: u32) -> bool {
+        if timediff(sn, self.snd_una) < 0 || timediff(sn, self.snd_nxt) >= 0 {
+            return false;
+        }
+
+        for seg in &self.snd_buf {
+            match sn.cmp(&seg.sn) {
+                Ordering::Equal => return true,
+                Ordering::Less => return false,
+                Ordering::Greater => {}
+            }
+        }
+
+        false
+    }
+
     fn parse_una(&mut self, una: u32) {
         while let Some(seg) = self.snd_buf.front() {
             if timediff(una, seg.sn) > 0 {
@@ -789,6 +812,8 @@ impl<Output: Write> Kcp<Output> {
             }
 
             self.rmt_wnd = wnd;
+            let ack_matches_unacked_segment =
+                cmd == KCP_CMD_ACK && self.contains_unacked_segment(sn);
 
             self.parse_una(una);
             self.shrink_buf();
@@ -797,27 +822,31 @@ impl<Output: Write> Kcp<Output> {
 
             match cmd {
                 KCP_CMD_ACK => {
-                    let rtt = timediff(self.current, ts);
-                    if rtt >= 0 {
-                        self.update_ack(rtt as u32);
+                    if ack_matches_unacked_segment {
+                        let rtt = timediff(self.current, ts);
+                        if rtt >= 0 {
+                            self.update_ack(rtt as u32);
+                        }
                     }
                     self.parse_ack(sn);
                     self.shrink_buf();
 
-                    if !flag {
-                        flag = true;
-                        max_ack = sn;
-                        latest_ts = ts;
-                    } else if timediff(sn, max_ack) > 0 {
-                        #[cfg(feature = "fastack-conserve")]
-                        {
+                    if ack_matches_unacked_segment {
+                        if !flag {
+                            flag = true;
                             max_ack = sn;
                             latest_ts = ts;
-                        }
-                        #[cfg(not(feature = "fastack-conserve"))]
-                        if timediff(ts, latest_ts) > 0 {
-                            max_ack = sn;
-                            latest_ts = ts;
+                        } else if timediff(sn, max_ack) > 0 {
+                            #[cfg(feature = "fastack-conserve")]
+                            {
+                                max_ack = sn;
+                                latest_ts = ts;
+                            }
+                            #[cfg(not(feature = "fastack-conserve"))]
+                            if timediff(ts, latest_ts) > 0 {
+                                max_ack = sn;
+                                latest_ts = ts;
+                            }
                         }
                     }
 
@@ -914,16 +943,25 @@ impl<Output: Write> Kcp<Output> {
     fn _flush_ack(&mut self, segment: &mut KcpSegment) -> KcpResult<()> {
         // flush acknowledges
         // while let Some((sn, ts)) = self.acklist.pop_front() {
-        for &(sn, ts) in &self.acklist {
+        for i in 0..self.acklist.len() {
+            let (sn, ts) = self.acklist[i];
             if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
-                self.output.write_all(&self.buf)?;
-                self.buf.clear();
+                self.flush_output_buffer()?;
             }
             segment.sn = sn;
             segment.ts = ts;
             segment.encode(&mut self.buf);
         }
         self.acklist.clear();
+
+        Ok(())
+    }
+
+    fn flush_output_buffer(&mut self) -> KcpResult<()> {
+        if !self.buf.is_empty() {
+            self.output.write_all(&self.buf)?;
+            self.buf.clear();
+        }
 
         Ok(())
     }
@@ -959,8 +997,7 @@ impl<Output: Write> Kcp<Output> {
     fn _flush_probe_commands(&mut self, cmd: u8, segment: &mut KcpSegment) -> KcpResult<()> {
         segment.cmd = cmd;
         if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
-            self.output.write_all(&self.buf)?;
-            self.buf.clear();
+            self.flush_output_buffer()?;
         }
         segment.encode(&mut self.buf);
         Ok(())
@@ -986,6 +1023,7 @@ impl<Output: Write> Kcp<Output> {
             debug!("flush updated() must be called at least once");
             return Err(Error::NeedUpdate);
         }
+        self.flush_output_buffer()?;
 
         let mut segment = KcpSegment {
             conv: self.conv,
@@ -995,7 +1033,8 @@ impl<Output: Write> Kcp<Output> {
             ..Default::default()
         };
 
-        self._flush_ack(&mut segment)
+        self._flush_ack(&mut segment)?;
+        self.flush_output_buffer()
     }
 
     /// Flush pending data in buffer.
@@ -1004,6 +1043,7 @@ impl<Output: Write> Kcp<Output> {
             debug!("flush updated() must be called at least once");
             return Err(Error::NeedUpdate);
         }
+        self.flush_output_buffer()?;
 
         let mut segment = KcpSegment {
             conv: self.conv,
@@ -1058,30 +1098,52 @@ impl<Output: Write> Kcp<Output> {
         let mut lost = false;
         let mut change = 0;
 
-        for snd_segment in &mut self.snd_buf {
-            let mut need_send = false;
-
-            if snd_segment.xmit == 0 {
-                need_send = true;
-                snd_segment.xmit += 1;
-                snd_segment.rto = self.rx_rto;
-                snd_segment.resendts = self.current + snd_segment.rto + rtomin;
-            } else if timediff(self.current, snd_segment.resendts) >= 0 {
-                need_send = true;
-                self.lost_segments = self.lost_segments.saturating_add(1);
-                snd_segment.xmit += 1;
-                self.xmit += 1;
-                if !self.nodelay {
-                    snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
+        for i in 0..self.snd_buf.len() {
+            let send_reason = {
+                let snd_segment = &self.snd_buf[i];
+                if snd_segment.xmit == 0 {
+                    Some(FlushSendReason::Initial)
+                } else if timediff(self.current, snd_segment.resendts) >= 0 {
+                    Some(FlushSendReason::Timeout)
+                } else if snd_segment.fastack >= resent
+                    && (snd_segment.xmit <= self.fastlimit || self.fastlimit <= 0)
+                {
+                    Some(FlushSendReason::FastAck)
                 } else {
-                    let step = snd_segment.rto; // (kcp->nodelay < 2) ? ((IINT32)(segment->rto)) : kcp->rx_rto;
-                    snd_segment.rto += step / 2;
+                    None
                 }
-                snd_segment.resendts = self.current + snd_segment.rto;
-                lost = true;
-            } else if snd_segment.fastack >= resent {
-                if snd_segment.xmit <= self.fastlimit || self.fastlimit <= 0 {
-                    need_send = true;
+            };
+
+            let Some(send_reason) = send_reason else {
+                continue;
+            };
+
+            let need = KCP_OVERHEAD as usize + self.snd_buf[i].data.len();
+            if self.buf.len() + need > self.mtu as usize {
+                self.flush_output_buffer()?;
+            }
+
+            let snd_segment = self.snd_buf.get_mut(i).expect("send buffer index");
+            match send_reason {
+                FlushSendReason::Initial => {
+                    snd_segment.xmit += 1;
+                    snd_segment.rto = self.rx_rto;
+                    snd_segment.resendts = self.current + snd_segment.rto + rtomin;
+                }
+                FlushSendReason::Timeout => {
+                    self.lost_segments = self.lost_segments.saturating_add(1);
+                    snd_segment.xmit += 1;
+                    self.xmit += 1;
+                    if !self.nodelay {
+                        snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
+                    } else {
+                        let step = snd_segment.rto; // (kcp->nodelay < 2) ? ((IINT32)(segment->rto)) : kcp->rx_rto;
+                        snd_segment.rto += step / 2;
+                    }
+                    snd_segment.resendts = self.current + snd_segment.rto;
+                    lost = true;
+                }
+                FlushSendReason::FastAck => {
                     self.lost_segments = self.lost_segments.saturating_add(1);
                     snd_segment.xmit += 1;
                     snd_segment.fastack = 0;
@@ -1090,32 +1152,19 @@ impl<Output: Write> Kcp<Output> {
                 }
             }
 
-            if need_send {
-                self.sent_segments = self.sent_segments.saturating_add(1);
-                snd_segment.ts = self.current;
-                snd_segment.wnd = segment.wnd;
-                snd_segment.una = self.rcv_nxt;
+            self.sent_segments = self.sent_segments.saturating_add(1);
+            snd_segment.ts = self.current;
+            snd_segment.wnd = segment.wnd;
+            snd_segment.una = self.rcv_nxt;
+            snd_segment.encode(&mut self.buf);
 
-                let need = KCP_OVERHEAD as usize + snd_segment.data.len();
-
-                if self.buf.len() + need > self.mtu as usize {
-                    self.output.write_all(&self.buf)?;
-                    self.buf.clear();
-                }
-
-                snd_segment.encode(&mut self.buf);
-
-                if snd_segment.xmit >= self.dead_link {
-                    self.state = -1; // (IUINT32)-1
-                }
+            if snd_segment.xmit >= self.dead_link {
+                self.state = -1; // (IUINT32)-1
             }
         }
 
         // Flush all data in buffer
-        if !self.buf.is_empty() {
-            self.output.write_all(&self.buf)?;
-            self.buf.clear();
-        }
+        self.flush_output_buffer()?;
 
         // update ssthresh
         if change > 0 {
@@ -1375,7 +1424,10 @@ impl<Output: Write> Kcp<Output> {
 
 #[cfg(test)]
 mod stats_tests {
-    use super::{Kcp, KCP_CMD_ACK};
+    use super::{Kcp, KCP_CMD_ACK, KCP_CMD_PUSH, KCP_OVERHEAD};
+    use std::cell::RefCell;
+    use std::io::{self, ErrorKind, Write};
+    use std::rc::Rc;
 
     fn ack_packet(conv: u32, ts: u32, sn: u32, una: u32) -> Vec<u8> {
         let mut packet = Vec::with_capacity(super::KCP_OVERHEAD);
@@ -1388,6 +1440,70 @@ mod stats_tests {
         packet.extend_from_slice(&una.to_le_bytes());
         packet.extend_from_slice(&0u32.to_le_bytes());
         packet
+    }
+
+    fn push_packet(conv: u32, ts: u32, sn: u32, una: u32, data: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(super::KCP_OVERHEAD + data.len());
+        packet.extend_from_slice(&conv.to_le_bytes());
+        packet.push(KCP_CMD_PUSH);
+        packet.push(0);
+        packet.extend_from_slice(&128u16.to_le_bytes());
+        packet.extend_from_slice(&ts.to_le_bytes());
+        packet.extend_from_slice(&sn.to_le_bytes());
+        packet.extend_from_slice(&una.to_le_bytes());
+        packet.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        packet.extend_from_slice(data);
+        packet
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedOutput {
+        inner: Rc<RefCell<SharedOutputState>>,
+    }
+
+    #[derive(Default)]
+    struct SharedOutputState {
+        packets: Vec<Vec<u8>>,
+        fail_writes: usize,
+    }
+
+    impl SharedOutput {
+        fn with_fail_writes(fail_writes: usize) -> Self {
+            Self {
+                inner: Rc::new(RefCell::new(SharedOutputState {
+                    packets: Vec::new(),
+                    fail_writes,
+                })),
+            }
+        }
+
+        fn packets(&self) -> Vec<Vec<u8>> {
+            self.inner.borrow().packets.clone()
+        }
+    }
+
+    impl Write for SharedOutput {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            let mut inner = self.inner.borrow_mut();
+            if inner.fail_writes > 0 {
+                inner.fail_writes -= 1;
+                return Err(io::Error::from(ErrorKind::WouldBlock));
+            }
+            inner.packets.push(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn packet_cmd(packet: &[u8]) -> u8 {
+        packet[4]
+    }
+
+    fn packet_sn(packet: &[u8]) -> u32 {
+        u32::from_le_bytes(packet[12..16].try_into().expect("packet sn"))
     }
 
     #[test]
@@ -1424,12 +1540,123 @@ mod stats_tests {
     #[test]
     fn stats_report_ack_rtt_state() {
         let mut kcp = Kcp::new(7, Vec::new());
+        kcp.update(100).unwrap();
+        kcp.send(b"hello").unwrap();
+        kcp.flush().unwrap();
         kcp.set_current(137);
         kcp.input(&ack_packet(7, 100, 0, 0)).unwrap();
 
         let stats = kcp.stats();
         assert_eq!(stats.srtt_ms(), Some(37));
         assert_eq!(stats.rto_ms(), 137);
+        assert_eq!(stats.rtt_sample_count(), 1);
+    }
+
+    #[test]
+    fn flush_ack_writes_final_buffer() {
+        let output = SharedOutput::default();
+        let capture = output.clone();
+        let mut kcp = Kcp::new(7, output);
+        kcp.update(10).unwrap();
+        kcp.input(&push_packet(7, 5, 0, 0, b"hello")).unwrap();
+
+        kcp.flush_ack().unwrap();
+
+        let packets = capture.packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].len(), KCP_OVERHEAD);
+        assert_eq!(packet_cmd(&packets[0]), KCP_CMD_ACK);
+        assert_eq!(packet_sn(&packets[0]), 0);
+    }
+
+    #[test]
+    fn flush_ack_preserves_buffer_after_wouldblock() {
+        let output = SharedOutput::with_fail_writes(1);
+        let capture = output.clone();
+        let mut kcp = Kcp::new(7, output);
+        kcp.update(10).unwrap();
+        kcp.input(&push_packet(7, 5, 0, 0, b"hello")).unwrap();
+
+        let err = kcp
+            .flush_ack()
+            .expect_err("first ACK flush should be backpressured");
+        assert!(
+            matches!(err, super::Error::IoError(ref io_err) if io_err.kind() == ErrorKind::WouldBlock)
+        );
+        assert!(capture.packets().is_empty());
+
+        kcp.flush_ack().unwrap();
+
+        let packets = capture.packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packet_cmd(&packets[0]), KCP_CMD_ACK);
+        assert_eq!(packet_sn(&packets[0]), 0);
+    }
+
+    #[test]
+    fn data_flush_wouldblock_before_split_segment_does_not_mark_it_sent() {
+        let output = SharedOutput::with_fail_writes(1);
+        let capture = output.clone();
+        let mut kcp = Kcp::new(7, output);
+        kcp.set_mtu(50).unwrap();
+        kcp.set_nodelay(false, 40, 0, true);
+        kcp.update(10).unwrap();
+        let payload = vec![7; kcp.mss * 2];
+        kcp.send(&payload).unwrap();
+
+        let err = kcp
+            .flush()
+            .expect_err("first datagram split should be backpressured");
+        assert!(
+            matches!(err, super::Error::IoError(ref io_err) if io_err.kind() == ErrorKind::WouldBlock)
+        );
+        assert!(capture.packets().is_empty());
+        assert_eq!(kcp.snd_buf.len(), 2);
+        assert_eq!(kcp.snd_buf[0].xmit, 1);
+        assert_eq!(kcp.snd_buf[1].xmit, 0);
+        assert_eq!(kcp.stats().sent_segments(), 1);
+
+        kcp.flush().unwrap();
+
+        let packets = capture.packets();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packet_sn(&packets[0]), 0);
+        assert_eq!(packet_sn(&packets[1]), 1);
+        assert_eq!(kcp.snd_buf[1].xmit, 1);
+        assert_eq!(kcp.stats().sent_segments(), 2);
+    }
+
+    #[test]
+    fn stale_ack_does_not_update_rtt() {
+        let mut kcp = Kcp::new(7, Vec::new());
+        kcp.update(100).unwrap();
+        kcp.send(b"hello").unwrap();
+        kcp.flush().unwrap();
+        kcp.set_current(137);
+        kcp.input(&ack_packet(7, 100, 0, 0)).unwrap();
+        let stats = kcp.stats();
+
+        kcp.set_current(10_000);
+        kcp.input(&ack_packet(7, 100, 0, 0)).unwrap();
+
+        let after = kcp.stats();
+        assert_eq!(after.rtt_sample_count(), stats.rtt_sample_count());
+        assert_eq!(after.srtt_ms(), stats.srtt_ms());
+        assert_eq!(after.rto_ms(), stats.rto_ms());
+    }
+
+    #[test]
+    fn cumulative_ack_still_updates_rtt() {
+        let mut kcp = Kcp::new(7, Vec::new());
+        kcp.update(100).unwrap();
+        kcp.send(b"hello").unwrap();
+        kcp.flush().unwrap();
+
+        kcp.set_current(150);
+        kcp.input(&ack_packet(7, 100, 0, 1)).unwrap();
+
+        let stats = kcp.stats();
+        assert_eq!(stats.srtt_ms(), Some(50));
         assert_eq!(stats.rtt_sample_count(), 1);
     }
 }

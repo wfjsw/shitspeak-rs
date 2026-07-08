@@ -29,10 +29,8 @@ impl Write for UdpOutput {
         match self.socket.try_send_to(buf, self.target_addr) {
             Ok(n) => Ok(n),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-                // send return EAGAIN
-                // treated as packet loss/backpressure; KCP may retransmit.
-                trace!("[SEND] UDP send EAGAIN, packet.size: {} bytes, dropped", buf.len());
-                Ok(buf.len())
+                trace!("[SEND] UDP send EAGAIN, packet.size: {} bytes, retry later", buf.len());
+                Err(io::Error::from(ErrorKind::WouldBlock))
             }
             Err(err) => Err(err),
         }
@@ -41,6 +39,10 @@ impl Write for UdpOutput {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+pub(crate) fn is_would_block(err: &KcpError) -> bool {
+    matches!(err, KcpError::IoError(io_err) if io_err.kind() == ErrorKind::WouldBlock)
 }
 
 #[cfg(test)]
@@ -84,7 +86,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn would_block_send_is_dropped_instead_of_deferred() {
+    async fn would_block_send_is_reported_instead_of_dropped() {
         let async_send_calls = Arc::new(AtomicUsize::new(0));
         let socket: SharedUdpIo = Arc::new(BlockingUdpIo {
             async_send_calls: async_send_calls.clone(),
@@ -92,7 +94,10 @@ mod tests {
         let target = "127.0.0.1:9".parse().expect("socket addr");
         let mut output = UdpOutput::new(socket, target);
 
-        assert_eq!(output.write(b"kcp packet").expect("write"), 10);
+        let err = output
+            .write(b"kcp packet")
+            .expect_err("write should report backpressure");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -167,7 +172,14 @@ impl KcpSocket {
         self.last_update = Instant::now();
 
         if self.flush_ack_input {
-            self.kcp.flush_ack()?;
+            match self.kcp.flush_ack() {
+                Ok(()) => {}
+                Err(err) if is_would_block(&err) => {
+                    self.pending_update = true;
+                    trace!("[INPUT] ACK flush backpressured; retry scheduled");
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             self.pending_update = true;
         }
@@ -212,15 +224,24 @@ impl KcpSocket {
         let n = self.kcp.send(buf)?;
         self.sent_first = true;
         self.pending_update = true;
-
-        if self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize {
-            self.flush()?;
-        }
-
         self.last_update = Instant::now();
 
+        if self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize {
+            if let Err(err) = self.flush() {
+                if is_would_block(&err) {
+                    return Ok(n).into();
+                }
+                return Err(err).into();
+            }
+        }
+
         if self.flush_write {
-            self.flush()?;
+            if let Err(err) = self.flush() {
+                if is_would_block(&err) {
+                    return Ok(n).into();
+                }
+                return Err(err).into();
+            }
         }
 
         Ok(n).into()
@@ -285,10 +306,19 @@ impl KcpSocket {
 
     pub fn flush(&mut self) -> KcpResult<()> {
         self.refresh_current();
-        self.kcp.flush()?;
-        self.pending_update = self.kcp.wait_snd() > 0 || self.kcp.waiting_conv();
-        self.last_update = Instant::now();
-        Ok(())
+        match self.kcp.flush() {
+            Ok(()) => {
+                self.pending_update = self.kcp.wait_snd() > 0 || self.kcp.waiting_conv();
+                self.last_update = Instant::now();
+                Ok(())
+            }
+            Err(err) => {
+                if is_would_block(&err) {
+                    self.pending_update = true;
+                }
+                Err(err)
+            }
+        }
     }
 
     fn refresh_current(&mut self) {
@@ -395,16 +425,20 @@ impl KcpSocket {
 #[cfg(test)]
 mod test {
 
+    use futures_util::task::noop_waker_ref;
     use kcp::Error as KcpError;
     use log::trace;
     use std::{
         convert::TryInto,
         io::{self, ErrorKind},
         net::SocketAddr,
+        pin::Pin,
         sync::{Arc, Mutex as StdMutex},
+        task::{Context, Poll},
         time::Duration,
     };
     use tokio::{
+        io::AsyncWrite,
         net::UdpSocket,
         sync::Mutex,
         time::{self, Instant},
@@ -413,6 +447,8 @@ mod test {
     use super::KcpSocket;
     use crate::{
         config::{KcpConfig, KcpNoDelayConfig},
+        session::KcpSession,
+        stream::KcpStream,
         udp_io::{KcpUdpIo, SharedUdpIo},
         utils::now_millis,
     };
@@ -423,12 +459,31 @@ mod test {
 
     #[derive(Debug, Default)]
     struct CapturingUdpIo {
-        sent: StdMutex<Vec<Vec<u8>>>,
+        state: StdMutex<CapturingUdpState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingUdpState {
+        sent: Vec<Vec<u8>>,
+        fail_sends: usize,
     }
 
     impl CapturingUdpIo {
+        fn with_fail_sends(fail_sends: usize) -> Self {
+            Self {
+                state: StdMutex::new(CapturingUdpState {
+                    sent: Vec::new(),
+                    fail_sends,
+                }),
+            }
+        }
+
         fn take_sent(&self) -> Vec<Vec<u8>> {
-            std::mem::take(&mut *self.sent.lock().expect("capture lock poisoned"))
+            std::mem::take(&mut self.state.lock().expect("capture lock poisoned").sent)
+        }
+
+        fn set_fail_sends(&self, fail_sends: usize) {
+            self.state.lock().expect("capture lock poisoned").fail_sends = fail_sends;
         }
     }
 
@@ -447,7 +502,12 @@ mod test {
         }
 
         fn try_send_to(&self, buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
-            self.sent.lock().expect("capture lock poisoned").push(buf.to_vec());
+            let mut state = self.state.lock().expect("capture lock poisoned");
+            if state.fail_sends > 0 {
+                state.fail_sends -= 1;
+                return Err(io::Error::from(ErrorKind::WouldBlock));
+            }
+            state.sent.push(buf.to_vec());
             Ok(buf.len())
         }
 
@@ -478,6 +538,12 @@ mod test {
         )
     }
 
+    fn capturing_socket_with_io(config: &KcpConfig, capture: Arc<CapturingUdpIo>) -> KcpSocket {
+        let udp: SharedUdpIo = capture;
+        let target = TEST_TARGET.parse().expect("socket addr");
+        KcpSocket::new(config, TEST_CONV, udp, target, true).expect("kcp socket")
+    }
+
     fn packet_ts(packet: &[u8]) -> u32 {
         u32::from_le_bytes(packet[8..12].try_into().expect("packet timestamp"))
     }
@@ -493,6 +559,10 @@ mod test {
         packet.extend_from_slice(&una.to_le_bytes());
         packet.extend_from_slice(&0u32.to_le_bytes());
         packet
+    }
+
+    fn packet_cmd(packet: &[u8]) -> u8 {
+        packet[4]
     }
 
     #[tokio::test]
@@ -570,6 +640,83 @@ mod test {
         time::sleep_until(Instant::from_std(next)).await;
         receiver.update().unwrap();
         assert!(!receiver.pending_update);
+    }
+
+    #[tokio::test]
+    async fn flush_acks_input_emits_ack_immediately() {
+        let sender_config = realtime_test_config();
+        let mut receiver_config = realtime_test_config();
+        receiver_config.flush_acks_input = true;
+        let (mut sender, sender_capture) = capturing_socket(&sender_config);
+        let (mut receiver, receiver_capture) = capturing_socket(&receiver_config);
+
+        sender.send(b"needs ack").await.unwrap();
+        let packets = sender_capture.take_sent();
+        assert_eq!(packets.len(), 1);
+
+        receiver.input(&packets[0]).unwrap();
+
+        let ack_packets = receiver_capture.take_sent();
+        assert_eq!(ack_packets.len(), 1);
+        assert_eq!(packet_cmd(&ack_packets[0]), KCP_CMD_ACK);
+    }
+
+    #[tokio::test]
+    async fn poll_send_accepts_bytes_when_immediate_flush_is_backpressured() {
+        let config = realtime_test_config();
+        let capture = Arc::new(CapturingUdpIo::with_fail_sends(1));
+        let mut socket = capturing_socket_with_io(&config, capture.clone());
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        match socket.poll_send(&mut cx, b"backpressured") {
+            Poll::Ready(Ok(n)) => assert_eq!(n, b"backpressured".len()),
+            other => panic!("expected accepted write, got {:?}", other),
+        }
+        assert!(socket.pending_update);
+        assert!(capture.take_sent().is_empty());
+
+        socket.flush().unwrap();
+
+        let packets = capture.take_sent();
+        assert_eq!(packets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_poll_flush_is_pending_until_backpressured_packet_retries() {
+        let config = realtime_test_config();
+        let capture = Arc::new(CapturingUdpIo::with_fail_sends(usize::MAX / 2));
+        let socket = capturing_socket_with_io(&config, capture.clone());
+        let session = KcpSession::new_shared(socket, Duration::from_secs(90), None);
+        let mut stream = KcpStream::with_session(session);
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        match Pin::new(&mut stream).poll_write(&mut cx, b"retry me") {
+            Poll::Ready(Ok(n)) => assert_eq!(n, b"retry me".len()),
+            other => panic!("expected accepted stream write, got {:?}", other),
+        }
+        assert!(capture.take_sent().is_empty());
+
+        match Pin::new(&mut stream).poll_flush(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("expected backpressured flush to be pending, got {:?}", other),
+        }
+        assert!(capture.take_sent().is_empty());
+
+        capture.set_fail_sends(0);
+        for _ in 0..5 {
+            match Pin::new(&mut stream).poll_flush(&mut cx) {
+                Poll::Ready(Ok(())) => {
+                    assert_eq!(capture.take_sent().len(), 1);
+                    return;
+                }
+                Poll::Pending => tokio::task::yield_now().await,
+                other => panic!("expected pending or successful retry, got {:?}", other),
+            }
+        }
+
+        panic!("backpressured flush did not retry successfully");
     }
 
     #[tokio::test]
