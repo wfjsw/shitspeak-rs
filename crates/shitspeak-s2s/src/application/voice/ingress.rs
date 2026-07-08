@@ -306,7 +306,7 @@ impl VoiceService {
                     .recipient_index
                     .read()
                     .as_ref()
-                    .and_then(|idx| idx.lookup_nodes_for(channel_id));
+                    .and_then(|idx| idx.lookup_nodes_for_in_server(&server_id, channel_id));
                 match nodes {
                     Some(nodes) if !nodes.is_empty() => {
                         let local = self.transport.local_node_id();
@@ -331,6 +331,7 @@ impl VoiceService {
                     _ => {
                         // No index entry yet — degrade safely to broadcast.
                         trace!(
+                            server_id = %server_id,
                             channel_id,
                             "voice targeted: no index entry; falling back to broadcast"
                         );
@@ -381,7 +382,7 @@ impl VoiceService {
                     let index_guard = self.recipient_index.read();
                     if let Some(index) = index_guard.as_ref() {
                         for &channel_id in channel_ids {
-                            match index.lookup_nodes_for(channel_id) {
+                            match index.lookup_nodes_for_in_server(&server_id, channel_id) {
                                 Some(channel_nodes) => nodes.extend(channel_nodes),
                                 None => {
                                     missing_channel = Some(channel_id);
@@ -396,6 +397,7 @@ impl VoiceService {
 
                 if let Some(channel_id) = missing_channel {
                     trace!(
+                        server_id = %server_id,
                         channel_id,
                         "voice targeted: incomplete target channel index; falling back to broadcast"
                     );
@@ -1288,6 +1290,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_for_channel_targeted_scopes_index_by_server_id() {
+        use crate::application::voice::targeted::RecipientIndex;
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service_with_strategy(transport.clone(), "targeted");
+        let idx = RecipientIndex::new();
+        idx.add_in_server("alpha", 5, 1);
+        idx.add_in_server("beta", 5, 2);
+        idx.add_in_server("beta", 5, 7);
+        svc.set_recipient_index(idx);
+
+        svc.send_for_channel(0xABC, "beta".to_owned(), 5, false, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            FakeCall::Multicast { dsts, body } => {
+                assert_eq!(dsts, &vec![2]);
+                let frame = proto::decode_voice(body.as_ref()).unwrap();
+                assert_eq!(frame.server_id, "beta");
+            }
+            other => panic!("expected Multicast, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn send_for_target_channels_targeted_preserves_shout_intent() {
         use crate::application::proto::{VoiceIntentKind, VoiceIntentTarget, VoiceTargetChannel};
         use crate::application::voice::targeted::RecipientIndex;
@@ -1380,6 +1409,51 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         assert!(matches!(calls[0], FakeCall::Multicast { .. }));
+    }
+
+    #[tokio::test]
+    async fn send_for_target_channels_targeted_missing_channel_is_server_scoped() {
+        use crate::application::proto::{VoiceIntentKind, VoiceIntentTarget, VoiceTargetChannel};
+        use crate::application::voice::targeted::RecipientIndex;
+
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service_with_strategy(transport.clone(), "targeted");
+        let idx = RecipientIndex::new();
+        idx.add_in_server("alpha", 5, 1);
+        idx.add_in_server("alpha", 6, 1);
+        idx.add_in_server("beta", 5, 2);
+        svc.set_recipient_index(idx);
+
+        let intent = VoiceIntent {
+            kind: Some(VoiceIntentKind::Target(VoiceIntentTarget {
+                source_channel: 5,
+                sessions: Vec::new(),
+                channels: vec![VoiceTargetChannel {
+                    id: 5,
+                    children: false,
+                    links: false,
+                    group: String::new(),
+                }],
+            })),
+        };
+        svc.send_for_target_channels(
+            0xABC,
+            "beta".to_owned(),
+            &[5, 6],
+            1,
+            false,
+            Bytes::from_static(b"shout"),
+            intent,
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            matches!(calls[0], FakeCall::Multicast { .. }),
+            "missing beta channel 6 should fall back despite alpha channel 6 existing"
+        );
     }
 
     #[tokio::test]

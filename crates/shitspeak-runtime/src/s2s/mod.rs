@@ -34,7 +34,7 @@ use shitspeak_s2s::application::proto::{
     ModerationCommand, ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope,
     UserRemovePatch, UserStatePatch, UserStatsReply, VoiceFrame, VoiceIntent,
 };
-use shitspeak_s2s::application::voice::{AudioSink, RecipientIndex};
+use shitspeak_s2s::application::voice::{AudioSink, RecipientIndex, RecipientIndexSnapshot};
 use shitspeak_s2s::overlay as s2s_overlay;
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::replications as s2s_replications;
@@ -190,7 +190,7 @@ enum NativeToS2SCommand {
         respond: oneshot::Sender<bool>,
     },
     ProposeClientReplication(ClientStateLogEntry),
-    RefreshVoiceRecipientIndex(HashMap<u32, BTreeSet<NodeIdentifier>>),
+    RefreshVoiceRecipientIndex(RecipientIndexSnapshot),
     DispatchPluginData {
         owner: NodeIdentifier,
         envelope: PluginDataEnvelope,
@@ -339,15 +339,18 @@ fn estimate_client_replication_entry(entry: &ClientStateLogEntry) -> usize {
     )
 }
 
-fn estimate_recipient_index_snapshot(snapshot: &HashMap<u32, BTreeSet<NodeIdentifier>>) -> usize {
+fn estimate_recipient_index_snapshot(snapshot: &RecipientIndexSnapshot) -> usize {
     snapshot
-        .values()
-        .map(|nodes| {
-            S2S_GATEWAY_COMMAND_OVERHEAD_BYTES.saturating_add(
-                nodes
-                    .len()
-                    .saturating_mul(std::mem::size_of::<NodeIdentifier>()),
-            )
+        .iter()
+        .map(|(key, nodes)| {
+            S2S_GATEWAY_COMMAND_OVERHEAD_BYTES
+                .saturating_add(key.server_id().len())
+                .saturating_add(std::mem::size_of::<u32>())
+                .saturating_add(
+                    nodes
+                        .len()
+                        .saturating_mul(std::mem::size_of::<NodeIdentifier>()),
+                )
         })
         .sum::<usize>()
         .max(S2S_GATEWAY_COMMAND_OVERHEAD_BYTES)
@@ -2292,10 +2295,6 @@ fn spawn_native_voice_recipient_index_bridge(
 }
 
 fn client_entry_affects_voice_recipient_index(entry: &ClientStateLogEntry) -> bool {
-    if entry.op.server_id() != DEFAULT_SERVER_ID {
-        return false;
-    }
-
     match &entry.op {
         ClientStateOperation::AddClient { .. } | ClientStateOperation::RemoveClient { .. } => true,
         ClientStateOperation::UpdateGlobalState { delta, .. } => {
@@ -4157,7 +4156,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_recipient_index_filter_ignores_non_default_server_scopes() {
+    fn voice_recipient_index_filter_detects_non_default_server_scopes() {
         let entry = ClientStateLogEntry {
             version: 1,
             node_id: 1,
@@ -4175,7 +4174,7 @@ mod tests {
             },
         };
 
-        assert!(!client_entry_affects_voice_recipient_index(&entry));
+        assert!(client_entry_affects_voice_recipient_index(&entry));
     }
 
     fn test_channel_repo(node_id: u16) -> Arc<ChannelRepository> {

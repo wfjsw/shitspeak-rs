@@ -12,6 +12,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{RwLock as AsyncRwLock, broadcast, mpsc};
 use tokio_rustls::server::TlsStream;
 
+use shitspeak_s2s::application::voice::{RecipientIndexKey, RecipientIndexSnapshot};
+
 use crate::{
     client::{
         Client, ClientInstanceId, ClientStateSubscription,
@@ -1609,24 +1611,21 @@ impl ClientRepository {
 
     /// Build a channel/listener interest snapshot for S2S voice node targeting.
     /// Local and replicated remote clients are included by their owning node id.
-    pub async fn voice_recipient_index_snapshot(
-        &self,
-    ) -> std::collections::HashMap<u32, std::collections::BTreeSet<u16>> {
-        let mut snapshot: std::collections::HashMap<u32, std::collections::BTreeSet<u16>> =
-            std::collections::HashMap::new();
+    pub async fn voice_recipient_index_snapshot(&self) -> RecipientIndexSnapshot {
+        let mut snapshot = RecipientIndexSnapshot::new();
         {
             let register = self.register.read().await;
             for (id, client) in &register.local_clients {
-                if id.server_id() != DEFAULT_SERVER_ID {
-                    continue;
-                }
                 snapshot
-                    .entry(client.get_current_channel_id())
+                    .entry(RecipientIndexKey::new(
+                        id.server_id(),
+                        client.get_current_channel_id(),
+                    ))
                     .or_default()
                     .insert(id.session_id().get_node_id());
                 for listener_channel in client.get_listening_channel_ids() {
                     snapshot
-                        .entry(listener_channel)
+                        .entry(RecipientIndexKey::new(id.server_id(), listener_channel))
                         .or_default()
                         .insert(id.session_id().get_node_id());
                 }
@@ -1634,16 +1633,16 @@ impl ClientRepository {
         }
         for (_, register) in self.remote_register_snapshots().await {
             for (id, client) in &register.read().await.clients {
-                if id.server_id() != DEFAULT_SERVER_ID {
-                    continue;
-                }
                 snapshot
-                    .entry(client.get_current_channel_id())
+                    .entry(RecipientIndexKey::new(
+                        id.server_id(),
+                        client.get_current_channel_id(),
+                    ))
                     .or_default()
                     .insert(id.session_id().get_node_id());
                 for listener_channel in client.get_listening_channel_ids() {
                     snapshot
-                        .entry(listener_channel)
+                        .entry(RecipientIndexKey::new(id.server_id(), listener_channel))
                         .or_default()
                         .insert(id.session_id().get_node_id());
                 }
@@ -3452,6 +3451,68 @@ mod tests {
                 .is_some()
         );
         assert!(stale_remove.to_message(&repo).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_recipient_index_snapshot_is_scoped_to_all_servers() {
+        let repo = ClientRepository::new(1, 128);
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+        let peer_alpha = SocketAddr::new(real_ip, 30001);
+        let peer_beta = SocketAddr::new(real_ip, 30002);
+        let (tx_alpha, _rx_alpha) = tokio::sync::mpsc::channel(8);
+        let (tx_beta, _rx_beta) = tokio::sync::mpsc::channel(8);
+
+        let alpha = repo
+            .allocate_web_client_in_server("alpha", real_ip, peer_alpha, local_addr, tx_alpha)
+            .await;
+        let beta = repo
+            .allocate_web_client_in_server("beta", real_ip, peer_beta, local_addr, tx_beta)
+            .await;
+        alpha.set_current_channel_id(42, &repo, 1);
+        beta.set_current_channel_id(42, &repo, 1);
+
+        let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let remote_add = Arc::new(ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id: "beta".to_owned(),
+                session_id: remote_session,
+                client_instance_id: 7,
+                real_ip,
+                tcp_addr: SocketAddr::new(real_ip, 30003),
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta {
+                    current_channel_id: Some(42),
+                    listening_channel_add: Some([84].into_iter().collect()),
+                    ..Default::default()
+                },
+            },
+        });
+        repo.apply_remote_operation(remote_add, 1).await.unwrap();
+
+        let snapshot = repo.voice_recipient_index_snapshot().await;
+        let alpha_nodes = snapshot
+            .get(&RecipientIndexKey::new("alpha", 42))
+            .expect("alpha channel 42 is tracked");
+        assert_eq!(alpha_nodes, &std::collections::BTreeSet::from([1]));
+
+        let beta_nodes = snapshot
+            .get(&RecipientIndexKey::new("beta", 42))
+            .expect("beta channel 42 is tracked separately");
+        assert_eq!(beta_nodes, &std::collections::BTreeSet::from([1, 2]));
+
+        let beta_listener_nodes = snapshot
+            .get(&RecipientIndexKey::new("beta", 84))
+            .expect("beta listener channel is tracked");
+        assert_eq!(beta_listener_nodes, &std::collections::BTreeSet::from([2]));
+        assert!(!snapshot.contains_key(&RecipientIndexKey::new("alpha", 84)));
     }
 
     #[tokio::test]
