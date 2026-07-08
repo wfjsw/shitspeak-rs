@@ -8,8 +8,8 @@ use std::io::{self, Cursor, Read, Write};
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::KcpResult;
 use crate::error::Error;
+use crate::KcpResult;
 
 const KCP_RTO_NDL: u32 = 30; // no delay min rto
 const KCP_RTO_MIN: u32 = 100; // normal min rto
@@ -483,7 +483,9 @@ impl<Output: Write> Kcp<Output> {
 
                     trace!(
                         "send stream mss={} last length={} extend={}",
-                        self.mss, l, extend
+                        self.mss,
+                        l,
+                        extend
                     );
 
                     let (lf, rt) = buf.split_at(extend);
@@ -661,6 +663,13 @@ impl<Output: Write> Kcp<Output> {
     #[inline]
     pub fn set_conv(&mut self, conv: u32) {
         self.conv = conv;
+    }
+
+    /// Refresh KCP's notion of the current clock without flushing or
+    /// retransmitting.
+    #[inline]
+    pub fn set_current(&mut self, current: u32) {
+        self.current = current;
     }
 
     /// Get `conv`

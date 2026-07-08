@@ -46,8 +46,8 @@ impl Write for UdpOutput {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
 
     use crate::udp_io::KcpUdpIo;
@@ -155,6 +155,7 @@ impl KcpSocket {
 
     /// Call every time you got data from transmission
     pub fn input(&mut self, buf: &[u8]) -> KcpResult<bool> {
+        self.refresh_current();
         match self.kcp.input(buf) {
             Ok(..) => {}
             Err(KcpError::ConvInconsistent(expected, actual)) => {
@@ -213,13 +214,13 @@ impl KcpSocket {
         self.pending_update = true;
 
         if self.kcp.wait_snd() >= self.kcp.snd_wnd() as usize || self.kcp.wait_snd() >= self.kcp.rmt_wnd() as usize {
-            self.kcp.flush()?;
+            self.flush()?;
         }
 
         self.last_update = Instant::now();
 
         if self.flush_write {
-            self.kcp.flush()?;
+            self.flush()?;
         }
 
         Ok(n).into()
@@ -283,10 +284,15 @@ impl KcpSocket {
     }
 
     pub fn flush(&mut self) -> KcpResult<()> {
+        self.refresh_current();
         self.kcp.flush()?;
         self.pending_update = self.kcp.wait_snd() > 0 || self.kcp.waiting_conv();
         self.last_update = Instant::now();
         Ok(())
+    }
+
+    fn refresh_current(&mut self) {
+        self.kcp.set_current(now_millis());
     }
 
     fn try_wake_pending_waker(&mut self) -> bool {
@@ -335,10 +341,7 @@ impl KcpSocket {
     }
 
     pub fn needs_update(&self) -> bool {
-        self.pending_update
-            || self.kcp.wait_snd() > 0
-            || self.kcp.waiting_conv()
-            || self.need_flush()
+        self.pending_update || self.kcp.wait_snd() > 0 || self.kcp.waiting_conv() || self.need_flush()
     }
 
     pub fn close(&mut self) {
@@ -394,7 +397,13 @@ mod test {
 
     use kcp::Error as KcpError;
     use log::trace;
-    use std::sync::Arc;
+    use std::{
+        convert::TryInto,
+        io::{self, ErrorKind},
+        net::SocketAddr,
+        sync::{Arc, Mutex as StdMutex},
+        time::Duration,
+    };
     use tokio::{
         net::UdpSocket,
         sync::Mutex,
@@ -402,31 +411,157 @@ mod test {
     };
 
     use super::KcpSocket;
-    use crate::config::KcpConfig;
+    use crate::{
+        config::{KcpConfig, KcpNoDelayConfig},
+        udp_io::{KcpUdpIo, SharedUdpIo},
+        utils::now_millis,
+    };
+
+    const TEST_CONV: u32 = 0xfeed_beef;
+    const TEST_TARGET: &str = "127.0.0.1:9";
+    const KCP_CMD_ACK: u8 = 82;
+
+    #[derive(Debug, Default)]
+    struct CapturingUdpIo {
+        sent: StdMutex<Vec<Vec<u8>>>,
+    }
+
+    impl CapturingUdpIo {
+        fn take_sent(&self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut *self.sent.lock().expect("capture lock poisoned"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KcpUdpIo for CapturingUdpIo {
+        async fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::WouldBlock))
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            Err(io::Error::from(ErrorKind::WouldBlock))
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+            self.try_send_to(buf, target)
+        }
+
+        fn try_send_to(&self, buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+            self.sent.lock().expect("capture lock poisoned").push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().expect("socket addr"))
+        }
+    }
+
+    fn realtime_test_config() -> KcpConfig {
+        let mut config = KcpConfig::default();
+        config.nodelay = KcpNoDelayConfig {
+            nodelay: true,
+            interval: 10,
+            resend: 0,
+            nc: false,
+        };
+        config.flush_write = true;
+        config
+    }
+
+    fn capturing_socket(config: &KcpConfig) -> (KcpSocket, Arc<CapturingUdpIo>) {
+        let capture = Arc::new(CapturingUdpIo::default());
+        let udp: SharedUdpIo = capture.clone();
+        let target = TEST_TARGET.parse().expect("socket addr");
+        (
+            KcpSocket::new(config, TEST_CONV, udp, target, true).expect("kcp socket"),
+            capture,
+        )
+    }
+
+    fn packet_ts(packet: &[u8]) -> u32 {
+        u32::from_le_bytes(packet[8..12].try_into().expect("packet timestamp"))
+    }
+
+    fn ack_packet(ts: u32, sn: u32, una: u32) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(kcp::KCP_OVERHEAD);
+        packet.extend_from_slice(&TEST_CONV.to_le_bytes());
+        packet.push(KCP_CMD_ACK);
+        packet.push(0);
+        packet.extend_from_slice(&128u16.to_le_bytes());
+        packet.extend_from_slice(&ts.to_le_bytes());
+        packet.extend_from_slice(&sn.to_le_bytes());
+        packet.extend_from_slice(&una.to_le_bytes());
+        packet.extend_from_slice(&0u32.to_le_bytes());
+        packet
+    }
+
+    #[tokio::test]
+    async fn stale_clock_immediate_flush_uses_current_timestamp_after_idle() {
+        let config = realtime_test_config();
+        let (mut sender, capture) = capturing_socket(&config);
+
+        time::sleep(Duration::from_millis(60)).await;
+        let before_send = now_millis();
+        sender.send(b"fresh timestamp").await.unwrap();
+        let after_send = now_millis();
+
+        let packets = capture.take_sent();
+        assert_eq!(packets.len(), 1);
+        let ts = packet_ts(&packets[0]);
+        assert!(
+            ts >= before_send.saturating_sub(1),
+            "packet timestamp {} predates send window {}..={}",
+            ts,
+            before_send,
+            after_send
+        );
+        assert!(
+            ts <= after_send.saturating_add(5),
+            "packet timestamp {} exceeds send window {}..={}",
+            ts,
+            before_send,
+            after_send
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_clock_delayed_ack_input_prevents_min_rto_retransmit() {
+        let config = realtime_test_config();
+        let (mut sender, capture) = capturing_socket(&config);
+
+        sender.send(b"first").await.unwrap();
+        let first_packets = capture.take_sent();
+        assert_eq!(first_packets.len(), 1);
+        let first_ts = packet_ts(&first_packets[0]);
+
+        time::sleep(Duration::from_millis(80)).await;
+        sender.input(&ack_packet(first_ts, 0, 1)).unwrap();
+        assert!(capture.take_sent().is_empty());
+
+        sender.send(b"second").await.unwrap();
+        let second_packets = capture.take_sent();
+        assert_eq!(second_packets.len(), 1);
+
+        time::sleep(Duration::from_millis(45)).await;
+        sender.update().unwrap();
+        assert!(
+            capture.take_sent().is_empty(),
+            "delayed ACK should raise RTO above the no-delay min-RTO window"
+        );
+    }
 
     #[tokio::test]
     async fn pending_update_survives_early_update_until_due_tick() {
-        static CONV: u32 = 0xfeedbeef;
-
-        let s1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let s2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let s1_addr = s1.local_addr().unwrap();
-        let s2_addr = s2.local_addr().unwrap();
-
-        let s1 = Arc::new(s1);
-        let s2 = Arc::new(s2);
-
         let config = KcpConfig::default();
-        let mut sender = KcpSocket::new(&config, CONV, s1.clone(), s2_addr, true).unwrap();
-        let mut receiver = KcpSocket::new(&config, CONV, s2.clone(), s1_addr, true).unwrap();
+        let (mut sender, sender_capture) = capturing_socket(&config);
+        let (mut receiver, _) = capturing_socket(&config);
 
         sender.send(b"hello").await.unwrap();
         sender.flush().unwrap();
 
-        let mut packet = [0u8; 1500];
-        let n = s2.recv(&mut packet).await.unwrap();
-        receiver.input(&packet[..n]).unwrap();
+        let packets = sender_capture.take_sent();
+        assert_eq!(packets.len(), 1);
+        receiver.input(&packets[0]).unwrap();
 
         assert!(receiver.pending_update);
         let next = receiver.update().unwrap();
