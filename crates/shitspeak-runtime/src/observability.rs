@@ -443,6 +443,11 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "Total voice fanout flushes by dispatch mode.",
         "counter",
     ),
+    // CPU_ATTRIBUTION_PROMQL voice_pipeline:
+    // topk(20, sum by (path, stage) (
+    //   rate(shitspeak_voice_pipeline_stage_duration_us_total{node="12"}[5m])
+    // ) / 1e6)
+    // Search with: rg "CPU_ATTRIBUTION_PROMQL voice_pipeline"
     (
         "shitspeak_voice_pipeline_stage_events_total",
         "Total voice pipeline stage observations by path and stage.",

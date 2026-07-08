@@ -860,6 +860,11 @@ impl<'a> PrometheusWriter<'a> {
             "S2S outbound frames dropped because their send deadline expired.",
             "counter",
         );
+        // CPU_ATTRIBUTION_PROMQL s2s_transport_pipeline:
+        // topk(20, sum by (transport, stage) (
+        //   rate(shitspeak_s2s_transport_pipeline_stage_duration_us_total{source="12"}[5m])
+        // ) / 1e6)
+        // Search with: rg "CPU_ATTRIBUTION_PROMQL s2s_transport_pipeline"
         self.header(
             "shitspeak_s2s_transport_pipeline_stage_events_total",
             "S2S transport pipeline stage observations by transport and stage.",
@@ -920,6 +925,12 @@ impl<'a> PrometheusWriter<'a> {
             "S2S replication catchup responses currently active.",
             "gauge",
         );
+        // CPU_ATTRIBUTION_PROMQL s2s_replication_pipeline:
+        // topk(20, sum by (kind, stage) (
+        //   rate(shitspeak_s2s_replication_pipeline_stage_duration_us_total{node="12"}[5m])
+        // ) / 1e6)
+        // Replace node="12" with the scraper's node-id label if needed.
+        // Search with: rg "CPU_ATTRIBUTION_PROMQL s2s_replication_pipeline"
         self.header(
             "shitspeak_s2s_replication_pipeline_stage_events_total",
             "S2S replication pipeline stage observations by replication kind and stage.",
