@@ -55,8 +55,7 @@ impl PingRequest {
     /// Decode a legacy Ping packet.
     ///
     /// When called from the encrypted path (`decode_udp_packet`), `data` is the
-    /// bytes after the type byte: a PDS varint-encoded timestamp (1–4 bytes for
-    /// timestamps up to ~74 hours).
+    /// bytes after the type byte: a PDS varint-encoded timestamp (1–9 bytes).
     ///
     /// When called from the unencrypted path (`PingRequest::decode`), `data` is
     /// the full 12-byte packet including the `\x00\x00\x00\x00` header followed
@@ -66,19 +65,14 @@ impl PingRequest {
             return Err(DecodeError::TooShort);
         }
 
-        let (request_extended_information, timestamp) = if data.len() < size_of::<u64>() {
+        let (request_extended_information, timestamp) = if data.len() <= size_of::<u64>() + 1 {
             // Short form: PDS varint-encoded timestamp (encrypted pings from authenticated clients).
-            let (ts, consumed) =
-                super::codec::read_varint_slice(data).ok_or(DecodeError::UnparsableVarIntValue)?;
+            let (ts, consumed) = super::codec::read_varint_u64_slice(data)
+                .ok_or(DecodeError::UnparsableVarIntValue)?;
             if consumed != data.len() {
                 return Err(DecodeError::UnparsableVarIntValue);
             }
-            (false, ts as u64)
-        } else if data.len() <= size_of::<u64>() + 1 {
-            let bytes: [u8; 8] = data[..size_of::<u64>()]
-                .try_into()
-                .map_err(|_| DecodeError::UnparsableVarIntValue)?;
-            (false, u64::from_be_bytes(bytes))
+            (false, ts)
         } else if data.len() == 4 + size_of::<u64>() {
             let prefix: [u8; 4] = data[..4]
                 .try_into()
@@ -115,43 +109,14 @@ impl PingRequest {
                 buf.freeze()
             }
             PacketFormat::Legacy => {
-                let mut buf = BytesMut::with_capacity(1 + legacy_varint_len(self.timestamp));
+                let mut buf = BytesMut::with_capacity(
+                    1 + super::codec::varint_u64_encoded_len(self.timestamp),
+                );
                 buf.put_u8(0x20);
-                write_legacy_varint(&mut buf, self.timestamp);
+                super::codec::write_varint_u64_buf(&mut buf, self.timestamp);
                 buf.freeze()
             }
         })
-    }
-}
-
-fn legacy_varint_len(value: u64) -> usize {
-    if value <= 0x7F {
-        1
-    } else if value <= 0x3FFF {
-        2
-    } else if value <= 0x1F_FFFF {
-        3
-    } else {
-        4
-    }
-}
-
-fn write_legacy_varint(buf: &mut impl BufMut, value: u64) {
-    if value <= 0x7F {
-        buf.put_u8(value as u8);
-    } else if value <= 0x3FFF {
-        buf.put_u8(0x80 | (value >> 8) as u8);
-        buf.put_u8((value & 0xFF) as u8);
-    } else if value <= 0x1F_FFFF {
-        buf.put_u8(0xC0 | (value >> 16) as u8);
-        buf.put_u8(((value >> 8) & 0xFF) as u8);
-        buf.put_u8((value & 0xFF) as u8);
-    } else {
-        let value = value.min(0x0FFF_FFFF);
-        buf.put_u8(0xE0 | (value >> 24) as u8);
-        buf.put_u8(((value >> 16) & 0xFF) as u8);
-        buf.put_u8(((value >> 8) & 0xFF) as u8);
-        buf.put_u8((value & 0xFF) as u8);
     }
 }
 
@@ -222,6 +187,36 @@ mod tests {
         };
         assert_eq!(decoded.timestamp, request.timestamp);
         assert_eq!(decoded.format, PacketFormat::Legacy);
+    }
+
+    #[test]
+    fn authenticated_legacy_echo_decodes_large_timestamps() {
+        let cases = [
+            (0x0FFF_FFFF, 0xEF, 5),
+            (0x1000_0000, 0xF0, 6),
+            (u64::from(u32::MAX), 0xF0, 6),
+            (0x1_0000_0000, 0xF4, 10),
+        ];
+
+        for (timestamp, marker, expected_len) in cases {
+            let request = PingRequest {
+                timestamp,
+                request_extended_information: false,
+                format: PacketFormat::Legacy,
+            };
+
+            let encoded = request.encode_authenticated_echo().expect("encode echo");
+            assert_eq!(encoded[0], 0x20);
+            assert_eq!(encoded[1], marker);
+            assert_eq!(encoded.len(), expected_len);
+
+            let packet = IncomingUdpPacket::decode(&encoded, None).expect("decode ping");
+            let IncomingUdpPacket::Ping(decoded) = packet else {
+                panic!("expected ping");
+            };
+            assert_eq!(decoded.timestamp, timestamp);
+            assert_eq!(decoded.format, PacketFormat::Legacy);
+        }
     }
 
     #[test]

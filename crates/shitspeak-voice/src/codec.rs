@@ -32,7 +32,9 @@
 //! | `0x80–0xBF`      | 2 byte | `((byte & 0x3F) << 8) | b1`                       |
 //! | `0xC0–0xDF`      | 3 byte | `((byte & 0x1F) << 16) | (b1 << 8) | b2`          |
 //! | `0xE0–0xEF`      | 4 byte | `((byte & 0x0F) << 24) | (b1 << 16) | … | b3`     |
-//! | `0xF0–0xFF`      | special/negative — rejected                         |
+//! | `0xF0–0xF3`      | 5 byte | 32-bit positive integer                            |
+//! | `0xF4–0xF7`      | 9 byte | 64-bit positive integer                            |
+//! | `0xF8–0xFF`      | special/negative — rejected                         |
 
 use std::{fmt::Display, io::Cursor};
 
@@ -255,38 +257,83 @@ pub enum IncomingUdpPacket {
 /// Read a Mumble PacketDataStream varint from `data`.
 ///
 /// Returns `(value, bytes_consumed)` or `None` on truncation or unsupported
-/// encoding (0xF0–0xFF: special/negative forms not used in voice packets).
-pub(super) fn read_varint_slice(data: &[u8]) -> Option<(u32, usize)> {
-    let c = *data.first()? as u32;
+/// encoding. Full positive `u64` forms are decoded here; callers that need
+/// bounded `u32` values should use `read_varint_slice`.
+pub(super) fn read_varint_u64_slice(data: &[u8]) -> Option<(u64, usize)> {
+    let c = *data.first()? as u64;
     if c & 0x80 == 0 {
         // 0x00–0x7F: 1 byte, 7-bit value
-        Some((c, 1))
-    } else if c & 0x40 == 0 {
+        Some((c & 0x7F, 1))
+    } else if c & 0xC0 == 0x80 {
         // 0x80–0xBF: 2 bytes, 14-bit value
-        let b1 = *data.get(1)? as u32;
+        let b1 = *data.get(1)? as u64;
         Some(((c & 0x3F) << 8 | b1, 2))
-    } else if c & 0x20 == 0 {
+    } else if c & 0xE0 == 0xC0 {
         // 0xC0–0xDF: 3 bytes, 21-bit value
-        let b1 = *data.get(1)? as u32;
-        let b2 = *data.get(2)? as u32;
+        let b1 = *data.get(1)? as u64;
+        let b2 = *data.get(2)? as u64;
         Some(((c & 0x1F) << 16 | b1 << 8 | b2, 3))
-    } else if c & 0x10 == 0 {
+    } else if c & 0xF0 == 0xE0 {
         // 0xE0–0xEF: 4 bytes, 28-bit value
-        let b1 = *data.get(1)? as u32;
-        let b2 = *data.get(2)? as u32;
-        let b3 = *data.get(3)? as u32;
+        let b1 = *data.get(1)? as u64;
+        let b2 = *data.get(2)? as u64;
+        let b3 = *data.get(3)? as u64;
         Some(((c & 0x0F) << 24 | b1 << 16 | b2 << 8 | b3, 4))
+    } else if c & 0xFC == 0xF0 {
+        // 0xF0–0xF3: positive 32-bit value. The encoder emits 0xF0.
+        let b1 = *data.get(1)? as u64;
+        let b2 = *data.get(2)? as u64;
+        let b3 = *data.get(3)? as u64;
+        let b4 = *data.get(4)? as u64;
+        Some((b1 << 24 | b2 << 16 | b3 << 8 | b4, 5))
+    } else if c & 0xFC == 0xF4 {
+        // 0xF4–0xF7: positive 64-bit value. The encoder emits 0xF4.
+        let b1 = *data.get(1)? as u64;
+        let b2 = *data.get(2)? as u64;
+        let b3 = *data.get(3)? as u64;
+        let b4 = *data.get(4)? as u64;
+        let b5 = *data.get(5)? as u64;
+        let b6 = *data.get(6)? as u64;
+        let b7 = *data.get(7)? as u64;
+        let b8 = *data.get(8)? as u64;
+        Some((
+            b1 << 56 | b2 << 48 | b3 << 40 | b4 << 32 | b5 << 24 | b6 << 16 | b7 << 8 | b8,
+            9,
+        ))
     } else {
-        // 0xF0–0xFF: special/negative forms — not emitted by voice packets
+        // 0xF8–0xFF: negative/special forms are not used in voice packets.
         None
     }
 }
 
-/// Read a Mumble PacketDataStream varint from `data`, advancing the cursor by
+/// Read a bounded Mumble PacketDataStream varint from `data`.
+///
+/// Returns `(value, bytes_consumed)` or `None` on truncation, unsupported
+/// encoding, or a decoded value that does not fit in `u32`.
+pub(super) fn read_varint_slice(data: &[u8]) -> Option<(u32, usize)> {
+    let (value, n) = read_varint_u64_slice(data)?;
+    let value = u32::try_from(value).ok()?;
+    Some((value, n))
+}
+
+/// Read a Mumble PacketDataStream `u64` varint from `data`, advancing the cursor by
 /// the number of bytes consumed.
 ///
-/// Returns `None` on truncation or unsupported encoding (0xF0–0xFF). On
+/// Returns `None` on truncation or unsupported encoding. On
 /// `None` the cursor position is left unchanged.
+pub fn read_varint_u64(data: &mut Cursor<&[u8]>) -> Option<u64> {
+    let pos = data.position() as usize;
+    let remaining = data.get_ref().get(pos..)?;
+    let (value, n) = read_varint_u64_slice(remaining)?;
+    data.set_position((pos + n) as u64);
+    Some(value)
+}
+
+/// Read a bounded Mumble PacketDataStream varint from `data`, advancing the cursor by
+/// the number of bytes consumed.
+///
+/// Returns `None` on truncation, unsupported encoding, or a decoded value that
+/// does not fit in `u32`. On `None` the cursor position is left unchanged.
 pub fn read_varint(data: &mut Cursor<&[u8]>) -> Option<u32> {
     let pos = data.position() as usize;
     let remaining = data.get_ref().get(pos..)?;
@@ -295,7 +342,7 @@ pub fn read_varint(data: &mut Cursor<&[u8]>) -> Option<u32> {
     Some(value)
 }
 
-fn write_varint_buf(buf: &mut impl BufMut, value: u32) {
+pub(super) fn write_varint_u64_buf(buf: &mut impl BufMut, value: u64) {
     if value <= 0x7F {
         buf.put_u8(value as u8);
     } else if value <= 0x3FFF {
@@ -310,25 +357,39 @@ fn write_varint_buf(buf: &mut impl BufMut, value: u32) {
         buf.put_u8(((value >> 16) & 0xFF) as u8);
         buf.put_u8(((value >> 8) & 0xFF) as u8);
         buf.put_u8((value & 0xFF) as u8);
+    } else if value <= u64::from(u32::MAX) {
+        buf.put_u8(0xF0);
+        buf.put_u32(value as u32);
     } else {
-        buf.put_u8(0xEF);
-        buf.put_u8(0xFF);
-        buf.put_u8(0xFF);
-        buf.put_u8(0xFF);
+        buf.put_u8(0xF4);
+        buf.put_u64(value);
     }
 }
 
-/// Number of bytes required to encode `value` as a Mumble PDS varint.
-fn varint_encoded_len(value: u32) -> usize {
+fn write_varint_buf(buf: &mut impl BufMut, value: u32) {
+    write_varint_u64_buf(buf, u64::from(value));
+}
+
+/// Number of bytes required to encode `value` as a Mumble PDS u64 varint.
+pub(super) fn varint_u64_encoded_len(value: u64) -> usize {
     if value <= 0x7F {
         1
     } else if value <= 0x3FFF {
         2
     } else if value <= 0x1F_FFFF {
         3
-    } else {
+    } else if value <= 0x0FFF_FFFF {
         4
+    } else if value <= u64::from(u32::MAX) {
+        5
+    } else {
+        9
     }
+}
+
+/// Number of bytes required to encode `value` as a bounded Mumble PDS varint.
+fn varint_encoded_len(value: u32) -> usize {
+    varint_u64_encoded_len(u64::from(value))
 }
 
 // ── Public helpers ────────────────────────────────────────────────────────────
@@ -605,7 +666,7 @@ impl Audio {
         }
 
         let frame_number =
-            read_varint(&mut data_reader).ok_or(DecodeError::UnparsableVarIntValue)? as u64;
+            read_varint_u64(&mut data_reader).ok_or(DecodeError::UnparsableVarIntValue)?;
 
         let audio_payload = match udp_message_type {
             LegacyUdpMessageType::VoiceCELTAlpha
@@ -752,12 +813,17 @@ impl Audio {
             0
         };
 
-        let cap = 1 + 4 + 4 + payload_len + positional_len;
+        let sender_session = self.sender_session.map(u32::from).unwrap_or(0);
+        let cap = 1
+            + varint_encoded_len(sender_session)
+            + varint_u64_encoded_len(self.frame_number)
+            + payload_len
+            + positional_len;
 
         let mut buf = BytesMut::with_capacity(cap);
         buf.put_u8(header);
-        write_varint_buf(&mut buf, self.sender_session.map(u32::from).unwrap_or(0));
-        write_varint_buf(&mut buf, self.frame_number as u32);
+        write_varint_buf(&mut buf, sender_session);
+        write_varint_u64_buf(&mut buf, self.frame_number);
 
         self.audio_payload.write_legacy_into(&mut buf);
 
@@ -900,7 +966,7 @@ mod tests {
         let mut buf = BytesMut::new();
         let header = (0x04u8 << 5) | (target as u8 & 0x1f);
         buf.put_u8(header);
-        write_varint_buf(&mut buf, frame_number as u32);
+        write_varint_u64_buf(&mut buf, frame_number);
         let size_flag = (opus_data.len() as u32 & 0x1FFF) | if is_terminator { 0x2000 } else { 0 };
         write_varint_buf(&mut buf, size_flag);
         buf.extend_from_slice(opus_data);
@@ -1072,14 +1138,19 @@ mod tests {
         assert!(read_varint_slice(&[0xC0, 0x00]).is_none());
         // 4-byte form needs 4 bytes; truncated at 3 must fail.
         assert!(read_varint_slice(&[0xE0, 0x00, 0x00]).is_none());
+        // 5-byte form needs the 0xF0 prefix plus 4 bytes.
+        assert!(read_varint_u64_slice(&[0xF0, 0x00, 0x00, 0x00]).is_none());
+        // 9-byte form needs the 0xF4 prefix plus 8 bytes.
+        assert!(read_varint_u64_slice(&[0xF4, 0x00, 0x00, 0x00, 0x00]).is_none());
     }
 
     #[test]
     fn varint_special_byte_returns_none() {
-        // 0xF0–0xFF are special/negative forms rejected in voice packets.
-        assert!(read_varint_slice(&[0xF0]).is_none());
+        // 0xF8–0xFF are negative/special forms rejected in voice packets.
         assert!(read_varint_slice(&[0xF8, 0x00, 0x00, 0x00, 0x00]).is_none());
         assert!(read_varint_slice(&[0xFF]).is_none());
+        assert!(read_varint_u64_slice(&[0xF8, 0x00]).is_none());
+        assert!(read_varint_u64_slice(&[0xFF]).is_none());
     }
 
     #[test]
@@ -1103,6 +1174,40 @@ mod tests {
         assert_eq!(buf.len(), 4);
         let (decoded, n) = read_varint_slice(&buf).unwrap();
         assert_eq!((decoded, n), (2097152, 4));
+    }
+
+    #[test]
+    fn varint_u64_boundary_roundtrip() {
+        let cases: &[(u64, &[u8])] = &[
+            (0x0FFF_FFFF, &[0xEF, 0xFF, 0xFF, 0xFF]),
+            (0x1000_0000, &[0xF0, 0x10, 0x00, 0x00, 0x00]),
+            (u64::from(u32::MAX), &[0xF0, 0xFF, 0xFF, 0xFF, 0xFF]),
+            (
+                0x1_0000_0000,
+                &[0xF4, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let mut buf = BytesMut::new();
+            write_varint_u64_buf(&mut buf, *value);
+            assert_eq!(&buf[..], *expected);
+
+            let (decoded, consumed) = read_varint_u64_slice(&buf).expect("read u64 varint");
+            assert_eq!((decoded, consumed), (*value, expected.len()));
+        }
+    }
+
+    #[test]
+    fn bounded_varint_rejects_above_u32() {
+        let mut buf = BytesMut::new();
+        write_varint_u64_buf(&mut buf, 0x1_0000_0000);
+
+        assert!(read_varint_slice(&buf).is_none());
+
+        let mut cursor = Cursor::new(buf.as_ref());
+        assert!(read_varint(&mut cursor).is_none());
+        assert_eq!(cursor.position(), 0);
     }
 
     // ── Legacy decode additional ─────────────────────────────────────────
@@ -1137,6 +1242,16 @@ mod tests {
         let packet = build_legacy_client_packet(0, 128, &[0x01], false);
         let decoded = Audio::decode(&packet, None).expect("decode large frame_number");
         assert_eq!(decoded.frame_number, 128);
+    }
+
+    #[test]
+    fn legacy_decode_u64_frame_number() {
+        let frame_number = 0x1_0000_0000;
+        let packet = build_legacy_client_packet(0, frame_number, &[0x01], false);
+        assert_eq!(packet[1], 0xF4);
+
+        let decoded = Audio::decode(&packet, None).expect("decode u64 frame_number");
+        assert_eq!(decoded.frame_number, frame_number);
     }
 
     // ── Protobuf decode additional ────────────────────────────────────────
