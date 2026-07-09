@@ -11,6 +11,9 @@ const MOQ_AUDIO_TERMINATOR = 0x01;
 const OPUS_SAMPLE_RATE = 48_000;
 const OPUS_CHANNELS = 1;
 const OPUS_RTP_TICKS_PER_20MS = 960;
+const MOQ_PLAYBACK_LEAD_SECONDS = 0.08;
+const MOQ_PLAYBACK_UNDERRUN_GRACE_SECONDS = 0.005;
+const MOQ_PLAYBACK_MAX_LEAD_SECONDS = 0.5;
 const DEFAULT_MOQ_AUDIO_BITRATE = 64_000;
 const DEFAULT_MOQ_LITE_MODULE_URL = "https://esm.sh/@moq/lite@0.2.3?bundle";
 const DEFAULT_MOQ_HANG_MODULE_URL = "https://esm.sh/@moq/hang@0.2.5?bundle";
@@ -511,7 +514,6 @@ class BrowserMoqAdapter extends EventTarget {
     this.audioDestination = null;
     this.outputStream = null;
     this.outputTrackEmitted = false;
-    this.playbackTime = 0;
     this.localStream = null;
     this.micReader = null;
     this.micTask = null;
@@ -868,30 +870,6 @@ class BrowserMoqAdapter extends EventTarget {
     return [{ data: decoded.payload, timestamp: decoded.timestamp, keyframe: false }];
   }
 
-  async playAudioData(audioData) {
-    let shouldClose = true;
-    try {
-      await this.ensureAudioOutput();
-      if (!this.audioContext || !this.audioDestination) {
-        audioData.close();
-        shouldClose = false;
-        return;
-      }
-      const buffer = audioDataToAudioBuffer(this.audioContext, audioData);
-      const source = this.audioContext.createBufferSource();
-      source.buffer = buffer;
-      source.connect(this.audioDestination);
-      const now = this.audioContext.currentTime;
-      const start = Math.max(now + 0.02, this.playbackTime || now);
-      this.playbackTime = start + buffer.duration;
-      source.start(start);
-    } finally {
-      if (shouldClose) {
-        audioData.close();
-      }
-    }
-  }
-
   async ensureAudioOutput() {
     const AudioContextCtor = globalThis.AudioContext ?? globalThis.webkitAudioContext;
     if (!AudioContextCtor) {
@@ -957,6 +935,7 @@ class MoqSpeakerSlotPlayback {
     this.track = track;
     this.decoder = null;
     this.closed = false;
+    this.playbackTime = 0;
   }
 
   start() {
@@ -993,7 +972,7 @@ class MoqSpeakerSlotPlayback {
     }
     if (!this.decoder) {
       this.decoder = new AudioDecoder({
-        output: (audioData) => void this.adapter.playAudioData(audioData),
+        output: (audioData) => void this.playAudioData(audioData),
         error: (error) => this.adapter.fail(error),
       });
       this.decoder.configure({
@@ -1007,6 +986,39 @@ class MoqSpeakerSlotPlayback {
       timestamp: Number(timestamp) || 0,
       data: payload,
     }));
+  }
+
+  async playAudioData(audioData) {
+    let shouldClose = true;
+    try {
+      await this.adapter.ensureAudioOutput();
+      if (!this.adapter.audioContext || !this.adapter.audioDestination) {
+        audioData.close();
+        shouldClose = false;
+        return;
+      }
+      const buffer = audioDataToAudioBuffer(this.adapter.audioContext, audioData);
+      const source = this.adapter.audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(this.adapter.audioDestination);
+      source.start(this.nextStartTime(buffer.duration));
+    } finally {
+      if (shouldClose) {
+        audioData.close();
+      }
+    }
+  }
+
+  nextStartTime(duration) {
+    const now = this.adapter.audioContext.currentTime;
+    const minStart = now + MOQ_PLAYBACK_UNDERRUN_GRACE_SECONDS;
+    const maxStart = now + MOQ_PLAYBACK_MAX_LEAD_SECONDS;
+    if (this.playbackTime <= 0 || this.playbackTime < minStart || this.playbackTime > maxStart) {
+      this.playbackTime = now + MOQ_PLAYBACK_LEAD_SECONDS;
+    }
+    const start = this.playbackTime;
+    this.playbackTime = start + duration;
+    return start;
   }
 
   resetDecoder() {

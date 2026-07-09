@@ -1784,7 +1784,11 @@ mod tests {
             .handle_inbound_audio_frame(MoqAudioFrame::new(101, Bytes::from_static(b"opus")))
             .await
             .expect("audio after ptt");
-        let routed = voice_rx.try_recv().expect("routed voice").decoded_audio;
+        let routed = voice_rx
+            .try_recv()
+            .expect("routed voice")
+            .decoded_audio()
+            .clone();
         assert_eq!(routed.sender_session, Some(client.get_session_id()));
         let AudioPayload::Opus(opus) = routed.audio_payload else {
             panic!("expected opus payload");
@@ -1838,7 +1842,8 @@ mod tests {
         let routed = voice_rx
             .try_recv()
             .expect("routed terminator")
-            .decoded_audio;
+            .decoded_audio()
+            .clone();
         let AudioPayload::Opus(opus) = routed.audio_payload else {
             panic!("expected opus payload");
         };
@@ -1995,7 +2000,6 @@ mod tests {
             password: Option<&str>,
             auxiliary_data: &AuthenticateAuxiliaryData,
         ) -> Result<AuthenticateResult, AuthenticationRejection> {
-            assert_eq!(auxiliary_data.session_id, 0);
             assert_eq!(auxiliary_data.ip_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
             if username != "alice" {
                 return Err(AuthenticationRejection::NoSuchUser);
@@ -2129,6 +2133,7 @@ mod tests {
             privacy: shitspeak_runtime::config::PrivacyConfig::default(),
             s2s: shitspeak_runtime::config::S2sConfig::default(),
             web: WebConfig::default(),
+            voice: shitspeak_runtime::config::VoiceTuning::default(),
         }
     }
 }

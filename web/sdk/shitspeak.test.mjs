@@ -139,8 +139,8 @@ class FakeRTCPeerConnection extends EventTarget {
 }
 
 class FakeMediaStream {
-  constructor() {
-    this.tracks = [];
+  constructor(tracks = []) {
+    this.tracks = [...tracks];
   }
 
   addTrack(track) {
@@ -195,6 +195,8 @@ class FakeMoqTrack {
   constructor(name) {
     this.name = name;
     this.frames = [];
+    this.readFrames = [];
+    this.readResolvers = [];
     this.closed = false;
   }
 
@@ -207,12 +209,116 @@ class FakeMoqTrack {
   }
 
   async readFrame() {
-    return undefined;
+    if (this.readFrames.length > 0) {
+      return this.readFrames.shift();
+    }
+    if (this.closed) {
+      return undefined;
+    }
+    return new Promise((resolve) => this.readResolvers.push(resolve));
+  }
+
+  pushFrame(frame) {
+    const resolve = this.readResolvers.shift();
+    if (resolve) {
+      resolve(frame);
+      return;
+    }
+    this.readFrames.push(frame);
+  }
+
+  close() {
+    this.closed = true;
+    while (this.readResolvers.length > 0) {
+      this.readResolvers.shift()(undefined);
+    }
+  }
+}
+
+class FakeEncodedAudioChunk {
+  constructor(init) {
+    this.type = init.type;
+    this.timestamp = init.timestamp;
+    this.data = init.data;
+  }
+}
+
+class FakeAudioData {
+  constructor({ numberOfFrames = 960, sampleRate = 48_000, numberOfChannels = 1 } = {}) {
+    this.numberOfFrames = numberOfFrames;
+    this.sampleRate = sampleRate;
+    this.numberOfChannels = numberOfChannels;
+    this.closed = false;
+  }
+
+  copyTo(destination) {
+    destination.fill(0);
   }
 
   close() {
     this.closed = true;
   }
+}
+
+class FakeAudioDecoder {
+  constructor({ output, error }) {
+    this.output = output;
+    this.error = error;
+    this.closed = false;
+  }
+
+  configure(config) {
+    this.config = config;
+  }
+
+  decode(_chunk) {
+    queueMicrotask(() => {
+      if (!this.closed) {
+        this.output(new FakeAudioData());
+      }
+    });
+  }
+
+  close() {
+    this.closed = true;
+  }
+}
+
+class FakeAudioContext {
+  static instances = [];
+
+  constructor(config) {
+    this.config = config;
+    this.currentTime = 0;
+    this.state = "running";
+    this.scheduledStarts = [];
+    FakeAudioContext.instances.push(this);
+  }
+
+  createMediaStreamDestination() {
+    return {
+      stream: new FakeMediaStream([{ kind: "audio", id: "moq-output" }]),
+    };
+  }
+
+  createBuffer(_channels, frames, sampleRate) {
+    return {
+      duration: frames / sampleRate,
+      getChannelData: () => new Float32Array(frames),
+    };
+  }
+
+  createBufferSource() {
+    return {
+      buffer: null,
+      connect: () => {},
+      start: (time) => this.scheduledStarts.push(time),
+    };
+  }
+
+  async resume() {}
+
+  async close() {}
 }
 
 class FakeMoqBroadcast {
@@ -334,10 +440,17 @@ function fakeMoqModules(connections) {
 function installFakes() {
   FakeWebSocket.instances = [];
   FakeRTCPeerConnection.instances = [];
+  FakeAudioContext.instances = [];
   globalThis.WebSocket = FakeWebSocket;
   globalThis.RTCPeerConnection = FakeRTCPeerConnection;
   globalThis.MediaStream = FakeMediaStream;
   globalThis.WebTransport = class FakeWebTransport {};
+}
+
+function installAudioFakes() {
+  globalThis.AudioDecoder = FakeAudioDecoder;
+  globalThis.EncodedAudioChunk = FakeEncodedAudioChunk;
+  globalThis.AudioContext = FakeAudioContext;
 }
 
 function restoreGlobals() {
@@ -633,12 +746,86 @@ async function testDefaultMoqAdapterPublishesControlAndAudioTracks() {
   assert.equal(audioUp.frames.at(-1)[5] & 0x01, 0x01);
 }
 
+async function testMoqPlaybackUsesIndependentSlotClocks() {
+  installFakes();
+  installAudioFakes();
+  const connections = [];
+  const modules = fakeMoqModules(connections);
+  const client = new ShitSpeakClient({
+    signalingUrl: "ws://gateway.test/web/signaling",
+    transport: "moq",
+    moqUrl: "https://gateway.test/web/moq",
+    maxSpeakerSlots: 2,
+    moqLiteModule: modules.Moq,
+    moqHangModule: modules.Hang,
+  });
+
+  await client.connect();
+  moqDownTrack(connections[0], "audio/down/slot/0").pushFrame(makeHangAudioFrame(modules, 0));
+  moqDownTrack(connections[0], "audio/down/slot/1").pushFrame(makeHangAudioFrame(modules, 0));
+
+  await waitFor(() => FakeAudioContext.instances[0]?.scheduledStarts.length === 2);
+  assert.deepEqual(FakeAudioContext.instances[0].scheduledStarts, [0.08, 0.08]);
+  client.close();
+}
+
+async function testMoqPlaybackKeepsFramesContiguousAfterSmallJitter() {
+  installFakes();
+  installAudioFakes();
+  const connections = [];
+  const modules = fakeMoqModules(connections);
+  const client = new ShitSpeakClient({
+    signalingUrl: "ws://gateway.test/web/signaling",
+    transport: "moq",
+    moqUrl: "https://gateway.test/web/moq",
+    maxSpeakerSlots: 1,
+    moqLiteModule: modules.Moq,
+    moqHangModule: modules.Hang,
+  });
+
+  await client.connect();
+  const slot = moqDownTrack(connections[0], "audio/down/slot/0");
+  slot.pushFrame(makeHangAudioFrame(modules, 0));
+  await waitFor(() => FakeAudioContext.instances[0]?.scheduledStarts.length === 1);
+  const context = FakeAudioContext.instances[0];
+  context.currentTime = 0.021;
+
+  slot.pushFrame(makeHangAudioFrame(modules, 960));
+
+  await waitFor(() => context.scheduledStarts.length === 2);
+  assert.deepEqual(context.scheduledStarts, [0.08, 0.1]);
+  client.close();
+}
+
 function adapterServerEvent(client, event) {
   if (typeof client.moq?.handleServerEvent === "function") {
     client.moq.handleServerEvent(event);
     return;
   }
   client.moq.dispatchEvent(new CustomEvent("event", { detail: event }));
+}
+
+function moqDownTrack(connection, name) {
+  return connection.downstream.subscribed.find((entry) => entry.name === name).track;
+}
+
+function makeHangAudioFrame(modules, timestamp, payloadText = "opus") {
+  const timestampBytes = modules.Moq.Varint.encode(timestamp);
+  const payload = new TextEncoder().encode(payloadText);
+  const frame = new Uint8Array(timestampBytes.byteLength + payload.byteLength);
+  frame.set(timestampBytes, 0);
+  frame.set(payload, timestampBytes.byteLength);
+  return frame;
+}
+
+async function waitFor(predicate) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.fail("condition was not met");
 }
 
 const tests = [
@@ -650,6 +837,8 @@ const tests = [
   testMoqTransportDoesNotCreatePeerConnection,
   testAutoSelectsMoqWhenGatewayAdvertisesOnlyMoq,
   testDefaultMoqAdapterPublishesControlAndAudioTracks,
+  testMoqPlaybackUsesIndependentSlotClocks,
+  testMoqPlaybackKeepsFramesContiguousAfterSmallJitter,
 ];
 
 try {

@@ -2940,6 +2940,7 @@ mod tests {
             privacy: shitspeak_runtime::config::PrivacyConfig::default(),
             s2s: shitspeak_runtime::config::S2sConfig::default(),
             web: WebConfig::default(),
+            voice: shitspeak_runtime::config::VoiceTuning::default(),
         };
 
         Server::new(config, authenticator).await.unwrap()
