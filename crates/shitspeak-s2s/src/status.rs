@@ -880,6 +880,102 @@ impl<'a> PrometheusWriter<'a> {
             "Bucketed S2S transport pipeline stage wall-clock duration in microseconds by transport and stage.",
             "counter",
         );
+        // CHOPPY_VOICE_PROMQL node_to_node:
+        // Source node egress to each peer:
+        // sum by (source, peer, transport, direction) (
+        //   rate(shitspeak_s2s_transport_io_bytes_total{
+        //     source="12", direction="egress"
+        //   }[1m])
+        // )
+        // Peer ingress from source node 12:
+        // sum by (source, peer, transport, direction) (
+        //   rate(shitspeak_s2s_transport_io_bytes_total{
+        //     peer="12", direction="ingress"
+        //   }[1m])
+        // )
+        // Pressure on node 12 vs sibling China nodes:
+        // sum by (source, peer, transport, direction, result) (
+        //   rate(shitspeak_s2s_transport_io_pressure_total{
+        //     source=~"1|11|12|13|14"
+        //   }[5m])
+        // )
+        // Search with: rg "CHOPPY_VOICE_PROMQL node_to_node"
+        self.header(
+            "shitspeak_s2s_transport_io_batches_total",
+            "S2S transport IO batches by local node, peer, transport, and direction.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_transport_io_frames_total",
+            "S2S transport IO frames by local node, peer, transport, direction, and class.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_transport_io_bytes_total",
+            "S2S transport IO bytes by local node, peer, transport, and direction.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_transport_io_batch_size_bucket_total",
+            "S2S transport IO batch size buckets by local node, peer, transport, and direction.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_transport_io_pressure_total",
+            "S2S transport IO pressure events by local node, peer, transport, direction, and result.",
+            "counter",
+        );
+        // CHOPPY_VOICE_PROMQL source_node_egress:
+        // Source node app-level S2S voice egress:
+        // sum by (source, mode, result) (
+        //   rate(shitspeak_s2s_voice_send_events_total{source="12"}[1m])
+        // )
+        // Compare against native ingress gaps on the same node:
+        // sum by (node, origin_node, result) (
+        //   rate(shitspeak_voice_ingress_continuity_total{
+        //     node="12", result!="frame"
+        //   }[1m])
+        // )
+        // Search with: rg "CHOPPY_VOICE_PROMQL source_node_egress"
+        self.header(
+            "shitspeak_s2s_voice_send_events_total",
+            "S2S voice application send events by local node, mode, destination-count bucket, bytes bucket, and result.",
+            "counter",
+        );
+        // CHOPPY_VOICE_PROMQL receiver_node_ingress:
+        // Receiver reorder outcomes for voice originated by node 12:
+        // sum by (source, origin_node, from_immediate, result) (
+        //   rate(shitspeak_s2s_voice_receive_events_total{source="13", origin_node="12"}[1m])
+        // )
+        // Receiver repair behavior for the same incident window:
+        // sum by (source, peer, result) (
+        //   rate(shitspeak_s2s_voice_repair_events_total{source="13"}[1m])
+        // )
+        // Compare with receiver native UDP egress pressure:
+        // sum by (node, result) (
+        //   rate(shitspeak_voice_udp_send_events_total{node="13"}[1m])
+        // )
+        // Search with: rg "CHOPPY_VOICE_PROMQL receiver_node_ingress"
+        self.header(
+            "shitspeak_s2s_voice_receive_events_total",
+            "S2S voice application receive and reorder events by local node, origin node, immediate peer, and result.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_repair_events_total",
+            "S2S voice repair events by local node, peer, and result.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reorder_pending",
+            "Current S2S voice reorder pending frame count by local node.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reorder_pending_bucket_total",
+            "Sampled S2S voice reorder pending frame count buckets by local node.",
+            "counter",
+        );
         self.header(
             "shitspeak_s2s_debug_packet_io_bytes_total",
             "Debug S2S packet IO bytes by packet kind and direction.",
@@ -1009,6 +1105,7 @@ impl<'a> PrometheusWriter<'a> {
 fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
     let mut out = Vec::new();
     out.extend(crate::replications::metrics::prometheus_samples());
+    out.extend(crate::application::voice::metrics::prometheus_samples());
     let local_node = snapshot.local_node.to_string();
     for node in snapshot
         .nodes
@@ -1470,6 +1567,12 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
     for stage in shitspeak_s2s_transport::transport_pipeline_stage_snapshots() {
         add_transport_pipeline_stage_samples(&mut out, &local_node, stage);
     }
+    for io in shitspeak_s2s_transport::transport_io_snapshots() {
+        add_transport_io_samples(&mut out, &local_node, io);
+    }
+    for frames in shitspeak_s2s_transport::transport_io_frame_snapshots() {
+        add_transport_io_frame_samples(&mut out, &local_node, frames);
+    }
 
     for packet in &snapshot.debug_packet_io {
         add_debug_packet_samples(&mut out, packet);
@@ -1532,6 +1635,69 @@ fn add_transport_pipeline_stage_samples(
             count as f64,
         ));
     }
+}
+
+fn add_transport_io_samples(
+    out: &mut Vec<PrometheusSample>,
+    local_node: &str,
+    io: shitspeak_s2s_transport::TransportIoSnapshot,
+) {
+    let peer = io.peer().to_string();
+    let transport = transport_kind_name(io.transport());
+    let direction = io.direction().name();
+    let labels = vec![
+        ("source", local_node),
+        ("peer", peer.as_str()),
+        ("transport", transport),
+        ("direction", direction),
+    ];
+    out.push(sample(
+        "shitspeak_s2s_transport_io_batches_total",
+        labels.clone(),
+        io.batches() as f64,
+    ));
+    out.push(sample(
+        "shitspeak_s2s_transport_io_bytes_total",
+        labels.clone(),
+        io.bytes() as f64,
+    ));
+    for (bucket, count) in io.batch_size_buckets() {
+        let mut bucket_labels = labels.clone();
+        bucket_labels.push(("bucket", bucket));
+        out.push(sample(
+            "shitspeak_s2s_transport_io_batch_size_bucket_total",
+            bucket_labels,
+            count as f64,
+        ));
+    }
+    for (result, count) in io.pressure() {
+        let mut pressure_labels = labels.clone();
+        pressure_labels.push(("result", result.name()));
+        out.push(sample(
+            "shitspeak_s2s_transport_io_pressure_total",
+            pressure_labels,
+            count as f64,
+        ));
+    }
+}
+
+fn add_transport_io_frame_samples(
+    out: &mut Vec<PrometheusSample>,
+    local_node: &str,
+    frames: shitspeak_s2s_transport::TransportIoFrameSnapshot,
+) {
+    let peer = frames.peer().to_string();
+    out.push(sample(
+        "shitspeak_s2s_transport_io_frames_total",
+        vec![
+            ("source", local_node),
+            ("peer", peer.as_str()),
+            ("transport", transport_kind_name(frames.transport())),
+            ("direction", frames.direction().name()),
+            ("class", message_class_name(frames.class())),
+        ],
+        frames.frames() as f64,
+    ));
 }
 
 fn add_debug_packet_samples(
@@ -2284,6 +2450,11 @@ mod tests {
         assert!(rendered.contains(
             "shitspeak_s2s_transport_health_exclusions_total{source=\"1\",peer=\"2\",transport=\"kcp\",reason=\"kcp_failaway\"} 7"
         ));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_transport_io_batches_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_transport_io_frames_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_send_events_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_receive_events_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_events_total counter\n"));
     }
 
     #[test]

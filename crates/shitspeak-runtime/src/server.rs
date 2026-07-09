@@ -504,6 +504,7 @@ impl Server {
                     },
                     _ = shutdown.changed() => break,
                 };
+                crate::voice::metrics::record_udp_recv_batch(received);
 
                 for datagram in batch.iter().take(received) {
                     if shutdown.has_changed().unwrap_or(true) {
@@ -591,9 +592,25 @@ impl Server {
 
         if voice_enabled {
             let packet = Bytes::copy_from_slice(packet);
+            let capacity = tx.max_capacity();
+            let depth = capacity.saturating_sub(tx.capacity());
+            crate::voice::metrics::record_queue_status(
+                crate::voice::metrics::VoiceQueueKind::UdpProcessing,
+                depth,
+                capacity,
+            );
             match tx.try_send(UdpPacket::new(packet, src_addr, local_addr)) {
-                Ok(()) => {}
+                Ok(()) => {
+                    crate::voice::metrics::record_queue_enqueue(
+                        crate::voice::metrics::VoiceQueueKind::UdpProcessing,
+                        crate::voice::metrics::VoiceQueueEnqueueResult::Accepted,
+                    );
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    crate::voice::metrics::record_queue_enqueue(
+                        crate::voice::metrics::VoiceQueueKind::UdpProcessing,
+                        crate::voice::metrics::VoiceQueueEnqueueResult::Full,
+                    );
                     crate::voice::metrics::record_udp_drain_drop(
                         crate::voice::metrics::UdpDrainDropReason::ProcessingQueueFull,
                     );
@@ -602,11 +619,15 @@ impl Server {
                         src_addr
                     );
                 }
-                Err(e) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    crate::voice::metrics::record_queue_enqueue(
+                        crate::voice::metrics::VoiceQueueKind::UdpProcessing,
+                        crate::voice::metrics::VoiceQueueEnqueueResult::Closed,
+                    );
                     crate::voice::metrics::record_udp_drain_drop(
                         crate::voice::metrics::UdpDrainDropReason::ProcessingQueueClosed,
                     );
-                    tracing::warn!("UDP processing channel error for {}: {e}", src_addr);
+                    tracing::warn!("UDP processing channel closed for {}", src_addr);
                 }
             }
         } else {
@@ -924,6 +945,18 @@ impl Server {
                         crate::voice::metrics::record_ingress(
                             crate::voice::metrics::VoiceIngressTransport::Udp,
                             packet.len(),
+                        );
+                        crate::voice::metrics::record_native_ingress_continuity(
+                            crate::voice::metrics::VoiceIngressTransport::Udp,
+                            decoded_audio
+                                .sender_session
+                                .unwrap_or_else(|| client.get_session_id()),
+                            decoded_audio.frame_number,
+                            matches!(
+                                &decoded_audio.audio_payload,
+                                crate::voice::codec::AudioPayload::Opus(payload)
+                                    if payload.is_terminator
+                            ),
                         );
                         tracing::trace!(
                             "UDP audio packet from {}: sender_session={:?}, frame_number={}, format={:?}, payload_len={}",

@@ -21,6 +21,10 @@ use crate::application::error::ApplicationError;
 use crate::application::proto::{
     self, VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal, VoiceRepairRequest,
 };
+use crate::application::voice::metrics;
+use crate::application::voice::metrics::{
+    VoiceReceiveResult, VoiceRepairResult, VoiceSendMode, VoiceSendResult,
+};
 use crate::application::voice::reorder::{self, GapReport, Reorderer, VoiceRouteHint};
 use crate::application::voice::repair::{RepairCache, RepairFrame};
 use crate::application::voice::send::{self, OverlayVoiceTransport, VoiceTransport};
@@ -229,6 +233,13 @@ impl VoiceService {
     ) -> Result<(), ApplicationError> {
         let dsts = self.remote_voice_members();
         if dsts.is_empty() {
+            metrics::record_send(
+                self.transport.local_node_id(),
+                VoiceSendMode::Broadcast,
+                0,
+                payload.len(),
+                VoiceSendResult::Noop,
+            );
             return Ok(());
         }
         let (bytes, seq) = self.encode(
@@ -239,7 +250,19 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        self.transport.send_multicast(&dsts, bytes.clone()).await?;
+        let result = self.transport.send_multicast(&dsts, bytes.clone()).await;
+        metrics::record_send(
+            self.transport.local_node_id(),
+            VoiceSendMode::Broadcast,
+            dsts.len(),
+            bytes.len(),
+            if result.is_ok() {
+                VoiceSendResult::Sent
+            } else {
+                VoiceSendResult::Failed
+            },
+        );
+        result?;
         self.cache_and_send_proactive_repairs(sender_session, seq, bytes, &dsts)
             .await;
         Ok(())
@@ -258,6 +281,13 @@ impl VoiceService {
         dsts: &[NodeIdentifier],
     ) -> Result<(), ApplicationError> {
         if dsts.is_empty() {
+            metrics::record_send(
+                self.transport.local_node_id(),
+                VoiceSendMode::Multicast,
+                0,
+                payload.len(),
+                VoiceSendResult::Noop,
+            );
             return Ok(());
         }
         let (bytes, seq) = self.encode(
@@ -268,7 +298,19 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        self.transport.send_multicast(dsts, bytes.clone()).await?;
+        let result = self.transport.send_multicast(dsts, bytes.clone()).await;
+        metrics::record_send(
+            self.transport.local_node_id(),
+            VoiceSendMode::Multicast,
+            dsts.len(),
+            bytes.len(),
+            if result.is_ok() {
+                VoiceSendResult::Sent
+            } else {
+                VoiceSendResult::Failed
+            },
+        );
+        result?;
         self.cache_and_send_proactive_repairs(sender_session, seq, bytes, dsts)
             .await;
         Ok(())
@@ -294,6 +336,7 @@ impl VoiceService {
         is_terminator: bool,
         payload: Bytes,
     ) -> Result<(), ApplicationError> {
+        let payload_len = payload.len();
         let intent = normal_intent(channel_id);
         match self.delivery_strategy {
             DeliveryStrategy::Broadcast => {
@@ -310,18 +353,38 @@ impl VoiceService {
                         if dsts.is_empty() {
                             // Index exists but only the speaker is in the
                             // channel; nothing to do for cross-node delivery.
+                            metrics::record_send(
+                                self.transport.local_node_id(),
+                                VoiceSendMode::TargetedNoop,
+                                0,
+                                payload_len,
+                                VoiceSendResult::Noop,
+                            );
                             return Ok(());
                         }
-                        self.send_multicast(
-                            sender_session,
-                            server_id,
-                            0,
-                            is_terminator,
-                            payload,
-                            intent,
-                            &dsts,
-                        )
-                        .await
+                        let result = self
+                            .send_multicast(
+                                sender_session,
+                                server_id,
+                                0,
+                                is_terminator,
+                                payload,
+                                intent,
+                                &dsts,
+                            )
+                            .await;
+                        metrics::record_send(
+                            self.transport.local_node_id(),
+                            VoiceSendMode::Targeted,
+                            dsts.len(),
+                            payload_len,
+                            if result.is_ok() {
+                                VoiceSendResult::Sent
+                            } else {
+                                VoiceSendResult::Failed
+                            },
+                        );
+                        result
                     }
                     Some(RemoteNodeLookup::Missing { .. }) | None => {
                         // No index entry yet — degrade safely to broadcast.
@@ -330,15 +393,28 @@ impl VoiceService {
                             channel_id,
                             "voice targeted: no index entry; falling back to broadcast"
                         );
-                        self.send_broadcast(
-                            sender_session,
-                            server_id,
+                        let result = self
+                            .send_broadcast(
+                                sender_session,
+                                server_id,
+                                0,
+                                is_terminator,
+                                payload,
+                                intent,
+                            )
+                            .await;
+                        metrics::record_send(
+                            self.transport.local_node_id(),
+                            VoiceSendMode::TargetedFallback,
                             0,
-                            is_terminator,
-                            payload,
-                            intent,
-                        )
-                        .await
+                            payload_len,
+                            if result.is_ok() {
+                                VoiceSendResult::Sent
+                            } else {
+                                VoiceSendResult::Failed
+                            },
+                        );
+                        result
                     }
                 }
             }
@@ -358,6 +434,7 @@ impl VoiceService {
         payload: Bytes,
         intent: VoiceIntent,
     ) -> Result<(), ApplicationError> {
+        let payload_len = payload.len();
         match self.delivery_strategy {
             DeliveryStrategy::Broadcast => {
                 self.send_broadcast(
@@ -383,7 +460,7 @@ impl VoiceService {
                             channel_id,
                             "voice targeted: incomplete target channel index; falling back to broadcast"
                         );
-                        return self
+                        let result = self
                             .send_broadcast(
                                 sender_session,
                                 server_id,
@@ -393,6 +470,18 @@ impl VoiceService {
                                 intent,
                             )
                             .await;
+                        metrics::record_send(
+                            self.transport.local_node_id(),
+                            VoiceSendMode::TargetedFallback,
+                            0,
+                            payload_len,
+                            if result.is_ok() {
+                                VoiceSendResult::Sent
+                            } else {
+                                VoiceSendResult::Failed
+                            },
+                        );
+                        return result;
                     }
                     None => {
                         if let Some(channel_id) = channel_ids.first().copied() {
@@ -401,7 +490,7 @@ impl VoiceService {
                                 channel_id,
                                 "voice targeted: incomplete target channel index; falling back to broadcast"
                             );
-                            return self
+                            let result = self
                                 .send_broadcast(
                                     sender_session,
                                     server_id,
@@ -411,23 +500,62 @@ impl VoiceService {
                                     intent,
                                 )
                                 .await;
+                            metrics::record_send(
+                                self.transport.local_node_id(),
+                                VoiceSendMode::TargetedFallback,
+                                0,
+                                payload_len,
+                                if result.is_ok() {
+                                    VoiceSendResult::Sent
+                                } else {
+                                    VoiceSendResult::Failed
+                                },
+                            );
+                            return result;
                         }
+                        metrics::record_send(
+                            self.transport.local_node_id(),
+                            VoiceSendMode::TargetedNoop,
+                            0,
+                            payload_len,
+                            VoiceSendResult::Noop,
+                        );
                         return Ok(());
                     }
                 };
                 if dsts.is_empty() {
+                    metrics::record_send(
+                        self.transport.local_node_id(),
+                        VoiceSendMode::TargetedNoop,
+                        0,
+                        payload_len,
+                        VoiceSendResult::Noop,
+                    );
                     return Ok(());
                 }
-                self.send_multicast(
-                    sender_session,
-                    server_id,
-                    target_kind,
-                    is_terminator,
-                    payload,
-                    intent,
-                    &dsts,
-                )
-                .await
+                let result = self
+                    .send_multicast(
+                        sender_session,
+                        server_id,
+                        target_kind,
+                        is_terminator,
+                        payload,
+                        intent,
+                        &dsts,
+                    )
+                    .await;
+                metrics::record_send(
+                    self.transport.local_node_id(),
+                    VoiceSendMode::Targeted,
+                    dsts.len(),
+                    payload_len,
+                    if result.is_ok() {
+                        VoiceSendResult::Sent
+                    } else {
+                        VoiceSendResult::Failed
+                    },
+                );
+                result
             }
         }
     }
@@ -451,7 +579,19 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        self.transport.send_unicast(dst, bytes.clone()).await?;
+        let result = self.transport.send_unicast(dst, bytes.clone()).await;
+        metrics::record_send(
+            self.transport.local_node_id(),
+            VoiceSendMode::Unicast,
+            1,
+            bytes.len(),
+            if result.is_ok() {
+                VoiceSendResult::Sent
+            } else {
+                VoiceSendResult::Failed
+            },
+        );
+        result?;
         self.cache_and_send_proactive_repairs(sender_session, seq, bytes, &[dst])
             .await;
         Ok(())
@@ -529,10 +669,19 @@ impl VoiceService {
                 })
                 .unwrap_or(0);
             for _ in 0..extra_copies {
-                let _ = self
+                if self
                     .transport
                     .send_repair_frame(dst, body.clone(), avoid_first_hop, transport_ttl)
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    metrics::record_repair(
+                        self.transport.local_node_id(),
+                        dst,
+                        VoiceRepairResult::ProactiveCopySent,
+                        1,
+                    );
+                }
             }
         }
     }
@@ -705,6 +854,7 @@ impl ServiceInbound for VoiceRepairInbound {
         if !self.cfg.repair_enabled {
             return;
         }
+        let source = self.transport.local_node_id();
         let request = match proto::decode_voice_repair_request(&msg.body) {
             Ok(request) => request,
             Err(e) => {
@@ -713,6 +863,7 @@ impl ServiceInbound for VoiceRepairInbound {
             }
         };
         if repair_request_is_stale(&request) {
+            metrics::record_repair(source, msg.from, VoiceRepairResult::RequestSuppressed, 1);
             trace!(from=%msg.from, "voice repair: dropping stale request");
             return;
         }
@@ -724,8 +875,15 @@ impl ServiceInbound for VoiceRepairInbound {
             request.last_seq,
         );
         if frames.is_empty() {
+            metrics::record_repair(source, msg.from, VoiceRepairResult::FrameMissed, 1);
             return;
         }
+        metrics::record_repair(
+            source,
+            msg.from,
+            VoiceRepairResult::FrameServed,
+            frames.len(),
+        );
         let transport = self.transport.clone();
         let ttl = Duration::from_millis(self.cfg.repair_transport_ttl_ms);
         tokio::spawn(async move {
@@ -757,17 +915,30 @@ fn spawn_dispatch_task(
                 _ = shutdown.cancelled() => return,
                 next = rx.recv() => {
                     let Some(ev) = next else { return };
-                    let emits = match ev {
+                    let source = transport.local_node_id();
+                    let (report, inbound_labels) = match ev {
                         DispatchEvent::Inbound(d) => {
                             let frame_for_gap = d.frame.clone();
+                            let origin_node =
+                                shitspeak_core::ClientSessionIdentifier::from(
+                                    frame_for_gap.sender_session,
+                                )
+                                .get_node_id();
                             let route_hint =
                                 transport.voice_route_quality(d.from).map(route_hint_from_quality);
-                            let emits = reorderer.push_with_route_hint(d.from, d.frame, route_hint);
+                            let report =
+                                reorderer.push_with_route_hint_report(d.from, d.frame, route_hint);
                             let gap = cfg
                                 .repair_enabled
                                 .then(|| reorderer.gap_for_frame(d.from, &frame_for_gap))
                                 .flatten();
                             if let Some(gap) = gap {
+                                metrics::record_repair(
+                                    source,
+                                    gap.from,
+                                    VoiceRepairResult::GapDetected,
+                                    1,
+                                );
                                 schedule_gap_repair(
                                     reorderer.clone(),
                                     transport.clone(),
@@ -776,10 +947,39 @@ fn spawn_dispatch_task(
                                     gap,
                                 );
                             }
-                            emits
+                            (report, Some((origin_node, d.from)))
                         }
-                        DispatchEvent::DeadlineFired => reorderer.drain_expired(),
+                        DispatchEvent::DeadlineFired => {
+                            (reorderer.drain_expired_report(), None)
+                        }
                     };
+                    metrics::set_reorder_pending(source, report.pending_total());
+                    if let Some((origin_node, from_immediate)) = inbound_labels {
+                        for result in report.result_counts() {
+                            metrics::record_receive(
+                                source,
+                                origin_node,
+                                from_immediate,
+                                result.result(),
+                                result.count(),
+                            );
+                        }
+                    }
+                    let emits = report.into_emissions();
+                    if inbound_labels.is_none() {
+                        for (from, frame) in &emits {
+                            let origin_node =
+                                shitspeak_core::ClientSessionIdentifier::from(frame.sender_session)
+                                    .get_node_id();
+                            metrics::record_receive(
+                                source,
+                                origin_node,
+                                *from,
+                                VoiceReceiveResult::DeadlineFlush,
+                                1,
+                            );
+                        }
+                    }
                     if emits.is_empty() {
                         continue;
                     }
@@ -790,10 +990,26 @@ fn spawn_dispatch_task(
                                 sink.deliver(from, frame).await;
                             }
                         }
-                        None => trace!(
-                            n = emits.len(),
-                            "voice: no audio sink installed; dropping emit batch",
-                        ),
+                        None => {
+                            for (from, frame) in &emits {
+                                let origin_node =
+                                    shitspeak_core::ClientSessionIdentifier::from(
+                                        frame.sender_session,
+                                    )
+                                    .get_node_id();
+                                metrics::record_receive(
+                                    source,
+                                    origin_node,
+                                    *from,
+                                    VoiceReceiveResult::NoSinkDrop,
+                                    1,
+                                );
+                            }
+                            trace!(
+                                n = emits.len(),
+                                "voice: no audio sink installed; dropping emit batch",
+                            )
+                        }
                     }
                 }
             }
@@ -808,14 +1024,18 @@ fn schedule_gap_repair(
     request_ttl_ms: u64,
     gap: GapReport,
 ) {
-    if gap.from == transport.local_node_id() {
+    let source = transport.local_node_id();
+    if gap.from == source {
+        metrics::record_repair(source, gap.from, VoiceRepairResult::RequestSuppressed, 1);
         return;
     }
+    metrics::record_repair(source, gap.from, VoiceRepairResult::RequestScheduled, 1);
     tokio::spawn(async move {
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         if !reorderer.gap_still_missing(gap) {
+            metrics::record_repair(source, gap.from, VoiceRepairResult::RequestSuppressed, 1);
             return;
         }
         let request = VoiceRepairRequest {
@@ -828,11 +1048,25 @@ fn schedule_gap_repair(
         };
         match proto::encode_voice_repair_request(&request) {
             Ok(body) => {
-                let _ = transport
+                if transport
                     .send_repair_request(gap.from, body, Duration::from_millis(request_ttl_ms))
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    metrics::record_repair(source, gap.from, VoiceRepairResult::RequestSent, 1);
+                } else {
+                    metrics::record_repair(
+                        source,
+                        gap.from,
+                        VoiceRepairResult::RequestSuppressed,
+                        1,
+                    );
+                }
             }
-            Err(e) => trace!(error=%e, "voice repair: encode request failed"),
+            Err(e) => {
+                metrics::record_repair(source, gap.from, VoiceRepairResult::RequestSuppressed, 1);
+                trace!(error=%e, "voice repair: encode request failed")
+            }
         }
     });
 }

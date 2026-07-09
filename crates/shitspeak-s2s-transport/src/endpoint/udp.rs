@@ -44,7 +44,9 @@ use super::super::frame::{FrameType, build_frame};
 use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
 use super::super::metrics::{
-    ExpiredOutboundDropStage, TransportPipelineStage, record_transport_pipeline_stage,
+    ExpiredOutboundDropStage, TransportIoDirection, TransportIoPressureResult,
+    TransportPipelineStage, record_transport_io_batch, record_transport_io_frames,
+    record_transport_io_pressure, record_transport_pipeline_stage,
 };
 use super::super::service_level::{MessageClass, ServiceLevel, TransportKind};
 use super::super::tls;
@@ -390,6 +392,13 @@ enum UdpIo {
     Prefixed(Arc<PrefixedUdpSocket>),
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct UdpIoBatchSendOutcome {
+    bytes: usize,
+    would_block: u64,
+    partial: u64,
+}
+
 impl UdpIo {
     async fn recv_batch_from(&self, batch: &mut RecvDatagramBatch) -> io::Result<usize> {
         match self {
@@ -417,7 +426,11 @@ impl UdpIo {
         }
     }
 
-    async fn send_batch_to(&self, payloads: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
+    async fn send_batch_to(
+        &self,
+        payloads: &[&[u8]],
+        target: SocketAddr,
+    ) -> io::Result<UdpIoBatchSendOutcome> {
         match self {
             Self::Direct(socket) => {
                 let batch = payloads
@@ -432,10 +445,30 @@ impl UdpIo {
                         "S2S UDP direct batch send observed socket backpressure"
                     );
                 }
-                Ok(payloads.iter().map(|payload| payload.len()).sum())
+                Ok(UdpIoBatchSendOutcome {
+                    bytes: payloads.iter().map(|payload| payload.len()).sum(),
+                    would_block: stats.would_block_count(),
+                    partial: stats.partial_count(),
+                })
             }
-            Self::Mux(handle) => handle.send_batch_to(payloads, target).await,
-            Self::Prefixed(socket) => socket.send_batch_to(payloads, target).await,
+            Self::Mux(handle) => {
+                handle
+                    .send_batch_to(payloads, target)
+                    .await
+                    .map(|bytes| UdpIoBatchSendOutcome {
+                        bytes,
+                        ..UdpIoBatchSendOutcome::default()
+                    })
+            }
+            Self::Prefixed(socket) => {
+                socket
+                    .send_batch_to(payloads, target)
+                    .await
+                    .map(|bytes| UdpIoBatchSendOutcome {
+                        bytes,
+                        ..UdpIoBatchSendOutcome::default()
+                    })
+            }
         }
     }
 
@@ -589,15 +622,40 @@ impl UdpCryptoSession {
         let datagram = self.encrypt_frame(frame, self.socket.payload_mtu(udp_mtu))?;
         let addr = *self.peer_addr.lock();
         let write_started_at = Instant::now();
-        let n = self
-            .socket
-            .send_to(&datagram, addr)
-            .await
-            .map_err(|e| io::Error::other(format!("udp send: {e}")))?;
+        let n = match self.socket.send_to(&datagram, addr).await {
+            Ok(n) => n,
+            Err(e) => {
+                record_transport_io_pressure(
+                    peer.node_id(),
+                    TransportKind::Udp,
+                    TransportIoDirection::Egress,
+                    TransportIoPressureResult::Error,
+                    1,
+                );
+                return Err(io::Error::other(format!("udp send: {e}")));
+            }
+        };
         record_transport_pipeline_stage(
             TransportKind::Udp,
             TransportPipelineStage::SocketWrite,
             write_started_at.elapsed(),
+        );
+        let class = pb::MessageClass::try_from(frame.message_class)
+            .map(MessageClass::from)
+            .unwrap_or(MessageClass::Regular);
+        record_transport_io_batch(
+            peer.node_id(),
+            TransportKind::Udp,
+            TransportIoDirection::Egress,
+            1,
+            n,
+        );
+        record_transport_io_frames(
+            peer.node_id(),
+            TransportKind::Udp,
+            TransportIoDirection::Egress,
+            class,
+            1,
         );
         peer.metrics().record_sent(TransportKind::Udp, n);
         #[cfg(debug_assertions)]
@@ -620,20 +678,56 @@ impl UdpCryptoSession {
             .collect::<Vec<_>>();
         let addr = *self.peer_addr.lock();
         let write_started_at = Instant::now();
-        let n = self
-            .socket
-            .send_batch_to(&payloads, addr)
-            .await
-            .map_err(|e| io::Error::other(format!("udp send batch: {e}")))?;
+        let outcome = match self.socket.send_batch_to(&payloads, addr).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                record_transport_io_pressure(
+                    peer.node_id(),
+                    TransportKind::Udp,
+                    TransportIoDirection::Egress,
+                    TransportIoPressureResult::Error,
+                    1,
+                );
+                return Err(io::Error::other(format!("udp send batch: {e}")));
+            }
+        };
         record_transport_pipeline_stage(
             TransportKind::Udp,
             TransportPipelineStage::SocketWrite,
             write_started_at.elapsed(),
         );
+        record_transport_io_batch(
+            peer.node_id(),
+            TransportKind::Udp,
+            TransportIoDirection::Egress,
+            batch.len(),
+            outcome.bytes,
+        );
+        record_transport_io_pressure(
+            peer.node_id(),
+            TransportKind::Udp,
+            TransportIoDirection::Egress,
+            TransportIoPressureResult::WouldBlock,
+            outcome.would_block,
+        );
+        record_transport_io_pressure(
+            peer.node_id(),
+            TransportKind::Udp,
+            TransportIoDirection::Egress,
+            TransportIoPressureResult::Partial,
+            outcome.partial,
+        );
 
         for entry in batch {
             peer.metrics()
                 .record_sent(TransportKind::Udp, entry.datagram.len());
+            record_transport_io_frames(
+                peer.node_id(),
+                TransportKind::Udp,
+                TransportIoDirection::Egress,
+                entry.class,
+                1,
+            );
             #[cfg(debug_assertions)]
             crate::debug_io::record_named_sent(
                 udp_frame_kind_name(entry.frame_type),
@@ -641,7 +735,7 @@ impl UdpCryptoSession {
             );
         }
 
-        Ok(n)
+        Ok(outcome.bytes)
     }
 
     fn encrypt_frame(&self, frame: &pb::Frame, udp_mtu: usize) -> io::Result<Vec<u8>> {
@@ -1171,6 +1265,23 @@ async fn handle_udp_datagram(
     }
     let peer = inner.get_or_create_peer(header.src);
     peer.metrics().record_recv(TransportKind::Udp, packet.len());
+    let class = pb::MessageClass::try_from(frame.message_class)
+        .map(MessageClass::from)
+        .unwrap_or(MessageClass::Regular);
+    record_transport_io_batch(
+        peer.node_id(),
+        TransportKind::Udp,
+        TransportIoDirection::Ingress,
+        1,
+        packet.len(),
+    );
+    record_transport_io_frames(
+        peer.node_id(),
+        TransportKind::Udp,
+        TransportIoDirection::Ingress,
+        class,
+        1,
+    );
     handle_frame(
         frame,
         &session,

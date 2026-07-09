@@ -4,6 +4,7 @@
 //! default, opt-in targeted mode, per-(sender, epoch) reorder buffer).
 
 pub mod ingress;
+pub(crate) mod metrics;
 pub mod reorder;
 pub mod repair;
 pub mod send;

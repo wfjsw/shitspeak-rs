@@ -28,6 +28,7 @@ use tracing::trace;
 
 use crate::application::config::VoiceConfig;
 use crate::application::proto::VoiceFrame;
+use crate::application::voice::metrics::VoiceReceiveResult;
 use shitspeak_core::NodeIdentifier;
 
 const ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN: u32 = 16;
@@ -37,6 +38,59 @@ const ADAPTIVE_REPAIR_LOSS_BONUS_MAX_MS: u64 = 200;
 /// One emit decision: forward the bundled `(from_immediate, frame)` to
 /// the audio sink.
 pub type Emission = (NodeIdentifier, VoiceFrame);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReorderResultCount {
+    result: VoiceReceiveResult,
+    count: usize,
+}
+
+impl ReorderResultCount {
+    fn new(result: VoiceReceiveResult, count: usize) -> Self {
+        Self { result, count }
+    }
+
+    pub(crate) fn result(self) -> VoiceReceiveResult {
+        self.result
+    }
+
+    pub(crate) fn count(self) -> usize {
+        self.count
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReorderReport {
+    emissions: Vec<Emission>,
+    results: Vec<ReorderResultCount>,
+    pending_total: usize,
+}
+
+impl ReorderReport {
+    fn new(
+        emissions: Vec<Emission>,
+        results: Vec<ReorderResultCount>,
+        pending_total: usize,
+    ) -> Self {
+        Self {
+            emissions,
+            results,
+            pending_total,
+        }
+    }
+
+    pub(crate) fn result_counts(&self) -> &[ReorderResultCount] {
+        &self.results
+    }
+
+    pub(crate) fn pending_total(&self) -> usize {
+        self.pending_total
+    }
+
+    pub(crate) fn into_emissions(self) -> Vec<Emission> {
+        self.emissions
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GapReport {
@@ -205,11 +259,26 @@ impl Reorderer {
         frame: VoiceFrame,
         route_hint: Option<VoiceRouteHint>,
     ) -> Vec<Emission> {
+        self.push_with_route_hint_report(from, frame, route_hint)
+            .into_emissions()
+    }
+
+    pub(crate) fn push_with_route_hint_report(
+        &self,
+        from: NodeIdentifier,
+        frame: VoiceFrame,
+        route_hint: Option<VoiceRouteHint>,
+    ) -> ReorderReport {
         if self.cfg.reorder_disabled {
-            return vec![(from, frame)];
+            return ReorderReport::new(
+                vec![(from, frame)],
+                vec![ReorderResultCount::new(VoiceReceiveResult::InOrder, 1)],
+                0,
+            );
         }
 
         let mut emit: Vec<Emission> = Vec::new();
+        let mut results: Vec<ReorderResultCount> = Vec::new();
         let mut state = self.state.lock();
         let session = frame.sender_session;
         let arrived_epoch = frame.sender_epoch;
@@ -236,6 +305,7 @@ impl Reorderer {
 
         // ── 1. Sender restart (strictly greater epoch) ────────────────
         if arrived_epoch > entry.epoch {
+            results.push(ReorderResultCount::new(VoiceReceiveResult::EpochReset, 1));
             // Flush pending under old epoch in seq order, then reset.
             let drained: Vec<(NodeIdentifier, VoiceFrame)> = std::mem::take(&mut entry.pending)
                 .into_iter()
@@ -255,7 +325,11 @@ impl Reorderer {
             }
         } else if arrived_epoch < entry.epoch {
             // Old-epoch frame; drop silently.
-            return emit;
+            results.push(ReorderResultCount::new(
+                VoiceReceiveResult::DuplicateOrLate,
+                1,
+            ));
+            return ReorderReport::new(emit, results, state.total_pending);
         }
 
         // Re-borrow after the mutation above (needed if we hit the
@@ -276,17 +350,26 @@ impl Reorderer {
                 "voice reorder: dropping too-late frame"
             );
             self.grow_adaptive_delay(entry);
-            return emit;
+            results.push(ReorderResultCount::new(
+                VoiceReceiveResult::DuplicateOrLate,
+                1,
+            ));
+            return ReorderReport::new(emit, results, state.total_pending);
         }
         // Strictly-less but within lag: still drop (duplicate or out-of-
         // order older). next_seq has already advanced; we can't unwind.
         if frame.s2s_seq < entry.next_seq {
             self.grow_adaptive_delay(entry);
-            return emit;
+            results.push(ReorderResultCount::new(
+                VoiceReceiveResult::DuplicateOrLate,
+                1,
+            ));
+            return ReorderReport::new(emit, results, state.total_pending);
         }
 
         // ── 3. In-order match: emit + drain contiguous suffix ─────────
         if frame.s2s_seq == entry.next_seq {
+            results.push(ReorderResultCount::new(VoiceReceiveResult::InOrder, 1));
             emit.push((from, frame.clone()));
             entry.next_seq = entry.next_seq.saturating_add(1);
             let mut drained_count: usize = 0;
@@ -306,6 +389,10 @@ impl Reorderer {
                 entry.deadline = None;
             }
             if drained_count > 0 {
+                results.push(ReorderResultCount::new(
+                    VoiceReceiveResult::GapFilled,
+                    drained_count,
+                ));
                 self.grow_adaptive_delay(entry);
             } else if entry.pending.is_empty() {
                 self.record_clean_in_order(entry);
@@ -318,6 +405,7 @@ impl Reorderer {
                 if let Some(&oldest_seq) = entry.pending.keys().next() {
                     entry.pending.remove(&oldest_seq);
                     state.total_pending = state.total_pending.saturating_sub(1);
+                    results.push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
                 }
             }
             // Node-wide cap: drop-tail.
@@ -327,7 +415,8 @@ impl Reorderer {
                     seq = frame.s2s_seq,
                     "voice reorder: node-wide buffer full; dropping"
                 );
-                return emit;
+                results.push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
+                return ReorderReport::new(emit, results, state.total_pending);
             }
             let (inserted_new, deadline_delay_ms) = {
                 let entry = state.per_sender.get_mut(&session).unwrap();
@@ -345,7 +434,13 @@ impl Reorderer {
                 )
             };
             if inserted_new {
+                results.push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
                 state.total_pending = state.total_pending.saturating_add(1);
+            } else {
+                results.push(ReorderResultCount::new(
+                    VoiceReceiveResult::DuplicateOrLate,
+                    1,
+                ));
             }
             if let Some(delay_ms) = deadline_delay_ms {
                 let deadline = Instant::now() + Duration::from_millis(delay_ms);
@@ -371,18 +466,29 @@ impl Reorderer {
                 entry.next_seq = last_frame.s2s_seq.saturating_add(1);
             }
             entry.deadline = None;
+            if !drained.is_empty() {
+                results.push(ReorderResultCount::new(
+                    VoiceReceiveResult::GapFilled,
+                    drained.len(),
+                ));
+            }
             for e in drained {
                 emit.push(e);
             }
         }
 
-        emit
+        ReorderReport::new(emit, results, state.total_pending)
     }
 
     /// Drain every deadline that has expired. Returns frames in
     /// per-sender seq order; cross-sender ordering is unspecified.
     pub fn drain_expired(&self) -> Vec<Emission> {
+        self.drain_expired_report().into_emissions()
+    }
+
+    pub(crate) fn drain_expired_report(&self) -> ReorderReport {
         let mut emit: Vec<Emission> = Vec::new();
+        let mut results: Vec<ReorderResultCount> = Vec::new();
         let mut state = self.state.lock();
         let now = Instant::now();
         loop {
@@ -422,11 +528,17 @@ impl Reorderer {
                 drained
             };
             state.total_pending = state.total_pending.saturating_sub(drained.len());
+            if !drained.is_empty() {
+                results.push(ReorderResultCount::new(
+                    VoiceReceiveResult::DeadlineFlush,
+                    drained.len(),
+                ));
+            }
             for (_, from, frame) in drained {
                 emit.push((from, frame));
             }
         }
-        emit
+        ReorderReport::new(emit, results, state.total_pending)
     }
 
     pub fn gap_for_frame(&self, from: NodeIdentifier, frame: &VoiceFrame) -> Option<GapReport> {

@@ -3,8 +3,8 @@
 //! can score path quality among co-existing transports.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -90,6 +90,19 @@ const TRANSPORT_PIPELINE_DURATION_BUCKETS_US: [(&str, u64); 8] = [
     ("le_10000", 10_000),
     ("gt_10000", u64::MAX),
 ];
+const TRANSPORT_IO_BATCH_SIZE_BUCKETS: [(&str, u64); 8] = [
+    ("1", 1),
+    ("2", 2),
+    ("3_4", 4),
+    ("5_8", 8),
+    ("9_16", 16),
+    ("17_32", 32),
+    ("33_64", 64),
+    ("65_plus", u64::MAX),
+];
+
+static TRANSPORT_IO: LazyLock<StdMutex<TransportIoMetrics>> =
+    LazyLock::new(|| StdMutex::new(TransportIoMetrics::default()));
 
 static TRANSPORT_PIPELINE_STAGE_EVENTS: [[AtomicU64; TRANSPORT_PIPELINE_STAGE_COUNT];
     TRANSPORT_KIND_COUNT] =
@@ -211,6 +224,295 @@ pub fn transport_pipeline_stage_snapshots() -> Vec<TransportPipelineStageSnapsho
             });
         }
     }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportIoDirection {
+    Ingress,
+    Egress,
+}
+
+impl TransportIoDirection {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ingress => "ingress",
+            Self::Egress => "egress",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportIoPressureResult {
+    WouldBlock,
+    Partial,
+    Timeout,
+    Error,
+}
+
+impl TransportIoPressureResult {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::WouldBlock => "would_block",
+            Self::Partial => "partial",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TransportIoKey {
+    peer: NodeIdentifier,
+    transport: TransportKind,
+    direction: TransportIoDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TransportIoFrameKey {
+    peer: NodeIdentifier,
+    transport: TransportKind,
+    direction: TransportIoDirection,
+    class: MessageClass,
+}
+
+#[derive(Debug, Clone)]
+struct TransportIoCounter {
+    batches: u64,
+    bytes: u64,
+    batch_size_buckets: [u64; TRANSPORT_IO_BATCH_SIZE_BUCKETS.len()],
+    pressure: [u64; TRANSPORT_IO_PRESSURE_RESULT_COUNT],
+}
+
+impl Default for TransportIoCounter {
+    fn default() -> Self {
+        Self {
+            batches: 0,
+            bytes: 0,
+            batch_size_buckets: [0; TRANSPORT_IO_BATCH_SIZE_BUCKETS.len()],
+            pressure: [0; TRANSPORT_IO_PRESSURE_RESULT_COUNT],
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TransportIoMetrics {
+    io: HashMap<TransportIoKey, TransportIoCounter>,
+    frames: HashMap<TransportIoFrameKey, u64>,
+}
+
+const TRANSPORT_IO_PRESSURE_RESULT_COUNT: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportIoSnapshot {
+    peer: NodeIdentifier,
+    transport: TransportKind,
+    direction: TransportIoDirection,
+    batches: u64,
+    bytes: u64,
+    batch_size_buckets: [u64; TRANSPORT_IO_BATCH_SIZE_BUCKETS.len()],
+    pressure: [u64; TRANSPORT_IO_PRESSURE_RESULT_COUNT],
+}
+
+impl TransportIoSnapshot {
+    pub fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+
+    pub fn transport(&self) -> TransportKind {
+        self.transport
+    }
+
+    pub fn direction(&self) -> TransportIoDirection {
+        self.direction
+    }
+
+    pub fn batches(&self) -> u64 {
+        self.batches
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn batch_size_buckets(
+        &self,
+    ) -> [(&'static str, u64); TRANSPORT_IO_BATCH_SIZE_BUCKETS.len()] {
+        std::array::from_fn(|index| {
+            (
+                TRANSPORT_IO_BATCH_SIZE_BUCKETS[index].0,
+                self.batch_size_buckets[index],
+            )
+        })
+    }
+
+    pub fn pressure(
+        &self,
+    ) -> [(TransportIoPressureResult, u64); TRANSPORT_IO_PRESSURE_RESULT_COUNT] {
+        std::array::from_fn(|index| (transport_io_pressure_result(index), self.pressure[index]))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportIoFrameSnapshot {
+    peer: NodeIdentifier,
+    transport: TransportKind,
+    direction: TransportIoDirection,
+    class: MessageClass,
+    frames: u64,
+}
+
+impl TransportIoFrameSnapshot {
+    pub fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+
+    pub fn transport(&self) -> TransportKind {
+        self.transport
+    }
+
+    pub fn direction(&self) -> TransportIoDirection {
+        self.direction
+    }
+
+    pub fn class(&self) -> MessageClass {
+        self.class
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+}
+
+pub fn record_transport_io_batch(
+    peer: NodeIdentifier,
+    transport: TransportKind,
+    direction: TransportIoDirection,
+    frames: usize,
+    bytes: usize,
+) {
+    if frames == 0 && bytes == 0 {
+        return;
+    }
+    let mut metrics = TRANSPORT_IO.lock().unwrap();
+    let entry = metrics
+        .io
+        .entry(TransportIoKey {
+            peer,
+            transport,
+            direction,
+        })
+        .or_default();
+    entry.batches = entry.batches.saturating_add(1);
+    entry.bytes = entry.bytes.saturating_add(bytes as u64);
+    if let Some((bucket_index, _)) = TRANSPORT_IO_BATCH_SIZE_BUCKETS
+        .iter()
+        .enumerate()
+        .find(|(_, (_, upper_bound))| frames as u64 <= *upper_bound)
+    {
+        entry.batch_size_buckets[bucket_index] =
+            entry.batch_size_buckets[bucket_index].saturating_add(1);
+    }
+}
+
+pub fn record_transport_io_frames(
+    peer: NodeIdentifier,
+    transport: TransportKind,
+    direction: TransportIoDirection,
+    class: MessageClass,
+    frames: usize,
+) {
+    if frames == 0 {
+        return;
+    }
+    let mut metrics = TRANSPORT_IO.lock().unwrap();
+    let entry = metrics
+        .frames
+        .entry(TransportIoFrameKey {
+            peer,
+            transport,
+            direction,
+            class,
+        })
+        .or_default();
+    *entry = entry.saturating_add(frames as u64);
+}
+
+pub fn record_transport_io_pressure(
+    peer: NodeIdentifier,
+    transport: TransportKind,
+    direction: TransportIoDirection,
+    result: TransportIoPressureResult,
+    events: u64,
+) {
+    if events == 0 {
+        return;
+    }
+    let mut metrics = TRANSPORT_IO.lock().unwrap();
+    let entry = metrics
+        .io
+        .entry(TransportIoKey {
+            peer,
+            transport,
+            direction,
+        })
+        .or_default();
+    entry.pressure[transport_io_pressure_result_index(result)] =
+        entry.pressure[transport_io_pressure_result_index(result)].saturating_add(events);
+}
+
+pub fn transport_io_snapshots() -> Vec<TransportIoSnapshot> {
+    let metrics = TRANSPORT_IO.lock().unwrap();
+    let mut out = metrics
+        .io
+        .iter()
+        .map(|(key, counter)| TransportIoSnapshot {
+            peer: key.peer,
+            transport: key.transport,
+            direction: key.direction,
+            batches: counter.batches,
+            bytes: counter.bytes,
+            batch_size_buckets: counter.batch_size_buckets,
+            pressure: counter.pressure,
+        })
+        .collect::<Vec<_>>();
+    out.sort_by_key(|snapshot| {
+        (
+            snapshot.peer,
+            transport_pipeline_kind_index(snapshot.transport),
+            match snapshot.direction {
+                TransportIoDirection::Ingress => 0u8,
+                TransportIoDirection::Egress => 1u8,
+            },
+        )
+    });
+    out
+}
+
+pub fn transport_io_frame_snapshots() -> Vec<TransportIoFrameSnapshot> {
+    let metrics = TRANSPORT_IO.lock().unwrap();
+    let mut out = metrics
+        .frames
+        .iter()
+        .map(|(key, frames)| TransportIoFrameSnapshot {
+            peer: key.peer,
+            transport: key.transport,
+            direction: key.direction,
+            class: key.class,
+            frames: *frames,
+        })
+        .collect::<Vec<_>>();
+    out.sort_by_key(|snapshot| {
+        (
+            snapshot.peer,
+            transport_pipeline_kind_index(snapshot.transport),
+            match snapshot.direction {
+                TransportIoDirection::Ingress => 0u8,
+                TransportIoDirection::Egress => 1u8,
+            },
+            message_class_index(snapshot.class),
+        )
+    });
     out
 }
 
@@ -1859,6 +2161,24 @@ fn transport_pipeline_stage_index(stage: TransportPipelineStage) -> usize {
     }
 }
 
+fn transport_io_pressure_result_index(result: TransportIoPressureResult) -> usize {
+    match result {
+        TransportIoPressureResult::WouldBlock => 0,
+        TransportIoPressureResult::Partial => 1,
+        TransportIoPressureResult::Timeout => 2,
+        TransportIoPressureResult::Error => 3,
+    }
+}
+
+fn transport_io_pressure_result(index: usize) -> TransportIoPressureResult {
+    match index {
+        0 => TransportIoPressureResult::WouldBlock,
+        1 => TransportIoPressureResult::Partial,
+        2 => TransportIoPressureResult::Timeout,
+        _ => TransportIoPressureResult::Error,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InboundQueueStatusSnapshot {
     class: MessageClass,
@@ -1932,6 +2252,68 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_io_snapshots_record_bounded_bidirectional_labels() {
+        let peer = 4094;
+
+        record_transport_io_batch(
+            peer,
+            TransportKind::Udp,
+            TransportIoDirection::Egress,
+            5,
+            4096,
+        );
+        record_transport_io_frames(
+            peer,
+            TransportKind::Udp,
+            TransportIoDirection::Egress,
+            MessageClass::Regular,
+            5,
+        );
+        record_transport_io_pressure(
+            peer,
+            TransportKind::Udp,
+            TransportIoDirection::Egress,
+            TransportIoPressureResult::Partial,
+            2,
+        );
+
+        let snapshot = transport_io_snapshots()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.peer() == peer
+                    && snapshot.transport() == TransportKind::Udp
+                    && snapshot.direction() == TransportIoDirection::Egress
+            })
+            .expect("transport IO snapshot");
+
+        assert!(snapshot.batches() >= 1);
+        assert!(snapshot.bytes() >= 4096);
+        assert!(
+            snapshot
+                .batch_size_buckets()
+                .into_iter()
+                .any(|(bucket, count)| bucket == "5_8" && count >= 1)
+        );
+        assert!(
+            snapshot
+                .pressure()
+                .into_iter()
+                .any(|(result, count)| result == TransportIoPressureResult::Partial && count >= 2)
+        );
+
+        let frames = transport_io_frame_snapshots()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.peer() == peer
+                    && snapshot.transport() == TransportKind::Udp
+                    && snapshot.direction() == TransportIoDirection::Egress
+                    && snapshot.class() == MessageClass::Regular
+            })
+            .expect("transport IO frame snapshot");
+        assert!(frames.frames() >= 5);
+    }
 
     #[test]
     fn ewma_smoothing() {

@@ -87,12 +87,14 @@ pub use manager::PeerAddressSnapshot;
 pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage};
 pub use metrics::{
     ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics,
-    MetricsSnapshot, OutboundQueueStatusSnapshot, QueueStatusSnapshot,
+    MetricsSnapshot, OutboundQueueStatusSnapshot, QueueStatusSnapshot, TransportIoDirection,
+    TransportIoFrameSnapshot, TransportIoPressureResult, TransportIoSnapshot,
     TransportPipelineStageSnapshot,
 };
 pub use metrics::{
     apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,
-    conversational_quality_score, transport_pipeline_stage_snapshots,
+    conversational_quality_score, transport_io_frame_snapshots, transport_io_snapshots,
+    transport_pipeline_stage_snapshots,
 };
 pub use public_ip::discover_public_geo;
 pub use service_level::{

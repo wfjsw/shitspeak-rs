@@ -1369,17 +1369,50 @@ impl Client {
 
     pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) -> bool {
         let payload = VoiceRoutingPayload::new(decoded_audio);
-        if self.voice_routing_tx.try_send(payload).is_err() {
-            crate::voice::metrics::record_queue_drop(
-                crate::voice::metrics::VoiceQueueDropReason::RoutingQueueFullOrClosed,
-            );
-            tracing::trace!(
-                session = u32::from(self.get_session_id()),
-                "voice routing queue full or closed, dropping packet"
-            );
-            return false;
+        let capacity = self.voice_routing_tx.max_capacity();
+        let depth = capacity.saturating_sub(self.voice_routing_tx.capacity());
+        crate::voice::metrics::record_queue_status(
+            crate::voice::metrics::VoiceQueueKind::Routing,
+            depth,
+            capacity,
+        );
+        match self.voice_routing_tx.try_send(payload) {
+            Ok(()) => {
+                crate::voice::metrics::record_queue_enqueue(
+                    crate::voice::metrics::VoiceQueueKind::Routing,
+                    crate::voice::metrics::VoiceQueueEnqueueResult::Accepted,
+                );
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                crate::voice::metrics::record_queue_enqueue(
+                    crate::voice::metrics::VoiceQueueKind::Routing,
+                    crate::voice::metrics::VoiceQueueEnqueueResult::Full,
+                );
+                crate::voice::metrics::record_queue_drop(
+                    crate::voice::metrics::VoiceQueueDropReason::RoutingQueueFullOrClosed,
+                );
+                tracing::trace!(
+                    session = u32::from(self.get_session_id()),
+                    "voice routing queue full, dropping packet"
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                crate::voice::metrics::record_queue_enqueue(
+                    crate::voice::metrics::VoiceQueueKind::Routing,
+                    crate::voice::metrics::VoiceQueueEnqueueResult::Closed,
+                );
+                crate::voice::metrics::record_queue_drop(
+                    crate::voice::metrics::VoiceQueueDropReason::RoutingQueueFullOrClosed,
+                );
+                tracing::trace!(
+                    session = u32::from(self.get_session_id()),
+                    "voice routing queue closed, dropping packet"
+                );
+                false
+            }
         }
-        true
     }
 
     /// Take the receiver half of the voice routing queue.  Called once by
@@ -1397,9 +1430,26 @@ impl Client {
     /// builds the packet is silently dropped (voice is realtime, backlog is
     /// worse than loss).
     pub fn try_enqueue_voice_tcp(&self, raw: Bytes) -> bool {
+        let capacity = self.voice_tcp_tx.max_capacity();
+        let depth = capacity.saturating_sub(self.voice_tcp_tx.capacity());
+        crate::voice::metrics::record_queue_status(
+            crate::voice::metrics::VoiceQueueKind::TcpFallback,
+            depth,
+            capacity,
+        );
         match self.voice_tcp_tx.try_send(raw) {
-            Ok(()) => true,
+            Ok(()) => {
+                crate::voice::metrics::record_queue_enqueue(
+                    crate::voice::metrics::VoiceQueueKind::TcpFallback,
+                    crate::voice::metrics::VoiceQueueEnqueueResult::Accepted,
+                );
+                true
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                crate::voice::metrics::record_queue_enqueue(
+                    crate::voice::metrics::VoiceQueueKind::TcpFallback,
+                    crate::voice::metrics::VoiceQueueEnqueueResult::Full,
+                );
                 crate::voice::metrics::record_queue_drop(
                     crate::voice::metrics::VoiceQueueDropReason::TcpQueueFull,
                 );
@@ -1415,6 +1465,10 @@ impl Client {
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                crate::voice::metrics::record_queue_enqueue(
+                    crate::voice::metrics::VoiceQueueKind::TcpFallback,
+                    crate::voice::metrics::VoiceQueueEnqueueResult::Closed,
+                );
                 crate::voice::metrics::record_queue_drop(
                     crate::voice::metrics::VoiceQueueDropReason::TcpQueueClosed,
                 );

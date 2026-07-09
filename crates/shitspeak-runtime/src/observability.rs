@@ -398,9 +398,38 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "Total UDP packets dropped before voice processing by reason.",
         "counter",
     ),
+    // CHOPPY_VOICE_PROMQL speaker_to_node:
+    // Source node native ingress gaps and duplicates from node 12:
+    // sum by (origin_node, transport, result) (
+    //   rate(shitspeak_voice_ingress_continuity_total{
+    //     origin_node="12", result!="frame"
+    //   }[1m])
+    // )
+    // Node 12 vs sibling China nodes:
+    // sum by (node, origin_node, result) (
+    //   rate(shitspeak_voice_ingress_continuity_total{
+    //     origin_node=~"1|11|12|13|14", result!="frame"
+    //   }[5m])
+    // )
+    // Search with: rg "CHOPPY_VOICE_PROMQL speaker_to_node"
+    (
+        "shitspeak_voice_ingress_continuity_total",
+        "Native voice ingress continuity events by origin node, transport, and result.",
+        "counter",
+    ),
     (
         "shitspeak_voice_queue_drops_total",
         "Total voice packets dropped by bounded routing or TCP voice queues.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_queue_status",
+        "Voice queue status by queue and metric.",
+        "gauge",
+    ),
+    (
+        "shitspeak_voice_queue_enqueues_total",
+        "Voice queue enqueue attempts by queue and result.",
         "counter",
     ),
     (
@@ -481,6 +510,60 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
     (
         "shitspeak_voice_udp_send_events_total",
         "Total UDP batch send events by result.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_recv_batches_total",
+        "Total native voice UDP receive batches drained from sockets.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_recv_datagrams_total",
+        "Total native voice UDP datagrams drained from sockets.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_recv_batch_size_bucket_total",
+        "Native voice UDP receive batch size buckets.",
+        "counter",
+    ),
+    // CHOPPY_VOICE_PROMQL receiver_client_egress:
+    // Receiver native UDP egress pressure:
+    // sum by (node, result) (
+    //   rate(shitspeak_voice_udp_send_events_total{node="12"}[1m])
+    // )
+    // Receiver native UDP egress flush tail:
+    // sum by (node, bucket) (
+    //   rate(shitspeak_voice_udp_egress_send_duration_us_bucket_total{node="12"}[1m])
+    // )
+    // Receiver queue pressure:
+    // max by (node, queue, metric) (
+    //   shitspeak_voice_queue_status{node="12", metric=~"depth|high_watermark|full_samples"}
+    // )
+    // Search with: rg "CHOPPY_VOICE_PROMQL receiver_client_egress"
+    (
+        "shitspeak_voice_udp_egress_batches_total",
+        "Total native voice UDP egress batches flushed to clients.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_egress_datagrams_total",
+        "Total native voice UDP egress datagrams flushed to clients.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_egress_batch_size_bucket_total",
+        "Native voice UDP egress batch size buckets.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_egress_batch_bytes_bucket_total",
+        "Native voice UDP egress batch byte buckets.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_udp_egress_send_duration_us_bucket_total",
+        "Native voice UDP egress socket flush duration buckets.",
         "counter",
     ),
     (
@@ -1254,5 +1337,19 @@ mod tests {
         assert!(labels.iter().any(|(name, _)| name == "commit_hash"));
         assert!(labels.iter().any(|(name, _)| name == "build_date"));
         assert!(rendered.ends_with(" 1\n"));
+    }
+
+    #[test]
+    fn voice_metric_headers_include_choppy_diagnostic_metrics() {
+        let mut rendered = String::new();
+        render_voice_metrics_into(&mut rendered, &[]);
+
+        assert!(rendered.contains("# TYPE shitspeak_voice_ingress_continuity_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_voice_udp_recv_batches_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_voice_udp_recv_datagrams_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_voice_udp_egress_batches_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_voice_udp_egress_datagrams_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_voice_queue_status gauge\n"));
+        assert!(rendered.contains("# TYPE shitspeak_voice_queue_enqueues_total counter\n"));
     }
 }

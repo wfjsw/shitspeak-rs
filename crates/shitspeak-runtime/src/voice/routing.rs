@@ -1517,6 +1517,15 @@ pub(crate) async fn flush_voice_batch(
             }
             let packet_count = udp_batch.len();
             let byte_count = udp_batch.bytes_len();
+            super::metrics::record_queue_status(
+                super::metrics::VoiceQueueKind::UdpFanout,
+                packet_count,
+                targets.len(),
+            );
+            super::metrics::record_queue_enqueue(
+                super::metrics::VoiceQueueKind::UdpFanout,
+                super::metrics::VoiceQueueEnqueueResult::Accepted,
+            );
             super::metrics::record_egress(
                 VoiceEgressTransport::Udp,
                 VoiceEgressResult::Queued,
@@ -1542,6 +1551,12 @@ pub(crate) async fn flush_voice_batch(
             .await
             {
                 Err(e) => {
+                    let flush_duration = flush_started_at.elapsed();
+                    super::metrics::record_udp_egress_batch(
+                        packet_count,
+                        byte_count,
+                        flush_duration,
+                    );
                     tracing::warn!("UDP batch send error: {e}");
                     super::metrics::record_egress(
                         VoiceEgressTransport::Udp,
@@ -1549,9 +1564,22 @@ pub(crate) async fn flush_voice_batch(
                         packet_count,
                         byte_count,
                     );
-                    super::metrics::record_udp_send_result(VoiceUdpSendResult::Failed, 1);
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        super::metrics::record_udp_send_result(
+                            VoiceUdpSendResult::RetryBudgetExhausted,
+                            1,
+                        );
+                    } else {
+                        super::metrics::record_udp_send_result(VoiceUdpSendResult::Failed, 1);
+                    }
                 }
                 Ok(stats) => {
+                    let flush_duration = flush_started_at.elapsed();
+                    super::metrics::record_udp_egress_batch(
+                        packet_count,
+                        byte_count,
+                        flush_duration,
+                    );
                     record_udp_flush_stats(stats);
                     super::metrics::record_egress(
                         VoiceEgressTransport::Udp,
@@ -1716,6 +1744,15 @@ pub(crate) async fn flush_voice_batch(
         }
         let packet_count = batch.len();
         let byte_count = batch.bytes_len();
+        super::metrics::record_queue_status(
+            super::metrics::VoiceQueueKind::UdpFanout,
+            packet_count,
+            targets.len(),
+        );
+        super::metrics::record_queue_enqueue(
+            super::metrics::VoiceQueueKind::UdpFanout,
+            super::metrics::VoiceQueueEnqueueResult::Accepted,
+        );
         super::metrics::record_egress(
             VoiceEgressTransport::Udp,
             VoiceEgressResult::Queued,
@@ -1741,6 +1778,8 @@ pub(crate) async fn flush_voice_batch(
         .await
         {
             Err(e) => {
+                let flush_duration = flush_started_at.elapsed();
+                super::metrics::record_udp_egress_batch(packet_count, byte_count, flush_duration);
                 tracing::warn!("UDP batch send error: {e}");
                 super::metrics::record_egress(
                     VoiceEgressTransport::Udp,
@@ -1748,9 +1787,18 @@ pub(crate) async fn flush_voice_batch(
                     packet_count,
                     byte_count,
                 );
-                super::metrics::record_udp_send_result(VoiceUdpSendResult::Failed, 1);
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    super::metrics::record_udp_send_result(
+                        VoiceUdpSendResult::RetryBudgetExhausted,
+                        1,
+                    );
+                } else {
+                    super::metrics::record_udp_send_result(VoiceUdpSendResult::Failed, 1);
+                }
             }
             Ok(stats) => {
+                let flush_duration = flush_started_at.elapsed();
+                super::metrics::record_udp_egress_batch(packet_count, byte_count, flush_duration);
                 record_udp_flush_stats(stats);
                 super::metrics::record_egress(
                     VoiceEgressTransport::Udp,

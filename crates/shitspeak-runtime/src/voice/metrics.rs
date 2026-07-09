@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use shitspeak_core::ClientSessionIdentifier;
 use shitspeak_s2s::status::PrometheusSample;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum VoiceIngressTransport {
     Udp,
     TcpTunnel,
@@ -258,6 +261,7 @@ pub(crate) enum VoiceUdpSendResult {
     WouldBlock,
     Partial,
     Failed,
+    RetryBudgetExhausted,
 }
 
 impl VoiceUdpSendResult {
@@ -266,6 +270,64 @@ impl VoiceUdpSendResult {
             Self::WouldBlock => "would_block",
             Self::Partial => "partial",
             Self::Failed => "failed",
+            Self::RetryBudgetExhausted => "retry_budget_exhausted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum VoiceContinuityResult {
+    Frame,
+    ForwardGap,
+    DuplicateOrOld,
+    ResetOrTerminator,
+}
+
+impl VoiceContinuityResult {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Frame => "frame",
+            Self::ForwardGap => "forward_gap",
+            Self::DuplicateOrOld => "duplicate_or_old",
+            Self::ResetOrTerminator => "reset_or_terminator",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VoiceQueueKind {
+    UdpProcessing,
+    Routing,
+    TcpFallback,
+    UdpFanout,
+}
+
+impl VoiceQueueKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UdpProcessing => "udp_processing",
+            Self::Routing => "routing",
+            Self::TcpFallback => "tcp_fallback",
+            Self::UdpFanout => "udp_fanout",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VoiceQueueEnqueueResult {
+    Accepted,
+    Full,
+    Closed,
+    Dropped,
+}
+
+impl VoiceQueueEnqueueResult {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Full => "full",
+            Self::Closed => "closed",
+            Self::Dropped => "dropped",
         }
     }
 }
@@ -314,9 +376,11 @@ const VOICE_EGRESS_TRANSPORT_COUNT: usize = 2;
 const VOICE_EGRESS_RESULT_COUNT: usize = 4;
 const VOICE_AGE_STAGE_COUNT: usize = 2;
 const VOICE_SCHEDULER_STAGE_COUNT: usize = 2;
-const VOICE_UDP_SEND_RESULT_COUNT: usize = 3;
+const VOICE_UDP_SEND_RESULT_COUNT: usize = 4;
 const S2S_VOICE_GATEWAY_DROP_DIRECTION_COUNT: usize = 2;
 const S2S_VOICE_GATEWAY_DROP_REASON_COUNT: usize = 2;
+const VOICE_QUEUE_KIND_COUNT: usize = 4;
+const VOICE_QUEUE_ENQUEUE_RESULT_COUNT: usize = 4;
 
 const ROUTE_DIMENSIONS: [(VoiceRouteSource, VoiceRouteKind); 5] = [
     (VoiceRouteSource::Local, VoiceRouteKind::Normal),
@@ -394,6 +458,26 @@ const SCHEDULER_DELAY_BUCKETS_US: [(&str, u64); 8] = [
     ("le_10000", 10_000),
     ("gt_10000", u64::MAX),
 ];
+const VOICE_BATCH_SIZE_BUCKETS: [(&str, u64); 8] = [
+    ("1", 1),
+    ("2", 2),
+    ("3_4", 4),
+    ("5_8", 8),
+    ("9_16", 16),
+    ("17_32", 32),
+    ("33_64", 64),
+    ("65_plus", u64::MAX),
+];
+const VOICE_BATCH_BYTES_BUCKETS: [(&str, u64); 8] = [
+    ("le_512", 512),
+    ("le_1024", 1_024),
+    ("le_2048", 2_048),
+    ("le_4096", 4_096),
+    ("le_8192", 8_192),
+    ("le_16384", 16_384),
+    ("le_65536", 65_536),
+    ("gt_65536", u64::MAX),
+];
 
 static INGRESS_PACKETS: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
 static INGRESS_BYTES: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
@@ -456,6 +540,52 @@ static SCHEDULER_DELAY_BUCKETS: [[AtomicU64; SCHEDULER_DELAY_BUCKETS_US.len()];
 static CRYPT_LOCK_CONTENTION_DROPS: AtomicU64 = AtomicU64::new(0);
 static UDP_SEND_EVENTS: [AtomicU64; VOICE_UDP_SEND_RESULT_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_UDP_SEND_RESULT_COUNT];
+static UDP_RECV_BATCHES: AtomicU64 = AtomicU64::new(0);
+static UDP_RECV_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
+static UDP_RECV_BATCH_SIZE_BUCKETS: [AtomicU64; VOICE_BATCH_SIZE_BUCKETS.len()] =
+    [const { AtomicU64::new(0) }; VOICE_BATCH_SIZE_BUCKETS.len()];
+static UDP_EGRESS_BATCHES: AtomicU64 = AtomicU64::new(0);
+static UDP_EGRESS_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
+static UDP_EGRESS_BATCH_SIZE_BUCKETS: [AtomicU64; VOICE_BATCH_SIZE_BUCKETS.len()] =
+    [const { AtomicU64::new(0) }; VOICE_BATCH_SIZE_BUCKETS.len()];
+static UDP_EGRESS_BATCH_BYTES_BUCKETS: [AtomicU64; VOICE_BATCH_BYTES_BUCKETS.len()] =
+    [const { AtomicU64::new(0) }; VOICE_BATCH_BYTES_BUCKETS.len()];
+static UDP_EGRESS_SEND_DURATION_BUCKETS: [AtomicU64; ROUTE_DURATION_BUCKETS_US.len()] =
+    [const { AtomicU64::new(0) }; ROUTE_DURATION_BUCKETS_US.len()];
+static QUEUE_STATUS: [Mutex<VoiceQueueStatus>; VOICE_QUEUE_KIND_COUNT] =
+    [const { Mutex::new(VoiceQueueStatus::new()) }; VOICE_QUEUE_KIND_COUNT];
+static QUEUE_ENQUEUES: [[AtomicU64; VOICE_QUEUE_ENQUEUE_RESULT_COUNT]; VOICE_QUEUE_KIND_COUNT] =
+    [const { [const { AtomicU64::new(0) }; VOICE_QUEUE_ENQUEUE_RESULT_COUNT] };
+        VOICE_QUEUE_KIND_COUNT];
+static CONTINUITY: LazyLock<Mutex<VoiceContinuityState>> =
+    LazyLock::new(|| Mutex::new(VoiceContinuityState::default()));
+
+#[derive(Default)]
+struct VoiceContinuityState {
+    sessions: HashMap<(VoiceIngressTransport, u32), u64>,
+    counters: HashMap<(VoiceIngressTransport, u16, VoiceContinuityResult), u64>,
+}
+
+#[derive(Clone, Copy)]
+struct VoiceQueueStatus {
+    depth: u64,
+    high_watermark: u64,
+    capacity: u64,
+    samples: u64,
+    full_samples: u64,
+}
+
+impl VoiceQueueStatus {
+    const fn new() -> Self {
+        Self {
+            depth: 0,
+            high_watermark: 0,
+            capacity: 0,
+            samples: 0,
+            full_samples: 0,
+        }
+    }
+}
 
 fn transport_index(transport: VoiceIngressTransport) -> usize {
     match transport {
@@ -584,6 +714,25 @@ fn udp_send_result_index(result: VoiceUdpSendResult) -> usize {
         VoiceUdpSendResult::WouldBlock => 0,
         VoiceUdpSendResult::Partial => 1,
         VoiceUdpSendResult::Failed => 2,
+        VoiceUdpSendResult::RetryBudgetExhausted => 3,
+    }
+}
+
+fn queue_kind_index(kind: VoiceQueueKind) -> usize {
+    match kind {
+        VoiceQueueKind::UdpProcessing => 0,
+        VoiceQueueKind::Routing => 1,
+        VoiceQueueKind::TcpFallback => 2,
+        VoiceQueueKind::UdpFanout => 3,
+    }
+}
+
+fn queue_enqueue_result_index(result: VoiceQueueEnqueueResult) -> usize {
+    match result {
+        VoiceQueueEnqueueResult::Accepted => 0,
+        VoiceQueueEnqueueResult::Full => 1,
+        VoiceQueueEnqueueResult::Closed => 2,
+        VoiceQueueEnqueueResult::Dropped => 3,
     }
 }
 
@@ -797,6 +946,108 @@ pub(crate) fn record_udp_send_result(result: VoiceUdpSendResult, events: u64) {
         return;
     }
     increment(&UDP_SEND_EVENTS[udp_send_result_index(result)], events);
+}
+
+pub(crate) fn record_udp_recv_batch(datagrams: usize) {
+    if datagrams == 0 {
+        return;
+    }
+    increment(&UDP_RECV_BATCHES, 1);
+    increment(&UDP_RECV_DATAGRAMS, datagrams as u64);
+    observe_bucket(
+        &UDP_RECV_BATCH_SIZE_BUCKETS,
+        &VOICE_BATCH_SIZE_BUCKETS,
+        datagrams as u64,
+    );
+}
+
+pub(crate) fn record_udp_egress_batch(datagrams: usize, bytes: usize, duration: Duration) {
+    if datagrams == 0 {
+        return;
+    }
+    increment(&UDP_EGRESS_BATCHES, 1);
+    increment(&UDP_EGRESS_DATAGRAMS, datagrams as u64);
+    observe_bucket(
+        &UDP_EGRESS_BATCH_SIZE_BUCKETS,
+        &VOICE_BATCH_SIZE_BUCKETS,
+        datagrams as u64,
+    );
+    observe_bucket(
+        &UDP_EGRESS_BATCH_BYTES_BUCKETS,
+        &VOICE_BATCH_BYTES_BUCKETS,
+        bytes as u64,
+    );
+    observe_bucket(
+        &UDP_EGRESS_SEND_DURATION_BUCKETS,
+        &ROUTE_DURATION_BUCKETS_US,
+        duration.as_micros().min(u64::MAX as u128) as u64,
+    );
+}
+
+pub(crate) fn record_queue_status(kind: VoiceQueueKind, depth: usize, capacity: usize) {
+    let mut status = QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+    let depth = depth as u64;
+    let capacity = capacity as u64;
+    status.depth = depth;
+    status.high_watermark = status.high_watermark.max(depth);
+    status.capacity = capacity;
+    status.samples = status.samples.saturating_add(1);
+    if capacity > 0 && depth >= capacity {
+        status.full_samples = status.full_samples.saturating_add(1);
+    }
+}
+
+pub(crate) fn record_queue_enqueue(kind: VoiceQueueKind, result: VoiceQueueEnqueueResult) {
+    increment(
+        &QUEUE_ENQUEUES[queue_kind_index(kind)][queue_enqueue_result_index(result)],
+        1,
+    );
+}
+
+pub(crate) fn record_native_ingress_continuity(
+    transport: VoiceIngressTransport,
+    session: ClientSessionIdentifier,
+    frame_number: u64,
+    is_terminator: bool,
+) {
+    let origin_node = session.get_node_id();
+    let session_key = (transport, session.to_u32());
+    let mut state = CONTINUITY.lock().unwrap();
+    *state
+        .counters
+        .entry((transport, origin_node, VoiceContinuityResult::Frame))
+        .or_default() += 1;
+
+    match state.sessions.insert(session_key, frame_number) {
+        Some(previous) if frame_number > previous.saturating_add(1) => {
+            *state
+                .counters
+                .entry((transport, origin_node, VoiceContinuityResult::ForwardGap))
+                .or_default() += frame_number.saturating_sub(previous.saturating_add(1));
+        }
+        Some(previous) if frame_number <= previous => {
+            *state
+                .counters
+                .entry((
+                    transport,
+                    origin_node,
+                    VoiceContinuityResult::DuplicateOrOld,
+                ))
+                .or_default() += 1;
+        }
+        _ => {}
+    }
+
+    if is_terminator {
+        *state
+            .counters
+            .entry((
+                transport,
+                origin_node,
+                VoiceContinuityResult::ResetOrTerminator,
+            ))
+            .or_default() += 1;
+    }
 }
 
 pub(crate) fn record_s2s_forward(sent: bool) {
@@ -1036,12 +1287,115 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         VoiceUdpSendResult::WouldBlock,
         VoiceUdpSendResult::Partial,
         VoiceUdpSendResult::Failed,
+        VoiceUdpSendResult::RetryBudgetExhausted,
     ] {
         samples.push(PrometheusSample::new(
             "shitspeak_voice_udp_send_events_total",
             vec![("result".to_owned(), result.label().to_owned())],
             UDP_SEND_EVENTS[udp_send_result_index(result)].load(Ordering::Relaxed) as f64,
         ));
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_voice_udp_recv_batches_total",
+        Vec::new(),
+        UDP_RECV_BATCHES.load(Ordering::Relaxed) as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_voice_udp_recv_datagrams_total",
+        Vec::new(),
+        UDP_RECV_DATAGRAMS.load(Ordering::Relaxed) as f64,
+    ));
+    for (bucket_index, (bucket, _)) in VOICE_BATCH_SIZE_BUCKETS.iter().enumerate() {
+        samples.push(PrometheusSample::new(
+            "shitspeak_voice_udp_recv_batch_size_bucket_total",
+            vec![("bucket".to_owned(), (*bucket).to_owned())],
+            UDP_RECV_BATCH_SIZE_BUCKETS[bucket_index].load(Ordering::Relaxed) as f64,
+        ));
+        samples.push(PrometheusSample::new(
+            "shitspeak_voice_udp_egress_batch_size_bucket_total",
+            vec![("bucket".to_owned(), (*bucket).to_owned())],
+            UDP_EGRESS_BATCH_SIZE_BUCKETS[bucket_index].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_voice_udp_egress_batches_total",
+        Vec::new(),
+        UDP_EGRESS_BATCHES.load(Ordering::Relaxed) as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_voice_udp_egress_datagrams_total",
+        Vec::new(),
+        UDP_EGRESS_DATAGRAMS.load(Ordering::Relaxed) as f64,
+    ));
+    for (bucket_index, (bucket, _)) in VOICE_BATCH_BYTES_BUCKETS.iter().enumerate() {
+        samples.push(PrometheusSample::new(
+            "shitspeak_voice_udp_egress_batch_bytes_bucket_total",
+            vec![("bucket".to_owned(), (*bucket).to_owned())],
+            UDP_EGRESS_BATCH_BYTES_BUCKETS[bucket_index].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    for (bucket_index, (bucket, _)) in ROUTE_DURATION_BUCKETS_US.iter().enumerate() {
+        samples.push(PrometheusSample::new(
+            "shitspeak_voice_udp_egress_send_duration_us_bucket_total",
+            vec![("bucket".to_owned(), (*bucket).to_owned())],
+            UDP_EGRESS_SEND_DURATION_BUCKETS[bucket_index].load(Ordering::Relaxed) as f64,
+        ));
+    }
+
+    {
+        let state = CONTINUITY.lock().unwrap();
+        for ((transport, origin_node, result), count) in &state.counters {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_ingress_continuity_total",
+                vec![
+                    ("transport".to_owned(), transport.label().to_owned()),
+                    ("origin_node".to_owned(), origin_node.to_string()),
+                    ("result".to_owned(), result.label().to_owned()),
+                ],
+                *count as f64,
+            ));
+        }
+    }
+
+    for kind in [
+        VoiceQueueKind::UdpProcessing,
+        VoiceQueueKind::Routing,
+        VoiceQueueKind::TcpFallback,
+        VoiceQueueKind::UdpFanout,
+    ] {
+        let status = *QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+        for (metric, value) in [
+            ("depth", status.depth),
+            ("high_watermark", status.high_watermark),
+            ("capacity", status.capacity),
+            ("samples", status.samples),
+            ("full_samples", status.full_samples),
+        ] {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_queue_status",
+                vec![
+                    ("queue".to_owned(), kind.label().to_owned()),
+                    ("metric".to_owned(), metric.to_owned()),
+                ],
+                value as f64,
+            ));
+        }
+        for result in [
+            VoiceQueueEnqueueResult::Accepted,
+            VoiceQueueEnqueueResult::Full,
+            VoiceQueueEnqueueResult::Closed,
+            VoiceQueueEnqueueResult::Dropped,
+        ] {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_queue_enqueues_total",
+                vec![
+                    ("queue".to_owned(), kind.label().to_owned()),
+                    ("result".to_owned(), result.label().to_owned()),
+                ],
+                QUEUE_ENQUEUES[queue_kind_index(kind)][queue_enqueue_result_index(result)]
+                    .load(Ordering::Relaxed) as f64,
+            ));
+        }
     }
 
     for sent in [false, true] {
@@ -1081,6 +1435,35 @@ mod tests {
 
     use super::*;
 
+    fn sample_value(samples: &[PrometheusSample], name: &str, labels: &[(&str, &str)]) -> f64 {
+        samples
+            .iter()
+            .filter(|sample| sample.name() == name)
+            .filter(|sample| {
+                labels.iter().all(|(key, value)| {
+                    sample
+                        .labels()
+                        .iter()
+                        .any(|(label_key, label_value)| label_key == key && label_value == value)
+                })
+            })
+            .map(PrometheusSample::value)
+            .sum()
+    }
+
+    fn assert_no_unbounded_voice_labels(sample: &PrometheusSample) {
+        for forbidden in ["session", "user", "ip", "channel"] {
+            assert!(
+                sample
+                    .labels()
+                    .iter()
+                    .all(|(label, _)| label.as_str() != forbidden),
+                "{forbidden} label must not be exported on {}",
+                sample.name()
+            );
+        }
+    }
+
     #[test]
     fn route_samples_use_only_real_route_dimensions() {
         let route_dimensions = prometheus_samples()
@@ -1111,5 +1494,198 @@ mod tests {
                 ("loopback".to_owned(), "loopback".to_owned()),
             ])
         );
+    }
+
+    #[test]
+    fn udp_batch_and_queue_metrics_record_diagnostic_buckets() {
+        let before = prometheus_samples();
+
+        record_udp_recv_batch(5);
+        record_udp_egress_batch(17, 70_000, Duration::from_micros(6_000));
+        record_udp_send_result(VoiceUdpSendResult::RetryBudgetExhausted, 2);
+        record_queue_status(VoiceQueueKind::UdpFanout, 32, 32);
+        record_queue_enqueue(VoiceQueueKind::UdpFanout, VoiceQueueEnqueueResult::Full);
+
+        let after = prometheus_samples();
+        assert!(
+            sample_value(&after, "shitspeak_voice_udp_recv_batches_total", &[])
+                >= sample_value(&before, "shitspeak_voice_udp_recv_batches_total", &[]) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_udp_recv_batch_size_bucket_total",
+                &[("bucket", "5_8")]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_udp_recv_batch_size_bucket_total",
+                &[("bucket", "5_8")]
+            ) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_udp_egress_batch_size_bucket_total",
+                &[("bucket", "17_32")]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_udp_egress_batch_size_bucket_total",
+                &[("bucket", "17_32")]
+            ) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_udp_egress_batch_bytes_bucket_total",
+                &[("bucket", "gt_65536")]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_udp_egress_batch_bytes_bucket_total",
+                &[("bucket", "gt_65536")]
+            ) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_udp_send_events_total",
+                &[("result", "retry_budget_exhausted")]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_udp_send_events_total",
+                &[("result", "retry_budget_exhausted")]
+            ) + 2.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_queue_enqueues_total",
+                &[("queue", "udp_fanout"), ("result", "full")]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_queue_enqueues_total",
+                &[("queue", "udp_fanout"), ("result", "full")]
+            ) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_queue_status",
+                &[("queue", "udp_fanout"), ("metric", "high_watermark")]
+            ) >= 32.0
+        );
+
+        for sample in after.iter().filter(|sample| {
+            matches!(
+                sample.name(),
+                "shitspeak_voice_udp_recv_batches_total"
+                    | "shitspeak_voice_udp_recv_datagrams_total"
+                    | "shitspeak_voice_udp_recv_batch_size_bucket_total"
+                    | "shitspeak_voice_udp_egress_batches_total"
+                    | "shitspeak_voice_udp_egress_datagrams_total"
+                    | "shitspeak_voice_udp_egress_batch_size_bucket_total"
+                    | "shitspeak_voice_udp_egress_batch_bytes_bucket_total"
+                    | "shitspeak_voice_udp_egress_send_duration_us_bucket_total"
+                    | "shitspeak_voice_queue_status"
+                    | "shitspeak_voice_queue_enqueues_total"
+            )
+        }) {
+            assert_no_unbounded_voice_labels(sample);
+        }
+    }
+
+    #[test]
+    fn native_ingress_continuity_aggregates_by_origin_node_only() {
+        let session = ClientSessionIdentifier::new(4094, 77).expect("test session id");
+        let before = prometheus_samples();
+
+        record_native_ingress_continuity(VoiceIngressTransport::Udp, session, 10, false);
+        record_native_ingress_continuity(VoiceIngressTransport::Udp, session, 12, false);
+        record_native_ingress_continuity(VoiceIngressTransport::Udp, session, 12, false);
+        record_native_ingress_continuity(VoiceIngressTransport::Udp, session, 13, true);
+
+        let after = prometheus_samples();
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_ingress_continuity_total",
+                &[
+                    ("transport", "udp"),
+                    ("origin_node", "4094"),
+                    ("result", "frame"),
+                ]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_ingress_continuity_total",
+                &[
+                    ("transport", "udp"),
+                    ("origin_node", "4094"),
+                    ("result", "frame"),
+                ]
+            ) + 4.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_ingress_continuity_total",
+                &[
+                    ("transport", "udp"),
+                    ("origin_node", "4094"),
+                    ("result", "forward_gap"),
+                ]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_ingress_continuity_total",
+                &[
+                    ("transport", "udp"),
+                    ("origin_node", "4094"),
+                    ("result", "forward_gap"),
+                ]
+            ) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_ingress_continuity_total",
+                &[
+                    ("transport", "udp"),
+                    ("origin_node", "4094"),
+                    ("result", "duplicate_or_old"),
+                ]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_ingress_continuity_total",
+                &[
+                    ("transport", "udp"),
+                    ("origin_node", "4094"),
+                    ("result", "duplicate_or_old"),
+                ]
+            ) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_ingress_continuity_total",
+                &[
+                    ("transport", "udp"),
+                    ("origin_node", "4094"),
+                    ("result", "reset_or_terminator"),
+                ]
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_ingress_continuity_total",
+                &[
+                    ("transport", "udp"),
+                    ("origin_node", "4094"),
+                    ("result", "reset_or_terminator"),
+                ]
+            ) + 1.0
+        );
+
+        for sample in after
+            .iter()
+            .filter(|sample| sample.name() == "shitspeak_voice_ingress_continuity_total")
+        {
+            assert_no_unbounded_voice_labels(sample);
+        }
     }
 }

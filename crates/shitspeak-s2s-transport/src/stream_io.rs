@@ -42,7 +42,9 @@ use super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::frame::{FrameType, build_frame, stream_codec};
 use super::manager::InboundDispatch;
 use super::metrics::{
-    ExpiredOutboundDropStage, TransportPipelineStage, record_transport_pipeline_stage,
+    ExpiredOutboundDropStage, TransportIoDirection, TransportIoPressureResult,
+    TransportPipelineStage, record_transport_io_batch, record_transport_io_frames,
+    record_transport_io_pressure, record_transport_pipeline_stage,
 };
 use super::native_stats::BoxedNativeLossSampler;
 use super::service_level::{MessageClass, ServiceLevel, TransportKind};
@@ -209,6 +211,7 @@ pub(crate) fn stream_handoff_lane_bytes(global_bytes: usize, max_frame_bytes: us
 struct PreparedStreamWrite {
     encoded: Bytes,
     frame_type: i32,
+    class: MessageClass,
     expires_at: Option<Instant>,
 }
 
@@ -457,6 +460,23 @@ async fn run_pump<S>(
                 );
                 match decoded_frame {
                     Ok(frame) => {
+                        let class = pb::MessageClass::try_from(frame.message_class)
+                            .map(MessageClass::from)
+                            .unwrap_or(MessageClass::Regular);
+                        record_transport_io_batch(
+                            peer.node_id(),
+                            cfg.transport,
+                            TransportIoDirection::Ingress,
+                            1,
+                            recv_size,
+                        );
+                        record_transport_io_frames(
+                            peer.node_id(),
+                            cfg.transport,
+                            TransportIoDirection::Ingress,
+                            class,
+                            1,
+                        );
                         #[cfg(debug_assertions)]
                         crate::debug_io::record_named_received(
                             stream_frame_kind_name(cfg.transport, frame.frame_type),
@@ -924,6 +944,7 @@ fn prepare_stream_data_frame(
         write: PreparedStreamWrite {
             encoded,
             frame_type: frame.frame_type,
+            class,
             expires_at: options.expires_at(),
         },
         class,
@@ -1062,6 +1083,9 @@ where
     let write = PreparedStreamWrite {
         encoded,
         frame_type: frame.frame_type,
+        class: pb::MessageClass::try_from(frame.message_class)
+            .map(MessageClass::from)
+            .unwrap_or(MessageClass::Regular),
         expires_at,
     };
     let _ = send_encoded_stream_writes(framed, cfg, peer, std::slice::from_ref(&write)).await?;
@@ -1095,6 +1119,9 @@ where
         return Ok(0);
     }
 
+    let total_len = writes
+        .iter()
+        .fold(0usize, |acc, write| acc.saturating_add(write.encoded.len()));
     let expires_at = writes.iter().filter_map(|write| write.expires_at).min();
     let send = async {
         for write in writes {
@@ -1119,15 +1146,38 @@ where
         write_started_at.elapsed(),
     );
     if let Err(error) = send_result {
+        record_transport_io_batch(
+            peer.node_id(),
+            cfg.transport,
+            TransportIoDirection::Egress,
+            writes.len(),
+            total_len,
+        );
+        record_transport_io_pressure(
+            peer.node_id(),
+            cfg.transport,
+            TransportIoDirection::Egress,
+            if error.kind() == io::ErrorKind::TimedOut {
+                TransportIoPressureResult::Timeout
+            } else {
+                TransportIoPressureResult::Error
+            },
+            1,
+        );
         peer.metrics().record_data_health_failure(cfg.transport);
         return Err(error);
     }
 
-    let mut total_len = 0usize;
     for write in writes {
         let len = write.encoded.len();
-        total_len = total_len.saturating_add(len);
         peer.metrics().record_sent(cfg.transport, len);
+        record_transport_io_frames(
+            peer.node_id(),
+            cfg.transport,
+            TransportIoDirection::Egress,
+            write.class,
+            1,
+        );
         #[cfg(debug_assertions)]
         crate::debug_io::record_named_sent(
             stream_frame_kind_name(cfg.transport, write.frame_type),
@@ -1135,6 +1185,13 @@ where
         );
         peer.metrics().record_data_health_success(cfg.transport);
     }
+    record_transport_io_batch(
+        peer.node_id(),
+        cfg.transport,
+        TransportIoDirection::Egress,
+        writes.len(),
+        total_len,
+    );
     Ok(total_len)
 }
 
@@ -1509,11 +1566,13 @@ mod tests {
             PreparedStreamWrite {
                 encoded: Bytes::from_static(b"first"),
                 frame_type: pb::FrameType::FrameData as i32,
+                class: MessageClass::HighPriority,
                 expires_at: None,
             },
             PreparedStreamWrite {
                 encoded: Bytes::from_static(b"second"),
                 frame_type: pb::FrameType::FrameData as i32,
+                class: MessageClass::HighPriority,
                 expires_at: None,
             },
         ];
