@@ -11,8 +11,8 @@ use crate::channels::{Channel, ChannelPatch};
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
 use crate::messages::encoder::{
-    Authenticate, ChanAcl, ClientType, PluginDataTransmission, TextMessage, UserState, UserStats,
-    VoiceTarget,
+    Authenticate, CLIENT_PERMISSION_CACHE_BIT, ChanAcl, ClientType, PluginDataTransmission,
+    TextMessage, UserState, UserStats, VoiceTarget,
 };
 
 /// Checks that ACL denial prevents a non-admin from entering a channel.
@@ -1795,7 +1795,44 @@ async fn permission_query_reports_evaluated_bits() {
         panic!("Bob should receive PermissionQuery response");
     };
     let permissions = reply.permissions.expect("permissions");
+    assert_ne!(permissions & CLIENT_PERMISSION_CACHE_BIT, 0);
     assert_eq!(permissions & ACLPermissions::TextMessage as u32, 0);
+}
+
+#[tokio::test]
+async fn permission_query_marks_empty_permissions_cached() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    create_secret_channel(&server, 63).await;
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    bob.send(
+        crate::messages::encoder::PermissionQuery {
+            channel_id: Some(63),
+            permissions: None,
+            flush: None,
+        }
+        .into(),
+    )
+    .await;
+
+    let msg = bob
+        .recv_until(
+            |m| matches!(m, Message::PermissionQuery(pq) if pq.channel_id == Some(63)),
+            Duration::from_secs(2),
+        )
+        .await;
+
+    let Some(Message::PermissionQuery(reply)) = msg else {
+        panic!("Bob should receive PermissionQuery response");
+    };
+    assert_eq!(reply.permissions, Some(CLIENT_PERMISSION_CACHE_BIT));
 }
 
 #[tokio::test]

@@ -74,12 +74,7 @@ pub(crate) async fn send_enter_permission_queries(
         let permissions =
             crate::client::acl::compute_permissions_for_client(server, target, channel_id).await;
         messages.push(Message::PermissionQuery(
-            PermissionQuery {
-                channel_id: Some(channel_id),
-                permissions: Some(permissions.bits()),
-                flush: Some(false),
-            }
-            .into(),
+            PermissionQuery::refresh_channel_permissions(channel_id, permissions.bits()).into(),
         ));
     }
 

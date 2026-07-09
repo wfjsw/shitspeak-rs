@@ -1256,11 +1256,10 @@ pub async fn build_channel_permission_query_refresh_messages_for_channel_ids(
         let perms =
             crate::client::acl::compute_permissions_for_client(server, client, channel_id).await;
         messages.push(
-            crate::messages::encoder::PermissionQuery {
-                channel_id: Some(channel_id),
-                permissions: Some(perms.bits()),
-                flush: Some(false),
-            }
+            crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                channel_id,
+                perms.bits(),
+            )
             .into(),
         );
     }
@@ -1340,11 +1339,10 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
         let (is_enter_restricted, perms) =
             permission_info_for_channel(server, client, channel.id).await;
         messages.push(
-            crate::messages::encoder::PermissionQuery {
-                channel_id: Some(channel.id),
-                permissions: Some(perms.bits()),
-                flush: Some(false),
-            }
+            crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                channel.id,
+                perms.bits(),
+            )
             .into(),
         );
         if send_permission_info {
