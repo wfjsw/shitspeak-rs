@@ -1348,7 +1348,8 @@ impl Client {
     }
 
     pub fn try_crypt_state(&self) -> Option<ParkingMutexGuard<'_, Option<CryptState>>> {
-        self.crypt_state.try_lock()
+        self.crypt_state
+            .try_lock_until(std::time::Instant::now() + std::time::Duration::from_millis(10))
     }
 
     pub fn create_crypt_state(&self, mode: &str) -> Result<(), crate::client::crypt::CryptError> {

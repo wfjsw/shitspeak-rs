@@ -29,7 +29,7 @@ use crate::integration_tests::harness::{
     TestClient, TestServer, TestServerOpts, spawn_test_server, test_client::ConnectError,
 };
 use crate::messages::Message;
-use crate::messages::encoder::{ChanAcl, Ping, UserState, VoiceTarget};
+use crate::messages::encoder::{AudioTarget, ChanAcl, Ping, UserState, VoiceTarget};
 use crate::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{AudioPayload, PacketFormat};
@@ -1520,7 +1520,11 @@ async fn voice_target_channel_cache_tracks_client_moves() {
 /// allowed by Speak permission and does not require Whisper.
 #[tokio::test]
 async fn voice_target_plain_current_channel_uses_speak_permission() {
-    let server = spawn_test_server(TestServerOpts::default()).await;
+    let server = spawn_test_server(TestServerOpts {
+        server_protocol_version: PROTOBUF_INTRODUCED_VERSION,
+        ..TestServerOpts::default()
+    })
+    .await;
     server
         .authenticator
         .register_superuser("admin", None, Some(1), vec!["admin".into()]);
@@ -1604,32 +1608,24 @@ async fn voice_target_plain_current_channel_uses_speak_permission() {
             vec![voice_target_channel(105, false, false, None)],
         ))
         .await;
-    let normal_routes_before =
-        route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Normal);
-    let target_routes_before =
-        route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Target);
     alice
         .send_voice_tcp(7, 36, Bytes::from_static(SAMPLE_OPUS))
         .await;
 
-    expect_voice_from(
-        &bob,
-        &alice,
-        "Bob should hear a plain current-channel VoiceTarget when Alice can Speak",
-    )
-    .await;
-    let normal_routes = route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Normal)
-        .saturating_sub(normal_routes_before);
-    let target_routes = route_metric_snapshot(VoiceRouteSource::Local, VoiceRouteKind::Target)
-        .saturating_sub(target_routes_before);
+    let audio = bob
+        .recv_voice_tcp(VOICE_DEADLINE)
+        .await
+        .expect("Bob should hear a plain current-channel VoiceTarget when Alice can Speak");
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
     assert_eq!(
-        normal_routes.frames(),
-        0,
-        "plain current-channel VoiceTarget should keep shout semantics"
+        audio.format,
+        PacketFormat::Protobuf,
+        "1.5 recipient should expose the outbound voice context"
     );
     assert_eq!(
-        target_routes.frames(),
-        1,
+        audio.target,
+        AudioTarget::VoiceTarget(1),
         "plain current-channel VoiceTarget should still process as target shout routing"
     );
 }
