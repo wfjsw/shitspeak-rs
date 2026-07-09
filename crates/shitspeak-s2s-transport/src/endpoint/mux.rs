@@ -20,7 +20,10 @@ use tracing::{debug, warn};
 
 use super::{
     bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
-    udp_batch::{UdpBatchDatagram, send_udp_batch},
+    udp_batch::{
+        RecvDatagramBatch, UDP_RECV_BATCH_MAX_DATAGRAMS, UdpBatchDatagram, recv_udp_batch,
+        send_udp_batch,
+    },
 };
 use crate::service_level::TransportKind;
 
@@ -341,68 +344,77 @@ async fn run_mux_read_loop(
     socket: Arc<UdpSocket>,
     shutdown: CancellationToken,
 ) {
-    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut batch = RecvDatagramBatch::new(UDP_RECV_BATCH_MAX_DATAGRAMS, MAX_DATAGRAM);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            result = socket.recv_from(&mut buf) => {
-                let (n, peer_addr) = match result {
-                    Ok(v) => v,
+            result = recv_udp_batch(&socket, &mut batch) => {
+                match result {
+                    Ok(_) => {}
                     Err(e) => {
                         warn!(addr=%mux.addr, error=%e, "S2S UDP mux socket read failed");
                         return;
                     }
                 };
-                let Some((&discriminator, payload)) = buf[..n].split_first() else {
-                    debug!(addr=%mux.addr, %peer_addr, "dropped empty S2S UDP mux datagram");
-                    continue;
-                };
-                let protocol = match MuxProtocol::decode(discriminator) {
-                    Ok(protocol) => protocol,
-                    Err(e) => {
-                        debug!(addr=%mux.addr, %peer_addr, error=%e, "dropped invalid S2S UDP mux datagram");
-                        continue;
+                for datagram in batch.iter() {
+                    if shutdown.is_cancelled() {
+                        return;
                     }
-                };
-                let Some(slot) = mux.slots.get(&protocol.to_transport()) else {
-                    debug!(addr=%mux.addr, %peer_addr, protocol=?protocol, "dropped S2S UDP mux datagram for unconfigured protocol");
-                    continue;
-                };
-                let datagram = MuxDatagram {
-                    payload: payload.to_vec(),
-                    peer_addr,
-                };
-                match slot.try_send(datagram) {
-                    Ok(Some((old_capacity, new_capacity))) => {
-                        debug!(
-                            addr=%mux.addr,
-                            %peer_addr,
-                            protocol=?protocol,
-                            old_capacity,
-                            new_capacity,
-                            burst_capacity=slot.tuning.burst_capacity(),
-                            hard_capacity=slot.tuning.hard_capacity(),
-                            queued_len=slot.queued_len(),
-                            "grew S2S UDP mux protocol queue capacity"
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        debug!(
-                            addr=%mux.addr,
-                            %peer_addr,
-                            protocol=?protocol,
-                            queue_capacity=slot.capacity(),
-                            baseline_capacity=slot.tuning.baseline_capacity(),
-                            burst_capacity=slot.tuning.burst_capacity(),
-                            hard_capacity=slot.tuning.hard_capacity(),
-                            queued_len=slot.queued_len(),
-                            error=%e,
-                            "dropped S2S UDP mux datagram because protocol queue is full"
-                        );
-                    }
+                    handle_mux_datagram(&mux, datagram.payload(), datagram.peer_addr());
                 }
             }
+        }
+    }
+}
+
+fn handle_mux_datagram(mux: &UdpMuxSocket, packet: &[u8], peer_addr: SocketAddr) {
+    let Some((&discriminator, payload)) = packet.split_first() else {
+        debug!(addr=%mux.addr, %peer_addr, "dropped empty S2S UDP mux datagram");
+        return;
+    };
+    let protocol = match MuxProtocol::decode(discriminator) {
+        Ok(protocol) => protocol,
+        Err(e) => {
+            debug!(addr=%mux.addr, %peer_addr, error=%e, "dropped invalid S2S UDP mux datagram");
+            return;
+        }
+    };
+    let Some(slot) = mux.slots.get(&protocol.to_transport()) else {
+        debug!(addr=%mux.addr, %peer_addr, protocol=?protocol, "dropped S2S UDP mux datagram for unconfigured protocol");
+        return;
+    };
+    let datagram = MuxDatagram {
+        payload: payload.to_vec(),
+        peer_addr,
+    };
+    match slot.try_send(datagram) {
+        Ok(Some((old_capacity, new_capacity))) => {
+            debug!(
+                addr=%mux.addr,
+                %peer_addr,
+                protocol=?protocol,
+                old_capacity,
+                new_capacity,
+                burst_capacity=slot.tuning.burst_capacity(),
+                hard_capacity=slot.tuning.hard_capacity(),
+                queued_len=slot.queued_len(),
+                "grew S2S UDP mux protocol queue capacity"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            debug!(
+                addr=%mux.addr,
+                %peer_addr,
+                protocol=?protocol,
+                queue_capacity=slot.capacity(),
+                baseline_capacity=slot.tuning.baseline_capacity(),
+                burst_capacity=slot.tuning.burst_capacity(),
+                hard_capacity=slot.tuning.hard_capacity(),
+                queued_len=slot.queued_len(),
+                error=%e,
+                "dropped S2S UDP mux datagram because protocol queue is full"
+            );
         }
     }
 }
@@ -877,6 +889,38 @@ mod tests {
             );
         }
         assert_eq!(received, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn mux_datagram_handler_delivers_ordered_payloads_to_protocol_slot() {
+        let tuning = UdpMuxQueueTuning::for_max_users(1);
+        let mux = UdpMuxSocket::new(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            false,
+            vec![TransportKind::Udp],
+            tuning,
+        );
+        let slot = mux.slots.get(&TransportKind::Udp).unwrap();
+        let mut rx = slot.take_rx().unwrap();
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 64738));
+
+        handle_mux_datagram(
+            &mux,
+            &prefixed_datagram(MuxProtocol::Udp, b"first"),
+            peer_addr,
+        );
+        handle_mux_datagram(
+            &mux,
+            &prefixed_datagram(MuxProtocol::Udp, b"second"),
+            peer_addr,
+        );
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!(first.payload, b"first");
+        assert_eq!(first.peer_addr, peer_addr);
+        assert_eq!(second.payload, b"second");
+        assert_eq!(second.peer_addr, peer_addr);
     }
 
     #[test]

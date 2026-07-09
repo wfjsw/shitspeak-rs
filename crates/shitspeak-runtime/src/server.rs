@@ -35,6 +35,7 @@ mod connection;
 mod entrypoints;
 mod extensions;
 mod tls;
+mod udp_recv_batch;
 
 #[cfg(test)]
 mod tests;
@@ -53,6 +54,7 @@ use entrypoints::{
     bind_entrypoint_socket_pair, bind_entrypoints, entrypoint_config_routes,
 };
 use tls::{load_c2s_tls_acceptor, validate_privacy_config};
+use udp_recv_batch::{VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, VoiceUdpRecvBatch, recv_voice_udp_batch};
 
 const UDP_PROCESSING_MIN_BASELINE_CAPACITY: usize = 1024;
 const UDP_PROCESSING_PACKETS_PER_USER_BASELINE: usize = 16;
@@ -486,17 +488,15 @@ impl Server {
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut buf = BytesMut::with_capacity(MTU);
+            let mut batch = VoiceUdpRecvBatch::new(VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, MTU);
             let local_addr = socket
                 .local_addr()
                 .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
             tracing::info!("UDP drain started, listening on {}", local_addr);
             loop {
-                buf.clear();
-                buf.reserve(MTU);
-                let (len, src_addr) = tokio::select! {
-                    result = socket.recv_buf_from(&mut buf) => match result {
-                        Ok(r) => r,
+                let received = tokio::select! {
+                    result = recv_voice_udp_batch(&socket, &mut batch) => match result {
+                        Ok(n) => n,
                         Err(e) => {
                             tracing::warn!("UDP recv error: {e}");
                             continue;
@@ -505,93 +505,115 @@ impl Server {
                     _ = shutdown.changed() => break,
                 };
 
-                if len <= 1 {
-                    // Empty packages or packages consisting only of the header byte are invalid
-                    crate::voice::metrics::record_udp_drain_drop(
-                        crate::voice::metrics::UdpDrainDropReason::PacketTooShort,
-                    );
-                    continue;
-                }
-
-                tracing::trace!("UDP received {} bytes from {}", len, src_addr);
-
-                if ping_enabled {
-                    match crate::voice::ping::PingRequest::decode(&buf) {
-                        Ok(ping) => {
-                            tracing::trace!(
-                                "UDP ping from {}: timestamp={}, format={}",
-                                src_addr,
-                                ping.timestamp,
-                                ping.format
-                            );
-                            let status_server_id =
-                                server.udp_ping_status_server_id_for_port(local_addr.port());
-                            let reply =
-                                match Self::build_ping_response(&server, &ping, &status_server_id)
-                                    .await
-                                {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to build UDP ping response for {}: {e}",
-                                            src_addr
-                                        );
-                                        continue;
-                                    }
-                                };
-                            match socket.send_to(&reply, src_addr).await {
-                                Ok(sent) => tracing::trace!(
-                                    "UDP ping reply sent to {}: {} bytes",
-                                    src_addr,
-                                    sent
-                                ),
-                                Err(e) => {
-                                    tracing::warn!("UDP ping reply failed to {}: {e}", src_addr)
-                                }
-                            }
-                            continue;
-                        }
-                        Err(crate::voice::codec::DecodeError::NotPing) => {
-                            // Not a ping packet, continue with normal processing
-                        }
-                        Err(e) => {
-                            crate::voice::metrics::record_udp_drain_drop(
-                                crate::voice::metrics::UdpDrainDropReason::PingDecodeFailed,
-                            );
-                            tracing::trace!("UDP packet decode failed from {}: {e}", src_addr);
-                            continue;
-                        }
+                for datagram in batch.iter().take(received) {
+                    if shutdown.has_changed().unwrap_or(true) {
+                        break;
                     }
-                }
-
-                if voice_enabled {
-                    let packet = buf.split().freeze();
-                    match tx.try_send(UdpPacket::new(packet, src_addr, local_addr)) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            crate::voice::metrics::record_udp_drain_drop(
-                                crate::voice::metrics::UdpDrainDropReason::ProcessingQueueFull,
-                            );
-                            tracing::warn!(
-                                "UDP processing channel is full, dropping packet from {}",
-                                src_addr
-                            );
-                        }
-                        Err(e) => {
-                            crate::voice::metrics::record_udp_drain_drop(
-                                crate::voice::metrics::UdpDrainDropReason::ProcessingQueueClosed,
-                            );
-                            tracing::warn!("UDP processing channel error for {}: {e}", src_addr);
-                        }
-                    }
-                } else {
-                    crate::voice::metrics::record_udp_drain_drop(
-                        crate::voice::metrics::UdpDrainDropReason::VoiceDisabled,
-                    );
+                    Self::handle_udp_drain_datagram(
+                        &server,
+                        &socket,
+                        &tx,
+                        local_addr,
+                        datagram.payload(),
+                        datagram.src_addr(),
+                        voice_enabled,
+                        ping_enabled,
+                    )
+                    .await;
                 }
             }
             tracing::info!("UDP drain stopped");
         })
+    }
+
+    async fn handle_udp_drain_datagram(
+        server: &Arc<Box<Self>>,
+        socket: &Arc<tokio::net::UdpSocket>,
+        tx: &tokio::sync::mpsc::Sender<UdpPacket>,
+        local_addr: std::net::SocketAddr,
+        packet: &[u8],
+        src_addr: std::net::SocketAddr,
+        voice_enabled: bool,
+        ping_enabled: bool,
+    ) {
+        if packet.len() <= 1 {
+            // Empty packages or packages consisting only of the header byte are invalid.
+            crate::voice::metrics::record_udp_drain_drop(
+                crate::voice::metrics::UdpDrainDropReason::PacketTooShort,
+            );
+            return;
+        }
+
+        tracing::trace!("UDP received {} bytes from {}", packet.len(), src_addr);
+
+        if ping_enabled {
+            match crate::voice::ping::PingRequest::decode(packet) {
+                Ok(ping) => {
+                    tracing::trace!(
+                        "UDP ping from {}: timestamp={}, format={}",
+                        src_addr,
+                        ping.timestamp,
+                        ping.format
+                    );
+                    let status_server_id =
+                        server.udp_ping_status_server_id_for_port(local_addr.port());
+                    let reply =
+                        match Self::build_ping_response(server, &ping, &status_server_id).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to build UDP ping response for {}: {e}",
+                                    src_addr
+                                );
+                                return;
+                            }
+                        };
+                    match socket.send_to(&reply, src_addr).await {
+                        Ok(sent) => {
+                            tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent)
+                        }
+                        Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
+                    }
+                    return;
+                }
+                Err(crate::voice::codec::DecodeError::NotPing) => {
+                    // Not a ping packet, continue with normal processing.
+                }
+                Err(e) => {
+                    crate::voice::metrics::record_udp_drain_drop(
+                        crate::voice::metrics::UdpDrainDropReason::PingDecodeFailed,
+                    );
+                    tracing::trace!("UDP packet decode failed from {}: {e}", src_addr);
+                    return;
+                }
+            }
+        }
+
+        if voice_enabled {
+            let packet = Bytes::copy_from_slice(packet);
+            match tx.try_send(UdpPacket::new(packet, src_addr, local_addr)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    crate::voice::metrics::record_udp_drain_drop(
+                        crate::voice::metrics::UdpDrainDropReason::ProcessingQueueFull,
+                    );
+                    tracing::warn!(
+                        "UDP processing channel is full, dropping packet from {}",
+                        src_addr
+                    );
+                }
+                Err(e) => {
+                    crate::voice::metrics::record_udp_drain_drop(
+                        crate::voice::metrics::UdpDrainDropReason::ProcessingQueueClosed,
+                    );
+                    tracing::warn!("UDP processing channel error for {}: {e}", src_addr);
+                }
+            }
+        } else {
+            crate::voice::metrics::record_udp_drain_drop(
+                crate::voice::metrics::UdpDrainDropReason::VoiceDisabled,
+            );
+        }
     }
 
     /// Spawn the UDP processing task: decrypt, parse, and route voice

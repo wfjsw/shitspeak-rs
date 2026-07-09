@@ -52,7 +52,10 @@ use super::{
     Endpoint, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
     mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxHandle, UdpMuxSet},
     remote_udp_addr_is_muxed, socket_addr_supports_remote,
-    udp_batch::{UdpBatchDatagram, send_udp_batch},
+    udp_batch::{
+        RecvDatagramBatch, UDP_RECV_BATCH_MAX_DATAGRAMS, UdpBatchDatagram, recv_udp_batch,
+        send_udp_batch,
+    },
 };
 
 const MAGIC: [u8; 4] = *b"SSU1";
@@ -388,11 +391,21 @@ enum UdpIo {
 }
 
 impl UdpIo {
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    async fn recv_batch_from(&self, batch: &mut RecvDatagramBatch) -> io::Result<usize> {
         match self {
-            Self::Direct(socket) => socket.recv_from(buf).await,
-            Self::Mux(handle) => handle.recv_from(buf).await,
-            Self::Prefixed(socket) => socket.recv_from(buf).await,
+            Self::Direct(socket) => recv_udp_batch(socket, batch).await,
+            Self::Mux(handle) => {
+                batch.clear();
+                let (len, peer_addr) = handle.recv_from(batch.first_buffer_mut()).await?;
+                batch.push_received(0, len, peer_addr);
+                Ok(1)
+            }
+            Self::Prefixed(socket) => {
+                batch.clear();
+                let (len, peer_addr) = socket.recv_from(batch.first_buffer_mut()).await?;
+                batch.push_received(0, len, peer_addr);
+                Ok(1)
+            }
         }
     }
 
@@ -883,31 +896,38 @@ async fn run_socket_read_loop(
     inner: Arc<ManagerInner>,
     identity: Arc<NodeIdentity>,
 ) {
-    let mut buf =
-        vec![0u8; inner.cfg().udp_mtu().max(MAX_HANDSHAKE_DATAGRAM) + HEADER_LEN + TAG_LEN];
+    let buffer_size = inner.cfg().udp_mtu().max(MAX_HANDSHAKE_DATAGRAM) + HEADER_LEN + TAG_LEN;
+    let mut batch = RecvDatagramBatch::new(UDP_RECV_BATCH_MAX_DATAGRAMS, buffer_size);
     loop {
         tokio::select! {
             _ = inner.shutdown().cancelled() => {
                 state.shutdown.cancel();
                 return;
             }
-            result = state.socket.recv_from(&mut buf) => {
-                let (n, peer_addr) = match result {
+            result = state.socket.recv_batch_from(&mut batch) => {
+                match result {
                     Ok(v) => v,
                     Err(e) => {
                         warn!(error=%e, "udp encrypted socket read failed");
                         return;
                     }
                 };
-                if let Err(e) = handle_udp_datagram(
-                    &state,
-                    &inner,
-                    &identity,
-                    &buf[..n],
-                    peer_addr,
-                ).await {
-                    if e.kind() != io::ErrorKind::AlreadyExists {
-                        trace!(error=%e, %peer_addr, "ignored udp encrypted packet");
+                for datagram in batch.iter() {
+                    if inner.shutdown().is_cancelled() {
+                        state.shutdown.cancel();
+                        return;
+                    }
+                    let peer_addr = datagram.peer_addr();
+                    if let Err(e) = handle_udp_datagram(
+                        &state,
+                        &inner,
+                        &identity,
+                        datagram.payload(),
+                        peer_addr,
+                    ).await {
+                        if e.kind() != io::ErrorKind::AlreadyExists {
+                            trace!(error=%e, %peer_addr, "ignored udp encrypted packet");
+                        }
                     }
                 }
             }
