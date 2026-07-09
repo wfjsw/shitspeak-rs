@@ -52,6 +52,7 @@ use super::{
     Endpoint, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
     mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxHandle, UdpMuxSet},
     remote_udp_addr_is_muxed, socket_addr_supports_remote,
+    udp_batch::{UdpBatchDatagram, send_udp_batch},
 };
 
 const MAGIC: [u8; 4] = *b"SSU1";
@@ -65,6 +66,8 @@ const UDP_KEX_RETRANSMIT_MAX_INTERVAL: Duration = Duration::from_secs(8);
 const UDP_KEX_RETRANSMIT_JITTER_DIVISOR: u32 = 4;
 const UDP_KEX_MAX_RETRANSMIT_AGE: Duration = Duration::from_secs(30);
 const UDP_KEX_MAX_RETRANSMITS: u32 = 16;
+const UDP_WRITE_BATCH_MAX_FRAMES: usize = 32;
+const UDP_WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 const KEX_TRANSCRIPT_DOMAIN: &[u8] = b"shitspeak-s2s-udp-kex-v1";
 const KEX_KEY_INFO: &[u8] = b"shitspeak-s2s-udp-packet-keys-v1";
 const SUPPORTED_SIGNATURE_SCHEMES: &[SignatureScheme] = &[
@@ -401,6 +404,28 @@ impl UdpIo {
         }
     }
 
+    async fn send_batch_to(&self, payloads: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Direct(socket) => {
+                let batch = payloads
+                    .iter()
+                    .map(|payload| UdpBatchDatagram::new(payload, target))
+                    .collect::<Vec<_>>();
+                let stats = send_udp_batch(socket, &batch).await?;
+                if stats.would_block_count() > 0 || stats.partial_count() > 0 {
+                    debug!(
+                        would_block = stats.would_block_count(),
+                        partial = stats.partial_count(),
+                        "S2S UDP direct batch send observed socket backpressure"
+                    );
+                }
+                Ok(payloads.iter().map(|payload| payload.len()).sum())
+            }
+            Self::Mux(handle) => handle.send_batch_to(payloads, target).await,
+            Self::Prefixed(socket) => socket.send_batch_to(payloads, target).await,
+        }
+    }
+
     fn overhead(&self) -> usize {
         match self {
             Self::Direct(_) => 0,
@@ -423,6 +448,14 @@ impl UdpIo {
             Self::Prefixed(socket) => socket.local_addr(),
         }
     }
+}
+
+struct PreparedUdpData {
+    datagram: Vec<u8>,
+    frame_type: i32,
+    class: MessageClass,
+    expires_at: Option<Instant>,
+    original_payload_len: usize,
 }
 
 #[derive(Default)]
@@ -556,6 +589,45 @@ impl UdpCryptoSession {
         peer.metrics().record_sent(TransportKind::Udp, n);
         #[cfg(debug_assertions)]
         crate::debug_io::record_named_sent(udp_frame_kind_name(frame.frame_type), n);
+        Ok(n)
+    }
+
+    async fn send_data_batch(
+        &self,
+        batch: &[PreparedUdpData],
+        peer: &PeerState,
+    ) -> io::Result<usize> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        let payloads = batch
+            .iter()
+            .map(|entry| entry.datagram.as_slice())
+            .collect::<Vec<_>>();
+        let addr = *self.peer_addr.lock();
+        let write_started_at = Instant::now();
+        let n = self
+            .socket
+            .send_batch_to(&payloads, addr)
+            .await
+            .map_err(|e| io::Error::other(format!("udp send batch: {e}")))?;
+        record_transport_pipeline_stage(
+            TransportKind::Udp,
+            TransportPipelineStage::SocketWrite,
+            write_started_at.elapsed(),
+        );
+
+        for entry in batch {
+            peer.metrics()
+                .record_sent(TransportKind::Udp, entry.datagram.len());
+            #[cfg(debug_assertions)]
+            crate::debug_io::record_named_sent(
+                udp_frame_kind_name(entry.frame_type),
+                entry.datagram.len(),
+            );
+        }
+
         Ok(n)
     }
 
@@ -2431,6 +2503,7 @@ async fn run_write(
         .saturating_mul(2)
         .max(Duration::from_secs(1));
     let mut ping_tick = MaybeInterval::maybe(active_ping_interval);
+    let mut pending_udp_data = None;
 
     let hello = build_frame(
         inner.self_id(),
@@ -2458,52 +2531,53 @@ async fn run_write(
 
     let mut remove_session_on_exit = false;
     loop {
+        if let Some(first) = pending_udp_data.take() {
+            let Some(first) = drop_expired_prepared_udp_data(first, &peer) else {
+                continue;
+            };
+            if let Err(e) = send_udp_data_batch(
+                &session,
+                &peer,
+                &inner,
+                &mut rx,
+                &mut pending_udp_data,
+                first,
+                level,
+            )
+            .await
+            {
+                warn!(peer=%peer.node_id(), error=%e, "udp encrypted write failed");
+                remove_session_on_exit = true;
+                break;
+            }
+            continue;
+        }
+
         tokio::select! {
             biased;
             _ = closed.cancelled() => break,
 
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
-                if out.options().is_expired() {
-                    peer.record_expired_outbound_drop(
-                        ExpiredOutboundDropStage::TransportWrite,
-                        Some(TransportKind::Udp),
-                        out.class(),
-                    );
-                    trace!(peer=%peer.node_id(), "dropping expired outbound udp frame");
-                    continue;
-                }
-                let original_payload_len = out.payload().len();
-                let mut frame = build_frame(
-                    inner.self_id(),
-                    peer.node_id(),
+                let first = match prepare_udp_data_frame(out, &session, &peer, &inner, level) {
+                    Ok(Some(first)) => first,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!(peer=%peer.node_id(), error=%e, "udp outbound frame preparation failed");
+                        remove_session_on_exit = true;
+                        break;
+                    }
+                };
+                match send_udp_data_batch(
+                    &session,
+                    &peer,
+                    &inner,
+                    &mut rx,
+                    &mut pending_udp_data,
+                    first,
                     level,
-                    FrameType::Data,
-                    out.class(),
-                    now_us(),
-                    out.payload().clone(),
-                );
-                let compress_started_at = Instant::now();
-                let compress_result = maybe_compress_frame_payload(
-                    &mut frame,
-                    out.options(),
-                    inner.cfg().compression_config(),
-                    inner.cfg().max_frame_bytes(),
-                );
-                record_transport_pipeline_stage(
-                    TransportKind::Udp,
-                    TransportPipelineStage::L1Compress,
-                    compress_started_at.elapsed(),
-                );
-                if let Err(e) = compress_result {
-                    warn!(peer=%peer.node_id(), error=%e, "udp payload compression failed");
-                    remove_session_on_exit = true;
-                    break;
-                }
-                match session.send_frame(&frame, &peer, inner.cfg().udp_mtu()).await {
-                    Ok(_) => peer
-                        .metrics()
-                        .record_payload_sent(TransportKind::Udp, original_payload_len),
+                ).await {
+                    Ok(()) => {}
                     Err(e) => {
                         warn!(peer=%peer.node_id(), error=%e, "udp encrypted write failed");
                         remove_session_on_exit = true;
@@ -2556,6 +2630,133 @@ async fn run_write(
     }
     closed.cancel();
     trace!(peer=%peer.node_id(), "udp encrypted write pump exited");
+}
+
+fn prepare_udp_data_frame(
+    out: OutboundFrame,
+    session: &UdpCryptoSession,
+    peer: &PeerState,
+    inner: &ManagerInner,
+    level: ServiceLevel,
+) -> io::Result<Option<PreparedUdpData>> {
+    let options = out.options();
+    if options.is_expired() {
+        peer.record_expired_outbound_drop(
+            ExpiredOutboundDropStage::TransportWrite,
+            Some(TransportKind::Udp),
+            out.class(),
+        );
+        trace!(peer=%peer.node_id(), "dropping expired outbound udp frame");
+        return Ok(None);
+    }
+
+    let original_payload_len = out.payload().len();
+    let class = out.class();
+    let mut frame = build_frame(
+        inner.self_id(),
+        peer.node_id(),
+        level,
+        FrameType::Data,
+        class,
+        now_us(),
+        out.payload().clone(),
+    );
+    let compress_started_at = Instant::now();
+    let compress_result = maybe_compress_frame_payload(
+        &mut frame,
+        options,
+        inner.cfg().compression_config(),
+        inner.cfg().max_frame_bytes(),
+    );
+    record_transport_pipeline_stage(
+        TransportKind::Udp,
+        TransportPipelineStage::L1Compress,
+        compress_started_at.elapsed(),
+    );
+    compress_result?;
+
+    let frame_type = frame.frame_type;
+    let datagram =
+        session.encrypt_frame(&frame, session.socket.payload_mtu(inner.cfg().udp_mtu()))?;
+    Ok(Some(PreparedUdpData {
+        datagram,
+        frame_type,
+        class,
+        expires_at: options.expires_at(),
+        original_payload_len,
+    }))
+}
+
+fn drop_expired_prepared_udp_data(
+    prepared: PreparedUdpData,
+    peer: &PeerState,
+) -> Option<PreparedUdpData> {
+    if prepared
+        .expires_at
+        .is_some_and(|expires_at| Instant::now() >= expires_at)
+    {
+        peer.record_expired_outbound_drop(
+            ExpiredOutboundDropStage::TransportWrite,
+            Some(TransportKind::Udp),
+            prepared.class,
+        );
+        trace!(peer=%peer.node_id(), "dropping expired pending outbound udp frame");
+        return None;
+    }
+    Some(prepared)
+}
+
+async fn send_udp_data_batch(
+    session: &UdpCryptoSession,
+    peer: &PeerState,
+    inner: &ManagerInner,
+    rx: &mut AdaptiveQueueReceiver<OutboundFrame>,
+    pending_udp_data: &mut Option<PreparedUdpData>,
+    first: PreparedUdpData,
+    level: ServiceLevel,
+) -> io::Result<()> {
+    let mut batch = Vec::with_capacity(UDP_WRITE_BATCH_MAX_FRAMES);
+    let mut batch_bytes = first.datagram.len();
+    batch.push(first);
+
+    while batch.len() < UDP_WRITE_BATCH_MAX_FRAMES && batch_bytes < UDP_WRITE_BATCH_MAX_BYTES {
+        let out = match rx.try_recv() {
+            Ok(out) => out,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        };
+        let Some(prepared) = prepare_udp_data_frame(out, session, peer, inner, level)? else {
+            continue;
+        };
+        if let Err(prepared) = push_prepared_udp_data(&mut batch, &mut batch_bytes, prepared) {
+            *pending_udp_data = Some(prepared);
+            break;
+        }
+    }
+
+    session.send_data_batch(&batch, peer).await?;
+    for entry in batch {
+        peer.metrics()
+            .record_payload_sent(TransportKind::Udp, entry.original_payload_len);
+    }
+    Ok(())
+}
+
+fn push_prepared_udp_data(
+    batch: &mut Vec<PreparedUdpData>,
+    batch_bytes: &mut usize,
+    prepared: PreparedUdpData,
+) -> Result<(), PreparedUdpData> {
+    let datagram_len = prepared.datagram.len();
+    if !batch.is_empty()
+        && (batch.len() >= UDP_WRITE_BATCH_MAX_FRAMES
+            || batch_bytes.saturating_add(datagram_len) > UDP_WRITE_BATCH_MAX_BYTES)
+    {
+        return Err(prepared);
+    }
+    *batch_bytes = batch_bytes.saturating_add(datagram_len);
+    batch.push(prepared);
+    Ok(())
 }
 
 fn record_expired_udp_pending(

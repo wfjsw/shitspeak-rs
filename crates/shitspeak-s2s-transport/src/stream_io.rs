@@ -54,6 +54,8 @@ const DICTIONARY_COMPRESSION_CONFIGURED_FLAG: u8 = 0x02;
 const DICTIONARY_COMPRESSION_ADAPTIVE_ADVERTISEMENT_FLAG: u8 = 0x04;
 const MAX_ADAPTIVE_DICTIONARIES_PER_STREAM: usize = 4;
 const STREAM_HANDOFF_FRAMES: usize = 2;
+const STREAM_WRITE_BATCH_MAX_FRAMES: usize = 32;
+const STREAM_WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PeerDictionaryCompressionSupport {
@@ -203,6 +205,21 @@ pub(crate) fn stream_handoff_lane_bytes(global_bytes: usize, max_frame_bytes: us
         .min(global_bytes)
 }
 
+#[derive(Clone)]
+struct PreparedStreamWrite {
+    encoded: Bytes,
+    frame_type: i32,
+    expires_at: Option<Instant>,
+}
+
+struct PreparedStreamData {
+    write: PreparedStreamWrite,
+    class: MessageClass,
+    original_payload: Bytes,
+    original_payload_len: usize,
+    encoded_payload_len: usize,
+}
+
 /// In-flight ping bookkeeping.
 struct PendingPings {
     inner: VecDeque<(u64, PendingPing)>,
@@ -345,6 +362,7 @@ async fn run_pump<S>(
     let mut pending_adaptive_dictionary_id = None;
     let mut training_in_flight = false;
     let (training_tx, mut training_rx) = mpsc::channel::<AdaptiveTrainingResult>(1);
+    let mut pending_stream_data = None;
 
     let hello = build_frame(
         cfg.local_node,
@@ -380,6 +398,30 @@ async fn run_pump<S>(
             &mut training_in_flight,
             &training_tx,
         );
+
+        if let Some(first) = pending_stream_data.take() {
+            let Some(first) = drop_expired_prepared_stream_data(first, &cfg, &peer) else {
+                continue;
+            };
+            if let Err(e) = send_stream_data_batch(
+                &mut framed,
+                &cfg,
+                &peer,
+                &mut rx,
+                &mut pending_stream_data,
+                first,
+                &mut outbound_compression,
+                &local_adaptive_dictionaries,
+                active_adaptive_dictionary_id,
+                peer_dictionary_support,
+            )
+            .await
+            {
+                warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream write failed");
+                break;
+            }
+            continue;
+        }
 
         tokio::select! {
             biased;
@@ -564,67 +606,35 @@ async fn run_pump<S>(
 
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
-                if out.options().is_expired() {
-                    peer.record_expired_outbound_drop(
-                        ExpiredOutboundDropStage::TransportWrite,
-                        Some(cfg.transport),
-                        out.class(),
-                    );
-                    trace!(peer=%peer.node_id(), transport=?cfg.transport, "dropping expired outbound stream frame");
-                    continue;
-                }
-                let original_payload_len = out.payload().len();
-                let mut frame = build_frame(
-                    cfg.local_node,
-                    cfg.peer_node,
-                    level_for_metrics,
-                    FrameType::Data,
-                    out.class(),
-                    now_us(),
-                    out.payload().clone(),
-                );
-                let dictionary = outbound_compression_dictionary(
-                    outbound_compression.config(),
+                let first = match prepare_stream_data_frame(
+                    out,
+                    &cfg,
+                    &peer,
+                    &mut outbound_compression,
                     &local_adaptive_dictionaries,
                     active_adaptive_dictionary_id,
                     peer_dictionary_support,
-                );
-                let compress_started_at = Instant::now();
-                let compress_result = maybe_compress_frame_payload_with_dictionary(
-                    &mut frame,
-                    out.options(),
-                    outbound_compression.config(),
-                    dictionary,
-                    cfg.max_frame_bytes,
-                );
-                record_transport_pipeline_stage(
-                    cfg.transport,
-                    TransportPipelineStage::L1Compress,
-                    compress_started_at.elapsed(),
-                );
-                if let Err(e) = compress_result {
-                    warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream payload compression failed");
-                    break;
-                }
-                let encoded_payload_len = frame.payload.len();
-                match encode_and_send(
+                ) {
+                    Ok(Some(first)) => first,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream outbound frame preparation failed");
+                        break;
+                    }
+                };
+                match send_stream_data_batch(
                     &mut framed,
-                    &frame,
                     &cfg,
                     &peer,
-                    out.options().expires_at(),
+                    &mut rx,
+                    &mut pending_stream_data,
+                    first,
+                    &mut outbound_compression,
+                    &local_adaptive_dictionaries,
+                    active_adaptive_dictionary_id,
+                    peer_dictionary_support,
                 ).await {
-                    Ok(()) => {
-                        peer
-                            .metrics()
-                            .record_payload_sent(cfg.transport, original_payload_len);
-                        peer.metrics().record_l1_compression_sent(
-                            cfg.transport,
-                            original_payload_len,
-                            encoded_payload_len,
-                        );
-                        outbound_compression.record_sample(out.payload());
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream write failed");
                         break;
@@ -855,6 +865,174 @@ where
     Ok(())
 }
 
+fn prepare_stream_data_frame(
+    out: OutboundFrame,
+    cfg: &StreamPumpConfig,
+    peer: &PeerState,
+    outbound_compression: &mut AdaptiveCompressionState,
+    local_adaptive_dictionaries: &AdaptiveDictionaryStore,
+    active_adaptive_dictionary_id: Option<u64>,
+    peer_dictionary_support: PeerDictionaryCompressionSupport,
+) -> io::Result<Option<PreparedStreamData>> {
+    let options = out.options();
+    if options.is_expired() {
+        peer.record_expired_outbound_drop(
+            ExpiredOutboundDropStage::TransportWrite,
+            Some(cfg.transport),
+            out.class(),
+        );
+        trace!(peer=%peer.node_id(), transport=?cfg.transport, "dropping expired outbound stream frame");
+        return Ok(None);
+    }
+
+    let original_payload = out.payload().clone();
+    let original_payload_len = original_payload.len();
+    let class = out.class();
+    let mut frame = build_frame(
+        cfg.local_node,
+        cfg.peer_node,
+        cfg.transport.service_level(),
+        FrameType::Data,
+        class,
+        now_us(),
+        original_payload.clone(),
+    );
+    let dictionary = outbound_compression_dictionary(
+        outbound_compression.config(),
+        local_adaptive_dictionaries,
+        active_adaptive_dictionary_id,
+        peer_dictionary_support,
+    );
+    let compress_started_at = Instant::now();
+    let compress_result = maybe_compress_frame_payload_with_dictionary(
+        &mut frame,
+        options,
+        outbound_compression.config(),
+        dictionary,
+        cfg.max_frame_bytes,
+    );
+    record_transport_pipeline_stage(
+        cfg.transport,
+        TransportPipelineStage::L1Compress,
+        compress_started_at.elapsed(),
+    );
+    compress_result?;
+
+    let encoded_payload_len = frame.payload.len();
+    let encoded = encode_stream_frame(&frame, cfg)?;
+    Ok(Some(PreparedStreamData {
+        write: PreparedStreamWrite {
+            encoded,
+            frame_type: frame.frame_type,
+            expires_at: options.expires_at(),
+        },
+        class,
+        original_payload,
+        original_payload_len,
+        encoded_payload_len,
+    }))
+}
+
+fn drop_expired_prepared_stream_data(
+    prepared: PreparedStreamData,
+    cfg: &StreamPumpConfig,
+    peer: &PeerState,
+) -> Option<PreparedStreamData> {
+    if prepared
+        .write
+        .expires_at
+        .is_some_and(|expires_at| Instant::now() >= expires_at)
+    {
+        peer.record_expired_outbound_drop(
+            ExpiredOutboundDropStage::TransportWrite,
+            Some(cfg.transport),
+            prepared.class,
+        );
+        trace!(peer=%peer.node_id(), transport=?cfg.transport, "dropping expired pending outbound stream frame");
+        return None;
+    }
+    Some(prepared)
+}
+
+async fn send_stream_data_batch<S>(
+    framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
+    cfg: &StreamPumpConfig,
+    peer: &PeerState,
+    rx: &mut AdaptiveQueueReceiver<OutboundFrame>,
+    pending_stream_data: &mut Option<PreparedStreamData>,
+    first: PreparedStreamData,
+    outbound_compression: &mut AdaptiveCompressionState,
+    local_adaptive_dictionaries: &AdaptiveDictionaryStore,
+    active_adaptive_dictionary_id: Option<u64>,
+    peer_dictionary_support: PeerDictionaryCompressionSupport,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    let mut batch = Vec::with_capacity(STREAM_WRITE_BATCH_MAX_FRAMES);
+    let mut batch_bytes = first.write.encoded.len();
+    batch.push(first);
+
+    while batch.len() < STREAM_WRITE_BATCH_MAX_FRAMES && batch_bytes < STREAM_WRITE_BATCH_MAX_BYTES
+    {
+        let out = match rx.try_recv() {
+            Ok(out) => out,
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        };
+        let Some(prepared) = prepare_stream_data_frame(
+            out,
+            cfg,
+            peer,
+            outbound_compression,
+            local_adaptive_dictionaries,
+            active_adaptive_dictionary_id,
+            peer_dictionary_support,
+        )?
+        else {
+            continue;
+        };
+        if let Err(prepared) = push_prepared_stream_data(&mut batch, &mut batch_bytes, prepared) {
+            *pending_stream_data = Some(prepared);
+            break;
+        }
+    }
+
+    let writes = batch
+        .iter()
+        .map(|entry| entry.write.clone())
+        .collect::<Vec<_>>();
+    send_encoded_stream_writes(framed, cfg, peer, &writes).await?;
+    for entry in batch {
+        peer.metrics()
+            .record_payload_sent(cfg.transport, entry.original_payload_len);
+        peer.metrics().record_l1_compression_sent(
+            cfg.transport,
+            entry.original_payload_len,
+            entry.encoded_payload_len,
+        );
+        outbound_compression.record_sample(&entry.original_payload);
+    }
+    Ok(())
+}
+
+fn push_prepared_stream_data(
+    batch: &mut Vec<PreparedStreamData>,
+    batch_bytes: &mut usize,
+    prepared: PreparedStreamData,
+) -> Result<(), PreparedStreamData> {
+    let encoded_len = prepared.write.encoded.len();
+    if !batch.is_empty()
+        && (batch.len() >= STREAM_WRITE_BATCH_MAX_FRAMES
+            || batch_bytes.saturating_add(encoded_len) > STREAM_WRITE_BATCH_MAX_BYTES)
+    {
+        return Err(prepared);
+    }
+    *batch_bytes = batch_bytes.saturating_add(encoded_len);
+    batch.push(prepared);
+    Ok(())
+}
+
 async fn encode_and_send<S>(
     framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     frame: &pb::Frame,
@@ -879,6 +1057,18 @@ async fn encode_and_send_returning_size<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
+    let encoded = encode_stream_frame(frame, cfg)?;
+    let len = encoded.len();
+    let write = PreparedStreamWrite {
+        encoded,
+        frame_type: frame.frame_type,
+        expires_at,
+    };
+    let _ = send_encoded_stream_writes(framed, cfg, peer, std::slice::from_ref(&write)).await?;
+    Ok(len)
+}
+
+fn encode_stream_frame(frame: &pb::Frame, cfg: &StreamPumpConfig) -> io::Result<Bytes> {
     let mut buf = BytesMut::with_capacity(frame.encoded_len());
     let encode_started_at = Instant::now();
     frame
@@ -889,8 +1079,29 @@ where
         TransportPipelineStage::FrameEncode,
         encode_started_at.elapsed(),
     );
-    let len = buf.len();
-    let send = framed.send(buf.freeze());
+    Ok(buf.freeze())
+}
+
+async fn send_encoded_stream_writes<S>(
+    framed: &mut Framed<S, tokio_util::codec::LengthDelimitedCodec>,
+    cfg: &StreamPumpConfig,
+    peer: &PeerState,
+    writes: &[PreparedStreamWrite],
+) -> io::Result<usize>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    if writes.is_empty() {
+        return Ok(0);
+    }
+
+    let expires_at = writes.iter().filter_map(|write| write.expires_at).min();
+    let send = async {
+        for write in writes {
+            framed.feed(write.encoded.clone()).await?;
+        }
+        framed.flush().await
+    };
     let write_started_at = Instant::now();
     let send_result = match stream_write_deadline(&cfg, expires_at) {
         Some(deadline) => match timeout(deadline, send).await {
@@ -911,14 +1122,20 @@ where
         peer.metrics().record_data_health_failure(cfg.transport);
         return Err(error);
     }
-    peer.metrics().record_sent(cfg.transport, len);
-    #[cfg(debug_assertions)]
-    crate::debug_io::record_named_sent(
-        stream_frame_kind_name(cfg.transport, frame.frame_type),
-        len,
-    );
-    peer.metrics().record_data_health_success(cfg.transport);
-    Ok(len)
+
+    let mut total_len = 0usize;
+    for write in writes {
+        let len = write.encoded.len();
+        total_len = total_len.saturating_add(len);
+        peer.metrics().record_sent(cfg.transport, len);
+        #[cfg(debug_assertions)]
+        crate::debug_io::record_named_sent(
+            stream_frame_kind_name(cfg.transport, write.frame_type),
+            len,
+        );
+        peer.metrics().record_data_health_success(cfg.transport);
+    }
+    Ok(total_len)
 }
 
 fn stream_write_deadline(cfg: &StreamPumpConfig, expires_at: Option<Instant>) -> Option<Duration> {
@@ -1206,6 +1423,119 @@ fn now_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex};
+
+    use super::super::metrics::MetricsTuning;
+
+    struct FlushCountingDuplex {
+        inner: DuplexStream,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl FlushCountingDuplex {
+        fn new(inner: DuplexStream, flushes: Arc<AtomicUsize>) -> Self {
+            Self { inner, flushes }
+        }
+    }
+
+    impl AsyncRead for FlushCountingDuplex {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FlushCountingDuplex {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    fn test_peer() -> Arc<PeerState> {
+        PeerState::new(
+            2,
+            Duration::from_millis(250),
+            Duration::from_secs(5),
+            MetricsTuning::default(),
+            1024 * 1024,
+        )
+    }
+
+    fn test_stream_cfg() -> StreamPumpConfig {
+        StreamPumpConfig::new(
+            1,
+            2,
+            TransportKind::Tcp,
+            4096,
+            0,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            CompressionConfig::default(),
+            4,
+        )
+    }
+
+    #[tokio::test]
+    async fn encoded_stream_writes_feed_in_order_with_one_flush() {
+        let (client, server) = duplex(4096);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let counting_client = FlushCountingDuplex::new(client, flushes.clone());
+        let cfg = test_stream_cfg();
+        let peer = test_peer();
+        let mut writer = Framed::new(counting_client, stream_codec(cfg.max_frame_bytes));
+        let mut reader = Framed::new(server, stream_codec(cfg.max_frame_bytes));
+        let writes = [
+            PreparedStreamWrite {
+                encoded: Bytes::from_static(b"first"),
+                frame_type: pb::FrameType::FrameData as i32,
+                expires_at: None,
+            },
+            PreparedStreamWrite {
+                encoded: Bytes::from_static(b"second"),
+                frame_type: pb::FrameType::FrameData as i32,
+                expires_at: None,
+            },
+        ];
+
+        send_encoded_stream_writes(&mut writer, &cfg, &peer, &writes)
+            .await
+            .unwrap();
+
+        let first = timeout(Duration::from_secs(1), reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = timeout(Duration::from_secs(1), reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.freeze(), Bytes::from_static(b"first"));
+        assert_eq!(second.freeze(), Bytes::from_static(b"second"));
+        assert_eq!(flushes.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn tls_close_notify_eof_is_not_a_read_warning() {

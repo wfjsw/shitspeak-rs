@@ -233,7 +233,6 @@ async fn sendmmsg_linux(
         let mut chunk_cursor = cursor;
 
         while chunk_cursor < chunk_end {
-            socket.writable().await?;
             let chunk = &batch.datagrams[chunk_cursor..chunk_end];
             match sendmmsg_chunk(fd, batch, chunk) {
                 Ok(0) => {

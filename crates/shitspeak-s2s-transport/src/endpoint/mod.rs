@@ -41,6 +41,7 @@ pub(crate) mod mux;
 pub(crate) mod quic;
 pub(crate) mod tcp;
 pub(crate) mod udp;
+pub(crate) mod udp_batch;
 
 pub(crate) fn ipv6_only_for_address(addr: SocketAddr, listen_addrs: &[SocketAddr]) -> bool {
     addr.is_ipv6()

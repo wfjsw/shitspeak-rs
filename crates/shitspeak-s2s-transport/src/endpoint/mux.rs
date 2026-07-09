@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 
 use super::{
     bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
+    udp_batch::{UdpBatchDatagram, send_udp_batch},
 };
 use crate::service_level::TransportKind;
 
@@ -426,6 +427,14 @@ impl UdpMuxHandle {
         send_prefixed(&self.socket, self.protocol, payload, target).await
     }
 
+    pub(crate) async fn send_batch_to(
+        &self,
+        payloads: &[&[u8]],
+        target: SocketAddr,
+    ) -> io::Result<usize> {
+        send_prefixed_batch(&self.socket, self.protocol, payloads, target).await
+    }
+
     pub(crate) fn try_send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<usize> {
         try_send_prefixed(&self.socket, self.protocol, payload, target)
     }
@@ -519,6 +528,14 @@ impl PrefixedUdpSocket {
 
     pub(crate) async fn send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<usize> {
         send_prefixed(&self.socket, self.protocol, payload, target).await
+    }
+
+    pub(crate) async fn send_batch_to(
+        &self,
+        payloads: &[&[u8]],
+        target: SocketAddr,
+    ) -> io::Result<usize> {
+        send_prefixed_batch(&self.socket, self.protocol, payloads, target).await
     }
 
     pub(crate) fn try_send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<usize> {
@@ -672,6 +689,37 @@ async fn send_prefixed(
     Ok(payload.len())
 }
 
+async fn send_prefixed_batch(
+    socket: &UdpSocket,
+    protocol: MuxProtocol,
+    payloads: &[&[u8]],
+    target: SocketAddr,
+) -> io::Result<usize> {
+    if payloads.is_empty() {
+        return Ok(0);
+    }
+
+    let datagrams = payloads
+        .iter()
+        .map(|payload| prefixed_datagram(protocol, payload))
+        .collect::<Vec<_>>();
+    let batch = datagrams
+        .iter()
+        .map(|datagram| UdpBatchDatagram::new(datagram.as_slice(), target))
+        .collect::<Vec<_>>();
+    let stats = send_udp_batch(socket, &batch).await?;
+    if stats.would_block_count() > 0 || stats.partial_count() > 0 {
+        debug!(
+            protocol=?protocol,
+            would_block=stats.would_block_count(),
+            partial=stats.partial_count(),
+            "S2S UDP mux batch send observed socket backpressure"
+        );
+    }
+
+    Ok(payloads.iter().map(|payload| payload.len()).sum())
+}
+
 fn try_send_prefixed(
     socket: &UdpSocket,
     protocol: MuxProtocol,
@@ -796,6 +844,39 @@ mod tests {
             decode_prefixed(MuxProtocol::Udp, &datagram).unwrap(),
             Some(&[][..])
         );
+    }
+
+    #[tokio::test]
+    async fn prefixed_batch_sends_ordered_payloads() {
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let receiver = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let target = receiver.local_addr().unwrap();
+        let payloads = [b"first".as_slice(), b"second".as_slice()];
+
+        let sent = send_prefixed_batch(&sender, MuxProtocol::Udp, &payloads, target)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sent,
+            payloads.iter().map(|payload| payload.len()).sum::<usize>()
+        );
+        let mut received = Vec::new();
+        for _ in 0..payloads.len() {
+            let mut buf = [0u8; 64];
+            let (n, _) = receiver.recv_from(&mut buf).await.unwrap();
+            received.push(
+                decode_prefixed(MuxProtocol::Udp, &buf[..n])
+                    .unwrap()
+                    .unwrap()
+                    .to_vec(),
+            );
+        }
+        assert_eq!(received, vec![b"first".to_vec(), b"second".to_vec()]);
     }
 
     #[test]
