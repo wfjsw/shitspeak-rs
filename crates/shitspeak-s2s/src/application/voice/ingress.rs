@@ -5,7 +5,6 @@
 //! hands emitted frames to the installed audio sink. The speaker-side API
 //! wraps already-encoded audio payloads with unresolved routing intent.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,7 +25,7 @@ use crate::application::voice::reorder::{self, GapReport, Reorderer, VoiceRouteH
 use crate::application::voice::repair::{RepairCache, RepairFrame};
 use crate::application::voice::send::{self, OverlayVoiceTransport, VoiceTransport};
 use crate::application::voice::sink::AudioSink;
-use crate::application::voice::targeted::RecipientIndex;
+use crate::application::voice::targeted::{RecipientIndex, RemoteNodeLookup};
 use crate::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::TransportKind;
@@ -302,16 +301,12 @@ impl VoiceService {
                     .await
             }
             DeliveryStrategy::Targeted => {
-                let nodes = self
-                    .recipient_index
-                    .read()
-                    .as_ref()
-                    .and_then(|idx| idx.lookup_nodes_for_in_server(&server_id, channel_id));
-                match nodes {
-                    Some(nodes) if !nodes.is_empty() => {
-                        let local = self.transport.local_node_id();
-                        let dsts: Vec<NodeIdentifier> =
-                            nodes.into_iter().filter(|n| *n != local).collect();
+                let local = self.transport.local_node_id();
+                let lookup = self.recipient_index.read().as_ref().map(|idx| {
+                    idx.lookup_remote_nodes_for_in_server(&server_id, channel_id, local)
+                });
+                match lookup {
+                    Some(RemoteNodeLookup::Nodes(dsts)) => {
                         if dsts.is_empty() {
                             // Index exists but only the speaker is in the
                             // channel; nothing to do for cross-node delivery.
@@ -328,7 +323,7 @@ impl VoiceService {
                         )
                         .await
                     }
-                    _ => {
+                    Some(RemoteNodeLookup::Missing { .. }) | None => {
                         // No index entry yet — degrade safely to broadcast.
                         trace!(
                             server_id = %server_id,
@@ -376,45 +371,50 @@ impl VoiceService {
                 .await
             }
             DeliveryStrategy::Targeted => {
-                let mut nodes = BTreeSet::new();
-                let mut missing_channel = None;
-                {
-                    let index_guard = self.recipient_index.read();
-                    if let Some(index) = index_guard.as_ref() {
-                        for &channel_id in channel_ids {
-                            match index.lookup_nodes_for_in_server(&server_id, channel_id) {
-                                Some(channel_nodes) => nodes.extend(channel_nodes),
-                                None => {
-                                    missing_channel = Some(channel_id);
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        missing_channel = channel_ids.first().copied();
-                    }
-                }
-
-                if let Some(channel_id) = missing_channel {
-                    trace!(
-                        server_id = %server_id,
-                        channel_id,
-                        "voice targeted: incomplete target channel index; falling back to broadcast"
-                    );
-                    return self
-                        .send_broadcast(
-                            sender_session,
-                            server_id,
-                            target_kind,
-                            is_terminator,
-                            payload,
-                            intent,
-                        )
-                        .await;
-                }
-
                 let local = self.transport.local_node_id();
-                let dsts: Vec<NodeIdentifier> = nodes.into_iter().filter(|n| *n != local).collect();
+                let lookup = self.recipient_index.read().as_ref().map(|idx| {
+                    idx.lookup_remote_nodes_for_channels_in_server(&server_id, channel_ids, local)
+                });
+                let dsts = match lookup {
+                    Some(RemoteNodeLookup::Nodes(dsts)) => dsts,
+                    Some(RemoteNodeLookup::Missing { channel_id }) => {
+                        trace!(
+                            server_id = %server_id,
+                            channel_id,
+                            "voice targeted: incomplete target channel index; falling back to broadcast"
+                        );
+                        return self
+                            .send_broadcast(
+                                sender_session,
+                                server_id,
+                                target_kind,
+                                is_terminator,
+                                payload,
+                                intent,
+                            )
+                            .await;
+                    }
+                    None => {
+                        if let Some(channel_id) = channel_ids.first().copied() {
+                            trace!(
+                                server_id = %server_id,
+                                channel_id,
+                                "voice targeted: incomplete target channel index; falling back to broadcast"
+                            );
+                            return self
+                                .send_broadcast(
+                                    sender_session,
+                                    server_id,
+                                    target_kind,
+                                    is_terminator,
+                                    payload,
+                                    intent,
+                                )
+                                .await;
+                        }
+                        return Ok(());
+                    }
+                };
                 if dsts.is_empty() {
                     return Ok(());
                 }

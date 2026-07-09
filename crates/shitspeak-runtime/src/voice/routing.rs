@@ -1,10 +1,12 @@
 //! Voice routing logic — determines recipients and dispatches audio packets.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
+use parking_lot::RwLock;
 use scc::HashCache;
 use tracing::Instrument;
 
@@ -39,11 +41,95 @@ use shitspeak_s2s::application::proto::{
 /// 256 recipients; rayon starts paying off around 512.
 const RAYON_FANOUT_THRESHOLD: usize = 512;
 const RAYON_FANOUT_BATCH_MIN_LEN: usize = 256;
-const S2S_TARGET_RECIPIENT_CACHE_MAX_CAPACITY: usize = 4096;
+const S2S_RECIPIENT_CACHE_INITIAL_CAPACITY: usize = 256;
+const S2S_RECIPIENT_CACHE_MAX_CAPACITY: usize = 65536;
 
 static S2S_TARGET_RECIPIENT_CACHE: LazyLock<
-    HashCache<S2SVoiceTargetResolutionCacheKey, Arc<[ResolvedVoiceTargetRecipient]>>,
-> = LazyLock::new(|| HashCache::with_capacity(0, S2S_TARGET_RECIPIENT_CACHE_MAX_CAPACITY));
+    AdaptiveHashCache<S2SVoiceTargetResolutionCacheKey, Arc<[ResolvedVoiceTargetRecipient]>>,
+> = LazyLock::new(|| {
+    AdaptiveHashCache::new(
+        S2S_RECIPIENT_CACHE_INITIAL_CAPACITY,
+        S2S_RECIPIENT_CACHE_MAX_CAPACITY,
+    )
+});
+
+static S2S_NORMAL_RECIPIENT_CACHE: LazyLock<
+    AdaptiveHashCache<S2SVoiceNormalResolutionCacheKey, Arc<[ResolvedVoiceTargetRecipient]>>,
+> = LazyLock::new(|| {
+    AdaptiveHashCache::new(
+        S2S_RECIPIENT_CACHE_INITIAL_CAPACITY,
+        S2S_RECIPIENT_CACHE_MAX_CAPACITY,
+    )
+});
+
+struct AdaptiveHashCache<K, V> {
+    state: RwLock<AdaptiveHashCacheState<K, V>>,
+    max_capacity: usize,
+}
+
+struct AdaptiveHashCacheState<K, V> {
+    cache: Arc<HashCache<K, V>>,
+    current_max_capacity: usize,
+}
+
+impl<K, V> AdaptiveHashCache<K, V>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+{
+    fn new(initial_capacity: usize, max_capacity: usize) -> Self {
+        let initial_capacity = adaptive_cache_capacity(initial_capacity, max_capacity);
+        Self {
+            state: RwLock::new(AdaptiveHashCacheState {
+                cache: Arc::new(HashCache::with_capacity(0, initial_capacity)),
+                current_max_capacity: initial_capacity,
+            }),
+            max_capacity: adaptive_cache_capacity(max_capacity, max_capacity),
+        }
+    }
+
+    fn read<R, F: FnOnce(&K, &V) -> R>(&self, key: &K, reader: F) -> Option<R> {
+        let cache = self.cache();
+        cache.read_sync(key, reader)
+    }
+
+    fn put(&self, key: K, value: V) {
+        let mut state = self.state.write();
+        if state.current_max_capacity < self.max_capacity
+            && state.cache.len().saturating_mul(4) >= state.current_max_capacity.saturating_mul(3)
+        {
+            let next_capacity = state
+                .current_max_capacity
+                .saturating_mul(2)
+                .min(self.max_capacity);
+            let next_cache = Arc::new(HashCache::with_capacity(0, next_capacity));
+            state.cache.iter_sync(|key, value| {
+                next_cache.entry_sync(key.clone()).put_entry(value.clone());
+                true
+            });
+            *state = AdaptiveHashCacheState {
+                cache: next_cache,
+                current_max_capacity: next_capacity,
+            };
+        }
+        state.cache.entry_sync(key).put_entry(value);
+    }
+
+    fn cache(&self) -> Arc<HashCache<K, V>> {
+        self.state.read().cache.clone()
+    }
+
+    fn current_max_capacity(&self) -> usize {
+        self.state.read().current_max_capacity
+    }
+}
+
+fn adaptive_cache_capacity(requested_capacity: usize, max_capacity: usize) -> usize {
+    requested_capacity
+        .max(64)
+        .min(max_capacity.max(64))
+        .next_power_of_two()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct S2SVoiceTargetResolutionCacheKey {
@@ -59,6 +145,20 @@ struct S2SVoiceTargetResolutionCacheKey {
     source_channel: u32,
     sessions: Vec<u32>,
     channels: Vec<S2SVoiceTargetChannelCacheKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct S2SVoiceNormalResolutionCacheKey {
+    server_identity: usize,
+    local_node_id: u16,
+    server_id: String,
+    sender_session: ClientSessionIdentifier,
+    sender_instance_id: Option<ClientInstanceId>,
+    channel_version: u64,
+    channel_acl_generation: u64,
+    client_version: u64,
+    hide_users_without_traverse: bool,
+    source_channel: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -425,6 +525,33 @@ fn s2s_target_resolution_cache_key(
     })
 }
 
+fn s2s_normal_resolution_cache_key(
+    server: &Arc<Box<Server>>,
+    sender: Option<&Arc<Box<Client>>>,
+    server_id: &str,
+    sender_id: ClientSessionIdentifier,
+    intent: &VoiceIntent,
+) -> Option<S2SVoiceNormalResolutionCacheKey> {
+    let sender = sender?;
+    let normal = match intent.kind.as_ref()? {
+        VoiceIntentKind::Normal(normal) => normal,
+        _ => return None,
+    };
+
+    Some(S2SVoiceNormalResolutionCacheKey {
+        server_identity: Arc::as_ptr(server) as usize,
+        local_node_id: server.get_clients().local_node_id(),
+        server_id: server_id.to_owned(),
+        sender_session: sender_id,
+        sender_instance_id: Some(sender.client_instance_id()),
+        channel_version: server.get_channels().current_version_in_server(server_id),
+        channel_acl_generation: server.get_channels().channel_acl_generation(),
+        client_version: server.get_clients().current_version_in_server(server_id),
+        hide_users_without_traverse: server.get_hide_users_without_traverse(),
+        source_channel: normal.source_channel,
+    })
+}
+
 async fn resolve_s2s_voice_intent(
     server: &Arc<Box<Server>>,
     sender: Option<&Arc<Box<Client>>>,
@@ -433,10 +560,16 @@ async fn resolve_s2s_voice_intent(
     intent: &VoiceIntent,
     default_context: AudioContext,
 ) -> Vec<(Arc<Box<Client>>, AudioContext)> {
-    let Some(cache_key) =
+    if let Some(cache_key) =
         s2s_target_resolution_cache_key(server, sender, server_id, sender_id, intent)
-    else {
-        return resolve_voice_intent(
+    {
+        if let Some(recipients) =
+            S2S_TARGET_RECIPIENT_CACHE.read(&cache_key, |_, recipients| recipients.clone())
+        {
+            return live_targets_from_cached_recipients(server, server_id, &recipients).await;
+        }
+
+        let targets = resolve_voice_intent(
             server,
             sender,
             server_id,
@@ -445,15 +578,33 @@ async fn resolve_s2s_voice_intent(
             default_context,
         )
         .await;
-    };
-
-    if let Some(recipients) =
-        S2S_TARGET_RECIPIENT_CACHE.read_sync(&cache_key, |_, recipients| recipients.clone())
-    {
-        return live_targets_from_cached_recipients(server, server_id, &recipients).await;
+        S2S_TARGET_RECIPIENT_CACHE.put(cache_key, cacheable_recipients_from_targets(&targets));
+        return targets;
     }
 
-    let targets = resolve_voice_intent(
+    if let Some(cache_key) =
+        s2s_normal_resolution_cache_key(server, sender, server_id, sender_id, intent)
+    {
+        if let Some(recipients) =
+            S2S_NORMAL_RECIPIENT_CACHE.read(&cache_key, |_, recipients| recipients.clone())
+        {
+            return live_targets_from_cached_recipients(server, server_id, &recipients).await;
+        }
+
+        let targets = resolve_voice_intent(
+            server,
+            sender,
+            server_id,
+            sender_id,
+            intent,
+            default_context,
+        )
+        .await;
+        S2S_NORMAL_RECIPIENT_CACHE.put(cache_key, cacheable_recipients_from_targets(&targets));
+        return targets;
+    }
+
+    resolve_voice_intent(
         server,
         sender,
         server_id,
@@ -461,11 +612,7 @@ async fn resolve_s2s_voice_intent(
         intent,
         default_context,
     )
-    .await;
-    S2S_TARGET_RECIPIENT_CACHE
-        .entry_sync(cache_key)
-        .put_entry(cacheable_recipients_from_targets(&targets));
-    targets
+    .await
 }
 
 async fn resolve_voice_intent_with_resolved_channels(
@@ -1701,4 +1848,70 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
         }
         .instrument(span),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_s2s_normal_cache_key() -> S2SVoiceNormalResolutionCacheKey {
+        S2SVoiceNormalResolutionCacheKey {
+            server_identity: 1,
+            local_node_id: 2,
+            server_id: "default".to_owned(),
+            sender_session: ClientSessionIdentifier::from(0x0002_0001),
+            sender_instance_id: Some(7),
+            channel_version: 11,
+            channel_acl_generation: 13,
+            client_version: 17,
+            hide_users_without_traverse: false,
+            source_channel: 19,
+        }
+    }
+
+    #[test]
+    fn s2s_normal_cache_key_scopes_routing_versions_and_sender() {
+        let base = base_s2s_normal_cache_key();
+
+        let mut changed = base.clone();
+        changed.sender_instance_id = Some(8);
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.channel_version += 1;
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.channel_acl_generation += 1;
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.client_version += 1;
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.hide_users_without_traverse = true;
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.source_channel += 1;
+        assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn adaptive_hash_cache_grows_under_insert_pressure() {
+        let cache = AdaptiveHashCache::new(64, 256);
+        let initial_capacity = cache.current_max_capacity();
+
+        for key in 0..=(initial_capacity * 3 / 4) {
+            cache.put(key as u32, key as u32);
+        }
+
+        assert!(cache.current_max_capacity() > initial_capacity);
+        assert_eq!(cache.read(&0, |_, value| *value), Some(0));
+        assert_eq!(
+            cache.read(&((initial_capacity * 3 / 4) as u32), |_, value| *value),
+            Some((initial_capacity * 3 / 4) as u32)
+        );
+    }
 }
