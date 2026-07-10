@@ -74,6 +74,10 @@ impl S2sTopologyMetricsSource {
     fn build_info_samples(&self) -> Vec<PrometheusSample> {
         app_build_info_samples(self.transport.local_node_id())
     }
+
+    fn process_samples(&self) -> Vec<PrometheusSample> {
+        process_samples(self.transport.local_node_id())
+    }
 }
 
 #[async_trait]
@@ -86,6 +90,7 @@ impl S2sMetricsSource for S2sTopologyMetricsSource {
         );
         append_prometheus_metrics_separator(&mut body);
         render_app_build_info_metrics_into(&mut body, &self.build_info_samples());
+        render_process_metrics_into(&mut body, &self.process_samples());
         Some(body)
     }
 
@@ -97,6 +102,7 @@ impl S2sMetricsSource for S2sTopologyMetricsSource {
         let mut samples =
             status::prometheus_samples(&self.overlay, &self.transport, self.local_geo.clone());
         samples.extend(self.build_info_samples());
+        samples.extend(self.process_samples());
         let timestamp_ms = now_unix_ms();
         Some(remote_write_bodies(
             &samples,
@@ -142,6 +148,10 @@ impl ServerMetricsSource {
     fn build_info_samples(&self) -> Vec<PrometheusSample> {
         app_build_info_samples(self.clients.local_node_id())
     }
+
+    fn process_samples(&self) -> Vec<PrometheusSample> {
+        process_samples(self.clients.local_node_id())
+    }
 }
 
 #[async_trait]
@@ -150,6 +160,7 @@ impl S2sMetricsSource for ServerMetricsSource {
         let mut body = self.s2s.prometheus_metrics_text().unwrap_or_default();
         append_prometheus_metrics_separator(&mut body);
         render_app_build_info_metrics_into(&mut body, &self.build_info_samples());
+        render_process_metrics_into(&mut body, &self.process_samples());
         render_consensus_metrics_into(&mut body, &self.consensus_samples().await);
         render_voice_metrics_into(&mut body, &self.voice_samples());
         Some(body)
@@ -162,6 +173,7 @@ impl S2sMetricsSource for ServerMetricsSource {
     ) -> Option<Vec<Vec<u8>>> {
         let mut samples = self.s2s.prometheus_samples().unwrap_or_default();
         samples.extend(self.build_info_samples());
+        samples.extend(self.process_samples());
         samples.extend(self.consensus_samples().await);
         samples.extend(self.voice_samples());
         let timestamp_ms = now_unix_ms();
@@ -199,6 +211,46 @@ fn render_app_build_info_metrics_into(out: &mut String, samples: &[PrometheusSam
     for sample in samples {
         render_prometheus_sample(out, sample);
     }
+}
+
+fn process_samples(node_id: u16) -> Vec<PrometheusSample> {
+    let Some(rss_bytes) = current_process_resident_memory_bytes() else {
+        return Vec::new();
+    };
+
+    vec![PrometheusSample::new(
+        "shitspeak_process_resident_memory_bytes",
+        vec![("node".to_owned(), node_id.to_string())],
+        rss_bytes as f64,
+    )]
+}
+
+fn render_process_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
+    render_prometheus_header(
+        out,
+        "shitspeak_process_resident_memory_bytes",
+        "Resident memory used by the ShitSpeak process.",
+        "gauge",
+    );
+    for sample in samples {
+        render_prometheus_sample(out, sample);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_resident_memory_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some(resident_pages.saturating_mul(page_size as u64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_process_resident_memory_bytes() -> Option<u64> {
+    None
 }
 
 struct ConsensusMetricsSnapshot {

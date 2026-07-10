@@ -10,8 +10,8 @@ use crate::{
 const DECRYPT_HISTORY_SIZE: usize = 0x100;
 
 pub struct CryptState {
-    encrypt_iv: BytesMut,
-    decrypt_iv: BytesMut,
+    encrypt_iv: [u8; Ocb2::NONCE_SIZE],
+    decrypt_iv: [u8; Ocb2::NONCE_SIZE],
 
     last_good_time: DateTime<Utc>,
 
@@ -25,7 +25,7 @@ pub struct CryptState {
     remote_resync: u32,
 
     decrypt_history: [u8; DECRYPT_HISTORY_SIZE],
-    mode: Box<dyn CryptoMode>,
+    mode: Ocb2,
 }
 
 impl CryptState {
@@ -35,19 +35,18 @@ impl CryptState {
 
     pub fn generate(mode: &str, rng: &dyn SecureRandom) -> Result<Self, CryptError> {
         let mode = match mode {
-            "OCB2-AES128" => Box::new(Ocb2::new(rng)?) as Box<dyn CryptoMode>,
+            "OCB2-AES128" => Ocb2::new(rng)?,
             _ => return Err(CryptError::UnsupportedMode),
         };
 
-        let nonce_size = mode.nonce_size();
-        let mut encrypt_iv = vec![0u8; nonce_size];
-        let mut decrypt_iv = vec![0u8; nonce_size];
+        let mut encrypt_iv = [0u8; Ocb2::NONCE_SIZE];
+        let mut decrypt_iv = [0u8; Ocb2::NONCE_SIZE];
         rng.fill(&mut encrypt_iv)?;
         rng.fill(&mut decrypt_iv)?;
 
         Ok(CryptState {
-            encrypt_iv: BytesMut::from(encrypt_iv.as_slice()),
-            decrypt_iv: BytesMut::from(decrypt_iv.as_slice()),
+            encrypt_iv,
+            decrypt_iv,
             last_good_time: Utc::now(),
             good: 0,
             late: 0,
@@ -69,19 +68,22 @@ impl CryptState {
         decrypt_iv: &[u8],
     ) -> Result<Self, CryptError> {
         let mode = match mode {
-            "OCB2-AES128" => Box::new(Ocb2::from_key(
-                key.try_into().map_err(|_| CryptError::InvalidKeySize)?,
-            )?) as Box<dyn CryptoMode>,
+            "OCB2-AES128" => {
+                Ocb2::from_key(key.try_into().map_err(|_| CryptError::InvalidKeySize)?)?
+            }
             _ => return Err(CryptError::UnsupportedMode),
         };
 
-        if encrypt_iv.len() != mode.nonce_size() || decrypt_iv.len() != mode.nonce_size() {
-            return Err(CryptError::InvalidNonceSize);
-        }
+        let encrypt_iv = encrypt_iv
+            .try_into()
+            .map_err(|_| CryptError::InvalidNonceSize)?;
+        let decrypt_iv = decrypt_iv
+            .try_into()
+            .map_err(|_| CryptError::InvalidNonceSize)?;
 
         Ok(CryptState {
-            encrypt_iv: BytesMut::from(encrypt_iv),
-            decrypt_iv: BytesMut::from(decrypt_iv),
+            encrypt_iv,
+            decrypt_iv,
             last_good_time: Utc::now(),
             good: 0,
             late: 0,
@@ -112,7 +114,10 @@ impl CryptState {
 
     /// Overwrite the decrypt IV (used for client-requested resync).
     pub fn set_decrypt_iv(&mut self, iv: &[u8]) {
-        self.decrypt_iv = BytesMut::from(iv);
+        if iv.len() != Ocb2::NONCE_SIZE {
+            return;
+        }
+        self.decrypt_iv.copy_from_slice(iv);
         self.resync = self.resync.wrapping_add(1);
     }
 
@@ -207,10 +212,6 @@ impl CryptState {
         if dests.len() != datas.len() || datas.len() != plaintext_checksums.len() {
             return Err(CryptError::DestinationBufferTooSmall);
         }
-        if self.mode.nonce_size() != 16 || self.encrypt_iv.len() != 16 {
-            return Err(CryptError::InvalidNonceSize);
-        }
-
         let mode_overhead = self.mode.overhead();
         let wire_overhead = self.overhead();
         let mut nonces = Vec::with_capacity(datas.len());
@@ -228,9 +229,7 @@ impl CryptState {
             }
             dest[0] = self.encrypt_iv[0];
 
-            let mut nonce = [0u8; 16];
-            nonce.copy_from_slice(&self.encrypt_iv);
-            nonces.push(nonce);
+            nonces.push(self.encrypt_iv);
         }
 
         let mut mode_dests = dests
@@ -254,12 +253,24 @@ impl CryptState {
 
         let plain_len = data.len() - self.overhead();
         dest.resize(plain_len, 0);
+        self.decrypt_into(&mut dest[..plain_len], data).map(|_| ())
+    }
+
+    pub fn decrypt_into(&mut self, dest: &mut [u8], data: &[u8]) -> Result<usize, CryptError> {
+        if data.len() < self.overhead() {
+            return Err(CryptError::DataTooShort);
+        }
+
+        let plain_len = data.len() - self.overhead();
+        if dest.len() < plain_len {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
 
         let incoming_iv_byte = data[0];
         let known_iv_byte = self.decrypt_iv[0];
         let mut restore = false;
 
-        let iv_backup = self.decrypt_iv.to_vec();
+        let iv_backup = self.decrypt_iv;
 
         if known_iv_byte.wrapping_add(1) == incoming_iv_byte {
             // in order as expected
@@ -276,7 +287,7 @@ impl CryptState {
                 }
             } else {
                 // unexpected identical IV byte — treat as unexpected/replay
-                self.decrypt_iv.copy_from_slice(&iv_backup);
+                self.decrypt_iv = iv_backup;
                 return Err(CryptError::UnexpectedTag);
             }
         } else {
@@ -300,7 +311,7 @@ impl CryptState {
                         }
                     }
                 } else {
-                    self.decrypt_iv.copy_from_slice(&iv_backup);
+                    self.decrypt_iv = iv_backup;
                     return Err(CryptError::UnexpectedTag);
                 }
             } else if diff > 0 {
@@ -321,40 +332,42 @@ impl CryptState {
                         }
                     }
                 } else {
-                    self.decrypt_iv.copy_from_slice(&iv_backup);
+                    self.decrypt_iv = iv_backup;
                     return Err(CryptError::UnexpectedTag);
                 }
             } else {
                 // diff == 0: duplicate/replay packet
-                self.decrypt_iv.copy_from_slice(&iv_backup);
+                self.decrypt_iv = iv_backup;
                 return Err(CryptError::UnexpectedTag);
             }
 
             if self.decrypt_history[self.decrypt_iv[0] as usize] == self.decrypt_iv[1] {
                 // restore the IV
-                self.decrypt_iv.copy_from_slice(&iv_backup);
+                self.decrypt_iv = iv_backup;
 
                 return Err(CryptError::UnexpectedTag);
             }
         }
 
-        let decrypt_result = self.mode.decrypt(dest, &data[1..], &self.decrypt_iv);
+        let decrypt_result =
+            self.mode
+                .decrypt(&mut dest[..plain_len], &data[1..], &self.decrypt_iv);
 
         if let Err(e) = decrypt_result {
-            self.decrypt_iv.copy_from_slice(&iv_backup);
+            self.decrypt_iv = iv_backup;
             return Err(e);
         }
 
         self.decrypt_history[self.decrypt_iv[0] as usize] = self.decrypt_iv[1];
 
         if restore {
-            self.decrypt_iv.copy_from_slice(&iv_backup);
+            self.decrypt_iv = iv_backup;
         }
 
         self.good = self.good.saturating_add(1);
         self.last_good_time = Utc::now();
 
-        Ok(())
+        Ok(plain_len)
     }
 
     pub fn update_from_ping_message(&mut self, ping_message: &Ping) {
@@ -457,6 +470,15 @@ mod tests {
             let mut decrypted = BytesMut::new();
             decrypt.decrypt(&mut decrypted, encrypted).unwrap();
             assert_eq!(decrypted.as_ref(), plain.as_slice());
+        }
+
+        let mut decrypt_into = receiver();
+        for (encrypted, plain) in actual.iter().zip(datas.iter()) {
+            let mut decrypted = [0u8; 256];
+            let len = decrypt_into
+                .decrypt_into(&mut decrypted, encrypted)
+                .unwrap();
+            assert_eq!(&decrypted[..len], plain.as_slice());
         }
     }
 }

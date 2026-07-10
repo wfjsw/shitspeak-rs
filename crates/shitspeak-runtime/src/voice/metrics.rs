@@ -59,6 +59,7 @@ pub(crate) enum UdpDrainDropReason {
     ProcessingQueueClosed,
     VoiceDisabled,
     PacketTooShort,
+    PacketTooLarge,
     PingDecodeFailed,
 }
 
@@ -69,6 +70,7 @@ impl UdpDrainDropReason {
             Self::ProcessingQueueClosed => "processing_queue_closed",
             Self::VoiceDisabled => "voice_disabled",
             Self::PacketTooShort => "packet_too_short",
+            Self::PacketTooLarge => "packet_too_large",
             Self::PingDecodeFailed => "ping_decode_failed",
         }
     }
@@ -365,7 +367,7 @@ impl S2SVoiceGatewayDropReason {
 const INGRESS_TRANSPORT_COUNT: usize = 2;
 const UDP_DECRYPT_PATH_COUNT: usize = 2;
 const UDP_DECRYPT_RESULT_COUNT: usize = 3;
-const UDP_DRAIN_DROP_REASON_COUNT: usize = 5;
+const UDP_DRAIN_DROP_REASON_COUNT: usize = 6;
 const VOICE_QUEUE_DROP_REASON_COUNT: usize = 3;
 const VOICE_ROUTE_SOURCE_COUNT: usize = 3;
 const VOICE_ROUTE_KIND_COUNT: usize = 3;
@@ -615,7 +617,8 @@ fn udp_drain_drop_index(reason: UdpDrainDropReason) -> usize {
         UdpDrainDropReason::ProcessingQueueClosed => 1,
         UdpDrainDropReason::VoiceDisabled => 2,
         UdpDrainDropReason::PacketTooShort => 3,
-        UdpDrainDropReason::PingDecodeFailed => 4,
+        UdpDrainDropReason::PacketTooLarge => 4,
+        UdpDrainDropReason::PingDecodeFailed => 5,
     }
 }
 
@@ -1119,6 +1122,7 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         UdpDrainDropReason::ProcessingQueueClosed,
         UdpDrainDropReason::VoiceDisabled,
         UdpDrainDropReason::PacketTooShort,
+        UdpDrainDropReason::PacketTooLarge,
         UdpDrainDropReason::PingDecodeFailed,
     ] {
         samples.push(PrometheusSample::new(

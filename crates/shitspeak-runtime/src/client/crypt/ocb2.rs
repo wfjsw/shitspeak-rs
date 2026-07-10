@@ -1,5 +1,4 @@
 use aws_lc_rs::rand::SecureRandom;
-use bytes::Bytes;
 
 use crate::client::crypt::{CryptoMode, aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops};
 
@@ -37,15 +36,19 @@ fn stage_full_blocks<'a>(
 }
 
 pub struct Ocb2 {
-    key: Bytes,
+    key: [u8; BLOCK_SIZE],
     aes: Aes128,
     gf128: Gf128Ops,
 }
 
 impl Ocb2 {
+    pub const KEY_SIZE: usize = BLOCK_SIZE;
+    pub const NONCE_SIZE: usize = BLOCK_SIZE;
+    pub const TAG_SIZE: usize = 3;
+
     pub fn from_key(key: [u8; BLOCK_SIZE]) -> Result<Self, CryptError> {
         Ok(Ocb2 {
-            key: Bytes::copy_from_slice(&key),
+            key,
             aes: Aes128::new(&key)?,
             gf128: Gf128Ops::new(),
         })
@@ -375,11 +378,11 @@ impl CryptoMode for Ocb2 {
     }
 
     fn overhead(&self) -> usize {
-        3
+        Self::TAG_SIZE
     }
 
     fn key(&self) -> Option<&[u8]> {
-        Some(self.key.as_ref())
+        Some(&self.key)
     }
 
     fn encrypt_with_plaintext_checksum(
@@ -635,6 +638,7 @@ fn consttime_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use hex::decode;
 
     fn must_decode_hex(s: &str) -> Bytes {

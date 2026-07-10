@@ -218,15 +218,15 @@ pub struct Client {
     global_state: ParkingRwLock<ClientGlobalState>,
     crypt_state: ParkingMutex<Option<CryptState>>,
     voice_targets: ParkingMutex<HashMap<u32, VoiceTarget>>,
-    voice_routing_tx: mpsc::Sender<VoiceRoutingPayload>,
+    voice_routing_tx: Option<mpsc::Sender<VoiceRoutingPayload>>,
     voice_routing_rx: ParkingMutex<Option<mpsc::Receiver<VoiceRoutingPayload>>>,
     /// Per-user outgoing TCP voice tunnel queue. The routing task pushes raw
     /// `UDPTunnel` payload bytes here without awaiting normal control fanout.
     /// Native clients drain this as a separate priority input in the writer
     /// task; gateway clients use the fallback bridge in `voice::routing`.
-    voice_tcp_tx: mpsc::Sender<Bytes>,
+    voice_tcp_tx: Option<mpsc::Sender<Bytes>>,
     voice_tcp_rx: ParkingMutex<Option<mpsc::Receiver<Bytes>>>,
-    outbound_message_tx: mpsc::Sender<ClientOutboundMessage>,
+    outbound_message_tx: Option<mpsc::Sender<ClientOutboundMessage>>,
     outbound_message_rx: ParkingMutex<Option<mpsc::Receiver<ClientOutboundMessage>>>,
 
     /// Whether this client has been published to the log (i.e. `AddClient`
@@ -406,11 +406,11 @@ impl Client {
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
-            voice_routing_tx,
+            voice_routing_tx: Some(voice_routing_tx),
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
-            voice_tcp_tx,
+            voice_tcp_tx: Some(voice_tcp_tx),
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
-            outbound_message_tx,
+            outbound_message_tx: Some(outbound_message_tx),
             outbound_message_rx: ParkingMutex::new(Some(outbound_message_rx)),
             published: AtomicBool::new(false),
             pending_client_state_subscription: ParkingMutex::new(None),
@@ -568,11 +568,11 @@ impl Client {
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
-            voice_routing_tx,
+            voice_routing_tx: Some(voice_routing_tx),
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
-            voice_tcp_tx,
+            voice_tcp_tx: Some(voice_tcp_tx),
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
-            outbound_message_tx,
+            outbound_message_tx: Some(outbound_message_tx),
             outbound_message_rx: ParkingMutex::new(Some(outbound_message_rx)),
             published: AtomicBool::new(false),
             pending_client_state_subscription: ParkingMutex::new(None),
@@ -620,11 +620,6 @@ impl Client {
         client_instance_id: ClientInstanceId,
     ) -> Box<Self> {
         let is_verified = cert_hash.is_some();
-        let (voice_routing_tx, voice_routing_rx) =
-            mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
-        let (voice_tcp_tx, voice_tcp_rx) = mpsc::channel::<Bytes>(VOICE_TCP_QUEUE_CAPACITY);
-        let (outbound_message_tx, outbound_message_rx) =
-            mpsc::channel::<ClientOutboundMessage>(OUTBOUND_MESSAGE_QUEUE_CAPACITY);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
@@ -654,12 +649,12 @@ impl Client {
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
-            voice_routing_tx,
-            voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
-            voice_tcp_tx,
-            voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
-            outbound_message_tx,
-            outbound_message_rx: ParkingMutex::new(Some(outbound_message_rx)),
+            voice_routing_tx: None,
+            voice_routing_rx: ParkingMutex::new(None),
+            voice_tcp_tx: None,
+            voice_tcp_rx: ParkingMutex::new(None),
+            outbound_message_tx: None,
+            outbound_message_rx: ParkingMutex::new(None),
             published: AtomicBool::new(true),
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
@@ -1031,6 +1026,8 @@ impl Client {
         match &self.transport {
             ClientTransport::NativeTls { .. } => {
                 self.outbound_message_tx
+                    .as_ref()
+                    .ok_or_else(transport_closed_error)?
                     .send(ClientOutboundMessage::Single(message.clone()))
                     .await
                     .map_err(|_| transport_closed_error())?;
@@ -1066,6 +1063,8 @@ impl Client {
         match &self.transport {
             ClientTransport::NativeTls { .. } => {
                 self.outbound_message_tx
+                    .as_ref()
+                    .ok_or_else(transport_closed_error)?
                     .send(ClientOutboundMessage::Batch(messages.to_vec()))
                     .await
                     .map_err(|_| transport_closed_error())?;
@@ -1107,6 +1106,8 @@ impl Client {
         match &self.transport {
             ClientTransport::NativeTls { .. } => {
                 self.outbound_message_tx
+                    .as_ref()
+                    .ok_or_else(transport_closed_error)?
                     .send(ClientOutboundMessage::Single(message.clone()))
                     .await
                     .map_err(|_| transport_closed_error())?;
@@ -1172,6 +1173,8 @@ impl Client {
         match &self.transport {
             ClientTransport::NativeTls { .. } => {
                 self.outbound_message_tx
+                    .as_ref()
+                    .ok_or_else(transport_closed_error)?
                     .send(ClientOutboundMessage::Batch(messages.to_vec()))
                     .await
                     .map_err(|_| transport_closed_error())?;
@@ -1369,14 +1372,28 @@ impl Client {
 
     pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) -> bool {
         let payload = VoiceRoutingPayload::new(decoded_audio);
-        let capacity = self.voice_routing_tx.max_capacity();
-        let depth = capacity.saturating_sub(self.voice_routing_tx.capacity());
+        let Some(voice_routing_tx) = self.voice_routing_tx.as_ref() else {
+            crate::voice::metrics::record_queue_enqueue(
+                crate::voice::metrics::VoiceQueueKind::Routing,
+                crate::voice::metrics::VoiceQueueEnqueueResult::Closed,
+            );
+            crate::voice::metrics::record_queue_drop(
+                crate::voice::metrics::VoiceQueueDropReason::RoutingQueueFullOrClosed,
+            );
+            tracing::trace!(
+                session = u32::from(self.get_session_id()),
+                "voice routing queue unavailable, dropping packet"
+            );
+            return false;
+        };
+        let capacity = voice_routing_tx.max_capacity();
+        let depth = capacity.saturating_sub(voice_routing_tx.capacity());
         crate::voice::metrics::record_queue_status(
             crate::voice::metrics::VoiceQueueKind::Routing,
             depth,
             capacity,
         );
-        match self.voice_routing_tx.try_send(payload) {
+        match voice_routing_tx.try_send(payload) {
             Ok(()) => {
                 crate::voice::metrics::record_queue_enqueue(
                     crate::voice::metrics::VoiceQueueKind::Routing,
@@ -1430,14 +1447,28 @@ impl Client {
     /// builds the packet is silently dropped (voice is realtime, backlog is
     /// worse than loss).
     pub fn try_enqueue_voice_tcp(&self, raw: Bytes) -> bool {
-        let capacity = self.voice_tcp_tx.max_capacity();
-        let depth = capacity.saturating_sub(self.voice_tcp_tx.capacity());
+        let Some(voice_tcp_tx) = self.voice_tcp_tx.as_ref() else {
+            crate::voice::metrics::record_queue_enqueue(
+                crate::voice::metrics::VoiceQueueKind::TcpFallback,
+                crate::voice::metrics::VoiceQueueEnqueueResult::Closed,
+            );
+            crate::voice::metrics::record_queue_drop(
+                crate::voice::metrics::VoiceQueueDropReason::TcpQueueClosed,
+            );
+            tracing::trace!(
+                session = u32::from(self.get_session_id()),
+                "voice TCP queue unavailable, dropping packet"
+            );
+            return false;
+        };
+        let capacity = voice_tcp_tx.max_capacity();
+        let depth = capacity.saturating_sub(voice_tcp_tx.capacity());
         crate::voice::metrics::record_queue_status(
             crate::voice::metrics::VoiceQueueKind::TcpFallback,
             depth,
             capacity,
         );
-        match self.voice_tcp_tx.try_send(raw) {
+        match voice_tcp_tx.try_send(raw) {
             Ok(()) => {
                 crate::voice::metrics::record_queue_enqueue(
                     crate::voice::metrics::VoiceQueueKind::TcpFallback,
@@ -1746,4 +1777,32 @@ fn transport_closed_error() -> std::io::Error {
         std::io::ErrorKind::BrokenPipe,
         "web gateway client transport is closed",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn remote_clients_do_not_allocate_local_only_queues() {
+        let client = Client::new_remote_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            ClientSessionIdentifier::from(0x0002_0001),
+            Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            Utc::now(),
+            7,
+        );
+
+        assert!(client.voice_routing_tx.is_none());
+        assert!(client.take_voice_routing_rx().is_none());
+        assert!(client.voice_tcp_tx.is_none());
+        assert!(client.take_voice_tcp_rx().is_none());
+        assert!(client.outbound_message_tx.is_none());
+        assert!(client.take_outbound_message_rx().is_none());
+    }
 }

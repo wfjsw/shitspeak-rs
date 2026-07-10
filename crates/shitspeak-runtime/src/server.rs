@@ -51,7 +51,7 @@ use auth_finalization::AuthFinalizationQueue;
 use connection::sorted_channel_ids;
 use entrypoints::{
     EntrypointBindings, EntrypointListenSpec, EntrypointRuntime, ServerTcpListener, UdpPacket,
-    bind_entrypoint_socket_pair, bind_entrypoints, entrypoint_config_routes,
+    UdpPacketPool, bind_entrypoint_socket_pair, bind_entrypoints, entrypoint_config_routes,
 };
 use tls::{load_c2s_tls_acceptor, validate_privacy_config};
 use udp_recv_batch::{VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, VoiceUdpRecvBatch, recv_voice_udp_batch};
@@ -365,6 +365,10 @@ impl Server {
 
         // Bounded channel shared between UDP drain and processing tasks.
         let (udp_in, udp_out) = tokio::sync::mpsc::channel::<UdpPacket>(udp_channel_size);
+        let udp_packet_pool = UdpPacketPool::new(
+            MTU,
+            udp_channel_size.saturating_add(VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS),
+        );
 
         // Internal shutdown channel: used to signal all spawned tasks regardless
         // of whether shutdown originated from the external signal or a task dying.
@@ -374,6 +378,7 @@ impl Server {
             let mut runtime = self.entrypoint_runtime.lock();
             *runtime = Some(EntrypointRuntime {
                 udp_in: udp_in.clone(),
+                udp_packet_pool: udp_packet_pool.clone(),
                 udp_voice_enabled,
                 udp_ping_enabled,
                 shutdown: internal_rx.clone(),
@@ -385,7 +390,7 @@ impl Server {
             udp_ping_enabled,
             internal_rx.clone(),
         );
-        self.spawn_entrypoint_tasks_for_existing_bindings(&udp_in, &internal_rx);
+        self.spawn_entrypoint_tasks_for_existing_bindings(&udp_in, &udp_packet_pool, &internal_rx);
         let mut idle_reaper =
             Self::spawn_idle_reaper(Arc::clone(self), idle_timeout_secs, internal_rx.clone());
         let mut pending_delete_watchdog = Self::spawn_pending_delete_watchdog(
@@ -483,6 +488,7 @@ impl Server {
         server: Arc<Box<Self>>,
         socket: Arc<tokio::net::UdpSocket>,
         tx: tokio::sync::mpsc::Sender<UdpPacket>,
+        packet_pool: UdpPacketPool,
         voice_enabled: bool,
         ping_enabled: bool,
         mut shutdown: tokio::sync::watch::Receiver<()>,
@@ -514,6 +520,7 @@ impl Server {
                         &server,
                         &socket,
                         &tx,
+                        &packet_pool,
                         local_addr,
                         datagram.payload(),
                         datagram.src_addr(),
@@ -531,6 +538,7 @@ impl Server {
         server: &Arc<Box<Self>>,
         socket: &Arc<tokio::net::UdpSocket>,
         tx: &tokio::sync::mpsc::Sender<UdpPacket>,
+        packet_pool: &UdpPacketPool,
         local_addr: std::net::SocketAddr,
         packet: &[u8],
         src_addr: std::net::SocketAddr,
@@ -591,7 +599,17 @@ impl Server {
         }
 
         if voice_enabled {
-            let packet = Bytes::copy_from_slice(packet);
+            let Some(packet) = packet_pool.copy_packet(packet) else {
+                crate::voice::metrics::record_udp_drain_drop(
+                    crate::voice::metrics::UdpDrainDropReason::PacketTooLarge,
+                );
+                tracing::trace!(
+                    len = packet.len(),
+                    mtu = MTU,
+                    "UDP packet exceeds pooled buffer size"
+                );
+                return;
+            };
             let capacity = tx.max_capacity();
             let depth = capacity.saturating_sub(tx.capacity());
             crate::voice::metrics::record_queue_status(
@@ -675,8 +693,9 @@ impl Server {
                 // decrypt fails (stale NAT binding, crypt state re-keyed, etc.)
                 // the binding is removed and we fall through to IP-based candidate
                 // probing so the packet is not silently dropped.
-                let mut decrypted_from_match: Option<BytesMut> = None;
+                let mut decrypted_from_match: Option<Bytes> = None;
                 let mut matched_via_ip_fallback = false;
+                let mut decrypt_scratch = [0u8; MTU];
 
                 let client = {
                     let lookup_started_at = std::time::Instant::now();
@@ -692,12 +711,12 @@ impl Server {
                     let mut found = None;
 
                     if let Some(c) = address_match {
-                        let decrypt_result: Option<Result<BytesMut, _>> = {
+                        let decrypt_result: Option<Result<Bytes, _>> = {
                             let mut crypt = c.crypt_state();
                             crypt.as_mut().map(|state| {
                                 let mut dec = BytesMut::new();
                                 let decrypt_started_at = std::time::Instant::now();
-                                let result = state.decrypt(&mut dec, &packet).map(|_| dec);
+                                let result = state.decrypt(&mut dec, &packet).map(|_| dec.freeze());
                                 crate::voice::metrics::record_pipeline_stage(
                                     crate::voice::metrics::VoicePipelinePath::UdpIngress,
                                     crate::voice::metrics::VoicePipelineStage::UdpDecrypt,
@@ -767,16 +786,16 @@ impl Server {
                                 let mut crypt = c.crypt_state();
                                 match crypt.as_mut() {
                                     Some(state) => {
-                                        let mut decrypted = BytesMut::new();
                                         let decrypt_started_at = std::time::Instant::now();
-                                        let decrypt_result = state.decrypt(&mut decrypted, &packet);
+                                        let decrypt_result =
+                                            state.decrypt_into(&mut decrypt_scratch, &packet);
                                         crate::voice::metrics::record_pipeline_stage(
                                             crate::voice::metrics::VoicePipelinePath::UdpIngress,
                                             crate::voice::metrics::VoicePipelineStage::UdpDecrypt,
                                             decrypt_started_at.elapsed(),
                                         );
                                         match decrypt_result {
-                                            Ok(()) => {
+                                            Ok(plain_len) => {
                                                 crate::voice::metrics::record_udp_decrypt(
                                                     crate::voice::metrics::UdpDecryptPath::IpFallback,
                                                     crate::voice::metrics::UdpDecryptResult::Success,
@@ -786,7 +805,9 @@ impl Server {
                                                     src_addr,
                                                     c.get_session_id()
                                                 );
-                                                Some(decrypted)
+                                                Some(Bytes::copy_from_slice(
+                                                    &decrypt_scratch[..plain_len],
+                                                ))
                                             }
                                             Err(e) => {
                                                 crate::voice::metrics::record_udp_decrypt(
@@ -870,7 +891,7 @@ impl Server {
                 // After decryption, check if this is a ping or audio packet.
                 let decode_started_at = std::time::Instant::now();
                 let decoded_packet = crate::voice::codec::IncomingUdpPacket::decode_owned(
-                    decrypted.freeze(),
+                    decrypted,
                     Some(client.get_session_id()),
                 );
                 crate::voice::metrics::record_pipeline_stage(
@@ -1060,6 +1081,7 @@ impl Server {
     fn spawn_entrypoint_tasks_for_existing_bindings(
         self: &Arc<Box<Self>>,
         udp_in: &tokio::sync::mpsc::Sender<UdpPacket>,
+        udp_packet_pool: &UdpPacketPool,
         shutdown: &tokio::sync::watch::Receiver<()>,
     ) {
         let (listeners, sockets) = {
@@ -1078,6 +1100,7 @@ impl Server {
                 Arc::clone(self),
                 socket,
                 udp_in.clone(),
+                udp_packet_pool.clone(),
                 self.read_config().udp_voice_enabled,
                 self.read_config().udp_ping_enabled,
                 shutdown.clone(),
@@ -1099,6 +1122,7 @@ impl Server {
             Arc::clone(self),
             udp_socket,
             runtime.udp_in,
+            runtime.udp_packet_pool,
             runtime.udp_voice_enabled,
             runtime.udp_ping_enabled,
             runtime.shutdown,

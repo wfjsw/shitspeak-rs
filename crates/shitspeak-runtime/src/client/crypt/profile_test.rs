@@ -385,7 +385,7 @@ fn profile_shared_checksum_savings() {
     println!("  measured savings                     : {savings:>+10.0} ns  ({pct:>+5.1}%)");
 }
 
-// ── Lean CryptState: measure the cost of removing BytesMut + Box<dyn> ────────
+// ── CryptState wrapper overhead: compare production layout to direct OCB2 ────
 
 struct LeanState {
     encrypt_iv: [u8; 16],
@@ -416,7 +416,7 @@ impl LeanState {
 
 #[test]
 #[ignore]
-fn profile_lean_layout_savings() {
+fn profile_crypt_state_wrapper_overhead() {
     super::probe_aes_backend();
     super::probe_gf128_backend();
 
@@ -424,8 +424,8 @@ fn profile_lean_layout_savings() {
     let n = 256;
 
     println!();
-    println!("=== Lean-layout savings @ n=256 ===");
-    println!("(removes BytesMut and Box<dyn CryptoMode> indirections)");
+    println!("=== CryptState wrapper overhead @ n=256 ===");
+    println!("(production CryptState now stores IVs and OCB2 inline)");
 
     let mut buf = vec![0u8; PLAINTEXT_LEN + 4];
 
@@ -482,7 +482,7 @@ fn profile_lean_layout_savings() {
         prod / n as f64
     );
     println!(
-        "  lean-layout fanout           :   {lean:>10.0} ns  ({:.1} ns/rcp)",
+        "  direct OCB2 lower bound      :   {lean:>10.0} ns  ({:.1} ns/rcp)",
         lean / n as f64
     );
     println!("  savings                      :   {savings:>+10.0} ns  ({pct:>+5.1}%)");

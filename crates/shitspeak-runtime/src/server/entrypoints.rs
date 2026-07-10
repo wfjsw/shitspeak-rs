@@ -1,22 +1,27 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use parking_lot::Mutex;
 use rand::RngExt;
 
 use crate::config::{Config, ServerEntrypointConfig};
 
 pub(super) struct UdpPacket {
-    packet: Bytes,
+    packet: UdpPacketPayload,
     src_addr: SocketAddr,
     local_addr: SocketAddr,
     enqueued_at: Instant,
 }
 
 impl UdpPacket {
-    pub(super) fn new(packet: Bytes, src_addr: SocketAddr, local_addr: SocketAddr) -> Self {
+    pub(super) fn new(
+        packet: UdpPacketPayload,
+        src_addr: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> Self {
         Self {
             packet,
             src_addr,
@@ -29,8 +34,89 @@ impl UdpPacket {
         self.enqueued_at.elapsed()
     }
 
-    pub(super) fn into_parts(self) -> (Bytes, SocketAddr, SocketAddr) {
+    pub(super) fn into_parts(self) -> (UdpPacketPayload, SocketAddr, SocketAddr) {
         (self.packet, self.src_addr, self.local_addr)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct UdpPacketPool {
+    inner: Arc<UdpPacketPoolInner>,
+}
+
+struct UdpPacketPoolInner {
+    buffer_size: usize,
+    max_retained: usize,
+    buffers: Mutex<Vec<Vec<u8>>>,
+}
+
+impl UdpPacketPool {
+    pub(super) fn new(buffer_size: usize, max_retained: usize) -> Self {
+        Self {
+            inner: Arc::new(UdpPacketPoolInner {
+                buffer_size,
+                max_retained,
+                buffers: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    pub(super) fn copy_packet(&self, packet: &[u8]) -> Option<UdpPacketPayload> {
+        if packet.len() > self.inner.buffer_size {
+            return None;
+        }
+
+        let mut buffer = self
+            .inner
+            .buffers
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.inner.buffer_size));
+        buffer.extend_from_slice(packet);
+
+        Some(UdpPacketPayload {
+            buffer: Some(buffer),
+            pool: self.clone(),
+        })
+    }
+
+    fn return_buffer(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        if buffer.capacity() < self.inner.buffer_size {
+            return;
+        }
+
+        let mut buffers = self.inner.buffers.lock();
+        if buffers.len() < self.inner.max_retained {
+            buffers.push(buffer);
+        }
+    }
+}
+
+pub(super) struct UdpPacketPayload {
+    buffer: Option<Vec<u8>>,
+    pool: UdpPacketPool,
+}
+
+impl Deref for UdpPacketPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.buffer.as_deref().unwrap_or(&[])
+    }
+}
+
+impl AsRef<[u8]> for UdpPacketPayload {
+    fn as_ref(&self) -> &[u8] {
+        &**self
+    }
+}
+
+impl Drop for UdpPacketPayload {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.return_buffer(buffer);
+        }
     }
 }
 
@@ -56,6 +142,7 @@ pub(super) struct EntrypointBindings {
 #[derive(Clone)]
 pub(super) struct EntrypointRuntime {
     pub(super) udp_in: tokio::sync::mpsc::Sender<UdpPacket>,
+    pub(super) udp_packet_pool: UdpPacketPool,
     pub(super) udp_voice_enabled: bool,
     pub(super) udp_ping_enabled: bool,
     pub(super) shutdown: tokio::sync::watch::Receiver<()>,
@@ -303,4 +390,35 @@ pub(super) fn entrypoint_config_routes(
     }
 
     Ok((server_id_by_sni, listen_specs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_packet_pool_reuses_returned_buffers() {
+        let pool = UdpPacketPool::new(8, 1);
+
+        {
+            let packet = pool.copy_packet(b"voice").expect("packet fits");
+            assert_eq!(&*packet, b"voice");
+            assert_eq!(pool.inner.buffers.lock().len(), 0);
+        }
+
+        assert_eq!(pool.inner.buffers.lock().len(), 1);
+
+        {
+            let packet = pool.copy_packet(b"next").expect("packet fits");
+            assert_eq!(&*packet, b"next");
+            assert_eq!(pool.inner.buffers.lock().len(), 0);
+        }
+    }
+
+    #[test]
+    fn udp_packet_pool_rejects_oversized_packets() {
+        let pool = UdpPacketPool::new(4, 1);
+        assert!(pool.copy_packet(b"too-large").is_none());
+        assert_eq!(pool.inner.buffers.lock().len(), 0);
+    }
 }
