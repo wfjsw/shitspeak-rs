@@ -227,7 +227,7 @@ fn recvmmsg_chunk(fd: std::os::fd::RawFd, batch: &mut RecvDatagramBatch) -> io::
             fd,
             msgs.as_mut_ptr(),
             msgs.len() as u32,
-            libc::MSG_DONTWAIT,
+            libc::MSG_DONTWAIT as _,
             std::ptr::null_mut(),
         )
     };

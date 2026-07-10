@@ -194,6 +194,7 @@ pub async fn flush_batch_with_retry_budget(
 }
 
 /// Fallback: one `send_to` per datagram.
+#[cfg(not(target_os = "linux"))]
 async fn send_each(
     socket: &tokio::net::UdpSocket,
     batch: &DatagramBatch,

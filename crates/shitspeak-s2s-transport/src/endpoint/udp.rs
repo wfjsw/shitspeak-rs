@@ -498,6 +498,7 @@ impl UdpIo {
 
 struct PreparedUdpData {
     datagram: Vec<u8>,
+    #[cfg(debug_assertions)]
     frame_type: i32,
     class: MessageClass,
     expires_at: Option<Instant>,
@@ -2009,7 +2010,7 @@ async fn send_exchange_packets(
     packets: Vec<Vec<u8>>,
 ) -> io::Result<()> {
     for packet in packets {
-        let n = state
+        let _n = state
             .socket
             .send_to(&packet, peer_addr)
             .await
@@ -2017,10 +2018,10 @@ async fn send_exchange_packets(
         #[cfg(debug_assertions)]
         match UdpPacketHeader::decode(&packet) {
             Ok(header) => {
-                crate::debug_io::record_named_sent(udp_datagram_kind_name(header.kind), n);
+                crate::debug_io::record_named_sent(udp_datagram_kind_name(header.kind), _n);
             }
             Err(_) => {
-                crate::debug_io::record_named_sent("transport.udp.datagram.encode_error", n);
+                crate::debug_io::record_named_sent("transport.udp.datagram.encode_error", _n);
             }
         }
     }
@@ -2806,12 +2807,12 @@ fn prepare_udp_data_frame(
     );
     compress_result?;
 
-    let frame_type = frame.frame_type;
     let datagram =
         session.encrypt_frame(&frame, session.socket.payload_mtu(inner.cfg().udp_mtu()))?;
     Ok(Some(PreparedUdpData {
         datagram,
-        frame_type,
+        #[cfg(debug_assertions)]
+        frame_type: frame.frame_type,
         class,
         expires_at: options.expires_at(),
         original_payload_len,

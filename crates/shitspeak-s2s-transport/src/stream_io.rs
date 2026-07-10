@@ -210,6 +210,7 @@ pub(crate) fn stream_handoff_lane_bytes(global_bytes: usize, max_frame_bytes: us
 #[derive(Clone)]
 struct PreparedStreamWrite {
     encoded: Bytes,
+    #[cfg(debug_assertions)]
     frame_type: i32,
     class: MessageClass,
     expires_at: Option<Instant>,
@@ -943,6 +944,7 @@ fn prepare_stream_data_frame(
     Ok(Some(PreparedStreamData {
         write: PreparedStreamWrite {
             encoded,
+            #[cfg(debug_assertions)]
             frame_type: frame.frame_type,
             class,
             expires_at: options.expires_at(),
@@ -1082,6 +1084,7 @@ where
     let len = encoded.len();
     let write = PreparedStreamWrite {
         encoded,
+        #[cfg(debug_assertions)]
         frame_type: frame.frame_type,
         class: pb::MessageClass::try_from(frame.message_class)
             .map(MessageClass::from)
@@ -1565,12 +1568,14 @@ mod tests {
         let writes = [
             PreparedStreamWrite {
                 encoded: Bytes::from_static(b"first"),
+                #[cfg(debug_assertions)]
                 frame_type: pb::FrameType::FrameData as i32,
                 class: MessageClass::HighPriority,
                 expires_at: None,
             },
             PreparedStreamWrite {
                 encoded: Bytes::from_static(b"second"),
+                #[cfg(debug_assertions)]
                 frame_type: pb::FrameType::FrameData as i32,
                 class: MessageClass::HighPriority,
                 expires_at: None,
