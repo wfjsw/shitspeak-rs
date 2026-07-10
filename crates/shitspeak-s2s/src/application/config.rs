@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 
 /// Top-level configuration block for the application (L3) layer.
@@ -59,6 +61,9 @@ pub struct VoiceConfig {
     /// How long the origin keeps encoded voice frames available for replay.
     pub repair_cache_ms: u64,
 
+    /// Short transport TTL for normal outbound voice frames.
+    transport_ttl_ms: u64,
+
     /// Short transport TTL for replayed/alternate voice repair frames.
     pub repair_transport_ttl_ms: u64,
 
@@ -96,6 +101,7 @@ impl Default for VoiceConfig {
             repair_enabled: default_repair_enabled(),
             repair_nack_delay_ms: default_repair_nack_delay_ms(),
             repair_cache_ms: default_repair_cache_ms(),
+            transport_ttl_ms: default_transport_ttl_ms(),
             repair_transport_ttl_ms: default_repair_transport_ttl_ms(),
             repair_request_ttl_ms: default_repair_transport_ttl_ms(),
             repair_loss_start_ppm: default_repair_loss_start_ppm(),
@@ -136,6 +142,8 @@ struct VoiceConfigWire {
     repair_nack_delay_ms: u64,
     #[serde(default = "default_repair_cache_ms")]
     repair_cache_ms: u64,
+    #[serde(default = "default_transport_ttl_ms")]
+    transport_ttl_ms: u64,
     #[serde(default = "default_repair_transport_ttl_ms")]
     repair_transport_ttl_ms: u64,
     #[serde(default)]
@@ -171,6 +179,7 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             repair_enabled: raw.repair_enabled,
             repair_nack_delay_ms: raw.repair_nack_delay_ms,
             repair_cache_ms: raw.repair_cache_ms,
+            transport_ttl_ms: raw.transport_ttl_ms,
             repair_transport_ttl_ms: raw.repair_transport_ttl_ms,
             repair_request_ttl_ms: raw
                 .repair_request_ttl_ms
@@ -180,6 +189,20 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             repair_jitter_start_ms: raw.repair_jitter_start_ms,
             repair_max_extra_copies_per_frame: raw.repair_max_extra_copies_per_frame,
         })
+    }
+}
+
+impl VoiceConfig {
+    pub fn transport_ttl(&self) -> Duration {
+        Duration::from_millis(self.transport_ttl_ms)
+    }
+
+    pub fn transport_ttl_ms(&self) -> u64 {
+        self.transport_ttl_ms
+    }
+
+    pub fn set_transport_ttl_ms(&mut self, ms: u64) {
+        self.transport_ttl_ms = ms;
     }
 }
 
@@ -238,8 +261,11 @@ fn default_repair_nack_delay_ms() -> u64 {
 fn default_repair_cache_ms() -> u64 {
     300
 }
+fn default_transport_ttl_ms() -> u64 {
+    250
+}
 fn default_repair_transport_ttl_ms() -> u64 {
-    120
+    250
 }
 fn default_repair_loss_start_ppm() -> u32 {
     10_000
@@ -264,12 +290,21 @@ mod tests {
         assert!(cfg.voice.repair_enabled);
         assert_eq!(cfg.voice.repair_nack_delay_ms, 8);
         assert_eq!(cfg.voice.repair_cache_ms, 300);
-        assert_eq!(cfg.voice.repair_transport_ttl_ms, 120);
-        assert_eq!(cfg.voice.repair_request_ttl_ms, 120);
+        assert_eq!(cfg.voice.transport_ttl_ms(), 250);
+        assert_eq!(cfg.voice.repair_transport_ttl_ms, 250);
+        assert_eq!(cfg.voice.repair_request_ttl_ms, 250);
         assert_eq!(cfg.voice.repair_loss_start_ppm, 10_000);
         assert_eq!(cfg.voice.repair_full_dup_loss_ppm, 30_000);
         assert_eq!(cfg.voice.repair_jitter_start_ms, 40);
         assert_eq!(cfg.voice.repair_max_extra_copies_per_frame, 1);
+    }
+
+    #[test]
+    fn voice_transport_ttl_can_be_overridden() {
+        let cfg: ApplicationConfig =
+            serde_json::from_str(r#"{"voice":{"transport_ttl_ms":180}}"#).unwrap();
+        assert_eq!(cfg.voice.transport_ttl_ms(), 180);
+        assert_eq!(cfg.voice.transport_ttl(), Duration::from_millis(180));
     }
 
     #[test]

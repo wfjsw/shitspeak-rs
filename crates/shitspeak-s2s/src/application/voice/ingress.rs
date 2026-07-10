@@ -250,7 +250,10 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        let result = self.transport.send_multicast(&dsts, bytes.clone()).await;
+        let result = self
+            .transport
+            .send_multicast(&dsts, bytes.clone(), self.cfg.transport_ttl())
+            .await;
         metrics::record_send(
             self.transport.local_node_id(),
             VoiceSendMode::Broadcast,
@@ -298,7 +301,10 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        let result = self.transport.send_multicast(dsts, bytes.clone()).await;
+        let result = self
+            .transport
+            .send_multicast(dsts, bytes.clone(), self.cfg.transport_ttl())
+            .await;
         metrics::record_send(
             self.transport.local_node_id(),
             VoiceSendMode::Multicast,
@@ -579,7 +585,10 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        let result = self.transport.send_unicast(dst, bytes.clone()).await;
+        let result = self
+            .transport
+            .send_unicast(dst, bytes.clone(), self.cfg.transport_ttl())
+            .await;
         metrics::record_send(
             self.transport.local_node_id(),
             VoiceSendMode::Unicast,
@@ -1137,15 +1146,17 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(calls.len(), 2);
         let first = match &calls[0] {
-            FakeCall::Multicast { dsts, body } => {
+            FakeCall::Multicast { dsts, body, ttl } => {
                 assert_eq!(dsts.as_slice(), &[1, 2, 3]);
+                assert_eq!(*ttl, VoiceConfig::default().transport_ttl());
                 proto::decode_voice(body.as_ref()).unwrap()
             }
             other => panic!("expected Multicast, got {other:?}"),
         };
         let second = match &calls[1] {
-            FakeCall::Multicast { dsts, body } => {
+            FakeCall::Multicast { dsts, body, ttl } => {
                 assert_eq!(dsts.as_slice(), &[1, 2, 3]);
+                assert_eq!(*ttl, VoiceConfig::default().transport_ttl());
                 proto::decode_voice(body.as_ref()).unwrap()
             }
             other => panic!("expected Multicast, got {other:?}"),
@@ -1221,8 +1232,9 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            FakeCall::Multicast { dsts, body } => {
+            FakeCall::Multicast { dsts, body, ttl } => {
                 assert_eq!(dsts.as_slice(), &[1, 3]);
+                assert_eq!(*ttl, VoiceConfig::default().transport_ttl());
                 let f = proto::decode_voice(body.as_ref()).unwrap();
                 assert_eq!(f.target_kind, 2);
                 assert_eq!(f.payload, b"whisper".as_ref());
@@ -1249,12 +1261,55 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            FakeCall::Unicast { dst, body } => {
+            FakeCall::Unicast { dst, body, ttl } => {
                 assert_eq!(*dst, 5);
+                assert_eq!(*ttl, VoiceConfig::default().transport_ttl());
                 let f = proto::decode_voice(body.as_ref()).unwrap();
                 assert!(f.is_terminator);
             }
             other => panic!("expected Unicast, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_sends_use_configured_transport_ttl() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let mut cfg = VoiceConfig::default();
+        cfg.set_transport_ttl_ms(180);
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
+
+        svc.send_multicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            2,
+            false,
+            Bytes::from_static(b"ttl"),
+            normal_intent(5),
+            &[1, 3],
+        )
+        .await
+        .unwrap();
+        svc.send_unicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            2,
+            false,
+            Bytes::from_static(b"ttl"),
+            normal_intent(5),
+            3,
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            let ttl = match call {
+                FakeCall::Multicast { ttl, .. } | FakeCall::Unicast { ttl, .. } => ttl,
+                other => panic!("expected normal voice send, got {other:?}"),
+            };
+            assert_eq!(ttl, Duration::from_millis(180));
         }
     }
 
@@ -1541,7 +1596,7 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            FakeCall::Multicast { dsts, body } => {
+            FakeCall::Multicast { dsts, body, .. } => {
                 assert_eq!(dsts, &vec![2]);
                 let frame = proto::decode_voice(body.as_ref()).unwrap();
                 assert_eq!(frame.server_id, "beta");
@@ -1590,7 +1645,7 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            FakeCall::Multicast { dsts, body } => {
+            FakeCall::Multicast { dsts, body, .. } => {
                 let mut sorted = dsts.clone();
                 sorted.sort();
                 assert_eq!(sorted, vec![1, 2]);
@@ -1907,9 +1962,13 @@ mod tests {
 
         let calls = wait_for_call_count(&transport, 2).await;
         match &calls[1] {
-            FakeCall::RepairFrame { dst, body, .. } => {
+            FakeCall::RepairFrame { dst, body, ttl, .. } => {
                 assert_eq!(*dst, 2);
                 assert_eq!(body, &original);
+                assert_eq!(
+                    *ttl,
+                    Duration::from_millis(VoiceConfig::default().repair_transport_ttl_ms)
+                );
             }
             other => panic!("expected RepairFrame, got {other:?}"),
         }

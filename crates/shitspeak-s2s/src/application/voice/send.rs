@@ -28,15 +28,21 @@ pub const VOICE_REPAIR_ROUTING_METRIC: RoutingMetric = RoutingMetric::Conversati
 /// impl: [`OverlayVoiceTransport`]. Test impl: see the unit tests below.
 #[async_trait]
 pub trait VoiceTransport: Send + Sync + 'static {
-    async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError>;
+    async fn send_unicast(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError>;
 
     async fn send_multicast(
         &self,
         dsts: &[NodeIdentifier],
         body: Bytes,
+        ttl: Duration,
     ) -> Result<(), ApplicationError>;
 
-    async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError>;
+    async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError>;
 
     async fn send_repair_request(
         &self,
@@ -71,15 +77,22 @@ pub struct OverlayVoiceTransport {
 
 #[async_trait]
 impl VoiceTransport for OverlayVoiceTransport {
-    async fn send_unicast(&self, dst: NodeIdentifier, body: Bytes) -> Result<(), ApplicationError> {
+    async fn send_unicast(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        let options = OverlaySendOptions::default().expire_after(ttl);
         self.overlay
-            .send_unicast_with_routing_metric(
+            .send_unicast_unordered_with_routing_metric_and_options(
                 dst,
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
                 VOICE_ROUTING_METRIC,
                 VOICE_CLASS,
                 body,
+                options,
             )
             .await?;
         Ok(())
@@ -89,24 +102,27 @@ impl VoiceTransport for OverlayVoiceTransport {
         &self,
         dsts: &[NodeIdentifier],
         body: Bytes,
+        ttl: Duration,
     ) -> Result<(), ApplicationError> {
         if dsts.is_empty() {
             return Ok(());
         }
+        let options = OverlaySendOptions::default().expire_after(ttl);
         self.overlay
-            .send_multicast_with_routing_metric(
+            .send_multicast_unordered_with_routing_metric_and_options(
                 dsts,
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
                 VOICE_ROUTING_METRIC,
                 VOICE_CLASS,
                 body,
+                options,
             )
             .await?;
         Ok(())
     }
 
-    async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError> {
+    async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError> {
         let local = self.overlay.local_node_id();
         let dsts: Vec<NodeIdentifier> = self
             .overlay
@@ -117,14 +133,16 @@ impl VoiceTransport for OverlayVoiceTransport {
         if dsts.is_empty() {
             return Ok(());
         }
+        let options = OverlaySendOptions::default().expire_after(ttl);
         self.overlay
-            .send_multicast_with_routing_metric(
+            .send_multicast_unordered_with_routing_metric_and_options(
                 &dsts,
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
                 VOICE_ROUTING_METRIC,
                 VOICE_CLASS,
                 body,
+                options,
             )
             .await?;
         Ok(())
@@ -241,13 +259,16 @@ pub(crate) mod testing {
         Unicast {
             dst: NodeIdentifier,
             body: Bytes,
+            ttl: Duration,
         },
         Multicast {
             dsts: Vec<NodeIdentifier>,
             body: Bytes,
+            ttl: Duration,
         },
         Broadcast {
             body: Bytes,
+            ttl: Duration,
         },
         RepairRequest {
             dst: NodeIdentifier,
@@ -258,6 +279,7 @@ pub(crate) mod testing {
             dst: NodeIdentifier,
             body: Bytes,
             avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
         },
     }
 
@@ -291,11 +313,12 @@ pub(crate) mod testing {
             &self,
             dst: NodeIdentifier,
             body: Bytes,
+            ttl: Duration,
         ) -> Result<(), ApplicationError> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(FakeCall::Unicast { dst, body });
+                .push(FakeCall::Unicast { dst, body, ttl });
             Ok(())
         }
 
@@ -303,19 +326,21 @@ pub(crate) mod testing {
             &self,
             dsts: &[NodeIdentifier],
             body: Bytes,
+            ttl: Duration,
         ) -> Result<(), ApplicationError> {
             self.calls.lock().unwrap().push(FakeCall::Multicast {
                 dsts: dsts.to_vec(),
                 body,
+                ttl,
             });
             Ok(())
         }
 
-        async fn send_broadcast(&self, body: Bytes) -> Result<(), ApplicationError> {
+        async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(FakeCall::Broadcast { body });
+                .push(FakeCall::Broadcast { body, ttl });
             Ok(())
         }
 
@@ -337,12 +362,13 @@ pub(crate) mod testing {
             dst: NodeIdentifier,
             body: Bytes,
             avoid_first_hop: Option<NodeIdentifier>,
-            _ttl: Duration,
+            ttl: Duration,
         ) -> Result<(), ApplicationError> {
             self.calls.lock().unwrap().push(FakeCall::RepairFrame {
                 dst,
                 body,
                 avoid_first_hop,
+                ttl,
             });
             Ok(())
         }

@@ -33,7 +33,7 @@ use super::{OverlaySendOptions, ServiceRegistry};
 const FORWARD_PAYLOAD_LOG_BYTES: usize = 256;
 const CONTROL_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
 const CONTROL_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
-const VOICE_TRANSPORT_TTL: Duration = Duration::from_secs(2);
+const VOICE_TRANSPORT_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForwardNextHop {
@@ -1281,8 +1281,12 @@ mod tests {
         );
 
         data.service_tag = VOICE_SERVICE_TAG;
+        let before = std::time::Instant::now();
         let options = transport_options_for_overlay_data(&data, None);
-        assert!(options.expires_at().is_some());
+        let expires_at = options.expires_at().expect("voice fallback ttl");
+        assert_eq!(VOICE_TRANSPORT_TTL, Duration::from_millis(250));
+        assert!(expires_at > before);
+        assert!(expires_at <= before + Duration::from_millis(275));
         assert!(!options.is_expired());
     }
 

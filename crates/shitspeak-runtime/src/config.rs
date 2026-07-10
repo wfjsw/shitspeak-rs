@@ -1465,10 +1465,10 @@ fn default_udp_channel_size() -> usize {
     2048
 }
 fn default_voice_max_udp_packet_age_ms() -> u64 {
-    120
+    250
 }
 fn default_voice_max_routing_queue_age_ms() -> u64 {
-    120
+    250
 }
 fn default_voice_udp_send_retry_budget_ms() -> u64 {
     2
@@ -1716,6 +1716,49 @@ mod tests {
         let disabled_cfg = parse_config(&format!("{base}\nshow_node_id_for_superusers = false\n"))
             .expect("config deserialize");
         assert!(!disabled_cfg.show_node_id_for_superusers);
+    }
+
+    #[test]
+    fn voice_tuning_defaults_and_overrides_parse() {
+        let base = r#"
+            listen = "127.0.0.1:64738"
+            register_name = "test"
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            send_version = true
+            send_build_info = true
+            send_os_info = true
+            allowed_proxies = []
+            min_client_version = 0
+            max_users = 100
+        "#;
+        let default_cfg = parse_config(base).expect("config deserialize");
+        assert_eq!(
+            default_cfg.voice.max_udp_packet_age(),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            default_cfg.voice.max_routing_queue_age(),
+            Duration::from_millis(250)
+        );
+
+        let override_cfg = parse_config(&format!(
+            r#"{base}
+
+            [voice]
+            max_udp_packet_age_ms = 180
+            max_routing_queue_age_ms = 190
+        "#
+        ))
+        .expect("config deserialize");
+        assert_eq!(
+            override_cfg.voice.max_udp_packet_age(),
+            Duration::from_millis(180)
+        );
+        assert_eq!(
+            override_cfg.voice.max_routing_queue_age(),
+            Duration::from_millis(190)
+        );
     }
 
     #[test]
@@ -2502,6 +2545,7 @@ mod tests {
             no_progress_close_ms = 789
 
             [application.voice]
+            transport_ttl_ms = 180
             repair_transport_ttl_ms = 300
         "#
         .replace("__DICT__", &dictionary_path.display().to_string());
@@ -2624,6 +2668,7 @@ mod tests {
             Duration::from_millis(456)
         );
         assert_eq!(kcp.no_progress_close(), Duration::from_millis(789));
+        assert_eq!(cfg.application.voice.transport_ttl_ms(), 180);
         assert_eq!(cfg.application.voice.repair_transport_ttl_ms, 300);
         assert_eq!(cfg.application.voice.repair_request_ttl_ms, 300);
         assert_eq!(
