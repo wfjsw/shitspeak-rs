@@ -1545,6 +1545,149 @@ async fn s2s_cross_node_voice_routes_normal_channel() {
     assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
+/// Checks the Mumble "shout to linked channels" voice-target shape across
+/// nodes. The sender targets its current channel with `links=true`, while the
+/// recipient is connected to a linked channel on another server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_cross_node_voice_target_shouts_to_linked_channel() {
+    const SOURCE_CHANNEL: u32 = 50;
+    const LINKED_CHANNEL: u32 = 51;
+    const TARGET_SLOT: u32 = 7;
+
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let channels = a.server.get_channels();
+    channels
+        .create_channel(Channel::new(
+            SOURCE_CHANNEL,
+            "Link source".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create link source channel");
+    channels
+        .create_channel(Channel::new(
+            LINKED_CHANNEL,
+            "Linked remote".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create linked remote channel");
+    channels
+        .add_link(SOURCE_CHANNEL, LINKED_CHANNEL)
+        .await
+        .expect("link voice target channels");
+
+    let links_replicated = wait_until(S2S_DEADLINE, || {
+        b.server
+            .get_channels()
+            .effective_link_group_in_server(crate::types::DEFAULT_SERVER_ID, SOURCE_CHANNEL)
+            .is_some_and(|group| group.contains(&LINKED_CHANNEL))
+    })
+    .await;
+    assert!(links_replicated, "server B should learn the channel link");
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+    alice.move_to_channel(SOURCE_CHANNEL).await;
+    bob.move_to_channel(LINKED_CHANNEL).await;
+
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+    let placements_replicated = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            let b_knows_alice = handle
+                .block_on(b.server.get_clients().get_client(alice.server_session))
+                .is_some_and(|client| client.get_current_channel_id() == SOURCE_CHANNEL);
+            let b_knows_bob = handle
+                .block_on(b.server.get_clients().get_client(bob.server_session))
+                .is_some_and(|client| client.get_current_channel_id() == LINKED_CHANNEL);
+            let a_knows_bob = handle
+                .block_on(a.server.get_clients().get_client(bob.server_session))
+                .is_some_and(|client| client.get_current_channel_id() == LINKED_CHANNEL);
+            b_knows_alice && b_knows_bob && a_knows_bob
+        })
+    })
+    .await;
+    assert!(
+        placements_replicated,
+        "server B should learn both channel placements"
+    );
+
+    let sender_index = a.server.get_clients().voice_recipient_index_snapshot().await;
+    let linked_nodes = sender_index
+        .get(&shitspeak_s2s::application::voice::targeted::RecipientIndexKey::new(
+            crate::types::DEFAULT_SERVER_ID,
+            LINKED_CHANNEL,
+        ))
+        .expect("sender recipient snapshot should contain the linked channel");
+    assert!(
+        linked_nodes.contains(&2),
+        "sender recipient snapshot should route linked-channel voice to node 2"
+    );
+
+    let replicated_alice = b
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("server B should retain replicated Alice");
+    assert!(replicated_alice.is_superuser());
+    let linked_permissions = crate::client::acl::compute_permissions_for_client(
+        &b.server,
+        &replicated_alice,
+        LINKED_CHANNEL,
+    )
+    .await;
+    assert!(linked_permissions.contains(crate::acl::ACLPermissions::Whisper));
+    let local_bob = b
+        .server
+        .get_clients()
+        .get_client(bob.server_session)
+        .await
+        .expect("server B should retain local Bob");
+    assert!(
+        crate::client::visibility::can_view_user(&b.server, &local_bob, &replicated_alice).await
+    );
+
+    alice
+        .set_voice_target(s2s_voice_target(
+            TARGET_SLOT,
+            vec![s2s_voice_target_channel(SOURCE_CHANNEL, false, true, None)],
+        ))
+        .await;
+    wait_for_s2s_voice_target_installed(&a, &alice, TARGET_SLOT).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    bob.drain_now().await;
+
+    let route_sample = S2SRouteResourceSample::capture_target();
+    alice
+        .send_voice_tcp(TARGET_SLOT, 2, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    let audio = bob.recv_voice_tcp(CLIENT_DEADLINE).await;
+    let route = route_sample.finish();
+    assert_eq!(
+        route.frames(),
+        1,
+        "server B should route the linked-channel S2S frame"
+    );
+    let audio = audio.expect("Bob should receive Alice's linked-channel shout");
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
+}
+
 /// Checks sustained cross-node voice-target shout delivery under a large
 /// receiver batch.
 /// Expected: 500 real native clients on server B receive Alice's 10-second
