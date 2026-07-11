@@ -427,9 +427,10 @@ impl VoiceService {
         }
     }
 
-    /// Channel-aware send for a non-normal voice intent. This preserves
-    /// the original target kind and intent while reusing the targeted
-    /// delivery strategy's recipient-index multicast path.
+    /// Channel-aware send that preserves the original target kind and intent
+    /// while reusing the targeted delivery strategy's recipient-index
+    /// multicast path. Normal speech may supply its source channel together
+    /// with Speak-authorized linked channels.
     pub async fn send_for_target_channels(
         &self,
         sender_session: u32,
@@ -1700,6 +1701,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_for_target_channels_targeted_preserves_normal_intent() {
+        use crate::application::proto::VoiceIntentKind;
+        use crate::application::voice::targeted::{
+            RecipientIndex, RecipientIndexKey, RecipientIndexSnapshot, RecipientIndexUpdate,
+        };
+
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service_with_strategy(transport.clone(), "targeted");
+        let idx = RecipientIndex::new();
+        let mut snapshot = RecipientIndexSnapshot::new();
+        snapshot.insert(
+            RecipientIndexKey::new(shitspeak_core::default_server_id(), 5),
+            [1].into_iter().collect(),
+        );
+        snapshot.insert(
+            RecipientIndexKey::new(shitspeak_core::default_server_id(), 6),
+            [2, 7].into_iter().collect(),
+        );
+        idx.replace_all_complete(RecipientIndexUpdate::new(
+            snapshot,
+            [shitspeak_core::default_server_id()].into_iter().collect(),
+            [1, 2, 3, 7].into_iter().collect(),
+        ));
+        svc.set_recipient_index(idx);
+
+        svc.send_for_target_channels(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            Arc::from([5, 6]),
+            0,
+            false,
+            Bytes::from_static(b"normal"),
+            normal_intent(5),
+        )
+        .await
+        .unwrap();
+
+        match &transport.calls()[0] {
+            FakeCall::Multicast { dsts, body, .. } => {
+                let mut sorted = dsts.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec![1, 2]);
+                let frame = proto::decode_voice(body.as_ref()).unwrap();
+                assert_eq!(frame.target_kind, 0);
+                assert!(matches!(
+                    frame.intent.and_then(|intent| intent.kind),
+                    Some(VoiceIntentKind::Normal(normal)) if normal.source_channel == 5
+                ));
+            }
+            other => panic!("expected Multicast, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn send_for_server_targeted_uses_complete_server_membership() {
         use crate::application::proto::{VoiceIntentKind, VoiceIntentTarget, VoiceTargetChannel};
         use crate::application::voice::targeted::{
@@ -1788,6 +1843,42 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         assert!(matches!(calls[0], FakeCall::Multicast { .. }));
+    }
+
+    #[tokio::test]
+    async fn normal_channel_set_falls_back_when_linked_channel_is_missing() {
+        use crate::application::proto::VoiceIntentKind;
+        use crate::application::voice::targeted::RecipientIndex;
+
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service_with_strategy(transport.clone(), "targeted");
+        let idx = RecipientIndex::new();
+        idx.add(5, 1);
+        svc.set_recipient_index(idx);
+
+        svc.send_for_target_channels(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            Arc::from([5, 6]),
+            0,
+            false,
+            Bytes::from_static(b"normal"),
+            normal_intent(5),
+        )
+        .await
+        .unwrap();
+
+        match &transport.calls()[0] {
+            FakeCall::Multicast { dsts, body, .. } => {
+                assert_eq!(dsts, &vec![1, 2, 3]);
+                let frame = proto::decode_voice(body.as_ref()).unwrap();
+                assert!(matches!(
+                    frame.intent.and_then(|intent| intent.kind),
+                    Some(VoiceIntentKind::Normal(normal)) if normal.source_channel == 5
+                ));
+            }
+            other => panic!("expected broadcast fallback, got {other:?}"),
+        }
     }
 
     #[tokio::test]

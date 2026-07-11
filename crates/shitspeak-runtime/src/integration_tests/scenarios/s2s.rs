@@ -127,6 +127,45 @@ async fn spawn_s2s_pair_with_opts(
     (a, b)
 }
 
+async fn spawn_targeted_s2s_pair() -> (TestServer, TestServer) {
+    let pki = Arc::new(mint_pki(&[1, 2]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+
+    let mut a_config = S2sConfig {
+        enabled: true,
+        tcp_listen: vec![loopback(a_s2s_port)],
+        seed_addresses: vec![S2sSeedAddressConfig::new(
+            S2sTransportKindConfig::Tcp,
+            loopback(b_s2s_port),
+        )],
+        ..S2sConfig::default()
+    };
+    a_config.application.voice.delivery_strategy = "targeted".to_owned();
+    let mut b_config = S2sConfig {
+        enabled: true,
+        tcp_listen: vec![loopback(b_s2s_port)],
+        seed_addresses: vec![S2sSeedAddressConfig::new(
+            S2sTransportKindConfig::Tcp,
+            loopback(a_s2s_port),
+        )],
+        ..S2sConfig::default()
+    };
+    b_config.application.voice.delivery_strategy = "targeted".to_owned();
+
+    let a = spawn_s2s_test_server_with_config(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        1,
+        0,
+        a_config,
+    )
+    .await;
+    let b = spawn_s2s_test_server_with_config(TestServerOpts::default(), pki, 2, 1, b_config).await;
+
+    (a, b)
+}
+
 async fn spawn_s2s_three_node_with_opts(
     a_opts: TestServerOpts,
     b_opts: TestServerOpts,
@@ -1717,6 +1756,128 @@ async fn s2s_cross_node_voice_routes_normal_channel() {
         .await
         .expect("Bob should receive Alice's cross-node voice");
 
+    assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
+    assert_eq!(audio.sender_session, Some(alice.server_session));
+}
+
+/// Checks normal speech across a linked channel on another node while the
+/// S2S voice service uses targeted delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_targeted_normal_voice_routes_to_linked_channel() {
+    const SOURCE_CHANNEL: u32 = 52;
+    const LINKED_CHANNEL: u32 = 53;
+
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_targeted_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let channels = a.server.get_channels();
+    channels
+        .create_channel(Channel::new(
+            SOURCE_CHANNEL,
+            "Normal link source".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create normal link source channel");
+    channels
+        .create_channel(Channel::new(
+            LINKED_CHANNEL,
+            "Normal linked remote".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create normal linked channel");
+    channels
+        .add_link(SOURCE_CHANNEL, LINKED_CHANNEL)
+        .await
+        .expect("link normal voice channels");
+
+    let links_replicated = wait_until(S2S_DEADLINE, || {
+        b.server
+            .get_channels()
+            .effective_link_group_in_server(crate::types::DEFAULT_SERVER_ID, SOURCE_CHANNEL)
+            .is_some_and(|group| group.contains(&LINKED_CHANNEL))
+    })
+    .await;
+    assert!(links_replicated, "server B should learn the channel link");
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+    alice.move_to_channel(SOURCE_CHANNEL).await;
+    bob.move_to_channel(LINKED_CHANNEL).await;
+
+    let placements_replicated = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            let b_knows_alice = handle
+                .block_on(b.server.get_clients().get_client(alice.server_session))
+                .is_some_and(|client| client.get_current_channel_id() == SOURCE_CHANNEL);
+            let a_knows_bob = handle
+                .block_on(a.server.get_clients().get_client(bob.server_session))
+                .is_some_and(|client| client.get_current_channel_id() == LINKED_CHANNEL);
+            b_knows_alice && a_knows_bob
+        })
+    })
+    .await;
+    assert!(
+        placements_replicated,
+        "both nodes should learn the source and linked channel placements"
+    );
+
+    let linked_node_indexed = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(a.server.get_clients().voice_recipient_index_snapshot())
+                .get(
+                    &shitspeak_s2s::application::voice::targeted::RecipientIndexKey::new(
+                        crate::types::DEFAULT_SERVER_ID,
+                        LINKED_CHANNEL,
+                    ),
+                )
+                .is_some_and(|nodes| nodes.contains(&2))
+        })
+    })
+    .await;
+    assert!(
+        linked_node_indexed,
+        "targeted sender index should include the linked-channel node"
+    );
+
+    let replicated_alice = b
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("server B should retain replicated Alice");
+    assert!(
+        crate::client::acl::compute_permissions_for_client(
+            &b.server,
+            &replicated_alice,
+            LINKED_CHANNEL,
+        )
+        .await
+        .contains(crate::acl::ACLPermissions::Speak)
+    );
+
+    bob.drain_now().await;
+    alice
+        .send_voice_tcp(0, 2, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    let audio = bob
+        .recv_voice_tcp(CLIENT_DEADLINE)
+        .await
+        .expect("Bob should receive normal voice through the linked channel");
     assert_eq!(opus_frame(&audio.audio_payload), SAMPLE_OPUS);
     assert_eq!(audio.sender_session, Some(alice.server_session));
 }

@@ -1335,6 +1335,96 @@ async fn voice_tcp_linked_channel_routes() {
     assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
+#[tokio::test]
+async fn voice_tcp_linked_channel_requires_speak_permission() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("admin", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("alice", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(3), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(4), vec![]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(72, "Source".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(73, "Linked".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels.add_link(72, 73).await.unwrap();
+
+    let admin = TestClient::connect_and_authenticate(&server, "admin", None)
+        .await
+        .expect("admin");
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    admin
+        .set_acls(
+            73,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: true,
+                inherited: false,
+                user_id: None,
+                group: Some("all".into()),
+                grant: 0,
+                deny: ACLPermissions::Speak as u32,
+            }],
+            true,
+        )
+        .await;
+
+    alice.move_to_channel(72).await;
+    bob.move_to_channel(73).await;
+    carol.move_to_channel(72).await;
+    expect_user_channel(&alice, 72, "Alice enters source channel").await;
+    expect_user_channel(&bob, 73, "Bob enters linked channel").await;
+    expect_user_channel(&carol, 72, "Carol enters source channel").await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    let alice_server = server
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("Alice is still connected");
+    let source_permissions =
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 72).await;
+    let linked_permissions =
+        crate::client::acl::compute_permissions_for_client(&server.server, &alice_server, 73).await;
+    assert!(source_permissions.contains(ACLPermissions::Speak));
+    assert!(!linked_permissions.contains(ACLPermissions::Speak));
+
+    alice
+        .send_voice_tcp(0, 6, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(&carol, &alice, "Carol should hear source-channel voice").await;
+    expect_no_voice(
+        &bob,
+        "Bob should not hear linked-channel voice without Speak permission",
+    )
+    .await;
+}
+
 /// Checks direct-user voice targets.
 /// Expected: only the targeted session receives the packet.
 #[tokio::test]

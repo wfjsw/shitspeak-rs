@@ -542,6 +542,7 @@ async fn resolve_voice_intent(
         intent,
         default_context,
         None,
+        None,
         false,
         true,
     )
@@ -708,6 +709,7 @@ async fn resolve_voice_intent_with_resolved_channels(
     sender_id: ClientSessionIdentifier,
     intent: &VoiceIntent,
     default_context: AudioContext,
+    normal_channel_ids: Option<&[u32]>,
     resolved_channels: Option<&[ResolvedVoiceTargetChannel]>,
     preauthorized_channels: bool,
     preauthorized_whole_server: bool,
@@ -720,9 +722,17 @@ async fn resolve_voice_intent_with_resolved_channels(
     match intent.kind.as_ref() {
         Some(VoiceIntentKind::Normal(normal)) => {
             let source_channel = normal.source_channel;
+            let owned_normal_channel_ids;
+            let normal_channel_ids = if let Some(channel_ids) = normal_channel_ids {
+                channel_ids
+            } else {
+                owned_normal_channel_ids =
+                    resolve_normal_voice_channels(server, sender, server_id, source_channel).await;
+                &owned_normal_channel_ids
+            };
             let channel_clients = server
                 .get_clients()
-                .get_local_clients_in_channel_in_server(server_id, source_channel)
+                .get_local_clients_in_channels_in_server(server_id, normal_channel_ids)
                 .await;
             for client in channel_clients {
                 if let Some(sender) = sender {
@@ -738,42 +748,6 @@ async fn resolve_voice_intent_with_resolved_channels(
                     client,
                     AudioContext::Normal,
                 );
-            }
-
-            if let Some(sender) = sender {
-                let linked_ids = server
-                    .get_channels()
-                    .effective_link_group_in_server(server_id, source_channel);
-                for linked_id in linked_ids.iter().flat_map(|group| group.iter()).copied() {
-                    if linked_id == source_channel {
-                        continue;
-                    }
-                    let perms = crate::client::acl::compute_permissions_for_client(
-                        server, sender, linked_id,
-                    )
-                    .await;
-                    if !perms.contains(crate::acl::ACLPermissions::Speak) {
-                        continue;
-                    }
-                    let linked_clients = server
-                        .get_clients()
-                        .get_local_clients_in_channel_in_server(server_id, linked_id)
-                        .await;
-                    for client in linked_clients {
-                        if !crate::client::visibility::can_view_user(server, &client, sender).await
-                        {
-                            continue;
-                        }
-                        push_unique_target(
-                            &mut targets,
-                            &mut seen,
-                            sender_id,
-                            sender_instance_id,
-                            client,
-                            AudioContext::Normal,
-                        );
-                    }
-                }
             }
 
             let listeners = server
@@ -1104,6 +1078,36 @@ async fn resolve_voice_intent_with_resolved_channels(
     targets
 }
 
+/// Resolve the channel set for ordinary speech. The source channel is always
+/// included; linked channels require the speaker to hold Speak there.
+async fn resolve_normal_voice_channels(
+    server: &Arc<Box<Server>>,
+    sender: Option<&Arc<Box<Client>>>,
+    server_id: &str,
+    source_channel: u32,
+) -> Arc<[u32]> {
+    let mut channel_ids = vec![source_channel];
+    let Some(sender) = sender else {
+        return channel_ids.into();
+    };
+
+    let linked_ids = server
+        .get_channels()
+        .effective_link_group_in_server(server_id, source_channel);
+    for linked_id in linked_ids.iter().flat_map(|group| group.iter()).copied() {
+        if linked_id == source_channel {
+            continue;
+        }
+        let permissions =
+            crate::client::acl::compute_permissions_for_client(server, sender, linked_id).await;
+        if permissions.contains(crate::acl::ACLPermissions::Speak) {
+            channel_ids.push(linked_id);
+        }
+    }
+
+    channel_ids.into()
+}
+
 async fn resolve_voice_target_channel(
     server: &Arc<Box<Server>>,
     server_id: &str,
@@ -1331,6 +1335,7 @@ async fn resolved_voice_target_recipients(
         sender_id,
         intent,
         default_context,
+        None,
         Some(resolved_channels),
         true,
         true,
@@ -1376,47 +1381,61 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         "routing voice packet"
     );
 
-    let (intent, target_kind, send_s2s, route_kind, resolved_channels, voice_target) =
-        match audio.target {
-            AudioTarget::Normal => (
+    let (
+        intent,
+        target_kind,
+        send_s2s,
+        route_kind,
+        normal_channel_ids,
+        resolved_channels,
+        voice_target,
+    ) = match audio.target {
+        AudioTarget::Normal => {
+            let normal_channel_ids =
+                resolve_normal_voice_channels(server, Some(sender), &server_id, sender_channel)
+                    .await;
+            (
                 normal_intent(sender_channel),
                 S2S_TARGET_NORMAL,
                 true,
                 VoiceRouteKind::Normal,
+                Some(normal_channel_ids),
                 None,
                 None,
-            ),
-            AudioTarget::ServerLoopback => {
-                let targets = [(sender.clone(), AudioContext::Normal)];
-                flush_voice_batch(server, audio, &targets).await;
-                super::metrics::record_route(
-                    VoiceRouteSource::Loopback,
-                    VoiceRouteKind::Loopback,
-                    targets.len(),
-                    started_at.elapsed(),
-                );
+            )
+        }
+        AudioTarget::ServerLoopback => {
+            let targets = [(sender.clone(), AudioContext::Normal)];
+            flush_voice_batch(server, audio, &targets).await;
+            super::metrics::record_route(
+                VoiceRouteSource::Loopback,
+                VoiceRouteKind::Loopback,
+                targets.len(),
+                started_at.elapsed(),
+            );
+            return;
+        }
+        AudioTarget::VoiceTarget(slot) => {
+            let Some(vt) = sender.voice_target(slot) else {
+                return;
+            };
+            if vt.is_empty() {
                 return;
             }
-            AudioTarget::VoiceTarget(slot) => {
-                let Some(vt) = sender.voice_target(slot) else {
-                    return;
-                };
-                if vt.is_empty() {
-                    return;
-                }
-                let resolved_channels =
-                    resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
+            let resolved_channels =
+                resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
 
-                (
-                    target_intent(sender_channel, &vt),
-                    S2S_TARGET_SHOUT,
-                    true,
-                    VoiceRouteKind::Target,
-                    Some(resolved_channels),
-                    Some(vt),
-                )
-            }
-        };
+            (
+                target_intent(sender_channel, &vt),
+                S2S_TARGET_SHOUT,
+                true,
+                VoiceRouteKind::Target,
+                None,
+                Some(resolved_channels),
+                Some(vt),
+            )
+        }
+    };
 
     let default_context = audio_context_from_target_kind(target_kind);
     let authorized_channels = if let (Some(vt), Some(resolved_channels)) =
@@ -1459,6 +1478,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
             sender_id,
             &intent,
             default_context,
+            normal_channel_ids.as_deref(),
             resolved_channels.as_deref(),
             false,
             false,
@@ -1471,7 +1491,8 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         .unwrap_or(true);
     let s2s_target_channels = authorized_channels
         .as_ref()
-        .and_then(AuthorizedVoiceTarget::s2s_channel_ids);
+        .and_then(AuthorizedVoiceTarget::s2s_channel_ids)
+        .or(normal_channel_ids);
     let s2s_intent = match (voice_target.as_ref(), authorized_channels.as_ref()) {
         (Some(vt), Some(target)) => authorized_target_intent(sender_channel, vt, target.channels()),
         _ => intent.clone(),
