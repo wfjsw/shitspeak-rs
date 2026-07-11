@@ -21,6 +21,7 @@ use parking_lot::Mutex as ParkingMutex;
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 use serde::Deserialize;
+use shitspeak_s2s::testing::s2s_network_test_guard;
 
 use crate::acl::ACLPermissions;
 use crate::channels::Channel;
@@ -463,6 +464,24 @@ fn large_tree_shout_cases(
             label: "recursive second production branch",
         });
     }
+    cases.push(LargeTreeShoutCase {
+        slot: 13,
+        target_channel: 0,
+        children: true,
+        links: false,
+        group: None,
+        frame: 1100,
+        label: "whole server",
+    });
+    cases.push(LargeTreeShoutCase {
+        slot: 14,
+        target_channel: 0,
+        children: true,
+        links: true,
+        group: Some("casters"),
+        frame: 1200,
+        label: "caster-only whole server",
+    });
     cases
 }
 
@@ -756,11 +775,13 @@ async fn send_and_assert_large_tree_shout_delivery(
             break;
         }
     }
-    assert!(
-        checked > 0,
-        "{} should leave at least one non-recipient to sample",
-        case.label
-    );
+    if expected.len() < clients.len() {
+        assert!(
+            checked > 0,
+            "{} should leave at least one non-recipient to sample",
+            case.label
+        );
+    }
 }
 
 async fn wait_for_voice_target_installed(
@@ -1793,6 +1814,62 @@ async fn voice_target_to_children_shouts_to_descendants() {
     .await;
 }
 
+#[tokio::test]
+async fn root_children_shout_targets_server_users_once_and_applies_group() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["casters".into()]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    server
+        .server
+        .get_channels()
+        .create_channel(Channel::new(120, "Branch".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+    bob.move_to_channel(120).await;
+    carol.move_to_channel(120).await;
+    listen_to_channel(&bob, 0, "Bob listens to root").await;
+
+    alice
+        .set_voice_target(voice_target(
+            13,
+            vec![voice_target_channel(0, true, true, Some("casters"))],
+        ))
+        .await;
+    alice
+        .send_voice_tcp(13, 44, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+
+    expect_voice_from(&bob, &alice, "group member receives whole-server shout").await;
+    expect_no_voice(
+        &bob,
+        "listener subscription must not duplicate whole-server shout",
+    )
+    .await;
+    expect_no_voice(
+        &carol,
+        "non-group user must not receive grouped whole-server shout",
+    )
+    .await;
+}
+
 /// Checks linked-channel expansion for channel voice targets.
 /// Expected: users in linked channels receive shout audio when `links` is
 /// enabled.
@@ -2249,6 +2326,7 @@ async fn voice_target_group_filter_applies_to_linked_channel_listeners() {
 /// exact, recursive, linked, recursive+linked, and group-filtered settings.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn voice_target_large_root_multi_branch_1000_clients_shout_matrix() {
+    let _guard = s2s_network_test_guard().await;
     let server = spawn_test_server(TestServerOpts {
         max_users: (LARGE_TREE_CLIENTS + 8) as u64,
         client_idle_timeout_secs: LARGE_TREE_AUTHENTICATE_TIMEOUT_MS / 1_000,

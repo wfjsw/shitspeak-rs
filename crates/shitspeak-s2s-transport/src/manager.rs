@@ -1744,7 +1744,7 @@ fn tcp_transport_usable(
 ) -> bool {
     if peer
         .outbound_stream_queue_status(TransportKind::Tcp)
-        .is_some_and(|status| status.full_samples() > 0)
+        .is_some_and(|status| status.full_samples() > 0 && status.depth() > 0)
     {
         return false;
     }
@@ -1844,7 +1844,7 @@ fn deadline_queue_penalty(
     let Some(status) = peer.outbound_stream_queue_status(transport) else {
         return 0;
     };
-    if status.full_samples() > 0 {
+    if status.full_samples() > 0 && status.depth() > 0 {
         return 3;
     }
 
@@ -3041,6 +3041,7 @@ mod tests {
             1024 * 1024,
             true,
         );
+        fill_stream_queue(&peer, TransportKind::Kcp, 1);
 
         let ranked = pick_transports(
             &peer,
@@ -3134,6 +3135,7 @@ mod tests {
             1024 * 1024,
             true,
         );
+        fill_stream_queue(&peer, TransportKind::Kcp, 1);
 
         let ranked = pick_transports(
             &peer,
@@ -3146,6 +3148,30 @@ mod tests {
         );
 
         assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn expiring_high_priority_reuses_drained_stream_after_historical_full_sample() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Kcp]);
+        peer.record_outbound_stream_queue_sample(
+            TransportKind::Kcp,
+            MessageClass::HighPriority,
+            1024 * 1024,
+            1024 * 1024,
+            true,
+        );
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::ReliableLowLatency,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+            0,
+            TransportRoutingPolicy::default(),
+        );
+
+        assert_eq!(ranked, vec![TransportKind::Kcp]);
     }
 
     #[test]

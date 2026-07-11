@@ -1,23 +1,33 @@
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use scc::{Equivalent, HashCache};
+use parking_lot::RwLock;
 
 use super::{ClientInstanceId, client_session_identifier::ClientSessionIdentifier};
 use crate::messages::encoder::AudioContext;
-
-const RESOLVED_CHANNEL_CACHE_MAX_CAPACITY: usize = 256;
-const RESOLVED_RECIPIENT_CACHE_MAX_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct VoiceTarget {
     sessions: Vec<u32>,
     channels: Vec<VoiceTargetChannel>,
-    resolved_channels:
-        Arc<HashCache<ResolvedVoiceTargetChannelCacheKey, Arc<[ResolvedVoiceTargetChannel]>>>,
-    resolved_recipients:
-        Arc<HashCache<ResolvedVoiceTargetRecipientsCacheKey, Arc<[ResolvedVoiceTargetRecipient]>>>,
+    resolved_channels: Arc<
+        RwLock<
+            Option<(
+                ResolvedVoiceTargetChannelCacheKey,
+                Arc<[ResolvedVoiceTargetChannel]>,
+            )>,
+        >,
+    >,
+    authorized_channels:
+        Arc<RwLock<Option<(AuthorizedVoiceTargetChannelCacheKey, AuthorizedVoiceTarget)>>>,
+    resolved_recipients: Arc<
+        RwLock<
+            Option<(
+                ResolvedVoiceTargetRecipientsCacheKey,
+                Arc<[ResolvedVoiceTargetRecipient]>,
+            )>,
+        >,
+    >,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -40,6 +50,7 @@ struct ResolvedVoiceTargetRecipientsCacheKey {
     channel_version: u64,
     channel_acl_generation: u64,
     client_version: u64,
+    sender_acl_generation: u64,
     hide_users_without_traverse: bool,
     source_channel: u32,
 }
@@ -50,7 +61,17 @@ struct ResolvedVoiceTargetRecipientsCacheLookupKey<'a> {
     channel_version: u64,
     channel_acl_generation: u64,
     client_version: u64,
+    sender_acl_generation: u64,
     hide_users_without_traverse: bool,
+    source_channel: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthorizedVoiceTargetChannelCacheKey {
+    server_id: String,
+    channel_version: u64,
+    channel_acl_generation: u64,
+    sender_acl_generation: u64,
     source_channel: u32,
 }
 
@@ -91,8 +112,43 @@ pub struct ResolvedVoiceTargetChannel {
     id: u32,
     group: String,
     current_channel_talk: bool,
+    whole_server: bool,
+    authorized: bool,
     channel_ids: Arc<[u32]>,
     channel_id_set: Arc<HashSet<u32>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthorizedVoiceTarget {
+    channels: Arc<[ResolvedVoiceTargetChannel]>,
+    s2s_channel_ids: Option<Arc<[u32]>>,
+    has_authorized_target: bool,
+}
+
+impl AuthorizedVoiceTarget {
+    pub fn new(
+        channels: Arc<[ResolvedVoiceTargetChannel]>,
+        s2s_channel_ids: Option<Arc<[u32]>>,
+        has_authorized_target: bool,
+    ) -> Self {
+        Self {
+            channels,
+            s2s_channel_ids,
+            has_authorized_target,
+        }
+    }
+
+    pub fn channels(&self) -> &[ResolvedVoiceTargetChannel] {
+        &self.channels
+    }
+
+    pub fn s2s_channel_ids(&self) -> Option<Arc<[u32]>> {
+        self.s2s_channel_ids.clone()
+    }
+
+    pub fn has_authorized_target(&self) -> bool {
+        self.has_authorized_target
+    }
 }
 
 impl ResolvedVoiceTargetChannel {
@@ -102,8 +158,34 @@ impl ResolvedVoiceTargetChannel {
             id,
             group,
             current_channel_talk,
+            whole_server: false,
+            authorized: true,
             channel_ids: Arc::from(channel_ids),
             channel_id_set: Arc::new(channel_id_set),
+        }
+    }
+
+    pub fn whole_server(group: String) -> Self {
+        Self {
+            id: 0,
+            group,
+            current_channel_talk: false,
+            whole_server: true,
+            authorized: true,
+            channel_ids: Arc::from([]),
+            channel_id_set: Arc::new(HashSet::new()),
+        }
+    }
+
+    pub fn denied_like(channel: &Self) -> Self {
+        Self {
+            id: channel.id,
+            group: channel.group.clone(),
+            current_channel_talk: channel.current_channel_talk,
+            whole_server: channel.whole_server,
+            authorized: false,
+            channel_ids: Arc::from([]),
+            channel_id_set: Arc::new(HashSet::new()),
         }
     }
 
@@ -117,6 +199,14 @@ impl ResolvedVoiceTargetChannel {
 
     pub fn current_channel_talk(&self) -> bool {
         self.current_channel_talk
+    }
+
+    pub fn is_whole_server(&self) -> bool {
+        self.whole_server
+    }
+
+    pub fn is_authorized(&self) -> bool {
+        self.authorized
     }
 
     pub fn channel_ids(&self) -> &[u32] {
@@ -166,14 +256,9 @@ impl Default for VoiceTarget {
         Self {
             sessions: Vec::new(),
             channels: Vec::new(),
-            resolved_channels: Arc::new(HashCache::with_capacity(
-                0,
-                RESOLVED_CHANNEL_CACHE_MAX_CAPACITY,
-            )),
-            resolved_recipients: Arc::new(HashCache::with_capacity(
-                0,
-                RESOLVED_RECIPIENT_CACHE_MAX_CAPACITY,
-            )),
+            resolved_channels: Arc::new(RwLock::new(None)),
+            authorized_channels: Arc::new(RwLock::new(None)),
+            resolved_recipients: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -209,14 +294,16 @@ impl VoiceTarget {
         channel_version: u64,
         source_channel: u32,
     ) -> Option<Arc<[ResolvedVoiceTargetChannel]>> {
-        self.resolved_channels.read_sync(
-            &ResolvedVoiceTargetChannelCacheLookupKey {
-                server_id,
-                channel_version,
-                source_channel,
-            },
-            |_, channels| channels.clone(),
-        )
+        let lookup = ResolvedVoiceTargetChannelCacheLookupKey {
+            server_id,
+            channel_version,
+            source_channel,
+        };
+        self.resolved_channels
+            .read()
+            .as_ref()
+            .filter(|(key, _)| lookup.matches(key))
+            .map(|(_, channels)| channels.clone())
     }
 
     pub fn store_resolved_channels(
@@ -226,13 +313,52 @@ impl VoiceTarget {
         source_channel: u32,
         channels: Arc<[ResolvedVoiceTargetChannel]>,
     ) {
-        self.resolved_channels
-            .entry_sync(ResolvedVoiceTargetChannelCacheKey::new(
-                server_id,
+        *self.resolved_channels.write() = Some((
+            ResolvedVoiceTargetChannelCacheKey::new(server_id, channel_version, source_channel),
+            channels,
+        ));
+    }
+
+    pub fn cached_authorized_target(
+        &self,
+        server_id: &str,
+        channel_version: u64,
+        channel_acl_generation: u64,
+        sender_acl_generation: u64,
+        source_channel: u32,
+    ) -> Option<AuthorizedVoiceTarget> {
+        self.authorized_channels
+            .read()
+            .as_ref()
+            .filter(|(key, _)| {
+                key.server_id == server_id
+                    && key.channel_version == channel_version
+                    && key.channel_acl_generation == channel_acl_generation
+                    && key.sender_acl_generation == sender_acl_generation
+                    && key.source_channel == source_channel
+            })
+            .map(|(_, target)| target.clone())
+    }
+
+    pub fn store_authorized_target(
+        &self,
+        server_id: &str,
+        channel_version: u64,
+        channel_acl_generation: u64,
+        sender_acl_generation: u64,
+        source_channel: u32,
+        target: AuthorizedVoiceTarget,
+    ) {
+        *self.authorized_channels.write() = Some((
+            AuthorizedVoiceTargetChannelCacheKey {
+                server_id: server_id.to_owned(),
                 channel_version,
+                channel_acl_generation,
+                sender_acl_generation,
                 source_channel,
-            ))
-            .put_entry(channels);
+            },
+            target,
+        ));
     }
 
     pub fn cached_resolved_recipients(
@@ -241,20 +367,24 @@ impl VoiceTarget {
         channel_version: u64,
         channel_acl_generation: u64,
         client_version: u64,
+        sender_acl_generation: u64,
         hide_users_without_traverse: bool,
         source_channel: u32,
     ) -> Option<Arc<[ResolvedVoiceTargetRecipient]>> {
-        self.resolved_recipients.read_sync(
-            &ResolvedVoiceTargetRecipientsCacheLookupKey {
-                server_id,
-                channel_version,
-                channel_acl_generation,
-                client_version,
-                hide_users_without_traverse,
-                source_channel,
-            },
-            |_, recipients| recipients.clone(),
-        )
+        let lookup = ResolvedVoiceTargetRecipientsCacheLookupKey {
+            server_id,
+            channel_version,
+            channel_acl_generation,
+            client_version,
+            sender_acl_generation,
+            hide_users_without_traverse,
+            source_channel,
+        };
+        self.resolved_recipients
+            .read()
+            .as_ref()
+            .filter(|(key, _)| lookup.matches(key))
+            .map(|(_, recipients)| recipients.clone())
     }
 
     pub fn store_resolved_recipients(
@@ -263,27 +393,31 @@ impl VoiceTarget {
         channel_version: u64,
         channel_acl_generation: u64,
         client_version: u64,
+        sender_acl_generation: u64,
         hide_users_without_traverse: bool,
         source_channel: u32,
         recipients: Arc<[ResolvedVoiceTargetRecipient]>,
     ) {
-        self.resolved_recipients
-            .entry_sync(ResolvedVoiceTargetRecipientsCacheKey::new(
+        *self.resolved_recipients.write() = Some((
+            ResolvedVoiceTargetRecipientsCacheKey::new(
                 server_id,
                 channel_version,
                 channel_acl_generation,
                 client_version,
+                sender_acl_generation,
                 hide_users_without_traverse,
                 source_channel,
-            ))
-            .put_entry(recipients);
+            ),
+            recipients,
+        ));
     }
 
     pub fn clear(&mut self) {
         self.sessions.clear();
         self.channels.clear();
-        self.resolved_channels.clear_sync();
-        self.resolved_recipients.clear_sync();
+        *self.resolved_channels.write() = None;
+        *self.authorized_channels.write() = None;
+        *self.resolved_recipients.write() = None;
     }
 }
 
@@ -303,6 +437,7 @@ impl ResolvedVoiceTargetRecipientsCacheKey {
         channel_version: u64,
         channel_acl_generation: u64,
         client_version: u64,
+        sender_acl_generation: u64,
         hide_users_without_traverse: bool,
         source_channel: u32,
     ) -> Self {
@@ -311,51 +446,30 @@ impl ResolvedVoiceTargetRecipientsCacheKey {
             channel_version,
             channel_acl_generation,
             client_version,
+            sender_acl_generation,
             hide_users_without_traverse,
             source_channel,
         }
     }
 }
 
-impl Equivalent<ResolvedVoiceTargetChannelCacheKey>
-    for ResolvedVoiceTargetChannelCacheLookupKey<'_>
-{
-    fn equivalent(&self, key: &ResolvedVoiceTargetChannelCacheKey) -> bool {
+impl ResolvedVoiceTargetChannelCacheLookupKey<'_> {
+    fn matches(&self, key: &ResolvedVoiceTargetChannelCacheKey) -> bool {
         self.server_id == key.server_id
             && self.channel_version == key.channel_version
             && self.source_channel == key.source_channel
     }
 }
 
-impl Hash for ResolvedVoiceTargetChannelCacheLookupKey<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.server_id.hash(state);
-        self.channel_version.hash(state);
-        self.source_channel.hash(state);
-    }
-}
-
-impl Equivalent<ResolvedVoiceTargetRecipientsCacheKey>
-    for ResolvedVoiceTargetRecipientsCacheLookupKey<'_>
-{
-    fn equivalent(&self, key: &ResolvedVoiceTargetRecipientsCacheKey) -> bool {
+impl ResolvedVoiceTargetRecipientsCacheLookupKey<'_> {
+    fn matches(&self, key: &ResolvedVoiceTargetRecipientsCacheKey) -> bool {
         self.server_id == key.server_id
             && self.channel_version == key.channel_version
             && self.channel_acl_generation == key.channel_acl_generation
             && self.client_version == key.client_version
+            && self.sender_acl_generation == key.sender_acl_generation
             && self.hide_users_without_traverse == key.hide_users_without_traverse
             && self.source_channel == key.source_channel
-    }
-}
-
-impl Hash for ResolvedVoiceTargetRecipientsCacheLookupKey<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.server_id.hash(state);
-        self.channel_version.hash(state);
-        self.channel_acl_generation.hash(state);
-        self.client_version.hash(state);
-        self.hide_users_without_traverse.hash(state);
-        self.source_channel.hash(state);
     }
 }
 
@@ -409,36 +523,36 @@ mod tests {
                 AudioContext::Shout,
             )]);
 
-        target.store_resolved_recipients("default", 1, 2, 3, false, 10, recipients.clone());
+        target.store_resolved_recipients("default", 1, 2, 3, 4, false, 10, recipients.clone());
 
         assert!(
             target
-                .cached_resolved_recipients("default", 1, 2, 3, false, 10)
+                .cached_resolved_recipients("default", 1, 2, 3, 4, false, 10)
                 .is_some()
         );
         assert!(
             target
-                .cached_resolved_recipients("default", 2, 2, 3, false, 10)
+                .cached_resolved_recipients("default", 2, 2, 3, 4, false, 10)
                 .is_none()
         );
         assert!(
             target
-                .cached_resolved_recipients("default", 1, 3, 3, false, 10)
+                .cached_resolved_recipients("default", 1, 3, 3, 4, false, 10)
                 .is_none()
         );
         assert!(
             target
-                .cached_resolved_recipients("default", 1, 2, 4, false, 10)
+                .cached_resolved_recipients("default", 1, 2, 4, 4, false, 10)
                 .is_none()
         );
         assert!(
             target
-                .cached_resolved_recipients("default", 1, 2, 3, true, 10)
+                .cached_resolved_recipients("default", 1, 2, 3, 4, true, 10)
                 .is_none()
         );
         assert!(
             target
-                .cached_resolved_recipients("default", 1, 2, 3, false, 11)
+                .cached_resolved_recipients("default", 1, 2, 3, 4, false, 11)
                 .is_none()
         );
     }
@@ -453,32 +567,43 @@ mod tests {
                 AudioContext::Whisper,
             )]);
 
-        target.store_resolved_recipients("default", 1, 2, 3, false, 10, recipients);
+        target.store_resolved_recipients("default", 1, 2, 3, 4, false, 10, recipients);
 
         assert!(
             target
-                .cached_resolved_recipients("default", 1, 2, 3, false, 10)
+                .cached_resolved_recipients("default", 1, 2, 3, 4, false, 10)
                 .is_some()
         );
         target.clear();
         assert!(
             target
-                .cached_resolved_recipients("default", 1, 2, 3, false, 10)
+                .cached_resolved_recipients("default", 1, 2, 3, 4, false, 10)
                 .is_none()
         );
     }
 
     #[test]
-    fn voice_target_cache_has_bounded_capacity() {
+    fn voice_target_cache_retains_only_latest_entry() {
         let target = VoiceTarget::new();
+        let first: Arc<[ResolvedVoiceTargetChannel]> =
+            Arc::from([ResolvedVoiceTargetChannel::new(
+                10,
+                String::new(),
+                false,
+                vec![10],
+            )]);
+        let second: Arc<[ResolvedVoiceTargetChannel]> =
+            Arc::from([ResolvedVoiceTargetChannel::new(
+                20,
+                String::new(),
+                false,
+                vec![20],
+            )]);
 
-        assert_eq!(
-            *target.resolved_channels.capacity_range().end(),
-            RESOLVED_CHANNEL_CACHE_MAX_CAPACITY.next_power_of_two()
-        );
-        assert_eq!(
-            *target.resolved_recipients.capacity_range().end(),
-            RESOLVED_RECIPIENT_CACHE_MAX_CAPACITY.next_power_of_two()
-        );
+        target.store_resolved_channels("default", 1, 10, first);
+        target.store_resolved_channels("default", 2, 20, second);
+
+        assert!(target.cached_resolved_channels("default", 1, 10).is_none());
+        assert!(target.cached_resolved_channels("default", 2, 20).is_some());
     }
 }

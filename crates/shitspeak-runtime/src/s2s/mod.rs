@@ -34,7 +34,9 @@ use shitspeak_s2s::application::proto::{
     ModerationCommand, ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope,
     UserRemovePatch, UserStatePatch, UserStatsReply, VoiceFrame, VoiceIntent,
 };
-use shitspeak_s2s::application::voice::{AudioSink, RecipientIndex, RecipientIndexSnapshot};
+use shitspeak_s2s::application::voice::{
+    AudioSink, RecipientIndex, RecipientIndexSnapshot, RecipientIndexUpdate,
+};
 use shitspeak_s2s::overlay as s2s_overlay;
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::replications as s2s_replications;
@@ -190,7 +192,7 @@ enum NativeToS2SCommand {
         respond: oneshot::Sender<bool>,
     },
     ProposeClientReplication(ClientStateLogEntry),
-    RefreshVoiceRecipientIndex(RecipientIndexSnapshot),
+    RefreshVoiceRecipientIndex(RecipientIndexUpdate),
     DispatchPluginData {
         owner: NodeIdentifier,
         envelope: PluginDataEnvelope,
@@ -221,7 +223,7 @@ enum NativeToS2SCommand {
     SendVoiceForTargetChannels {
         sender_session: u32,
         server_id: String,
-        target_channels: Vec<u32>,
+        target_channels: Arc<[u32]>,
         target_kind: u32,
         is_terminator: bool,
         payload: Bytes,
@@ -339,8 +341,9 @@ fn estimate_client_replication_entry(entry: &ClientStateLogEntry) -> usize {
     )
 }
 
-fn estimate_recipient_index_snapshot(snapshot: &RecipientIndexSnapshot) -> usize {
-    snapshot
+fn estimate_recipient_index_snapshot(update: &RecipientIndexUpdate) -> usize {
+    update
+        .snapshot()
         .iter()
         .map(|(key, nodes)| {
             S2S_GATEWAY_COMMAND_OVERHEAD_BYTES
@@ -353,6 +356,19 @@ fn estimate_recipient_index_snapshot(snapshot: &RecipientIndexSnapshot) -> usize
                 )
         })
         .sum::<usize>()
+        .saturating_add(
+            update
+                .complete_servers()
+                .iter()
+                .map(String::len)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            update
+                .covered_nodes()
+                .len()
+                .saturating_mul(std::mem::size_of::<NodeIdentifier>()),
+        )
         .max(S2S_GATEWAY_COMMAND_OVERHEAD_BYTES)
 }
 
@@ -1538,7 +1554,7 @@ impl S2SManager {
         &self,
         sender_session: u32,
         server_id: String,
-        target_channels: Vec<u32>,
+        target_channels: Arc<[u32]>,
         target_kind: u32,
         is_terminator: bool,
         payload: Bytes,
@@ -2094,6 +2110,7 @@ impl S2SManager {
             bridge_tasks.push(spawn_native_voice_recipient_index_bridge(
                 native_runtime,
                 server.get_clients().clone(),
+                server.get_channels().clone(),
                 s2s_tx.clone(),
                 shutdown,
             ));
@@ -2258,12 +2275,13 @@ fn spawn_native_client_replication_bridge(
 fn spawn_native_voice_recipient_index_bridge(
     runtime: &tokio::runtime::Handle,
     repo: Arc<ClientRepository>,
+    channels: Arc<ChannelRepository>,
     tx: S2SGatewayTx,
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     let mut rx = repo.subscribe();
     runtime.spawn(async move {
-        enqueue_voice_recipient_index_snapshot(&repo, &tx).await;
+        enqueue_voice_recipient_index_snapshot(&repo, &channels, &tx).await;
         let mut dirty = false;
         let mut refresh = tokio::time::interval(VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL);
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2273,7 +2291,7 @@ fn spawn_native_voice_recipient_index_bridge(
                 _ = shutdown.changed() => return,
                 _ = refresh.tick(), if dirty => {
                     dirty = false;
-                    enqueue_voice_recipient_index_snapshot(&repo, &tx).await;
+                    enqueue_voice_recipient_index_snapshot(&repo, &channels, &tx).await;
                 }
                 payload = rx.recv() => {
                     match payload {
@@ -2295,26 +2313,20 @@ fn spawn_native_voice_recipient_index_bridge(
 }
 
 fn client_entry_affects_voice_recipient_index(entry: &ClientStateLogEntry) -> bool {
-    match &entry.op {
-        ClientStateOperation::AddClient { .. } | ClientStateOperation::RemoveClient { .. } => true,
-        ClientStateOperation::UpdateGlobalState { delta, .. } => {
-            delta.current_channel_id.is_some()
-                || delta
-                    .listening_channel_add
-                    .as_ref()
-                    .is_some_and(|channels| !channels.is_empty())
-                || delta
-                    .listening_channel_remove
-                    .as_ref()
-                    .is_some_and(|channels| !channels.is_empty())
-        }
-        ClientStateOperation::ResetNode { .. } => true,
-    }
+    entry.op.affects_voice_routing()
 }
 
-async fn enqueue_voice_recipient_index_snapshot(repo: &Arc<ClientRepository>, tx: &S2SGatewayTx) {
+async fn enqueue_voice_recipient_index_snapshot(
+    repo: &Arc<ClientRepository>,
+    channels: &Arc<ChannelRepository>,
+    tx: &S2SGatewayTx,
+) {
     let snapshot = repo.voice_recipient_index_snapshot().await;
-    if !tx.try_send_coalesced(NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot)) {
+    let (_, versions) = repo.snapshot_with_versions().await;
+    let complete_servers = channels.known_server_ids().into_iter().collect();
+    let covered_nodes = versions.keys().copied().collect();
+    let update = RecipientIndexUpdate::new(snapshot, complete_servers, covered_nodes);
+    if !tx.try_send_coalesced(NativeToS2SCommand::RefreshVoiceRecipientIndex(update)) {
         warn!("s2s voice recipient index gateway full; dropping snapshot");
     }
 }
@@ -2530,7 +2542,7 @@ async fn run_s2s_voice_command(
                 .send_for_target_channels(
                     sender_session,
                     server_id,
-                    &target_channels,
+                    target_channels,
                     target_kind,
                     is_terminator,
                     payload,
@@ -2579,8 +2591,8 @@ async fn run_s2s_coalesced_gateway(
 ) {
     while let Some(command) = rx.recv().await {
         match command {
-            NativeToS2SCommand::RefreshVoiceRecipientIndex(snapshot) => {
-                recipient_index.replace_all(snapshot);
+            NativeToS2SCommand::RefreshVoiceRecipientIndex(update) => {
+                recipient_index.replace_all_complete(update);
             }
             other => {
                 warn!(

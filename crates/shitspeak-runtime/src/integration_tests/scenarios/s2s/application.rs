@@ -81,6 +81,9 @@ async fn two_node_voice_passthrough_in_order() {
             )
             .await
             .expect("send_broadcast");
+        if !is_terminator {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     let ok = wait_until(Duration::from_secs(8), || sink_b.len() as u64 == N_FRAMES).await;
@@ -197,10 +200,10 @@ async fn three_node_voice_unicast_learns_direct_connection() {
 }
 
 /// Checks targeted voice over a forced routed line topology.
-/// Expected: B receives A's frame while forwarding it to C, even though
-/// B is not listed as an overlay destination.
+/// Expected: B forwards A's frame to C without rendering it locally because
+/// B is not listed as an overlay destination and transit processing is off.
 #[tokio::test]
-async fn three_node_voice_unicast_delivers_to_transit_node_when_direct_blocked() {
+async fn three_node_voice_unicast_forwards_without_transit_delivery_when_direct_blocked() {
     let cluster = Cluster::build(&[1, 2, 3], line_seeds).await;
     let a = cluster.node(1);
     let b = cluster.node(2);
@@ -259,26 +262,26 @@ async fn three_node_voice_unicast_delivers_to_transit_node_when_direct_blocked()
         .await
         .expect("send_unicast");
 
-    let ok = wait_until(Duration::from_secs(8), || {
-        sink_b.len() == 1 && sink_c.len() == 1
-    })
-    .await;
+    let ok = wait_until(Duration::from_secs(8), || sink_c.len() == 1).await;
     assert!(
         ok,
-        "expected B transit and C destination sinks to receive one frame; got B={}, C={}",
+        "expected C destination sink to receive one frame through B; got B={}, C={}",
         sink_b.len(),
         sink_c.len()
     );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        sink_b.len(),
+        0,
+        "B should forward the unicast frame without rendering it locally"
+    );
 
-    let b_received = sink_b.snapshot();
     let c_received = sink_c.snapshot();
-    for (label, received) in [("B", &b_received), ("C", &c_received)] {
-        let (from, frame) = &received[0];
-        assert_eq!(*from, 1, "{label} should see original voice sender A");
-        assert_eq!(frame.sender_session, 0xABC_12345);
-        assert_eq!(frame.target_kind, 0);
-        assert_eq!(frame.payload, b"line-frame".as_ref());
-    }
+    let (from, frame) = &c_received[0];
+    assert_eq!(*from, 1, "C should see original voice sender A");
+    assert_eq!(frame.sender_session, 0xABC_12345);
+    assert_eq!(frame.target_kind, 0);
+    assert_eq!(frame.payload, b"line-frame".as_ref());
 
     app_a.shutdown().await;
     app_b.shutdown().await;

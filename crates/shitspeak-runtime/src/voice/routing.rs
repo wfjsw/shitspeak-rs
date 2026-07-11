@@ -13,7 +13,8 @@ use tracing::Instrument;
 use super::codec::{self, Audio, PacketFormat};
 use super::metrics::{
     VoiceAgeStage, VoiceDispatchMode, VoiceEgressResult, VoiceEgressTransport, VoicePipelinePath,
-    VoicePipelineStage, VoiceRouteKind, VoiceRouteSource, VoiceSchedulerStage, VoiceUdpSendResult,
+    VoicePipelineStage, VoiceRouteCacheLayer, VoiceRouteKind, VoiceRouteScope, VoiceRouteSource,
+    VoiceSchedulerStage, VoiceUdpSendResult,
 };
 use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, DatagramBatch};
@@ -22,7 +23,10 @@ use crate::{
         Client, ClientInstanceId,
         client_session_identifier::ClientSessionIdentifier,
         crypt::CryptState,
-        voice_target::{ResolvedVoiceTargetChannel, ResolvedVoiceTargetRecipient, VoiceTarget},
+        voice_target::{
+            AuthorizedVoiceTarget, ResolvedVoiceTargetChannel, ResolvedVoiceTargetRecipient,
+            VoiceTarget,
+        },
     },
     constants::PROTOBUF_INTRODUCED_VERSION,
     messages::encoder::{Audio as AudioWire, AudioContext, AudioHeader, AudioTarget},
@@ -140,7 +144,8 @@ struct S2SVoiceTargetResolutionCacheKey {
     sender_instance_id: Option<ClientInstanceId>,
     channel_version: u64,
     channel_acl_generation: u64,
-    client_version: u64,
+    voice_routing_generation: u64,
+    sender_acl_generation: Option<u64>,
     hide_users_without_traverse: bool,
     source_channel: u32,
     sessions: Vec<u32>,
@@ -156,7 +161,8 @@ struct S2SVoiceNormalResolutionCacheKey {
     sender_instance_id: Option<ClientInstanceId>,
     channel_version: u64,
     channel_acl_generation: u64,
-    client_version: u64,
+    voice_routing_generation: u64,
+    sender_acl_generation: u64,
     hide_users_without_traverse: bool,
     source_channel: u32,
 }
@@ -310,15 +316,67 @@ fn target_intent(
     }
 }
 
-fn voice_target_is_current_channel_or_links(vt: &VoiceTarget, source_channel: u32) -> bool {
-    if !vt.sessions().is_empty() || vt.channels().len() != 1 {
-        return false;
+fn authorized_target_intent(
+    source_channel: u32,
+    vt: &VoiceTarget,
+    authorized_channels: &[ResolvedVoiceTargetChannel],
+) -> VoiceIntent {
+    VoiceIntent {
+        kind: Some(VoiceIntentKind::Target(VoiceIntentTarget {
+            source_channel,
+            sessions: vt.sessions().to_vec(),
+            channels: vt
+                .channels()
+                .iter()
+                .zip(authorized_channels)
+                .filter(|(_, resolved)| resolved.is_authorized())
+                .map(|(channel, _)| S2SVoiceTargetChannel {
+                    id: channel.id(),
+                    children: channel.sub_channels(),
+                    links: channel.links(),
+                    group: channel.only_group().to_owned(),
+                })
+                .collect(),
+        })),
     }
+}
 
-    let channel = &vt.channels()[0];
-    channel.id() == source_channel
-        && !channel.sub_channels()
-        && channel.only_group().trim().is_empty()
+fn s2s_target_channels(
+    vt: &VoiceTarget,
+    authorized_channels: &[ResolvedVoiceTargetChannel],
+) -> Option<Arc<[u32]>> {
+    if authorized_channels
+        .iter()
+        .any(|channel| channel.is_authorized() && channel.is_whole_server())
+    {
+        return Some(Arc::from([]));
+    }
+    if !vt.sessions().is_empty() {
+        return None;
+    }
+    let mut channel_ids = authorized_channels
+        .iter()
+        .filter(|channel| channel.is_authorized())
+        .flat_map(|channel| channel.channel_ids().iter().copied())
+        .collect::<Vec<_>>();
+    channel_ids.sort_unstable();
+    channel_ids.dedup();
+    (!channel_ids.is_empty()).then(|| Arc::from(channel_ids))
+}
+
+fn voice_intent_scope(intent: &VoiceIntent) -> VoiceRouteScope {
+    match intent.kind.as_ref() {
+        Some(VoiceIntentKind::Target(target))
+            if target
+                .channels
+                .iter()
+                .any(|channel| channel.id == 0 && channel.children) =>
+        {
+            VoiceRouteScope::WholeServer
+        }
+        Some(VoiceIntentKind::Target(_)) => VoiceRouteScope::TargetChannel,
+        Some(VoiceIntentKind::Normal(_)) | None => VoiceRouteScope::Normal,
+    }
 }
 
 fn audio_context_from_target_kind(target_kind: u32) -> AudioContext {
@@ -484,6 +542,8 @@ async fn resolve_voice_intent(
         intent,
         default_context,
         None,
+        false,
+        true,
     )
     .await
 }
@@ -508,7 +568,10 @@ fn s2s_target_resolution_cache_key(
         sender_instance_id: sender.map(|sender| sender.client_instance_id()),
         channel_version: server.get_channels().current_version_in_server(server_id),
         channel_acl_generation: server.get_channels().channel_acl_generation(),
-        client_version: server.get_clients().current_version_in_server(server_id),
+        voice_routing_generation: server
+            .get_clients()
+            .voice_routing_generation_in_server(server_id),
+        sender_acl_generation: sender.map(|sender| sender.get_acl_generation()),
         hide_users_without_traverse: server.get_hide_users_without_traverse(),
         source_channel: target.source_channel,
         sessions: target.sessions.clone(),
@@ -546,7 +609,10 @@ fn s2s_normal_resolution_cache_key(
         sender_instance_id: Some(sender.client_instance_id()),
         channel_version: server.get_channels().current_version_in_server(server_id),
         channel_acl_generation: server.get_channels().channel_acl_generation(),
-        client_version: server.get_clients().current_version_in_server(server_id),
+        voice_routing_generation: server
+            .get_clients()
+            .voice_routing_generation_in_server(server_id),
+        sender_acl_generation: sender.get_acl_generation(),
         hide_users_without_traverse: server.get_hide_users_without_traverse(),
         source_channel: normal.source_channel,
     })
@@ -566,8 +632,18 @@ async fn resolve_s2s_voice_intent(
         if let Some(recipients) =
             S2S_TARGET_RECIPIENT_CACHE.read(&cache_key, |_, recipients| recipients.clone())
         {
+            super::metrics::record_route_cache(
+                VoiceRouteSource::S2s,
+                VoiceRouteCacheLayer::Recipients,
+                true,
+            );
             return live_targets_from_cached_recipients(server, server_id, &recipients).await;
         }
+        super::metrics::record_route_cache(
+            VoiceRouteSource::S2s,
+            VoiceRouteCacheLayer::Recipients,
+            false,
+        );
 
         let targets = resolve_voice_intent(
             server,
@@ -588,8 +664,18 @@ async fn resolve_s2s_voice_intent(
         if let Some(recipients) =
             S2S_NORMAL_RECIPIENT_CACHE.read(&cache_key, |_, recipients| recipients.clone())
         {
+            super::metrics::record_route_cache(
+                VoiceRouteSource::S2s,
+                VoiceRouteCacheLayer::Recipients,
+                true,
+            );
             return live_targets_from_cached_recipients(server, server_id, &recipients).await;
         }
+        super::metrics::record_route_cache(
+            VoiceRouteSource::S2s,
+            VoiceRouteCacheLayer::Recipients,
+            false,
+        );
 
         let targets = resolve_voice_intent(
             server,
@@ -623,6 +709,8 @@ async fn resolve_voice_intent_with_resolved_channels(
     intent: &VoiceIntent,
     default_context: AudioContext,
     resolved_channels: Option<&[ResolvedVoiceTargetChannel]>,
+    preauthorized_channels: bool,
+    preauthorized_whole_server: bool,
 ) -> Vec<(Arc<Box<Client>>, AudioContext)> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
@@ -768,30 +856,94 @@ async fn resolve_voice_intent_with_resolved_channels(
                     .await;
                     &owned_resolved_channel
                 };
+                if !resolved_channel.is_authorized() {
+                    continue;
+                }
+                if resolved_channel.is_whole_server() {
+                    let allowed = if preauthorized_channels || preauthorized_whole_server {
+                        true
+                    } else if let Some(sender) = sender {
+                        let permissions =
+                            crate::client::acl::compute_permissions_for_client(server, sender, 0)
+                                .await;
+                        if target.source_channel == 0 {
+                            permissions.contains(crate::acl::ACLPermissions::Speak)
+                        } else {
+                            permissions.contains(crate::acl::ACLPermissions::Whisper)
+                        }
+                    } else {
+                        true
+                    };
+                    if !allowed {
+                        continue;
+                    }
+
+                    let clients = server
+                        .get_clients()
+                        .get_local_clients_in_server(server_id)
+                        .await;
+                    for client in clients {
+                        let evaluation_channel = client.get_current_channel_id();
+                        if !client_matches_voice_target_group(
+                            server,
+                            &client,
+                            server_id,
+                            evaluation_channel,
+                            resolved_channel.group(),
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        if let Some(sender) = sender {
+                            if !crate::client::visibility::can_view_user(server, &client, sender)
+                                .await
+                            {
+                                continue;
+                            }
+                        }
+                        push_unique_target(
+                            &mut targets,
+                            &mut seen,
+                            sender_id,
+                            sender_instance_id,
+                            client,
+                            AudioContext::Shout,
+                        );
+                    }
+                    continue;
+                }
+
                 let mut channel_ids = resolved_channel.channel_ids().to_vec();
 
                 if let Some(sender) = sender {
-                    let mut allowed_channels = Vec::new();
-                    let mut allowed_channel_set = HashSet::new();
-                    let source_channel = target.source_channel;
-                    for channel_id in channel_ids {
-                        let perms = crate::client::acl::compute_permissions_for_client(
-                            server, sender, channel_id,
+                    let (allowed_channels, allowed_channel_set) = if preauthorized_channels {
+                        (
+                            channel_ids,
+                            resolved_channel.channel_ids().iter().copied().collect(),
                         )
-                        .await;
-                        let allowed = if resolved_channel.current_channel_talk()
-                            && channel_id == source_channel
-                        {
-                            perms.contains(crate::acl::ACLPermissions::Speak)
-                        } else {
-                            perms.contains(crate::acl::ACLPermissions::Whisper)
-                        };
-                        if allowed {
-                            if allowed_channel_set.insert(channel_id) {
+                    } else {
+                        let mut allowed_channels = Vec::new();
+                        let mut allowed_channel_set = HashSet::new();
+                        let source_channel = target.source_channel;
+                        for channel_id in channel_ids {
+                            let perms = crate::client::acl::compute_permissions_for_client(
+                                server, sender, channel_id,
+                            )
+                            .await;
+                            let allowed = if resolved_channel.current_channel_talk()
+                                && channel_id == source_channel
+                            {
+                                perms.contains(crate::acl::ACLPermissions::Speak)
+                            } else {
+                                perms.contains(crate::acl::ACLPermissions::Whisper)
+                            };
+                            if allowed && allowed_channel_set.insert(channel_id) {
                                 allowed_channels.push(channel_id);
                             }
                         }
-                    }
+                        (allowed_channels, allowed_channel_set)
+                    };
                     channel_ids = allowed_channels;
                     if channel_ids.is_empty() {
                         continue;
@@ -831,37 +983,34 @@ async fn resolve_voice_intent_with_resolved_channels(
                         );
                     }
 
-                    for channel_id in &channel_ids {
-                        let channel_listeners = server
-                            .get_clients()
-                            .get_local_listeners_for_channel_in_server(server_id, *channel_id)
-                            .await;
-                        for client in channel_listeners {
-                            if !client_matches_voice_target_group(
-                                server,
-                                &client,
-                                server_id,
-                                *channel_id,
-                                resolved_channel.group(),
-                            )
-                            .await
-                            {
-                                continue;
-                            }
-                            if !crate::client::visibility::can_view_user(server, &client, sender)
-                                .await
-                            {
-                                continue;
-                            }
-                            push_unique_target(
-                                &mut targets,
-                                &mut seen,
-                                sender_id,
-                                sender_instance_id,
-                                client,
-                                AudioContext::Listen,
-                            );
+                    let listener_entries = server
+                        .get_clients()
+                        .get_local_listener_entries_for_channels_in_server(server_id, &channel_ids)
+                        .await;
+                    for (channel_id, client) in listener_entries {
+                        if !client_matches_voice_target_group(
+                            server,
+                            &client,
+                            server_id,
+                            channel_id,
+                            resolved_channel.group(),
+                        )
+                        .await
+                        {
+                            continue;
                         }
+                        if !crate::client::visibility::can_view_user(server, &client, sender).await
+                        {
+                            continue;
+                        }
+                        push_unique_target(
+                            &mut targets,
+                            &mut seen,
+                            sender_id,
+                            sender_instance_id,
+                            client,
+                            AudioContext::Listen,
+                        );
                     }
                     continue;
                 }
@@ -905,39 +1054,36 @@ async fn resolve_voice_intent_with_resolved_channels(
                     );
                 }
 
-                for channel_id in &channel_ids {
-                    let channel_listeners = server
-                        .get_clients()
-                        .get_local_listeners_for_channel_in_server(server_id, *channel_id)
-                        .await;
-                    for client in channel_listeners {
-                        if !client_matches_voice_target_group(
-                            server,
-                            &client,
-                            server_id,
-                            *channel_id,
-                            resolved_channel.group(),
-                        )
-                        .await
+                let listener_entries = server
+                    .get_clients()
+                    .get_local_listener_entries_for_channels_in_server(server_id, &channel_ids)
+                    .await;
+                for (channel_id, client) in listener_entries {
+                    if !client_matches_voice_target_group(
+                        server,
+                        &client,
+                        server_id,
+                        channel_id,
+                        resolved_channel.group(),
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    if let Some(sender) = sender {
+                        if !crate::client::visibility::can_view_user(server, &client, sender).await
                         {
                             continue;
                         }
-                        if let Some(sender) = sender {
-                            if !crate::client::visibility::can_view_user(server, &client, sender)
-                                .await
-                            {
-                                continue;
-                            }
-                        }
-                        push_unique_target(
-                            &mut targets,
-                            &mut seen,
-                            sender_id,
-                            sender_instance_id,
-                            client,
-                            AudioContext::Listen,
-                        );
                     }
+                    push_unique_target(
+                        &mut targets,
+                        &mut seen,
+                        sender_id,
+                        sender_instance_id,
+                        client,
+                        AudioContext::Listen,
+                    );
                 }
             }
         }
@@ -964,6 +1110,10 @@ async fn resolve_voice_target_channel(
     source_channel: u32,
     ch_target: &S2SVoiceTargetChannel,
 ) -> ResolvedVoiceTargetChannel {
+    if ch_target.id == 0 && ch_target.children {
+        return ResolvedVoiceTargetChannel::whole_server(ch_target.group.clone());
+    }
+
     let mut channel_ids = if ch_target.children {
         server
             .get_channels()
@@ -1011,8 +1161,18 @@ async fn resolved_voice_target_channels(
     let channel_version = server.get_channels().current_version_in_server(server_id);
     if let Some(channels) = vt.cached_resolved_channels(server_id, channel_version, source_channel)
     {
+        super::metrics::record_route_cache(
+            VoiceRouteSource::Local,
+            VoiceRouteCacheLayer::Topology,
+            true,
+        );
         return channels;
     }
+    super::metrics::record_route_cache(
+        VoiceRouteSource::Local,
+        VoiceRouteCacheLayer::Topology,
+        false,
+    );
 
     let mut channels = Vec::with_capacity(vt.channels().len());
     for ch in vt.channels() {
@@ -1031,6 +1191,98 @@ async fn resolved_voice_target_channels(
     channels
 }
 
+async fn authorized_voice_target_channels(
+    server: &Arc<Box<Server>>,
+    sender: &Arc<Box<Client>>,
+    server_id: &str,
+    source_channel: u32,
+    vt: &VoiceTarget,
+    resolved_channels: &[ResolvedVoiceTargetChannel],
+) -> AuthorizedVoiceTarget {
+    let channel_version = server.get_channels().current_version_in_server(server_id);
+    let channel_acl_generation = server.get_channels().channel_acl_generation();
+    let sender_acl_generation = sender.get_acl_generation();
+    if let Some(target) = vt.cached_authorized_target(
+        server_id,
+        channel_version,
+        channel_acl_generation,
+        sender_acl_generation,
+        source_channel,
+    ) {
+        super::metrics::record_route_cache(
+            VoiceRouteSource::Local,
+            VoiceRouteCacheLayer::Authorization,
+            true,
+        );
+        return target;
+    }
+    super::metrics::record_route_cache(
+        VoiceRouteSource::Local,
+        VoiceRouteCacheLayer::Authorization,
+        false,
+    );
+
+    let mut authorized = Vec::with_capacity(resolved_channels.len());
+    for channel in resolved_channels {
+        if channel.is_whole_server() {
+            let permissions =
+                crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
+            let allowed = if source_channel == 0 {
+                permissions.contains(crate::acl::ACLPermissions::Speak)
+            } else {
+                permissions.contains(crate::acl::ACLPermissions::Whisper)
+            };
+            authorized.push(if allowed {
+                channel.clone()
+            } else {
+                ResolvedVoiceTargetChannel::denied_like(channel)
+            });
+            continue;
+        }
+
+        let mut allowed_ids = Vec::new();
+        for &channel_id in channel.channel_ids() {
+            let permissions =
+                crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
+                    .await;
+            let allowed = if channel.current_channel_talk() && channel_id == source_channel {
+                permissions.contains(crate::acl::ACLPermissions::Speak)
+            } else {
+                permissions.contains(crate::acl::ACLPermissions::Whisper)
+            };
+            if allowed {
+                allowed_ids.push(channel_id);
+            }
+        }
+        authorized.push(if allowed_ids.is_empty() {
+            ResolvedVoiceTargetChannel::denied_like(channel)
+        } else {
+            ResolvedVoiceTargetChannel::new(
+                channel.id(),
+                channel.group().to_owned(),
+                channel.current_channel_talk(),
+                allowed_ids,
+            )
+        });
+    }
+
+    let authorized: Arc<[ResolvedVoiceTargetChannel]> = Arc::from(authorized);
+    let target = AuthorizedVoiceTarget::new(
+        authorized.clone(),
+        s2s_target_channels(vt, &authorized),
+        !vt.sessions().is_empty() || authorized.iter().any(|channel| channel.is_authorized()),
+    );
+    vt.store_authorized_target(
+        server_id,
+        channel_version,
+        channel_acl_generation,
+        sender_acl_generation,
+        source_channel,
+        target.clone(),
+    );
+    target
+}
+
 async fn resolved_voice_target_recipients(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
@@ -1044,7 +1296,10 @@ async fn resolved_voice_target_recipients(
 ) -> Vec<(Arc<Box<Client>>, AudioContext)> {
     let channel_version = server.get_channels().current_version_in_server(server_id);
     let channel_acl_generation = server.get_channels().channel_acl_generation();
-    let client_version = server.get_clients().current_version_in_server(server_id);
+    let client_version = server
+        .get_clients()
+        .voice_routing_generation_in_server(server_id);
+    let sender_acl_generation = sender.get_acl_generation();
     let hide_users_without_traverse = server.get_hide_users_without_traverse();
 
     if let Some(recipients) = vt.cached_resolved_recipients(
@@ -1052,11 +1307,22 @@ async fn resolved_voice_target_recipients(
         channel_version,
         channel_acl_generation,
         client_version,
+        sender_acl_generation,
         hide_users_without_traverse,
         source_channel,
     ) {
+        super::metrics::record_route_cache(
+            VoiceRouteSource::Local,
+            VoiceRouteCacheLayer::Recipients,
+            true,
+        );
         return live_targets_from_cached_recipients(server, server_id, &recipients).await;
     }
+    super::metrics::record_route_cache(
+        VoiceRouteSource::Local,
+        VoiceRouteCacheLayer::Recipients,
+        false,
+    );
 
     let targets = resolve_voice_intent_with_resolved_channels(
         server,
@@ -1066,6 +1332,8 @@ async fn resolved_voice_target_recipients(
         intent,
         default_context,
         Some(resolved_channels),
+        true,
+        true,
     )
     .await;
     vt.store_resolved_recipients(
@@ -1073,6 +1341,7 @@ async fn resolved_voice_target_recipients(
         channel_version,
         channel_acl_generation,
         client_version,
+        sender_acl_generation,
         hide_users_without_traverse,
         source_channel,
         cacheable_recipients_from_targets(&targets),
@@ -1107,68 +1376,68 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         "routing voice packet"
     );
 
-    let (
-        intent,
-        target_kind,
-        send_s2s,
-        route_kind,
-        resolved_channels,
-        voice_target,
-        s2s_target_channels,
-    ) = match audio.target {
-        AudioTarget::Normal => (
-            normal_intent(sender_channel),
-            S2S_TARGET_NORMAL,
-            true,
-            VoiceRouteKind::Normal,
-            None,
-            None,
-            None,
-        ),
-        AudioTarget::ServerLoopback => {
-            let targets = [(sender.clone(), AudioContext::Normal)];
-            flush_voice_batch(server, audio, &targets).await;
-            super::metrics::record_route(
-                VoiceRouteSource::Loopback,
-                VoiceRouteKind::Loopback,
-                targets.len(),
-                started_at.elapsed(),
-            );
-            return;
-        }
-        AudioTarget::VoiceTarget(slot) => {
-            let Some(vt) = sender.voice_target(slot) else {
-                return;
-            };
-            if vt.is_empty() {
+    let (intent, target_kind, send_s2s, route_kind, resolved_channels, voice_target) =
+        match audio.target {
+            AudioTarget::Normal => (
+                normal_intent(sender_channel),
+                S2S_TARGET_NORMAL,
+                true,
+                VoiceRouteKind::Normal,
+                None,
+                None,
+            ),
+            AudioTarget::ServerLoopback => {
+                let targets = [(sender.clone(), AudioContext::Normal)];
+                flush_voice_batch(server, audio, &targets).await;
+                super::metrics::record_route(
+                    VoiceRouteSource::Loopback,
+                    VoiceRouteKind::Loopback,
+                    targets.len(),
+                    started_at.elapsed(),
+                );
                 return;
             }
-            let resolved_channels =
-                resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
-            let s2s_target_channels =
-                if voice_target_is_current_channel_or_links(&vt, sender_channel) {
-                    resolved_channels
-                        .first()
-                        .map(|channel| channel.channel_ids().to_vec())
-                } else {
-                    None
+            AudioTarget::VoiceTarget(slot) => {
+                let Some(vt) = sender.voice_target(slot) else {
+                    return;
                 };
+                if vt.is_empty() {
+                    return;
+                }
+                let resolved_channels =
+                    resolved_voice_target_channels(server, &server_id, sender_channel, &vt).await;
 
-            (
-                target_intent(sender_channel, &vt),
-                S2S_TARGET_SHOUT,
-                true,
-                VoiceRouteKind::Target,
-                Some(resolved_channels),
-                Some(vt),
-                s2s_target_channels,
-            )
-        }
-    };
+                (
+                    target_intent(sender_channel, &vt),
+                    S2S_TARGET_SHOUT,
+                    true,
+                    VoiceRouteKind::Target,
+                    Some(resolved_channels),
+                    Some(vt),
+                )
+            }
+        };
 
     let default_context = audio_context_from_target_kind(target_kind);
-    let targets = if let (Some(vt), Some(resolved_channels)) =
+    let authorized_channels = if let (Some(vt), Some(resolved_channels)) =
         (voice_target.as_ref(), resolved_channels.as_deref())
+    {
+        Some(
+            authorized_voice_target_channels(
+                server,
+                sender,
+                &server_id,
+                sender_channel,
+                vt,
+                resolved_channels,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let targets = if let (Some(vt), Some(authorized_target)) =
+        (voice_target.as_ref(), authorized_channels.as_ref())
     {
         resolved_voice_target_recipients(
             server,
@@ -1179,7 +1448,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
             &intent,
             default_context,
             vt,
-            resolved_channels,
+            authorized_target.channels(),
         )
         .await
     } else {
@@ -1191,8 +1460,21 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
             &intent,
             default_context,
             resolved_channels.as_deref(),
+            false,
+            false,
         )
         .await
+    };
+    let has_authorized_s2s_target = authorized_channels
+        .as_ref()
+        .map(AuthorizedVoiceTarget::has_authorized_target)
+        .unwrap_or(true);
+    let s2s_target_channels = authorized_channels
+        .as_ref()
+        .and_then(AuthorizedVoiceTarget::s2s_channel_ids);
+    let s2s_intent = match (voice_target.as_ref(), authorized_channels.as_ref()) {
+        (Some(vt), Some(target)) => authorized_target_intent(sender_channel, vt, target.channels()),
+        _ => intent.clone(),
     };
 
     tracing::trace!(
@@ -1214,8 +1496,9 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         targets.len(),
         started_at.elapsed(),
     );
+    super::metrics::record_route_scope(VoiceRouteSource::Local, voice_intent_scope(&intent));
 
-    if send_s2s {
+    if send_s2s && has_authorized_s2s_target {
         let encode_started_at = Instant::now();
         let payload = encode_s2s_voice_payload(audio);
         record_pipeline_stage(
@@ -1236,10 +1519,10 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
                 target_kind,
                 is_terminator,
                 payload,
-                intent,
+                s2s_intent,
             )
         } else {
-            match intent.kind.as_ref() {
+            match s2s_intent.kind.as_ref() {
                 Some(VoiceIntentKind::Normal(normal)) => {
                     server.s2s_manager().send_voice_for_channel(
                         u32::from(sender_id),
@@ -1255,7 +1538,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
                     target_kind,
                     is_terminator,
                     payload,
-                    intent,
+                    s2s_intent,
                 ),
             }
         };
@@ -1353,6 +1636,7 @@ pub(crate) async fn route_s2s_voice_frame(
         targets.len(),
         started_at.elapsed(),
     );
+    super::metrics::record_route_scope(VoiceRouteSource::S2s, voice_intent_scope(&intent));
 }
 
 #[derive(Default)]
@@ -1911,7 +2195,8 @@ mod tests {
             sender_instance_id: Some(7),
             channel_version: 11,
             channel_acl_generation: 13,
-            client_version: 17,
+            voice_routing_generation: 17,
+            sender_acl_generation: 23,
             hide_users_without_traverse: false,
             source_channel: 19,
         }
@@ -1934,7 +2219,11 @@ mod tests {
         assert_ne!(base, changed);
 
         let mut changed = base.clone();
-        changed.client_version += 1;
+        changed.voice_routing_generation += 1;
+        assert_ne!(base, changed);
+
+        let mut changed = base.clone();
+        changed.sender_acl_generation += 1;
         assert_ne!(base, changed);
 
         let mut changed = base.clone();
@@ -1944,6 +2233,57 @@ mod tests {
         let mut changed = base.clone();
         changed.source_channel += 1;
         assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn s2s_scope_ignores_denied_whole_server_and_canonicalizes_channels() {
+        let mut target = VoiceTarget::new();
+        target.add_channel(crate::client::voice_target::VoiceTargetChannel::new(
+            0,
+            true,
+            false,
+            String::new(),
+        ));
+        target.add_channel(crate::client::voice_target::VoiceTargetChannel::new(
+            7,
+            true,
+            false,
+            String::new(),
+        ));
+        let authorized = [
+            ResolvedVoiceTargetChannel::denied_like(&ResolvedVoiceTargetChannel::whole_server(
+                String::new(),
+            )),
+            ResolvedVoiceTargetChannel::new(7, String::new(), false, vec![9, 7, 9]),
+        ];
+
+        let channels = s2s_target_channels(&target, &authorized).expect("channel scope");
+        assert_eq!(channels.as_ref(), &[7, 9]);
+
+        let intent = authorized_target_intent(3, &target, &authorized);
+        let Some(VoiceIntentKind::Target(intent)) = intent.kind else {
+            panic!("expected target intent");
+        };
+        assert_eq!(intent.channels.len(), 1);
+        assert_eq!(intent.channels[0].id, 7);
+    }
+
+    #[test]
+    fn authorized_whole_server_uses_server_scope() {
+        let mut target = VoiceTarget::new();
+        target.add_channel(crate::client::voice_target::VoiceTargetChannel::new(
+            0,
+            true,
+            true,
+            String::new(),
+        ));
+
+        let channels = s2s_target_channels(
+            &target,
+            &[ResolvedVoiceTargetChannel::whole_server(String::new())],
+        )
+        .expect("whole-server scope");
+        assert!(channels.is_empty());
     }
 
     #[test]

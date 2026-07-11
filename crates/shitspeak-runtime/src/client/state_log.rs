@@ -160,6 +160,18 @@ impl ClientGlobalStateDelta {
             || self.tokens.is_some()
     }
 
+    pub fn affects_voice_routing(&self) -> bool {
+        self.current_channel_id.is_some()
+            || self.listening_channel_add.is_some()
+            || self.listening_channel_remove.is_some()
+            || self.deaf.is_some()
+            || self.self_deaf.is_some()
+            || self.user_id.is_some()
+            || self.groups.is_some()
+            || self.is_superuser.is_some()
+            || self.tokens.is_some()
+    }
+
     pub fn to_initial_user_state(
         &self,
         session_id: ClientSessionIdentifier,
@@ -326,6 +338,13 @@ pub enum ClientStateOperation {
 }
 
 impl ClientStateOperation {
+    pub fn affects_voice_routing(&self) -> bool {
+        match self {
+            Self::AddClient { .. } | Self::RemoveClient { .. } | Self::ResetNode { .. } => true,
+            Self::UpdateGlobalState { delta, .. } => delta.affects_voice_routing(),
+        }
+    }
+
     /// Return the `session_id` associated with this operation, if any.
     pub fn session_id(&self) -> Option<ClientSessionIdentifier> {
         match self {
@@ -607,6 +626,63 @@ impl ClientStateLogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_routing_delta_classification_is_narrow() {
+        for delta in [
+            ClientGlobalStateDelta {
+                current_channel_id: Some(7),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                listening_channel_add: Some(HashSet::from([7])),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                deaf: Some(true),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                self_deaf: Some(true),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                groups: Some(HashSet::from(["casters".to_owned()])),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                tokens: Some(HashSet::from(["voice".to_owned()])),
+                ..Default::default()
+            },
+        ] {
+            assert!(delta.affects_voice_routing());
+        }
+
+        for delta in [
+            ClientGlobalStateDelta {
+                mute: Some(true),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                self_mute: Some(true),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                recording: Some(true),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                comment_hash: Some(Some("hash".to_owned())),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                display_name: Some(Some("name".to_owned())),
+                ..Default::default()
+            },
+        ] {
+            assert!(!delta.affects_voice_routing());
+        }
+    }
 
     #[test]
     fn client_state_log_entry_msgpack_round_trips_add_client() {

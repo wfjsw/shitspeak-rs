@@ -265,9 +265,9 @@ impl VoiceService {
                 VoiceSendResult::Failed
             },
         );
-        result?;
         self.cache_and_send_proactive_repairs(sender_session, seq, bytes, &dsts)
             .await;
+        result?;
         Ok(())
     }
 
@@ -316,9 +316,9 @@ impl VoiceService {
                 VoiceSendResult::Failed
             },
         );
-        result?;
         self.cache_and_send_proactive_repairs(sender_session, seq, bytes, dsts)
             .await;
+        result?;
         Ok(())
     }
 
@@ -434,7 +434,7 @@ impl VoiceService {
         &self,
         sender_session: u32,
         server_id: String,
-        channel_ids: &[u32],
+        channel_ids: Arc<[u32]>,
         target_kind: u32,
         is_terminator: bool,
         payload: Bytes,
@@ -455,8 +455,22 @@ impl VoiceService {
             }
             DeliveryStrategy::Targeted => {
                 let local = self.transport.local_node_id();
+                let voice_members = self.remote_voice_members();
                 let lookup = self.recipient_index.read().as_ref().map(|idx| {
-                    idx.lookup_remote_nodes_for_channels_in_server(&server_id, channel_ids, local)
+                    if channel_ids.is_empty() {
+                        idx.lookup_remote_nodes_for_server_in_server(
+                            &server_id,
+                            local,
+                            &voice_members,
+                        )
+                    } else {
+                        idx.lookup_remote_nodes_for_complete_shared_channels_in_server(
+                            &server_id,
+                            channel_ids.clone(),
+                            local,
+                            &voice_members,
+                        )
+                    }
                 });
                 let dsts = match lookup {
                     Some(RemoteNodeLookup::Nodes(dsts)) => dsts,
@@ -490,43 +504,34 @@ impl VoiceService {
                         return result;
                     }
                     None => {
-                        if let Some(channel_id) = channel_ids.first().copied() {
-                            trace!(
-                                server_id = %server_id,
-                                channel_id,
-                                "voice targeted: incomplete target channel index; falling back to broadcast"
-                            );
-                            let result = self
-                                .send_broadcast(
-                                    sender_session,
-                                    server_id,
-                                    target_kind,
-                                    is_terminator,
-                                    payload,
-                                    intent,
-                                )
-                                .await;
-                            metrics::record_send(
-                                self.transport.local_node_id(),
-                                VoiceSendMode::TargetedFallback,
-                                0,
-                                payload_len,
-                                if result.is_ok() {
-                                    VoiceSendResult::Sent
-                                } else {
-                                    VoiceSendResult::Failed
-                                },
-                            );
-                            return result;
-                        }
+                        let channel_id = channel_ids.first().copied().unwrap_or(0);
+                        trace!(
+                            server_id = %server_id,
+                            channel_id,
+                            "voice targeted: incomplete target channel index; falling back to broadcast"
+                        );
+                        let result = self
+                            .send_broadcast(
+                                sender_session,
+                                server_id,
+                                target_kind,
+                                is_terminator,
+                                payload,
+                                intent,
+                            )
+                            .await;
                         metrics::record_send(
                             self.transport.local_node_id(),
-                            VoiceSendMode::TargetedNoop,
+                            VoiceSendMode::TargetedFallback,
                             0,
                             payload_len,
-                            VoiceSendResult::Noop,
+                            if result.is_ok() {
+                                VoiceSendResult::Sent
+                            } else {
+                                VoiceSendResult::Failed
+                            },
                         );
-                        return Ok(());
+                        return result;
                     }
                 };
                 if dsts.is_empty() {
@@ -564,6 +569,27 @@ impl VoiceService {
                 result
             }
         }
+    }
+
+    pub async fn send_for_server(
+        &self,
+        sender_session: u32,
+        server_id: String,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+    ) -> Result<(), ApplicationError> {
+        self.send_for_target_channels(
+            sender_session,
+            server_id,
+            Arc::from([]),
+            target_kind,
+            is_terminator,
+            payload,
+            intent,
+        )
+        .await
     }
 
     /// Unicast to a single peer.
@@ -1608,14 +1634,27 @@ mod tests {
     #[tokio::test]
     async fn send_for_target_channels_targeted_preserves_shout_intent() {
         use crate::application::proto::{VoiceIntentKind, VoiceIntentTarget, VoiceTargetChannel};
-        use crate::application::voice::targeted::RecipientIndex;
+        use crate::application::voice::targeted::{
+            RecipientIndex, RecipientIndexKey, RecipientIndexSnapshot, RecipientIndexUpdate,
+        };
 
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service_with_strategy(transport.clone(), "targeted");
         let idx = RecipientIndex::new();
-        idx.add(5, 1);
-        idx.add(6, 2);
-        idx.add(6, 7);
+        let mut snapshot = RecipientIndexSnapshot::new();
+        snapshot.insert(
+            RecipientIndexKey::new(shitspeak_core::default_server_id(), 5),
+            [1].into_iter().collect(),
+        );
+        snapshot.insert(
+            RecipientIndexKey::new(shitspeak_core::default_server_id(), 6),
+            [2, 7].into_iter().collect(),
+        );
+        idx.replace_all_complete(RecipientIndexUpdate::new(
+            snapshot,
+            [shitspeak_core::default_server_id()].into_iter().collect(),
+            [1, 2, 3, 7].into_iter().collect(),
+        ));
         svc.set_recipient_index(idx);
 
         let intent = VoiceIntent {
@@ -1633,7 +1672,7 @@ mod tests {
         svc.send_for_target_channels(
             0xABC,
             shitspeak_core::default_server_id(),
-            &[5, 6],
+            Arc::from([5, 6]),
             1,
             false,
             Bytes::from_static(b"shout"),
@@ -1657,6 +1696,57 @@ mod tests {
                 ));
             }
             other => panic!("expected Multicast, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_for_server_targeted_uses_complete_server_membership() {
+        use crate::application::proto::{VoiceIntentKind, VoiceIntentTarget, VoiceTargetChannel};
+        use crate::application::voice::targeted::{
+            RecipientIndex, RecipientIndexKey, RecipientIndexSnapshot, RecipientIndexUpdate,
+        };
+
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service_with_strategy(transport.clone(), "targeted");
+        let idx = RecipientIndex::new();
+        let mut snapshot = RecipientIndexSnapshot::new();
+        snapshot.insert(
+            RecipientIndexKey::new("alpha", 5),
+            [1, 2].into_iter().collect(),
+        );
+        idx.replace_all_complete(RecipientIndexUpdate::new(
+            snapshot,
+            ["alpha".to_owned()].into_iter().collect(),
+            [1, 2, 3, 7].into_iter().collect(),
+        ));
+        svc.set_recipient_index(idx);
+        let intent = VoiceIntent {
+            kind: Some(VoiceIntentKind::Target(VoiceIntentTarget {
+                source_channel: 0,
+                sessions: Vec::new(),
+                channels: vec![VoiceTargetChannel {
+                    id: 0,
+                    children: true,
+                    links: false,
+                    group: String::new(),
+                }],
+            })),
+        };
+
+        svc.send_for_server(
+            0xABC,
+            "alpha".to_owned(),
+            1,
+            false,
+            Bytes::from_static(b"server"),
+            intent,
+        )
+        .await
+        .unwrap();
+
+        match &transport.calls()[0] {
+            FakeCall::Multicast { dsts, .. } => assert_eq!(dsts, &vec![1, 2]),
+            other => panic!("expected server-scoped multicast, got {other:?}"),
         }
     }
 
@@ -1686,7 +1776,7 @@ mod tests {
         svc.send_for_target_channels(
             0xABC,
             shitspeak_core::default_server_id(),
-            &[5, 6],
+            Arc::from([5, 6]),
             1,
             false,
             Bytes::from_static(b"shout"),
@@ -1728,7 +1818,7 @@ mod tests {
         svc.send_for_target_channels(
             0xABC,
             "beta".to_owned(),
-            &[5, 6],
+            Arc::from([5, 6]),
             1,
             false,
             Bytes::from_static(b"shout"),

@@ -117,6 +117,40 @@ pub(crate) enum VoiceRouteKind {
     Loopback,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum VoiceRouteScope {
+    Normal,
+    TargetChannel,
+    WholeServer,
+}
+
+impl VoiceRouteScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::TargetChannel => "target_channel",
+            Self::WholeServer => "whole_server",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VoiceRouteCacheLayer {
+    Topology,
+    Authorization,
+    Recipients,
+}
+
+impl VoiceRouteCacheLayer {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Topology => "topology",
+            Self::Authorization => "authorization",
+            Self::Recipients => "recipients",
+        }
+    }
+}
+
 impl VoiceRouteKind {
     fn label(self) -> &'static str {
         match self {
@@ -371,6 +405,9 @@ const UDP_DRAIN_DROP_REASON_COUNT: usize = 6;
 const VOICE_QUEUE_DROP_REASON_COUNT: usize = 3;
 const VOICE_ROUTE_SOURCE_COUNT: usize = 3;
 const VOICE_ROUTE_KIND_COUNT: usize = 3;
+const VOICE_ROUTE_CACHE_SOURCE_COUNT: usize = 2;
+const VOICE_ROUTE_CACHE_LAYER_COUNT: usize = 3;
+const VOICE_ROUTE_SCOPE_COUNT: usize = 3;
 const VOICE_DISPATCH_MODE_COUNT: usize = 2;
 const VOICE_PIPELINE_PATH_COUNT: usize = 4;
 const VOICE_PIPELINE_STAGE_COUNT: usize = 11;
@@ -494,6 +531,15 @@ static QUEUE_DROPS: [AtomicU64; VOICE_QUEUE_DROP_REASON_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_QUEUE_DROP_REASON_COUNT];
 static ROUTED_FRAMES: [AtomicU64; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
+static ROUTE_CACHE_HITS: [AtomicU64;
+    VOICE_ROUTE_CACHE_SOURCE_COUNT * VOICE_ROUTE_CACHE_LAYER_COUNT] =
+    [const { AtomicU64::new(0) }; VOICE_ROUTE_CACHE_SOURCE_COUNT * VOICE_ROUTE_CACHE_LAYER_COUNT];
+static ROUTE_CACHE_MISSES: [AtomicU64;
+    VOICE_ROUTE_CACHE_SOURCE_COUNT * VOICE_ROUTE_CACHE_LAYER_COUNT] =
+    [const { AtomicU64::new(0) }; VOICE_ROUTE_CACHE_SOURCE_COUNT * VOICE_ROUTE_CACHE_LAYER_COUNT];
+static ROUTE_SCOPE_RESOLUTIONS: [AtomicU64;
+    VOICE_ROUTE_CACHE_SOURCE_COUNT * VOICE_ROUTE_SCOPE_COUNT] =
+    [const { AtomicU64::new(0) }; VOICE_ROUTE_CACHE_SOURCE_COUNT * VOICE_ROUTE_SCOPE_COUNT];
 static ROUTE_RESOLUTION_DURATION_TOTAL_US: [AtomicU64;
     VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
@@ -648,6 +694,34 @@ fn route_kind_index(kind: VoiceRouteKind) -> usize {
 
 fn route_index(source: VoiceRouteSource, kind: VoiceRouteKind) -> usize {
     route_source_index(source) * VOICE_ROUTE_KIND_COUNT + route_kind_index(kind)
+}
+
+fn route_cache_index(source: VoiceRouteSource, layer: VoiceRouteCacheLayer) -> usize {
+    let source = match source {
+        VoiceRouteSource::Local => 0,
+        VoiceRouteSource::S2s => 1,
+        VoiceRouteSource::Loopback => return 0,
+    };
+    let layer = match layer {
+        VoiceRouteCacheLayer::Topology => 0,
+        VoiceRouteCacheLayer::Authorization => 1,
+        VoiceRouteCacheLayer::Recipients => 2,
+    };
+    source * VOICE_ROUTE_CACHE_LAYER_COUNT + layer
+}
+
+fn route_scope_index(source: VoiceRouteSource, scope: VoiceRouteScope) -> usize {
+    let source = match source {
+        VoiceRouteSource::Local => 0,
+        VoiceRouteSource::S2s => 1,
+        VoiceRouteSource::Loopback => return 0,
+    };
+    let scope = match scope {
+        VoiceRouteScope::Normal => 0,
+        VoiceRouteScope::TargetChannel => 1,
+        VoiceRouteScope::WholeServer => 2,
+    };
+    source * VOICE_ROUTE_SCOPE_COUNT + scope
 }
 
 fn dispatch_mode_index(mode: VoiceDispatchMode) -> usize {
@@ -845,6 +919,22 @@ pub(crate) fn record_route_resolution(
     let index = route_index(source, kind);
     let duration_us = duration.as_micros().min(u64::MAX as u128) as u64;
     increment(&ROUTE_RESOLUTION_DURATION_TOTAL_US[index], duration_us);
+}
+
+pub(crate) fn record_route_cache(source: VoiceRouteSource, layer: VoiceRouteCacheLayer, hit: bool) {
+    let index = route_cache_index(source, layer);
+    if hit {
+        increment(&ROUTE_CACHE_HITS[index], 1);
+    } else {
+        increment(&ROUTE_CACHE_MISSES[index], 1);
+    }
+}
+
+pub(crate) fn record_route_scope(source: VoiceRouteSource, scope: VoiceRouteScope) {
+    increment(
+        &ROUTE_SCOPE_RESOLUTIONS[route_scope_index(source, scope)],
+        1,
+    );
 }
 
 #[cfg(test)]
@@ -1197,6 +1287,48 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             labels,
             ROUTE_RESOLUTION_DURATION_TOTAL_US[index].load(Ordering::Relaxed) as f64,
         ));
+    }
+
+    for source in [VoiceRouteSource::Local, VoiceRouteSource::S2s] {
+        for layer in [
+            VoiceRouteCacheLayer::Topology,
+            VoiceRouteCacheLayer::Authorization,
+            VoiceRouteCacheLayer::Recipients,
+        ] {
+            let index = route_cache_index(source, layer);
+            for (result, value) in [
+                ("hit", ROUTE_CACHE_HITS[index].load(Ordering::Relaxed)),
+                ("miss", ROUTE_CACHE_MISSES[index].load(Ordering::Relaxed)),
+            ] {
+                samples.push(PrometheusSample::new(
+                    "shitspeak_voice_route_cache_events_total",
+                    vec![
+                        ("source".to_owned(), source.label().to_owned()),
+                        ("layer".to_owned(), layer.label().to_owned()),
+                        ("result".to_owned(), result.to_owned()),
+                    ],
+                    value as f64,
+                ));
+            }
+        }
+    }
+
+    for source in [VoiceRouteSource::Local, VoiceRouteSource::S2s] {
+        for scope in [
+            VoiceRouteScope::Normal,
+            VoiceRouteScope::TargetChannel,
+            VoiceRouteScope::WholeServer,
+        ] {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_route_scope_resolutions_total",
+                vec![
+                    ("source".to_owned(), source.label().to_owned()),
+                    ("scope".to_owned(), scope.label().to_owned()),
+                ],
+                ROUTE_SCOPE_RESOLUTIONS[route_scope_index(source, scope)].load(Ordering::Relaxed)
+                    as f64,
+            ));
+        }
     }
 
     for stage in [

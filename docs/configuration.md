@@ -502,6 +502,11 @@ no_progress_close_ms = 1500
 [s2s.application.voice]
 # "broadcast" is the default. "targeted" scopes voice fan-out by
 # (server_id, channel_id) and requires fresh client replication state.
+# A VoiceTarget for channel 0 with children enabled is treated as a
+# whole-server shout: root permissions are checked once and recipients are
+# filtered directly from server users. In targeted mode, whole-server and
+# recursive targets fall back to broadcast until the recipient snapshot covers
+# every current voice member.
 delivery_strategy = "broadcast"
 repair_enabled = true
 repair_transport_ttl_ms = 120

@@ -1610,6 +1610,11 @@ impl Server {
 
         // Single cleanup point: remove the client on any error.
         if result.is_err() {
+            if let Some(task) = writer_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            let _ = client.force_disconnect().await;
             async {
                 let server_id = client.server_id();
                 let old_channel_id = client.get_current_channel_id();

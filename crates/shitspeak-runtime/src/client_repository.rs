@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -73,6 +73,7 @@ pub struct ClientRepository {
     tx: broadcast::Sender<Arc<ClientStateBroadcastPayload>>,
     deferred_commit_tx: Option<mpsc::UnboundedSender<DeferredClientCommit>>,
     deferred_commit_pending: Arc<AtomicUsize>,
+    versions: Arc<ClientVersionIndex>,
 }
 
 pub(crate) struct ClientSnapshotWithVersions {
@@ -89,6 +90,50 @@ impl ClientSnapshotWithVersions {
 struct DeferredClientCommit {
     op: ClientStateOperation,
     channel_version_dep: Option<u64>,
+}
+
+#[derive(Default)]
+struct ClientServerVersions {
+    log: u64,
+    voice_routing: u64,
+}
+
+#[derive(Default)]
+struct ClientVersionIndex {
+    global: AtomicU64,
+    by_server: ParkingRwLock<HashMap<String, ClientServerVersions>>,
+}
+
+impl ClientVersionIndex {
+    fn record(&self, op: &ClientStateOperation, version: u64) {
+        self.global.store(version, Ordering::Release);
+        let mut by_server = self.by_server.write();
+        let entry = by_server.entry(op.server_id().to_owned()).or_default();
+        entry.log = version;
+        if op.affects_voice_routing() {
+            entry.voice_routing = version;
+        }
+    }
+
+    fn current(&self) -> u64 {
+        self.global.load(Ordering::Acquire)
+    }
+
+    fn current_in_server(&self, server_id: &str) -> u64 {
+        self.by_server
+            .read()
+            .get(server_id)
+            .map(|versions| versions.log)
+            .unwrap_or(0)
+    }
+
+    fn voice_routing_in_server(&self, server_id: &str) -> u64 {
+        self.by_server
+            .read()
+            .get(server_id)
+            .map(|versions| versions.voice_routing)
+            .unwrap_or(0)
+    }
 }
 
 pub struct ClientRegister {
@@ -326,6 +371,7 @@ impl ClientRepository {
             client_channel: HashMap::new(),
             listeners_by_channel: HashMap::new(),
         }));
+        let versions = Arc::new(ClientVersionIndex::default());
         let remote_registers = Arc::new(AsyncRwLock::new(HashMap::new()));
         let deferred_commit_pending = Arc::new(AtomicUsize::new(0));
         let deferred_commit_tx = tokio::runtime::Handle::try_current().ok().map(|handle| {
@@ -333,6 +379,7 @@ impl ClientRepository {
             let register = Arc::clone(&register);
             let tx = tx.clone();
             let pending = Arc::clone(&deferred_commit_pending);
+            let versions = Arc::clone(&versions);
             handle.spawn(async move {
                 while let Some(commit) = deferred_rx.recv().await {
                     let broadcast = {
@@ -341,6 +388,7 @@ impl ClientRepository {
                             &mut register,
                             local_node_id,
                             log_max_entries,
+                            &versions,
                             commit.op,
                             commit.channel_version_dep,
                         )
@@ -365,6 +413,7 @@ impl ClientRepository {
             tx,
             deferred_commit_tx,
             deferred_commit_pending,
+            versions,
         }
     }
 
@@ -792,6 +841,7 @@ impl ClientRepository {
                 &mut register,
                 self.local_node_id,
                 self.log_max_entries,
+                &self.versions,
                 ClientStateOperation::AddClient {
                     server_id: server_id.to_owned(),
                     session_id: id,
@@ -1609,6 +1659,26 @@ impl ClientRepository {
         result
     }
 
+    pub(crate) async fn get_local_listener_entries_for_channels_in_server(
+        &self,
+        server_id: &str,
+        channel_ids: &[u32],
+    ) -> Vec<(u32, Arc<Box<Client>>)> {
+        let register = self.register.read().await;
+        let mut result = Vec::new();
+        for &channel_id in channel_ids {
+            let channel_key = ScopedChannelId::new(server_id.to_owned(), channel_id);
+            if let Some(ids) = register.listeners_by_channel.get(&channel_key) {
+                for id in ids {
+                    if let Some(client) = register.local_clients.get(id) {
+                        result.push((channel_id, client.clone()));
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// Build a channel/listener interest snapshot for S2S voice node targeting.
     /// Local and replicated remote clients are included by their owning node id.
     pub async fn voice_recipient_index_snapshot(&self) -> RecipientIndexSnapshot {
@@ -2160,15 +2230,15 @@ impl ClientRepository {
 
     /// Return the current local version.
     pub fn current_version(&self) -> u64 {
-        self.register.try_read().map(|r| r.version).unwrap_or(0)
+        self.versions.current()
     }
 
     pub fn current_version_in_server(&self, server_id: &str) -> u64 {
-        self.register
-            .try_read()
-            .ok()
-            .and_then(|register| register.log_version_in_server(server_id))
-            .unwrap_or(0)
+        self.versions.current_in_server(server_id)
+    }
+
+    pub(crate) fn voice_routing_generation_in_server(&self, server_id: &str) -> u64 {
+        self.versions.voice_routing_in_server(server_id)
     }
 
     /// Subscribe to the stream of committed `ClientStateLogEntry`s.
@@ -2531,6 +2601,7 @@ impl ClientRepository {
                 &mut register,
                 self.local_node_id,
                 self.log_max_entries,
+                &self.versions,
                 op,
                 channel_version_dep,
             )
@@ -2573,6 +2644,7 @@ impl ClientRepository {
                     &mut register,
                     self.local_node_id,
                     self.log_max_entries,
+                    &self.versions,
                     commit.op,
                     commit.channel_version_dep,
                 ) else {
@@ -2611,6 +2683,7 @@ impl ClientRepository {
         register: &mut ClientRegister,
         local_node_id: u16,
         log_max_entries: usize,
+        versions: &ClientVersionIndex,
         op: ClientStateOperation,
         channel_version_dep: Option<u64>,
     ) -> Option<Arc<ClientStateBroadcastPayload>> {
@@ -2668,6 +2741,7 @@ impl ClientRepository {
             version < u64::MAX - 1_000_000,
             "ClientRepository version counter approaching u64::MAX - likely a bug"
         );
+        versions.record(&op, version);
 
         let entry = Arc::new(ClientStateLogEntry {
             version,
@@ -2699,6 +2773,47 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+
+    #[test]
+    fn version_index_separates_log_and_voice_generations() {
+        let versions = ClientVersionIndex::default();
+        let session_id = ClientSessionIdentifier::new(1, 7).unwrap();
+        let irrelevant = ClientStateOperation::UpdateGlobalState {
+            server_id: "alpha".to_owned(),
+            session_id,
+            client_instance_id: 1,
+            sender_session_id: None,
+            delta: ClientGlobalStateDelta {
+                comment_hash: Some(Some("hash".to_owned())),
+                ..Default::default()
+            },
+        };
+        let relevant = ClientStateOperation::UpdateGlobalState {
+            server_id: "alpha".to_owned(),
+            session_id,
+            client_instance_id: 1,
+            sender_session_id: None,
+            delta: ClientGlobalStateDelta {
+                deaf: Some(true),
+                ..Default::default()
+            },
+        };
+
+        versions.record(
+            &ClientStateOperation::ResetNode {
+                server_id: "alpha".to_owned(),
+            },
+            1,
+        );
+        versions.record(&irrelevant, 2);
+        assert_eq!(versions.current(), 2);
+        assert_eq!(versions.current_in_server("alpha"), 2);
+        assert_eq!(versions.voice_routing_in_server("alpha"), 1);
+
+        versions.record(&relevant, 3);
+        assert_eq!(versions.current_in_server("alpha"), 3);
+        assert_eq!(versions.voice_routing_in_server("alpha"), 3);
+    }
 
     fn text_message(message: &str) -> Message {
         Message::TextMessage(

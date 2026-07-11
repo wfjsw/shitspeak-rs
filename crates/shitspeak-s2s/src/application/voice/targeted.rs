@@ -69,6 +69,48 @@ impl RecipientIndexKey {
 /// Full recipient-index snapshot used by the runtime refresh bridge.
 pub type RecipientIndexSnapshot = HashMap<RecipientIndexKey, BTreeSet<NodeIdentifier>>;
 
+pub struct RecipientIndexUpdate {
+    snapshot: RecipientIndexSnapshot,
+    complete_servers: BTreeSet<String>,
+    covered_nodes: BTreeSet<NodeIdentifier>,
+}
+
+impl RecipientIndexUpdate {
+    pub fn new(
+        snapshot: RecipientIndexSnapshot,
+        complete_servers: BTreeSet<String>,
+        covered_nodes: BTreeSet<NodeIdentifier>,
+    ) -> Self {
+        Self {
+            snapshot,
+            complete_servers,
+            covered_nodes,
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        RecipientIndexSnapshot,
+        BTreeSet<String>,
+        BTreeSet<NodeIdentifier>,
+    ) {
+        (self.snapshot, self.complete_servers, self.covered_nodes)
+    }
+
+    pub fn snapshot(&self) -> &RecipientIndexSnapshot {
+        &self.snapshot
+    }
+
+    pub fn complete_servers(&self) -> &BTreeSet<String> {
+        &self.complete_servers
+    }
+
+    pub fn covered_nodes(&self) -> &BTreeSet<NodeIdentifier> {
+        &self.covered_nodes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteNodeLookup {
     Nodes(Arc<[NodeIdentifier]>),
@@ -79,8 +121,24 @@ pub(crate) enum RemoteNodeLookup {
 struct RemoteNodeLookupCacheKey {
     generation: u64,
     server_id: String,
-    channel_ids: Vec<u32>,
+    channels: RemoteNodeLookupChannels,
+    complete: bool,
     local_node_id: NodeIdentifier,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RemoteNodeLookupChannels {
+    Single(u32),
+    Multiple(Arc<[u32]>),
+}
+
+impl RemoteNodeLookupChannels {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Single(channel_id) => std::slice::from_ref(channel_id),
+            Self::Multiple(channel_ids) => channel_ids,
+        }
+    }
 }
 
 struct RemoteNodeLookupCache {
@@ -168,6 +226,9 @@ fn remote_node_lookup_cache_capacity(channel_count: usize) -> usize {
 /// wholesale on each reconcile pass to keep the read path lock-light.
 pub struct RecipientIndex {
     inner: Arc<RwLock<RecipientIndexSnapshot>>,
+    nodes_by_server: Arc<RwLock<HashMap<String, BTreeSet<NodeIdentifier>>>>,
+    complete_servers: Arc<RwLock<BTreeSet<String>>>,
+    covered_nodes: Arc<RwLock<BTreeSet<NodeIdentifier>>>,
     generation: AtomicU64,
     remote_node_lookup_cache: RemoteNodeLookupCache,
 }
@@ -176,6 +237,9 @@ impl RecipientIndex {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            nodes_by_server: Arc::new(RwLock::new(HashMap::new())),
+            complete_servers: Arc::new(RwLock::new(BTreeSet::new())),
+            covered_nodes: Arc::new(RwLock::new(BTreeSet::new())),
             generation: AtomicU64::new(0),
             remote_node_lookup_cache: RemoteNodeLookupCache::new(0),
         })
@@ -207,8 +271,98 @@ impl RecipientIndex {
     /// fresh full snapshot.
     pub fn replace_all(&self, snapshot: RecipientIndexSnapshot) {
         let channel_count = snapshot.len();
+        *self.nodes_by_server.write() = nodes_by_server(&snapshot);
         *self.inner.write() = snapshot;
+        self.complete_servers.write().clear();
+        self.covered_nodes.write().clear();
         self.invalidate_remote_node_lookup_cache(channel_count);
+    }
+
+    pub fn replace_all_complete(&self, update: RecipientIndexUpdate) {
+        let (snapshot, complete_servers, covered_nodes) = update.into_parts();
+        let channel_count = snapshot.len();
+        *self.nodes_by_server.write() = nodes_by_server(&snapshot);
+        *self.inner.write() = snapshot;
+        *self.complete_servers.write() = complete_servers;
+        *self.covered_nodes.write() = covered_nodes;
+        self.invalidate_remote_node_lookup_cache(channel_count);
+    }
+
+    pub(crate) fn covers_voice_members(
+        &self,
+        server_id: &str,
+        voice_members: &[NodeIdentifier],
+    ) -> bool {
+        if !self.complete_servers.read().contains(server_id) {
+            return false;
+        }
+        let covered_nodes = self.covered_nodes.read();
+        voice_members
+            .iter()
+            .all(|node| covered_nodes.contains(node))
+    }
+
+    pub(crate) fn lookup_remote_nodes_for_server_in_server(
+        &self,
+        server_id: &str,
+        local_node_id: NodeIdentifier,
+        voice_members: &[NodeIdentifier],
+    ) -> RemoteNodeLookup {
+        if !self.covers_voice_members(server_id, voice_members) {
+            return RemoteNodeLookup::Missing { channel_id: 0 };
+        }
+        RemoteNodeLookup::Nodes(
+            self.nodes_by_server
+                .read()
+                .get(server_id)
+                .into_iter()
+                .flat_map(|nodes| nodes.iter())
+                .copied()
+                .filter(|node| *node != local_node_id)
+                .collect::<Vec<_>>()
+                .into(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookup_remote_nodes_for_complete_channels_in_server(
+        &self,
+        server_id: &str,
+        channel_ids: &[u32],
+        local_node_id: NodeIdentifier,
+        voice_members: &[NodeIdentifier],
+    ) -> RemoteNodeLookup {
+        if !self.covers_voice_members(server_id, voice_members) {
+            return RemoteNodeLookup::Missing {
+                channel_id: channel_ids.first().copied().unwrap_or(0),
+            };
+        }
+        self.lookup_remote_nodes_for_shared_channels_in_server(
+            server_id,
+            Arc::from(channel_ids),
+            local_node_id,
+            true,
+        )
+    }
+
+    pub(crate) fn lookup_remote_nodes_for_complete_shared_channels_in_server(
+        &self,
+        server_id: &str,
+        channel_ids: Arc<[u32]>,
+        local_node_id: NodeIdentifier,
+        voice_members: &[NodeIdentifier],
+    ) -> RemoteNodeLookup {
+        if !self.covers_voice_members(server_id, voice_members) {
+            return RemoteNodeLookup::Missing {
+                channel_id: channel_ids.first().copied().unwrap_or(0),
+            };
+        }
+        self.lookup_remote_nodes_for_shared_channels_in_server(
+            server_id,
+            channel_ids,
+            local_node_id,
+            true,
+        )
     }
 
     /// Add `node` as an interested party in `channel_id`. Idempotent.
@@ -258,20 +412,69 @@ impl RecipientIndex {
         channel_id: u32,
         local_node_id: NodeIdentifier,
     ) -> RemoteNodeLookup {
-        self.lookup_remote_nodes_for_channels_in_server(server_id, &[channel_id], local_node_id)
+        self.lookup_remote_nodes_for_channel_key_in_server(
+            server_id,
+            RemoteNodeLookupChannels::Single(channel_id),
+            local_node_id,
+            false,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup_remote_nodes_for_channels_in_server(
         &self,
         server_id: &str,
         channel_ids: &[u32],
         local_node_id: NodeIdentifier,
     ) -> RemoteNodeLookup {
+        match channel_ids {
+            [channel_id] => self.lookup_remote_nodes_for_channel_key_in_server(
+                server_id,
+                RemoteNodeLookupChannels::Single(*channel_id),
+                local_node_id,
+                false,
+            ),
+            _ => self.lookup_remote_nodes_for_shared_channels_in_server(
+                server_id,
+                Arc::from(channel_ids),
+                local_node_id,
+                false,
+            ),
+        }
+    }
+
+    fn lookup_remote_nodes_for_shared_channels_in_server(
+        &self,
+        server_id: &str,
+        channel_ids: Arc<[u32]>,
+        local_node_id: NodeIdentifier,
+        complete: bool,
+    ) -> RemoteNodeLookup {
+        let channels = match channel_ids.as_ref() {
+            [channel_id] => RemoteNodeLookupChannels::Single(*channel_id),
+            _ => RemoteNodeLookupChannels::Multiple(channel_ids),
+        };
+        self.lookup_remote_nodes_for_channel_key_in_server(
+            server_id,
+            channels,
+            local_node_id,
+            complete,
+        )
+    }
+
+    fn lookup_remote_nodes_for_channel_key_in_server(
+        &self,
+        server_id: &str,
+        channels: RemoteNodeLookupChannels,
+        local_node_id: NodeIdentifier,
+        complete: bool,
+    ) -> RemoteNodeLookup {
         let generation = self.generation();
         let cache_key = RemoteNodeLookupCacheKey {
             generation,
             server_id: server_id.to_owned(),
-            channel_ids: channel_ids.to_vec(),
+            channels,
+            complete,
             local_node_id,
         };
 
@@ -279,8 +482,12 @@ impl RecipientIndex {
             return lookup;
         }
 
-        let lookup =
-            self.lookup_remote_nodes_for_channels_uncached(server_id, channel_ids, local_node_id);
+        let lookup = self.lookup_remote_nodes_for_channels_uncached(
+            server_id,
+            cache_key.channels.as_slice(),
+            local_node_id,
+            complete,
+        );
         self.remote_node_lookup_cache.put(cache_key, lookup.clone());
         lookup
     }
@@ -319,6 +526,7 @@ impl RecipientIndex {
         server_id: &str,
         channel_ids: &[u32],
         local_node_id: NodeIdentifier,
+        complete: bool,
     ) -> RemoteNodeLookup {
         let g = self.inner.read();
         if let [channel_id] = channel_ids {
@@ -331,6 +539,7 @@ impl RecipientIndex {
                         .collect::<Vec<_>>()
                         .into(),
                 ),
+                None if complete => RemoteNodeLookup::Nodes(Arc::from([])),
                 None => RemoteNodeLookup::Missing {
                     channel_id: *channel_id,
                 },
@@ -340,6 +549,9 @@ impl RecipientIndex {
         let mut remote_nodes = BTreeSet::new();
         for channel_id in channel_ids {
             let Some(nodes) = g.get(&RecipientIndexKey::new(server_id, *channel_id)) else {
+                if complete {
+                    continue;
+                }
                 return RemoteNodeLookup::Missing {
                     channel_id: *channel_id,
                 };
@@ -362,10 +574,24 @@ impl RecipientIndex {
     }
 }
 
+fn nodes_by_server(snapshot: &RecipientIndexSnapshot) -> HashMap<String, BTreeSet<NodeIdentifier>> {
+    let mut result = HashMap::<String, BTreeSet<NodeIdentifier>>::new();
+    for (key, nodes) in snapshot {
+        result
+            .entry(key.server_id().to_owned())
+            .or_default()
+            .extend(nodes.iter().copied());
+    }
+    result
+}
+
 impl Default for RecipientIndex {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            nodes_by_server: Arc::new(RwLock::new(HashMap::new())),
+            complete_servers: Arc::new(RwLock::new(BTreeSet::new())),
+            covered_nodes: Arc::new(RwLock::new(BTreeSet::new())),
             generation: AtomicU64::new(0),
             remote_node_lookup_cache: RemoteNodeLookupCache::new(0),
         }
@@ -375,6 +601,35 @@ impl Default for RecipientIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_snapshot_supports_server_scope_and_known_empty_channels() {
+        let index = RecipientIndex::new();
+        let mut snapshot = RecipientIndexSnapshot::new();
+        snapshot.insert(
+            RecipientIndexKey::new("alpha", 5),
+            [1, 2].into_iter().collect(),
+        );
+        index.replace_all_complete(RecipientIndexUpdate::new(
+            snapshot,
+            ["alpha".to_owned()].into_iter().collect(),
+            [1, 2, 7].into_iter().collect(),
+        ));
+
+        assert_eq!(
+            index.lookup_remote_nodes_for_server_in_server("alpha", 7, &[1, 2]),
+            RemoteNodeLookup::Nodes(Arc::from([1, 2]))
+        );
+        assert_eq!(
+            index
+                .lookup_remote_nodes_for_complete_channels_in_server("alpha", &[5, 6], 7, &[1, 2],),
+            RemoteNodeLookup::Nodes(Arc::from([1, 2]))
+        );
+        assert_eq!(
+            index.lookup_remote_nodes_for_server_in_server("alpha", 7, &[1, 2, 3]),
+            RemoteNodeLookup::Missing { channel_id: 0 }
+        );
+    }
 
     #[test]
     fn add_remove_lookup() {

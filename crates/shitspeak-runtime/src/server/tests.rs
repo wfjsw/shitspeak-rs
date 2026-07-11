@@ -614,6 +614,7 @@ async fn idle_reaper_only_disconnects_local_clients() {
             outbound_tx,
         )
         .await;
+    local_client.set_authenticated(true);
     let local_sid = local_client.get_session_id();
 
     let remote_sid = ClientSessionIdentifier::new(2, 1).unwrap();

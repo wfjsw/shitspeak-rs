@@ -669,6 +669,7 @@ async fn forward_pb_as(
 
     let path_trace_set = path_trace_set(&data.path_trace);
     let mut buckets: HashMap<NodeIdentifier, Vec<u32>> = HashMap::new();
+    let mut first_err: Option<OverlayError> = None;
     for dst_wire in &data.dsts {
         let Ok(dst) = NodeIdentifier::try_from(*dst_wire) else {
             continue;
@@ -676,7 +677,7 @@ async fn forward_pb_as(
         if dst == self_id {
             continue;
         }
-        match select_forward_next_hop_for_send(
+        let next_hop = select_forward_next_hop_for_send(
             &tables,
             self_id,
             dst,
@@ -688,7 +689,17 @@ async fn forward_pb_as(
             transport_class,
             send_options,
             avoid_first_hop,
-        )? {
+        );
+        let next_hop = match next_hop {
+            Ok(next_hop) => next_hop,
+            Err(error) => {
+                if is_originator && first_err.is_none() {
+                    first_err = Some(error);
+                }
+                continue;
+            }
+        };
+        match next_hop {
             ForwardNextHop::Send { next_hop } => {
                 buckets.entry(next_hop).or_default().push(*dst_wire);
             }
@@ -732,7 +743,7 @@ async fn forward_pb_as(
         }
     }
     if buckets.is_empty() {
-        return Ok(());
+        return first_err.map_or(Ok(()), Err);
     }
 
     let mut new_trace = data.path_trace.clone();
@@ -800,7 +811,6 @@ async fn forward_pb_as(
         });
     }
 
-    let mut first_err: Option<OverlayError> = None;
     for (next_hop, result) in join_all(sends).await {
         match result {
             Ok(()) => {
@@ -1789,6 +1799,46 @@ mod tests {
             .expect("healthy peer should receive its frame")
             .expect("healthy peer receiver should remain open");
         assert_eq!(forwarded.class(), MessageClass::Regular);
+        let decoded = decode_message(forwarded.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(data.dsts, vec![node_to_wire(5)]);
+    }
+
+    #[tokio::test]
+    async fn originated_overlay_forward_still_reaches_healthy_peer_without_other_transport() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 5, &[TransportKind::Tcp]);
+        let mut healthy_rx = receivers.pop().expect("healthy receiver");
+        let routing = routing_with_routes(&[(4, 4), (5, 5)]);
+
+        let err = forward_pb_as(
+            &transport,
+            &routing,
+            1,
+            overlay_data_for_dsts(&[4, 5]),
+            MessageClass::Regular,
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing transport should still be reported");
+
+        assert!(
+            matches!(
+                err,
+                OverlayError::Send(
+                    SendError::NoSuitableTransport { node: 4 } | SendError::UnknownNode { node: 4 }
+                )
+            ),
+            "unexpected error: {err:?}"
+        );
+        let forwarded = timeout(Duration::from_millis(50), healthy_rx.recv())
+            .await
+            .expect("healthy peer should receive its frame")
+            .expect("healthy peer receiver should remain open");
         let decoded = decode_message(forwarded.payload()).expect("overlay data");
         let Some(OverlayBody::Data(data)) = decoded.body else {
             panic!("not overlay data");

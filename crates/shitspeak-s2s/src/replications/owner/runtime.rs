@@ -320,6 +320,14 @@ impl OwnerState {
             }
         }
     }
+
+    /// A newly observed forward gap needs an immediate request even when a
+    /// recent bootstrap or anti-entropy probe is still inside the throttle
+    /// window. Callers only use this when the origin's pending buffer changes
+    /// from empty to non-empty, which keeps later out-of-order ops deduplicated.
+    pub fn arm_gap_catchup(&mut self, origin: NodeIdentifier, now: Instant) {
+        self.catchup_in_flight.insert(origin, now);
+    }
 }
 
 impl Default for OwnerState {
@@ -597,12 +605,10 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                             let mut s = self.state.lock();
                             let was_empty =
                                 s.buffer_op(origin, op.origin_version, Bytes::from(op.op_msgpack));
+                            if was_empty {
+                                s.arm_gap_catchup(origin, Instant::now());
+                            }
                             was_empty
-                                && s.arm_catchup(
-                                    origin,
-                                    Instant::now(),
-                                    self.cfg.owner_catchup_timeout(),
-                                )
                         };
                         if arm {
                             self.send_catchup_req(origin, new_epoch).await;
@@ -627,8 +633,10 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                         .unwrap_or(op.origin_epoch);
                     let was_empty =
                         s.buffer_op(origin, op.origin_version, Bytes::from(op.op_msgpack));
-                    let arm = was_empty
-                        && s.arm_catchup(origin, Instant::now(), self.cfg.owner_catchup_timeout());
+                    if was_empty {
+                        s.arm_gap_catchup(origin, Instant::now());
+                    }
+                    let arm = was_empty;
                     (arm, known_epoch)
                 };
                 if arm {
@@ -967,6 +975,20 @@ mod tests {
         assert!(!s.arm_catchup(7, t0, timeout));
         // Way later — re-arm.
         assert!(s.arm_catchup(7, t0 + timeout + Duration::from_secs(1), timeout));
+    }
+
+    #[test]
+    fn new_gap_bypasses_existing_catchup_throttle() {
+        let timeout = ReplicationConfig::default().owner_catchup_timeout();
+        let mut s = OwnerState::new();
+        let bootstrap = Instant::now();
+        assert!(s.arm_catchup(7, bootstrap, timeout));
+
+        let gap = bootstrap + Duration::from_millis(1);
+        s.arm_gap_catchup(7, gap);
+
+        assert_eq!(s.catchup_in_flight.get(&7), Some(&gap));
+        assert!(!s.arm_catchup(7, gap, timeout));
     }
 
     #[test]
