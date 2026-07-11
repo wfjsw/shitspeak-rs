@@ -378,7 +378,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source) group_left(city, region, country, node_label) label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_latitude{job=~\"$job\"}), \"source\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join((max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\"))) * on (source) group_left(city, region, country, node_label) label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_latitude{job=~\"$job\"}), \"source\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{node}}",
@@ -391,7 +391,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source) group_left(city, region, country, node_label) label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_longitude{job=~\"$job\"}), \"source\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join((max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\"))) * on (source) group_left(city, region, country, node_label) label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_longitude{job=~\"$job\"}), \"source\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"(.*)\"), \"node_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{node}}",
@@ -404,7 +404,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source, target, transport) group_left() (max by (source, target, transport) (shitspeak_s2s_link_rtt_us{job=~\"$job\"}) / 1000), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join((max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\"))) * on (source, target, transport) group_left() (max by (source, target, transport) (shitspeak_s2s_link_rtt_us{job=~\"$job\"}) / 1000), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{source}} -> {{target}} {{transport}}",
@@ -417,7 +417,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source, target, transport) group_left() max by (source, target, transport) (shitspeak_s2s_link_loss_ppm{job=~\"$job\"}), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join((max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\"))) * on (source, target, transport) group_left() max by (source, target, transport) (shitspeak_s2s_link_loss_ppm{job=~\"$job\"}), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{source}} -> {{target}} {{transport}}",
@@ -430,7 +430,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\")), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{source}} -> {{target}} {{transport}}",
@@ -443,7 +443,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source, target, transport) group_left() max by (source, target, transport) (shitspeak_s2s_link_throughput_bps{job=~\"$job\"}), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join((max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\"))) * on (source, target, transport) group_left() max by (source, target, transport) (shitspeak_s2s_link_throughput_bps{job=~\"$job\"}), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{source}} -> {{target}} {{transport}}",
@@ -456,7 +456,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (source, target, transport) group_left() min by (source, target, transport) (label_replace(max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, metric, level, transport) (max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"target\", \"$1\", \"next_hop\", \"(.*)\")), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join((max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\"))) * on (source, target, transport) group_left() min by (source, target, transport) (label_replace(max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, metric, level, transport) (max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"target\", \"$1\", \"next_hop\", \"(.*)\")), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{source}} -> {{target}} conv best-effort link cost",
@@ -469,7 +469,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (target) group_left(target_city, target_region, target_country, target_label) label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_latitude{job=~\"$job\"}), \"target\", \"$1\", \"node\", \"(.*)\"), \"target_city\", \"$1\", \"city\", \"(.*)\"), \"target_region\", \"$1\", \"region\", \"(.*)\"), \"target_country\", \"$1\", \"country\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join((max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\"))) * on (target) group_left(target_city, target_region, target_country, target_label) label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_latitude{job=~\"$job\"}), \"target\", \"$1\", \"node\", \"(.*)\"), \"target_city\", \"$1\", \"city\", \"(.*)\"), \"target_region\", \"$1\", \"region\", \"(.*)\"), \"target_country\", \"$1\", \"country\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{target}} target latitude",
@@ -482,7 +482,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) * on (target) group_left(target_city, target_region, target_country, target_label) label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_longitude{job=~\"$job\"}), \"target\", \"$1\", \"node\", \"(.*)\"), \"target_city\", \"$1\", \"city\", \"(.*)\"), \"target_region\", \"$1\", \"region\", \"(.*)\"), \"target_country\", \"$1\", \"country\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
+          "expr": "label_join((max by (source, target, transport) (shitspeak_s2s_link_status{job=~\"$job\",status=\"active\"}) and on (source, target, transport) max by (source, target, transport) (label_replace(max by (source, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"}) == 1, \"target\", \"$1\", \"next_hop\", \"(.*)\"))) * on (target) group_left(target_city, target_region, target_country, target_label) label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(max by (node, city, region, country) (shitspeak_s2s_node_geo_longitude{job=~\"$job\"}), \"target\", \"$1\", \"node\", \"(.*)\"), \"target_city\", \"$1\", \"city\", \"(.*)\"), \"target_region\", \"$1\", \"region\", \"(.*)\"), \"target_country\", \"$1\", \"country\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"(.*)\"), \"target_label\", \"$1\", \"node\", \"([^.]*)\\\\..*\"), \"edge_id\", \"|\", \"source\", \"target\", \"transport\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{target}} target longitude",
@@ -703,6 +703,159 @@
             "renameByName": {
               "Value #A": "info",
               "Value #B": "alive"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "footer": {
+              "reducers": []
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^(chosen_route_cost|chosen_transport_cost|best_candidate_cost)$"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "candidate_routes"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "id": 69,
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, transport) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"decision_id\", \"|\", \"source\", \"dst\")",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, transport) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1), \"decision_id\", \"|\", \"source\", \"dst\")",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(count by (source, dst) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"})), \"decision_id\", \"|\", \"source\", \"dst\")",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "label_join(min by (source, dst) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"})), \"decision_id\", \"|\", \"source\", \"dst\")",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "D"
+        }
+      ],
+      "title": "Conversational Best-Effort Routing Decisions",
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "decision_id",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "decision_id": true,
+              "metric": true,
+              "level": true,
+              "target": true
+            },
+            "renameByName": {
+              "Value #A": "chosen_route_cost",
+              "Value #B": "chosen_transport_cost",
+              "Value #C": "candidate_routes",
+              "Value #D": "best_candidate_cost",
+              "dst": "destination",
+              "next_hop": "chosen_next_hop"
             }
           }
         }
@@ -1148,7 +1301,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",service_fit=\"chosen\"})",
+          "expr": "max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1160,7 +1313,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_cost{job=~\"$job\"})",
+          "expr": "max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, transport) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1)",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1172,14 +1325,14 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, target, dst, next_hop, metric, level, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\"})",
+          "expr": "max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_transport_cost{job=~\"$job\",metric=\"conversational\",level=\"best_effort\"}) and on (source, target, dst, next_hop, transport) (max by (source, target, dst, next_hop, transport) (shitspeak_s2s_route_service_fit{job=~\"$job\",metric=\"conversational\",level=\"best_effort\",service_fit=\"chosen\"}) == 1)",
           "format": "table",
           "instant": true,
           "range": false,
           "refId": "C"
         }
       ],
-      "title": "Routes",
+      "title": "Chosen Conversational Best-Effort Routes",
       "transformations": [
         {
           "id": "merge",
@@ -1757,10 +1910,10 @@
         ]
       },
       "gridPos": {
-        "h": 12,
+        "h": 6,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 41
       },
       "id": 11,
       "options": {
@@ -1892,7 +2045,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, direction, peer, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"depth\"})",
+          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"depth\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1904,7 +2057,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, direction, peer, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"high_watermark\"})",
+          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"high_watermark\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1916,7 +2069,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, direction, peer, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"capacity\"})",
+          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"capacity\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1928,7 +2081,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, direction, peer, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"full_samples\"})",
+          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"full_samples\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1940,7 +2093,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, direction, peer, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"samples\"})",
+          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"samples\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -3085,8 +3238,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, kind) (rate(shitspeak_voice_routed_frames_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{source}} {{kind}}",
+          "expr": "sum by (kind) (rate(shitspeak_voice_routed_frames_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{kind}}",
           "range": true,
           "refId": "A"
         }
@@ -3186,8 +3339,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, kind, bucket) (rate(shitspeak_voice_fanout_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{source}} {{kind}} {{bucket}}",
+          "expr": "sum by (kind, bucket) (rate(shitspeak_voice_fanout_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{kind}} {{bucket}}",
           "range": true,
           "refId": "A"
         }
@@ -3287,8 +3440,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, kind, bucket) (rate(shitspeak_voice_route_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{source}} {{kind}} {{bucket}}",
+          "expr": "sum by (kind, bucket) (rate(shitspeak_voice_route_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{kind}} {{bucket}}",
           "range": true,
           "refId": "A"
         },
@@ -3298,8 +3451,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, kind) (rate(shitspeak_voice_route_resolution_duration_us_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "resolution {{source}} {{kind}}",
+          "expr": "sum by (kind) (rate(shitspeak_voice_route_resolution_duration_us_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "resolution {{kind}}",
           "range": true,
           "refId": "B"
         },
@@ -4400,13 +4553,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (transport, stage, bucket) (rate(shitspeak_s2s_transport_pipeline_stage_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "protocol={{transport}} stage={{stage}} bucket={{bucket}}",
+          "expr": "sum by (transport, bucket) (rate(shitspeak_s2s_transport_pipeline_stage_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "protocol={{transport}} bucket={{bucket}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Transport Pipeline Duration Buckets",
+      "title": "Transport Pipeline Duration Buckets by Protocol",
       "type": "timeseries"
     },
     {
@@ -4999,7 +5152,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_conflict{job=~\"$job\"})",
+          "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_conflict{job=~\"$job\"}) > 0",
           "range": false,
           "refId": "A",
           "format": "table",
@@ -5011,7 +5164,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, node, reason) (shitspeak_s2s_node_quarantined{job=~\"$job\"})",
+          "expr": "max by (source, node, reason) (shitspeak_s2s_node_quarantined{job=~\"$job\"}) > 0",
           "range": false,
           "refId": "B",
           "format": "table",
@@ -5023,7 +5176,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_observed_epochs{job=~\"$job\"})",
+          "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_observed_epochs{job=~\"$job\"}) and on (source, node) ((max by (source, node) (shitspeak_s2s_duplicate_node_conflict{job=~\"$job\"}) > 0) or (max by (source, node) (shitspeak_s2s_node_quarantined{job=~\"$job\"}) > 0))",
           "range": false,
           "refId": "C",
           "format": "table",
@@ -5035,7 +5188,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_quarantine_age_ms{job=~\"$job\"})",
+          "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_quarantine_age_ms{job=~\"$job\"}) > 0",
           "range": false,
           "refId": "D",
           "format": "table",
@@ -5047,7 +5200,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_quarantine_remaining_ms{job=~\"$job\"})",
+          "expr": "max by (source, node) (shitspeak_s2s_duplicate_node_quarantine_remaining_ms{job=~\"$job\"}) > 0",
           "range": false,
           "refId": "E",
           "format": "table",
@@ -5059,7 +5212,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, node) (rate(shitspeak_s2s_duplicate_node_conflicts_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (source, node) (rate(shitspeak_s2s_duplicate_node_conflicts_total{job=~\"$job\"}[$__rate_interval])) > 0",
           "range": false,
           "refId": "F",
           "format": "table",
@@ -5071,7 +5224,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, node, kind) (rate(shitspeak_s2s_duplicate_node_dropped_messages_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (source, node, kind) (rate(shitspeak_s2s_duplicate_node_dropped_messages_total{job=~\"$job\"}[$__rate_interval])) > 0",
           "range": false,
           "refId": "G",
           "format": "table",
@@ -5083,14 +5236,14 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node) (rate(shitspeak_s2s_duplicate_node_startup_failures_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (node) (rate(shitspeak_s2s_duplicate_node_startup_failures_total{job=~\"$job\"}[$__rate_interval])) > 0",
           "range": false,
           "refId": "H",
           "format": "table",
           "instant": true
         }
       ],
-      "title": "Duplicate Node Signals",
+      "title": "Active Duplicate Node Signals",
       "transformations": [
         {
           "id": "merge",
@@ -5486,8 +5639,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, mode) (rate(shitspeak_s2s_replication_catchup_requests_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{instance}} {{mode}} requests",
+          "expr": "sum by (mode) (rate(shitspeak_s2s_replication_catchup_requests_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}} requests",
           "range": true,
           "refId": "A"
         },
@@ -5497,8 +5650,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, mode) (rate(shitspeak_s2s_replication_catchup_responses_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{instance}} {{mode}} responses",
+          "expr": "sum by (mode) (rate(shitspeak_s2s_replication_catchup_responses_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}} responses",
           "range": true,
           "refId": "B"
         },
@@ -5508,8 +5661,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, mode) (rate(shitspeak_s2s_replication_catchup_suppressed_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{instance}} {{mode}} suppressed",
+          "expr": "sum by (mode) (rate(shitspeak_s2s_replication_catchup_suppressed_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}} suppressed",
           "range": true,
           "refId": "C"
         }
@@ -5609,8 +5762,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, mode) (rate(shitspeak_s2s_replication_catchup_response_bytes_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{instance}} {{mode}} bytes/s",
+          "expr": "sum by (mode) (rate(shitspeak_s2s_replication_catchup_response_bytes_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}} bytes/s",
           "range": true,
           "refId": "A"
         }
@@ -5811,13 +5964,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, kind, stage, bucket) (rate(shitspeak_s2s_replication_pipeline_stage_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{instance}} {{kind}} {{stage}} {{bucket}}",
+          "expr": "sum by (kind, bucket) (rate(shitspeak_s2s_replication_pipeline_stage_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{kind}} {{bucket}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Replication Pipeline Duration Buckets",
+      "title": "Replication Pipeline Duration Buckets by Kind",
       "type": "timeseries"
     },
     {
@@ -5912,8 +6065,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance) (rate(shitspeak_s2s_client_replication_worker_queue_wait_us_total{job=~\"$job\"}[$__rate_interval])) / clamp_min(sum by (instance) (rate(shitspeak_s2s_client_replication_worker_queue_wait_samples_total{job=~\"$job\"}[$__rate_interval])), 1)",
-          "legendFormat": "{{instance}} avg wait",
+          "expr": "sum(rate(shitspeak_s2s_client_replication_worker_queue_wait_us_total{job=~\"$job\"}[$__rate_interval])) / clamp_min(sum(rate(shitspeak_s2s_client_replication_worker_queue_wait_samples_total{job=~\"$job\"}[$__rate_interval])), 1)",
+          "legendFormat": "avg wait",
           "range": true,
           "refId": "A"
         },
@@ -5923,8 +6076,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, bucket) (rate(shitspeak_s2s_client_replication_worker_queue_wait_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{instance}} {{bucket}}",
+          "expr": "sum by (bucket) (rate(shitspeak_s2s_client_replication_worker_queue_wait_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{bucket}}",
           "range": true,
           "refId": "B"
         }
@@ -6037,8 +6190,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, mode, result) (rate(shitspeak_s2s_voice_send_events_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "send {{source}} {{mode}} {{result}}",
+          "expr": "sum by (mode, result) (rate(shitspeak_s2s_voice_send_events_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "send {{mode}} {{result}}",
           "range": true,
           "refId": "A"
         },
@@ -6048,8 +6201,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, origin_node, from_immediate, result) (rate(shitspeak_s2s_voice_receive_events_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "recv {{source}} origin={{origin_node}} via={{from_immediate}} {{result}}",
+          "expr": "sum by (from_immediate, result) (rate(shitspeak_s2s_voice_receive_events_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "recv via={{from_immediate}} {{result}}",
           "range": true,
           "refId": "B"
         }
@@ -6149,8 +6302,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, peer, result) (rate(shitspeak_s2s_voice_repair_events_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "repair {{source}} -> {{peer}} {{result}}",
+          "expr": "sum by (result) (rate(shitspeak_s2s_voice_repair_events_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "repair {{result}}",
           "range": true,
           "refId": "A"
         },
@@ -6160,8 +6313,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source) (shitspeak_s2s_voice_reorder_pending{job=~\"$job\"})",
-          "legendFormat": "pending {{source}}",
+          "expr": "sum(shitspeak_s2s_voice_reorder_pending{job=~\"$job\"})",
+          "legendFormat": "pending",
           "range": true,
           "refId": "B"
         },
@@ -6171,8 +6324,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, bucket) (rate(shitspeak_s2s_voice_reorder_pending_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "pending bucket {{source}} {{bucket}}",
+          "expr": "sum by (bucket) (rate(shitspeak_s2s_voice_reorder_pending_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "pending bucket {{bucket}}",
           "range": true,
           "refId": "C"
         }
@@ -6285,8 +6438,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, origin_node, transport, result) (rate(shitspeak_voice_ingress_continuity_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} origin={{origin_node}} {{transport}} {{result}}",
+          "expr": "sum by (transport, result) (rate(shitspeak_voice_ingress_continuity_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{transport}} {{result}}",
           "range": true,
           "refId": "A"
         }
@@ -6386,8 +6539,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (node, queue, metric) (shitspeak_voice_queue_status{job=~\"$job\"})",
-          "legendFormat": "{{node}} {{queue}} {{metric}}",
+          "expr": "max by (queue, metric) (shitspeak_voice_queue_status{job=~\"$job\"})",
+          "legendFormat": "{{queue}} {{metric}}",
           "range": true,
           "refId": "A"
         },
@@ -6397,8 +6550,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, queue, result) (rate(shitspeak_voice_queue_enqueues_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} {{queue}} enqueue {{result}}",
+          "expr": "sum by (queue, result) (rate(shitspeak_voice_queue_enqueues_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{queue}} enqueue {{result}}",
           "range": true,
           "refId": "B"
         }
@@ -6498,8 +6651,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, path, stage) (rate(shitspeak_voice_pipeline_stage_duration_us_total{job=~\"$job\"}[$__rate_interval])) / clamp_min(sum by (node, path, stage) (rate(shitspeak_voice_pipeline_stage_events_total{job=~\"$job\"}[$__rate_interval])), 1)",
-          "legendFormat": "{{node}} {{path}} {{stage}}",
+          "expr": "sum by (path, stage) (rate(shitspeak_voice_pipeline_stage_duration_us_total{job=~\"$job\"}[$__rate_interval])) / clamp_min(sum by (path, stage) (rate(shitspeak_voice_pipeline_stage_events_total{job=~\"$job\"}[$__rate_interval])), 1)",
+          "legendFormat": "{{path}} {{stage}}",
           "range": true,
           "refId": "A"
         }
@@ -6599,13 +6752,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, path, stage, bucket) (rate(shitspeak_voice_pipeline_stage_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} {{path}} {{stage}} {{bucket}}",
+          "expr": "sum by (path, bucket) (rate(shitspeak_voice_pipeline_stage_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{path}} {{bucket}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Voice Pipeline Duration Buckets",
+      "title": "Voice Pipeline Duration Buckets by Path",
       "type": "timeseries"
     },
     {
@@ -6700,8 +6853,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node) (rate(shitspeak_voice_udp_recv_batches_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} recv batches",
+          "expr": "sum(rate(shitspeak_voice_udp_recv_batches_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "recv batches",
           "range": true,
           "refId": "A"
         },
@@ -6711,8 +6864,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node) (rate(shitspeak_voice_udp_recv_datagrams_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} recv datagrams",
+          "expr": "sum(rate(shitspeak_voice_udp_recv_datagrams_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "recv datagrams",
           "range": true,
           "refId": "B"
         },
@@ -6722,8 +6875,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, bucket) (rate(shitspeak_voice_udp_recv_batch_size_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} recv batch {{bucket}}",
+          "expr": "sum by (bucket) (rate(shitspeak_voice_udp_recv_batch_size_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "recv batch {{bucket}}",
           "range": true,
           "refId": "C"
         }
@@ -6823,8 +6976,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node) (rate(shitspeak_voice_udp_egress_batches_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} egress batches",
+          "expr": "sum(rate(shitspeak_voice_udp_egress_batches_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "egress batches",
           "range": true,
           "refId": "A"
         },
@@ -6834,8 +6987,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node) (rate(shitspeak_voice_udp_egress_datagrams_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} egress datagrams",
+          "expr": "sum(rate(shitspeak_voice_udp_egress_datagrams_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "egress datagrams",
           "range": true,
           "refId": "B"
         },
@@ -6845,8 +6998,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, bucket) (rate(shitspeak_voice_udp_egress_batch_size_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} egress batch {{bucket}}",
+          "expr": "sum by (bucket) (rate(shitspeak_voice_udp_egress_batch_size_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "egress batch {{bucket}}",
           "range": true,
           "refId": "C"
         },
@@ -6856,8 +7009,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, bucket) (rate(shitspeak_voice_udp_egress_batch_bytes_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} egress bytes {{bucket}}",
+          "expr": "sum by (bucket) (rate(shitspeak_voice_udp_egress_batch_bytes_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "egress bytes {{bucket}}",
           "range": true,
           "refId": "D"
         }
@@ -6957,8 +7110,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, bucket) (rate(shitspeak_voice_udp_egress_send_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} {{bucket}}",
+          "expr": "sum by (bucket) (rate(shitspeak_voice_udp_egress_send_duration_us_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{bucket}}",
           "range": true,
           "refId": "A"
         }
@@ -7058,8 +7211,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (node, direction, reason) (rate(shitspeak_voice_s2s_gateway_drops_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{node}} {{direction}} {{reason}}",
+          "expr": "sum by (direction, reason) (rate(shitspeak_voice_s2s_gateway_drops_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{direction}} {{reason}}",
           "range": true,
           "refId": "A"
         }
