@@ -14,7 +14,7 @@ pub async fn compute_permissions_for_client(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channel_id: u32,
-) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
+) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
     compute_permissions_for_client_inner(server, client, channel_id, None).await
 }
 
@@ -27,7 +27,7 @@ pub async fn compute_permissions_for_client_as_if_in_channel(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channel_id: u32,
-) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
+) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
     compute_permissions_for_client_inner(server, client, channel_id, Some(channel_id)).await
 }
 
@@ -36,8 +36,8 @@ async fn compute_permissions_for_client_inner(
     client: &Arc<Box<Client>>,
     channel_id: u32,
     home_channel_override: Option<u32>,
-) -> enumflags2::BitFlags<crate::acl::ACLPermissions> {
-    use crate::acl::ACLPermissions;
+) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
+    use shitspeak_state::ACLPermissions;
 
     let session = u32::from(client.get_session_id());
     let is_superuser = client.is_superuser();
@@ -99,15 +99,14 @@ async fn compute_permissions_for_client_inner(
             .map(|ancestor| ancestor.id)
             .collect()
     };
-    let home_channel =
-        crate::client::group::ChannelHierarchy::new(home_channel_id, &home_ancestors);
+    let home_channel = shitspeak_state::ChannelHierarchy::new(home_channel_id, &home_ancestors);
     let ip_geo = server
         .lookup_ip_geo_metadata(client.get_real_ip_address())
         .await;
     let ip_geo_asn = ip_geo.as_ref().and_then(|geo| geo.asn());
     let ip_geo_country = ip_geo.as_ref().and_then(|geo| geo.country_code());
 
-    let membership = crate::client::group::ClientMembershipQuery::new(
+    let membership = shitspeak_state::ClientMembershipQuery::new(
         &group_refs,
         user_id.is_some(),
         &token_refs,
@@ -133,7 +132,7 @@ async fn compute_permissions_for_client_inner(
         "Computing ACL permissions"
     );
 
-    let mut permissions = crate::acl::evaluate_permission_with_behavior(
+    let mut permissions = shitspeak_state::evaluate_permission_with_behavior(
         &channel,
         &ancestors,
         user_id,

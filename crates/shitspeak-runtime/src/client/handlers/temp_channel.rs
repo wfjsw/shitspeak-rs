@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
-use crate::{
-    channel_repository::{ChannelOp, ChannelRepository},
-    client_repository::ClientRepository,
-    server::Server,
-};
+use shitspeak_state::{ChannelOp, ChannelRepository};
+
+use crate::{client_repository::ClientRepository, server::Server};
 
 /// Deletes `channel_id` if it is a temporary channel with no known occupants.
 /// Returns `true` if the channel was deleted.
@@ -199,11 +197,10 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
+    use shitspeak_state::{Channel, ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
     use tokio::sync::mpsc;
 
     use crate::{
-        channel_repository::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig},
-        channels::Channel,
         client::{Client, client_session_identifier::ClientSessionIdentifier},
         client_repository::ClientRepository,
         types::DEFAULT_SERVER_ID,
@@ -288,7 +285,6 @@ mod tests {
     async fn creator_in_temp_channel_is_visible_in_occupancy_index() {
         let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
-        channels.set_client_repo(clients.clone()).await;
 
         let temp_id = channels
             .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
@@ -370,7 +366,6 @@ mod tests {
     async fn reap_does_not_delete_occupied_temporary_channel() {
         let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
-        channels.set_client_repo(clients.clone()).await;
 
         let temp_id = channels
             .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
@@ -409,7 +404,6 @@ mod tests {
     async fn reap_does_not_delete_temporary_channel_with_remote_occupant() {
         let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
-        channels.set_client_repo(clients.clone()).await;
 
         let temp_id = channels
             .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
@@ -481,7 +475,6 @@ mod tests {
     async fn reap_fires_after_last_user_moves_out() {
         let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
-        channels.set_client_repo(clients.clone()).await;
 
         let temp_id = channels
             .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
@@ -534,7 +527,6 @@ mod tests {
     async fn reap_fires_after_last_user_disconnects() {
         let channels = channel_repository();
         let clients = Arc::new(ClientRepository::new(1, 128));
-        channels.set_client_repo(clients.clone()).await;
 
         let temp_id = channels
             .next_channel_id_in_server(DEFAULT_SERVER_ID, true)

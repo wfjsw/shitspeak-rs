@@ -3,9 +3,9 @@
 
 use std::time::Duration;
 
-use crate::channels::Channel;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
+use shitspeak_state::Channel;
 
 /// Checks that the login channel-tree burst contains every existing channel.
 /// Expected: the authenticated client receives `ChannelState` entries for

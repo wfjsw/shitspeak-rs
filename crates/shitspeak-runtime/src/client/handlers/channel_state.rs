@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
+use shitspeak_state::{ACL, ACLPermissions, Channel, ChannelOp, ChannelPatch};
+
 use crate::{
-    acl::{ACL, ACLPermissions},
-    channel_repository::ChannelOp,
-    channels::{Channel, ChannelPatch},
     client::Client,
     errors::MessageHandlerError,
     localization::{TextKey, text},
@@ -601,9 +600,8 @@ async fn inherited_creator_permissions(
             .map(|ancestor| ancestor.id)
             .collect()
     };
-    let home_channel =
-        crate::client::group::ChannelHierarchy::new(home_channel_id, &home_ancestors);
-    let membership = crate::client::group::ClientMembershipQuery::new(
+    let home_channel = shitspeak_state::ChannelHierarchy::new(home_channel_id, &home_ancestors);
+    let membership = shitspeak_state::ClientMembershipQuery::new(
         &group_refs,
         user_id.is_some(),
         &token_refs,
@@ -613,7 +611,7 @@ async fn inherited_creator_permissions(
     )
     .with_home_channel(home_channel);
 
-    crate::acl::evaluate_permission_with_behavior(
+    shitspeak_state::evaluate_permission_with_behavior(
         channel,
         &ancestors,
         user_id,

@@ -4,22 +4,17 @@
 //! with optional permission info and ACL handling. Useful for authentication, gap replay,
 //! subscription broadcasts, and future features like S2S replication and admin APIs.
 
+use shitspeak_state::{
+    Channel, ChannelHierarchy, ChannelOp, ChannelOperation, ChannelRepository,
+    ClientMembershipQuery, group_depends_on_home_channel, is_member_in_group,
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use crate::{
-    channel_repository::{ChannelOp, ChannelOperation, ChannelRepository},
-    channels::Channel,
-    client::{
-        Client,
-        client_session_identifier::ClientSessionIdentifier,
-        group::{
-            ChannelHierarchy, ClientMembershipQuery, group_depends_on_home_channel,
-            is_member_in_group,
-        },
-    },
+    client::{Client, client_session_identifier::ClientSessionIdentifier},
     errors::WriteProtoMessageError,
     messages::{Message, encoder::ChannelState},
     server::Server,
@@ -191,21 +186,21 @@ pub(crate) async fn permission_info_for_channel(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channel_id: u32,
-) -> (bool, enumflags2::BitFlags<crate::acl::ACLPermissions>) {
+) -> (bool, enumflags2::BitFlags<shitspeak_state::ACLPermissions>) {
     let server_id = client.server_id();
     let (_, channel, ancestors) = server
         .get_channels()
         .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
         .await;
     let is_enter_restricted = channel.as_ref().is_some_and(|channel| {
-        crate::acl::channel_has_effective_restriction(
+        shitspeak_state::channel_has_effective_restriction(
             channel,
             &ancestors,
-            crate::acl::ACLPermissions::Traverse,
-        ) || crate::acl::channel_has_effective_restriction(
+            shitspeak_state::ACLPermissions::Traverse,
+        ) || shitspeak_state::channel_has_effective_restriction(
             channel,
             &ancestors,
-            crate::acl::ACLPermissions::Enter,
+            shitspeak_state::ACLPermissions::Enter,
         )
     });
     let perms =
@@ -538,7 +533,7 @@ async fn deleted_subtree_from_shadow(
 }
 
 fn has_ancestor(
-    channels_by_id: &HashMap<u32, crate::channels::Channel>,
+    channels_by_id: &HashMap<u32, shitspeak_state::Channel>,
     channel_id: u32,
     ancestor_id: u32,
 ) -> bool {
@@ -769,9 +764,9 @@ async fn replay_channel_snapshot(
 }
 
 pub fn ordered_snapshot_channels(
-    channels: &[crate::channels::Channel],
-) -> Vec<crate::channels::Channel> {
-    let by_id: HashMap<u32, &crate::channels::Channel> = channels
+    channels: &[shitspeak_state::Channel],
+) -> Vec<shitspeak_state::Channel> {
+    let by_id: HashMap<u32, &shitspeak_state::Channel> = channels
         .iter()
         .map(|channel| (channel.id, channel))
         .collect();
@@ -825,11 +820,11 @@ pub fn ordered_snapshot_channels(
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use crate::acl::ACL;
-    use crate::channels::Channel;
     use crate::client::client_session_identifier::ClientSessionIdentifier;
-    use crate::client::group::ChannelHierarchy;
     use crate::messages::{Message, encoder};
+    use shitspeak_state::ACL;
+    use shitspeak_state::Channel;
+    use shitspeak_state::ChannelHierarchy;
 
     use super::{
         ChannelTreeShadow, SessionChannelShadow, channels_affected_by_home_channel_move,
@@ -897,7 +892,7 @@ mod tests {
             .iter()
             .filter(|channel| {
                 let ancestors = ancestors_for_channel(channel.id, &by_id).unwrap_or_default();
-                crate::acl::effective_acl_chain_has_home_channel_dependent_group(
+                shitspeak_state::effective_acl_chain_has_home_channel_dependent_group(
                     channel, &ancestors,
                 )
             })
@@ -925,7 +920,7 @@ mod tests {
             .iter()
             .filter(|channel| {
                 let ancestors = ancestors_for_channel(channel.id, &by_id).unwrap_or_default();
-                crate::acl::effective_acl_chain_home_channel_match_changes(
+                shitspeak_state::effective_acl_chain_home_channel_match_changes(
                     channel,
                     &ancestors,
                     ChannelHierarchy::new(old_channel_id, &old_ancestors),
@@ -1119,7 +1114,7 @@ mod tests {
 pub async fn build_channel_state_message(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    channel: &crate::channels::Channel,
+    channel: &shitspeak_state::Channel,
 ) -> ChannelState {
     build_channel_state_message_with_options(
         server,
@@ -1133,7 +1128,7 @@ pub async fn build_channel_state_message(
 pub async fn build_channel_state_message_without_permission_info(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    channel: &crate::channels::Channel,
+    channel: &shitspeak_state::Channel,
 ) -> ChannelState {
     build_channel_state_message_with_options(server, client, channel, false).await
 }
@@ -1141,7 +1136,7 @@ pub async fn build_channel_state_message_without_permission_info(
 async fn build_channel_state_message_with_options(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    channel: &crate::channels::Channel,
+    channel: &shitspeak_state::Channel,
     include_permission_info: bool,
 ) -> ChannelState {
     let links: Vec<u32> = channel.links.iter().copied().collect();
@@ -1686,7 +1681,7 @@ fn has_home_channel_dependent_acl(channel: &Channel, application: AclApplication
     })
 }
 
-fn acl_applies(acl: &crate::acl::ACL, application: AclApplication) -> bool {
+fn acl_applies(acl: &shitspeak_state::ACL, application: AclApplication) -> bool {
     match application {
         AclApplication::Here => acl.apply_here,
         AclApplication::Subs => acl.apply_subs,

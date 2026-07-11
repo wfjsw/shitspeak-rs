@@ -2,10 +2,9 @@ use aws_lc_rs::rand::SecureRandom;
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 
-use crate::{
-    client::crypt::{CryptoMode, Ocb2, errors::CryptError},
-    messages::encoder::Ping,
-};
+use shitspeak_messages::messages::encoder::Ping;
+
+use crate::{CryptoMode, Ocb2, errors::CryptError};
 
 const DECRYPT_HISTORY_SIZE: usize = 0x100;
 
@@ -377,11 +376,11 @@ impl CryptState {
         self.remote_resync = ping_message.resync;
     }
 
-    pub(crate) fn local_packet_stats(&self) -> (u32, u32, u32, u32) {
+    pub fn local_packet_stats(&self) -> (u32, u32, u32, u32) {
         (self.good, self.late, self.lost, self.resync)
     }
 
-    pub(crate) fn remote_packet_stats(&self) -> (u32, u32, u32, u32) {
+    pub fn remote_packet_stats(&self) -> (u32, u32, u32, u32) {
         (
             self.remote_good,
             self.remote_late,

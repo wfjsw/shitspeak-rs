@@ -12,14 +12,14 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
-use crate::config::{
-    AuthenticatorConfig, Config, PrivacyConfig, S2sConfig, S2sSeedAddressConfig,
-    UdpPingUserCountScope, WebConfig,
-};
 use crate::constants::APP_PROTO_VER;
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
 use crate::protocol_version::ProtocolVersion;
 use crate::server::Server;
+use shitspeak_runtime_config::{
+    AuthenticatorConfig, Config, PrivacyConfig, S2sConfig, S2sSeedAddressConfig,
+    UdpPingUserCountScope, WebConfig,
+};
 use shitspeak_s2s::testing::LinkChaos;
 use shitspeak_s2s::testing::pki::{Pki, install_provider_once, mint_pki};
 
@@ -205,8 +205,8 @@ async fn spawn_test_server_with_pki(
         min_client_version: 0,
         max_users: opts.max_users,
         authenticator: AuthenticatorConfig::default(),
-        observability: crate::config::ObservabilityConfig::default(),
-        geoip: crate::config::GeoIpConfig::default(),
+        observability: shitspeak_runtime_config::ObservabilityConfig::default(),
+        geoip: shitspeak_runtime_config::GeoIpConfig::default(),
         welcome_text: opts.welcome_text.clone(),
         max_bandwidth: 72_000,
         allow_html: true,
@@ -225,7 +225,7 @@ async fn spawn_test_server_with_pki(
         udp_ping_enabled: opts.udp_ping_enabled,
         udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
         udp_channel_size: 2_048,
-        voice: crate::config::VoiceTuning::default(),
+        voice: shitspeak_runtime_config::VoiceTuning::default(),
         client_idle_timeout_secs: opts.client_idle_timeout_secs,
         authenticate_timeout_ms: opts.authenticate_timeout_ms,
         auth_finalization_concurrency: opts.auth_finalization_concurrency,
@@ -234,7 +234,7 @@ async fn spawn_test_server_with_pki(
         send_permission_info: opts.send_permission_info,
         hide_users_without_traverse: opts.hide_users_without_traverse,
         show_node_id_for_superusers: opts.show_node_id_for_superusers,
-        acl: crate::config::AclConfig::with_acl_behavior_and_speak_reevaluation(
+        acl: shitspeak_runtime_config::AclConfig::with_acl_behavior_and_speak_reevaluation(
             opts.debug_acl_enter,
             opts.explicit_enter_deny_overrides_write,
             opts.preserve_write_acl_on_edit,

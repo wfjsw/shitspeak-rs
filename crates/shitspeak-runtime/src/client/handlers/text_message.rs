@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use shitspeak_state::ACLPermissions;
+
 use crate::{
-    acl::ACLPermissions,
     client::Client,
     client::client_session_identifier::ClientSessionIdentifier,
     errors::MessageHandlerError,

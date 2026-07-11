@@ -23,8 +23,6 @@ use rand::{RngExt, SeedableRng};
 use serde::Deserialize;
 use shitspeak_s2s::testing::s2s_network_test_guard;
 
-use crate::acl::ACLPermissions;
-use crate::channels::Channel;
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 use crate::integration_tests::harness::{
     TestClient, TestServer, TestServerOpts, spawn_test_server, test_client::ConnectError,
@@ -37,6 +35,8 @@ use crate::voice::codec::{AudioPayload, PacketFormat};
 use crate::voice::metrics::{
     VoiceRouteKind, VoiceRouteSource, route_metric_snapshot, route_resolution_metric_snapshot,
 };
+use shitspeak_state::ACLPermissions;
+use shitspeak_state::Channel;
 
 const VOICE_DEADLINE: Duration = Duration::from_secs(2);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(500);

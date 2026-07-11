@@ -3,10 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use crate::ban_repository::BanRepository;
 use crate::blob_store::ChannelBlobStore;
-use crate::channel_repository::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
-use crate::config::{ObservabilityConfig, S2sConfig};
 use crate::logging;
 use crate::observability::{self, S2sMetricsSource, S2sTopologyMetricsSource};
 use crate::s2s::{
@@ -18,10 +15,13 @@ use crate::s2s::{
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
 use serde::Deserialize;
 use serde::de::Error as _;
+use shitspeak_runtime_config::{ObservabilityConfig, S2sConfig};
 use shitspeak_s2s::overlay::{ApplicationServices, OverlayNetwork, ReplicationServices};
 use shitspeak_s2s::replications::{ReplicationConfig, ReplicationManager};
 use shitspeak_s2s::status;
 use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
+use shitspeak_state::BanRepository;
+use shitspeak_state::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
 use tokio::sync::watch;
 use tracing::{info, warn};
 

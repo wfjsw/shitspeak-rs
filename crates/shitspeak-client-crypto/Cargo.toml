@@ -1,0 +1,14 @@
+[package]
+name = "shitspeak-client-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aws-lc-rs = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+shitspeak-messages = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }

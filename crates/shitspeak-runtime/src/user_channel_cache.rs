@@ -8,9 +8,9 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::acl::ACLPermissions;
 use crate::client::{Client, ClientTransportKind};
 use crate::server::Server;
+use shitspeak_state::ACLPermissions;
 
 const CACHE_DB_FILE_NAME: &str = "user_channel_cache.db";
 const LEGACY_CACHE_FILE_NAME: &str = "user_channel_cache.json";

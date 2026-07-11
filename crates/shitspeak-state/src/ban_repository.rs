@@ -19,7 +19,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::broadcast;
 
-use crate::types::StrictReplicationMetadata;
+use shitspeak_core::StrictReplicationMetadata;
 
 // ─── Ban entry ───────────────────────────────────────────────────────────────
 

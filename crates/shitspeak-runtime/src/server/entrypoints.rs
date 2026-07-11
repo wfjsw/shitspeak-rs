@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use rand::RngExt;
 
-use crate::config::{Config, ServerEntrypointConfig};
+use shitspeak_runtime_config::{Config, ServerEntrypointConfig};
 
 pub(super) struct UdpPacket {
     packet: UdpPacketPayload,

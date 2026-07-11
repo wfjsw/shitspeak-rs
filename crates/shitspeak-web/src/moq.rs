@@ -21,10 +21,10 @@ use shitspeak_runtime::channel_handler::SessionChannelShadow;
 use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOperation};
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{Client, client_session_identifier::ClientSessionIdentifier};
-use shitspeak_runtime::config::{WebConfig, WebMoqConfig};
 use shitspeak_runtime::messages::Message;
 use shitspeak_runtime::server::Server;
 use shitspeak_runtime::voice::codec::{Audio, AudioPayload, OpusPayload, PacketFormat};
+use shitspeak_runtime_config::{WebConfig, WebMoqConfig};
 
 #[cfg(feature = "moq")]
 use hang::moq_net as moq;
@@ -561,11 +561,8 @@ pub struct MoqSessionRuntime {
             Arc<shitspeak_runtime::client::state_log::ClientStateBroadcastPayload>,
         >,
     >,
-    channel_log_rx: Option<
-        tokio::sync::broadcast::Receiver<
-            Arc<shitspeak_runtime::channel_repository::ChannelOperation>,
-        >,
-    >,
+    channel_log_rx:
+        Option<tokio::sync::broadcast::Receiver<Arc<shitspeak_state::ChannelOperation>>>,
     voice_rx: Option<mpsc::Receiver<Bytes>>,
     channel_shadow: SessionChannelShadow,
     user_visibility: UserVisibilityState,
@@ -906,7 +903,7 @@ impl MoqSessionRuntime {
     #[cfg(feature = "moq")]
     async fn channel_log_events(
         &mut self,
-        op: Arc<shitspeak_runtime::channel_repository::ChannelOperation>,
+        op: Arc<shitspeak_state::ChannelOperation>,
     ) -> Result<Vec<ServerEvent>, String> {
         let Some(server) = self.context.server().cloned() else {
             return Ok(Vec::new());
@@ -1575,9 +1572,9 @@ mod tests {
         AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection,
     };
     use shitspeak_runtime::client::ClientTransportKind;
-    use shitspeak_runtime::config::{Config, UdpPingUserCountScope, WebAuthConfig, WebAuthMode};
     use shitspeak_runtime::localization::Language;
     use shitspeak_runtime::messages::encoder::AudioContext;
+    use shitspeak_runtime_config::{Config, UdpPingUserCountScope, WebAuthConfig, WebAuthMode};
 
     #[test]
     fn track_names_are_stable() {
@@ -1706,13 +1703,7 @@ mod tests {
         let server = test_server(TestAuthenticator).await;
         server
             .get_channels()
-            .create_channel(shitspeak_runtime::channels::Channel::new(
-                1,
-                "Lobby",
-                0,
-                0,
-                Some(0),
-            ))
+            .create_channel(shitspeak_state::Channel::new(1, "Lobby", 0, 0, Some(0)))
             .await
             .unwrap();
         let context = test_session_context(Arc::clone(&server));
@@ -2100,9 +2091,9 @@ mod tests {
             allowed_proxies: Vec::new(),
             min_client_version: 0,
             max_users: 100,
-            authenticator: shitspeak_runtime::config::AuthenticatorConfig::default(),
-            observability: shitspeak_runtime::config::ObservabilityConfig::default(),
-            geoip: shitspeak_runtime::config::GeoIpConfig::default(),
+            authenticator: shitspeak_runtime_config::AuthenticatorConfig::default(),
+            observability: shitspeak_runtime_config::ObservabilityConfig::default(),
+            geoip: shitspeak_runtime_config::GeoIpConfig::default(),
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,
@@ -2129,11 +2120,11 @@ mod tests {
             send_permission_info: false,
             hide_users_without_traverse: false,
             show_node_id_for_superusers: true,
-            acl: shitspeak_runtime::config::AclConfig::default(),
-            privacy: shitspeak_runtime::config::PrivacyConfig::default(),
-            s2s: shitspeak_runtime::config::S2sConfig::default(),
+            acl: shitspeak_runtime_config::AclConfig::default(),
+            privacy: shitspeak_runtime_config::PrivacyConfig::default(),
+            s2s: shitspeak_runtime_config::S2sConfig::default(),
             web: WebConfig::default(),
-            voice: shitspeak_runtime::config::VoiceTuning::default(),
+            voice: shitspeak_runtime_config::VoiceTuning::default(),
         }
     }
 }

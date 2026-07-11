@@ -31,20 +31,15 @@ pub mod s2s_application_proto {
     pub use shitspeak_proto::s2s_application_proto::*;
 }
 
-pub mod acl;
 pub mod api {
     pub use shitspeak_auth::*;
 }
-pub mod ban_repository;
 pub mod blob_store;
 pub mod channel_handler;
-pub mod channel_repository;
-pub mod channels;
 pub mod client;
 pub mod client_certificate_verifier;
 pub mod client_repository;
 pub mod codec_info;
-pub mod config;
 pub mod config_watcher;
 pub mod constants;
 pub mod context_action;
@@ -76,7 +71,8 @@ mod integration_tests;
 pub async fn run_server_with_extensions(
     extensions: server::ServerExtensions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::{api::ReloadableAuthenticator, config::Config, server::Server};
+    use crate::{api::ReloadableAuthenticator, server::Server};
+    use shitspeak_runtime_config::Config;
 
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -84,8 +80,8 @@ pub async fn run_server_with_extensions(
 
     let logging_guard = logging::init("shitspeak-rs")?;
 
-    crate::client::crypt::probe_aes_backend();
-    crate::client::crypt::probe_gf128_backend();
+    shitspeak_client_crypto::probe_aes_backend();
+    shitspeak_client_crypto::probe_gf128_backend();
 
     let config = Config::load();
     let authenticator = ReloadableAuthenticator::from_config(&config)?;

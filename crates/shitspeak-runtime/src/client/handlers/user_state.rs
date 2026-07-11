@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use shitspeak_state::ACLPermissions;
+
 use crate::{
-    acl::ACLPermissions,
     client::{Client, client_global_state::ClientGlobalState},
     errors::MessageHandlerError,
     localization::channel_does_not_exist,

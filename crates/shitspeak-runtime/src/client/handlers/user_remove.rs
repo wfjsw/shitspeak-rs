@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use shitspeak_state::{ACLPermissions, BanOp};
+
 use crate::{
-    acl::ACLPermissions,
-    ban_repository::BanOp,
     client::Client,
     errors::MessageHandlerError,
     messages::Message,
@@ -101,7 +101,7 @@ pub async fn handle_user_remove(
     let reason = msg.reason.clone().unwrap_or_default();
 
     if is_ban {
-        let entry = crate::ban_repository::BanEntry {
+        let entry = shitspeak_state::BanEntry {
             address: target.get_real_ip_address(),
             mask: if target.get_real_ip_address().is_ipv4() {
                 32

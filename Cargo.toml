@@ -3,9 +3,12 @@ members = [
     ".",
     "crates/shitspeak-auth",
     "crates/shitspeak-core",
+    "crates/shitspeak-client-crypto",
     "crates/shitspeak-messages",
     "crates/shitspeak-proto",
+    "crates/shitspeak-runtime-config",
     "crates/shitspeak-runtime",
+    "crates/shitspeak-state",
     "crates/shitspeak-s2s",
     "crates/shitspeak-s2s-transport",
     "crates/shitspeak-voice",
@@ -28,7 +31,7 @@ base64 = "0"
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0", features = ["serde"] }
 cidr = "0"
-config = "0"
+config = { version = "0", default-features = false, features = ["toml"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 enumflags2 = { version = "0", features = ["serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
@@ -79,14 +82,17 @@ wasmtime = { version = "45", default-features = false, features = ["async", "cra
 webrtc = "0.17"
 webpki-roots = "1"
 x509-parser = "0"
-zstd = "0"
+zstd = { version = "0", default-features = false, features = ["zdict_builder"] }
 shitspeak-proto = { path = "crates/shitspeak-proto" }
 shitspeak-auth = { path = "crates/shitspeak-auth" }
 shitspeak-core = { path = "crates/shitspeak-core" }
+shitspeak-client-crypto = { path = "crates/shitspeak-client-crypto" }
 shitspeak-messages = { path = "crates/shitspeak-messages" }
 shitspeak-runtime = { path = "crates/shitspeak-runtime" }
+shitspeak-runtime-config = { path = "crates/shitspeak-runtime-config" }
 shitspeak-s2s = { path = "crates/shitspeak-s2s" }
 shitspeak-s2s-transport = { path = "crates/shitspeak-s2s-transport" }
+shitspeak-state = { path = "crates/shitspeak-state" }
 shitspeak-voice = { path = "crates/shitspeak-voice" }
 shitspeak-web = { path = "crates/shitspeak-web" }
 

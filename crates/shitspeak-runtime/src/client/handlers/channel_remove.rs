@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use shitspeak_state::{ACLPermissions, ChannelOp};
+
 use crate::{
-    acl::ACLPermissions,
-    channel_repository::ChannelOp,
     client::Client,
     errors::MessageHandlerError,
     localization::{TextKey, text},

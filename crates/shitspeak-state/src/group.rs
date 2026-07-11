@@ -323,7 +323,7 @@ fn evaluate_group_string_match_type(group: &str) -> (Option<MatchType<'_>>, bool
     (match_type, invert, use_target_channel)
 }
 
-pub(crate) fn group_depends_on_home_channel(group: &str) -> bool {
+pub fn group_depends_on_home_channel(group: &str) -> bool {
     let (match_type, _, _) = evaluate_group_string_match_type(group);
     matches!(
         match_type,

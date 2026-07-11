@@ -1,8 +1,9 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use shitspeak_state::{BanEntry, BanOp};
+
 use crate::{
-    ban_repository::{BanEntry, BanOp},
     client::Client,
     errors::MessageHandlerError,
     messages::{Message, WriteMessageExt, encoder::BanList},
@@ -28,12 +29,12 @@ pub async fn handle_ban_list(
     );
 
     let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
-    if !root_perms.contains(crate::acl::ACLPermissions::Ban) {
+    if !root_perms.contains(shitspeak_state::ACLPermissions::Ban) {
         return Err(MessageHandlerError::PermissionDenied(
             crate::messages::encoder::PermissionDenied::for_permission(
                 u32::from(sender.get_session_id()),
                 Some(0),
-                crate::acl::ACLPermissions::Ban,
+                shitspeak_state::ACLPermissions::Ban,
             ),
         ));
     }

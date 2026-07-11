@@ -56,19 +56,19 @@ pub async fn handle_user_stats(
             let target_channel = target_state.get_current_channel_id();
             let root_perms =
                 crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
-            if !root_perms.contains(crate::acl::ACLPermissions::Ban) {
+            if !root_perms.contains(shitspeak_state::ACLPermissions::Ban) {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
                     server,
                     sender,
                     target_channel,
                 )
                 .await;
-                if !target_channel_perms.contains(crate::acl::ACLPermissions::Enter) {
+                if !target_channel_perms.contains(shitspeak_state::ACLPermissions::Enter) {
                     return Err(MessageHandlerError::PermissionDenied(
                         crate::messages::encoder::PermissionDenied::for_permission(
                             sender_raw,
                             Some(target_channel),
-                            crate::acl::ACLPermissions::Enter,
+                            shitspeak_state::ACLPermissions::Enter,
                         ),
                     ));
                 }
@@ -333,14 +333,14 @@ impl UserStatsResponder for ServerUserStatsResponder {
             let target_channel = target.get_current_channel_id();
             let root_perms =
                 crate::client::acl::compute_permissions_for_client(&server, &actor, 0).await;
-            if !root_perms.contains(crate::acl::ACLPermissions::Ban) {
+            if !root_perms.contains(shitspeak_state::ACLPermissions::Ban) {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
                     &server,
                     &actor,
                     target_channel,
                 )
                 .await;
-                if !target_channel_perms.contains(crate::acl::ACLPermissions::Enter) {
+                if !target_channel_perms.contains(shitspeak_state::ACLPermissions::Enter) {
                     return UserStatsApplyOutcome {
                         found: false,
                         payload: Bytes::new(),

@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::config::Config;
 use crate::http_client;
 use crate::server::Server;
 use crate::types::DEFAULT_SERVER_ID;
+use shitspeak_runtime_config::Config;
 
 /// Mumble public server registry submission URL.
 const REGISTRY_URL: &str = "https://publist-registration.mumble.info/v1/register";

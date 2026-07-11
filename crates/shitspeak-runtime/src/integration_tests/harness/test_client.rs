@@ -24,7 +24,6 @@ use tokio::time::timeout;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
-use crate::client::crypt::CryptState;
 use crate::integration_tests::harness::TestServer;
 use crate::messages::encoder::{
     Authenticate, ChanAcl, ChannelRemove, ClientType, RequestBlob, UserRemove, UserState, Version,
@@ -34,6 +33,7 @@ use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat};
 use crate::voice::ping::PingRequest;
+use shitspeak_client_crypto::CryptState;
 
 /// Build a Mumble-legacy client→server Opus voice packet.
 ///

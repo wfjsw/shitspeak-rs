@@ -8,6 +8,7 @@ use std::time::Instant;
 use bytes::{Bytes, BytesMut};
 use parking_lot::RwLock;
 use scc::HashCache;
+use shitspeak_client_crypto::CryptState;
 use tracing::Instrument;
 
 use super::codec::{self, Audio, PacketFormat};
@@ -22,7 +23,6 @@ use crate::{
     client::{
         Client, ClientInstanceId,
         client_session_identifier::ClientSessionIdentifier,
-        crypt::CryptState,
         voice_target::{
             AuthorizedVoiceTarget, ResolvedVoiceTargetChannel, ResolvedVoiceTargetRecipient,
             VoiceTarget,
@@ -422,10 +422,9 @@ async fn client_matches_voice_target_group(
             .map(|ancestor| ancestor.id)
             .collect()
     };
-    let evaluation =
-        crate::client::group::ChannelHierarchy::new(evaluation_channel, &eval_ancestors);
-    let home = crate::client::group::ChannelHierarchy::new(home_channel_id, &home_ancestors);
-    let membership = crate::client::group::ClientMembershipQuery::new(
+    let evaluation = shitspeak_state::ChannelHierarchy::new(evaluation_channel, &eval_ancestors);
+    let home = shitspeak_state::ChannelHierarchy::new(home_channel_id, &home_ancestors);
+    let membership = shitspeak_state::ClientMembershipQuery::new(
         &group_refs,
         client.get_user_id().is_some(),
         &token_refs,
@@ -434,7 +433,7 @@ async fn client_matches_voice_target_group(
         Some(client.get_real_ip_address()),
     )
     .with_home_channel(home);
-    crate::client::group::is_member_in_group(group, evaluation, Some(evaluation), &[], &membership)
+    shitspeak_state::is_member_in_group(group, evaluation, Some(evaluation), &[], &membership)
 }
 
 fn push_unique_target(
@@ -799,7 +798,7 @@ async fn resolve_voice_intent_with_resolved_channels(
                             client.get_current_channel_id(),
                         )
                         .await;
-                        if !perms.contains(crate::acl::ACLPermissions::Whisper) {
+                        if !perms.contains(shitspeak_state::ACLPermissions::Whisper) {
                             continue;
                         }
                     }
@@ -841,9 +840,9 @@ async fn resolve_voice_intent_with_resolved_channels(
                             crate::client::acl::compute_permissions_for_client(server, sender, 0)
                                 .await;
                         if target.source_channel == 0 {
-                            permissions.contains(crate::acl::ACLPermissions::Speak)
+                            permissions.contains(shitspeak_state::ACLPermissions::Speak)
                         } else {
-                            permissions.contains(crate::acl::ACLPermissions::Whisper)
+                            permissions.contains(shitspeak_state::ACLPermissions::Whisper)
                         }
                     } else {
                         true
@@ -908,9 +907,9 @@ async fn resolve_voice_intent_with_resolved_channels(
                             let allowed = if resolved_channel.current_channel_talk()
                                 && channel_id == source_channel
                             {
-                                perms.contains(crate::acl::ACLPermissions::Speak)
+                                perms.contains(shitspeak_state::ACLPermissions::Speak)
                             } else {
-                                perms.contains(crate::acl::ACLPermissions::Whisper)
+                                perms.contains(shitspeak_state::ACLPermissions::Whisper)
                             };
                             if allowed && allowed_channel_set.insert(channel_id) {
                                 allowed_channels.push(channel_id);
@@ -1100,7 +1099,7 @@ async fn resolve_normal_voice_channels(
         }
         let permissions =
             crate::client::acl::compute_permissions_for_client(server, sender, linked_id).await;
-        if permissions.contains(crate::acl::ACLPermissions::Speak) {
+        if permissions.contains(shitspeak_state::ACLPermissions::Speak) {
             channel_ids.push(linked_id);
         }
     }
@@ -1232,9 +1231,9 @@ async fn authorized_voice_target_channels(
             let permissions =
                 crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
             let allowed = if source_channel == 0 {
-                permissions.contains(crate::acl::ACLPermissions::Speak)
+                permissions.contains(shitspeak_state::ACLPermissions::Speak)
             } else {
-                permissions.contains(crate::acl::ACLPermissions::Whisper)
+                permissions.contains(shitspeak_state::ACLPermissions::Whisper)
             };
             authorized.push(if allowed {
                 channel.clone()
@@ -1250,9 +1249,9 @@ async fn authorized_voice_target_channels(
                 crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
                     .await;
             let allowed = if channel.current_channel_talk() && channel_id == source_channel {
-                permissions.contains(crate::acl::ACLPermissions::Speak)
+                permissions.contains(shitspeak_state::ACLPermissions::Speak)
             } else {
-                permissions.contains(crate::acl::ACLPermissions::Whisper)
+                permissions.contains(shitspeak_state::ACLPermissions::Whisper)
             };
             if allowed {
                 allowed_ids.push(channel_id);

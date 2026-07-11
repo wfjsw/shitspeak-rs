@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
+use async_trait::async_trait;
 use enumflags2::BitFlags;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use scc::HashCache;
@@ -42,16 +43,25 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
-use crate::acl::ACL;
-use crate::acl::ACLPermissions;
-use crate::channels::{Channel, ChannelPatch, PendingDeleteState};
-use crate::config::Config;
-use crate::errors::ChannelRepoError;
-use crate::types::{DEFAULT_SERVER_ID, StrictReplicationMetadata, default_server_id};
+use crate::{ACL, ACLPermissions, Channel, ChannelPatch, ChannelRepoError, PendingDeleteState};
+use shitspeak_core::{DEFAULT_SERVER_ID, StrictReplicationMetadata, default_server_id};
+use shitspeak_messages::messages::{Message, encoder};
 
 const TEMPORARY_CHANNEL_ID_BIT: u32 = 0x8000_0000;
 
-pub(crate) type ChannelStateSubscription = broadcast::Receiver<Arc<ChannelOperation>>;
+pub type ChannelStateSubscription = broadcast::Receiver<Arc<ChannelOperation>>;
+
+#[async_trait]
+pub trait ChannelRepositoryObserver: Send + Sync {
+    async fn channel_version_advanced(&self, server_id: &str, channel_version: u64);
+
+    async fn repair_missing_channels(
+        &self,
+        server_id: &str,
+        valid_channel_ids: &HashSet<u32>,
+        channel_version: u64,
+    ) -> usize;
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ChannelRepoTuning {
@@ -73,23 +83,6 @@ impl ChannelRootConfig {
 
     pub fn name(&self) -> &str {
         &self.name
-    }
-}
-
-impl From<&Config> for ChannelRepoTuning {
-    fn from(cfg: &Config) -> Self {
-        Self {
-            log_max_entries: cfg.channel_log_max_entries.max(1),
-            snapshot_every_ops: cfg.channel_snapshot_every_ops.max(1),
-            snapshot_every_secs: cfg.channel_snapshot_every_secs.max(1),
-            wal_compaction_expire_count: cfg.channel_wal_compaction_expire_count,
-        }
-    }
-}
-
-impl From<&Config> for ChannelRootConfig {
-    fn from(cfg: &Config) -> Self {
-        Self::new(cfg.root_channel_name.clone())
     }
 }
 
@@ -125,7 +118,7 @@ impl ChannelOperation {
     /// Convert this log entry into the protobuf `Message` that should be
     /// sent to a subscriber.  Only changed/delta fields are populated;
     /// Mumble clients merge deltas with their existing state.
-    pub fn to_message(&self) -> Option<crate::messages::Message> {
+    pub fn to_message(&self) -> Option<Message> {
         match &self.op {
             ChannelOp::CreateChannel { channel } => Some(channel_to_proto_full(channel)),
             ChannelOp::EditChannel {
@@ -134,7 +127,7 @@ impl ChannelOperation {
                 links_add,
                 links_remove,
             } => Some(
-                crate::messages::encoder::ChannelState {
+                encoder::ChannelState {
                     channel_id: Some(*id),
                     parent: patch.parent_id.unwrap_or(None),
                     name: patch.name.clone(),
@@ -152,12 +145,12 @@ impl ChannelOperation {
             ),
             ChannelOp::UpdateChannel { id, patch } => Some(channel_to_proto_delta(*id, patch)),
             ChannelOp::DeleteChannel { id, .. } if self.emits_client_message => {
-                Some(crate::messages::encoder::ChannelRemove { channel_id: *id }.into())
+                Some(encoder::ChannelRemove { channel_id: *id }.into())
             }
             ChannelOp::DeleteChannel { .. } => None,
             ChannelOp::MarkPendingDelete { .. } | ChannelOp::CancelPendingDelete { .. } => None,
             ChannelOp::AddLink { a, b } => Some(
-                crate::messages::encoder::ChannelState {
+                encoder::ChannelState {
                     channel_id: Some(*a),
                     links_add: vec![*b],
                     ..Default::default()
@@ -165,7 +158,7 @@ impl ChannelOperation {
                 .into(),
             ),
             ChannelOp::RemoveLink { a, b } => Some(
-                crate::messages::encoder::ChannelState {
+                encoder::ChannelState {
                     channel_id: Some(*a),
                     links_remove: vec![*b],
                     ..Default::default()
@@ -222,9 +215,9 @@ impl ChannelWalRecord {
 }
 
 /// Build a full `ChannelState` encoder message (for CreateChannel).
-fn channel_to_proto_full(ch: &Channel) -> crate::messages::Message {
+fn channel_to_proto_full(ch: &Channel) -> Message {
     let links: Vec<u32> = ch.links.iter().copied().collect();
-    crate::messages::encoder::ChannelState {
+    encoder::ChannelState {
         channel_id: Some(ch.id),
         parent: ch.parent_id,
         name: Some(ch.name.clone()),
@@ -242,8 +235,8 @@ fn channel_to_proto_full(ch: &Channel) -> crate::messages::Message {
 }
 
 /// Build a delta `ChannelState` encoder message (for UpdateChannel).
-fn channel_to_proto_delta(id: u32, patch: &ChannelPatch) -> crate::messages::Message {
-    crate::messages::encoder::ChannelState {
+fn channel_to_proto_delta(id: u32, patch: &ChannelPatch) -> Message {
+    encoder::ChannelState {
         channel_id: Some(id),
         parent: patch.parent_id.unwrap_or(None),
         name: patch.name.clone(),
@@ -541,9 +534,7 @@ pub struct ChannelRepository {
     wal_compaction_expire_count: usize,
     /// Broadcast channel for S2S subscribers.
     tx: broadcast::Sender<Arc<ChannelOperation>>,
-    /// Optional reference to `ClientRepository` for draining pending ops
-    /// after remote channel ops are applied.
-    client_repo: ParkingMutex<Option<Arc<crate::client_repository::ClientRepository>>>,
+    observer: ParkingMutex<Option<Arc<dyn ChannelRepositoryObserver>>>,
     /// Unix timestamp when the last snapshot compaction succeeded.
     last_snapshot_at: AtomicI64,
     history_freshness: ParkingRwLock<HashMap<String, i64>>,
@@ -587,7 +578,7 @@ impl ChannelRepository {
             snapshot_every_secs: tuning.snapshot_every_secs,
             wal_compaction_expire_count: tuning.wal_compaction_expire_count,
             tx,
-            client_repo: ParkingMutex::new(None),
+            observer: ParkingMutex::new(None),
             last_snapshot_at: AtomicI64::new(chrono::Utc::now().timestamp()),
             history_freshness: ParkingRwLock::new(HashMap::new()),
         })
@@ -730,7 +721,7 @@ impl ChannelRepository {
             snapshot_every_secs: tuning.snapshot_every_secs,
             wal_compaction_expire_count: tuning.wal_compaction_expire_count,
             tx,
-            client_repo: ParkingMutex::new(None),
+            observer: ParkingMutex::new(None),
             last_snapshot_at: AtomicI64::new(chrono::Utc::now().timestamp()),
             history_freshness: ParkingRwLock::new(history_freshness),
         }))
@@ -764,15 +755,11 @@ impl ChannelRepository {
         logged.max(snapshot)
     }
 
-    pub(crate) fn channel_acl_generation(&self) -> u64 {
+    pub fn channel_acl_generation(&self) -> u64 {
         self.channel_acl_generation.load(Ordering::Acquire)
     }
 
-    pub(crate) fn channel_acl_generation_for_channel(
-        &self,
-        server_id: &str,
-        channel_id: u32,
-    ) -> u64 {
+    pub fn channel_acl_generation_for_channel(&self, server_id: &str, channel_id: u32) -> u64 {
         self.channel_acl_generation
             .load(Ordering::Acquire)
             .wrapping_add(
@@ -875,7 +862,7 @@ impl ChannelRepository {
             .or_else(|| (id == 0).then(|| self.root_channel()))
     }
 
-    pub(crate) fn existing_channel_ids_in_server(
+    pub fn existing_channel_ids_in_server(
         &self,
         server_id: &str,
         ids: &HashSet<u32>,
@@ -893,7 +880,7 @@ impl ChannelRepository {
             .collect()
     }
 
-    pub(crate) fn delete_visibility_hint_for_operation(
+    pub fn delete_visibility_hint_for_operation(
         &self,
         op: &ChannelOperation,
     ) -> Option<Arc<[u32]>> {
@@ -1080,38 +1067,13 @@ impl ChannelRepository {
         valid_channel_ids: &HashSet<u32>,
         channel_version: u64,
     ) -> usize {
-        let Some(client_repo) = self.client_repo.lock().clone() else {
+        let observer = { self.observer.lock().clone() };
+        let Some(observer) = observer else {
             return 0;
         };
-
-        let mut repaired = 0;
-        for client in client_repo.get_local_clients_in_server(server_id).await {
-            let missing_listeners: Vec<u32> = client
-                .get_listening_channel_ids()
-                .into_iter()
-                .filter(|channel_id| !valid_channel_ids.contains(channel_id))
-                .collect();
-            let missing_current = !valid_channel_ids.contains(&client.get_current_channel_id());
-            if !missing_current && missing_listeners.is_empty() {
-                continue;
-            }
-
-            {
-                let mut state = client.write_global_state_as(
-                    &client_repo,
-                    Some(client.get_session_id()),
-                    Some(channel_version),
-                );
-                if missing_current {
-                    state.set_current_channel_id(0);
-                }
-                for channel_id in missing_listeners {
-                    state.unlisten_channel(channel_id);
-                }
-            }
-            repaired += 1;
-        }
-        repaired
+        observer
+            .repair_missing_channels(server_id, valid_channel_ids, channel_version)
+            .await
     }
 
     pub async fn get_all(&self) -> Vec<Channel> {
@@ -1132,7 +1094,7 @@ impl ChannelRepository {
         }
     }
 
-    pub(crate) fn snapshot_with_version_and_subscription_in_server(
+    pub fn snapshot_with_version_and_subscription_in_server(
         &self,
         server_id: &str,
     ) -> (Vec<Channel>, u64, ChannelStateSubscription) {
@@ -1282,7 +1244,7 @@ impl ChannelRepository {
     }
 
     /// Return a channel and ancestors from a stable ACL generation snapshot.
-    pub(crate) async fn get_channel_with_ancestors_for_acl(
+    pub async fn get_channel_with_ancestors_for_acl(
         &self,
         channel_id: u32,
     ) -> (u64, Option<Channel>, Vec<Channel>) {
@@ -1290,7 +1252,7 @@ impl ChannelRepository {
             .await
     }
 
-    pub(crate) async fn get_channel_with_ancestors_for_acl_in_server(
+    pub async fn get_channel_with_ancestors_for_acl_in_server(
         &self,
         server_id: &str,
         channel_id: u32,
@@ -1328,7 +1290,7 @@ impl ChannelRepository {
 
     pub async fn create_channel(
         self: &Arc<Self>,
-        mut channel: Channel,
+        channel: Channel,
     ) -> Result<Channel, ChannelRepoError> {
         self.create_channel_in_server(DEFAULT_SERVER_ID, channel)
             .await
@@ -1884,7 +1846,7 @@ impl ChannelRepository {
 
     // ── ACL cache ─────────────────────────────────────────────────────────
 
-    pub(crate) async fn get_cached_permissions(
+    pub async fn get_cached_permissions(
         &self,
         session_id: u64,
         client_instance_id: u64,
@@ -1904,7 +1866,7 @@ impl ChannelRepository {
         .await
     }
 
-    pub(crate) async fn get_cached_permissions_in_server(
+    pub async fn get_cached_permissions_in_server(
         &self,
         server_id: &str,
         session_id: u64,
@@ -1930,7 +1892,7 @@ impl ChannelRepository {
             })
     }
 
-    pub(crate) async fn cache_permissions(
+    pub async fn cache_permissions(
         &self,
         session_id: u64,
         client_instance_id: u64,
@@ -1952,7 +1914,7 @@ impl ChannelRepository {
         .await;
     }
 
-    pub(crate) async fn cache_permissions_in_server(
+    pub async fn cache_permissions_in_server(
         &self,
         server_id: &str,
         session_id: u64,
@@ -2200,7 +2162,7 @@ impl ChannelRepository {
             .collect()
     }
 
-    pub(crate) async fn acl_affected_channel_ids_for_op(
+    pub async fn acl_affected_channel_ids_for_op(
         &self,
         server_id: &str,
         op: &ChannelOp,
@@ -2278,11 +2240,10 @@ impl ChannelRepository {
             self.invalidate_acl_cache_for_op_scope(&op.server_id, affected_acl_channels);
         }
 
-        // Notify ClientRepository to drain pending ops whose dep is now satisfied
-        let client_repo = self.client_repo.lock().clone();
-        if let Some(client_repo) = client_repo {
-            client_repo
-                .drain_pending_ops(&op.server_id, new_version)
+        let observer = { self.observer.lock().clone() };
+        if let Some(observer) = observer {
+            observer
+                .channel_version_advanced(&op.server_id, new_version)
                 .await;
         }
 
@@ -2468,9 +2429,9 @@ impl ChannelRepository {
             },
         }));
 
-        let client_repo = self.client_repo.lock().clone();
-        if let Some(client_repo) = client_repo {
-            client_repo.drain_pending_ops(server_id, version).await;
+        let observer = { self.observer.lock().clone() };
+        if let Some(observer) = observer {
+            observer.channel_version_advanced(server_id, version).await;
         }
         let repaired = self
             .move_local_clients_out_of_missing_channels_in_server(
@@ -2496,19 +2457,11 @@ impl ChannelRepository {
         Ok(())
     }
 
-    /// Set the `ClientRepository` reference for cross-repo causal notification.
-    pub async fn set_client_repo(
-        &self,
-        client_repo: Arc<crate::client_repository::ClientRepository>,
-    ) {
-        *self.client_repo.lock() = Some(client_repo);
+    pub fn set_observer(&self, observer: Arc<dyn ChannelRepositoryObserver>) {
+        *self.observer.lock() = Some(observer);
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
-
-    fn make_op(&self, op: ChannelOp) -> ChannelOperation {
-        self.make_op_in_server(DEFAULT_SERVER_ID, op)
-    }
 
     fn make_op_in_server(&self, server_id: &str, op: ChannelOp) -> ChannelOperation {
         let root_config = self.root_config.read().clone();
@@ -2707,10 +2660,10 @@ impl ChannelRepository {
         let committed_server_id = op.server_id.clone();
         let _ = self.tx.send(Arc::clone(&op));
 
-        let client_repo = self.client_repo.lock().clone();
-        if let Some(client_repo) = client_repo {
-            client_repo
-                .drain_pending_ops(&committed_server_id, committed_version)
+        let observer = { self.observer.lock().clone() };
+        if let Some(observer) = observer {
+            observer
+                .channel_version_advanced(&committed_server_id, committed_version)
                 .await;
         }
 
@@ -3119,18 +3072,6 @@ fn remove_links_from_deleted_channel_neighbors(
     }
 }
 
-fn remove_links_to_channels(channels: &mut HashMap<u32, Channel>, removed_ids: &[u32]) {
-    if removed_ids.is_empty() {
-        return;
-    }
-    let removed_ids: HashSet<u32> = removed_ids.iter().copied().collect();
-    for channel in channels.values_mut() {
-        channel
-            .links
-            .retain(|linked_id| !removed_ids.contains(linked_id));
-    }
-}
-
 fn ordered_link_edge(a: u32, b: u32) -> (u32, u32) {
     if a < b { (a, b) } else { (b, a) }
 }
@@ -3234,7 +3175,7 @@ impl ChannelSnapshotState {
     }
 }
 
-pub(crate) fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
+pub fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
     match op {
         ChannelOp::CreateChannel { .. }
         | ChannelOp::DeleteChannel { .. }
@@ -3250,7 +3191,7 @@ pub(crate) fn channel_op_affects_acl_generation(op: &ChannelOp) -> bool {
     }
 }
 
-pub(crate) fn channel_op_invalidates_acl_cache(op: &ChannelOp) -> bool {
+pub fn channel_op_invalidates_acl_cache(op: &ChannelOp) -> bool {
     channel_op_affects_acl_generation(op) && !matches!(op, ChannelOp::CreateChannel { .. })
 }
 
@@ -3424,9 +3365,42 @@ fn is_descendant(channels: &HashMap<u32, Channel>, candidate: u32, ancestor_id: 
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Mutex;
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        versions: Mutex<Vec<(String, u64)>>,
+        repairs: Mutex<Vec<(String, HashSet<u32>, u64)>>,
+    }
+
+    #[async_trait]
+    impl ChannelRepositoryObserver for RecordingObserver {
+        async fn channel_version_advanced(&self, server_id: &str, channel_version: u64) {
+            self.versions
+                .lock()
+                .expect("recording observer mutex poisoned")
+                .push((server_id.to_owned(), channel_version));
+        }
+
+        async fn repair_missing_channels(
+            &self,
+            server_id: &str,
+            valid_channel_ids: &HashSet<u32>,
+            channel_version: u64,
+        ) -> usize {
+            self.repairs
+                .lock()
+                .expect("recording observer mutex poisoned")
+                .push((
+                    server_id.to_owned(),
+                    valid_channel_ids.clone(),
+                    channel_version,
+                ));
+            0
+        }
+    }
 
     fn tuning() -> ChannelRepoTuning {
         ChannelRepoTuning {
@@ -3886,7 +3860,7 @@ mod tests {
         let last = repo.get_log_since(0).await.pop().unwrap();
         assert!(matches!(
             last.to_message(),
-            Some(crate::messages::Message::ChannelRemove(_))
+            Some(shitspeak_messages::messages::Message::ChannelRemove(_))
         ));
     }
 
@@ -3960,10 +3934,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s2s_snapshot_install_repairs_clients_in_removed_channels() {
+    async fn s2s_snapshot_install_notifies_the_state_observer() {
         let repo = repo();
-        let client_repo = Arc::new(crate::client_repository::ClientRepository::new(1, 128));
-        repo.set_client_repo(client_repo.clone()).await;
+        let observer = Arc::new(RecordingObserver::default());
+        repo.set_observer(observer.clone());
 
         repo.create_channel(Channel::new(7, "kept", 0, 0, Some(0)))
             .await
@@ -3972,52 +3946,28 @@ mod tests {
             .await
             .unwrap();
 
-        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
-        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let client = client_repo
-            .allocate_web_client(peer.ip(), peer, local, tx)
-            .await;
-        {
-            let mut state = client.write_global_state_as(
-                &client_repo,
-                Some(client.get_session_id()),
-                Some(repo.current_version()),
-            );
-            state.set_current_channel_id(8);
-            state.listen_channel(8);
-            state.listen_channel(7);
-        }
-
-        assert_eq!(
-            client_repo.get_local_clients_in_channel(8).await.len(),
-            1,
-            "precondition: local channel index should point at removed channel"
-        );
-        assert_eq!(
-            client_repo.get_local_listeners_for_channel(8).await.len(),
-            1,
-            "precondition: local listener index should point at removed channel"
-        );
-
         repo.install_s2s_snapshot(3, vec![Channel::new(7, "kept", 0, 0, Some(0))])
             .await
             .unwrap();
 
         assert!(repo.get_channel(8).await.is_none());
-        assert_eq!(client.get_current_channel_id(), 0);
-        assert!(!client.get_listening_channel_ids().contains(&8));
-        assert!(client.get_listening_channel_ids().contains(&7));
-        assert_eq!(client_repo.get_local_clients_in_channel(8).await.len(), 0);
-        assert_eq!(client_repo.get_local_clients_in_channel(0).await.len(), 1);
         assert_eq!(
-            client_repo.get_local_listeners_for_channel(8).await.len(),
-            0
+            observer
+                .versions
+                .lock()
+                .expect("recording observer mutex poisoned")
+                .last(),
+            Some(&(DEFAULT_SERVER_ID.to_owned(), 3))
         );
-        assert_eq!(
-            client_repo.get_local_listeners_for_channel(7).await.len(),
-            1
-        );
+        let repairs = observer
+            .repairs
+            .lock()
+            .expect("recording observer mutex poisoned");
+        let (_, valid_channel_ids, version) = repairs.last().expect("repair callback was invoked");
+        assert_eq!(*version, 3);
+        assert!(valid_channel_ids.contains(&0));
+        assert!(valid_channel_ids.contains(&7));
+        assert!(!valid_channel_ids.contains(&8));
     }
 
     #[tokio::test]

@@ -1,8 +1,6 @@
 //! Auth-flow scenarios: success, wrong password, unknown user, server full,
 //! and `cert_required` rejection.
 
-use crate::acl::{ACL, ACLPermissions};
-use crate::client::crypt::CryptState;
 use crate::integration_tests::harness::{
     ManualNativeClient, TestClient, TestServerOpts, spawn_test_server,
 };
@@ -14,6 +12,8 @@ use bytes::BytesMut;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
+use shitspeak_client_crypto::CryptState;
+use shitspeak_state::{ACL, ACLPermissions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -496,7 +496,7 @@ async fn native_client_must_authenticate_before_timeout() {
 
 #[tokio::test]
 async fn certificate_hash_privacy_remaps_other_users_only() {
-    let privacy = crate::config::PrivacyConfig::new(
+    let privacy = shitspeak_runtime_config::PrivacyConfig::new(
         true,
         Some("test-shared-certificate-hash-secret".to_owned()),
     );
@@ -559,8 +559,8 @@ async fn certificate_hash_privacy_remaps_other_users_only() {
 
 #[tokio::test]
 async fn certificate_hash_privacy_reversible_remaps_other_users_only() {
-    let privacy = crate::config::PrivacyConfig::with_certificate_hash_protection(
-        crate::config::CertificateHashProtection::Reversible,
+    let privacy = shitspeak_runtime_config::PrivacyConfig::with_certificate_hash_protection(
+        shitspeak_runtime_config::CertificateHashProtection::Reversible,
         Some("test-shared-certificate-hash-secret".to_owned()),
     );
     let server = spawn_test_server(TestServerOpts {
@@ -609,7 +609,7 @@ async fn certificate_hash_privacy_reversible_remaps_other_users_only() {
         panic!("expected Bob UserState");
     };
     let expected = crate::privacy::protected_certificate_hash_hex(
-        crate::config::CertificateHashProtection::Reversible,
+        shitspeak_runtime_config::CertificateHashProtection::Reversible,
         "test-shared-certificate-hash-secret",
         &bob_self_hash,
     )

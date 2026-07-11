@@ -22,9 +22,9 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::config::S2sConfig;
 use crate::http_client;
 use crate::types::NodeIdentifier;
+use shitspeak_runtime_config::S2sConfig;
 
 const DEFAULT_LOKI_BATCH_SIZE: usize = 128;
 const DEFAULT_LOKI_FILTER_TARGET: &str = "shitspeak_rs";

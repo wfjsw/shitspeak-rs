@@ -8,10 +8,10 @@ use parking_lot::Mutex;
 use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::client::Client;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
-use crate::config::Config;
 use crate::errors::MessageHandlerError;
 use crate::messages::encoder::TextMessage;
 use crate::messages::{Message, WriteMessageExt};
+use shitspeak_runtime_config::Config;
 
 const AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
 

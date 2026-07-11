@@ -4,14 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::constants::APP_PROTO_VER;
-use crate::protocol_version::ProtocolVersion;
-use crate::types::NodeIdentifier;
-
 use config::{Config as ConfigCrate, Environment, File};
 use serde::{Deserialize, Deserializer};
-
-use crate::geoip::NodeGeo;
+use shitspeak_core::{NodeGeo, NodeIdentifier, ProtocolVersion, constants::APP_PROTO_VER};
 use shitspeak_s2s::application::ApplicationConfig;
 use shitspeak_s2s::overlay::OverlayTuning;
 use shitspeak_s2s::replications::ReplicationTuning;

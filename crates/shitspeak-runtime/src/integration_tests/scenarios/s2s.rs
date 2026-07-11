@@ -14,10 +14,7 @@ use futures_util::{
     stream::{FuturesUnordered, StreamExt},
 };
 
-use crate::ban_repository::{BanEntry, BanOp};
-use crate::channels::Channel;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
-use crate::config::{S2sConfig, S2sSeedAddressConfig, S2sTransportKindConfig};
 use crate::integration_tests::harness::{
     TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
     spawn_s2s_test_server_with_config, test_client::ConnectError,
@@ -29,6 +26,7 @@ use crate::voice::codec::AudioPayload;
 use crate::voice::metrics::{
     VoiceRouteKind, VoiceRouteSource, route_metric_snapshot, route_resolution_metric_snapshot,
 };
+use shitspeak_runtime_config::{S2sConfig, S2sSeedAddressConfig, S2sTransportKindConfig};
 use shitspeak_s2s::testing::{
     LinkChaos, MessageType, Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port,
     s2s_network_test_guard, wait_until,
@@ -36,6 +34,8 @@ use shitspeak_s2s::testing::{
 use shitspeak_s2s_transport::{
     MessageClass, PeerAddress, SendOptions, ServiceLevel, TransportKind,
 };
+use shitspeak_state::Channel;
+use shitspeak_state::{BanEntry, BanOp};
 
 const S2S_DEADLINE: Duration = Duration::from_secs(10);
 const CLIENT_DEADLINE: Duration = Duration::from_secs(4);
@@ -1866,7 +1866,7 @@ async fn s2s_targeted_normal_voice_routes_to_linked_channel() {
             LINKED_CHANNEL,
         )
         .await
-        .contains(crate::acl::ACLPermissions::Speak)
+        .contains(shitspeak_state::ACLPermissions::Speak)
     );
 
     bob.drain_now().await;
@@ -1993,7 +1993,7 @@ async fn s2s_cross_node_voice_target_shouts_to_linked_channel() {
         LINKED_CHANNEL,
     )
     .await;
-    assert!(linked_permissions.contains(crate::acl::ACLPermissions::Whisper));
+    assert!(linked_permissions.contains(shitspeak_state::ACLPermissions::Whisper));
     let local_bob = b
         .server
         .get_clients()
@@ -2896,7 +2896,7 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
 
     a.server
         .get_channels()
-        .create_channel(crate::channels::Channel::new(
+        .create_channel(shitspeak_state::Channel::new(
             42,
             "Elected Lobby".to_owned(),
             0,
@@ -2907,7 +2907,7 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
         .expect("create A channel 42");
     a.server
         .get_channels()
-        .create_channel(crate::channels::Channel::new(
+        .create_channel(shitspeak_state::Channel::new(
             43,
             "Elected Annex".to_owned(),
             1,
@@ -2918,7 +2918,7 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
         .expect("create A channel 43");
     b.server
         .get_channels()
-        .create_channel(crate::channels::Channel::new(
+        .create_channel(shitspeak_state::Channel::new(
             84,
             "Discarded Lobby".to_owned(),
             0,
@@ -3250,14 +3250,14 @@ async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
     wait_for_convergence_cluster(&cluster).await;
     println!("lag-diagnostic setup: full mesh converged without injected latency");
 
-    let diagnostic_channel = crate::channels::Channel::new(
+    let diagnostic_channel = shitspeak_state::Channel::new(
         S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
         "Lag Diagnostic",
         0,
         0,
         Some(0),
     );
-    let diagnostic_channel_op = crate::channel_repository::ChannelOp::CreateChannel {
+    let diagnostic_channel_op = shitspeak_state::ChannelOp::CreateChannel {
         channel: diagnostic_channel,
     };
     assert!(
@@ -3880,7 +3880,7 @@ async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
 
     a.server
         .get_channels()
-        .create_channel(crate::channels::Channel::new(
+        .create_channel(shitspeak_state::Channel::new(
             42,
             "S2S Lobby".to_owned(),
             0,

@@ -14,6 +14,7 @@ use parking_lot::{
     RwLockReadGuard as ParkingRwLockReadGuard, RwLockWriteGuard as ParkingRwLockWriteGuard,
 };
 use rustls::pki_types::CertificateDer;
+use shitspeak_client_crypto::{CryptError, CryptState};
 use socket2::Socket;
 use tokio::{
     io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
@@ -27,7 +28,7 @@ use crate::{
     client::{
         client_global_state::ClientGlobalState, client_local_state::ClientLocalState,
         client_session_identifier::ClientSessionIdentifier, client_stats::ClientStats,
-        crypt::CryptState, global_state_guard::GlobalStateWriteGuard, options::ClientOptions,
+        global_state_guard::GlobalStateWriteGuard, options::ClientOptions,
         user_info::UserInfoExtended, voice_target::VoiceTarget,
     },
     client_repository::ClientRepository,
@@ -92,8 +93,7 @@ pub type ClientInstanceId = u64;
 pub type ClientStateSubscription = tokio::sync::broadcast::Receiver<
     std::sync::Arc<crate::client::state_log::ClientStateBroadcastPayload>,
 >;
-pub type StagedChannelStateSubscription =
-    (u64, crate::channel_repository::ChannelStateSubscription);
+pub type StagedChannelStateSubscription = (u64, shitspeak_state::ChannelStateSubscription);
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PostAuthBaseline {
@@ -694,7 +694,7 @@ impl Client {
     pub fn stage_channel_state_subscription(
         &self,
         version: u64,
-        rx: crate::channel_repository::ChannelStateSubscription,
+        rx: shitspeak_state::ChannelStateSubscription,
     ) {
         *self.pending_channel_state_subscription.lock() = Some((version, rx));
     }
@@ -1355,7 +1355,7 @@ impl Client {
             .try_lock_until(std::time::Instant::now() + std::time::Duration::from_millis(10))
     }
 
-    pub fn create_crypt_state(&self, mode: &str) -> Result<(), crate::client::crypt::CryptError> {
+    pub fn create_crypt_state(&self, mode: &str) -> Result<(), CryptError> {
         let mut state = self.crypt_state.lock();
         let rng = aws_lc_rs::rand::SystemRandom::new();
         *state = Some(CryptState::generate(mode, &rng)?);

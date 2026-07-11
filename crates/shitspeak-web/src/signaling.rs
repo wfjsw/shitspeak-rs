@@ -22,10 +22,10 @@ use shitspeak_runtime::client::client_session_identifier::ClientSessionIdentifie
 use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOperation};
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
-use shitspeak_runtime::config::{WebAuthMode, WebConfig};
 use shitspeak_runtime::messages::Message;
 use shitspeak_runtime::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
 use shitspeak_runtime::server::Server;
+use shitspeak_runtime_config::{WebAuthMode, WebConfig};
 
 pub const ALPN_HTTP_1_1: &[u8] = b"http/1.1";
 pub const ALPN_MUMBLE: &[u8] = b"mumble";
@@ -473,11 +473,8 @@ struct SignalingSession {
             Arc<shitspeak_runtime::client::state_log::ClientStateBroadcastPayload>,
         >,
     >,
-    channel_log_rx: Option<
-        tokio::sync::broadcast::Receiver<
-            Arc<shitspeak_runtime::channel_repository::ChannelOperation>,
-        >,
-    >,
+    channel_log_rx:
+        Option<tokio::sync::broadcast::Receiver<Arc<shitspeak_state::ChannelOperation>>>,
     channel_shadow: SessionChannelShadow,
     user_visibility: UserVisibilityState,
     peer: Option<WebRtcPeer>,
@@ -591,7 +588,7 @@ where
                     Some(rx) => Some(rx.recv().await),
                     None => std::future::pending::<Option<
                         Result<
-                            Arc<shitspeak_runtime::channel_repository::ChannelOperation>,
+                            Arc<shitspeak_state::ChannelOperation>,
                             tokio::sync::broadcast::error::RecvError,
                         >,
                     >>().await,
@@ -1023,7 +1020,7 @@ mod gateway_config_tests {
     fn config_with_moq(enabled: bool, listen: Option<SocketAddr>) -> WebConfig {
         WebConfig {
             enabled: true,
-            moq: shitspeak_runtime::config::WebMoqConfig {
+            moq: shitspeak_runtime_config::WebMoqConfig {
                 enabled,
                 listen,
                 public_url: Some("https://voice.example.test/web/moq".to_string()),
@@ -1458,7 +1455,7 @@ async fn send_web_channel_log_update(
     stream: &mut (impl AsyncWrite + Unpin),
     context: &SignalingContext,
     session: &mut SignalingSession,
-    op: Arc<shitspeak_runtime::channel_repository::ChannelOperation>,
+    op: Arc<shitspeak_state::ChannelOperation>,
 ) -> io::Result<()> {
     let Some(server) = context.server.as_ref().cloned() else {
         return Ok(());
@@ -2322,7 +2319,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let signaling = SignalingServer::new(WebConfig {
             enabled: true,
-            auth: shitspeak_runtime::config::WebAuthConfig {
+            auth: shitspeak_runtime_config::WebAuthConfig {
                 password_enabled: false,
                 modes: Vec::new(),
                 ..Default::default()
@@ -2385,7 +2382,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let signaling = SignalingServer::new(WebConfig {
             enabled: true,
-            auth: shitspeak_runtime::config::WebAuthConfig {
+            auth: shitspeak_runtime_config::WebAuthConfig {
                 password_enabled: false,
                 modes: Vec::new(),
                 ..Default::default()
@@ -2627,13 +2624,7 @@ mod tests {
         let server = test_server_with_authenticator(TestAuthenticator::default_session()).await;
         server
             .get_channels()
-            .create_channel(shitspeak_runtime::channels::Channel::new(
-                1,
-                "Lobby",
-                0,
-                0,
-                Some(0),
-            ))
+            .create_channel(shitspeak_state::Channel::new(1, "Lobby", 0, 0, Some(0)))
             .await
             .unwrap();
 
@@ -2890,7 +2881,7 @@ mod tests {
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
 
-        let config = shitspeak_runtime::config::Config {
+        let config = shitspeak_runtime_config::Config {
             listen: "127.0.0.1:0".into(),
             server_entrypoints: Vec::new(),
             register_name: "test".into(),
@@ -2907,9 +2898,9 @@ mod tests {
             allowed_proxies: Vec::new(),
             min_client_version: 0,
             max_users: 100,
-            authenticator: shitspeak_runtime::config::AuthenticatorConfig::default(),
-            observability: shitspeak_runtime::config::ObservabilityConfig::default(),
-            geoip: shitspeak_runtime::config::GeoIpConfig::default(),
+            authenticator: shitspeak_runtime_config::AuthenticatorConfig::default(),
+            observability: shitspeak_runtime_config::ObservabilityConfig::default(),
+            geoip: shitspeak_runtime_config::GeoIpConfig::default(),
             welcome_text: None,
             max_bandwidth: 72_000,
             allow_html: true,
@@ -2926,7 +2917,7 @@ mod tests {
             channel_wal_compaction_expire_count: 2_000,
             udp_voice_enabled: false,
             udp_ping_enabled: false,
-            udp_ping_user_count_scope: shitspeak_runtime::config::UdpPingUserCountScope::Cluster,
+            udp_ping_user_count_scope: shitspeak_runtime_config::UdpPingUserCountScope::Cluster,
             udp_channel_size: 2_048,
             client_idle_timeout_secs: 30,
             authenticate_timeout_ms: 30_000,
@@ -2936,11 +2927,11 @@ mod tests {
             send_permission_info: false,
             hide_users_without_traverse: false,
             show_node_id_for_superusers: true,
-            acl: shitspeak_runtime::config::AclConfig::default(),
-            privacy: shitspeak_runtime::config::PrivacyConfig::default(),
-            s2s: shitspeak_runtime::config::S2sConfig::default(),
+            acl: shitspeak_runtime_config::AclConfig::default(),
+            privacy: shitspeak_runtime_config::PrivacyConfig::default(),
+            s2s: shitspeak_runtime_config::S2sConfig::default(),
             web: WebConfig::default(),
-            voice: shitspeak_runtime::config::VoiceTuning::default(),
+            voice: shitspeak_runtime_config::VoiceTuning::default(),
         };
 
         Server::new(config, authenticator).await.unwrap()

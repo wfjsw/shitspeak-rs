@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::GeoIpConfig;
 use parking_lot::Mutex;
 pub use shitspeak_core::{NodeGeo, valid_coordinates};
+use shitspeak_runtime_config::GeoIpConfig;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IpGeoMetadata {

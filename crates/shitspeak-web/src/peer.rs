@@ -36,11 +36,11 @@ use crate::voice::{
 use shitspeak_runtime::client::AsyncMessageHandlerExt;
 use shitspeak_runtime::client::Client;
 use shitspeak_runtime::client::client_session_identifier::ClientSessionIdentifier;
-use shitspeak_runtime::config::{WebRtcConfig, WebRtcIceServerConfig};
 use shitspeak_runtime::messages::Message;
 use shitspeak_runtime::messages::encoder::AudioTarget;
 use shitspeak_runtime::server::Server;
 use shitspeak_runtime::voice::codec::{Audio, AudioPayload, OpusPayload, PacketFormat};
+use shitspeak_runtime_config::{WebRtcConfig, WebRtcIceServerConfig};
 
 const CONTROL_LABEL: &str = "shitspeak-control";
 const OPUS_FRAME_DURATION: Duration = Duration::from_millis(20);
@@ -710,7 +710,7 @@ fn webrtc_error(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use shitspeak_runtime::config::WebRtcIceServerConfig;
+    use shitspeak_runtime_config::WebRtcIceServerConfig;
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
     fn install_crypto_provider() {

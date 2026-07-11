@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, RwLock as StdRwLock, Weak};
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock as ParkingRwLock};
@@ -13,9 +14,6 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
-use crate::channel_repository::{
-    ChannelOp, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
-};
 use crate::client::Client;
 use crate::errors::MessageHandlerError;
 use crate::geoip::{GeoIpResolver, IpGeoMetadata};
@@ -24,10 +22,13 @@ use crate::user_channel_cache::UserChannelCache;
 use crate::{
     client_repository::ClientRepository,
     codec_info::CodecInfo,
-    config::{CertificateHashProtection, Config, UdpPingUserCountScope},
     constants::MTU,
     s2s::S2SManager,
     types::{NodeIdentifier, default_server_id},
+};
+use shitspeak_runtime_config::{CertificateHashProtection, Config, UdpPingUserCountScope};
+use shitspeak_state::{
+    ChannelOp, ChannelRepoTuning, ChannelRepository, ChannelRepositoryObserver, ChannelRootConfig,
 };
 
 mod auth_finalization;
@@ -63,6 +64,70 @@ const UDP_PROCESSING_MIN_HARD_CAPACITY: usize =
     UDP_PROCESSING_MIN_BASELINE_CAPACITY * UDP_PROCESSING_BURST_MULTIPLIER;
 const UDP_PROCESSING_PACKETS_PER_USER_HARD_CAP: usize = 128;
 
+fn channel_repo_tuning(config: &Config) -> ChannelRepoTuning {
+    ChannelRepoTuning {
+        log_max_entries: config.channel_log_max_entries.max(1),
+        snapshot_every_ops: config.channel_snapshot_every_ops.max(1),
+        snapshot_every_secs: config.channel_snapshot_every_secs.max(1),
+        wal_compaction_expire_count: config.channel_wal_compaction_expire_count,
+    }
+}
+
+fn channel_root_config(config: &Config) -> ChannelRootConfig {
+    ChannelRootConfig::new(config.root_channel_name.clone())
+}
+
+struct ClientRepositoryChannelObserver {
+    clients: Weak<ClientRepository>,
+}
+
+#[async_trait::async_trait]
+impl ChannelRepositoryObserver for ClientRepositoryChannelObserver {
+    async fn channel_version_advanced(&self, server_id: &str, channel_version: u64) {
+        if let Some(clients) = self.clients.upgrade() {
+            clients.drain_pending_ops(server_id, channel_version).await;
+        }
+    }
+
+    async fn repair_missing_channels(
+        &self,
+        server_id: &str,
+        valid_channel_ids: &HashSet<u32>,
+        channel_version: u64,
+    ) -> usize {
+        let Some(clients) = self.clients.upgrade() else {
+            return 0;
+        };
+
+        let mut repaired = 0;
+        for client in clients.get_local_clients_in_server(server_id).await {
+            let missing_listeners: Vec<u32> = client
+                .get_listening_channel_ids()
+                .into_iter()
+                .filter(|channel_id| !valid_channel_ids.contains(channel_id))
+                .collect();
+            let missing_current = !valid_channel_ids.contains(&client.get_current_channel_id());
+            if !missing_current && missing_listeners.is_empty() {
+                continue;
+            }
+
+            let mut state = client.write_global_state_as(
+                &clients,
+                Some(client.get_session_id()),
+                Some(channel_version),
+            );
+            if missing_current {
+                state.set_current_channel_id(0);
+            }
+            for channel_id in missing_listeners {
+                state.unlisten_channel(channel_id);
+            }
+            repaired += 1;
+        }
+        repaired
+    }
+}
+
 #[cfg(test)]
 use auth_finalization::{AuthFinalizationAdmission, should_send_auth_finalization_queue_notice};
 #[cfg(test)]
@@ -96,7 +161,7 @@ pub struct Server {
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
     user_channel_cache: Arc<UserChannelCache>,
-    bans: Arc<crate::ban_repository::BanRepository>,
+    bans: Arc<shitspeak_state::BanRepository>,
 
     codec_info: Mutex<CodecInfo>,
 
@@ -163,8 +228,8 @@ impl Server {
         let node_id = config.local_node_id().map_err(std::io::Error::other)?;
         let client_log_max_entries = config.client_log_max_entries;
         let auth_finalization_concurrency = config.auth_finalization_concurrency.max(1);
-        let channel_repo_tuning = ChannelRepoTuning::from(&config);
-        let channel_root_config = ChannelRootConfig::from(&config);
+        let channel_repo_tuning = channel_repo_tuning(&config);
+        let channel_root_config = channel_root_config(&config);
         let (channels, channel_blobs, session_blobs, user_channel_cache, bans) = match &config
             .blob_storage_dir
         {
@@ -175,7 +240,7 @@ impl Server {
                 let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
                 let user_channel_cache = UserChannelCache::open(dir).await?;
-                let ban_repo = crate::ban_repository::BanRepository::open(node_id, dir).await?;
+                let ban_repo = shitspeak_state::BanRepository::open(node_id, dir).await?;
                 (ch_repo, ch_blobs, s_blobs, user_channel_cache, ban_repo)
             }
             None => {
@@ -190,7 +255,7 @@ impl Server {
                 let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
                 let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
                 let user_channel_cache = UserChannelCache::new_in_memory();
-                let ban_repo = crate::ban_repository::BanRepository::new_in_memory(node_id);
+                let ban_repo = shitspeak_state::BanRepository::new_in_memory(node_id);
                 (ch_repo, ch_blobs, s_blobs, user_channel_cache, ban_repo)
             }
         };
@@ -239,8 +304,9 @@ impl Server {
         // ClientRepository to drain pending ops after remote channel ops.
         server
             .channels
-            .set_client_repo(server.clients.clone())
-            .await;
+            .set_observer(Arc::new(ClientRepositoryChannelObserver {
+                clients: Arc::downgrade(&server.clients),
+            }));
 
         Ok(server)
     }
@@ -1339,7 +1405,7 @@ impl Server {
                         .expired_pending_deletes_in_server(&server_id, timeout_ms as i64)
                         .await;
                     for (channel_id, nonce) in expired {
-                        let op = crate::channel_repository::ChannelOp::CancelPendingDelete {
+                        let op = shitspeak_state::ChannelOp::CancelPendingDelete {
                             id: channel_id,
                             nonce,
                         };
@@ -1399,7 +1465,7 @@ impl Server {
                             current.root_channel_name,
                             new_config.root_channel_name
                         );
-                        root_channel_config_update = Some(ChannelRootConfig::from(&new_config));
+                        root_channel_config_update = Some(channel_root_config(&new_config));
                     }
                     if current.max_bandwidth != new_config.max_bandwidth {
                         tracing::info!(
@@ -1614,7 +1680,7 @@ impl Server {
         self.auth_finalization_queue.authenticator()
     }
 
-    pub fn get_bans(&self) -> &Arc<crate::ban_repository::BanRepository> {
+    pub fn get_bans(&self) -> &Arc<shitspeak_state::BanRepository> {
         &self.bans
     }
 
@@ -1683,7 +1749,7 @@ impl Server {
         &self,
         client: &Client,
         mode: &str,
-    ) -> Result<(), crate::client::crypt::CryptError> {
+    ) -> Result<(), shitspeak_client_crypto::CryptError> {
         let permit = self
             .crypt_setup_semaphore
             .clone()
@@ -1774,7 +1840,7 @@ impl Server {
                 client.get_current_channel_id(),
             )
             .await;
-            let suppress = !permissions.contains(crate::acl::ACLPermissions::Speak);
+            let suppress = !permissions.contains(shitspeak_state::ACLPermissions::Speak);
             {
                 let mut state =
                     client.write_global_state_as(self.get_clients(), None, Some(channel_version));

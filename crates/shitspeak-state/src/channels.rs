@@ -1,8 +1,8 @@
-use std::{borrow::Cow, collections::HashSet};
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::acl::ACL;
+use crate::ACL;
 
 /// Replicated two-phase delete marker for a channel subtree.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -16,10 +16,10 @@ use shitspeak_runtime::channel_handler::SessionChannelShadow;
 use shitspeak_runtime::client::user_info::Credential;
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
-use shitspeak_runtime::config::{WebAuthMode, WebConfig};
 use shitspeak_runtime::messages::Message;
 use shitspeak_runtime::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
 use shitspeak_runtime::server::Server;
+use shitspeak_runtime_config::{WebAuthMode, WebConfig};
 
 #[derive(Clone)]
 pub struct WebSessionContext {

@@ -2,14 +2,14 @@
 
 use std::time::Duration;
 
-use crate::acl::{ACL, ACLPermissions};
 use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow, replay_channel_log_gap};
-use crate::channels::Channel;
 use crate::client::visibility::UserVisibilityState;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
 use crate::messages::encoder::{ChannelState, DenyType};
 use crate::types::DEFAULT_SERVER_ID;
+use shitspeak_state::Channel;
+use shitspeak_state::{ACL, ACLPermissions};
 
 async fn create_channel_and_wait(
     client: &TestClient,

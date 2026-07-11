@@ -11,7 +11,6 @@ use tracing::Instrument;
 use crate::channel_handler::{
     ChannelReplayError, ChannelTreeShadow, SessionChannelShadow, replay_channel_log_gap,
 };
-use crate::channel_repository::{ChannelOp, ChannelOperation};
 use crate::client::{
     AsyncMessageHandlerExt, Client, ClientInstanceId, ClientOutboundMessage,
     client_session_identifier::ClientSessionIdentifier,
@@ -30,6 +29,7 @@ use crate::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::consume_proxy_protocol_connection_info;
 use crate::types::default_server_id;
 use crate::utils::{recv_mpsc_optional, recv_optional};
+use shitspeak_state::{ChannelOp, ChannelOperation};
 
 use super::Server;
 use super::entrypoints::normalize_sni_name;

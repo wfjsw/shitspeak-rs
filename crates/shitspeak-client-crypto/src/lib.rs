@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 mod aes_backend;
 mod crypt_state;
 mod crypto_mode;

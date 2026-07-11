@@ -1,4 +1,4 @@
-use crate::client::crypt::errors::CryptError;
+use crate::errors::CryptError;
 
 pub trait CryptoMode: Send + Sync {
     fn nonce_size(&self) -> usize;

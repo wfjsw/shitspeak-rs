@@ -11,7 +11,6 @@ use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use crate::client::{
     Client, client_session_identifier::ClientSessionIdentifier, visibility::UserVisibilityState,
 };
-use crate::config::{AuthenticatorConfig, Config, ServerEntrypointConfig, UdpPingUserCountScope};
 use crate::localization::Language;
 use crate::messages::encoder::TextMessage;
 use crate::messages::{Message, WriteMessageExt};
@@ -19,6 +18,9 @@ use crate::types::DEFAULT_SERVER_ID;
 use crate::voice::codec::PacketFormat;
 use crate::voice::ping::PingRequest;
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject as _};
+use shitspeak_runtime_config::{
+    AuthenticatorConfig, Config, ServerEntrypointConfig, UdpPingUserCountScope,
+};
 use tokio_rustls::TlsConnector;
 
 struct TestAuthenticator;
@@ -72,8 +74,8 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         min_client_version: 0,
         max_users: 100,
         authenticator: AuthenticatorConfig::default(),
-        observability: crate::config::ObservabilityConfig::default(),
-        geoip: crate::config::GeoIpConfig::default(),
+        observability: shitspeak_runtime_config::ObservabilityConfig::default(),
+        geoip: shitspeak_runtime_config::GeoIpConfig::default(),
         welcome_text: None,
         max_bandwidth: 72_000,
         allow_html: true,
@@ -92,7 +94,7 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         udp_ping_enabled: false,
         udp_ping_user_count_scope: UdpPingUserCountScope::Cluster,
         udp_channel_size: 2_048,
-        voice: crate::config::VoiceTuning::default(),
+        voice: shitspeak_runtime_config::VoiceTuning::default(),
         client_idle_timeout_secs: 30,
         authenticate_timeout_ms: 30_000,
         auth_finalization_concurrency: 4,
@@ -101,10 +103,10 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         send_permission_info: false,
         hide_users_without_traverse: false,
         show_node_id_for_superusers: true,
-        acl: crate::config::AclConfig::default(),
-        s2s: crate::config::S2sConfig::default(),
-        web: crate::config::WebConfig::default(),
-        privacy: crate::config::PrivacyConfig::default(),
+        acl: shitspeak_runtime_config::AclConfig::default(),
+        s2s: shitspeak_runtime_config::S2sConfig::default(),
+        web: shitspeak_runtime_config::WebConfig::default(),
+        privacy: shitspeak_runtime_config::PrivacyConfig::default(),
     }
 }
 

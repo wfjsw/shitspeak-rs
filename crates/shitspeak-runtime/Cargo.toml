@@ -41,10 +41,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 shitspeak-auth = { workspace = true }
 shitspeak-core = { workspace = true }
+shitspeak-client-crypto = { workspace = true }
 shitspeak-messages = { workspace = true }
 shitspeak-proto = { workspace = true }
+shitspeak-runtime-config = { workspace = true }
 shitspeak-s2s = { workspace = true }
 shitspeak-s2s-transport = { workspace = true, features = ["test-support"] }
+shitspeak-state = { workspace = true }
 shitspeak-voice = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }

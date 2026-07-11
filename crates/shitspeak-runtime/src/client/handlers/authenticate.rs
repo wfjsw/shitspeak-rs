@@ -311,7 +311,7 @@ pub async fn handle_authenticate(
     if !sender.is_superuser() {
         let root_perms =
             crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
-        if !root_perms.contains(crate::acl::ACLPermissions::Traverse) {
+        if !root_perms.contains(shitspeak_state::ACLPermissions::Traverse) {
             tracing::trace!(
                 session = u32::from(session),
                 "Authenticate built outbound Reject payload"
@@ -357,7 +357,7 @@ pub async fn handle_authenticate(
             for channel_id in &restored_channels.listening_channel_ids {
                 gs.listen_channel(*channel_id);
             }
-            gs.set_suppress(!initial_perms.contains(crate::acl::ACLPermissions::Speak));
+            gs.set_suppress(!initial_perms.contains(shitspeak_state::ACLPermissions::Speak));
         }
         if let Some(cache_key) = channel_cache_key.as_deref() {
             if let Err(error) = server

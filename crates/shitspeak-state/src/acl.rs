@@ -1,7 +1,7 @@
 use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
 
-use crate::client::group::{
+use crate::{
     ChannelHierarchy, ClientMembershipQuery, group_depends_on_home_channel, is_member_in_group,
 };
 
@@ -107,8 +107,8 @@ fn root_only_permissions() -> BitFlags<ACLPermissions> {
 /// ACL entries in list order. Later ACL entries overwrite earlier decisions for
 /// the same permission bit.
 pub fn evaluate_permission(
-    channel: &crate::channels::Channel,
-    ancestors: &[crate::channels::Channel],
+    channel: &crate::Channel,
+    ancestors: &[crate::Channel],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
 ) -> BitFlags<ACLPermissions> {
@@ -116,9 +116,9 @@ pub fn evaluate_permission(
 }
 
 /// Evaluate permissions with configurable ACL compatibility behavior.
-pub(crate) fn evaluate_permission_with_behavior(
-    channel: &crate::channels::Channel,
-    ancestors: &[crate::channels::Channel],
+pub fn evaluate_permission_with_behavior(
+    channel: &crate::Channel,
+    ancestors: &[crate::Channel],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
     explicit_enter_deny_overrides_write: bool,
@@ -191,10 +191,10 @@ pub(crate) fn evaluate_permission_with_behavior(
 }
 
 fn effective_acl_chain<'a>(
-    channel: &'a crate::channels::Channel,
-    ancestors: &'a [crate::channels::Channel],
-) -> Vec<&'a crate::channels::Channel> {
-    let mut inherited: Vec<&crate::channels::Channel> = Vec::new();
+    channel: &'a crate::Channel,
+    ancestors: &'a [crate::Channel],
+) -> Vec<&'a crate::Channel> {
+    let mut inherited: Vec<&crate::Channel> = Vec::new();
     for ancestor in ancestors.iter().rev() {
         inherited.push(ancestor);
         if !ancestor.inherit_acl {
@@ -211,8 +211,8 @@ fn effective_acl_chain<'a>(
 }
 
 fn any_applicable_effective_acl(
-    channel: &crate::channels::Channel,
-    ancestors: &[crate::channels::Channel],
+    channel: &crate::Channel,
+    ancestors: &[crate::Channel],
     mut predicate: impl FnMut(&ACL, ChannelHierarchy<'_>, ChannelHierarchy<'_>) -> bool,
 ) -> bool {
     let target_id = channel.id;
@@ -242,9 +242,9 @@ fn any_applicable_effective_acl(
     false
 }
 
-pub(crate) fn effective_acl_chain_has_home_channel_dependent_group(
-    channel: &crate::channels::Channel,
-    ancestors: &[crate::channels::Channel],
+pub fn effective_acl_chain_has_home_channel_dependent_group(
+    channel: &crate::Channel,
+    ancestors: &[crate::Channel],
 ) -> bool {
     any_applicable_effective_acl(channel, ancestors, |acl, _, _| {
         acl.group
@@ -253,9 +253,9 @@ pub(crate) fn effective_acl_chain_has_home_channel_dependent_group(
     })
 }
 
-pub(crate) fn effective_acl_chain_home_channel_match_changes(
-    channel: &crate::channels::Channel,
-    ancestors: &[crate::channels::Channel],
+pub fn effective_acl_chain_home_channel_match_changes(
+    channel: &crate::Channel,
+    ancestors: &[crate::Channel],
     old_home: ChannelHierarchy<'_>,
     new_home: ChannelHierarchy<'_>,
 ) -> bool {
@@ -296,8 +296,8 @@ pub(crate) fn effective_acl_chain_home_channel_match_changes(
 /// Check whether the effective ACL chain has any deny rules on the given permission.
 /// Used to compute `is_enter_restricted` for `ChannelState` messages.
 pub fn channel_has_effective_restriction(
-    channel: &crate::channels::Channel,
-    ancestors: &[crate::channels::Channel],
+    channel: &crate::Channel,
+    ancestors: &[crate::Channel],
     perm: ACLPermissions,
 ) -> bool {
     any_applicable_effective_acl(channel, ancestors, |acl, _, _| {
@@ -308,8 +308,8 @@ pub fn channel_has_effective_restriction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::Channel;
-    use crate::client::group::{ChannelHierarchy, ClientMembershipQuery};
+    use crate::Channel;
+    use crate::{ChannelHierarchy, ClientMembershipQuery};
 
     fn membership<'a>(
         home_channel_id: u32,

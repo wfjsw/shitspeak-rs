@@ -1,6 +1,6 @@
+use shitspeak_state::{ACL, ACLPermissions, ChannelOp};
+
 use crate::{
-    acl::{ACL, ACLPermissions},
-    channel_repository::ChannelOp,
     client::Client,
     errors::MessageHandlerError,
     localization::{TextKey, text},
@@ -74,7 +74,7 @@ pub async fn handle_acl(
             .await;
 
         let mut flattened_acls: Vec<ChanAcl> = Vec::with_capacity((ancestors.len() + 1) * 5);
-        let mut chain: Vec<&crate::channels::Channel> = Vec::with_capacity(ancestors.len() + 1);
+        let mut chain: Vec<&shitspeak_state::Channel> = Vec::with_capacity(ancestors.len() + 1);
         chain.push(&channel);
         if channel.inherit_acl {
             for ancestor in &ancestors {
@@ -180,8 +180,8 @@ pub async fn handle_acl(
                         .collect()
                 };
                 let home_channel =
-                    crate::client::group::ChannelHierarchy::new(home_channel_id, &home_ancestors);
-                let membership = crate::client::group::ClientMembershipQuery::new(
+                    shitspeak_state::ChannelHierarchy::new(home_channel_id, &home_ancestors);
+                let membership = shitspeak_state::ClientMembershipQuery::new(
                     &group_refs,
                     user_id.is_some(),
                     &token_refs,
@@ -191,8 +191,12 @@ pub async fn handle_acl(
                 )
                 .with_home_channel(home_channel);
 
-                let post_write =
-                    crate::acl::evaluate_permission(&channel, &ancestors, user_id, &membership);
+                let post_write = shitspeak_state::evaluate_permission(
+                    &channel,
+                    &ancestors,
+                    user_id,
+                    &membership,
+                );
                 if !post_write.contains(ACLPermissions::Write) {
                     if let Some(uid) = user_id {
                         new_acls.push(ACL {

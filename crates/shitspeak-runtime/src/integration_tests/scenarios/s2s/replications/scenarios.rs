@@ -13,10 +13,6 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 use super::harness::ReplCluster;
-use crate::channel_repository::{
-    ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
-};
-use crate::channels::Channel;
 use shitspeak_s2s::replications::proto::{
     self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG,
 };
@@ -28,6 +24,10 @@ use shitspeak_s2s::replications::{
 use shitspeak_s2s::testing::chaos::MessageType;
 use shitspeak_s2s::testing::{wait_for_full_routing, wait_until};
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
+use shitspeak_state::Channel;
+use shitspeak_state::{
+    ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
+};
 
 #[derive(Clone)]
 struct TestChannelReplicationAdapter {

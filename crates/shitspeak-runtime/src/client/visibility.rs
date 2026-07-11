@@ -2,9 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::acl::ACLPermissions;
 use crate::channel_handler::SessionChannelShadow;
-use crate::channel_repository::{ChannelOp, ChannelOperation};
 use crate::client::Client;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
@@ -12,6 +10,8 @@ use crate::messages::Message;
 use crate::messages::encoder::{UserRemove, UserState};
 use crate::server::Server;
 use parking_lot::RwLock as ParkingRwLock;
+use shitspeak_state::ACLPermissions;
+use shitspeak_state::{ChannelOp, ChannelOperation};
 
 const DELETE_FANOUT_CACHE_MAX_ENTRIES: usize = 128;
 const SUPERUSER_NODE_DISPLAY_TRAIT_PREFIX: &str = " [n";

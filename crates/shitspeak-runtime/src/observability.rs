@@ -14,17 +14,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::channel_repository::ChannelRepository;
 use crate::client_repository::ClientRepository;
-use crate::config::{MetricsConfig, RemoteWriteConfig};
 use crate::constants;
 use crate::geoip::NodeGeo;
 use crate::http_client;
 use crate::s2s::S2SManager;
 use crate::types::DEFAULT_SERVER_ID;
+use shitspeak_runtime_config::{MetricsConfig, RemoteWriteConfig};
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::status::{self, PrometheusSample};
 use shitspeak_s2s_transport::ConnectionManager;
+use shitspeak_state::ChannelRepository;
 
 #[async_trait]
 pub trait S2sMetricsSource: Send + Sync + 'static {

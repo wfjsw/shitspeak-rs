@@ -1,6 +1,6 @@
 use aws_lc_rs::rand::SecureRandom;
 
-use crate::client::crypt::{CryptoMode, aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops};
+use crate::{CryptoMode, aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops};
 
 const BLOCK_SIZE: usize = 16;
 /// Hard upper bound on plaintext we ever encrypt in one OCB2 call. The Mumble

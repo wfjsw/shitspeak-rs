@@ -6,7 +6,7 @@ use rustls::version::{TLS12, TLS13};
 use tokio_rustls::TlsAcceptor;
 
 use crate::client_certificate_verifier::ClientCertificateVerifier;
-use crate::config::Config;
+use shitspeak_runtime_config::Config;
 
 use super::extensions::{ALPN_MUMBLE, ServerExtensions};
 

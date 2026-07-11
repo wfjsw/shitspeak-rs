@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::acl::{ACL, ACLPermissions};
-use crate::channels::{Channel, ChannelPatch};
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use crate::messages::Message;
 use crate::messages::encoder::{
     Authenticate, CLIENT_PERMISSION_CACHE_BIT, ChanAcl, ClientType, PluginDataTransmission,
     TextMessage, UserState, UserStats, VoiceTarget,
 };
+use shitspeak_state::{ACL, ACLPermissions};
+use shitspeak_state::{Channel, ChannelPatch};
 
 /// Checks that ACL denial prevents a non-admin from entering a channel.
 /// Expected: Bob receives `PermissionDenied` for the private channel and no

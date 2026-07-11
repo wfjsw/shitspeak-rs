@@ -1,0 +1,27 @@
+[package]
+name = "shitspeak-state"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+cidr = { workspace = true }
+enumflags2 = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+rusqlite = { workspace = true }
+scc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shitspeak-core = { workspace = true }
+shitspeak-messages = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rmp-serde = { workspace = true }
+tempfile = { workspace = true }

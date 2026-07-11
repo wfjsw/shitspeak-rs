@@ -23,16 +23,18 @@ pub fn remapped_certificate_hash_hex(secret: &str, certificate_hash_hex: &str) -
 }
 
 pub fn protected_certificate_hash_hex(
-    protection: crate::config::CertificateHashProtection,
+    protection: shitspeak_runtime_config::CertificateHashProtection,
     secret: &str,
     certificate_hash_hex: &str,
 ) -> Option<String> {
     match protection {
-        crate::config::CertificateHashProtection::Disabled => Some(certificate_hash_hex.to_owned()),
-        crate::config::CertificateHashProtection::Irreversible => {
+        shitspeak_runtime_config::CertificateHashProtection::Disabled => {
+            Some(certificate_hash_hex.to_owned())
+        }
+        shitspeak_runtime_config::CertificateHashProtection::Irreversible => {
             remapped_certificate_hash_hex(secret, certificate_hash_hex)
         }
-        crate::config::CertificateHashProtection::Reversible => {
+        shitspeak_runtime_config::CertificateHashProtection::Reversible => {
             reversible_certificate_hash_hex(secret, certificate_hash_hex)
         }
     }
@@ -116,7 +118,7 @@ pub fn protect_user_state_certificate_hash(
     state: &mut UserState,
     viewer_is_superuser: bool,
     viewer_session: crate::client::client_session_identifier::ClientSessionIdentifier,
-    protection: crate::config::CertificateHashProtection,
+    protection: shitspeak_runtime_config::CertificateHashProtection,
     secret: Option<&str>,
 ) {
     if !protection.is_enabled() || viewer_is_superuser || state.session == Some(viewer_session) {
@@ -138,7 +140,7 @@ pub fn protect_user_state_certificate_hash(
 mod tests {
     use super::*;
     use crate::client::client_session_identifier::ClientSessionIdentifier;
-    use crate::config::CertificateHashProtection;
+    use shitspeak_runtime_config::CertificateHashProtection;
 
     #[test]
     fn remap_is_stable_and_not_the_source_hash() {

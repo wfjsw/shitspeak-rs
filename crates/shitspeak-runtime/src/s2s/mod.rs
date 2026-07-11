@@ -14,9 +14,7 @@ use tokio::sync::{Notify, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::ban_repository::{BanEntry, BanOp, BanOperation, BanRepository};
 use crate::blob_store::ChannelBlobStore;
-use crate::channel_repository::{ChannelOp, ChannelOperation, ChannelRepository};
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
 use crate::client_repository::ClientRepository;
@@ -26,6 +24,8 @@ use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier, StrictReplicationMetadata}
 use crate::voice::metrics::{
     S2SVoiceGatewayDropDirection, S2SVoiceGatewayDropReason, record_s2s_gateway_drop,
 };
+use shitspeak_state::{BanEntry, BanOp, BanOperation, BanRepository};
+use shitspeak_state::{ChannelOp, ChannelOperation, ChannelRepository};
 
 use shitspeak_s2s::application as s2s_application;
 use shitspeak_s2s::application::error::ApplicationError;
@@ -988,7 +988,7 @@ impl S2SRuntimeTask {
 }
 
 impl S2SManager {
-    pub fn initialize(config: &crate::config::Config) -> Self {
+    pub fn initialize(config: &shitspeak_runtime_config::Config) -> Self {
         let auto_advertise_host = config
             .register_hostname
             .as_deref()
@@ -3378,7 +3378,7 @@ impl ChannelReplicationAdapter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChannelSnapshot {
-    channels: Vec<crate::channels::Channel>,
+    channels: Vec<shitspeak_state::Channel>,
     #[serde(default)]
     freshness: i64,
 }
@@ -4028,8 +4028,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::channel_repository::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
     use crate::messages::Message;
+    use shitspeak_state::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
 
     #[test]
     fn strict_proposal_gateway_timeout_tracks_replication_ttl() {
