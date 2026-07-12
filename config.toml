@@ -49,6 +49,16 @@ udp_ping_user_count_scope = "cluster"
 # baseline = max_users * 16 packets, burst = 5x baseline, hard cap = max_users * 128 packets.
 udp_channel_size = 2048
 
+# Voice fan-out dispatch policy. The default calibrates separate profiles for
+# payloads up to and above 512 bytes before the server starts listening.
+[voice.dispatch]
+mode = "startup_calibrated" # startup_calibrated, sequential, fixed
+# Fixed mode uses these values instead of benchmarking at startup.
+# small_payload_rayon_threshold = 512
+# small_payload_rayon_min_len = 256
+# large_payload_rayon_threshold = 512
+# large_payload_rayon_min_len = 256
+
 # Idle timeout (seconds)
 client_idle_timeout_secs = 30
 # Authenticate timeout (milliseconds) after TLS setup.

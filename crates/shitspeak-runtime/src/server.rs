@@ -19,6 +19,7 @@ use crate::errors::MessageHandlerError;
 use crate::geoip::{GeoIpResolver, IpGeoMetadata};
 use crate::messages::encoder::Version;
 use crate::user_channel_cache::UserChannelCache;
+use crate::voice::dispatch_tuning::VoiceDispatchPlan;
 use crate::{
     client_repository::ClientRepository,
     codec_info::CodecInfo,
@@ -144,6 +145,7 @@ pub struct Server {
 
     // Shared config — can be hot-reloaded at runtime
     config: Arc<StdRwLock<Config>>,
+    voice_dispatch_plan: VoiceDispatchPlan,
 
     allowed_proxies: Vec<AnyIpCidr>,
 
@@ -211,6 +213,21 @@ impl Server {
         authenticator: ReloadableAuthenticator,
         extensions: ServerExtensions,
     ) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
+        Self::new_with_reloadable_authenticator_and_extensions_and_voice_dispatch_plan(
+            config,
+            authenticator,
+            extensions,
+            VoiceDispatchPlan::conservative(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_reloadable_authenticator_and_extensions_and_voice_dispatch_plan(
+        config: Config,
+        authenticator: ReloadableAuthenticator,
+        extensions: ServerExtensions,
+        voice_dispatch_plan: VoiceDispatchPlan,
+    ) -> Result<Arc<Box<Self>>, Box<dyn std::error::Error>> {
         Version::cache_server_os_info();
 
         let allowed_proxies = config
@@ -268,6 +285,7 @@ impl Server {
 
         let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
+            voice_dispatch_plan,
             allowed_proxies,
             tls_acceptor: ParkingRwLock::new(tls_acceptor),
             extensions,
@@ -314,6 +332,10 @@ impl Server {
     /// Read the current config (acquires a read lock).
     pub fn read_config(&self) -> std::sync::RwLockReadGuard<'_, Config> {
         self.config.read().expect("Config RwLock poisoned")
+    }
+
+    pub(crate) fn voice_dispatch_plan(&self) -> VoiceDispatchPlan {
+        self.voice_dispatch_plan
     }
 
     /// Local TCP listen address. Useful for tests that bind to `127.0.0.1:0`.
@@ -1443,6 +1465,9 @@ impl Server {
         match Config::reload() {
             Ok(Some(new_config)) => {
                 validate_privacy_config(&new_config)?;
+                new_config.voice.dispatch().validate().map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                })?;
                 let next_tls_acceptor = load_c2s_tls_acceptor(&new_config, &self.extensions)?;
                 let prepared_authenticator = self
                     .auth_finalization_queue
@@ -1531,6 +1556,11 @@ impl Server {
                             "config reload: udp_ping_user_count_scope {:?} -> {:?}",
                             current.udp_ping_user_count_scope,
                             new_config.udp_ping_user_count_scope
+                        );
+                    }
+                    if current.voice.dispatch() != new_config.voice.dispatch() {
+                        tracing::warn!(
+                            "config reload: voice.dispatch changed; startup calibration settings apply after restart"
                         );
                     }
                     if current.client_idle_timeout_secs != new_config.client_idle_timeout_secs {

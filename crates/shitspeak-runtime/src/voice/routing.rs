@@ -37,14 +37,6 @@ use shitspeak_s2s::application::proto::{
     VoiceTargetChannel as S2SVoiceTargetChannel,
 };
 
-/// Recipient count above which the encrypt fan-out is dispatched to rayon
-/// inside `spawn_blocking`. Below this threshold, sequential per-recipient
-/// encrypt on the routing task is faster: the per-recipient unit of work
-/// (~450 ns at 170-byte packet) is too small to amortize rayon's task
-/// scheduling overhead. Fresh profiling shows sequential remains faster at
-/// 256 recipients; rayon starts paying off around 512.
-const RAYON_FANOUT_THRESHOLD: usize = 512;
-const RAYON_FANOUT_BATCH_MIN_LEN: usize = 256;
 const S2S_RECIPIENT_CACHE_INITIAL_CAPACITY: usize = 256;
 const S2S_RECIPIENT_CACHE_MAX_CAPACITY: usize = 65536;
 
@@ -1742,8 +1734,11 @@ pub(crate) async fn flush_voice_batch(
     // multiple cores share the load.
     let server_protocol_version = server.get_server_protocol_version();
     let udp_send_retry_budget = server.read_config().voice.udp_send_retry_budget();
+    let dispatch_profile = server
+        .voice_dispatch_plan()
+        .for_payload_len(audio.audio_payload.len());
 
-    if targets.len() < RAYON_FANOUT_THRESHOLD {
+    if !dispatch_profile.uses_rayon(targets.len()) {
         super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
         let path = VoicePipelinePath::LocalSequential;
         let mut cache = EncodeCache::new();
@@ -1985,7 +1980,7 @@ pub(crate) async fn flush_voice_batch(
             use rayon::prelude::*;
             udp_items
                 .into_par_iter()
-                .with_min_len(RAYON_FANOUT_BATCH_MIN_LEN)
+                .with_min_len(dispatch_profile.rayon_min_len())
                 .fold(
                     HashMap::<std::net::SocketAddr, DatagramBatch>::new,
                     |mut batches, (client, local_addr, addr, format, context)| {

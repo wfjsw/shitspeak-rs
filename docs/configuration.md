@@ -215,6 +215,28 @@ udp_channel_size = 2048
 
 `udp_ping_user_count_scope` controls whether UDP ping responses report clusterwide users/max users or only users/max users on this node.
 
+## Voice Dispatch Calibration
+
+The server calibrates UDP voice encryption fan-out before it starts accepting
+connections. It chooses independent Rayon thresholds and recipient-run sizes
+for payloads up to 512 bytes and payloads above 512 bytes. Calibration is
+startup-only; changing this section takes effect after restart.
+
+```toml
+[voice.dispatch]
+mode = "startup_calibrated" # startup_calibrated, sequential, fixed
+
+# Used only when mode = "fixed".
+small_payload_rayon_threshold = 512
+small_payload_rayon_min_len = 256
+large_payload_rayon_threshold = 512
+large_payload_rayon_min_len = 256
+```
+
+`sequential` disables Rayon voice fan-out. `fixed` is an operational override
+for controlled experiments or recovery. The minimum length is a recipient run,
+not a per-packet task; it must be positive and cannot exceed its threshold.
+
 ## Timeouts
 
 ```toml

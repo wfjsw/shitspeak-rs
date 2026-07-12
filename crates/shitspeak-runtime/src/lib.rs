@@ -84,10 +84,28 @@ pub async fn run_server_with_extensions(
     shitspeak_client_crypto::probe_gf128_backend();
 
     let config = Config::load();
+    let dispatch_tuning =
+        voice::dispatch_tuning::resolve_voice_dispatch_plan(config.voice.dispatch()).await?;
+    let dispatch_plan = dispatch_tuning.plan();
+    tracing::info!(
+        source = dispatch_plan.source().as_str(),
+        elapsed_ms = dispatch_tuning.elapsed().as_millis(),
+        rayon_workers = dispatch_tuning.rayon_workers(),
+        small_payload_threshold = dispatch_plan.small_payload().fanout_threshold(),
+        small_payload_min_len = dispatch_plan.small_payload().rayon_min_len(),
+        large_payload_threshold = dispatch_plan.large_payload().fanout_threshold(),
+        large_payload_min_len = dispatch_plan.large_payload().rayon_min_len(),
+        "voice dispatch tuning resolved"
+    );
+    voice::metrics::record_dispatch_tuning(dispatch_plan, dispatch_tuning.elapsed());
     let authenticator = ReloadableAuthenticator::from_config(&config)?;
-    let server =
-        Server::new_with_reloadable_authenticator_and_extensions(config, authenticator, extensions)
-            .await?;
+    let server = Server::new_with_reloadable_authenticator_and_extensions_and_voice_dispatch_plan(
+        config,
+        authenticator,
+        extensions,
+        dispatch_plan,
+    )
+    .await?;
 
     let _watcher = config_watcher::spawn_config_watcher(server.clone(), server.shutdown_receiver());
 

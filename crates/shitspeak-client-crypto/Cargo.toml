@@ -11,4 +11,10 @@ shitspeak-messages = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 hex = { workspace = true }
+rayon = { workspace = true }
+
+[[bench]]
+name = "voice_partitioning"
+harness = false

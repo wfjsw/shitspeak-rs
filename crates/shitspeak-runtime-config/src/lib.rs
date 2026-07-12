@@ -1234,6 +1234,8 @@ pub struct VoiceTuning {
     max_routing_queue_age_ms: u64,
     #[serde(default = "default_voice_udp_send_retry_budget_ms")]
     udp_send_retry_budget_ms: u64,
+    #[serde(default)]
+    dispatch: VoiceDispatchTuning,
 }
 
 impl Default for VoiceTuning {
@@ -1242,6 +1244,7 @@ impl Default for VoiceTuning {
             max_udp_packet_age_ms: default_voice_max_udp_packet_age_ms(),
             max_routing_queue_age_ms: default_voice_max_routing_queue_age_ms(),
             udp_send_retry_budget_ms: default_voice_udp_send_retry_budget_ms(),
+            dispatch: VoiceDispatchTuning::default(),
         }
     }
 }
@@ -1258,6 +1261,96 @@ impl VoiceTuning {
     pub fn udp_send_retry_budget(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.udp_send_retry_budget_ms)
     }
+
+    pub fn dispatch(&self) -> &VoiceDispatchTuning {
+        &self.dispatch
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceDispatchMode {
+    #[default]
+    StartupCalibrated,
+    Sequential,
+    Fixed,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct VoiceDispatchTuning {
+    #[serde(default)]
+    mode: VoiceDispatchMode,
+    #[serde(default = "default_voice_dispatch_fanout_threshold")]
+    small_payload_rayon_threshold: usize,
+    #[serde(default = "default_voice_dispatch_rayon_min_len")]
+    small_payload_rayon_min_len: usize,
+    #[serde(default = "default_voice_dispatch_fanout_threshold")]
+    large_payload_rayon_threshold: usize,
+    #[serde(default = "default_voice_dispatch_rayon_min_len")]
+    large_payload_rayon_min_len: usize,
+}
+
+impl Default for VoiceDispatchTuning {
+    fn default() -> Self {
+        Self {
+            mode: VoiceDispatchMode::StartupCalibrated,
+            small_payload_rayon_threshold: default_voice_dispatch_fanout_threshold(),
+            small_payload_rayon_min_len: default_voice_dispatch_rayon_min_len(),
+            large_payload_rayon_threshold: default_voice_dispatch_fanout_threshold(),
+            large_payload_rayon_min_len: default_voice_dispatch_rayon_min_len(),
+        }
+    }
+}
+
+impl VoiceDispatchTuning {
+    pub fn mode(&self) -> VoiceDispatchMode {
+        self.mode
+    }
+
+    pub fn small_payload_profile(&self) -> (usize, usize) {
+        (
+            self.small_payload_rayon_threshold,
+            self.small_payload_rayon_min_len,
+        )
+    }
+
+    pub fn large_payload_profile(&self) -> (usize, usize) {
+        (
+            self.large_payload_rayon_threshold,
+            self.large_payload_rayon_min_len,
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode != VoiceDispatchMode::Fixed {
+            return Ok(());
+        }
+
+        validate_voice_dispatch_profile("small_payload", self.small_payload_profile())?;
+        validate_voice_dispatch_profile("large_payload", self.large_payload_profile())
+    }
+}
+
+fn validate_voice_dispatch_profile(
+    name: &str,
+    (threshold, min_len): (usize, usize),
+) -> Result<(), String> {
+    if threshold == 0 {
+        return Err(format!(
+            "voice.dispatch.{name}_rayon_threshold must be at least 1"
+        ));
+    }
+    if min_len == 0 {
+        return Err(format!(
+            "voice.dispatch.{name}_rayon_min_len must be at least 1"
+        ));
+    }
+    if min_len > threshold {
+        return Err(format!(
+            "voice.dispatch.{name}_rayon_min_len must not exceed {name}_rayon_threshold"
+        ));
+    }
+    Ok(())
 }
 
 impl AuthenticatorConfigSource for Config {
@@ -1468,6 +1561,12 @@ fn default_voice_max_routing_queue_age_ms() -> u64 {
 fn default_voice_udp_send_retry_budget_ms() -> u64 {
     2
 }
+fn default_voice_dispatch_fanout_threshold() -> usize {
+    512
+}
+fn default_voice_dispatch_rayon_min_len() -> usize {
+    256
+}
 fn default_udp_ping_user_count_scope() -> UdpPingUserCountScope {
     UdpPingUserCountScope::Cluster
 }
@@ -1591,6 +1690,68 @@ mod tests {
             .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
             .build()?
             .try_deserialize()
+    }
+
+    #[test]
+    fn voice_dispatch_defaults_to_startup_calibration() {
+        let dispatch: VoiceDispatchTuning = ::config::Config::builder()
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("voice dispatch config parses");
+
+        assert_eq!(dispatch.mode(), VoiceDispatchMode::StartupCalibrated);
+        assert_eq!(dispatch.small_payload_profile(), (512, 256));
+        assert_eq!(dispatch.large_payload_profile(), (512, 256));
+        assert!(dispatch.validate().is_ok());
+    }
+
+    #[test]
+    fn fixed_voice_dispatch_parses_and_validates_profiles() {
+        let dispatch: VoiceDispatchTuning = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    mode = "fixed"
+                    small_payload_rayon_threshold = 128
+                    small_payload_rayon_min_len = 64
+                    large_payload_rayon_threshold = 256
+                    large_payload_rayon_min_len = 128
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("voice dispatch config parses");
+
+        assert_eq!(dispatch.mode(), VoiceDispatchMode::Fixed);
+        assert_eq!(dispatch.small_payload_profile(), (128, 64));
+        assert_eq!(dispatch.large_payload_profile(), (256, 128));
+        assert!(dispatch.validate().is_ok());
+    }
+
+    #[test]
+    fn fixed_voice_dispatch_rejects_a_floor_above_its_threshold() {
+        let dispatch: VoiceDispatchTuning = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    mode = "fixed"
+                    small_payload_rayon_threshold = 128
+                    small_payload_rayon_min_len = 256
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("voice dispatch config parses");
+
+        assert!(
+            dispatch
+                .validate()
+                .expect_err("invalid fixed profile must be rejected")
+                .contains("must not exceed")
+        );
     }
 
     fn cert_with_cn(dir: &Path, cn: &str) -> PathBuf {

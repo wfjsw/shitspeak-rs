@@ -8,6 +8,7 @@
 //! single-syscall flush.  On other platforms, per-packet `send_to` is used.
 
 pub use shitspeak_voice::{codec, ping, routing_queue, udp_batch};
+pub(crate) mod dispatch_tuning;
 pub(crate) mod metrics;
 mod routing;
 

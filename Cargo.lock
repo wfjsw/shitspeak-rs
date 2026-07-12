@@ -4326,7 +4326,9 @@ dependencies = [
  "aws-lc-rs",
  "bytes",
  "chrono",
+ "criterion",
  "hex",
+ "rayon",
  "shitspeak-messages",
  "tracing",
 ]
@@ -4383,6 +4385,7 @@ dependencies = [
  "rcgen 0.13.2",
  "rustls",
  "serde",
+ "shitspeak-client-crypto",
  "shitspeak-runtime",
  "shitspeak-web",
  "tempfile",

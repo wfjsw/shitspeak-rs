@@ -6,6 +6,8 @@ use std::time::Duration;
 use shitspeak_core::ClientSessionIdentifier;
 use shitspeak_s2s::status::PrometheusSample;
 
+use super::dispatch_tuning::{VoiceDispatchPlan, VoiceDispatchPlanSource};
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum VoiceIngressTransport {
     Udp,
@@ -555,6 +557,12 @@ static FANOUT_BUCKETS_TOTAL: [[AtomicU64; FANOUT_BUCKETS.len()];
         VOICE_ROUTE_SOURCE_COUNT * VOICE_ROUTE_KIND_COUNT];
 static DISPATCH_FRAMES: [AtomicU64; VOICE_DISPATCH_MODE_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_DISPATCH_MODE_COUNT];
+static DISPATCH_TUNING_SMALL_THRESHOLD: AtomicU64 = AtomicU64::new(512);
+static DISPATCH_TUNING_SMALL_MIN_LEN: AtomicU64 = AtomicU64::new(256);
+static DISPATCH_TUNING_LARGE_THRESHOLD: AtomicU64 = AtomicU64::new(512);
+static DISPATCH_TUNING_LARGE_MIN_LEN: AtomicU64 = AtomicU64::new(256);
+static DISPATCH_TUNING_SOURCE: AtomicU64 = AtomicU64::new(3);
+static DISPATCH_TUNING_CALIBRATION_DURATION_US: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_STAGE_EVENTS: [[AtomicU64; VOICE_PIPELINE_STAGE_COUNT]; VOICE_PIPELINE_PATH_COUNT] =
     [const { [const { AtomicU64::new(0) }; VOICE_PIPELINE_STAGE_COUNT] }; VOICE_PIPELINE_PATH_COUNT];
 static PIPELINE_STAGE_DURATION_TOTAL_US: [[AtomicU64; VOICE_PIPELINE_STAGE_COUNT];
@@ -992,6 +1000,30 @@ pub(crate) fn record_dispatch(mode: VoiceDispatchMode) {
     increment(&DISPATCH_FRAMES[dispatch_mode_index(mode)], 1);
 }
 
+pub(crate) fn record_dispatch_tuning(plan: VoiceDispatchPlan, calibration_duration: Duration) {
+    DISPATCH_TUNING_SMALL_THRESHOLD.store(
+        plan.small_payload().fanout_threshold() as u64,
+        Ordering::Relaxed,
+    );
+    DISPATCH_TUNING_SMALL_MIN_LEN.store(
+        plan.small_payload().rayon_min_len() as u64,
+        Ordering::Relaxed,
+    );
+    DISPATCH_TUNING_LARGE_THRESHOLD.store(
+        plan.large_payload().fanout_threshold() as u64,
+        Ordering::Relaxed,
+    );
+    DISPATCH_TUNING_LARGE_MIN_LEN.store(
+        plan.large_payload().rayon_min_len() as u64,
+        Ordering::Relaxed,
+    );
+    DISPATCH_TUNING_SOURCE.store(plan.source().metric_value(), Ordering::Relaxed);
+    DISPATCH_TUNING_CALIBRATION_DURATION_US.store(
+        calibration_duration.as_micros().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+}
+
 pub(crate) fn record_pipeline_stage(
     path: VoicePipelinePath,
     stage: VoicePipelineStage,
@@ -1156,6 +1188,15 @@ pub(crate) fn record_s2s_gateway_drop(
             [s2s_gateway_drop_reason_index(reason)],
         1,
     );
+}
+
+fn dispatch_tuning_source_label(value: u64) -> &'static str {
+    match value {
+        0 => VoiceDispatchPlanSource::StartupCalibrated.as_str(),
+        1 => VoiceDispatchPlanSource::Fixed.as_str(),
+        2 => VoiceDispatchPlanSource::Sequential.as_str(),
+        _ => VoiceDispatchPlanSource::Fallback.as_str(),
+    }
 }
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
@@ -1355,6 +1396,38 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             DISPATCH_FRAMES[dispatch_mode_index(mode)].load(Ordering::Relaxed) as f64,
         ));
     }
+
+    let dispatch_tuning_source =
+        dispatch_tuning_source_label(DISPATCH_TUNING_SOURCE.load(Ordering::Relaxed));
+    for (payload_class, threshold, min_len) in [
+        (
+            "le_512",
+            DISPATCH_TUNING_SMALL_THRESHOLD.load(Ordering::Relaxed),
+            DISPATCH_TUNING_SMALL_MIN_LEN.load(Ordering::Relaxed),
+        ),
+        (
+            "gt_512",
+            DISPATCH_TUNING_LARGE_THRESHOLD.load(Ordering::Relaxed),
+            DISPATCH_TUNING_LARGE_MIN_LEN.load(Ordering::Relaxed),
+        ),
+    ] {
+        for (setting, value) in [("fanout_threshold", threshold), ("rayon_min_len", min_len)] {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_dispatch_tuning",
+                vec![
+                    ("payload_class".to_owned(), payload_class.to_owned()),
+                    ("setting".to_owned(), setting.to_owned()),
+                    ("source".to_owned(), dispatch_tuning_source.to_owned()),
+                ],
+                value as f64,
+            ));
+        }
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_voice_dispatch_calibration_duration_seconds",
+        vec![("source".to_owned(), dispatch_tuning_source.to_owned())],
+        DISPATCH_TUNING_CALIBRATION_DURATION_US.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+    ));
 
     for path in PIPELINE_PATHS {
         for stage in PIPELINE_STAGES {
@@ -1585,6 +1658,45 @@ mod tests {
             })
             .map(PrometheusSample::value)
             .sum()
+    }
+
+    #[test]
+    fn dispatch_tuning_metrics_expose_the_resolved_profiles() {
+        record_dispatch_tuning(VoiceDispatchPlan::conservative(), Duration::from_millis(12));
+
+        let samples = prometheus_samples();
+        assert_eq!(
+            sample_value(
+                &samples,
+                "shitspeak_voice_dispatch_tuning",
+                &[
+                    ("payload_class", "le_512"),
+                    ("setting", "fanout_threshold"),
+                    ("source", "fallback"),
+                ],
+            ),
+            512.0
+        );
+        assert_eq!(
+            sample_value(
+                &samples,
+                "shitspeak_voice_dispatch_tuning",
+                &[
+                    ("payload_class", "gt_512"),
+                    ("setting", "rayon_min_len"),
+                    ("source", "fallback"),
+                ],
+            ),
+            256.0
+        );
+        assert_eq!(
+            sample_value(
+                &samples,
+                "shitspeak_voice_dispatch_calibration_duration_seconds",
+                &[("source", "fallback")],
+            ),
+            0.012
+        );
     }
 
     fn assert_no_unbounded_voice_labels(sample: &PrometheusSample) {

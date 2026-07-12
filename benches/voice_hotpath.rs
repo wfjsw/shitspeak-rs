@@ -17,8 +17,8 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
 
+use shitspeak_client_crypto::CryptState;
 use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
-use shitspeak_rs::client::crypt::CryptState;
 use shitspeak_rs::messages::encoder::{AudioContext, AudioTarget};
 use shitspeak_rs::voice::codec::{
     Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat,
@@ -29,6 +29,8 @@ const KEY: [u8; 16] = [0x42; 16];
 const IV_E: [u8; 16] = [0x01; 16];
 const IV_D: [u8; 16] = [0x02; 16];
 const RAYON_DATAGRAM_BATCH_MIN_LEN: usize = 256;
+const PARTITIONED_FANOUT_SIZES: [usize; 3] = [512, 1024, 2048];
+const PARTITION_MIN_LENS: [usize; 4] = [64, 128, 256, 512];
 
 fn make_crypt() -> CryptState {
     CryptState::from_key("OCB2-AES128", &KEY, &IV_E, &IV_D).expect("crypt state")
@@ -460,7 +462,95 @@ fn bench_fanout_rayon_datagram_batch(c: &mut Criterion) {
     group.finish();
 }
 
-// ── 7. spawn_blocking necessity ──────────────────────────────────────────────
+// ── 7. Large fan-out partition size ─────────────────────────────────────────
+//
+// The production large-fanout path runs one `spawn_blocking` operation and
+// lets Rayon split its recipient collection. The minimum partition length is
+// deliberately varied here: each Rayon work item encrypts a run of recipients,
+// never a single UDP packet. This measures whether a lower floor gives enough
+// work to more cores without scheduling packets independently.
+fn bench_partitioned_fanout(c: &mut Criterion) {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 64738));
+    let mut group = c.benchmark_group("fanout/partitioned_datagram_batch_encrypt");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(2));
+
+    for opus_len in [170, 768] {
+        let raw = Audio::encode(
+            &make_audio(opus_len),
+            AudioContext::Normal,
+            PacketFormat::Legacy,
+        );
+        let checksum = CryptState::compute_plaintext_checksum(&raw);
+
+        for fanout in PARTITIONED_FANOUT_SIZES {
+            group.throughput(Throughput::Elements(fanout as u64));
+
+            group.bench_with_input(
+                BenchmarkId::new("sequential", format!("opus={opus_len}/fanout={fanout}")),
+                &fanout,
+                |b, &fanout| {
+                    b.iter_with_setup(
+                        || (0..fanout).map(|_| make_crypt()).collect::<Vec<_>>(),
+                        |mut states| {
+                            let mut batch = DatagramBatch::with_capacity(fanout);
+                            for state in &mut states {
+                                let encrypted_len = raw.len() + state.overhead();
+                                batch
+                                    .try_push_zeroed(addr, encrypted_len, |buf| {
+                                        state
+                                            .encrypt_with_precomputed_checksum(buf, &raw, &checksum)
+                                    })
+                                    .unwrap();
+                            }
+                            black_box(batch);
+                        },
+                    );
+                },
+            );
+
+            for min_len in PARTITION_MIN_LENS {
+                group.bench_with_input(
+                    BenchmarkId::new(
+                        format!("rayon_min_len={min_len}"),
+                        format!("opus={opus_len}/fanout={fanout}"),
+                    ),
+                    &fanout,
+                    |b, &fanout| {
+                        b.iter_with_setup(
+                            || (0..fanout).map(|_| make_crypt()).collect::<Vec<_>>(),
+                            |states| {
+                                let batch = states
+                                    .into_par_iter()
+                                    .with_min_len(min_len)
+                                    .fold(DatagramBatch::new, |mut batch, mut state| {
+                                        let encrypted_len = raw.len() + state.overhead();
+                                        batch
+                                            .try_push_zeroed(addr, encrypted_len, |buf| {
+                                                state.encrypt_with_precomputed_checksum(
+                                                    buf, &raw, &checksum,
+                                                )
+                                            })
+                                            .unwrap();
+                                        batch
+                                    })
+                                    .reduce(DatagramBatch::new, |mut left, right| {
+                                        left.append(right);
+                                        left
+                                    });
+                                black_box(batch);
+                            },
+                        );
+                    },
+                );
+            }
+        }
+    }
+
+    group.finish();
+}
+
+// ── 8. spawn_blocking necessity ──────────────────────────────────────────────
 //
 // flush_voice_batch currently wraps the rayon par_iter inside spawn_blocking
 // for the large-fanout path. Two questions:
@@ -688,6 +778,7 @@ criterion_group!(
     bench_fanout_seq_cached_vec,
     bench_fanout_seq_datagram_batch,
     bench_fanout_rayon_datagram_batch,
+    bench_partitioned_fanout,
     bench_dispatch_strategies,
     bench_multistream,
 );
