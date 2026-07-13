@@ -979,6 +979,61 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_voice_ingress_admission_drops_total",
+            "S2S voice ingress work rejected by byte-budget lane.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_ingress_queue_capacity_bytes",
+            "Current S2S voice ingress byte-budget capacity by lane.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_ingress_queue_used_bytes",
+            "S2S voice ingress byte-budget capacity reserved by lane.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reorder_speaker_states",
+            "Current S2S voice reorder speaker states.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reorder_speaker_cap",
+            "Current S2S voice reorder speaker-state admission cap.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_deadline_wakes_total",
+            "S2S voice reorder deadline wake requests by bounded result.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_proactive_queue_capacity_bytes",
+            "Current S2S voice proactive repair byte-budget capacity.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_proactive_queue_used_bytes",
+            "S2S voice proactive repair byte-budget capacity reserved.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_proactive_credit_balance_bytes",
+            "Current S2S voice proactive repair byte-credit balance.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_proactive_credit_cap_bytes",
+            "Current S2S voice proactive repair byte-credit burst cap.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_proactive_events_total",
+            "S2S voice proactive repair outcomes by bounded result.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_debug_packet_io_bytes_total",
             "Debug S2S packet IO bytes by packet kind and direction.",
             "counter",
@@ -2500,6 +2555,15 @@ mod tests {
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_send_events_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_receive_events_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_events_total counter\n"));
+        assert!(
+            rendered.contains("# TYPE shitspeak_s2s_voice_ingress_admission_drops_total counter\n")
+        );
+        assert!(
+            rendered.contains("# TYPE shitspeak_s2s_voice_ingress_queue_capacity_bytes gauge\n")
+        );
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_reorder_speaker_states gauge\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_deadline_wakes_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_proactive_events_total counter\n"));
     }
 
     #[test]

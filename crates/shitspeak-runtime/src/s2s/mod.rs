@@ -1144,9 +1144,10 @@ impl S2SManager {
         overlay.update_local_max_users(self.max_users.load(std::sync::atomic::Ordering::Relaxed));
         let repl =
             ReplicationManager::with_config(overlay.clone(), self.replication_config.clone());
-        let app = s2s_application::ApplicationLayer::new(
+        let app = s2s_application::ApplicationLayer::new_with_capacity_source(
             overlay.clone(),
             self.application_config.clone(),
+            self.max_users.clone(),
         );
         let mut state = self.state.write();
         state.overlay = Some(overlay);
@@ -1864,9 +1865,10 @@ impl S2SManager {
 
         let replications =
             ReplicationManager::with_config(overlay.clone(), self.replication_config.clone());
-        let application = s2s_application::ApplicationLayer::new(
+        let application = s2s_application::ApplicationLayer::new_with_capacity_source(
             overlay.clone(),
             self.application_config.clone(),
+            self.max_users.clone(),
         );
         let recipient_index = RecipientIndex::new();
         let server_handle = server.upgrade();

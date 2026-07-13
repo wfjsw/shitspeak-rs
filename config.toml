@@ -236,6 +236,9 @@ compression_adaptive_dictionary_enabled = true
 # Long-haul S2S transport and repair budgets. In-order remote voice is fanned
 # out immediately; only an observed S2S sequence gap waits in its per-speaker
 # reorder buffer.
+# Ingress lanes, tracked speaker states, and proactive-repair burst capacity
+# automatically scale from the live top-level max_users value. They have no
+# fixed queue-size settings; lowering max_users blocks only future admission.
 [s2s.application.voice]
 tree_delivery_enabled = true
 transport_ttl_ms = 750
@@ -253,6 +256,8 @@ adaptive_jitter_decay_step_ms = 10
 reorder_idle_reset_ms = 2000
 reorder_max_buffered_frames = 48
 reorder_max_total_buffer = 4096
+# Proactive copies are limited to 0 through 2 per frame (default: 1).
+# repair_max_extra_copies_per_frame = 1
 
 # ── L2 overlay tunables ───────────────────────────────────────────────
 [s2s.overlay]

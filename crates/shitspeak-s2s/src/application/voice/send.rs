@@ -389,6 +389,86 @@ impl VoiceTransport for OverlayVoiceTransport {
     }
 }
 
+/// A voice envelope prepared for ordinary delivery and, if admitted, one
+/// proactive alternate copy.
+///
+/// The unmarked body is encoded when this value is created so callers can
+/// send and cache it immediately. The marked proactive body is encoded only
+/// on the first [`Self::proactive_body`] call, directly from the retained
+/// [`proto::VoiceFrame`]. This keeps NACK replay on the original body and
+/// avoids decoding that cached wire representation to create a proactive
+/// copy.
+pub struct PreparedVoiceEnvelope {
+    frame: proto::VoiceFrame,
+    original_body: Bytes,
+    proactive_body: Option<Bytes>,
+}
+
+impl PreparedVoiceEnvelope {
+    /// Prepare an unmarked voice envelope from an already-built frame.
+    ///
+    /// A caller cannot accidentally cache a proactive-marked frame: the
+    /// ordinary representation is always encoded with the marker clear.
+    pub fn from_frame(mut frame: proto::VoiceFrame) -> Result<Self, prost::EncodeError> {
+        frame.proactive_copy = false;
+        let original_body = proto::encode_voice(&frame)?;
+        Ok(Self {
+            frame,
+            original_body,
+            proactive_body: None,
+        })
+    }
+
+    /// Construct a prepared envelope from the normal voice send fields.
+    pub fn new(
+        sender_session: u32,
+        server_id: String,
+        sender_epoch: u64,
+        s2s_seq: u64,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+    ) -> Result<Self, prost::EncodeError> {
+        Self::from_frame(proto::VoiceFrame {
+            sender_session,
+            server_id,
+            sender_epoch,
+            s2s_seq,
+            target_kind,
+            is_terminator,
+            payload,
+            intent: Some(intent),
+            proactive_copy: false,
+        })
+    }
+
+    /// Return a cheap clone of the unmarked body for ordinary send or repair
+    /// cache insertion.
+    pub fn original_body(&self) -> Bytes {
+        self.original_body.clone()
+    }
+
+    /// Lazily encode and cache the one marked proactive alternate body.
+    ///
+    /// Subsequent calls clone the cached [`Bytes`] allocation. The retained
+    /// ordinary frame is temporarily marked for serialization and restored
+    /// before this method returns, so the original cache can never acquire
+    /// the proactive marker.
+    pub fn proactive_body(&mut self) -> Result<Bytes, prost::EncodeError> {
+        if let Some(body) = &self.proactive_body {
+            return Ok(body.clone());
+        }
+
+        self.frame.proactive_copy = true;
+        let encoded = proto::encode_voice(&self.frame);
+        self.frame.proactive_copy = false;
+        let body = encoded?;
+        self.proactive_body = Some(body.clone());
+        Ok(body)
+    }
+}
+
 /// Build the wire envelope and encode it. Pulled out so unit tests can
 /// reach in without a transport.
 pub fn build_envelope(
@@ -401,7 +481,7 @@ pub fn build_envelope(
     payload: Bytes,
     intent: VoiceIntent,
 ) -> Result<Bytes, prost::EncodeError> {
-    let frame = proto::VoiceFrame {
+    PreparedVoiceEnvelope::new(
         sender_session,
         server_id,
         sender_epoch,
@@ -409,10 +489,9 @@ pub fn build_envelope(
         target_kind,
         is_terminator,
         payload,
-        intent: Some(intent),
-        proactive_copy: false,
-    };
-    proto::encode_voice(&frame)
+        intent,
+    )
+    .map(|envelope| envelope.original_body())
 }
 
 /// Derive the wire envelope for a proactive alternate copy without changing
@@ -686,6 +765,73 @@ mod tests {
         assert!(marked.proactive_copy);
         marked.proactive_copy = false;
         assert_eq!(marked, proto::decode_voice(&original).unwrap());
+    }
+
+    #[test]
+    fn prepared_envelope_caches_one_lazy_proactive_body_without_decoding_original() {
+        let mut envelope = PreparedVoiceEnvelope::new(
+            7,
+            shitspeak_core::default_server_id(),
+            11,
+            13,
+            0,
+            false,
+            Bytes::from_static(b"opus"),
+            VoiceIntent {
+                kind: Some(proto::VoiceIntentKind::Normal(proto::VoiceIntentNormal {
+                    source_channel: 5,
+                })),
+            },
+        )
+        .unwrap();
+
+        let original = envelope.original_body();
+        assert!(!proto::decode_voice(&original).unwrap().proactive_copy);
+        assert!(envelope.proactive_body.is_none());
+
+        let first = envelope.proactive_body().unwrap();
+        assert!(proto::decode_voice(&first).unwrap().proactive_copy);
+        assert_eq!(envelope.proactive_body.as_ref(), Some(&first));
+
+        let second = envelope.proactive_body().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(envelope.proactive_body.as_ref(), Some(&second));
+        assert!(
+            !proto::decode_voice(&envelope.original_body())
+                .unwrap()
+                .proactive_copy
+        );
+    }
+
+    #[test]
+    fn prepared_envelope_normalizes_a_pre_marked_input_frame() {
+        let mut envelope = PreparedVoiceEnvelope::from_frame(proto::VoiceFrame {
+            sender_session: 7,
+            server_id: shitspeak_core::default_server_id(),
+            sender_epoch: 11,
+            s2s_seq: 13,
+            target_kind: 0,
+            is_terminator: false,
+            payload: Bytes::from_static(b"opus"),
+            intent: Some(VoiceIntent {
+                kind: Some(proto::VoiceIntentKind::Normal(proto::VoiceIntentNormal {
+                    source_channel: 5,
+                })),
+            }),
+            proactive_copy: true,
+        })
+        .unwrap();
+
+        assert!(
+            !proto::decode_voice(&envelope.original_body())
+                .unwrap()
+                .proactive_copy
+        );
+        assert!(
+            proto::decode_voice(&envelope.proactive_body().unwrap())
+                .unwrap()
+                .proactive_copy
+        );
     }
 
     #[tokio::test]

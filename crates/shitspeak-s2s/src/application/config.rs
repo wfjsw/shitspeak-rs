@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use serde::{Deserialize, de::IgnoredAny};
+use serde::{
+    Deserialize,
+    de::{Error as _, IgnoredAny},
+};
 
 /// Top-level configuration block for the application (L3) layer.
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -81,7 +84,7 @@ pub struct VoiceConfig {
     /// Start proactive alternate copies when UDP jitter reaches this many ms.
     pub repair_jitter_start_ms: u64,
 
-    /// Extra proactive copies allowed per voice frame.
+    /// Extra proactive copies allowed per voice frame (0 through 2).
     pub repair_max_extra_copies_per_frame: usize,
 }
 
@@ -179,6 +182,11 @@ impl<'de> Deserialize<'de> for VoiceConfig {
         D: serde::Deserializer<'de>,
     {
         let raw = VoiceConfigWire::deserialize(deserializer)?;
+        if raw.repair_max_extra_copies_per_frame > 2 {
+            return Err(D::Error::custom(
+                "repair_max_extra_copies_per_frame must be between 0 and 2",
+            ));
+        }
         let _ = (
             raw.remote_playout_min_ms.as_ref(),
             raw.remote_playout_max_ms.as_ref(),
@@ -372,5 +380,31 @@ mod tests {
         assert_eq!(cfg.voice.reorder_idle_reset_ms, 2_000);
         assert_eq!(cfg.voice.reorder_max_delay_ms, 40);
         assert!(cfg.voice.repair_enabled);
+    }
+
+    #[test]
+    fn voice_repair_extra_copy_limit_accepts_zero_through_two() {
+        for copies in 0..=2 {
+            let cfg: ApplicationConfig = serde_json::from_str(&format!(
+                r#"{{"voice":{{"repair_max_extra_copies_per_frame":{copies}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(cfg.voice.repair_max_extra_copies_per_frame, copies);
+        }
+    }
+
+    #[test]
+    fn voice_repair_extra_copy_limit_rejects_values_above_two() {
+        for copies in [3, usize::MAX] {
+            let error = serde_json::from_str::<ApplicationConfig>(&format!(
+                r#"{{"voice":{{"repair_max_extra_copies_per_frame":{copies}}}}}"#
+            ))
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("repair_max_extra_copies_per_frame must be between 0 and 2")
+            );
+        }
     }
 }

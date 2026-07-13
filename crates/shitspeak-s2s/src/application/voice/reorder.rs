@@ -20,6 +20,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -29,10 +30,13 @@ use tracing::trace;
 
 use crate::application::config::VoiceConfig;
 use crate::application::proto::VoiceFrame;
-use crate::application::voice::metrics::VoiceReceiveResult;
+use crate::application::voice::metrics::{self, VoiceDeadlineWakeResult, VoiceReceiveResult};
 use shitspeak_core::NodeIdentifier;
 
 const ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN: u32 = 16;
+const DEFAULT_MAX_USERS: u64 = 5_000;
+const MIN_TRACKED_SPEAKERS: usize = 1_024;
+const MAX_TRACKED_SPEAKERS: usize = 16_384;
 
 /// One emit decision: forward the bundled `(from_immediate, frame)` to
 /// the audio sink.
@@ -184,8 +188,11 @@ impl VoiceRouteHint {
 /// Public reorder gate. Cheap to clone — internally `Arc`-wrapped.
 pub struct Reorderer {
     cfg: VoiceConfig,
+    max_users: Arc<AtomicU64>,
     state: Mutex<ReorderInner>,
     deadline_notify: Arc<Notify>,
+    deadline_wake_pending: AtomicBool,
+    deadline_wake_ack: Notify,
 }
 
 struct ReorderInner {
@@ -206,8 +213,19 @@ struct SenderState {
 
 impl Reorderer {
     pub fn new(cfg: VoiceConfig) -> Arc<Self> {
+        Self::new_with_capacity_source(cfg, Arc::new(AtomicU64::new(DEFAULT_MAX_USERS)))
+    }
+
+    /// Construct a reorderer whose tracked-speaker limit follows the shared
+    /// runtime user-capacity source. Existing streams are never evicted when
+    /// the configured capacity falls; the current value gates only new state.
+    pub(crate) fn new_with_capacity_source(
+        cfg: VoiceConfig,
+        max_users: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             cfg,
+            max_users,
             state: Mutex::new(ReorderInner {
                 per_sender: HashMap::new(),
                 deadlines: BinaryHeap::new(),
@@ -215,6 +233,8 @@ impl Reorderer {
                 total_pending: 0,
             }),
             deadline_notify: Arc::new(Notify::new()),
+            deadline_wake_pending: AtomicBool::new(false),
+            deadline_wake_ack: Notify::new(),
         })
     }
 
@@ -224,6 +244,19 @@ impl Reorderer {
 
     pub fn config(&self) -> &VoiceConfig {
         &self.cfg
+    }
+
+    /// Maximum concurrently tracked speaker streams for the current runtime
+    /// user limit. It intentionally applies only to new stream admission.
+    pub(crate) fn tracked_speaker_capacity(&self) -> usize {
+        self.max_users
+            .load(Ordering::Relaxed)
+            .saturating_mul(2)
+            .clamp(MIN_TRACKED_SPEAKERS as u64, MAX_TRACKED_SPEAKERS as u64) as usize
+    }
+
+    pub(crate) fn tracked_speaker_count(&self) -> usize {
+        self.state.lock().per_sender.len()
     }
 
     /// Earliest gap or idle-pruning deadline. Used by the deadline task to
@@ -305,9 +338,22 @@ impl Reorderer {
     }
 
     fn enqueue_idle_deadline(&self, state: &mut ReorderInner, session: u32, now: Instant) {
-        state
-            .idle_deadlines
-            .push(Reverse((now + self.idle_reset_duration(), session)));
+        let deadline = now + self.idle_reset_duration();
+        let current_earliest = match (state.deadlines.peek(), state.idle_deadlines.peek()) {
+            (Some(Reverse((gap, _))), Some(Reverse((idle, _)))) => Some((*gap).min(*idle)),
+            (Some(Reverse((gap, _))), None) => Some(*gap),
+            (None, Some(Reverse((idle, _)))) => Some(*idle),
+            (None, None) => None,
+        };
+        state.idle_deadlines.push(Reverse((deadline, session)));
+        // A quiet stream has no gap deadline to wake the task, so interrupt a
+        // current sleep only when this creates an earlier deadline.
+        if match current_earliest {
+            Some(current) => deadline < current,
+            None => true,
+        } {
+            self.deadline_notify.notify_one();
+        }
     }
 
     fn prune_idle(&self, state: &mut ReorderInner, now: Instant) {
@@ -412,6 +458,8 @@ impl Reorderer {
         let mut results: Vec<ReorderResultCount> = Vec::new();
         let mut state = self.state.lock();
         let session = frame.sender_session;
+        let frame_seq = frame.s2s_seq;
+        let sender_epoch = frame.sender_epoch;
         let now = Instant::now();
         self.prune_idle(&mut state, now);
 
@@ -425,6 +473,16 @@ impl Reorderer {
             return ReorderReport::new(emit, results, state.total_pending, None);
         }
 
+        if !state.per_sender.contains_key(&session)
+            && state.per_sender.len() >= self.tracked_speaker_capacity()
+        {
+            results.push(ReorderResultCount::new(
+                VoiceReceiveResult::SpeakerStateDrop,
+                1,
+            ));
+            return ReorderReport::new(emit, results, state.total_pending, None);
+        }
+
         // Bootstrap from the first original or proactive sequence instead of
         // assuming a source always starts at zero. `sender_epoch` is
         // intentionally not a state key or reset condition.
@@ -433,7 +491,7 @@ impl Reorderer {
             state.per_sender.insert(
                 session,
                 SenderState {
-                    next_seq: frame.s2s_seq,
+                    next_seq: frame_seq,
                     pending: BTreeMap::new(),
                     deadline: None,
                     adaptive_delay_ms: initial_adaptive_delay_ms,
@@ -457,7 +515,7 @@ impl Reorderer {
         // copies must not rewind an established speaker cursor. The original
         // rebase deliberately permits old/new stream mixing after a source
         // restart without coupling reorder state to sender epochs.
-        if frame.s2s_seq < entry.next_seq {
+        if frame_seq < entry.next_seq {
             if copy_kind != VoiceCopyKind::Original {
                 results.push(ReorderResultCount::new(
                     VoiceReceiveResult::DuplicateOrLate,
@@ -475,7 +533,7 @@ impl Reorderer {
 
         // In-order frames emit immediately and drain a contiguous buffered
         // suffix immediately. This is ordering only, never media pacing.
-        if frame.s2s_seq == entry.next_seq {
+        if frame_seq == entry.next_seq {
             // A reactive repair may only close a previously opened gap. It
             // cannot advance a healthy stream by itself.
             let gap_open = matches!(entry.deadline, Some(deadline) if deadline > now)
@@ -489,7 +547,7 @@ impl Reorderer {
                 return ReorderReport::new(emit, results, state.total_pending, None);
             }
             results.push(ReorderResultCount::new(VoiceReceiveResult::InOrder, 1));
-            emit.push(ReorderEmission::new(from, frame.clone(), copy_kind));
+            emit.push(ReorderEmission::new(from, frame, copy_kind));
             entry.next_seq = entry.next_seq.saturating_add(1);
             let mut drained_count: usize = 0;
             loop {
@@ -534,12 +592,11 @@ impl Reorderer {
             // A real gap: retain the nearest pending suffix, not the oldest
             // arrival. Keeping the earliest available sequence maximizes the
             // chance a single repair can immediately drain useful audio.
-            if let Some(existing) = entry.pending.get(&frame.s2s_seq) {
+            if let Some(existing) = entry.pending.get(&frame_seq) {
                 if copy_kind > existing.copy_kind {
-                    entry.pending.insert(
-                        frame.s2s_seq,
-                        ReorderEmission::new(from, frame.clone(), copy_kind),
-                    );
+                    entry
+                        .pending
+                        .insert(frame_seq, ReorderEmission::new(from, frame, copy_kind));
                     results.push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
                 } else {
                     results.push(ReorderResultCount::new(
@@ -563,7 +620,7 @@ impl Reorderer {
                     .keys()
                     .next_back()
                     .expect("nonempty pending buffer at capacity");
-                if frame.s2s_seq > farthest_seq {
+                if frame_seq > farthest_seq {
                     results.push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
                     state.per_sender.insert(session, entry);
                     return ReorderReport::new(emit, results, state.total_pending, None);
@@ -578,7 +635,7 @@ impl Reorderer {
             if state.total_pending >= self.cfg.reorder_max_total_buffer {
                 trace!(
                     session,
-                    seq = frame.s2s_seq,
+                    seq = frame_seq,
                     "voice reorder: node-wide buffer full; dropping"
                 );
                 results.push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
@@ -587,10 +644,9 @@ impl Reorderer {
             }
 
             let opened_gap = entry.pending.is_empty();
-            entry.pending.insert(
-                frame.s2s_seq,
-                ReorderEmission::new(from, frame.clone(), copy_kind),
-            );
+            entry
+                .pending
+                .insert(frame_seq, ReorderEmission::new(from, frame, copy_kind));
             entry.in_order_run = 0;
             results.push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
             state.total_pending = state.total_pending.saturating_add(1);
@@ -603,9 +659,9 @@ impl Reorderer {
                 Some(GapReport {
                     from,
                     sender_session: session,
-                    sender_epoch: frame.sender_epoch,
+                    sender_epoch,
                     first_seq: entry.next_seq,
-                    last_seq: frame.s2s_seq.saturating_sub(1),
+                    last_seq: frame_seq.saturating_sub(1),
                 })
             } else {
                 None
@@ -677,7 +733,16 @@ impl Reorderer {
             }
         }
         self.prune_idle(&mut state, now);
-        ReorderReport::new(emit, results, state.total_pending, None)
+        let pending_total = state.total_pending;
+        drop(state);
+        self.acknowledge_deadline_wake();
+        ReorderReport::new(emit, results, pending_total, None)
+    }
+
+    fn acknowledge_deadline_wake(&self) {
+        if self.deadline_wake_pending.swap(false, Ordering::AcqRel) {
+            self.deadline_wake_ack.notify_one();
+        }
     }
 
     pub fn gap_for_frame(&self, from: NodeIdentifier, frame: &VoiceFrame) -> Option<GapReport> {
@@ -722,8 +787,10 @@ impl Reorderer {
 
 /// Background task that watches the reorderer's deadline heap and
 /// nudges the dispatch task to drain expired entries via
-/// `dispatch_tx`. Owns the long-running `tokio::time::sleep_until`
-/// future so the dispatch task itself stays purely event-driven.
+/// `dispatch_tx`. At most one nudge can be outstanding: after sending it,
+/// this task waits for `drain_expired_report` to acknowledge dispatch before
+/// considering another deadline. That keeps an expired entry from producing a
+/// zero-duration wake loop while dispatch is busy.
 pub fn spawn_deadline_task<F>(reorderer: Arc<Reorderer>, shutdown: CancellationToken, nudge: F)
 where
     F: Fn() + Send + 'static,
@@ -741,7 +808,20 @@ where
                 _ = tokio::time::sleep(sleep_for) => {
                     if let Some(deadline) = reorderer.next_deadline() {
                         if Instant::now() >= deadline {
-                            nudge();
+                            if reorderer
+                                .deadline_wake_pending
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                            {
+                                metrics::record_deadline_wake(VoiceDeadlineWakeResult::Sent);
+                                nudge();
+                            } else {
+                                metrics::record_deadline_wake(VoiceDeadlineWakeResult::Coalesced);
+                            }
+                            tokio::select! {
+                                _ = shutdown.cancelled() => return,
+                                _ = reorderer.deadline_wake_ack.notified() => {}
+                            }
                         }
                     }
                 }
@@ -757,6 +837,8 @@ mod tests {
 
     use crate::application::proto::{VoiceIntent, VoiceIntentKind, VoiceIntentNormal};
     use bytes::Bytes;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::mpsc;
 
     fn cfg() -> VoiceConfig {
         VoiceConfig::default()
@@ -1073,6 +1155,126 @@ mod tests {
             ordinary.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
             vec![99]
         );
+    }
+
+    #[tokio::test]
+    async fn deadline_task_prunes_idle_stream_without_a_gap() {
+        let mut c = cfg();
+        c.reorder_idle_reset_ms = 10;
+        let r = Reorderer::new(c);
+        let shutdown = CancellationToken::new();
+        let (nudge_tx, mut nudge_rx) = mpsc::channel(1);
+        spawn_deadline_task(r.clone(), shutdown.clone(), move || {
+            let _ = nudge_tx.try_send(());
+        });
+
+        assert_eq!(r.push(11, frame(0xABC, 1, 0, false)).len(), 1);
+        tokio::time::timeout(Duration::from_millis(500), nudge_rx.recv())
+            .await
+            .expect("idle deadline should wake dispatch")
+            .expect("deadline task should remain running");
+
+        assert!(r.drain_expired_report().into_emissions().is_empty());
+        assert_eq!(r.tracked_speaker_count(), 0);
+        assert!(
+            r.push_with_route_hint_report_with_repair(11, frame(0xABC, 2, 99, false), None, true)
+                .into_emissions()
+                .is_empty()
+        );
+        assert_eq!(r.push(11, frame(0xABC, 2, 99, false)).len(), 1);
+        shutdown.cancel();
+    }
+
+    #[test]
+    fn tracked_speaker_admission_follows_live_capacity_without_eviction() {
+        let max_users = Arc::new(AtomicU64::new(100));
+        let mut c = cfg();
+        c.reorder_idle_reset_ms = 60_000;
+        let r = Reorderer::new_with_capacity_source(c, max_users.clone());
+
+        assert_eq!(r.tracked_speaker_capacity(), 1_024);
+        for session in 0..1_024 {
+            assert_eq!(r.push(11, frame(session, 1, 0, false)).len(), 1);
+        }
+        assert_eq!(r.tracked_speaker_count(), 1_024);
+
+        let dropped_at_floor = r.push_with_route_hint_report(11, frame(1_024, 1, 0, false), None);
+        assert_eq!(
+            dropped_at_floor.result_counts(),
+            &[ReorderResultCount::new(
+                VoiceReceiveResult::SpeakerStateDrop,
+                1
+            )]
+        );
+        assert_eq!(dropped_at_floor.into_emissions().len(), 0);
+        assert_eq!(r.tracked_speaker_count(), 1_024);
+
+        max_users.store(5_000, Ordering::Relaxed);
+        assert_eq!(r.tracked_speaker_capacity(), 10_000);
+        for session in 1_024..10_000 {
+            assert_eq!(r.push(11, frame(session, 1, 0, false)).len(), 1);
+        }
+        assert_eq!(r.tracked_speaker_count(), 10_000);
+
+        max_users.store(100, Ordering::Relaxed);
+        assert_eq!(r.tracked_speaker_capacity(), 1_024);
+        assert_eq!(r.push(11, frame(0, 1, 1, false)).len(), 1);
+        assert_eq!(r.tracked_speaker_count(), 10_000);
+
+        let dropped_after_reduction =
+            r.push_with_route_hint_report(11, frame(10_000, 1, 0, false), None);
+        assert_eq!(
+            dropped_after_reduction.result_counts(),
+            &[ReorderResultCount::new(
+                VoiceReceiveResult::SpeakerStateDrop,
+                1
+            )]
+        );
+        assert!(dropped_after_reduction.into_emissions().is_empty());
+        assert_eq!(r.tracked_speaker_count(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn deadline_nudge_is_coalesced_until_dispatch_drains() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 5;
+        let r = Reorderer::new(c);
+        let shutdown = CancellationToken::new();
+        let nudges = Arc::new(AtomicUsize::new(0));
+        let (nudge_tx, mut nudge_rx) = mpsc::channel(1);
+        let nudge_count = nudges.clone();
+        spawn_deadline_task(r.clone(), shutdown.clone(), move || {
+            nudge_count.fetch_add(1, Ordering::Relaxed);
+            let _ = nudge_tx.try_send(());
+        });
+
+        r.push(11, frame(0xABC, 1, 0, false));
+        r.push(11, frame(0xABC, 1, 2, false));
+        tokio::time::timeout(Duration::from_millis(500), nudge_rx.recv())
+            .await
+            .expect("expired gap should wake dispatch")
+            .expect("deadline task should remain running");
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(nudges.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            nudge_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert_eq!(
+            r.drain_expired_report()
+                .into_emissions()
+                .iter()
+                .map(|(_, frame)| frame.s2s_seq)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(nudges.load(Ordering::Relaxed), 1);
+        shutdown.cancel();
     }
 
     #[test]

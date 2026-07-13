@@ -78,6 +78,7 @@ pub(crate) enum VoiceReceiveResult {
     DeadlineFlush,
     BufferDrop,
     NoSinkDrop,
+    SpeakerStateDrop,
 }
 
 impl VoiceReceiveResult {
@@ -90,6 +91,62 @@ impl VoiceReceiveResult {
             Self::DeadlineFlush => "deadline_flush",
             Self::BufferDrop => "buffer_drop",
             Self::NoSinkDrop => "no_sink_drop",
+            Self::SpeakerStateDrop => "speaker_state_drop",
+        }
+    }
+}
+
+/// The delivery lane that admitted an inbound voice frame.
+///
+/// This is intentionally a small fixed label set: queue pressure must remain
+/// observable without multiplying the metric by sender or peer.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum VoiceIngressClass {
+    Primary,
+    Proactive,
+}
+
+impl VoiceIngressClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Proactive => "proactive",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum VoiceDeadlineWakeResult {
+    Sent,
+    Coalesced,
+}
+
+impl VoiceDeadlineWakeResult {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Coalesced => "coalesced",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum VoiceProactiveResult {
+    Queued,
+    Sent,
+    BudgetShed,
+    QueueShed,
+    SendFailed,
+}
+
+impl VoiceProactiveResult {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Sent => "sent",
+            Self::BudgetShed => "budget_shed",
+            Self::QueueShed => "queue_shed",
+            Self::SendFailed => "send_failed",
         }
     }
 }
@@ -144,12 +201,33 @@ struct RepairKey {
 }
 
 #[derive(Debug, Default)]
+struct QueueBudget {
+    capacity_bytes: u64,
+    used_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct ProactiveBudget {
+    queue_capacity_bytes: u64,
+    queue_used_bytes: u64,
+    credit_balance_bytes: u64,
+    credit_cap_bytes: u64,
+}
+
+#[derive(Debug, Default)]
 struct VoiceAppMetrics {
     sends: HashMap<SendKey, u64>,
     receives: HashMap<ReceiveKey, u64>,
     repairs: HashMap<RepairKey, u64>,
     reorder_pending: HashMap<NodeIdentifier, u64>,
     reorder_pending_buckets: HashMap<(NodeIdentifier, &'static str), u64>,
+    ingress_admission_drops: HashMap<VoiceIngressClass, u64>,
+    ingress_queue_budgets: HashMap<VoiceIngressClass, QueueBudget>,
+    reorder_speaker_states: u64,
+    reorder_speaker_cap: u64,
+    deadline_wakes: HashMap<VoiceDeadlineWakeResult, u64>,
+    proactive_budget: ProactiveBudget,
+    proactive_outcomes: HashMap<VoiceProactiveResult, u64>,
 }
 
 pub(crate) fn record_send(
@@ -218,6 +296,50 @@ pub(crate) fn set_reorder_pending(source: NodeIdentifier, pending: usize) {
         .or_default() += 1;
 }
 
+pub(crate) fn record_ingress_admission_drop(class: VoiceIngressClass) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics.ingress_admission_drops.entry(class).or_default() += 1;
+}
+
+pub(crate) fn set_ingress_queue_budget(
+    class: VoiceIngressClass,
+    capacity_bytes: usize,
+    used_bytes: usize,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    let budget = metrics.ingress_queue_budgets.entry(class).or_default();
+    budget.capacity_bytes = capacity_bytes as u64;
+    budget.used_bytes = used_bytes as u64;
+}
+
+pub(crate) fn set_reorder_speaker_state(tracked: usize, cap: usize) {
+    let mut metrics = METRICS.lock().unwrap();
+    metrics.reorder_speaker_states = tracked as u64;
+    metrics.reorder_speaker_cap = cap as u64;
+}
+
+pub(crate) fn record_deadline_wake(result: VoiceDeadlineWakeResult) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics.deadline_wakes.entry(result).or_default() += 1;
+}
+
+pub(crate) fn set_proactive_queue_budget(capacity_bytes: usize, used_bytes: usize) {
+    let mut metrics = METRICS.lock().unwrap();
+    metrics.proactive_budget.queue_capacity_bytes = capacity_bytes as u64;
+    metrics.proactive_budget.queue_used_bytes = used_bytes as u64;
+}
+
+pub(crate) fn set_proactive_credit(balance_bytes: usize, cap_bytes: usize) {
+    let mut metrics = METRICS.lock().unwrap();
+    metrics.proactive_budget.credit_balance_bytes = balance_bytes as u64;
+    metrics.proactive_budget.credit_cap_bytes = cap_bytes as u64;
+}
+
+pub(crate) fn record_proactive_outcome(result: VoiceProactiveResult) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics.proactive_outcomes.entry(result).or_default() += 1;
+}
+
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
     let metrics = METRICS.lock().unwrap();
     let mut out = Vec::new();
@@ -275,6 +397,71 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
                 ("source".to_owned(), source.to_string()),
                 ("bucket".to_owned(), (*bucket).to_owned()),
             ],
+            *count as f64,
+        ));
+    }
+
+    for (class, count) in &metrics.ingress_admission_drops {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_ingress_admission_drops_total",
+            vec![("class".to_owned(), class.label().to_owned())],
+            *count as f64,
+        ));
+    }
+    for (class, budget) in &metrics.ingress_queue_budgets {
+        let labels = vec![("class".to_owned(), class.label().to_owned())];
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_ingress_queue_capacity_bytes",
+            labels.clone(),
+            budget.capacity_bytes as f64,
+        ));
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_ingress_queue_used_bytes",
+            labels,
+            budget.used_bytes as f64,
+        ));
+    }
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_reorder_speaker_states",
+        Vec::new(),
+        metrics.reorder_speaker_states as f64,
+    ));
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_reorder_speaker_cap",
+        Vec::new(),
+        metrics.reorder_speaker_cap as f64,
+    ));
+    for (result, count) in &metrics.deadline_wakes {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_deadline_wakes_total",
+            vec![("result".to_owned(), result.label().to_owned())],
+            *count as f64,
+        ));
+    }
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_proactive_queue_capacity_bytes",
+        Vec::new(),
+        metrics.proactive_budget.queue_capacity_bytes as f64,
+    ));
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_proactive_queue_used_bytes",
+        Vec::new(),
+        metrics.proactive_budget.queue_used_bytes as f64,
+    ));
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_proactive_credit_balance_bytes",
+        Vec::new(),
+        metrics.proactive_budget.credit_balance_bytes as f64,
+    ));
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_proactive_credit_cap_bytes",
+        Vec::new(),
+        metrics.proactive_budget.credit_cap_bytes as f64,
+    ));
+    for (result, count) in &metrics.proactive_outcomes {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_proactive_events_total",
+            vec![("result".to_owned(), result.label().to_owned())],
             *count as f64,
         ));
     }
@@ -385,5 +572,110 @@ mod tests {
         .expect("pending bucket");
         assert!(pending_bucket.value() >= 1.0);
         assert_no_unbounded_voice_labels(&pending_bucket);
+    }
+
+    #[test]
+    fn adaptive_voice_protection_metrics_are_aggregate_and_bounded() {
+        record_ingress_admission_drop(VoiceIngressClass::Primary);
+        record_ingress_admission_drop(VoiceIngressClass::Proactive);
+        set_ingress_queue_budget(VoiceIngressClass::Primary, 2_560_000, 524_288);
+        set_ingress_queue_budget(VoiceIngressClass::Proactive, 320_000, 65_536);
+        set_reorder_speaker_state(10_000, 10_000);
+        record_deadline_wake(VoiceDeadlineWakeResult::Sent);
+        record_deadline_wake(VoiceDeadlineWakeResult::Coalesced);
+        set_proactive_queue_budget(320_000, 65_536);
+        set_proactive_credit(32_768, 80_000);
+        record_proactive_outcome(VoiceProactiveResult::Queued);
+        record_proactive_outcome(VoiceProactiveResult::Sent);
+        record_proactive_outcome(VoiceProactiveResult::BudgetShed);
+        record_proactive_outcome(VoiceProactiveResult::QueueShed);
+        record_proactive_outcome(VoiceProactiveResult::SendFailed);
+
+        let primary_drop = find_sample(
+            "shitspeak_s2s_voice_ingress_admission_drops_total",
+            &[("class", "primary")],
+        )
+        .expect("primary admission drop");
+        assert!(primary_drop.value() >= 1.0);
+        assert_eq!(
+            primary_drop.labels(),
+            &[("class".to_owned(), "primary".to_owned())]
+        );
+
+        let proactive_capacity = find_sample(
+            "shitspeak_s2s_voice_ingress_queue_capacity_bytes",
+            &[("class", "proactive")],
+        )
+        .expect("proactive queue capacity");
+        // Gauges are shared process-wide with asynchronous voice tests, so
+        // their current value may have been refreshed by another service.
+        // This test verifies the bounded aggregate dimension instead.
+        assert!(proactive_capacity.value() >= 0.0);
+        assert_eq!(
+            proactive_capacity.labels(),
+            &[("class".to_owned(), "proactive".to_owned())]
+        );
+
+        let speaker_states = find_sample("shitspeak_s2s_voice_reorder_speaker_states", &[])
+            .expect("speaker state gauge");
+        assert!(speaker_states.value() >= 0.0);
+        assert!(speaker_states.labels().is_empty());
+        let speaker_cap =
+            find_sample("shitspeak_s2s_voice_reorder_speaker_cap", &[]).expect("speaker cap gauge");
+        assert!(speaker_cap.value() >= 0.0);
+        assert!(speaker_cap.labels().is_empty());
+
+        let coalesced = find_sample(
+            "shitspeak_s2s_voice_deadline_wakes_total",
+            &[("result", "coalesced")],
+        )
+        .expect("coalesced deadline wake");
+        assert!(coalesced.value() >= 1.0);
+        assert_eq!(
+            coalesced.labels(),
+            &[("result".to_owned(), "coalesced".to_owned())]
+        );
+
+        let credit_cap = find_sample("shitspeak_s2s_voice_proactive_credit_cap_bytes", &[])
+            .expect("proactive credit cap");
+        assert!(credit_cap.value() >= 0.0);
+        assert!(credit_cap.labels().is_empty());
+        let proactive_sent = find_sample(
+            "shitspeak_s2s_voice_proactive_events_total",
+            &[("result", "sent")],
+        )
+        .expect("proactive sent outcome");
+        assert!(proactive_sent.value() >= 1.0);
+        assert_eq!(
+            proactive_sent.labels(),
+            &[("result".to_owned(), "sent".to_owned())]
+        );
+
+        for sample in prometheus_samples().into_iter().filter(|sample| {
+            sample.name().starts_with("shitspeak_s2s_voice_ingress_")
+                || sample.name().starts_with("shitspeak_s2s_voice_proactive_")
+                || sample.name().starts_with("shitspeak_s2s_voice_deadline_")
+                || sample
+                    .name()
+                    .starts_with("shitspeak_s2s_voice_reorder_speaker_")
+        }) {
+            assert_no_unbounded_voice_labels(&sample);
+        }
+    }
+
+    #[test]
+    fn speaker_state_drop_is_exported_as_a_receive_outcome() {
+        record_receive(4094, 4093, 4092, VoiceReceiveResult::SpeakerStateDrop, 1);
+        let drop = find_sample(
+            "shitspeak_s2s_voice_receive_events_total",
+            &[
+                ("source", "4094"),
+                ("origin_node", "4093"),
+                ("from_immediate", "4092"),
+                ("result", "speaker_state_drop"),
+            ],
+        )
+        .expect("speaker state drop");
+        assert!(drop.value() >= 1.0);
     }
 }

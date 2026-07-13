@@ -24,7 +24,8 @@ use crate::application::proto::{
 };
 use crate::application::voice::metrics;
 use crate::application::voice::metrics::{
-    VoiceReceiveResult, VoiceRepairResult, VoiceSendMode, VoiceSendResult,
+    VoiceIngressClass, VoiceProactiveResult, VoiceReceiveResult, VoiceRepairResult, VoiceSendMode,
+    VoiceSendResult,
 };
 use crate::application::voice::reorder::{
     self, GapReport, Reorderer, VoiceCopyKind, VoiceRouteHint,
@@ -35,6 +36,7 @@ use crate::application::voice::send::{
 };
 use crate::application::voice::sink::AudioSink;
 use crate::application::voice::targeted::{RecipientIndex, RemoteNodeLookup};
+use crate::application::voice::{AdaptiveVoiceBudget, VoiceBytePermit};
 use crate::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::TransportKind;
@@ -45,6 +47,7 @@ type RecipientIndexSlot = Arc<RwLock<Option<Arc<RecipientIndex>>>>;
 const REPAIR_REQUEST_QUEUE_CAPACITY: usize = 256;
 const REPAIR_RESPONSE_QUEUE_CAPACITY: usize = 256;
 const DISTANT_REPAIR_PATH_LATENCY_US: u64 = 150_000;
+const PROACTIVE_WORKER_CONCURRENCY: usize = 4;
 
 /// Decoded inbound voice frame along with the immediate sender (next-hop
 /// peer that delivered the overlay frame, not necessarily the originator).
@@ -106,14 +109,28 @@ struct RepairResponseRequest {
     request: VoiceRepairRequest,
 }
 
-/// Multiplexed event the dispatch task drains. Inbound frames feed
-/// through the reorder gate; deadline fires drain the gate's expired
-/// pending. Routing both through one mpsc keeps `AudioSink::deliver`
-/// calls strictly serialized.
-#[derive(Debug)]
+/// Work whose byte reservation remains live until serialized dispatch has
+/// processed the frame. The unbounded lane is therefore still byte bounded.
+struct InboundVoiceWork {
+    delivery: VoiceDelivery,
+    _permit: VoiceBytePermit,
+}
+
+/// The dispatch task drains primary work before proactive copies. Deadline
+/// fires share the same serialized fan-out but use a capacity-one channel.
 enum DispatchEvent {
-    Inbound(VoiceDelivery),
+    Inbound(InboundVoiceWork),
     DeadlineFired,
+}
+
+/// A low-priority proactive alternate held behind a byte permit until its
+/// dedicated worker submits it to the transport.
+struct ProactiveSendWork {
+    dst: NodeIdentifier,
+    body: Bytes,
+    avoid_first_hop: Option<NodeIdentifier>,
+    transport_ttl: Duration,
+    _permit: VoiceBytePermit,
 }
 
 /// Central handle for the voice L3 service.
@@ -130,8 +147,13 @@ pub struct VoiceService {
     transport: Arc<dyn VoiceTransport>,
     cfg: VoiceConfig,
     _shutdown: CancellationToken,
-    inbox_tx: mpsc::UnboundedSender<DispatchEvent>,
+    primary_inbox_tx: mpsc::UnboundedSender<InboundVoiceWork>,
+    proactive_inbox_tx: mpsc::UnboundedSender<InboundVoiceWork>,
+    proactive_send_tx: mpsc::UnboundedSender<ProactiveSendWork>,
     repair_response_tx: mpsc::Sender<RepairResponseRequest>,
+
+    /// Live byte and speaker admission limits derived from runtime capacity.
+    voice_budget: AdaptiveVoiceBudget,
 
     /// Set once at construction from the overlay's `local_boot_epoch`.
     sender_epoch: u64,
@@ -166,9 +188,27 @@ impl VoiceService {
         cfg: VoiceConfig,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
+        Self::new_with_capacity_source(overlay, cfg, shutdown, Arc::new(AtomicU64::new(5_000)))
+    }
+
+    /// Construct the voice service with a shared live user-capacity source.
+    /// New work samples this source when reserving admission capacity; queued
+    /// work is deliberately never evicted if the limit is lowered.
+    pub fn new_with_capacity_source(
+        overlay: OverlayNetwork,
+        cfg: VoiceConfig,
+        shutdown: CancellationToken,
+        max_users: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         let sender_epoch = overlay.local_boot_epoch();
         let transport: Arc<dyn VoiceTransport> = Arc::new(OverlayVoiceTransport { overlay });
-        Self::new_with_transport(transport, cfg, shutdown, sender_epoch)
+        Self::new_with_transport_and_capacity_source(
+            transport,
+            cfg,
+            shutdown,
+            sender_epoch,
+            max_users,
+        )
     }
 
     /// Constructor used by unit tests to inject a fake transport.
@@ -178,7 +218,30 @@ impl VoiceService {
         shutdown: CancellationToken,
         sender_epoch: u64,
     ) -> Arc<Self> {
-        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<DispatchEvent>();
+        Self::new_with_transport_and_capacity_source(
+            transport,
+            cfg,
+            shutdown,
+            sender_epoch,
+            Arc::new(AtomicU64::new(5_000)),
+        )
+    }
+
+    /// Test-oriented transport constructor which still follows a live user
+    /// capacity source.
+    pub(crate) fn new_with_transport_and_capacity_source(
+        transport: Arc<dyn VoiceTransport>,
+        cfg: VoiceConfig,
+        shutdown: CancellationToken,
+        sender_epoch: u64,
+        max_users: Arc<AtomicU64>,
+    ) -> Arc<Self> {
+        let voice_budget = AdaptiveVoiceBudget::new(max_users.clone());
+        let (primary_inbox_tx, primary_inbox_rx) = mpsc::unbounded_channel::<InboundVoiceWork>();
+        let (proactive_inbox_tx, proactive_inbox_rx) =
+            mpsc::unbounded_channel::<InboundVoiceWork>();
+        let (deadline_tx, deadline_rx) = mpsc::channel::<()>(1);
+        let (proactive_send_tx, proactive_send_rx) = mpsc::unbounded_channel::<ProactiveSendWork>();
         let (repair_request_tx, repair_request_rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
         let repair_request_scheduler = RepairRequestScheduler {
             tx: repair_request_tx,
@@ -187,7 +250,7 @@ impl VoiceService {
         let (repair_response_tx, repair_response_rx) =
             mpsc::channel(REPAIR_RESPONSE_QUEUE_CAPACITY);
         let audio_sink: AudioSinkSlot = Arc::new(RwLock::new(None));
-        let reorderer = Reorderer::new(cfg.clone());
+        let reorderer = Reorderer::new_with_capacity_source(cfg.clone(), max_users);
         let repair_cache = Arc::new(RepairCache::new(Duration::from_millis(cfg.repair_cache_ms)));
         spawn_repair_request_worker(
             repair_request_rx,
@@ -205,25 +268,36 @@ impl VoiceService {
             shutdown.clone(),
         );
         spawn_dispatch_task(
-            inbox_rx,
+            primary_inbox_rx,
+            proactive_inbox_rx,
+            deadline_rx,
             shutdown.clone(),
             audio_sink.clone(),
             reorderer.clone(),
             transport.clone(),
             cfg.clone(),
+            voice_budget.clone(),
             repair_request_scheduler,
         );
-        let nudge_tx = inbox_tx.clone();
+        spawn_proactive_worker(
+            proactive_send_rx,
+            transport.clone(),
+            voice_budget.clone(),
+            shutdown.clone(),
+        );
         reorder::spawn_deadline_task(reorderer.clone(), shutdown.clone(), move || {
-            let _ = nudge_tx.send(DispatchEvent::DeadlineFired);
+            let _ = deadline_tx.try_send(());
         });
         let delivery_strategy = DeliveryStrategy::parse(&cfg.delivery_strategy);
         Arc::new(Self {
             transport,
             cfg,
             _shutdown: shutdown,
-            inbox_tx,
+            primary_inbox_tx,
+            proactive_inbox_tx,
+            proactive_send_tx,
             repair_response_tx,
+            voice_budget,
             sender_epoch,
             seq_counters: Arc::new(SccMap::new()),
             audio_sink,
@@ -262,10 +336,12 @@ impl VoiceService {
     }
 
     /// `ServiceInbound` impl that decodes envelope bytes and pushes onto
-    /// the central dispatch mpsc.
+    /// the primary or lower-priority proactive dispatch lane.
     pub fn inbound_handler(&self) -> Arc<dyn ServiceInbound> {
         Arc::new(VoiceInbound {
-            inbox_tx: self.inbox_tx.clone(),
+            primary_inbox_tx: self.primary_inbox_tx.clone(),
+            proactive_inbox_tx: self.proactive_inbox_tx.clone(),
+            voice_budget: self.voice_budget.clone(),
         })
     }
 
@@ -325,7 +401,7 @@ impl VoiceService {
             );
             return Ok(());
         }
-        let (bytes, seq) = self.encode(
+        let (mut envelope, seq) = self.encode(
             sender_session,
             server_id,
             target_kind,
@@ -333,6 +409,7 @@ impl VoiceService {
             payload,
             intent,
         )?;
+        let bytes = envelope.original_body();
         let result = if self.cfg.tree_delivery_enabled {
             self.transport
                 .send_tree_multicast(
@@ -359,8 +436,7 @@ impl VoiceService {
             },
         );
         result?;
-        self.cache_and_send_proactive_repairs(sender_session, seq, bytes, &dsts)
-            .await;
+        self.cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &dsts);
         Ok(())
     }
 
@@ -411,7 +487,7 @@ impl VoiceService {
             );
             return Ok(());
         }
-        let (bytes, seq) = self.encode(
+        let (mut envelope, seq) = self.encode(
             sender_session,
             server_id,
             target_kind,
@@ -419,6 +495,7 @@ impl VoiceService {
             payload,
             intent,
         )?;
+        let bytes = envelope.original_body();
         let result = if self.cfg.tree_delivery_enabled {
             self.transport
                 .send_tree_multicast(dsts, group, bytes.clone(), self.cfg.transport_ttl())
@@ -440,8 +517,7 @@ impl VoiceService {
             },
         );
         result?;
-        self.cache_and_send_proactive_repairs(sender_session, seq, bytes, dsts)
-            .await;
+        self.cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, dsts);
         Ok(())
     }
 
@@ -731,7 +807,7 @@ impl VoiceService {
         intent: VoiceIntent,
         dst: NodeIdentifier,
     ) -> Result<(), ApplicationError> {
-        let (bytes, seq) = self.encode(
+        let (mut envelope, seq) = self.encode(
             sender_session,
             server_id,
             target_kind,
@@ -739,6 +815,7 @@ impl VoiceService {
             payload,
             intent,
         )?;
+        let bytes = envelope.original_body();
         let result = self
             .transport
             .send_unicast(dst, bytes.clone(), self.cfg.transport_ttl())
@@ -755,8 +832,7 @@ impl VoiceService {
             },
         );
         result?;
-        self.cache_and_send_proactive_repairs(sender_session, seq, bytes, &[dst])
-            .await;
+        self.cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &[dst]);
         Ok(())
     }
 
@@ -768,9 +844,9 @@ impl VoiceService {
         is_terminator: bool,
         payload: Bytes,
         intent: VoiceIntent,
-    ) -> Result<(Bytes, u64), ApplicationError> {
+    ) -> Result<(send::PreparedVoiceEnvelope, u64), ApplicationError> {
         let seq = self.next_seq(sender_session);
-        let bytes = send::build_envelope(
+        let envelope = send::PreparedVoiceEnvelope::new(
             sender_session,
             server_id,
             self.sender_epoch,
@@ -780,7 +856,7 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        Ok((bytes, seq))
+        Ok((envelope, seq))
     }
 
     fn remote_voice_members(&self) -> Vec<NodeIdentifier> {
@@ -792,22 +868,28 @@ impl VoiceService {
             .collect()
     }
 
-    async fn cache_and_send_proactive_repairs(
+    fn cache_and_queue_proactive_repairs(
         &self,
         sender_session: u32,
         s2s_seq: u64,
-        body: Bytes,
+        envelope: &mut send::PreparedVoiceEnvelope,
         dsts: &[NodeIdentifier],
     ) {
         if !self.cfg.repair_enabled {
             return;
         }
+        let original_body = envelope.original_body();
         self.repair_cache.insert(RepairFrame::new(
             sender_session,
             self.sender_epoch,
             s2s_seq,
-            body.clone(),
+            original_body.clone(),
         ));
+        // Credit belongs to locally originated ordinary frames only. Received
+        // originals never create proactive work on this node, so minting for
+        // them would violate the source-side 25% traffic ratio.
+        self.voice_budget.mint_proactive_credit(original_body.len());
+        publish_proactive_budget(&self.voice_budget);
         let mut proactive_body: Option<Bytes> = None;
         for &dst in dsts {
             if dst == self.transport.local_node_id() {
@@ -819,7 +901,7 @@ impl VoiceService {
             let extra_copies = proactive_repair_score_micros(&self.cfg, quality)
                 .map(|score| {
                     proactive_repair_extra_copy_count(
-                        self.cfg.repair_max_extra_copies_per_frame,
+                        self.cfg.repair_max_extra_copies_per_frame.min(2),
                         score,
                         proactive_repair_sample(dst, s2s_seq),
                     )
@@ -828,38 +910,52 @@ impl VoiceService {
             if extra_copies == 0 {
                 continue;
             }
-            if proactive_body.is_none() {
-                match send::mark_proactive_copy(&body) {
-                    Ok(marked) => proactive_body = Some(marked),
-                    Err(error) => {
-                        trace!(%error, "voice proactive repair: mark envelope failed");
-                        return;
+            for _ in 0..extra_copies {
+                // Reserve both the lower-priority queue and its traffic
+                // credit before the marked envelope is encoded. This avoids
+                // the decode/re-encode and allocation cost under saturation.
+                let reserve_bytes = original_body.len().saturating_add(3);
+                let Some(queue_permit) = self.voice_budget.try_reserve_proactive(reserve_bytes)
+                else {
+                    metrics::record_proactive_outcome(VoiceProactiveResult::BudgetShed);
+                    publish_proactive_budget(&self.voice_budget);
+                    continue;
+                };
+                let Some(credit_permit) = self
+                    .voice_budget
+                    .try_reserve_proactive_credit(reserve_bytes)
+                else {
+                    drop(queue_permit);
+                    metrics::record_proactive_outcome(VoiceProactiveResult::BudgetShed);
+                    publish_proactive_budget(&self.voice_budget);
+                    continue;
+                };
+                if proactive_body.is_none() {
+                    match envelope.proactive_body() {
+                        Ok(marked) => proactive_body = Some(marked),
+                        Err(error) => {
+                            trace!(%error, "voice proactive repair: mark envelope failed");
+                            return;
+                        }
                     }
                 }
-            }
-            let proactive_body = proactive_body
-                .as_ref()
-                .expect("proactive voice body was initialized")
-                .clone();
-            for _ in 0..extra_copies {
-                if self
-                    .transport
-                    .send_proactive_repair_frame(
-                        dst,
-                        proactive_body.clone(),
-                        avoid_first_hop,
-                        transport_ttl,
-                    )
-                    .await
-                    .is_ok()
-                {
-                    metrics::record_repair(
-                        self.transport.local_node_id(),
-                        dst,
-                        VoiceRepairResult::ProactiveCopySent,
-                        1,
-                    );
+                let work = ProactiveSendWork {
+                    dst,
+                    body: proactive_body
+                        .as_ref()
+                        .expect("proactive voice body was initialized")
+                        .clone(),
+                    avoid_first_hop,
+                    transport_ttl,
+                    _permit: queue_permit,
+                };
+                if self.proactive_send_tx.send(work).is_ok() {
+                    credit_permit.commit();
+                    metrics::record_proactive_outcome(VoiceProactiveResult::Queued);
+                } else {
+                    metrics::record_proactive_outcome(VoiceProactiveResult::QueueShed);
                 }
+                publish_proactive_budget(&self.voice_budget);
             }
         }
     }
@@ -931,6 +1027,7 @@ fn proactive_repair_extra_copy_count(
     score_micros: u64,
     sample: u64,
 ) -> usize {
+    let max_extra_copies = max_extra_copies.min(2);
     if max_extra_copies == 0 || score_micros == 0 {
         return 0;
     }
@@ -984,7 +1081,9 @@ fn normal_intent(channel_id: u32) -> VoiceIntent {
 }
 
 pub struct VoiceInbound {
-    inbox_tx: mpsc::UnboundedSender<DispatchEvent>,
+    primary_inbox_tx: mpsc::UnboundedSender<InboundVoiceWork>,
+    proactive_inbox_tx: mpsc::UnboundedSender<InboundVoiceWork>,
+    voice_budget: AdaptiveVoiceBudget,
 }
 
 impl ServiceInbound for VoiceInbound {
@@ -998,11 +1097,40 @@ impl ServiceInbound for VoiceInbound {
                 } else {
                     VoiceCopyKind::Original
                 };
-                let _ = self.inbox_tx.send(DispatchEvent::Inbound(VoiceDelivery {
-                    from: msg.from,
-                    frame,
-                    copy_kind,
-                }));
+                let class = if matches!(copy_kind, VoiceCopyKind::Proactive) {
+                    VoiceIngressClass::Proactive
+                } else {
+                    VoiceIngressClass::Primary
+                };
+                let permit = match class {
+                    VoiceIngressClass::Primary => {
+                        self.voice_budget.try_reserve_primary(msg.body.len())
+                    }
+                    VoiceIngressClass::Proactive => {
+                        self.voice_budget.try_reserve_proactive(msg.body.len())
+                    }
+                };
+                let Some(permit) = permit else {
+                    metrics::record_ingress_admission_drop(class);
+                    publish_ingress_budget(&self.voice_budget);
+                    return;
+                };
+                let work = InboundVoiceWork {
+                    delivery: VoiceDelivery {
+                        from: msg.from,
+                        frame,
+                        copy_kind,
+                    },
+                    _permit: permit,
+                };
+                let result = match class {
+                    VoiceIngressClass::Primary => self.primary_inbox_tx.send(work),
+                    VoiceIngressClass::Proactive => self.proactive_inbox_tx.send(work),
+                };
+                if result.is_err() {
+                    metrics::record_ingress_admission_drop(class);
+                }
+                publish_ingress_budget(&self.voice_budget);
             }
             Err(e) => {
                 trace!(error=%e, from=%msg.from, "voice: decode failed");
@@ -1041,111 +1169,269 @@ impl ServiceInbound for VoiceRepairInbound {
 }
 
 fn spawn_dispatch_task(
-    mut rx: mpsc::UnboundedReceiver<DispatchEvent>,
+    mut primary_rx: mpsc::UnboundedReceiver<InboundVoiceWork>,
+    mut proactive_rx: mpsc::UnboundedReceiver<InboundVoiceWork>,
+    mut deadline_rx: mpsc::Receiver<()>,
     shutdown: CancellationToken,
     audio_sink: AudioSinkSlot,
     reorderer: Arc<Reorderer>,
     transport: Arc<dyn VoiceTransport>,
     cfg: VoiceConfig,
+    voice_budget: AdaptiveVoiceBudget,
     repair_request_scheduler: RepairRequestScheduler,
 ) {
     tokio::spawn(async move {
+        let mut primary_open = true;
+        let mut proactive_open = true;
+        let mut deadline_open = true;
         loop {
+            // Greedily drain the latency-critical lane first. Proactive
+            // duplicates cannot preempt an original or reactive repair.
+            let ready = if primary_open {
+                match primary_rx.try_recv() {
+                    Ok(work) => Some(DispatchEvent::Inbound(work)),
+                    Err(mpsc::error::TryRecvError::Empty) => None,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        primary_open = false;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let event = match ready {
+                Some(event) => event,
+                None => {
+                    if !primary_open && !proactive_open && !deadline_open {
+                        return;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        work = primary_rx.recv(), if primary_open => match work {
+                            Some(work) => DispatchEvent::Inbound(work),
+                            None => {
+                                primary_open = false;
+                                continue;
+                            }
+                        },
+                        wake = deadline_rx.recv(), if deadline_open => match wake {
+                            Some(()) => DispatchEvent::DeadlineFired,
+                            None => {
+                                deadline_open = false;
+                                continue;
+                            }
+                        },
+                        work = proactive_rx.recv(), if proactive_open => match work {
+                            Some(work) => DispatchEvent::Inbound(work),
+                            None => {
+                                proactive_open = false;
+                                continue;
+                            }
+                        },
+                    }
+                }
+            };
+
+            let source = transport.local_node_id();
+            let (report, inbound_labels, _inbound_permit) = match event {
+                DispatchEvent::Inbound(InboundVoiceWork { delivery, _permit }) => {
+                    let origin_node = shitspeak_core::ClientSessionIdentifier::from(
+                        delivery.frame.sender_session,
+                    )
+                    .get_node_id();
+                    let from = delivery.from;
+                    let report = reorderer.push_with_route_hint_report_with_copy_kind(
+                        from,
+                        delivery.frame,
+                        None,
+                        delivery.copy_kind,
+                    );
+                    if cfg.repair_enabled
+                        && let Some(gap) = report.opened_gap()
+                    {
+                        metrics::record_repair(source, gap.from, VoiceRepairResult::GapDetected, 1);
+                        repair_request_scheduler.schedule(source, gap);
+                    }
+                    (report, Some((origin_node, from)), Some(_permit))
+                }
+                DispatchEvent::DeadlineFired => (reorderer.drain_expired_report(), None, None),
+            };
+            metrics::set_reorder_pending(source, report.pending_total());
+            metrics::set_reorder_speaker_state(
+                reorderer.tracked_speaker_count(),
+                reorderer.tracked_speaker_capacity(),
+            );
+            if let Some((origin_node, from_immediate)) = inbound_labels {
+                for result in report.result_counts() {
+                    metrics::record_receive(
+                        source,
+                        origin_node,
+                        from_immediate,
+                        result.result(),
+                        result.count(),
+                    );
+                }
+            }
+            let emits = report.into_marked_emissions();
+            if inbound_labels.is_none() {
+                for emission in &emits {
+                    let from = emission.from();
+                    let frame = emission.frame();
+                    let origin_node =
+                        shitspeak_core::ClientSessionIdentifier::from(frame.sender_session)
+                            .get_node_id();
+                    metrics::record_receive(
+                        source,
+                        origin_node,
+                        from,
+                        VoiceReceiveResult::DeadlineFlush,
+                        1,
+                    );
+                }
+            }
+            if emits.is_empty() {
+                drop(_inbound_permit);
+                publish_ingress_budget(&voice_budget);
+                continue;
+            }
+            let sink = audio_sink.read().clone();
+            match sink {
+                Some(sink) => {
+                    for emission in emits {
+                        let (from, frame, is_repair) = emission.into_parts();
+                        sink.deliver(from, frame, is_repair).await;
+                    }
+                }
+                None => {
+                    for emission in &emits {
+                        let from = emission.from();
+                        let frame = emission.frame();
+                        let origin_node =
+                            shitspeak_core::ClientSessionIdentifier::from(frame.sender_session)
+                                .get_node_id();
+                        metrics::record_receive(
+                            source,
+                            origin_node,
+                            from,
+                            VoiceReceiveResult::NoSinkDrop,
+                            1,
+                        );
+                    }
+                    trace!(
+                        n = emits.len(),
+                        "voice: no audio sink installed; dropping emit batch",
+                    )
+                }
+            }
+            drop(_inbound_permit);
+            publish_ingress_budget(&voice_budget);
+        }
+    });
+}
+
+fn publish_ingress_budget(budget: &AdaptiveVoiceBudget) {
+    metrics::set_ingress_queue_budget(
+        VoiceIngressClass::Primary,
+        budget.primary_capacity_bytes(),
+        budget.primary_reserved_bytes(),
+    );
+    metrics::set_ingress_queue_budget(
+        VoiceIngressClass::Proactive,
+        budget.proactive_capacity_bytes(),
+        budget.proactive_reserved_bytes(),
+    );
+}
+
+fn publish_proactive_budget(budget: &AdaptiveVoiceBudget) {
+    publish_ingress_budget(budget);
+    metrics::set_proactive_queue_budget(
+        budget.proactive_capacity_bytes(),
+        budget.proactive_reserved_bytes(),
+    );
+    metrics::set_proactive_credit(
+        budget.proactive_credit_balance_bytes(),
+        budget.proactive_credit_burst_bytes(),
+    );
+}
+
+/// Send proactively-marked alternates outside the foreground voice path.
+/// The unbounded work queue is bounded by `VoiceBytePermit`; at most four
+/// sends await transport completion concurrently.
+fn spawn_proactive_worker(
+    mut rx: mpsc::UnboundedReceiver<ProactiveSendWork>,
+    transport: Arc<dyn VoiceTransport>,
+    voice_budget: AdaptiveVoiceBudget,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let source = transport.local_node_id();
+        let mut in_flight = tokio::task::JoinSet::new();
+        let mut input_open = true;
+        loop {
+            if !input_open && in_flight.is_empty() {
+                publish_proactive_budget(&voice_budget);
+                return;
+            }
+            if in_flight.len() >= PROACTIVE_WORKER_CONCURRENCY {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    joined = in_flight.join_next() => {
+                        if joined.is_none() {
+                            return;
+                        }
+                        publish_proactive_budget(&voice_budget);
+                    }
+                }
+                continue;
+            }
             tokio::select! {
                 _ = shutdown.cancelled() => return,
-                next = rx.recv() => {
-                    let Some(ev) = next else { return };
-                    let source = transport.local_node_id();
-                    let (report, inbound_labels) = match ev {
-                        DispatchEvent::Inbound(d) => {
-                            let origin_node = shitspeak_core::ClientSessionIdentifier::from(
-                                d.frame.sender_session,
-                            )
-                            .get_node_id();
-                            let report = reorderer.push_with_route_hint_report_with_copy_kind(
-                                d.from,
-                                d.frame,
-                                None,
-                                d.copy_kind,
-                            );
-                            if cfg.repair_enabled && let Some(gap) = report.opened_gap() {
-                                metrics::record_repair(
-                                    source,
-                                    gap.from,
-                                    VoiceRepairResult::GapDetected,
-                                    1,
-                                );
-                                repair_request_scheduler.schedule(source, gap);
+                work = rx.recv(), if input_open => match work {
+                    Some(work) => {
+                        let transport = transport.clone();
+                        in_flight.spawn(async move {
+                            let ProactiveSendWork {
+                                dst,
+                                body,
+                                avoid_first_hop,
+                                transport_ttl,
+                                _permit,
+                            } = work;
+                            match transport
+                                .send_proactive_repair_frame(
+                                    dst,
+                                    body,
+                                    avoid_first_hop,
+                                    transport_ttl,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    metrics::record_repair(
+                                        source,
+                                        dst,
+                                        VoiceRepairResult::ProactiveCopySent,
+                                        1,
+                                    );
+                                    metrics::record_proactive_outcome(VoiceProactiveResult::Sent);
+                                }
+                                Err(_) => {
+                                    metrics::record_proactive_outcome(
+                                        VoiceProactiveResult::SendFailed,
+                                    );
+                                }
                             }
-                            (report, Some((origin_node, d.from)))
-                        }
-                        DispatchEvent::DeadlineFired => {
-                            (reorderer.drain_expired_report(), None)
-                        }
-                    };
-                    metrics::set_reorder_pending(source, report.pending_total());
-                    if let Some((origin_node, from_immediate)) = inbound_labels {
-                        for result in report.result_counts() {
-                            metrics::record_receive(
-                                source,
-                                origin_node,
-                                from_immediate,
-                                result.result(),
-                                result.count(),
-                            );
-                        }
+                            drop(_permit);
+                        });
                     }
-                    let emits = report.into_marked_emissions();
-                    if inbound_labels.is_none() {
-                        for emission in &emits {
-                            let from = emission.from();
-                            let frame = emission.frame();
-                            let origin_node =
-                                shitspeak_core::ClientSessionIdentifier::from(frame.sender_session)
-                                    .get_node_id();
-                            metrics::record_receive(
-                                source,
-                                origin_node,
-                                from,
-                                VoiceReceiveResult::DeadlineFlush,
-                                1,
-                            );
-                        }
+                    None => input_open = false,
+                },
+                joined = in_flight.join_next(), if !in_flight.is_empty() => {
+                    if joined.is_none() {
+                        return;
                     }
-                    if emits.is_empty() {
-                        continue;
-                    }
-                    let sink = audio_sink.read().clone();
-                    match sink {
-                        Some(sink) => {
-                            for emission in emits {
-                                let (from, frame, is_repair) = emission.into_parts();
-                                sink.deliver(from, frame, is_repair).await;
-                            }
-                        }
-                        None => {
-                            for emission in &emits {
-                                let from = emission.from();
-                                let frame = emission.frame();
-                                let origin_node =
-                                    shitspeak_core::ClientSessionIdentifier::from(
-                                        frame.sender_session,
-                                    )
-                                    .get_node_id();
-                                metrics::record_receive(
-                                    source,
-                                    origin_node,
-                                    from,
-                                    VoiceReceiveResult::NoSinkDrop,
-                                    1,
-                                );
-                            }
-                            trace!(
-                                n = emits.len(),
-                                "voice: no audio sink installed; dropping emit batch",
-                            )
-                        }
-                    }
+                    publish_proactive_budget(&voice_budget);
                 }
             }
         }
@@ -1281,6 +1567,7 @@ fn spawn_repair_response_worker(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -1645,6 +1932,9 @@ mod tests {
             ),
         );
         let svc = make_legacy_service(transport.clone());
+        // This test covers marker/cache semantics, not the source-side rate
+        // budget. Seed credit so the first qualifying alternate is admitted.
+        svc.voice_budget.mint_proactive_credit(1_024);
         svc.send_unicast(
             0xABC,
             shitspeak_core::default_server_id(),
@@ -1657,7 +1947,7 @@ mod tests {
         .await
         .unwrap();
 
-        let calls = transport.calls();
+        let calls = wait_for_call_count(&transport, 2).await;
         assert_eq!(calls.len(), 2);
         match &calls[1] {
             FakeCall::RepairFrame {
@@ -1703,6 +1993,124 @@ mod tests {
             }
             other => panic!("expected NACK replay frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn primary_lane_drains_before_a_saturated_proactive_backlog() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_legacy_service(transport);
+        let sink = RecordingSink::new();
+        svc.set_audio_sink(sink.clone());
+        let inbound = svc.inbound_handler();
+
+        // Queue enough marked copies to consume the low-priority lane before
+        // yielding to the dispatch task. The following ordinary frame must
+        // still be the first release.
+        for session in 1..256_u32 {
+            let body = send::mark_proactive_copy(
+                &send::build_envelope(
+                    session,
+                    shitspeak_core::default_server_id(),
+                    42,
+                    0,
+                    0,
+                    false,
+                    Bytes::from(vec![0; 512]),
+                    normal_intent(5),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            inbound.handle(OverlayInboundMessage {
+                from: 11,
+                level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+                class: shitspeak_s2s_transport::MessageClass::HighPriority,
+                body,
+                remote_playout_delay_ms: None,
+                is_distribution_repair: false,
+            });
+        }
+        let primary_session = 0xABCD;
+        inbound.handle(OverlayInboundMessage {
+            from: 11,
+            level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+            class: shitspeak_s2s_transport::MessageClass::HighPriority,
+            body: send::build_envelope(
+                primary_session,
+                shitspeak_core::default_server_id(),
+                42,
+                0,
+                0,
+                false,
+                Bytes::from_static(b"primary"),
+                normal_intent(5),
+            )
+            .unwrap(),
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
+        });
+
+        for _ in 0..50 {
+            if sink.len() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(sink.snapshot()[0].1.sender_session, primary_session);
+    }
+
+    #[tokio::test]
+    async fn live_capacity_reduction_keeps_queued_primary_and_rejects_new_work() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let max_users = Arc::new(AtomicU64::new(5_000));
+        let svc = VoiceService::new_with_transport_and_capacity_source(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+            max_users.clone(),
+        );
+        let inbound = svc.inbound_handler();
+        let large = Bytes::from(vec![0; 300_000]);
+        let make_body = |session| {
+            send::build_envelope(
+                session,
+                shitspeak_core::default_server_id(),
+                42,
+                0,
+                0,
+                false,
+                large.clone(),
+                normal_intent(5),
+            )
+            .unwrap()
+        };
+        inbound.handle(OverlayInboundMessage {
+            from: 11,
+            level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+            class: shitspeak_s2s_transport::MessageClass::HighPriority,
+            body: make_body(1),
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
+        });
+        let reserved = svc.voice_budget.primary_reserved_bytes();
+        assert!(reserved > 256 * 1024);
+
+        max_users.store(100, Ordering::Relaxed);
+        inbound.handle(OverlayInboundMessage {
+            from: 11,
+            level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+            class: shitspeak_s2s_transport::MessageClass::HighPriority,
+            body: make_body(2),
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
+        });
+        assert_eq!(svc.voice_budget.primary_reserved_bytes(), reserved);
+
+        // Let dispatch release the retained item. The reduction affects only
+        // later reservation attempts; it never evicts queued voice.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(svc.voice_budget.primary_reserved_bytes(), 0);
     }
 
     #[tokio::test]

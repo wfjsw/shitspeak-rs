@@ -543,13 +543,8 @@ repair_transport_ttl_ms = 750
 repair_request_ttl_ms = 750
 repair_cache_ms = 1600
 adaptive_jitter_max_delay_ms = 750
-
-# Remote S2S playout policy. This applies after S2S ordering and before
-# the remote node fans voice out to its local listeners.
-remote_playout_min_ms = 80
-remote_playout_max_ms = 750
-remote_playout_p99_margin_ms = 60
-remote_playout_idle_reset_ms = 2000
+# At most two proactive copies may be requested per frame. The default is one.
+repair_max_extra_copies_per_frame = 1
 
 [s2s.overlay]
 hello_interval_ms = 1000
@@ -573,6 +568,22 @@ old `inbound_*_capacity` and `outbound_capacity` knobs are still accepted for
 compatibility, but they act as minimum budget hints rather than hard message
 counts.
 
+Voice admission and reorder protection scale from the live top-level
+`max_users` value at each new reservation; changing it does not rebuild queues
+or evict already admitted work. The primary voice ingress budget is
+`clamp(max_users * 512 B, 256 KiB, 4 MiB)`. The proactive lane is one eighth of
+that, clamped to `32 KiB..512 KiB`; tracked reorder speakers are
+`clamp(max_users * 2, 1024, 16384)`; and the proactive credit burst is
+`clamp(primary / 32, 16 KiB, 128 KiB)`. At `max_users = 5000`, that yields a
+2.5 MiB primary lane, 320 KiB proactive lane, 10,000 tracked speakers, and an
+80 KiB proactive burst. A capacity decrease blocks only future admission.
+
+Originals and reactive repairs use the primary lane. Proactive copies use the
+lower-priority lane and are shed before primary traffic when capacity is
+exhausted. Proactive copies retain a ratio budget: accepted original bytes mint
+at most 25% as proactive credits, capped by the dynamic burst. Configure
+`repair_max_extra_copies_per_frame` only in the supported `0..2` range.
+
 `strict_bootstrap_retry_interval_ms` gates strict startup and partition-heal
 history-election retries. `strict_steady_state_catchup_interval_ms` controls the
 periodic strict catchup interval used after history election has finished.
@@ -584,13 +595,13 @@ the documented long-haul profile uses `750` ms. `repair_cache_ms` must cover tha
 delivery window and the time needed to request a repair; it is `1600` ms in the
 deployment configuration.
 
-Remote voice is paced after S2S reordering so that a talkspurt reaches local
-listeners as a continuous stream rather than in an arrival burst. The selected
-delay is the larger of the path baseline and observed arrival-delay p99, plus
-`remote_playout_p99_margin_ms`, clamped to
-`remote_playout_min_ms..remote_playout_max_ms`. It is latched for a talkspurt
-and reset only after its terminator or `remote_playout_idle_reset_ms` of
-silence. Local same-node voice does not use this delay.
+Remote voice is released immediately after S2S sequence ordering. The server
+buffers only an observed sequence gap for its short per-speaker repair window;
+clients own media pacing and jitter buffering. Legacy
+`remote_playout_min_ms`, `remote_playout_max_ms`,
+`remote_playout_p99_margin_ms`, and `remote_playout_idle_reset_ms` keys are
+accepted as ignored no-ops for one release and should be removed from deployment
+configuration.
 
 The tracked `config.toml` enables the documented long-haul profile explicitly.
 The S2S dashboard reports deadline translation, expiry, and clock-offset
@@ -610,13 +621,13 @@ Per-edge tree traffic comes from
 `direction="sent"`. It exposes original and repair frames/bytes separately by
 directed edge without adding group or tree-version label cardinality.
 
-Remote playout observability is separate from local voice routing:
-`shitspeak_voice_remote_playout_events_total`,
-`shitspeak_voice_remote_playout_selected_delay_ms`, and
-`shitspeak_voice_remote_playout_release_lateness_ms_bucket_total` are labeled
-by the receiving local node and remote origin node. Use those metrics to
-distinguish selected delay, scheduled/released frames, and late copies dropped
-after their playout time.
+Adaptive voice protection observability is cluster-aggregated in Grafana.
+`shitspeak_s2s_voice_ingress_admission_drops_total` and
+`shitspeak_s2s_voice_proactive_events_total` retain only bounded `class` or
+`result` labels. Capacity, tracked-speaker, deadline-wake, queue, and credit
+metrics are aggregated across nodes so the dashboard does not create per-node
+legends. `shitspeak_s2s_voice_receive_events_total{result="speaker_state_drop"}`
+reports a dynamic speaker-cap admission refusal.
 
 See [Clustering](clustering.md) for certificate generation, local demos, and S2S operational notes.
 

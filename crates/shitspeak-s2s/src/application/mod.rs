@@ -12,7 +12,7 @@
 //!
 //! * **Voice** ([`VOICE_SERVICE_TAG`] = 3) — broadcast (default) or
 //!   targeted (opt-in) cross-node fan-out of voice frames. Receivers
-//!   never decode the audio payload; they reorder by `(sender, epoch)`
+//!   never decode the audio payload; they reorder by sender session
 //!   and hand the bytes straight to local per-client encryption +
 //!   send. Reorder caps and deadlines are operator-tunable.
 //!
@@ -35,6 +35,7 @@ pub mod user_stats;
 pub mod voice;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use tokio_util::sync::CancellationToken;
 
@@ -73,12 +74,28 @@ impl ApplicationLayer {
     /// Build the application layer on top of an already-started overlay.
     /// Spawns per-service dispatch tasks and registers the L3 handlers.
     pub fn new(overlay: OverlayNetwork, cfg: ApplicationConfig) -> Arc<Self> {
+        Self::new_with_capacity_source(overlay, cfg, Arc::new(AtomicU64::new(5_000)))
+    }
+
+    /// Build the application layer with a live source for adaptive voice
+    /// capacity. The current value is consulted when voice work is admitted,
+    /// so runtime capacity updates apply without rebuilding the layer.
+    pub fn new_with_capacity_source(
+        overlay: OverlayNetwork,
+        cfg: ApplicationConfig,
+        max_users: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         let shutdown = CancellationToken::new();
         let moderation = ModerationService::new(overlay.clone(), shutdown.child_token());
         let plugin_data = PluginDataService::new(overlay.clone(), shutdown.child_token());
         let text_message = TextMessageService::new(overlay.clone(), shutdown.child_token());
         let user_stats = UserStatsService::new(overlay.clone(), shutdown.child_token());
-        let voice = VoiceService::new(overlay.clone(), cfg.voice, shutdown.child_token());
+        let voice = VoiceService::new_with_capacity_source(
+            overlay.clone(),
+            cfg.voice,
+            shutdown.child_token(),
+            max_users,
+        );
 
         overlay.register_service(MODERATION_SERVICE_TAG, moderation.inbound_handler());
         overlay.register_service(PLUGIN_DATA_SERVICE_TAG, plugin_data.inbound_handler());
