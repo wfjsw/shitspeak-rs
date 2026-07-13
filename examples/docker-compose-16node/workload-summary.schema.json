@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ShitSpeak 16-node pre-release workload evidence",
+  "type": "object",
+  "required": ["schema_version", "run_id", "scenario_sha256", "faults_stopped_at_seconds", "strict", "tree", "control_plane", "performance"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "run_id": { "type": "string", "minLength": 8 },
+    "scenario_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "faults_stopped_at_seconds": { "type": "number", "minimum": 0 },
+    "strict": {
+      "type": "object",
+      "required": ["proposal_count", "proposal_failures", "failures_by_kind", "propose_timeouts", "expected_operation_ids", "restart_inflight_evidence_count", "converged_at_seconds", "logs_by_node"],
+      "properties": {
+        "proposal_count": { "type": "integer", "minimum": 1 },
+        "propose_timeouts": { "type": "integer", "minimum": 0 },
+        "proposal_failures": { "type": "integer", "minimum": 0 },
+        "failures_by_kind": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "expected_operation_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+        "restart_inflight_evidence_count": { "type": "integer", "minimum": 0 },
+        "converged_at_seconds": { "type": "number", "minimum": 0 },
+        "logs_by_node": { "type": "object", "minProperties": 16, "maxProperties": 16, "additionalProperties": { "type": "array", "items": { "type": "string" }, "minItems": 1 } }
+      }
+    },
+    "tree": {
+      "type": "object",
+      "required": ["expected_delivery_ids", "deliveries_by_node", "selected_ack_drops", "restart_tree_send_calls", "whole_group_fallbacks_after_initial_activation", "candidate_builds", "candidate_trigger_changes"],
+      "properties": {
+        "expected_delivery_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+        "deliveries_by_node": { "type": "object", "minProperties": 16, "maxProperties": 16, "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "selected_ack_drops": { "type": "integer", "minimum": 1 },
+        "restart_tree_send_calls": { "type": "integer", "minimum": 0 },
+        "whole_group_fallbacks_after_initial_activation": { "type": "integer", "minimum": 0 },
+        "candidate_builds": { "type": "integer", "minimum": 0 },
+        "candidate_trigger_changes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "control_plane": {
+      "type": "object",
+      "required": ["topology_epoch_changes_during_metric_mask_churn", "metric_lsa_observation_seconds", "metric_lsa_emissions_by_node"],
+      "properties": {
+        "topology_epoch_changes_during_metric_mask_churn": { "type": "integer", "minimum": 0 },
+        "metric_lsa_observation_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "metric_lsa_emissions_by_node": { "type": "object", "minProperties": 16, "maxProperties": 16, "additionalProperties": { "type": "integer", "minimum": 0 } }
+      }
+    },
+    "performance": {
+      "type": "object",
+      "required": ["tree_encode_send_operations", "legacy_encode_send_operations", "tree_logical_sends", "legacy_logical_sends", "tree_source_cpu_percent", "legacy_source_cpu_percent"],
+      "properties": {
+        "tree_encode_send_operations": { "type": "integer", "minimum": 0 },
+        "legacy_encode_send_operations": { "type": "integer", "minimum": 1 },
+        "tree_logical_sends": { "type": "integer", "minimum": 1 },
+        "legacy_logical_sends": { "type": "integer", "minimum": 1 },
+        "tree_source_cpu_percent": { "type": "number", "minimum": 0 },
+        "legacy_source_cpu_percent": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

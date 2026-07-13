@@ -80,3 +80,7 @@ tracing-test = { workspace = true }
 
 [features]
 default = []
+pre-release-workload = [
+    "shitspeak-s2s/test-support",
+    "shitspeak-s2s/pre-release-workload",
+]

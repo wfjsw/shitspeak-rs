@@ -10,13 +10,10 @@
 //!     whenever the LSDB changes.
 //!   * `ServiceRegistry` dispatches inbound `OverlayData` by tag.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-
-use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -27,7 +24,6 @@ use super::config::OverlayConfig;
 use super::distribution::DistributionPlane;
 use super::duplicate::DuplicateDetector;
 use super::error::OverlayError;
-use super::lsdb::advert::{cost_changed_significantly, voice_cost_changed_significantly};
 use super::lsdb::{
     ApplicationServices, DistributionCapabilities, LinkStateDb, LsaEmitter, LsaFloodPacer,
     LsaFloor, ReplicationServices, capture_boot_epoch, emit_once, spawn_anti_entropy,
@@ -39,18 +35,7 @@ use super::neighbor::hello::{HelloContext, spawn_hello_task, spawn_link_up_watch
 use super::neighbor::monitor::NeighborMonitor;
 use super::routing::{RoutingHandle, new_handle as new_routing_handle, spawn_recomputer};
 
-const METRIC_CHANGE_STABLE_CHECKS: u8 = 3;
-const VOICE_METRIC_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(500);
-const TREE_CLOCK_FALLBACK_LOG_INTERVAL: Duration = Duration::from_secs(5);
 static LAST_PROCESS_BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TreeClockFallbackLogState {
-    child: NodeIdentifier,
-    next_hop: Option<NodeIdentifier>,
-    reason: &'static str,
-    logged_at: Instant,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LocalBootEpochFileV1 {
@@ -166,7 +151,6 @@ pub(crate) struct OverlayInner {
     pub hello: Arc<HelloContext>,
     pub shutdown: CancellationToken,
     pub cfg: OverlayConfig,
-    tree_clock_fallback_log: Mutex<Option<TreeClockFallbackLogState>>,
 }
 
 impl OverlayInner {
@@ -214,9 +198,15 @@ impl OverlayInner {
             replication_services,
             application_services,
         ));
-        emitter.update_distribution_capabilities(DistributionCapabilities::v2([
+        #[cfg(feature = "pre-release-workload")]
+        let distribution_profiles = vec![
             super::distribution::VOICE_REALTIME_PROFILE_ID,
-        ]));
+            super::distribution::PRE_RELEASE_RELIABLE_PROFILE_ID,
+        ];
+        #[cfg(not(feature = "pre-release-workload"))]
+        let distribution_profiles = vec![super::distribution::VOICE_REALTIME_PROFILE_ID];
+        emitter
+            .update_distribution_capabilities(DistributionCapabilities::v3(distribution_profiles));
         let flood_pacer = Arc::new(LsaFloodPacer::new(self_id, transport.clone()));
 
         let shutdown = CancellationToken::new();
@@ -249,34 +239,7 @@ impl OverlayInner {
             hello,
             shutdown,
             cfg,
-            tree_clock_fallback_log: Mutex::new(None),
         }
-    }
-
-    pub(crate) fn should_log_tree_clock_fallback(
-        &self,
-        child: NodeIdentifier,
-        next_hop: Option<NodeIdentifier>,
-        reason: &'static str,
-    ) -> bool {
-        let now = Instant::now();
-        let mut last = self.tree_clock_fallback_log.lock();
-        let changed = last.is_none_or(|previous| {
-            previous.child != child || previous.next_hop != next_hop || previous.reason != reason
-        });
-        let interval_elapsed = last.is_none_or(|previous| {
-            now.saturating_duration_since(previous.logged_at) >= TREE_CLOCK_FALLBACK_LOG_INTERVAL
-        });
-        if !changed && !interval_elapsed {
-            return false;
-        }
-        *last = Some(TreeClockFallbackLogState {
-            child,
-            next_hop,
-            reason,
-            logged_at: now,
-        });
-        true
     }
 
     /// Spawn every long-running task: Hello ticker, link-up watcher,
@@ -306,55 +269,19 @@ impl OverlayInner {
             });
         }
 
-        // Forward volatile metric changes through a debounce so link-quality
-        // sampling cannot wake the LSA emitter on every HelloAck.
+        // The emitter classifies and stabilizes metric changes. Forward every
+        // notification so service-eligibility loss is still immediate.
         {
-            let mon = self.neighbor.clone();
             let em = self.emitter.clone();
             let shutdown = self.shutdown.clone();
-            let on_metric_change = mon.on_metric_change();
-            let normal_min_interval = self.cfg.cost_rerun_min_interval();
-            let cfg = self.cfg.clone();
+            let on_metric_change = self.neighbor.on_metric_change();
             tokio::spawn(async move {
-                let mut last_poke = Instant::now();
-                let mut stable_checks = 0u8;
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => return,
                         _ = on_metric_change.notified() => {}
                     }
-
-                    let initial_snap = mon.snapshot();
-                    let initial_urgent = voice_cost_changed_significantly(&em, &initial_snap, &cfg);
-                    let min_interval = if initial_urgent {
-                        VOICE_METRIC_CHANGE_MIN_INTERVAL
-                    } else {
-                        normal_min_interval
-                    };
-                    let remaining = min_interval
-                        .checked_sub(last_poke.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    if !remaining.is_zero() {
-                        tokio::select! {
-                            _ = shutdown.cancelled() => return,
-                            _ = tokio::time::sleep(remaining) => {}
-                        }
-                    }
-
-                    let snap = mon.snapshot();
-                    if voice_cost_changed_significantly(&em, &snap, &cfg) {
-                        em.poke();
-                        stable_checks = 0;
-                    } else if cost_changed_significantly(&em, &snap, &cfg) {
-                        stable_checks = stable_checks.saturating_add(1);
-                        if stable_checks >= METRIC_CHANGE_STABLE_CHECKS {
-                            em.poke();
-                            stable_checks = 0;
-                        }
-                    } else {
-                        stable_checks = 0;
-                    }
-                    last_poke = Instant::now();
+                    em.poke();
                 }
             });
         }
@@ -423,7 +350,7 @@ impl OverlayInner {
                                 Ok(super::MembershipEvent::Restarted(node))
                                 | Ok(super::MembershipEvent::Failed(node))
                                 | Ok(super::MembershipEvent::Left(node)) => {
-                                    ordering.reset_peer(node).await;
+                                    ordering.reset_peer(node.node_id()).await;
                                 }
                                 Ok(super::MembershipEvent::Joined(_)) => {}
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}

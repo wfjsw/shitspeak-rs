@@ -25,8 +25,13 @@ const UNKNOWN_TREE_FRAMES_PER_KEY: usize = 8;
 const UNKNOWN_TREE_FRAMES_TOTAL: usize = 256;
 const UNKNOWN_TREE_RECOVERY_RETRY: Duration = Duration::from_millis(10);
 const EDGE_FAILURE_REPORT_DEDUP: Duration = Duration::from_secs(1);
+const FAILED_EDGE_EXCLUSION: Duration = Duration::from_secs(10);
+const METRIC_RESHAPE_HOLD: Duration = Duration::from_secs(5);
+const METRIC_RESHAPE_IMPROVEMENT_PERCENT: u64 = 10;
 pub(crate) const DISTRIBUTION_CONTROL_SERVICE_TAG: u32 = 250;
 pub(crate) const VOICE_REALTIME_PROFILE_ID: u32 = 1;
+#[cfg(feature = "pre-release-workload")]
+pub(crate) const PRE_RELEASE_RELIABLE_PROFILE_ID: u32 = 2;
 
 /// A stable, service-filtered distribution policy. Profiles deliberately own
 /// transport semantics; callers supply only the recipient group.
@@ -63,7 +68,22 @@ pub(crate) fn profile_for_service(tag: u32) -> Option<DistributionProfile> {
         level: ServiceLevel::BestEffort,
         metric: RoutingMetric::ConversationalQuality,
     };
-    voice.accepts(tag).then_some(voice)
+    if voice.accepts(tag) {
+        return Some(voice);
+    }
+    #[cfg(feature = "pre-release-workload")]
+    {
+        let pre_release = DistributionProfile {
+            id: PRE_RELEASE_RELIABLE_PROFILE_ID,
+            service_tag: super::PRE_RELEASE_DISTRIBUTION_SERVICE_TAG,
+            level: ServiceLevel::ReliableLowLatency,
+            metric: RoutingMetric::ReliableLowLatencyCost,
+        };
+        if pre_release.accepts(tag) {
+            return Some(pre_release);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,6 +122,7 @@ pub(crate) struct TreeState {
     members: HashSet<NodeIdentifier>,
     children: HashMap<NodeIdentifier, Vec<NodeIdentifier>>,
     nodes: HashSet<NodeIdentifier>,
+    hop_ttl: Option<Duration>,
 }
 
 impl TreeState {
@@ -130,11 +151,13 @@ impl TreeState {
             members,
             children,
             nodes,
+            hop_ttl: None,
         }
     }
 
     /// Retained while mixed-version callers still supply the retired metadata.
     /// The values are deliberately ignored: tree state owns topology only.
+    #[cfg(test)]
     pub(crate) fn new_with_playout(
         source: NodeIdentifier,
         members: impl IntoIterator<Item = NodeIdentifier>,
@@ -166,6 +189,42 @@ impl TreeState {
             .flat_map(|(parent, children)| children.iter().map(move |child| (*parent, *child)))
     }
 
+    pub(crate) fn with_hop_ttl(mut self, hop_ttl: Duration) -> Self {
+        self.hop_ttl = (!hop_ttl.is_zero()).then_some(hop_ttl);
+        self
+    }
+
+    pub(crate) fn hop_ttl(&self) -> Option<Duration> {
+        self.hop_ttl
+    }
+
+    fn is_valid(&self, source: NodeIdentifier) -> bool {
+        if !self.nodes.contains(&source) || self.members.contains(&source) {
+            return false;
+        }
+        let mut parent_count = HashMap::<NodeIdentifier, usize>::new();
+        for (parent, child) in self.edges() {
+            if parent == child || child == source {
+                return false;
+            }
+            *parent_count.entry(child).or_default() += 1;
+        }
+        if parent_count.values().any(|count| *count != 1) {
+            return false;
+        }
+        let mut reached = HashSet::from([source]);
+        let mut pending = vec![source];
+        while let Some(parent) = pending.pop() {
+            for child in self.children(parent) {
+                if !reached.insert(*child) {
+                    return false;
+                }
+                pending.push(*child);
+            }
+        }
+        reached == self.nodes && self.members.iter().all(|member| reached.contains(member))
+    }
+
     /// Exact recipient members reachable through one direct child branch.
     /// The source tree should be acyclic, but the visited set also bounds this
     /// traversal when inspecting malformed remotely installed control state.
@@ -187,10 +246,23 @@ impl TreeState {
         members
     }
 
-    /// Retained until source-side route construction stops supplying the
-    /// retired playout-selection input. Path costs do not alter tree state.
-    pub(crate) fn with_recipient_path_cost(self, _cost: u64) -> Self {
-        self
+    pub(crate) fn is_reachable_from(
+        &self,
+        source: NodeIdentifier,
+        destination: NodeIdentifier,
+    ) -> bool {
+        let mut pending = vec![source];
+        let mut visited = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            if node == destination {
+                return true;
+            }
+            pending.extend(self.children(node).iter().copied());
+        }
+        false
     }
 }
 
@@ -201,9 +273,69 @@ struct PendingAcks {
 
 #[derive(Clone)]
 struct ActiveTree {
+    key: TreeKey,
     state: TreeState,
+    path_cost: u64,
     /// Failure edges already incorporated into the active replacement.
     applied_failures: HashSet<(NodeIdentifier, NodeIdentifier)>,
+    legacy_members: HashSet<NodeIdentifier>,
+}
+
+#[derive(Clone)]
+struct CandidateTree {
+    key: TreeKey,
+    state: TreeState,
+    path_cost: u64,
+    routing_generation: u64,
+    recheck_at: Option<Instant>,
+    legacy_members: HashSet<NodeIdentifier>,
+}
+
+#[derive(Clone)]
+struct MetricProposal {
+    state: TreeState,
+    path_cost: u64,
+    first_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StableTreeScope {
+    source: NodeIdentifier,
+    profile: u32,
+    group: u64,
+    group_version: u64,
+}
+
+impl From<TreeKey> for StableTreeScope {
+    fn from(key: TreeKey) -> Self {
+        Self {
+            source: key.source,
+            profile: key.profile,
+            group: key.group,
+            group_version: key.group_version,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SelectedTree {
+    key: TreeKey,
+    state: Arc<TreeState>,
+    legacy_members: Arc<HashSet<NodeIdentifier>>,
+}
+
+impl SelectedTree {
+    pub(crate) fn key(&self) -> TreeKey {
+        self.key
+    }
+
+    pub(crate) fn state(&self) -> &Arc<TreeState> {
+        &self.state
+    }
+
+    pub(crate) fn legacy_members(&self) -> &HashSet<NodeIdentifier> {
+        &self.legacy_members
+    }
 }
 
 #[derive(Default)]
@@ -356,12 +488,17 @@ pub(crate) struct DistributionPlane {
     unknown: Mutex<UnknownTreeFrames>,
     recovery_sender: Mutex<Option<RecoverySender>>,
     self_ref: Mutex<Weak<DistributionPlane>>,
-    failed_edges: Mutex<HashMap<TreeScope, HashSet<(NodeIdentifier, NodeIdentifier)>>>,
+    failed_edges:
+        Mutex<HashMap<StableTreeScope, HashMap<(NodeIdentifier, NodeIdentifier), Instant>>>,
     /// Reports are deduplicated by source-owned directed edge, rather than by
     /// exact tree version. A replacement can have a different version while
     /// referring to the same physical child edge.
     failure_reported_at: Mutex<HashMap<(NodeIdentifier, NodeIdentifier, NodeIdentifier), Instant>>,
-    active_trees: Mutex<HashMap<TreeScope, ActiveTree>>,
+    active_trees: Mutex<HashMap<StableTreeScope, ActiveTree>>,
+    candidates: Mutex<HashMap<TreeScope, CandidateTree>>,
+    metric_proposals: Mutex<HashMap<StableTreeScope, MetricProposal>>,
+    routing_generations: Mutex<HashMap<StableTreeScope, u64>>,
+    scope_activity: Mutex<HashMap<TreeScope, Instant>>,
 }
 
 impl DistributionPlane {
@@ -370,60 +507,297 @@ impl DistributionPlane {
         *self.self_ref.lock() = Arc::downgrade(self);
     }
 
-    pub(crate) fn select_tree(&self, key: TreeKey, candidate: TreeState) -> TreeState {
-        let scope = TreeScope::from(key);
-        let failed_edges = self
-            .failed_edges
+    pub(crate) fn cached_candidate(
+        &self,
+        key: TreeKey,
+        routing_generation: u64,
+    ) -> Option<SelectedTree> {
+        self.candidates
+            .lock()
+            .get(&TreeScope::from(key))
+            .filter(|candidate| candidate.routing_generation == routing_generation)
+            .filter(|candidate| candidate.recheck_at.is_none_or(|at| Instant::now() < at))
+            .map(|candidate| SelectedTree {
+                key: candidate.key,
+                state: Arc::new(candidate.state.clone()),
+                legacy_members: Arc::new(candidate.legacy_members.clone()),
+            })
+    }
+
+    pub(crate) fn prepare_routing_generation(&self, key: TreeKey, routing_generation: u64) {
+        let scope = StableTreeScope::from(key);
+        self.prune_scope_state(scope);
+        let previous_generation = self
+            .routing_generations
+            .lock()
+            .insert(scope, routing_generation);
+        let generation_changed = previous_generation != Some(routing_generation);
+        let structural_change = self
+            .active_trees
             .lock()
             .get(&scope)
-            .cloned()
-            .unwrap_or_default();
-        let mut active = self.active_trees.lock();
-        let Some(current) = active.get_mut(&scope) else {
-            let applied_failures = failed_edges
-                .iter()
-                .copied()
-                .filter(|edge| {
-                    !candidate
-                        .edges()
-                        .any(|candidate_edge| candidate_edge == *edge)
-                })
-                .collect();
-            active.insert(
-                scope,
-                ActiveTree {
-                    state: candidate.clone(),
-                    applied_failures,
+            .is_some_and(|active| active.key.topology_epoch != key.topology_epoch);
+        if generation_changed || structural_change {
+            distribution_metrics::record_candidate_trigger(
+                key.profile,
+                if previous_generation.is_none() {
+                    "group"
+                } else if structural_change {
+                    "topology"
+                } else {
+                    "routing"
                 },
             );
-            return candidate;
-        };
-        if same_tree_structure(&current.state, &candidate) {
-            return current.state.clone();
         }
-        // Membership, topology, and reparent changes are structural and
-        // immediately replace the active tree. Per-recipient playout policy
-        // is no longer part of tree state or publication.
-        let removed_failures: Vec<_> = failed_edges
-            .difference(&current.applied_failures)
-            .copied()
-            .filter(|edge| {
-                !candidate
-                    .edges()
-                    .any(|candidate_edge| candidate_edge == *edge)
+        if structural_change {
+            // A topology epoch proves that service-eligible adjacency changed.
+            // Metric-only recomputes are not evidence that a failed edge healed;
+            // those exclusions clear only after a successful direct send or TTL.
+            self.failed_edges.lock().remove(&scope);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_candidate(
+        &self,
+        key: TreeKey,
+        candidate: TreeState,
+        path_cost: u64,
+        routing_generation: u64,
+    ) -> Option<SelectedTree> {
+        self.stage_candidate_with_legacy(
+            key,
+            candidate,
+            path_cost,
+            routing_generation,
+            HashSet::new(),
+        )
+    }
+
+    pub(crate) fn stage_candidate_with_legacy(
+        &self,
+        key: TreeKey,
+        candidate: TreeState,
+        path_cost: u64,
+        routing_generation: u64,
+        legacy_members: HashSet<NodeIdentifier>,
+    ) -> Option<SelectedTree> {
+        distribution_metrics::record_candidate_build(key.profile, "attempt");
+        if !candidate.is_valid(key.source) {
+            distribution_metrics::record_candidate_build(key.profile, "invalid");
+            return None;
+        }
+        let stable_scope = StableTreeScope::from(key);
+        self.prepare_routing_generation(key, routing_generation);
+        let stale_keys = {
+            let current_scope = TreeScope::from(key);
+            let mut candidates = self.candidates.lock();
+            let stale: Vec<_> = candidates
+                .iter()
+                .filter_map(|(scope, candidate)| {
+                    (scope != &current_scope
+                        && scope.source == stable_scope.source
+                        && scope.profile == stable_scope.profile
+                        && scope.group == stable_scope.group
+                        && scope.group_version == stable_scope.group_version)
+                        .then_some(candidate.key)
+                })
+                .collect();
+            candidates.retain(|scope, _| {
+                scope == &current_scope
+                    || scope.source != stable_scope.source
+                    || scope.profile != stable_scope.profile
+                    || scope.group != stable_scope.group
+                    || scope.group_version != stable_scope.group_version
+            });
+            stale
+        };
+        if !stale_keys.is_empty() {
+            let mut pending = self.pending.lock();
+            for stale_key in stale_keys {
+                pending.remove(&stale_key);
+            }
+        }
+        let currently_failed = self.failed_edges(key);
+        if let Some(active) = self.active_trees.lock().get(&stable_scope).cloned() {
+            let topology_changed = active.key.topology_epoch != key.topology_epoch;
+            let capability_changed = active.legacy_members != legacy_members;
+            if !topology_changed
+                && same_tree_structure(&active.state, &candidate)
+                && active.legacy_members == legacy_members
+            {
+                self.candidates.lock().insert(
+                    TreeScope::from(key),
+                    CandidateTree {
+                        key: active.key,
+                        state: active.state.clone(),
+                        path_cost: active.path_cost,
+                        routing_generation,
+                        recheck_at: None,
+                        legacy_members: active.legacy_members.clone(),
+                    },
+                );
+                self.metric_proposals.lock().remove(&stable_scope);
+                return Some(SelectedTree {
+                    key: active.key,
+                    state: Arc::new(active.state.clone()),
+                    legacy_members: Arc::new(active.legacy_members.clone()),
+                });
+            }
+            let failed_replacement = active.state.edges().any(|edge| {
+                currently_failed.contains(&edge)
+                    && active.applied_failures.contains(&edge)
+                    && !candidate
+                        .edges()
+                        .any(|candidate_edge| candidate_edge == edge)
+            });
+            let improved = path_cost.saturating_mul(100)
+                <= active
+                    .path_cost
+                    .saturating_mul(100 - METRIC_RESHAPE_IMPROVEMENT_PERCENT);
+            let metric_ready = if improved {
+                let mut proposals = self.metric_proposals.lock();
+                let proposal = proposals
+                    .entry(stable_scope)
+                    .or_insert_with(|| MetricProposal {
+                        state: candidate.clone(),
+                        path_cost,
+                        first_seen: Instant::now(),
+                    });
+                if !same_tree_structure(&proposal.state, &candidate) {
+                    *proposal = MetricProposal {
+                        state: candidate.clone(),
+                        path_cost,
+                        first_seen: Instant::now(),
+                    };
+                } else {
+                    proposal.path_cost = path_cost;
+                }
+                proposal.first_seen.elapsed() >= METRIC_RESHAPE_HOLD
+            } else {
+                self.metric_proposals.lock().remove(&stable_scope);
+                false
+            };
+            if !topology_changed && !capability_changed && !failed_replacement && !metric_ready {
+                distribution_metrics::record_hysteresis_hold(key.profile);
+                self.candidates.lock().insert(
+                    TreeScope::from(key),
+                    CandidateTree {
+                        key: active.key,
+                        state: active.state.clone(),
+                        path_cost: active.path_cost,
+                        routing_generation,
+                        recheck_at: improved.then(|| {
+                            self.metric_proposals
+                                .lock()
+                                .get(&stable_scope)
+                                .expect("improved metric proposal installed")
+                                .first_seen
+                                + METRIC_RESHAPE_HOLD
+                        }),
+                        legacy_members: active.legacy_members.clone(),
+                    },
+                );
+                return Some(SelectedTree {
+                    key: active.key,
+                    state: Arc::new(active.state.clone()),
+                    legacy_members: Arc::new(active.legacy_members.clone()),
+                });
+            }
+        }
+        self.metric_proposals.lock().remove(&stable_scope);
+        let selected = SelectedTree {
+            key,
+            state: Arc::new(candidate.clone()),
+            legacy_members: Arc::new(legacy_members.clone()),
+        };
+        self.candidates.lock().insert(
+            TreeScope::from(key),
+            CandidateTree {
+                key,
+                state: candidate,
+                path_cost,
+                routing_generation,
+                recheck_at: None,
+                legacy_members,
+            },
+        );
+        distribution_metrics::record_candidate_build(key.profile, "staged");
+        Some(selected)
+    }
+
+    fn prune_scope_state(&self, current: StableTreeScope) {
+        let stale = |scope: &StableTreeScope| {
+            scope.source == current.source
+                && scope.profile == current.profile
+                && scope.group == current.group
+                && scope.group_version != current.group_version
+        };
+        self.active_trees.lock().retain(|scope, _| !stale(scope));
+        self.failed_edges.lock().retain(|scope, _| !stale(scope));
+        self.metric_proposals
+            .lock()
+            .retain(|scope, _| !stale(scope));
+        self.routing_generations
+            .lock()
+            .retain(|scope, _| !stale(scope));
+        self.scope_activity.lock().retain(|scope, _| {
+            scope.source != current.source
+                || scope.profile != current.profile
+                || scope.group != current.group
+                || scope.group_version == current.group_version
+        });
+        self.candidates.lock().retain(|scope, _| {
+            !(scope.source == current.source
+                && scope.profile == current.profile
+                && scope.group == current.group
+                && scope.group_version != current.group_version)
+        });
+        self.pending.lock().retain(|key, _| {
+            key.source != current.source
+                || key.profile != current.profile
+                || key.group != current.group
+                || key.group_version == current.group_version
+        });
+        self.versions.lock().retain(|scope, _| {
+            scope.source != current.source
+                || scope.profile != current.profile
+                || scope.group != current.group
+                || scope.group_version == current.group_version
+        });
+        self.trees.lock().retain(|key, _| {
+            key.source != current.source
+                || key.profile != current.profile
+                || key.group != current.group
+                || key.group_version == current.group_version
+        });
+        let now = Instant::now();
+        self.failure_reported_at.lock().retain(|_, reported_at| {
+            now.saturating_duration_since(*reported_at) < EDGE_FAILURE_REPORT_DEDUP
+        });
+    }
+
+    pub(crate) fn active_tree(&self, key: TreeKey) -> Option<SelectedTree> {
+        self.active_trees
+            .lock()
+            .get(&StableTreeScope::from(key))
+            .map(|active| SelectedTree {
+                key: active.key,
+                state: Arc::new(active.state.clone()),
+                legacy_members: Arc::new(active.legacy_members.clone()),
             })
-            .collect();
-        current.state = candidate.clone();
-        current.applied_failures.extend(removed_failures);
-        candidate
     }
 
     pub(crate) fn failed_edges(&self, key: TreeKey) -> HashSet<(NodeIdentifier, NodeIdentifier)> {
-        self.failed_edges
-            .lock()
-            .get(&TreeScope::from(key))
-            .cloned()
-            .unwrap_or_default()
+        let now = Instant::now();
+        let mut failures = self.failed_edges.lock();
+        let Some(edges) = failures.get_mut(&StableTreeScope::from(key)) else {
+            return HashSet::new();
+        };
+        edges.retain(|_, failed_at| {
+            now.saturating_duration_since(*failed_at) < FAILED_EDGE_EXCLUSION
+        });
+        edges.keys().copied().collect()
     }
 
     pub(crate) fn report_edge_failure(
@@ -452,15 +826,49 @@ impl DistributionPlane {
             }
             reported.insert(report_key, now);
         }
-        let scope = TreeScope::from(key);
-        let inserted = self
+        let scope = StableTreeScope::from(key);
+        let previous = self
             .failed_edges
             .lock()
             .entry(scope)
             .or_default()
-            .insert((parent, child));
-        if !inserted {
+            .insert((parent, child), now);
+        if previous.is_some_and(|failed_at| {
+            now.saturating_duration_since(failed_at) < FAILED_EDGE_EXCLUSION
+        }) {
             return;
+        }
+        distribution_metrics::record_candidate_trigger(key.profile, "failed_edge");
+        let invalidated: Vec<_> = self
+            .candidates
+            .lock()
+            .iter()
+            .filter_map(|(candidate_scope, candidate)| {
+                (candidate_scope.source == scope.source
+                    && candidate_scope.profile == scope.profile
+                    && candidate_scope.group == scope.group
+                    && candidate_scope.group_version == scope.group_version
+                    && candidate.state.edges().any(|edge| edge == (parent, child)))
+                .then_some(candidate.key)
+            })
+            .collect();
+        self.candidates.lock().retain(|candidate_scope, _| {
+            candidate_scope.source != scope.source
+                || candidate_scope.profile != scope.profile
+                || candidate_scope.group != scope.group
+                || candidate_scope.group_version != scope.group_version
+        });
+        let mut pending = self.pending.lock();
+        for invalidated_key in invalidated {
+            pending.remove(&invalidated_key);
+        }
+        drop(pending);
+        if let Some(active) = self
+            .active_trees
+            .lock()
+            .get_mut(&StableTreeScope::from(key))
+        {
+            active.applied_failures.insert((parent, child));
         }
         distribution_metrics::record_reparent(key.profile);
         let (Some(plane), Some(sender)) = (
@@ -478,7 +886,37 @@ impl DistributionPlane {
         });
     }
 
+    pub(crate) fn record_edge_success(
+        &self,
+        key: TreeKey,
+        parent: NodeIdentifier,
+        child: NodeIdentifier,
+    ) {
+        let scope = StableTreeScope::from(key);
+        let mut failures = self.failed_edges.lock();
+        if let Some(edges) = failures.get_mut(&scope) {
+            edges.remove(&(parent, child));
+            if edges.is_empty() {
+                failures.remove(&scope);
+            }
+        }
+        drop(failures);
+        if let Some(active) = self.active_trees.lock().get_mut(&scope) {
+            active.applied_failures.remove(&(parent, child));
+        }
+    }
+
     pub(crate) fn install(&self, key: TreeKey, state: TreeState) -> Vec<PendingDistributionFrame> {
+        self.try_install(key, state).unwrap_or_default()
+    }
+
+    fn try_install(&self, key: TreeKey, state: TreeState) -> Option<Vec<PendingDistributionFrame>> {
+        if !state.is_valid(key.source) {
+            distribution_metrics::record_candidate_build(key.profile, "invalid_install");
+            return None;
+        }
+        self.prune_scope_state(StableTreeScope::from(key));
+        self.prune_install_scopes(key);
         let tree_edges = state.edges().count();
         let recovered = {
             // Queueing takes these locks in the same order so an install can
@@ -499,7 +937,55 @@ impl DistributionPlane {
         };
         self.record_installed_version(key);
         distribution_metrics::set_tree_edges(key.profile, tree_edges);
-        recovered
+        Some(recovered)
+    }
+
+    fn prune_install_scopes(&self, key: TreeKey) {
+        let current = TreeScope::from(key);
+        let stable = StableTreeScope::from(key);
+        let active_scope = self
+            .active_trees
+            .lock()
+            .get(&stable)
+            .map(|active| TreeScope::from(active.key));
+        let stale = {
+            let mut activity = self.scope_activity.lock();
+            activity.insert(current, Instant::now());
+            let mut matching: Vec<_> = activity
+                .iter()
+                .filter(|(scope, _)| {
+                    scope.source == stable.source
+                        && scope.profile == stable.profile
+                        && scope.group == stable.group
+                        && scope.group_version == stable.group_version
+                })
+                .map(|(scope, at)| (*scope, *at))
+                .collect();
+            matching.sort_unstable_by_key(|(_, at)| std::cmp::Reverse(*at));
+            let mut retained: HashSet<_> = matching
+                .iter()
+                .take(RETAINED_VERSIONS)
+                .map(|(scope, _)| *scope)
+                .collect();
+            retained.insert(current);
+            retained.extend(active_scope);
+            let stale: HashSet<_> = matching
+                .into_iter()
+                .map(|(scope, _)| scope)
+                .filter(|scope| !retained.contains(scope))
+                .collect();
+            activity.retain(|scope, _| !stale.contains(scope));
+            stale
+        };
+        if stale.is_empty() {
+            return;
+        }
+        self.versions
+            .lock()
+            .retain(|scope, _| !stale.contains(scope));
+        self.trees
+            .lock()
+            .retain(|tree_key, _| !stale.contains(&TreeScope::from(*tree_key)));
     }
 
     fn record_installed_version(&self, key: TreeKey) {
@@ -553,8 +1039,7 @@ impl DistributionPlane {
         distribution_metrics::record_control_publish(key.profile);
         distribution_metrics::set_pending_acks(key.profile, remaining_count);
         if remaining_count == 0 {
-            distribution_metrics::record_activation(key.profile);
-            self.record_activated_version(key);
+            self.activate_candidate(key);
         }
         true
     }
@@ -579,6 +1064,22 @@ impl DistributionPlane {
         }
     }
 
+    pub(crate) fn expire_candidate(&self, key: TreeKey) {
+        self.abort_publish(key);
+        let scope = TreeScope::from(key);
+        self.candidates
+            .lock()
+            .retain(|candidate_scope, candidate| candidate_scope != &scope || candidate.key != key);
+    }
+
+    pub(crate) fn pending_peers(&self, key: TreeKey) -> Vec<NodeIdentifier> {
+        self.pending
+            .lock()
+            .get(&key)
+            .map(|pending| pending.remaining.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn acknowledge(&self, key: TreeKey, node: NodeIdentifier) {
         let (remaining, activated) = {
             let mut pending = self.pending.lock();
@@ -595,16 +1096,55 @@ impl DistributionPlane {
         distribution_metrics::record_control_ack(key.profile);
         distribution_metrics::set_pending_acks(key.profile, remaining);
         if activated {
-            distribution_metrics::record_activation(key.profile);
-            self.record_activated_version(key);
+            self.activate_candidate(key);
         }
     }
 
+    fn activate_candidate(&self, key: TreeKey) {
+        let scope = TreeScope::from(key);
+        let candidate = self.candidates.lock().get(&scope).cloned();
+        let Some(candidate) = candidate else { return };
+        if candidate.key != key {
+            return;
+        }
+        let failed_edges = self.failed_edges(key);
+        if candidate
+            .state
+            .edges()
+            .any(|edge| failed_edges.contains(&edge))
+        {
+            self.pending.lock().remove(&key);
+            return;
+        }
+        let applied_failures = failed_edges
+            .into_iter()
+            .filter(|failed| !candidate.state.edges().any(|edge| edge == *failed))
+            .collect();
+        self.active_trees.lock().insert(
+            StableTreeScope::from(key),
+            ActiveTree {
+                key,
+                state: candidate.state,
+                path_cost: candidate.path_cost,
+                applied_failures,
+                legacy_members: candidate.legacy_members,
+            },
+        );
+        self.pending.lock().remove(&key);
+        distribution_metrics::set_pending_acks(key.profile, 0);
+        distribution_metrics::record_activation(key.profile);
+        self.record_activated_version(key);
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_ready(&self, key: TreeKey) -> bool {
-        self.pending
-            .lock()
-            .get(&key)
-            .is_some_and(|pending| pending.remaining.is_empty())
+        self.active_tree(key)
+            .is_some_and(|active| active.key() == key)
+            || self
+                .pending
+                .lock()
+                .get(&key)
+                .is_some_and(|pending| pending.remaining.is_empty())
     }
 
     /// Queue a frame for bounded exact-state recovery. The first frame for a
@@ -724,7 +1264,16 @@ pub(crate) fn tree_version(
     let mut edges: Vec<_> = state.edges().collect();
     edges.sort_unstable();
     for value in std::iter::once(u64::from(source))
-        .chain([u64::from(profile), group, group_version, topology_epoch])
+        .chain([
+            u64::from(profile),
+            group,
+            group_version,
+            topology_epoch,
+            state
+                .hop_ttl()
+                .map(|ttl| ttl.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or_default(),
+        ])
         .chain(members.into_iter().map(u64::from))
         .chain(
             edges
@@ -779,6 +1328,10 @@ pub(crate) fn encode_install(key: TreeKey, state: &TreeState) -> Bytes {
                         child: child.into(),
                     })
                     .collect(),
+                hop_ttl_ms: state
+                    .hop_ttl()
+                    .map(|ttl| ttl.as_millis().min(u128::from(u32::MAX)) as u32)
+                    .unwrap_or_default(),
             },
         )),
     })
@@ -841,7 +1394,12 @@ fn installed_tree_state(
     });
     // `playout_delays` remains decodable on the wire for mixed deployments,
     // but remote playout is no longer a distribution-tree concern.
-    TreeState::new(source, members, edges)
+    let state = TreeState::new(source, members, edges);
+    if install.hop_ttl_ms == 0 {
+        state
+    } else {
+        state.with_hop_ttl(Duration::from_millis(u64::from(install.hop_ttl_ms)))
+    }
 }
 
 struct DistributionControlHandler {
@@ -874,7 +1432,11 @@ impl ServiceInbound for DistributionControlHandler {
                         topology_epoch: install.topology_epoch,
                         version: install.version,
                     };
-                    let recovered = plane.install(key, installed_tree_state(source, &install));
+                    let Some(recovered) =
+                        plane.try_install(key, installed_tree_state(source, &install))
+                    else {
+                        return;
+                    };
                     let ack = encode_control(pb::DistributionControl {
                         body: Some(pb::distribution_control::Body::Ack(
                             pb::DistributionTreeAck {
@@ -913,6 +1475,9 @@ impl ServiceInbound for DistributionControlHandler {
                     ) else {
                         return;
                     };
+                    if reporter != node {
+                        return;
+                    }
                     if source == overlay.local_node_id() {
                         plane.acknowledge(
                             TreeKey {
@@ -997,6 +1562,32 @@ impl ServiceInbound for DistributionControlHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "pre-release-workload")]
+    #[test]
+    fn pre_release_service_selects_reliable_generic_profile() {
+        let profile = profile_for_service(super::super::PRE_RELEASE_DISTRIBUTION_SERVICE_TAG)
+            .expect("pre-release distribution profile");
+        assert_eq!(profile.id(), PRE_RELEASE_RELIABLE_PROFILE_ID);
+        assert_eq!(profile.level(), ServiceLevel::ReliableLowLatency);
+        assert_eq!(profile.metric(), RoutingMetric::ReliableLowLatencyCost);
+        assert!(profile_for_service(crate::application::proto::VOICE_SERVICE_TAG).is_some());
+    }
+
+    #[cfg(feature = "pre-release-workload")]
+    #[test]
+    fn candidate_trigger_counts_distinct_routing_generations() {
+        let plane = DistributionPlane::default();
+        let mut candidate = key(77, 1);
+        candidate.profile = PRE_RELEASE_RELIABLE_PROFILE_ID;
+        let before = distribution_metrics::pre_release_counters().3;
+
+        plane.prepare_routing_generation(candidate, 10);
+        plane.prepare_routing_generation(candidate, 10);
+        plane.prepare_routing_generation(candidate, 11);
+
+        assert_eq!(distribution_metrics::pre_release_counters().3 - before, 2);
+    }
 
     fn key(group: u64, version: u64) -> TreeKey {
         TreeKey {
@@ -1099,24 +1690,241 @@ mod tests {
     }
 
     #[test]
-    fn structural_replacement_remains_immediate_when_legacy_playout_differs() {
+    fn structural_replacement_keeps_active_until_candidate_acknowledged() {
         let plane = DistributionPlane::default();
-        let key = key(1, 1);
+        let initial_key = key(1, 1);
         let initial = state_with_ignored_playout(100);
-        assert_eq!(plane.select_tree(key, initial.clone()).children(1), &[2]);
-        plane.install(key, initial);
-        plane.report_edge_failure(key, 1, 2);
+        plane
+            .stage_candidate(initial_key, initial.clone(), 100, 1)
+            .unwrap();
+        plane.install(initial_key, initial);
+        assert!(plane.begin_publish(initial_key, [2]));
+        plane.acknowledge(initial_key, 2);
+        plane.report_edge_failure(initial_key, 1, 2);
 
         let replacement = TreeState::new_with_playout(1, [2], [(1, 3), (3, 2)], [(2, 120)]);
-        let selected = plane.select_tree(key, replacement.clone());
-        assert_eq!(selected.children(1), &[3]);
+        let replacement_key = key(1, 2);
+        let selected = plane
+            .stage_candidate(replacement_key, replacement.clone(), 120, 1)
+            .unwrap();
+        assert_eq!(selected.state().children(1), &[3]);
+        assert_eq!(
+            plane.active_tree(replacement_key).unwrap().key(),
+            initial_key
+        );
+        plane.install(replacement_key, replacement);
+        assert!(plane.begin_publish(replacement_key, [2, 3]));
+        plane.acknowledge(replacement_key, 2);
+        assert_eq!(
+            plane.active_tree(replacement_key).unwrap().key(),
+            initial_key
+        );
+        plane.acknowledge(replacement_key, 3);
+        assert_eq!(
+            plane.active_tree(replacement_key).unwrap().key(),
+            replacement_key
+        );
 
         let unchanged_topology = TreeState::new_with_playout(1, [2], [(1, 3), (3, 2)], [(2, 140)]);
         assert_eq!(
-            plane.select_tree(key, unchanged_topology).children(1),
+            plane
+                .stage_candidate(key(1, 3), unchanged_topology, 140, 3)
+                .unwrap()
+                .state()
+                .children(1),
             &[3],
             "ignored playout metadata does not republish an unchanged tree"
         );
+    }
+
+    #[test]
+    fn topology_epoch_change_bypasses_metric_reshape_hysteresis() {
+        let plane = DistributionPlane::default();
+        let initial_key = key(1, 1);
+        let initial = state();
+        plane
+            .stage_candidate(initial_key, initial.clone(), 100, 1)
+            .unwrap();
+        plane.install(initial_key, initial);
+        assert!(plane.begin_publish(initial_key, [2]));
+        plane.acknowledge(initial_key, 2);
+
+        let replacement_key = TreeKey {
+            topology_epoch: 2,
+            version: 2,
+            ..initial_key
+        };
+        let replacement = TreeState::new(1, [2], [(1, 3), (3, 2)]);
+        let selected = plane
+            .stage_candidate(replacement_key, replacement, 200, 2)
+            .expect("structural replacement");
+
+        assert_eq!(selected.key(), replacement_key);
+        assert_eq!(
+            plane.active_tree(replacement_key).unwrap().key(),
+            initial_key
+        );
+    }
+
+    #[test]
+    fn routing_generation_invalidates_cached_candidate() {
+        let plane = DistributionPlane::default();
+        let current = key(1, 1);
+        plane
+            .stage_candidate(current, state(), 100, 41)
+            .expect("initial candidate");
+        assert!(plane.cached_candidate(current, 41).is_some());
+        assert!(plane.cached_candidate(current, 42).is_none());
+    }
+
+    #[test]
+    fn cached_candidate_preserves_legacy_branch_recipients() {
+        let plane = DistributionPlane::default();
+        let current = key(1, 1);
+        plane
+            .stage_candidate_with_legacy(current, state(), 100, 41, HashSet::from([7, 8]))
+            .expect("initial candidate");
+
+        let cached = plane.cached_candidate(current, 41).unwrap();
+        assert_eq!(cached.legacy_members(), &HashSet::from([7, 8]));
+    }
+
+    #[test]
+    fn metric_reshape_must_remain_improved_for_five_seconds() {
+        let plane = DistributionPlane::default();
+        let initial_key = key(1, 1);
+        let initial = state();
+        plane
+            .stage_candidate(initial_key, initial.clone(), 100, 1)
+            .unwrap();
+        plane.install(initial_key, initial);
+        assert!(plane.begin_publish(initial_key, [2]));
+        plane.acknowledge(initial_key, 2);
+
+        let replacement_key = key(1, 2);
+        let replacement = TreeState::new(1, [2], [(1, 3), (3, 2)]);
+        let held = plane
+            .stage_candidate(replacement_key, replacement.clone(), 80, 2)
+            .unwrap();
+        assert_eq!(held.key(), initial_key);
+        let scope = StableTreeScope::from(replacement_key);
+        plane
+            .metric_proposals
+            .lock()
+            .get_mut(&scope)
+            .unwrap()
+            .first_seen -= METRIC_RESHAPE_HOLD;
+        plane
+            .candidates
+            .lock()
+            .get_mut(&TreeScope::from(replacement_key))
+            .unwrap()
+            .recheck_at = Some(Instant::now() - Duration::from_millis(1));
+        assert!(plane.cached_candidate(replacement_key, 2).is_none());
+        let selected = plane
+            .stage_candidate(replacement_key, replacement, 79, 2)
+            .unwrap();
+        assert_eq!(selected.key(), replacement_key);
+    }
+
+    #[test]
+    fn successful_direct_edge_clears_failure_exclusion() {
+        let plane = DistributionPlane::default();
+        let current = key(1, 1);
+        plane.install(current, state());
+        plane.report_edge_failure(current, 1, 2);
+        assert!(plane.failed_edges(current).contains(&(1, 2)));
+
+        plane.record_edge_success(current, 1, 2);
+        assert!(!plane.failed_edges(current).contains(&(1, 2)));
+    }
+
+    #[test]
+    fn metric_routing_generation_preserves_failure_exclusion_hold() {
+        let plane = DistributionPlane::default();
+        let current = key(1, 1);
+        plane.prepare_routing_generation(current, 10);
+        plane.install(current, state());
+        plane.report_edge_failure(current, 1, 2);
+        assert!(plane.failed_edges(current).contains(&(1, 2)));
+
+        plane.prepare_routing_generation(current, 11);
+        assert!(plane.failed_edges(current).contains(&(1, 2)));
+    }
+
+    #[test]
+    fn receiver_install_state_is_bounded_across_topology_epochs() {
+        let plane = DistributionPlane::default();
+        let base = key(1, 1);
+        for topology_epoch in 1..=6 {
+            let current = TreeKey {
+                topology_epoch,
+                version: topology_epoch,
+                ..base
+            };
+            plane.install(current, state());
+        }
+        let matching_scopes = plane
+            .scope_activity
+            .lock()
+            .keys()
+            .filter(|scope| {
+                scope.source == base.source
+                    && scope.profile == base.profile
+                    && scope.group == base.group
+                    && scope.group_version == base.group_version
+            })
+            .count();
+        assert!(matching_scopes <= RETAINED_VERSIONS);
+        assert!(plane.get(base).is_none());
+    }
+
+    #[test]
+    fn receiver_install_prunes_obsolete_group_version() {
+        let plane = DistributionPlane::default();
+        let old = key(1, 1);
+        plane.install(old, state());
+        let new = TreeKey {
+            group_version: 2,
+            version: 2,
+            ..old
+        };
+        plane.install(new, state());
+        assert!(plane.get(old).is_none());
+        assert!(plane.get(new).is_some());
+    }
+
+    #[test]
+    fn edge_failure_cancels_candidate_and_late_ack_cannot_activate_it() {
+        let plane = DistributionPlane::default();
+        let initial_key = key(1, 1);
+        let initial = state();
+        plane
+            .stage_candidate(initial_key, initial.clone(), 100, 1)
+            .unwrap();
+        plane.install(initial_key, initial);
+        assert!(plane.begin_publish(initial_key, [2]));
+        plane.acknowledge(initial_key, 2);
+
+        let replacement_key = TreeKey {
+            topology_epoch: 2,
+            version: 2,
+            ..initial_key
+        };
+        let replacement = TreeState::new(1, [2], [(1, 3), (3, 2)]);
+        plane
+            .stage_candidate(replacement_key, replacement.clone(), 90, 2)
+            .unwrap();
+        plane.install(replacement_key, replacement);
+        assert!(plane.begin_publish(replacement_key, [2, 3]));
+        plane.report_edge_failure(replacement_key, 1, 3);
+        plane.acknowledge(replacement_key, 2);
+        plane.acknowledge(replacement_key, 3);
+        assert_eq!(
+            plane.active_tree(replacement_key).unwrap().key(),
+            initial_key
+        );
+        assert!(plane.pending_peers(replacement_key).is_empty());
     }
 
     #[test]
@@ -1126,13 +1934,37 @@ mod tests {
         let second = key(1, 2);
         let third = key(1, 3);
         let replacement = key(1, 4);
-        for current in [first, second, third] {
-            plane.install(current, state());
+        for (generation, current) in [first, second, third].into_iter().enumerate() {
+            let tree = state();
+            plane.candidates.lock().insert(
+                TreeScope::from(current),
+                CandidateTree {
+                    key: current,
+                    state: tree.clone(),
+                    path_cost: 100,
+                    routing_generation: generation as u64 + 1,
+                    recheck_at: None,
+                    legacy_members: HashSet::new(),
+                },
+            );
+            plane.install(current, tree);
             assert!(plane.begin_publish(current, [2]));
             plane.acknowledge(current, 2);
         }
 
-        plane.install(replacement, state());
+        let replacement_state = state();
+        plane.candidates.lock().insert(
+            TreeScope::from(replacement),
+            CandidateTree {
+                key: replacement,
+                state: replacement_state.clone(),
+                path_cost: 100,
+                routing_generation: 4,
+                recheck_at: None,
+                legacy_members: HashSet::new(),
+            },
+        );
+        plane.install(replacement, replacement_state);
         for retained in [first, second, third, replacement] {
             assert!(plane.get(retained).is_some());
         }

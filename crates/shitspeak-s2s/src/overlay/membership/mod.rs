@@ -27,6 +27,30 @@ use shitspeak_s2s_transport::PeerAddress;
 use super::lsdb::{ApplicationServices, LinkStateDb, ReplicationServices};
 pub use view::MemberStatus;
 
+/// Immutable identity of one observed node incarnation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MemberIncarnation {
+    node_id: NodeIdentifier,
+    incarnation: u64,
+}
+
+impl MemberIncarnation {
+    pub fn new(node_id: NodeIdentifier, incarnation: u64) -> Self {
+        Self {
+            node_id,
+            incarnation,
+        }
+    }
+
+    pub fn node_id(&self) -> NodeIdentifier {
+        self.node_id
+    }
+
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+}
+
 /// Caller-facing snapshot of one cluster member.
 #[derive(Clone, Debug)]
 pub struct MemberSnapshot {
@@ -88,6 +112,10 @@ impl MemberSnapshot {
         self.boot_epoch
     }
 
+    pub fn member_incarnation(&self) -> MemberIncarnation {
+        MemberIncarnation::new(self.node_id, self.boot_epoch)
+    }
+
     pub fn last_state_change(&self) -> Instant {
         Instant::now()
     }
@@ -100,10 +128,10 @@ impl MemberSnapshot {
 /// duplicate.
 #[derive(Clone, Debug)]
 pub enum MembershipEvent {
-    Joined(NodeIdentifier),
-    Left(NodeIdentifier),
-    Failed(NodeIdentifier),
-    Restarted(NodeIdentifier),
+    Joined(MemberIncarnation),
+    Left(MemberIncarnation),
+    Failed(MemberIncarnation),
+    Restarted(MemberIncarnation),
 }
 
 /// Thin reader over the LSDB. The Phase-1 `merge_update`/`note_ack`/
@@ -241,7 +269,12 @@ impl MembershipTable {
         for (nid, prev) in last.iter() {
             if !now.contains_key(nid) {
                 if !prev.tombstone && swept_failed.contains(nid) {
-                    let _ = self.events_tx.send(MembershipEvent::Failed(*nid));
+                    let _ = self
+                        .events_tx
+                        .send(MembershipEvent::Failed(MemberIncarnation::new(
+                            *nid,
+                            prev.boot_epoch,
+                        )));
                 }
                 // tombstone aged out: silent (Left already emitted).
             }
@@ -255,23 +288,45 @@ impl MembershipTable {
                 None => {
                     // First sight.
                     if cur.tombstone {
-                        let _ = self.events_tx.send(MembershipEvent::Left(*nid));
+                        let _ = self
+                            .events_tx
+                            .send(MembershipEvent::Left(MemberIncarnation::new(
+                                *nid,
+                                cur.boot_epoch,
+                            )));
                     } else {
-                        let _ = self.events_tx.send(MembershipEvent::Joined(*nid));
+                        let _ =
+                            self.events_tx
+                                .send(MembershipEvent::Joined(MemberIncarnation::new(
+                                    *nid,
+                                    cur.boot_epoch,
+                                )));
                     }
                 }
                 Some(prev) => {
                     // Restart detection.
                     if cur.boot_epoch > prev.boot_epoch {
-                        let _ = self.events_tx.send(MembershipEvent::Restarted(*nid));
+                        let _ = self.events_tx.send(MembershipEvent::Restarted(
+                            MemberIncarnation::new(*nid, cur.boot_epoch),
+                        ));
                     }
                     // Alive -> Left transition.
                     if !prev.tombstone && cur.tombstone {
-                        let _ = self.events_tx.send(MembershipEvent::Left(*nid));
+                        let _ = self
+                            .events_tx
+                            .send(MembershipEvent::Left(MemberIncarnation::new(
+                                *nid,
+                                cur.boot_epoch,
+                            )));
                     }
                     // Left/Failed -> Alive (rejoin).
                     if prev.tombstone && !cur.tombstone {
-                        let _ = self.events_tx.send(MembershipEvent::Joined(*nid));
+                        let _ =
+                            self.events_tx
+                                .send(MembershipEvent::Joined(MemberIncarnation::new(
+                                    *nid,
+                                    cur.boot_epoch,
+                                )));
                     }
                 }
             }

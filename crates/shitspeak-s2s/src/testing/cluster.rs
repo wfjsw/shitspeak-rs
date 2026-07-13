@@ -77,6 +77,17 @@ impl Node {
         self.overlay.shutdown().await;
         self.transport.shutdown().await;
     }
+
+    /// Cancel one live peer transport. The transport supervisor may reconnect
+    /// it normally, which lets tests model a link flap without rebuilding the
+    /// cluster.
+    pub fn disconnect_transport(&self, peer: u16, kind: TransportKind) -> bool {
+        self.transport.test_drop_transport_kind(peer, kind)
+    }
+
+    pub fn transport_is_up(&self, peer: u16, kind: TransportKind) -> bool {
+        self.transport.has_live_transport_kind(peer, kind)
+    }
 }
 
 /// Cluster: N nodes with PKI, ports, transports, and overlays. Each node

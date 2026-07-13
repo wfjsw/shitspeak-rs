@@ -11,6 +11,7 @@ test-support = [
     "dep:tempfile",
     "shitspeak-s2s-transport/test-support",
 ]
+pre-release-workload = []
 
 [dependencies]
 async-trait = { workspace = true }
@@ -41,4 +42,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 rcgen = { workspace = true }
 rustls = { workspace = true }
+shitspeak-s2s-transport = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

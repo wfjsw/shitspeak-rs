@@ -106,6 +106,7 @@ mod tests {
                 op_id_lo: 2,
                 ts_local: 50,
                 src_clock: 50,
+                ack_boot_epoch: 17,
             }),
         );
         let bytes = encode(&msg).unwrap();
@@ -118,6 +119,7 @@ mod tests {
         };
         assert_eq!(a.ack_node, 3);
         assert_eq!(a.coord_node, 7);
+        assert_eq!(a.ack_boot_epoch, 17);
         assert_eq!(a.ts_local, 50);
     }
 
@@ -313,6 +315,7 @@ mod tests {
                 ts_local: 41,
                 op_msgpack: pretend_msgpack(0x55),
                 src_clock: 60,
+                ack_boot_epoch: 17,
             }),
         );
         let back = decode(&encode(&ack).unwrap()).unwrap();
@@ -323,6 +326,7 @@ mod tests {
             panic!()
         };
         assert_eq!(a.ts_local, 41);
+        assert_eq!(a.ack_boot_epoch, 17);
         assert!(a.has_op && a.promised && !a.has_committed);
         assert_eq!(a.op_msgpack.len(), 64);
 

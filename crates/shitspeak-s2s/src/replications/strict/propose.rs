@@ -37,13 +37,35 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         accepted_waker: Option<oneshot::Sender<()>>,
         waker: oneshot::Sender<Result<u64, ReplicationError>>,
     ) -> Result<(), ReplicationError> {
+        let fence_timeout = self.cfg.propose_ttl();
+        tokio::time::timeout(fence_timeout, async {
+            while self.state.lock().history_election_blocks_steady_state() {
+                tokio::select! {
+                    _ = self.shutdown.cancelled() => return Err(ReplicationError::Shutdown),
+                    _ = tokio::time::sleep(self.cfg.delivery_tick_interval()) => {}
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| ReplicationError::ProposeTimeout(fence_timeout))??;
+
         // Bound concurrent in-flight proposals per topic.
-        let permit = self
-            .propose_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ReplicationError::Shutdown)?;
+        let permit = tokio::select! {
+            _ = self.shutdown.cancelled() => return Err(ReplicationError::Shutdown),
+            permit = self.propose_semaphore.clone().acquire_owned() => {
+                permit.map_err(|_| ReplicationError::Shutdown)?
+            }
+        };
+
+        if self.shutdown.is_cancelled() {
+            return Err(ReplicationError::Shutdown);
+        }
+
+        // Election can be rearmed while waiting for capacity.
+        if self.state.lock().history_election_blocks_steady_state() {
+            return Err(ReplicationError::ProposeTimeout(fence_timeout));
+        }
 
         let encode_started_at = Instant::now();
         let encoded = rmp_serde::to_vec(&op);
@@ -56,12 +78,19 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let op_id = self.next_op_id();
         let op_bytes = op_msgpack.len();
         let (target_set, fq) = self.snapshot_target_set();
+        let target_epochs = self.snapshot_target_epochs(&target_set);
         let target_count = target_set.len();
 
         // Register the proposal and advance our local clock.
         let started_at = Instant::now();
         let (ts_propose, src_clock) = {
             let mut s = self.state.lock();
+            // This check and proposal insertion must be one state-lock
+            // transaction. Membership recovery may rearm the fence after
+            // semaphore acquisition or encoding.
+            if s.history_election_blocks_steady_state() {
+                return Err(ReplicationError::ProposeTimeout(fence_timeout));
+            }
             let ts_propose = s.tick_clock();
             s.peer_clocks.insert(self.self_id, ts_propose);
             s.proposals.insert(
@@ -71,6 +100,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     ts_propose,
                     acks: HashMap::new(),
                     target_set: target_set.clone(),
+                    target_epochs,
+                    invalid_targets: Default::default(),
                     accepted_waker,
                     waker: Some(waker),
                     committed: false,
@@ -138,6 +169,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 op_id_lo: op_id.1,
                 ts_local: ts_propose,
                 src_clock,
+                ack_boot_epoch: self.boot_epoch,
             },
         )
         .await;

@@ -127,6 +127,47 @@ pub struct StrictHandle<R: StrictReplicable> {
     pub(crate) runtime: Arc<runtime::StrictRuntime<R>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy)]
+pub struct StrictDebugState {
+    election_pending: bool,
+    election_active: bool,
+    can_start_election: bool,
+    local_proposals: usize,
+    pending_proposes: usize,
+    buffered_commits: usize,
+    unresolved_promises: usize,
+    active_recoveries: usize,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl StrictDebugState {
+    pub fn election_pending(self) -> bool {
+        self.election_pending
+    }
+    pub fn election_active(self) -> bool {
+        self.election_active
+    }
+    pub fn can_start_election(self) -> bool {
+        self.can_start_election
+    }
+    pub fn local_proposals(self) -> usize {
+        self.local_proposals
+    }
+    pub fn pending_proposes(self) -> usize {
+        self.pending_proposes
+    }
+    pub fn buffered_commits(self) -> usize {
+        self.buffered_commits
+    }
+    pub fn unresolved_promises(self) -> usize {
+        self.unresolved_promises
+    }
+    pub fn active_recoveries(self) -> usize {
+        self.active_recoveries
+    }
+}
+
 /// In-flight strict proposal with separate accepted and delivered stages.
 pub struct StrictProposal {
     accepted: Option<oneshot::Receiver<()>>,
@@ -209,5 +250,10 @@ impl<R: StrictReplicable> StrictHandle<R> {
 
     pub fn local_node_id(&self) -> shitspeak_core::NodeIdentifier {
         self.runtime.self_id
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn debug_state(&self) -> StrictDebugState {
+        self.runtime.debug_state()
     }
 }

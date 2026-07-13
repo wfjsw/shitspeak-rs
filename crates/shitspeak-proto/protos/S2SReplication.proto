@@ -44,6 +44,7 @@ message StrictProposeAck {
   uint64 op_id_lo   = 4;
   uint64 ts_local   = 5;   // ack-side clock after advance
   uint64 src_clock  = 6;
+  uint64 ack_boot_epoch = 7; // physical sender incarnation
 }
 
 message StrictCommit {
@@ -117,6 +118,7 @@ message StrictRecoveryAck {
   uint64 ts_local           = 10; // 0 if !has_op
   bytes  op_msgpack         = 11; // empty if !has_op
   uint64 src_clock          = 12;
+  uint64 ack_boot_epoch     = 13; // physical sender incarnation
 }
 
 // Phase 2 — Accept-and-Commit. Once the takeover has a recovery quorum of

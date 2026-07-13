@@ -197,6 +197,10 @@ impl StrictNet for MockNet {
         self.alive.lock().clone()
     }
 
+    fn member_boot_epoch(&self, node: NodeIdentifier) -> Option<u64> {
+        self.epochs.lock().get(&node).copied()
+    }
+
     fn has_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
         match self.routes.lock().as_ref() {
             Some(routes) => routes.contains(&(level, dst)),
@@ -518,6 +522,7 @@ mod e2e_tests {
             default_cfg(),
         );
         rt.start();
+        rt.finish_history_election_for_test();
 
         let (accepted_tx, accepted_rx) = oneshot::channel();
         let (delivered_tx, delivered_rx) = oneshot::channel();
@@ -549,6 +554,7 @@ mod e2e_tests {
                 op_id_lo,
                 ts_local: ts_propose + 1,
                 src_clock: ts_propose + 1,
+                ack_boot_epoch: 0,
             },
         )
         .await;
@@ -633,6 +639,7 @@ mod e2e_tests {
             cfg,
         );
         let (tx, _rx) = oneshot::channel();
+        rt.finish_history_election_for_test();
 
         rt.clone().begin_propose(11u64, tx).await.unwrap();
         let mut captures = net.drain_captures();
@@ -657,6 +664,7 @@ mod e2e_tests {
                 op_id_lo,
                 ts_local: ts_propose + 1,
                 src_clock: ts_propose + 1,
+                ack_boot_epoch: 0,
             },
         )
         .await;
@@ -878,7 +886,9 @@ mod e2e_tests {
             .insert(2, std::time::Instant::now());
 
         // Restart event arrives.
-        rt.on_membership_event(&MembershipEvent::Restarted(2));
+        rt.on_membership_event(&MembershipEvent::Restarted(
+            crate::overlay::MemberIncarnation::new(2, 11),
+        ));
 
         // Pending buffer + catchup state cleared.
         assert!(rt.state.lock().pending_buffers.get(&2).is_none());
@@ -933,7 +943,9 @@ mod e2e_tests {
             .insert(2, (10, 2, vec![(1, 100), (2, 200)]));
         rt.state.lock().known.insert(2, (10, 2));
 
-        rt.on_membership_event(&MembershipEvent::Failed(2));
+        rt.on_membership_event(&MembershipEvent::Failed(
+            crate::overlay::MemberIncarnation::new(2, 10),
+        ));
 
         assert!(rt.state.lock().known.get(&2).is_none());
         tokio::time::timeout(Duration::from_secs(2), async {

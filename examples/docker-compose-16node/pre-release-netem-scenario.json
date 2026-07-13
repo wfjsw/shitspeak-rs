@@ -1,0 +1,111 @@
+{
+  "schema_version": 2,
+  "name": "serialized-16node-pre-release",
+  "duration_seconds": 900,
+  "sample_interval_seconds": 15,
+  "distribution_ack_arm_seconds": 88,
+  "deterministic_seed": 160713,
+  "node_groups": {
+    "region_a": ["node-01", "node-02", "node-03", "node-04", "node-05", "node-06", "node-07", "node-08"],
+    "region_b": ["node-09", "node-10", "node-11", "node-12", "node-13", "node-14", "node-15", "node-16"],
+    "quorum_majority": ["node-01", "node-02", "node-03", "node-04", "node-05", "node-06", "node-07", "node-08", "node-09", "node-10", "node-11", "node-12"],
+    "partition_minority": ["node-13", "node-14", "node-15", "node-16"],
+    "all": ["node-01", "node-02", "node-03", "node-04", "node-05", "node-06", "node-07", "node-08", "node-09", "node-10", "node-11", "node-12", "node-13", "node-14", "node-15", "node-16"],
+    "churn_a": ["node-04"],
+    "churn_b": ["node-13"]
+  },
+  "transport_ports": {
+    "tcp": { "protocol": "tcp", "port": 64739 },
+    "kcp": { "protocol": "udp", "port": 64740 },
+    "quic": { "protocol": "udp", "port": 64741 },
+    "udp": { "protocol": "udp", "port": 64742 }
+  },
+  "profiles": {
+    "local": { "delay_ms": 8, "jitter_ms": 2, "loss_percent": 0.1, "rate": "100mbit", "seed": 160714 },
+    "long_haul": { "delay_ms": 409, "jitter_ms": 450, "loss_percent": 0.0, "rate": "20mbit", "seed": 160715 },
+    "long_haul_burst": { "delay_ms": 1288, "jitter_ms": 750, "loss_percent": 0.0, "loss_model": { "kind": "gemodel", "p": 8.0, "r": 65.0, "h": 99.5, "k": 99.9 }, "rate": "5mbit", "seed": 160716 },
+    "partition": { "delay_ms": 0, "jitter_ms": 0, "loss_percent": 100.0, "rate": "100mbit", "seed": 160717 }
+  },
+  "rule_sets": {
+    "baseline": [
+      { "from_group": "region_a", "to_group": "region_a", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_b", "to_group": "region_b", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_a", "to_group": "region_b", "direction": "both", "profile": "long_haul", "transports": ["tcp", "kcp", "quic", "udp"] }
+    ],
+    "node_04_degraded": [
+      { "from_group": "all", "to_group": "churn_a", "direction": "both", "profile": "long_haul_burst", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_a", "to_group": "region_a", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_b", "to_group": "region_b", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_a", "to_group": "region_b", "direction": "both", "profile": "long_haul", "transports": ["tcp", "kcp", "quic", "udp"] }
+    ],
+    "cross_region_partition": [
+      { "from_group": "quorum_majority", "to_group": "partition_minority", "direction": "both", "profile": "partition", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_a", "to_group": "region_a", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_b", "to_group": "region_b", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] }
+    ],
+    "long_haul_burst": [
+      { "from_group": "region_a", "to_group": "region_b", "direction": "both", "profile": "long_haul_burst", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_a", "to_group": "region_a", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_b", "to_group": "region_b", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] }
+    ],
+    "node_04_quic_down": [
+      { "from_group": "all", "to_group": "churn_a", "direction": "both", "profile": "partition", "transports": ["quic"] },
+      { "from_group": "region_a", "to_group": "region_a", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_b", "to_group": "region_b", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_a", "to_group": "region_b", "direction": "both", "profile": "long_haul", "transports": ["tcp", "kcp", "quic", "udp"] }
+    ],
+    "node_13_kcp_down": [
+      { "from_group": "all", "to_group": "churn_b", "direction": "both", "profile": "partition", "transports": ["kcp"] },
+      { "from_group": "region_a", "to_group": "region_a", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_b", "to_group": "region_b", "direction": "both", "profile": "local", "transports": ["tcp", "kcp", "quic", "udp"] },
+      { "from_group": "region_a", "to_group": "region_b", "direction": "both", "profile": "long_haul", "transports": ["tcp", "kcp", "quic", "udp"] }
+    ]
+  },
+  "metric_mask_observation_windows": [
+    { "name": "tree_node_04_quic_mask", "start_seconds": 120, "end_seconds": 150 },
+    { "name": "tree_node_13_kcp_mask", "start_seconds": 300, "end_seconds": 330 },
+    { "name": "legacy_node_04_quic_mask", "start_seconds": 570, "end_seconds": 600 },
+    { "name": "legacy_node_13_kcp_mask", "start_seconds": 750, "end_seconds": 780 }
+  ],
+  "timeline": [
+    { "at_seconds": 0, "action": "netem", "rule_set": "baseline" },
+    { "at_seconds": 45, "action": "netem", "rule_set": "long_haul_burst", "reason": "tree phase controlled Gilbert-Elliott burst loss" },
+    { "at_seconds": 90, "action": "netem", "rule_set": "baseline" },
+    { "at_seconds": 120, "action": "netem", "rule_set": "node_04_quic_down", "reason": "tree phase QUIC endpoint churn" },
+    { "at_seconds": 150, "action": "netem", "rule_set": "baseline" },
+    { "at_seconds": 180, "action": "restart", "nodes": ["node-04", "node-13"], "reason": "tree phase in-flight restart" },
+    { "at_seconds": 210, "action": "netem", "rule_set": "cross_region_partition" },
+    { "at_seconds": 255, "action": "netem", "rule_set": "baseline" },
+    { "at_seconds": 300, "action": "netem", "rule_set": "node_13_kcp_down", "reason": "tree phase KCP endpoint churn" },
+    { "at_seconds": 330, "action": "netem", "rule_set": "long_haul_burst" },
+    { "at_seconds": 390, "action": "netem", "rule_set": "baseline" },
+
+    { "at_seconds": 450, "action": "netem", "rule_set": "baseline", "reason": "legacy comparison phase begins" },
+    { "at_seconds": 495, "action": "netem", "rule_set": "long_haul_burst", "reason": "legacy phase controlled Gilbert-Elliott burst loss" },
+    { "at_seconds": 540, "action": "netem", "rule_set": "baseline" },
+    { "at_seconds": 570, "action": "netem", "rule_set": "node_04_quic_down", "reason": "legacy phase QUIC endpoint churn" },
+    { "at_seconds": 600, "action": "netem", "rule_set": "baseline" },
+    { "at_seconds": 630, "action": "restart", "nodes": ["node-04", "node-13"], "reason": "legacy phase in-flight restart" },
+    { "at_seconds": 660, "action": "netem", "rule_set": "cross_region_partition" },
+    { "at_seconds": 705, "action": "netem", "rule_set": "baseline" },
+    { "at_seconds": 750, "action": "netem", "rule_set": "node_13_kcp_down", "reason": "legacy phase KCP endpoint churn" },
+    { "at_seconds": 780, "action": "netem", "rule_set": "long_haul_burst" },
+    { "at_seconds": 840, "action": "netem", "rule_set": "baseline" }
+  ],
+  "acceptance": {
+    "expected_nodes": 16,
+    "expected_routes_per_node": 15,
+    "minimum_final_converged_samples": 3,
+    "maximum_final_convergence_seconds": 90,
+    "minimum_tree_edge_samples": 1,
+    "minimum_lsa_counter_samples": 1,
+    "maximum_metric_lsa_emissions_per_node_per_second": 0.2,
+    "maximum_candidate_builds_per_change": 1.0,
+    "maximum_final_strict_convergence_seconds": 60,
+    "maximum_tree_to_legacy_operations_ratio": 0.5,
+    "maximum_phase_logical_send_imbalance_ratio": 0.05,
+    "maximum_tree_to_legacy_cpu_ratio": 1.05,
+    "maximum_node_cpu_percent": 85.0,
+    "minimum_cpu_samples": 1
+  }
+}

@@ -13,16 +13,39 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use shitspeak_s2s::testing::chaos::FaultSelector;
 use shitspeak_s2s::testing::{
     Capture, Cluster, MessageType, full_mesh_seeds, install_provider_once, line_seeds, loopback,
     mint_pki, overlay_cfg, pick_free_port, s2s_network_test_guard, transport_cfg,
     wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
 };
+use shitspeak_s2s::{application::VOICE_SERVICE_TAG, status::prometheus_samples};
 use shitspeak_s2s_transport::{
     ConnectionManager, MessageClass, PeerAddress, ServiceLevel, TransportKind,
 };
 
-use shitspeak_s2s::overlay::{MembershipEvent, OverlayNetwork, SeedPeer};
+use shitspeak_s2s::overlay::{
+    MembershipEvent, OverlayNetwork, OverlaySendOptions, RoutingMetric, SeedPeer,
+};
+
+fn distribution_event_total(cluster: &Cluster, node_id: u16, event: &str) -> f64 {
+    let node = cluster.node(node_id);
+    prometheus_samples(&node.overlay, &node.transport, None)
+        .into_iter()
+        .filter(|sample| {
+            sample.name() == "shitspeak_s2s_distribution_events_total"
+                && sample
+                    .labels()
+                    .iter()
+                    .any(|(key, value)| key == "source" && value == &node_id.to_string())
+                && sample
+                    .labels()
+                    .iter()
+                    .any(|(key, value)| key == "event" && value == event)
+        })
+        .map(|sample| sample.value())
+        .sum()
+}
 
 // ---------------------------------------------------------------------------
 // Phase-2 baseline tests (5)
@@ -105,7 +128,7 @@ async fn graceful_shutdown_emits_left() {
     let until = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < until {
         if let Ok(Ok(ev)) = timeout(Duration::from_millis(500), events_a.recv()).await {
-            if matches!(ev, MembershipEvent::Left(200)) {
+            if matches!(ev, MembershipEvent::Left(member) if member.node_id() == 200) {
                 got_left = true;
                 break;
             }
@@ -155,7 +178,7 @@ async fn failure_detection_marks_peer_failed() {
     let until = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < until {
         if let Ok(Ok(ev)) = timeout(Duration::from_millis(500), events_a.recv()).await {
-            if matches!(ev, MembershipEvent::Failed(20)) {
+            if matches!(ev, MembershipEvent::Failed(member) if member.node_id() == 20) {
                 got_failed = true;
                 break;
             }
@@ -569,7 +592,7 @@ async fn restart_detection_via_hello() {
     let until = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < until {
         if let Ok(Ok(ev)) = timeout(Duration::from_millis(500), events_a.recv()).await {
-            if matches!(ev, MembershipEvent::Restarted(2)) {
+            if matches!(ev, MembershipEvent::Restarted(member) if member.node_id() == 2) {
                 got_restarted = true;
                 break;
             }
@@ -628,8 +651,10 @@ async fn partition_heal_sync() {
     while tokio::time::Instant::now() < until && joined.len() < 2 {
         if let Ok(Ok(ev)) = timeout(Duration::from_millis(500), events_1.recv()).await {
             match ev {
-                MembershipEvent::Joined(n) | MembershipEvent::Restarted(n) if n == 3 || n == 4 => {
-                    joined.insert(n);
+                MembershipEvent::Joined(member) | MembershipEvent::Restarted(member)
+                    if member.node_id() == 3 || member.node_id() == 4 =>
+                {
+                    joined.insert(member.node_id());
                 }
                 _ => {}
             }
@@ -761,6 +786,379 @@ async fn paced_lsa_flood_burst_converges() {
         .await,
         "paced burst did not converge; node1 lsdb = {:?}",
         cluster.node(1).overlay.link_state_snapshot()
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// Checks repair when a source loses the live transport to one direct tree
+/// child at send time. The tree is activated first, then the child stream is
+/// cancelled without waiting for LSDB convergence; forwarding must report the
+/// failed edge and deliver that child's exact subtree over an alternate path.
+#[tokio::test]
+async fn distribution_tree_repairs_direct_child_send_failure() {
+    let cluster = Cluster::build(&[1, 2, 3], full_mesh_seeds).await;
+    let source = cluster.node(1);
+    let child = cluster.node(2);
+    let sibling = cluster.node(3);
+    let (tx_child, mut rx_child) = mpsc::channel(32);
+    let (tx_sibling, mut rx_sibling) = mpsc::channel(32);
+    child
+        .overlay
+        .register_service(VOICE_SERVICE_TAG, Arc::new(Capture(tx_child)));
+    sibling
+        .overlay
+        .register_service(VOICE_SERVICE_TAG, Arc::new(Capture(tx_sibling)));
+
+    assert!(
+        wait_for_full_routing(&cluster, Duration::from_secs(10)).await,
+        "tree cluster did not converge"
+    );
+    let activation_before = distribution_event_total(&cluster, 1, "activation");
+    let mut attempt = 0u8;
+    while distribution_event_total(&cluster, 1, "activation") == activation_before && attempt < 30 {
+        source
+            .overlay
+            .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+                &[2, 3],
+                700,
+                1,
+                VOICE_SERVICE_TAG,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+                MessageClass::Regular,
+                Bytes::from_static(b"activate"),
+                OverlaySendOptions::default(),
+            )
+            .await
+            .unwrap();
+        attempt += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        distribution_event_total(&cluster, 1, "activation") > activation_before,
+        "distribution tree never activated"
+    );
+    while rx_child.try_recv().is_ok() {}
+    while rx_sibling.try_recv().is_ok() {}
+
+    assert!(
+        source.transport_is_up(2, TransportKind::Tcp),
+        "source-child TCP stream was not live before fault injection"
+    );
+    let reparent_before = distribution_event_total(&cluster, 1, "reparent");
+    assert!(source.disconnect_transport(2, TransportKind::Tcp));
+    source
+        .overlay
+        .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+            &[2, 3],
+            700,
+            1,
+            VOICE_SERVICE_TAG,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::Regular,
+            Bytes::from_static(b"repair-child"),
+            OverlaySendOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let child_msg = timeout(Duration::from_secs(5), rx_child.recv())
+        .await
+        .expect("failed child subtree was not repaired")
+        .expect("child capture closed");
+    let sibling_msg = timeout(Duration::from_secs(5), rx_sibling.recv())
+        .await
+        .expect("healthy child did not receive tree frame")
+        .expect("sibling capture closed");
+    assert_eq!(&child_msg.body[..], b"repair-child");
+    assert_eq!(&sibling_msg.body[..], b"repair-child");
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            distribution_event_total(&cluster, 1, "reparent") > reparent_before
+        })
+        .await,
+        "direct child send failure was not reported for reparenting"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// Checks that link-metric churn does not create a new distribution topology
+/// epoch. The active two-node tree must remain reusable after a large RTT LSA
+/// update, so sending again cannot publish another tree version.
+#[tokio::test]
+async fn distribution_tree_epoch_is_stable_across_metric_churn() {
+    let cluster = Cluster::build(&[1, 2], full_mesh_seeds).await;
+    let source = cluster.node(1);
+    let receiver = cluster.node(2);
+    let (tx, mut rx) = mpsc::channel(32);
+    receiver
+        .overlay
+        .register_service(VOICE_SERVICE_TAG, Arc::new(Capture(tx)));
+    assert!(
+        wait_for_full_routing(&cluster, Duration::from_secs(10)).await,
+        "metric-churn cluster did not converge"
+    );
+
+    let activation_before = distribution_event_total(&cluster, 1, "activation");
+    for _ in 0..30 {
+        if distribution_event_total(&cluster, 1, "activation") > activation_before {
+            break;
+        }
+        source
+            .overlay
+            .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+                &[2],
+                701,
+                1,
+                VOICE_SERVICE_TAG,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+                MessageClass::Regular,
+                Bytes::from_static(b"activate"),
+                OverlaySendOptions::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        distribution_event_total(&cluster, 1, "activation") > activation_before,
+        "distribution tree never activated"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while rx.try_recv().is_ok() {}
+
+    let initial_rtt = source
+        .overlay
+        .link_state_snapshot()
+        .into_iter()
+        .find(|lsa| lsa.origin == 1)
+        .and_then(|lsa| {
+            lsa.links
+                .into_iter()
+                .find(|link| link.neighbor == 2)
+                .map(|link| link.rtt_us)
+        })
+        .unwrap_or_default();
+    source.chaos.add_latency(2, Duration::from_millis(120));
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            source
+                .overlay
+                .link_state_snapshot()
+                .into_iter()
+                .find(|lsa| lsa.origin == 1)
+                .and_then(|lsa| {
+                    lsa.links
+                        .into_iter()
+                        .find(|link| link.neighbor == 2)
+                        .map(|link| link.rtt_us)
+                })
+                .is_some_and(|rtt| rtt > initial_rtt.saturating_add(50_000))
+        })
+        .await,
+        "source LSA did not advertise the injected RTT churn"
+    );
+
+    let publishes_before = distribution_event_total(&cluster, 1, "control_publish");
+    source
+        .overlay
+        .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+            &[2],
+            701,
+            1,
+            VOICE_SERVICE_TAG,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::Regular,
+            Bytes::from_static(b"stable-epoch"),
+            OverlaySendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let msg = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("active tree did not deliver after metric churn")
+        .expect("receiver capture closed");
+    assert_eq!(&msg.body[..], b"stable-epoch");
+    assert_eq!(
+        distribution_event_total(&cluster, 1, "control_publish"),
+        publishes_before,
+        "metric-only churn published a new distribution tree"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// Checks that losing every ACK for a replacement tree does not deactivate
+/// the predecessor. A direct-child failure excludes that edge from the
+/// candidate, whose ACKs route via node 3. Once the direct transport recovers,
+/// the prior active tree must keep delivering while those ACKs are dropped.
+#[tokio::test]
+async fn distribution_tree_lost_candidate_ack_keeps_active_tree_delivering() {
+    let cluster = Cluster::build(&[1, 2, 3], full_mesh_seeds).await;
+    let source = cluster.node(1);
+    let node2 = cluster.node(2);
+    let node3 = cluster.node(3);
+    let (tx2, mut rx2) = mpsc::channel(32);
+    let (tx3, mut rx3) = mpsc::channel(32);
+    node2
+        .overlay
+        .register_service(VOICE_SERVICE_TAG, Arc::new(Capture(tx2)));
+    node3
+        .overlay
+        .register_service(VOICE_SERVICE_TAG, Arc::new(Capture(tx3)));
+    assert!(wait_for_full_routing(&cluster, Duration::from_secs(10)).await);
+
+    let activation_before = distribution_event_total(&cluster, 1, "activation");
+    for _ in 0..30 {
+        if distribution_event_total(&cluster, 1, "activation") > activation_before {
+            break;
+        }
+        source
+            .overlay
+            .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+                &[2, 3],
+                702,
+                1,
+                VOICE_SERVICE_TAG,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+                MessageClass::Regular,
+                Bytes::from_static(b"activate"),
+                OverlaySendOptions::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let active_count = distribution_event_total(&cluster, 1, "activation");
+    assert!(
+        active_count > activation_before,
+        "initial tree never activated"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while rx2.try_recv().is_ok() {}
+    while rx3.try_recv().is_ok() {}
+
+    assert!(
+        source.transport_is_up(2, TransportKind::Tcp),
+        "source-child TCP stream was not live before fault injection"
+    );
+    let reparent_before = distribution_event_total(&cluster, 1, "reparent");
+    assert!(source.disconnect_transport(2, TransportKind::Tcp));
+    source
+        .overlay
+        .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+            &[2, 3],
+            702,
+            1,
+            VOICE_SERVICE_TAG,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::Regular,
+            Bytes::from_static(b"exclude-failed-edge"),
+            OverlaySendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let repaired2 = timeout(Duration::from_secs(5), rx2.recv())
+        .await
+        .expect("failed child subtree was not repaired")
+        .expect("node 2 capture closed");
+    let repaired3 = timeout(Duration::from_secs(5), rx3.recv())
+        .await
+        .expect("healthy child missed the failure-triggering frame")
+        .expect("node 3 capture closed");
+    assert_eq!(&repaired2.body[..], b"exclude-failed-edge");
+    assert_eq!(&repaired3.body[..], b"exclude-failed-edge");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            distribution_event_total(&cluster, 1, "reparent") > reparent_before
+        })
+        .await,
+        "direct child failure was not recorded for candidate reparenting"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            source.transport_is_up(2, TransportKind::Tcp)
+        })
+        .await,
+        "source-child TCP stream did not recover for predecessor delivery"
+    );
+    while rx2.try_recv().is_ok() {}
+    while rx3.try_recv().is_ok() {}
+
+    let ack_fault = FaultSelector::new(3, TransportKind::Tcp, MessageType::DistributionAck);
+    source.chaos.drop_next(ack_fault, 100);
+    source
+        .overlay
+        .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+            &[2, 3],
+            702,
+            1,
+            VOICE_SERVICE_TAG,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::Regular,
+            Bytes::from_static(b"stage-candidate"),
+            OverlaySendOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || source
+            .chaos
+            .remaining_drops(ack_fault)
+            < 100)
+        .await,
+        "replacement tree did not emit an ACK on the expected routed hop"
+    );
+    assert_eq!(
+        distribution_event_total(&cluster, 1, "activation"),
+        active_count,
+        "replacement activated despite its ACK being lost"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while rx2.try_recv().is_ok() {}
+    while rx3.try_recv().is_ok() {}
+
+    let forwards_before = distribution_event_total(&cluster, 1, "original_forward");
+    source
+        .overlay
+        .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+            &[2, 3],
+            702,
+            1,
+            VOICE_SERVICE_TAG,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::Regular,
+            Bytes::from_static(b"active-predecessor"),
+            OverlaySendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let got2 = timeout(Duration::from_secs(5), rx2.recv())
+        .await
+        .expect("node 2 missed predecessor-tree delivery")
+        .expect("node 2 capture closed");
+    let got3 = timeout(Duration::from_secs(5), rx3.recv())
+        .await
+        .expect("node 3 missed predecessor-tree delivery")
+        .expect("node 3 capture closed");
+    assert_eq!(&got2.body[..], b"active-predecessor");
+    assert_eq!(&got3.body[..], b"active-predecessor");
+    assert!(
+        distribution_event_total(&cluster, 1, "original_forward") > forwards_before,
+        "pending replacement fell back instead of using the active tree"
+    );
+    assert_eq!(
+        distribution_event_total(&cluster, 1, "activation"),
+        active_count
     );
 
     cluster.shutdown_all().await;

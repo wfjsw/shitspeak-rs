@@ -24,7 +24,7 @@ pub mod wait;
 // Convenient re-exports for the most common items so callers can write
 // `crate::testing::{Cluster, mint_pki, wait_until}` without paying
 // attention to file layout.
-pub use chaos::{LinkChaos, MessageType};
+pub use chaos::{FaultSelector, LinkChaos, MessageType};
 pub use cluster::{
     Capture, Cluster, Node, full_mesh_seeds, line_seeds, overlay_cfg, s2s_network_test_guard,
     transport_cfg,

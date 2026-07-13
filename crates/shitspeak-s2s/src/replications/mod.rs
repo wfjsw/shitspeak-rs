@@ -39,6 +39,7 @@ mod topic;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,7 +49,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use crate::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
+use crate::overlay::{
+    MemberIncarnation, MembershipEvent, OverlayInboundMessage, OverlayNetwork, ServiceInbound,
+};
 use shitspeak_core::NodeIdentifier;
 
 pub use blob::{BlobHandle, BlobReplicable};
@@ -209,6 +212,8 @@ impl ReplicationManager {
 
         // Spawn the membership-event fan-out task.
         let mut events = overlay.subscribe_membership();
+        let mut membership_view = current_membership_view(&overlay);
+        let overlay_for_ev = overlay.clone();
         let strict_for_ev = strict_topics.clone();
         let owner_for_ev = owner_topics.clone();
         let blob_for_ev = blob_topics.clone();
@@ -218,25 +223,15 @@ impl ReplicationManager {
                 tokio::select! {
                     _ = shutdown_for_ev.cancelled() => return,
                     ev = events.recv() => {
-                        match ev {
-                            Ok(ev) => {
-                                strict_for_ev.iter_sync(|_, rt| {
-                                    rt.on_membership(&ev);
-                                    true
-                                });
-                                owner_for_ev.iter_sync(|_, rt| {
-                                    rt.on_membership(&ev);
-                                    true
-                                });
-                                blob_for_ev.iter_sync(|_, rt| {
-                                    rt.on_membership(&ev);
-                                    true
-                                });
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                warn!(skipped = n, "membership event subscriber lagged");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        if !handle_membership_result(
+                            ev,
+                            &mut membership_view,
+                            &strict_for_ev,
+                            &owner_for_ev,
+                            &blob_for_ev,
+                            || current_membership_view(&overlay_for_ev),
+                        ) {
+                            return;
                         }
                     }
                 }
@@ -279,6 +274,8 @@ impl ReplicationManager {
             self.inner.shutdown.child_token(),
             self.inner.cfg.clone(),
         );
+        runtime
+            .seed_membership_snapshot(current_membership_view(&self.inner.overlay).into_values());
         runtime.start();
         let erased: Arc<dyn ErasedStrictRuntime> = runtime.clone();
         let _ = self.inner.strict_topics.insert_sync(topic, erased);
@@ -415,6 +412,240 @@ impl ReplicationManager {
         self.inner
             .overlay
             .unregister_service(REPLICATION_SERVICE_TAG);
+    }
+}
+
+fn current_membership_view(overlay: &OverlayNetwork) -> HashMap<NodeIdentifier, MemberIncarnation> {
+    overlay
+        .members()
+        .into_iter()
+        .filter(|member| member.status().is_reachable())
+        .map(|member| (member.node_id(), member.member_incarnation()))
+        .collect()
+}
+
+fn update_membership_view(
+    view: &mut HashMap<NodeIdentifier, MemberIncarnation>,
+    event: &MembershipEvent,
+) {
+    match event {
+        MembershipEvent::Joined(member) | MembershipEvent::Restarted(member) => {
+            let should_apply = view
+                .get(&member.node_id())
+                .is_none_or(|current| member.incarnation() > current.incarnation());
+            if should_apply {
+                view.insert(member.node_id(), *member);
+            }
+        }
+        MembershipEvent::Left(member) | MembershipEvent::Failed(member) => {
+            let is_current = view
+                .get(&member.node_id())
+                .is_some_and(|current| current.incarnation() == member.incarnation());
+            if is_current {
+                view.remove(&member.node_id());
+            }
+        }
+    }
+}
+
+fn reconcile_membership_views(
+    previous: &HashMap<NodeIdentifier, MemberIncarnation>,
+    current: &HashMap<NodeIdentifier, MemberIncarnation>,
+) -> Vec<MembershipEvent> {
+    let mut nodes: Vec<_> = previous.keys().chain(current.keys()).copied().collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    nodes
+        .into_iter()
+        .filter_map(|node| match (previous.get(&node), current.get(&node)) {
+            (Some(old), None) => Some(MembershipEvent::Failed(*old)),
+            (None, Some(new)) => Some(MembershipEvent::Joined(*new)),
+            (Some(old), Some(new)) if old.incarnation() != new.incarnation() => {
+                Some(MembershipEvent::Restarted(*new))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn fan_out_membership_event(
+    event: &MembershipEvent,
+    strict_topics: &SccMap<String, Arc<dyn ErasedStrictRuntime>>,
+    owner_topics: &SccMap<String, Arc<dyn ErasedOwnerRuntime>>,
+    blob_topics: &SccMap<String, Arc<dyn ErasedBlobRuntime>>,
+) {
+    strict_topics.iter_sync(|_, runtime| {
+        runtime.on_membership(event);
+        true
+    });
+    owner_topics.iter_sync(|_, runtime| {
+        runtime.on_membership(event);
+        true
+    });
+    blob_topics.iter_sync(|_, runtime| {
+        runtime.on_membership(event);
+        true
+    });
+}
+
+fn handle_membership_result(
+    result: Result<MembershipEvent, tokio::sync::broadcast::error::RecvError>,
+    membership_view: &mut HashMap<NodeIdentifier, MemberIncarnation>,
+    strict_topics: &SccMap<String, Arc<dyn ErasedStrictRuntime>>,
+    owner_topics: &SccMap<String, Arc<dyn ErasedOwnerRuntime>>,
+    blob_topics: &SccMap<String, Arc<dyn ErasedBlobRuntime>>,
+    current_view: impl FnOnce() -> HashMap<NodeIdentifier, MemberIncarnation>,
+) -> bool {
+    match result {
+        Ok(event) => {
+            fan_out_membership_event(&event, strict_topics, owner_topics, blob_topics);
+            update_membership_view(membership_view, &event);
+            true
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            warn!(skipped, "membership event subscriber lagged");
+            let current = current_view();
+            for event in reconcile_membership_views(membership_view, &current) {
+                fan_out_membership_event(&event, strict_topics, owner_topics, blob_topics);
+            }
+            *membership_view = current;
+            true
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
+    }
+}
+
+#[cfg(test)]
+mod membership_reconciliation_tests {
+    use super::*;
+    use crate::replications::config::ReplicationConfig;
+    use crate::replications::proto::StrictBody;
+    use crate::replications::strict::runtime::{StrictNet, StrictRuntime};
+    use crate::replications::test_support::{CapturedFrame, CountingStrictRepo, MockNet};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn lag_reconciliation_recovers_restart_join_and_failure() {
+        let previous = HashMap::from([
+            (2, MemberIncarnation::new(2, 7)),
+            (3, MemberIncarnation::new(3, 4)),
+        ]);
+        let current = HashMap::from([
+            (2, MemberIncarnation::new(2, 8)),
+            (4, MemberIncarnation::new(4, 1)),
+        ]);
+
+        let events = reconcile_membership_views(&previous, &current);
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            MembershipEvent::Restarted(member)
+                if member.node_id() == 2 && member.incarnation() == 8
+        ));
+        assert!(matches!(
+            &events[1],
+            MembershipEvent::Failed(member)
+                if member.node_id() == 3 && member.incarnation() == 4
+        ));
+        assert!(matches!(
+            &events[2],
+            MembershipEvent::Joined(member)
+                if member.node_id() == 4 && member.incarnation() == 1
+        ));
+    }
+
+    #[test]
+    fn membership_view_ignores_stale_and_duplicate_incarnation_events() {
+        let current = MemberIncarnation::new(2, 8);
+        let mut view = HashMap::from([(2, current)]);
+
+        update_membership_view(
+            &mut view,
+            &MembershipEvent::Restarted(MemberIncarnation::new(2, 7)),
+        );
+        update_membership_view(&mut view, &MembershipEvent::Restarted(current));
+        update_membership_view(
+            &mut view,
+            &MembershipEvent::Failed(MemberIncarnation::new(2, 7)),
+        );
+
+        assert_eq!(view.get(&2), Some(&current));
+
+        update_membership_view(&mut view, &MembershipEvent::Failed(current));
+        assert!(!view.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn lagged_manager_subscriber_reconciles_restart_into_strict_runtime() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(2, 8);
+        let runtime = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            42,
+            "lag-reconcile".to_owned(),
+            net.clone() as Arc<dyn StrictNet>,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let strict_topics: SccMap<String, Arc<dyn ErasedStrictRuntime>> = SccMap::new();
+        let owner_topics: SccMap<String, Arc<dyn ErasedOwnerRuntime>> = SccMap::new();
+        let blob_topics: SccMap<String, Arc<dyn ErasedBlobRuntime>> = SccMap::new();
+        assert!(
+            strict_topics
+                .insert_sync("lag-reconcile".to_owned(), runtime)
+                .is_ok()
+        );
+
+        let (events, mut subscriber) = tokio::sync::broadcast::channel(1);
+        let mut membership_view = HashMap::from([(2, MemberIncarnation::new(2, 7))]);
+        events
+            .send(MembershipEvent::Joined(MemberIncarnation::new(3, 1)))
+            .expect("subscriber is active");
+        events
+            .send(MembershipEvent::Failed(MemberIncarnation::new(3, 1)))
+            .expect("subscriber is active");
+
+        let result = subscriber.recv().await;
+        assert!(matches!(
+            result,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+        ));
+        assert!(handle_membership_result(
+            result,
+            &mut membership_view,
+            &strict_topics,
+            &owner_topics,
+            &blob_topics,
+            || HashMap::from([(2, MemberIncarnation::new(2, 8))]),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if net.captures().iter().any(|frame| {
+                    matches!(
+                        frame,
+                        CapturedFrame::StrictUnicast {
+                            dst: 2,
+                            body: StrictBody::CatchupReq(request),
+                            ..
+                        } if request.history_probe_only
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reconciled restart should start strict history election");
+
+        assert_eq!(
+            membership_view.get(&2).map(MemberIncarnation::incarnation),
+            Some(8)
+        );
     }
 }
 

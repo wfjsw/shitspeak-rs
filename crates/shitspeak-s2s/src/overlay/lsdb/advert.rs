@@ -28,6 +28,14 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
+#[cfg(feature = "pre-release-workload")]
+static PRE_RELEASE_METRIC_LSA_EMISSIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "pre-release-workload")]
+pub(crate) fn pre_release_metric_lsa_emissions() -> u64 {
+    PRE_RELEASE_METRIC_LSA_EMISSIONS.load(Ordering::Relaxed)
+}
+
 use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{ConnectionManager, MessageClass, SendOptions, ServiceLevel};
@@ -343,6 +351,24 @@ impl LinkGate {
             voice_udp,
         }
     }
+
+    fn service_eligibility(self, cfg: &OverlayConfig) -> ServiceEligibility {
+        if self.excessive_loss {
+            return ServiceEligibility::default();
+        }
+        ServiceEligibility {
+            best_effort: self.transports_mask & cfg.best_effort_transports_mask() != 0,
+            reliable: self.transports_mask & cfg.reliable_transports_mask() != 0,
+            reliable_low_latency: self.transports_mask & cfg.rll_transports_mask() != 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ServiceEligibility {
+    best_effort: bool,
+    reliable: bool,
+    reliable_low_latency: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
@@ -648,8 +674,83 @@ pub fn cost_changed_significantly(
     false
 }
 
-/// Has UDP voice quality shifted enough to bypass the normal stable metric
-/// gate? Reliable transport movement continues to use the regular gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalChange {
+    Unchanged,
+    Metric,
+    Structural,
+}
+
+fn classify_local_change(
+    emitter: &LsaEmitter,
+    snap: &[NeighborSnapshot],
+    cfg: &OverlayConfig,
+) -> LocalChange {
+    {
+        let last = emitter.last_published.lock();
+        let prev_set: HashSet<NodeIdentifier> = last.keys().copied().collect();
+        let now_set: HashSet<NodeIdentifier> = snap.iter().map(|n| n.node_id).collect();
+        if prev_set != now_set {
+            return LocalChange::Structural;
+        }
+        for neighbor in snap {
+            let Some(previous) = last.get(&neighbor.node_id).copied() else {
+                return LocalChange::Structural;
+            };
+            let current = LinkGate::from_snapshot(neighbor, cfg);
+            if previous.service_eligibility(cfg) != current.service_eligibility(cfg) {
+                trace!(
+                    peer = %neighbor.node_id,
+                    previous = ?previous.service_eligibility(cfg),
+                    current = ?current.service_eligibility(cfg),
+                    "local lsa structural gate crossed: service eligibility"
+                );
+                return LocalChange::Structural;
+            }
+        }
+    }
+
+    if cost_changed_significantly(emitter, snap, cfg)
+        || voice_cost_changed_significantly(emitter, snap, cfg)
+    {
+        LocalChange::Metric
+    } else {
+        LocalChange::Unchanged
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingMetricChange {
+    fingerprint: ContentFingerprint,
+    stable_since: Instant,
+}
+
+impl PendingMetricChange {
+    fn observe(pending: &mut Option<Self>, fingerprint: ContentFingerprint, now: Instant) {
+        if pending
+            .as_ref()
+            .is_none_or(|candidate| candidate.fingerprint != fingerprint)
+        {
+            *pending = Some(Self {
+                fingerprint,
+                stable_since: now,
+            });
+        }
+    }
+
+    fn deadline(self, emitter: &LsaEmitter, cfg: &OverlayConfig) -> Instant {
+        let stable_at = self.stable_since + cfg.lsa_metric_hold();
+        let min_interval_at = emitter
+            .last_emitted_content
+            .lock()
+            .as_ref()
+            .map(|(_, emitted_at)| *emitted_at + cfg.lsa_metric_min_emit_interval())
+            .unwrap_or(self.stable_since);
+        stable_at.max(min_interval_at)
+    }
+}
+
+/// Has UDP voice quality shifted enough to cross its metric gate?
 pub fn voice_cost_changed_significantly(
     emitter: &LsaEmitter,
     snap: &[NeighborSnapshot],
@@ -939,22 +1040,34 @@ pub fn spawn_emitter_task(
         // First tick fires immediately; we already emitted, so absorb it.
         refresh.tick().await;
 
+        let mut pending_metric = None;
+
         loop {
+            let pending_deadline = pending_metric
+                .map(|candidate: PendingMetricChange| candidate.deadline(&emitter, &cfg));
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = emitter.trigger.notified() => {
                     let snap = monitor.snapshot();
-                    let changed = cost_changed_significantly(&emitter, &snap, &cfg);
-                    if emitter.force_next_emit.swap(false, Ordering::Relaxed) || changed {
-                        emit_once_with_reason(
-                            &emitter,
-                            &lsdb,
-                            &monitor,
-                            &transport,
-                            &pacer,
-                            &cfg,
-                            EmitReason::Changed,
-                        ).await;
+                    if emitter.force_next_emit.swap(false, Ordering::Relaxed) {
+                        pending_metric = None;
+                        emit_once_with_reason(&emitter, &lsdb, &monitor, &transport, &pacer, &cfg, EmitReason::Changed).await;
+                        continue;
+                    }
+                    match classify_local_change(&emitter, &snap, &cfg) {
+                        LocalChange::Structural => {
+                            pending_metric = None;
+                            emit_once_with_reason(&emitter, &lsdb, &monitor, &transport, &pacer, &cfg, EmitReason::Changed).await;
+                        }
+                        LocalChange::Metric => {
+                            let content = build_local_lsa_content(&emitter, &snap, false);
+                            PendingMetricChange::observe(
+                                &mut pending_metric,
+                                content_fingerprint(&content, &cfg),
+                                Instant::now(),
+                            );
+                        }
+                        LocalChange::Unchanged => pending_metric = None,
                     }
                 }
                 _ = refresh.tick() => {
@@ -967,6 +1080,47 @@ pub fn spawn_emitter_task(
                         &cfg,
                         EmitReason::Periodic,
                     ).await;
+                    let snap = monitor.snapshot();
+                    match classify_local_change(&emitter, &snap, &cfg) {
+                        LocalChange::Unchanged | LocalChange::Structural => pending_metric = None,
+                        LocalChange::Metric => {
+                            let content = build_local_lsa_content(&emitter, &snap, false);
+                            PendingMetricChange::observe(
+                                &mut pending_metric,
+                                content_fingerprint(&content, &cfg),
+                                Instant::now(),
+                            );
+                        }
+                    }
+                }
+                _ = async {
+                    match pending_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let snap = monitor.snapshot();
+                    match classify_local_change(&emitter, &snap, &cfg) {
+                        LocalChange::Structural => {
+                            pending_metric = None;
+                            emit_once_with_reason(&emitter, &lsdb, &monitor, &transport, &pacer, &cfg, EmitReason::Changed).await;
+                        }
+                        LocalChange::Metric => {
+                            let content = build_local_lsa_content(&emitter, &snap, false);
+                            PendingMetricChange::observe(
+                                &mut pending_metric,
+                                content_fingerprint(&content, &cfg),
+                                Instant::now(),
+                            );
+                            let ready = pending_metric
+                                .is_some_and(|candidate| candidate.deadline(&emitter, &cfg) <= Instant::now());
+                            if ready {
+                                pending_metric = None;
+                                emit_once_with_reason(&emitter, &lsdb, &monitor, &transport, &pacer, &cfg, EmitReason::Metric).await;
+                            }
+                        }
+                        LocalChange::Unchanged => pending_metric = None,
+                    }
                 }
             }
         }
@@ -976,6 +1130,7 @@ pub fn spawn_emitter_task(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmitReason {
     Changed,
+    Metric,
     Periodic,
     Tombstone,
 }
@@ -1066,6 +1221,10 @@ async fn emit_once_with_reason(
     }
     record_published(emitter, &snap, cfg);
     record_emitted_content(emitter, fingerprint);
+    #[cfg(feature = "pre-release-workload")]
+    if reason == EmitReason::Metric {
+        PRE_RELEASE_METRIC_LSA_EMISSIONS.fetch_add(1, Ordering::Relaxed);
+    }
     if tombstone {
         flood_to_neighbors(transport, emitter.self_id, &snap, vec![pb_lsa], None).await;
     } else {
@@ -1135,6 +1294,8 @@ mod tests {
     use super::*;
 
     use crate::overlay::proto::node_to_wire;
+    use crate::overlay::routing::dijkstra;
+    use shitspeak_s2s_transport::ServiceLevel;
 
     fn snap(ids: &[NodeIdentifier]) -> Vec<NeighborSnapshot> {
         ids.iter()
@@ -1483,6 +1644,160 @@ mod tests {
         changed[0].transports_mask = 0b11;
         assert!(cost_changed_significantly(&emitter, &changed, &cfg));
         assert!(cost_changed_significantly(&emitter, &[], &cfg));
+    }
+
+    #[test]
+    fn mask_churn_is_held_unless_service_eligibility_changes() {
+        use crate::overlay::config::transport_bit;
+        use shitspeak_s2s_transport::TransportKind;
+
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.transports_mask = transport_bit(TransportKind::Tcp);
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut still_eligible = base.clone();
+        still_eligible[0].transports_mask |= transport_bit(TransportKind::Udp);
+        assert_eq!(
+            classify_local_change(&emitter, &still_eligible, &cfg),
+            LocalChange::Metric
+        );
+
+        let mut loses_reliable = base.clone();
+        loses_reliable[0].transports_mask = transport_bit(TransportKind::Udp);
+        assert_eq!(
+            classify_local_change(&emitter, &loses_reliable, &cfg),
+            LocalChange::Structural
+        );
+
+        let mut loses_all = base.clone();
+        loses_all[0].transports_mask = 0;
+        assert_eq!(
+            classify_local_change(&emitter, &loses_all, &cfg),
+            LocalChange::Structural
+        );
+    }
+
+    #[test]
+    fn stable_service_mask_churn_preserves_distribution_epoch_and_routes() {
+        const MASK_SEQUENCE: [u32; 4] = [15, 13, 5, 15];
+
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let db = LinkStateDb::new(Arc::new(super::super::store::LsaFloor::new(0, None)));
+        let mut neighbor = one_neighbor();
+        neighbor.transports_mask = MASK_SEQUENCE[0];
+        let mut snapshot = vec![neighbor];
+
+        let initial = build_local_lsa(&emitter, &snapshot, false);
+        assert_eq!(db.admit(initial), AdmissionResult::Accepted);
+        assert_eq!(
+            db.admit(LsaEntry {
+                origin: 2,
+                boot_epoch: 200,
+                seq: 1,
+                ts_local_received: Instant::now(),
+                tombstone: false,
+                addresses: vec![],
+                links: vec![],
+                max_users: 10,
+                transit_disabled: false,
+                replication_services: ReplicationServices::ALL,
+                application_services: ApplicationServices::ALL,
+            }),
+            AdmissionResult::Accepted
+        );
+        record_published(&emitter, &snapshot, &cfg);
+
+        let structural_epoch = db.distribution_epoch();
+        for (index, mask) in MASK_SEQUENCE.into_iter().enumerate().skip(1) {
+            snapshot[0].transports_mask = mask;
+            let change = classify_local_change(&emitter, &snapshot, &cfg);
+            assert_ne!(
+                change,
+                LocalChange::Structural,
+                "eligibility-preserving mask transition at sequence index {index}"
+            );
+            if index < MASK_SEQUENCE.len() - 1 {
+                assert_eq!(change, LocalChange::Metric);
+            } else {
+                assert_eq!(change, LocalChange::Unchanged);
+            }
+
+            // Synthetic link-state injection follows the same construction and
+            // admission path as the emitter, then exercises routing over the
+            // accepted LSDB snapshot without waiting for EWMA sampling.
+            let lsa = build_local_lsa(&emitter, &snapshot, false);
+            assert_eq!(db.admit(lsa), AdmissionResult::Accepted);
+            assert_eq!(db.distribution_epoch(), structural_epoch);
+
+            let routes = dijkstra::compute(&db, 1, ServiceLevel::Reliable, &cfg);
+            assert_eq!(routes.get(&2).map(|route| route.next_hop), Some(2));
+        }
+    }
+
+    #[test]
+    fn excessive_loss_eligibility_crossing_is_structural() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.loss_ppm = 100_000;
+        base.loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].loss_ppm = cfg.max_route_packet_loss_ppm();
+        assert_eq!(
+            classify_local_change(&emitter, &changed, &cfg),
+            LocalChange::Structural
+        );
+    }
+
+    #[test]
+    fn metric_candidate_obeys_stability_hold_and_minimum_emit_interval() {
+        let cfg = OverlayConfig::new(vec![])
+            .with_lsa_metric_hold(Duration::from_secs(5))
+            .with_lsa_metric_min_emit_interval(Duration::from_secs(5));
+        let emitter = test_emitter();
+        let now = Instant::now();
+        let first = ContentFingerprint {
+            identity: 1,
+            gate: 10,
+        };
+        let second = ContentFingerprint {
+            identity: 1,
+            gate: 20,
+        };
+        *emitter.last_emitted_content.lock() = Some((first, now));
+
+        let mut pending = None;
+        PendingMetricChange::observe(&mut pending, first, now);
+        assert_eq!(
+            pending.unwrap().deadline(&emitter, &cfg),
+            now + Duration::from_secs(5)
+        );
+
+        PendingMetricChange::observe(&mut pending, second, now + Duration::from_secs(4));
+        assert_eq!(
+            pending.unwrap().deadline(&emitter, &cfg),
+            now + Duration::from_secs(9)
+        );
+
+        *emitter.last_emitted_content.lock() = Some((first, now + Duration::from_secs(7)));
+        assert_eq!(
+            pending.unwrap().deadline(&emitter, &cfg),
+            now + Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn metric_stabilization_defaults_to_five_seconds() {
+        let cfg = OverlayConfig::new(vec![]);
+        assert_eq!(cfg.lsa_metric_hold(), Duration::from_secs(5));
+        assert_eq!(cfg.lsa_metric_min_emit_interval(), Duration::from_secs(5));
     }
 
     #[test]

@@ -130,6 +130,7 @@ zstd = { workspace = true }
 default = []
 web = ["dep:shitspeak-web"]
 moq = ["web", "shitspeak-web/moq"]
+pre-release-workload = ["shitspeak-runtime/pre-release-workload"]
 
 [[bin]]
 name = "shitspeak-rs"

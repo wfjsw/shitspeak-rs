@@ -803,9 +803,9 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
     pub fn on_membership_event(&self, ev: &MembershipEvent) {
         match ev {
             MembershipEvent::Restarted(node) => {
-                self.clear_origin_tracking(*node);
+                self.clear_origin_tracking(node.node_id());
                 let weak = self.weak_self.lock().clone();
-                let node = *node;
+                let node = node.node_id();
                 if let Some(weak) = weak {
                     tokio::spawn(async move {
                         if let Some(runtime) = weak.upgrade() {
@@ -815,9 +815,9 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                 }
             }
             MembershipEvent::Failed(node) | MembershipEvent::Left(node) => {
-                self.clear_origin_tracking(*node);
+                self.clear_origin_tracking(node.node_id());
                 let weak = self.weak_self.lock().clone();
-                let node = *node;
+                let node = node.node_id();
                 if let Some(weak) = weak {
                     tokio::spawn(async move {
                         if let Some(runtime) = weak.upgrade() {
@@ -828,7 +828,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             }
             MembershipEvent::Joined(node) => {
                 let weak = self.weak_self.lock().clone();
-                let node = *node;
+                let node = node.node_id();
                 if let Some(weak) = weak {
                     tokio::spawn(async move {
                         if let Some(runtime) = weak.upgrade() {

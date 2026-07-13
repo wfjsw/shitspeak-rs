@@ -1747,6 +1747,7 @@ fn add_debug_packet_samples(
         sent_bytes: u64,
         recv_bytes: u64,
         sent_count: u64,
+        send_attempt_count: u64,
         recv_count: u64,
         avg_sent_bps: f64,
         avg_recv_bps: f64,
@@ -1758,6 +1759,15 @@ fn add_debug_packet_samples(
     };
     let source = view.source.to_string();
     let destination = view.destination.to_string();
+    out.push(sample(
+        "shitspeak_s2s_debug_packet_io_send_attempts_total",
+        vec![
+            ("source", source.as_str()),
+            ("destination", destination.as_str()),
+            ("packet_kind", view.kind.as_str()),
+        ],
+        view.send_attempt_count as f64,
+    ));
     for (direction, bytes, count, avg_bps) in [
         ("sent", view.sent_bytes, view.sent_count, view.avg_sent_bps),
         ("recv", view.recv_bytes, view.recv_count, view.avg_recv_bps),

@@ -7325,8 +7325,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum by (profile) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=\"compatibility_fallback\"}[$__rate_interval]))",
-          "legendFormat": "{{profile}}",
+          "expr": "sum by (profile, result) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=\"compatibility_fallback\"}[$__rate_interval]))",
+          "legendFormat": "{{profile}} {{result}}",
           "range": true,
           "refId": "A"
         }
@@ -7458,8 +7458,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum by (event, result) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=~\"reparent|hysteresis_hold|compatibility_fallback|clock_offset_fallback|deadline_expiry\"}[$__rate_interval]))",
-          "legendFormat": "{{event}} {{result}}",
+          "expr": "sum by (profile, event, result) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=~\"candidate_build|candidate_trigger|edge_forward|reparent|hysteresis_hold|compatibility_fallback\"}[$__rate_interval]))",
+          "legendFormat": "{{profile}} {{event}} {{result}}",
           "range": true,
           "refId": "A"
         }

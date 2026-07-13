@@ -66,6 +66,74 @@ Results are written under `.transport-survey/results-*`. The script temporarily
 rewrites generated node configs to isolate each transport, stops compose between
 runs, and restores the configs when it exits.
 
+## Serialized pre-release netem gate
+
+`pre-release-netem-scenario.json` defines a deterministic 15-minute release
+scenario. Nodes 1-8 and 9-16 form two local regions. The long-haul profiles span
+409-1288 ms one-way delay and 450-750 ms jitter, including a deterministic
+Gilbert-Elliott burst-loss interval. Rules match both TCP request and reply
+directions and each KCP, QUIC, and UDP destination port. The timeline serializes
+per-transport endpoint loss, a four-node minority partition that preserves the
+12-node quorum, node restart, and recovery.
+
+Regenerate the demo after pulling changes so the image includes `tc` and every
+node receives `NET_ADMIN`, then build and run the gate:
+
+```powershell
+cross build --target=x86_64-unknown-linux-musl `
+  --target-dir target/pre-release-workload --features pre-release-workload
+pwsh examples/docker-compose-16node/generate-compose-16node.ps1 `
+  -PreReleaseWorkload -Force
+pwsh examples/docker-compose-16node/run-pre-release-netem.ps1 -Build
+```
+
+The runner starts the cluster, waits for all health endpoints, applies timeline
+events one at a time, samples every 15 seconds, clears netem on exit, and runs
+strict acceptance checks. A failed check returns a nonzero exit code.
+
+The workload driver is mandatory because the production status endpoint cannot
+inject an encrypted semantic `DistributionAck` loss or export strict ordered
+histories. The runner invokes it concurrently with `-ArtifactDirectory`,
+`-ScenarioPath`, and `-DurationSeconds` parameters. It must generate concurrent
+strict proposals and generic tree traffic, restart a node during an in-flight
+proposal, drop a selected distribution ACK through test-support fault control,
+and run mirrored tree and legacy performance phases. A schema-v2 control file
+holds the run ID, phase, scoring window, and ACK-fault arm state, so restarted
+processes cannot infer a phase from local uptime. Tree sends continue unscored
+through restart windows. The exact fail-closed evidence
+contract is in `workload-summary.schema.json`. `logs_by_node` and
+`deliveries_by_node` contain ordered operation IDs and delivered packet IDs, not
+version counters. Metric-only LSA counts are emission events, not per-neighbor
+flood packet counts.
+
+The two CPU fields are source-container mean CPU percentages over mirrored
+phases with equal sample counts. Logical-send counts must remain within the
+configured tolerance. The operation fields are cluster-aggregate physical
+encode/send deltas from `shitspeak_s2s_debug_packet_io_packets_total` for
+`overlay.data.tag.251`, normalized by scored logical sends during acceptance.
+
+Result bundles are written below `.pre-release-netem/results-*`. They contain
+the scenario, topology snapshots, selected public Prometheus metrics, `tc`
+state, aggregate container stats, workload output, container/workload logs, and
+an acceptance report. They intentionally exclude node configs, container
+environment, certificates, and keys.
+
+Useful lower-level commands:
+
+```powershell
+# Apply or inspect one rule set on an already-running stack.
+pwsh examples/docker-compose-16node/netem-controller.ps1 -Action Apply -RuleSet baseline
+pwsh examples/docker-compose-16node/netem-controller.ps1 -Action Show
+pwsh examples/docker-compose-16node/netem-controller.ps1 -Action Clear
+
+# Re-evaluate an existing artifact bundle after adjusting acceptance thresholds.
+pwsh examples/docker-compose-16node/test-pre-release-netem.ps1 `
+  -ArtifactDirectory examples/docker-compose-16node/.pre-release-netem/results-YYYYMMDD-HHMMSS
+```
+
+`-NoStart` reuses a running stack, `-KeepNetem` preserves the final qdisc state,
+and `-SkipAcceptance` is intended only for controller/collector development.
+
 ## Ports
 
 Each container listens on the same internal ports as the UTD bundle:
@@ -73,7 +141,7 @@ Each container listens on the same internal ports as the UTD bundle:
 1. `64738/tcp` and `64738/udp`: Mumble client listener
 2. `64739/tcp`: S2S TCP listener
 3. `64740/udp`: S2S KCP listener
-4. `64741/tcp`: S2S QUIC listener
+4. `64741/udp`: S2S QUIC listener
 5. `64742/udp`: S2S UDP listener
 6. `64750/tcp`: S2S status HTTP page
 

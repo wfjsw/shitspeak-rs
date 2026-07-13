@@ -27,7 +27,7 @@ use shitspeak_s2s_transport::{ConnectionManager, TransportKind};
 use super::super::config::OverlayConfig;
 use super::super::config::kind_to_idx;
 use super::super::duplicate::DuplicateDetector;
-use super::super::membership::MembershipEvent;
+use super::super::membership::{MemberIncarnation, MembershipEvent};
 use super::super::proto::transports_to_mask;
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 
@@ -585,9 +585,9 @@ impl NeighborMonitor {
                 // First-ever boot_epoch is just initial state.
                 if prev_be > 0 {
                     restarted = true;
-                    let _ = self
-                        .membership_events
-                        .send(MembershipEvent::Restarted(from));
+                    let _ = self.membership_events.send(MembershipEvent::Restarted(
+                        MemberIncarnation::new(from, boot_epoch),
+                    ));
                     debug!(peer=%from, new_epoch=boot_epoch, "neighbor restart detected via hello");
                 }
             }
@@ -634,9 +634,9 @@ impl NeighborMonitor {
                 st.boot_epoch = boot_epoch;
                 if prev_be > 0 {
                     restarted = true;
-                    let _ = self
-                        .membership_events
-                        .send(MembershipEvent::Restarted(from));
+                    let _ = self.membership_events.send(MembershipEvent::Restarted(
+                        MemberIncarnation::new(from, boot_epoch),
+                    ));
                 }
             }
             st.last_ack_at = Some(now);

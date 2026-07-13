@@ -10,6 +10,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use arc_swap::ArcSwap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::ServiceLevel;
@@ -36,6 +37,7 @@ impl RoutingTableKey {
 /// One snapshot of the service-level tables for every routing metric.
 #[derive(Clone)]
 pub struct RoutingTables {
+    generation: u64,
     tables: HashMap<RoutingTableKey, HashMap<NodeIdentifier, RouteEntry>>,
     adjacency: HashMap<RoutingTableKey, HashMap<NodeIdentifier, Vec<(NodeIdentifier, EdgeCost)>>>,
     transit_disabled: HashSet<NodeIdentifier>,
@@ -43,6 +45,7 @@ pub struct RoutingTables {
 
 impl Default for RoutingTables {
     fn default() -> Self {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         let mut tables = HashMap::new();
         let mut adjacency = HashMap::new();
         for metric in RoutingMetric::ALL {
@@ -53,6 +56,7 @@ impl Default for RoutingTables {
             }
         }
         Self {
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             tables,
             adjacency,
             transit_disabled: HashSet::new(),
@@ -63,6 +67,10 @@ impl Default for RoutingTables {
 impl RoutingTables {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(crate) fn from_graph(
@@ -461,6 +469,14 @@ pub fn new_handle() -> RoutingHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_snapshots_have_monotonic_generations() {
+        let first = RoutingTables::empty();
+        let second = RoutingTables::empty();
+        assert!(second.generation() > first.generation());
+        assert_eq!(first.clone().generation(), first.generation());
+    }
 
     #[test]
     fn has_route_uses_service_level_fallback_rules() {

@@ -108,9 +108,10 @@ pub struct DistributionCapabilities {
 }
 
 impl DistributionCapabilities {
-    /// Version 2 carries hop-rebased, peer-clock-aware distribution
-    /// deadlines. Version 1 remains readable for rolling-upgrade fallback.
-    pub const PROTOCOL_VERSION: u32 = 2;
+    /// Version 3 uses direct tree edges with hop-local monotonic expiry.
+    /// Versions 1 and 2 remain readable for rolling-upgrade fallback.
+    pub const PROTOCOL_VERSION: u32 = 3;
+    pub const V2_PROTOCOL_VERSION: u32 = 2;
     pub const V1_PROTOCOL_VERSION: u32 = 1;
 
     pub const UNSUPPORTED: Self = Self {
@@ -134,6 +135,16 @@ impl DistributionCapabilities {
     }
 
     pub fn v2(profile_ids: impl IntoIterator<Item = u32>) -> Self {
+        let mut profile_ids: Vec<_> = profile_ids.into_iter().filter(|id| *id != 0).collect();
+        profile_ids.sort_unstable();
+        profile_ids.dedup();
+        Self {
+            protocol_version: Self::V2_PROTOCOL_VERSION,
+            profile_ids,
+        }
+    }
+
+    pub fn v3(profile_ids: impl IntoIterator<Item = u32>) -> Self {
         let mut profile_ids: Vec<_> = profile_ids.into_iter().filter(|id| *id != 0).collect();
         profile_ids.sort_unstable();
         profile_ids.dedup();
@@ -1544,7 +1555,7 @@ mod tests {
         let mut lsa = entry(1, 100, 1, false);
         lsa.application_services = ApplicationServices::with_distribution_capabilities(
             true,
-            DistributionCapabilities::v2([9, 3, 9]),
+            DistributionCapabilities::v3([9, 3, 9]),
         );
 
         let pb = lsa.to_pb();
@@ -1563,6 +1574,17 @@ mod tests {
         assert_eq!(db.admit(roundtrip), AdmissionResult::Accepted);
         assert!(db.supports_distribution_profile(1, 2, 3));
         assert!(!db.supports_distribution_profile(1, 2, 8));
+    }
+
+    #[test]
+    fn v2_capability_remains_version_two_after_v3_upgrade() {
+        let capability = DistributionCapabilities::v2([3]);
+        assert_eq!(
+            capability.protocol_version(),
+            DistributionCapabilities::V2_PROTOCOL_VERSION
+        );
+        assert!(capability.supports(DistributionCapabilities::V2_PROTOCOL_VERSION, 3));
+        assert!(!capability.supports(DistributionCapabilities::PROTOCOL_VERSION, 3));
     }
 
     #[test]

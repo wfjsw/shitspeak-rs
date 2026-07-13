@@ -22,6 +22,9 @@ enum DistributionEvent {
     ControlPublish,
     ControlAck,
     Activation,
+    CandidateBuild,
+    CandidateTrigger,
+    EdgeForward,
     CompatibilityFallback,
     StateRequest,
     OriginalForward,
@@ -39,6 +42,9 @@ impl DistributionEvent {
             Self::ControlPublish => "control_publish",
             Self::ControlAck => "control_ack",
             Self::Activation => "activation",
+            Self::CandidateBuild => "candidate_build",
+            Self::CandidateTrigger => "candidate_trigger",
+            Self::EdgeForward => "edge_forward",
             Self::CompatibilityFallback => "compatibility_fallback",
             Self::StateRequest => "state_request",
             Self::OriginalForward => "original_forward",
@@ -212,6 +218,30 @@ struct DistributionMetrics {
     peer_clocks: HashMap<NodeIdentifier, PeerClockGauge>,
 }
 
+#[cfg(feature = "pre-release-workload")]
+pub(crate) fn pre_release_counters() -> (u64, u64, u64, u64) {
+    let metrics = METRICS.lock().unwrap();
+    let profile = ProfileBucket::Other;
+    let sum = |event, result: Option<&'static str>| {
+        metrics
+            .events
+            .iter()
+            .filter(|(key, _)| {
+                key.profile == profile
+                    && key.event == event
+                    && result.is_none_or(|r| key.result == Some(r))
+            })
+            .map(|(_, count)| *count)
+            .sum()
+    };
+    (
+        sum(DistributionEvent::Activation, None),
+        sum(DistributionEvent::CompatibilityFallback, None),
+        sum(DistributionEvent::CandidateBuild, Some("attempt")),
+        sum(DistributionEvent::CandidateTrigger, None),
+    )
+}
+
 fn record(profile: u32, event: DistributionEvent) {
     record_with_result(profile, event, None, EventDimensions::legacy(profile));
 }
@@ -244,6 +274,33 @@ pub(crate) fn record_control_ack(profile: u32) {
 
 pub(crate) fn record_activation(profile: u32) {
     record(profile, DistributionEvent::Activation);
+}
+
+pub(crate) fn record_candidate_build(profile: u32, result: &'static str) {
+    record_with_result(
+        profile,
+        DistributionEvent::CandidateBuild,
+        Some(result),
+        EventDimensions::legacy(profile),
+    );
+}
+
+pub(crate) fn record_candidate_trigger(profile: u32, result: &'static str) {
+    record_with_result(
+        profile,
+        DistributionEvent::CandidateTrigger,
+        Some(result),
+        EventDimensions::legacy(profile),
+    );
+}
+
+pub(crate) fn record_edge_forward(profile: u32, result: &'static str) {
+    record_with_result(
+        profile,
+        DistributionEvent::EdgeForward,
+        Some(result),
+        EventDimensions::legacy(profile),
+    );
 }
 
 #[allow(dead_code)] // Retained for unit coverage of legacy metric dimensions.

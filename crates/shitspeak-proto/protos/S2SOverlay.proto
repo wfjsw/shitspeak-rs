@@ -199,6 +199,9 @@ message DistributionTreeInstall {
   // Optional source-selected receiver playout policy. Missing values retain
   // v1 behavior and must not delay local-only delivery.
   repeated DistributionTreePlayoutDelay playout_delays = 9;
+  // Version 3 gives every adjacent tree edge a fresh local monotonic
+  // transport expiry. Zero retains the version-2 wall-clock deadline path.
+  uint32 hop_ttl_ms = 10;
 }
 
 message DistributionTreePlayoutDelay {

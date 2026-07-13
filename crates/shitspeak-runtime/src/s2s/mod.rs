@@ -44,10 +44,13 @@ use shitspeak_s2s::replications::{
     BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable,
 };
 use shitspeak_s2s::status as s2s_status;
-#[cfg(test)]
+#[cfg(any(test, feature = "pre-release-workload"))]
 use shitspeak_s2s::testing as s2s_testing;
 use shitspeak_s2s_transport as s2s_transport;
 use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
+
+#[cfg(feature = "pre-release-workload")]
+mod pre_release_workload;
 
 const S2S_CLIENT_REPLICATION_WORKER_CAPACITY: usize = 4096;
 const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -121,7 +124,7 @@ struct S2SRuntimeState {
     gateway_tx: Option<S2SGatewayTx>,
     startup_duplicate_failures: u64,
     last_startup_duplicate_node: Option<NodeIdentifier>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pre-release-workload"))]
     inbound_chaos: Option<s2s_testing::LinkChaos>,
 }
 
@@ -1004,6 +1007,13 @@ impl S2SManager {
             Err(e) => (None, Some(e)),
         };
 
+        let mut state = S2SRuntimeState::default();
+        #[cfg(feature = "pre-release-workload")]
+        if pre_release_workload::enabled() {
+            let local_node = config.s2s.local_node_id().unwrap_or_default();
+            state.inbound_chaos = Some(pre_release_workload::configured_chaos(local_node));
+        }
+
         Self {
             enabled: config.s2s.is_enabled(),
             config_error,
@@ -1016,7 +1026,7 @@ impl S2SManager {
             status_http_listen: config.s2s.status_http_listen,
             local_geo: config.s2s.geo.manual_geo(),
             max_users: Arc::new(AtomicU64::new(config.max_users)),
-            state: RwLock::new(S2SRuntimeState::default()),
+            state: RwLock::new(state),
         }
     }
 
@@ -1791,7 +1801,7 @@ impl S2SManager {
                 return;
             }
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pre-release-workload"))]
         let inbound = {
             let chaos = self.state.read().inbound_chaos.clone();
             if let Some(chaos) = chaos {
@@ -1924,6 +1934,19 @@ impl S2SManager {
         application.plugin_data().set_sink(native_sink.clone());
         application.text_message().set_sink(native_sink);
 
+        #[cfg(feature = "pre-release-workload")]
+        let pre_release_task = if pre_release_workload::enabled() {
+            let chaos = self.state.read().inbound_chaos.clone();
+            pre_release_workload::start(
+                overlay.clone(),
+                replications.clone(),
+                chaos,
+                shutdown.clone(),
+            )
+        } else {
+            None
+        };
+
         let (
             channel_replications,
             ban_replication,
@@ -1965,6 +1988,10 @@ impl S2SManager {
             state.client_replication = client_replication;
             state.channel_blob_replications = channel_blob_replications;
             state.bridge_tasks = bridge_tasks;
+            #[cfg(feature = "pre-release-workload")]
+            if let Some(task) = pre_release_task {
+                state.bridge_tasks.push(task);
+            }
         }
 
         let status_task = self.status_http_listen.and_then(|listen| {

@@ -13,17 +13,22 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 use super::harness::ReplCluster;
+use shitspeak_s2s::overlay::{OverlayNetwork, SeedPeer};
 use shitspeak_s2s::replications::proto::{
     self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG,
 };
 use shitspeak_s2s::replications::strict::{HistoryMetadata, LogSlice, StrictLogEntry};
 use shitspeak_s2s::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
 use shitspeak_s2s::replications::{
-    OwnerReplicable, ReplicationConfig, ReplicationError, StrictReplicable,
+    OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager, StrictReplicable,
 };
-use shitspeak_s2s::testing::chaos::MessageType;
-use shitspeak_s2s::testing::{wait_for_full_routing, wait_until};
-use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
+use shitspeak_s2s::testing::chaos::{FaultSelector, MessageType};
+use shitspeak_s2s::testing::{
+    loopback, overlay_cfg, transport_cfg, wait_for_full_routing, wait_until,
+};
+use shitspeak_s2s_transport::{
+    ConnectionManager, MessageClass, PeerAddress, ServiceLevel, TransportKind,
+};
 use shitspeak_state::Channel;
 use shitspeak_state::{
     ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
@@ -228,9 +233,10 @@ async fn strict_three_node_convergence() {
 
 /// Checks strict replication with concurrent proposers.
 /// Expected: all proposals complete and all replicas reach version 21 despite
-/// A and B proposing concurrently after a warm-up write. Mumble/shitspeak
+/// A and B proposing concurrently after a warm-up write, with an identical
+/// total-order log at every replica. Mumble/shitspeak
 /// define the state being replicated; this crate defines the S2S protocol.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_concurrent_proposers_total_order() {
     let cfg = ReplicationConfig::default()
         .with_propose_ttl(Duration::from_secs(30))
@@ -254,20 +260,21 @@ async fn strict_concurrent_proposers_total_order() {
     .await;
     assert!(warmed, "all nodes must apply the warm-up proposal");
 
-    let h_a = handles[0].clone();
-    let h_b = handles[1].clone();
-    let task_a = tokio::spawn(async move {
-        for k in 0..10u64 {
-            h_a.propose(1000 + k).await.unwrap();
-        }
-    });
-    let task_b = tokio::spawn(async move {
-        for k in 0..10u64 {
-            h_b.propose(2000 + k).await.unwrap();
-        }
-    });
-    task_a.await.unwrap();
-    task_b.await.unwrap();
+    let tasks = [(handles[0].clone(), 1000), (handles[1].clone(), 2000)]
+        .into_iter()
+        .map(|(handle, base)| {
+            tokio::spawn(async move {
+                for k in 0..10u64 {
+                    handle.propose(base + k).await.unwrap();
+                }
+            })
+        });
+    for task in tasks {
+        timeout(Duration::from_secs(90), task)
+            .await
+            .expect("concurrent proposer hung")
+            .expect("concurrent proposer panicked");
+    }
 
     let ok = wait_until(Duration::from_secs(15), || {
         repos.iter().all(|r| r.current_version() == 21)
@@ -275,6 +282,215 @@ async fn strict_concurrent_proposers_total_order() {
     .await;
     assert!(ok, "all nodes must reach version 21");
 
+    let log0 = repos[0].log();
+    assert_eq!(
+        log0.len(),
+        21,
+        "the committed log must contain every proposal"
+    );
+    for repo in &repos[1..] {
+        assert_eq!(repo.log(), log0, "replicas diverged on total order");
+    }
+
+    cluster.shutdown().await;
+}
+
+/// Checks that a strict proposal does not bind its commit delivery to the
+/// routes that existed during the propose phase. Quorum ACKs are delayed while
+/// node 1's direct route to node 4 is withdrawn; after ACK processing resumes,
+/// the commit must use the replacement multi-hop route and converge every log.
+#[tokio::test]
+async fn strict_route_change_between_propose_ack_and_commit_converges() {
+    let cfg = ReplicationConfig::default()
+        .with_propose_ttl(Duration::from_secs(30))
+        .with_pending_propose_ttl(Duration::from_secs(45));
+    let cluster = ReplCluster::build_full_mesh_fast_failure_with_config(&[1, 2, 3, 4], cfg).await;
+    let repos: Vec<Arc<CountingStrictRepo>> = (0..4).map(|_| CountingStrictRepo::new()).collect();
+    let mut handles = Vec::new();
+    for (idx, repo) in repos.iter().enumerate() {
+        handles.push(
+            cluster
+                .register_strict(idx, "channels-route-change", repo.clone())
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let coordinator = cluster.cluster.node(1);
+    for peer in [3, 4] {
+        coordinator.chaos.set_delay(
+            FaultSelector::new(peer, TransportKind::Tcp, MessageType::StrictAck),
+            Duration::from_secs(12),
+            Duration::ZERO,
+        );
+    }
+
+    let handle = handles[0].clone();
+    let proposal = tokio::spawn(async move { handle.propose(4242).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    coordinator.chaos.block(4);
+    cluster.cluster.node(4).chaos.block(1);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            matches!(
+                coordinator
+                    .overlay
+                    .route_to(4, ServiceLevel::Reliable),
+                Some(next_hop) if next_hop != 4
+            )
+        })
+        .await,
+        "node 1 did not replace its direct route to node 4: {:?}",
+        coordinator.overlay.route_to(4, ServiceLevel::Reliable)
+    );
+
+    let version = timeout(Duration::from_secs(35), proposal)
+        .await
+        .expect("proposal hung after route change")
+        .expect("proposal task panicked")
+        .expect("proposal failed after route change");
+    assert_eq!(version, 1);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            repos.iter().all(|repo| repo.current_version() == 1)
+        })
+        .await,
+        "commit did not converge after route change: versions={:?}",
+        repos
+            .iter()
+            .map(|repo| repo.current_version())
+            .collect::<Vec<_>>()
+    );
+    let log0 = repos[0].log();
+    for repo in &repos[1..] {
+        assert_eq!(repo.log(), log0, "replicas diverged after route change");
+    }
+
+    cluster.shutdown().await;
+}
+
+/// Checks that strict state from an old node incarnation cannot wedge the same
+/// node ID after a real restart. The coordinator is stopped only after a peer
+/// ACK proves its proposal is pending; a fresh coordinator then rejoins and a
+/// later proposal must converge on all live replicas.
+#[tokio::test]
+async fn strict_same_id_restart_clears_old_pending_proposal() {
+    let cfg = ReplicationConfig::default()
+        .with_propose_ttl(Duration::from_secs(20))
+        .with_pending_propose_ttl(Duration::from_secs(30));
+    let cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3], cfg.clone()).await;
+    let repos: Vec<Arc<CountingStrictRepo>> = (0..3).map(|_| CountingStrictRepo::new()).collect();
+    let mut handles = Vec::new();
+    for (idx, repo) in repos.iter().enumerate() {
+        handles.push(
+            cluster
+                .register_strict(idx, "channels-restart", repo.clone())
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let old_coordinator = cluster.cluster.node(1);
+    let held_ack = FaultSelector::new(2, TransportKind::Tcp, MessageType::StrictAck);
+    old_coordinator.chaos.drop_next(held_ack, 100);
+    old_coordinator.chaos.drop_next(
+        FaultSelector::new(3, TransportKind::Tcp, MessageType::StrictAck),
+        100,
+    );
+    let old_handle = handles[0].clone();
+    let old_proposal = tokio::spawn(async move { old_handle.propose(1111).await });
+    assert!(
+        wait_until(Duration::from_secs(3), || old_coordinator
+            .chaos
+            .remaining_drops(held_ack)
+            < 100)
+        .await,
+        "peer ACK never proved the old proposal reached pending state"
+    );
+
+    cluster.managers[0].shutdown().await;
+    old_coordinator.overlay.shutdown().await;
+    old_coordinator.transport.shutdown().await;
+    let _ = timeout(Duration::from_secs(3), old_proposal)
+        .await
+        .expect("old proposal did not terminate with its coordinator");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let old_epoch = old_coordinator.overlay.local_boot_epoch();
+    let seeds = [2u16, 3]
+        .into_iter()
+        .map(|peer| {
+            SeedPeer::new(
+                peer,
+                vec![PeerAddress::new(
+                    loopback(cluster.cluster.node(peer).port),
+                    TransportKind::Tcp,
+                )],
+            )
+        })
+        .collect();
+    let (new_transport, new_inbound) = ConnectionManager::start(transport_cfg(
+        &cluster.cluster.pki,
+        0,
+        loopback(old_coordinator.port),
+    ))
+    .await
+    .unwrap();
+    let new_overlay = OverlayNetwork::start(new_transport.clone(), new_inbound, overlay_cfg(seeds))
+        .await
+        .unwrap();
+    assert!(
+        new_overlay.local_boot_epoch() > old_epoch,
+        "same-ID restart did not advance the incarnation"
+    );
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            new_overlay.route_to(2, ServiceLevel::Reliable).is_some()
+                && new_overlay.route_to(3, ServiceLevel::Reliable).is_some()
+        })
+        .await,
+        "restarted coordinator did not rejoin routing"
+    );
+
+    let new_manager = ReplicationManager::with_config(new_overlay.clone(), cfg);
+    let new_repo = CountingStrictRepo::new();
+    let new_handle = new_manager
+        .register_strict("channels-restart", new_repo.clone())
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let version = match timeout(Duration::from_secs(20), handles[1].propose(2222)).await {
+        Ok(Ok(version)) => version,
+        result => panic!(
+            "old pending proposal wedged the restarted node ID: result={result:?}, node2={:?}, node3={:?}, restarted={:?}",
+            handles[1].debug_state(),
+            handles[2].debug_state(),
+            new_handle.debug_state(),
+        ),
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            repos[1].current_version() == version
+                && repos[2].current_version() == version
+                && new_repo.current_version() == version
+        })
+        .await,
+        "post-restart proposal did not converge: peer2={}, peer3={}, restarted={}",
+        repos[1].current_version(),
+        repos[2].current_version(),
+        new_repo.current_version()
+    );
+    assert_eq!(repos[1].log(), repos[2].log());
+    assert_eq!(new_repo.log(), repos[1].log());
+    assert!(
+        repos[1].log().iter().any(|(_, op)| *op == 2222),
+        "the post-restart proposal is absent from the converged log"
+    );
+
+    new_manager.shutdown().await;
+    new_overlay.shutdown().await;
+    new_transport.shutdown().await;
     cluster.shutdown().await;
 }
 

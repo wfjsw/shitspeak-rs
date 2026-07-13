@@ -38,6 +38,7 @@ pub(crate) mod proto;
 pub mod routing;
 mod runtime;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -53,17 +54,19 @@ use shitspeak_s2s_transport::{
     ServiceLevel, TransportKind,
 };
 
-// A fresh LSA can briefly have no measured edge latency. Treat that as an
-// unknown long-haul leg, not a zero-latency leg, until probes converge.
-const UNKNOWN_TREE_EDGE_PLAYOUT_BASELINE_MS: u64 = 120;
+const DISTRIBUTION_HOP_TTL: Duration = Duration::from_millis(80);
 
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use duplicate::{DuplicateDetector, DuplicateEvidenceKind, DuplicateNodeSnapshot};
 pub use error::OverlayError;
 pub use lane::LaneId;
 pub use lsdb::{ApplicationServices, ReplicationServices};
-pub use membership::{MemberSnapshot, MemberStatus, MembershipEvent};
+pub use membership::{MemberIncarnation, MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{OverlayInboundMessage, OverlaySendOptions, ServiceInbound};
+
+/// Dedicated reliable generic-tree service used only by the pre-release gate.
+#[cfg(feature = "pre-release-workload")]
+pub const PRE_RELEASE_DISTRIBUTION_SERVICE_TAG: u32 = 251;
 pub use routing::{RouteEntry, RoutingMetric};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -299,57 +302,25 @@ impl OverlayNetwork {
         self.inner.neighbor.peer_clock_offsets()
     }
 
-    fn tree_playout_delays_ms(&self, tree: &distribution::TreeState) -> Vec<(NodeIdentifier, u64)> {
-        let source = self.inner.self_id;
-        let mut cumulative = std::collections::HashMap::from([(source, 0_u64)]);
-        let mut pending = std::collections::VecDeque::from([source]);
-        let mut delays = Vec::new();
-        while let Some(parent) = pending.pop_front() {
-            let parent_delay = cumulative.get(&parent).copied().unwrap_or_default();
-            for child in tree.children(parent) {
-                let measured_edge_delay = self
-                    .inner
-                    .lsdb
-                    .get(parent)
-                    .and_then(|entry| entry.links.into_iter().find(|link| link.neighbor == *child))
-                    .and_then(|link| {
-                        (link.rtt_us > 0).then_some(
-                            link.rtt_us
-                                .div_ceil(2_000)
-                                .saturating_add(link.jitter_us.saturating_mul(3).div_ceil(1_000))
-                                // Each logical tree edge can include forwarding
-                                // work at a relay, so leave a small fixed margin.
-                                .saturating_add(20),
-                        )
-                    });
-                let edge_delay = measured_edge_delay.unwrap_or_else(|| {
-                    self.inner
-                        .routing
-                        .load()
-                        .lookup_with_metric(
-                            *child,
-                            ServiceLevel::BestEffort,
-                            RoutingMetric::ConversationalQuality,
-                        )
-                        .map(|route| route.latency_us.div_ceil(1_000).saturating_add(20))
-                        .unwrap_or_default()
-                        .max(UNKNOWN_TREE_EDGE_PLAYOUT_BASELINE_MS)
-                });
-                let delay = parent_delay.saturating_add(edge_delay);
-                cumulative.insert(*child, delay);
-                if tree.is_member(*child) {
-                    delays.push((*child, delay));
-                }
-                pending.push_back(*child);
-            }
-        }
-        delays
-    }
-
     /// Local node's `boot_epoch` (microseconds since UNIX epoch, captured
     /// once at overlay start). Stable until the process restarts.
     pub fn local_boot_epoch(&self) -> u64 {
         self.inner.boot_epoch
+    }
+
+    #[cfg(feature = "pre-release-workload")]
+    pub fn pre_release_distribution_epoch(&self) -> u64 {
+        self.inner.lsdb.distribution_epoch()
+    }
+
+    #[cfg(feature = "pre-release-workload")]
+    pub fn pre_release_metric_lsa_emissions(&self) -> u64 {
+        lsdb::advert::pre_release_metric_lsa_emissions()
+    }
+
+    #[cfg(feature = "pre-release-workload")]
+    pub fn pre_release_distribution_counters(&self) -> (u64, u64, u64, u64) {
+        distribution_metrics::pre_release_counters()
     }
 
     /// Snapshot of every directed-edge RTT currently advertised in the
@@ -1143,6 +1114,27 @@ impl OverlayNetwork {
                 )
                 .await;
         };
+        let all_dsts = dsts;
+        let (dsts, mut legacy_dsts): (Vec<_>, Vec<_>) = all_dsts.into_iter().partition(|node| {
+            self.inner.lsdb.supports_distribution_profile(
+                *node,
+                crate::overlay::lsdb::DistributionCapabilities::PROTOCOL_VERSION,
+                profile.id(),
+            )
+        });
+        if dsts.is_empty() {
+            return self
+                .send_multicast_unordered_with_routing_metric_and_options(
+                    &legacy_dsts,
+                    tag,
+                    level,
+                    routing_metric,
+                    class,
+                    body,
+                    options,
+                )
+                .await;
+        }
         let level = profile.level();
         let routing_metric = profile.metric();
         let topology_epoch = self.inner.lsdb.distribution_epoch();
@@ -1154,139 +1146,140 @@ impl OverlayNetwork {
             topology_epoch,
             version: 0,
         };
-        let excluded = self.inner.distribution.failed_edges(scope);
-        let routing = self.inner.routing.load();
-        let recipient_path_cost = dsts
-            .iter()
-            .filter_map(|recipient| {
-                routing
-                    .lookup_with_metric(*recipient, level, routing_metric)
-                    .map(|route| route.cost)
-            })
-            .fold(0_u64, u64::saturating_add);
-        let edges = routing.multicast_tree_edges_avoiding(
-            self.inner.self_id,
-            &dsts,
-            level,
-            routing_metric,
-            &excluded,
-        );
-        drop(routing);
-        let shape = distribution::TreeState::new(
-            self.inner.self_id,
-            dsts.iter().copied(),
-            edges.iter().copied(),
-        );
-        // The tree profile is generic, but voice consumes this optional
-        // receiver policy to latch a remote media playout delay. Calculate it
-        // directly along every selected directed tree edge, not from a
-        // source-to-recipient shortcut: one-way RTT, three jitter terms, and
-        // a relay margin accumulate through the selected tree path.
-        let playout_delays = self.tree_playout_delays_ms(&shape);
-        let state = self.inner.distribution.select_tree(
-            scope,
-            distribution::TreeState::new_with_playout(
-                self.inner.self_id,
-                dsts.iter().copied(),
-                edges,
-                playout_delays,
-            )
-            .with_recipient_path_cost(recipient_path_cost),
-        );
-        let key = distribution::TreeKey {
-            version: distribution::tree_version(
-                self.inner.self_id,
-                profile.id(),
-                group,
-                group_version,
-                topology_epoch,
-                &state,
-            ),
-            ..scope
-        };
-        let capability_ready = state.nodes().all(|node| {
-            node == self.inner.self_id
-                || self.inner.lsdb.supports_distribution_profile(
-                    node,
-                    crate::overlay::lsdb::DistributionCapabilities::PROTOCOL_VERSION,
-                    profile.id(),
-                )
-        });
-        // The v2 tree wire format rebases deadlines at every physical hop.
-        // Before originating a tree, ensure each initial physical peer has a
-        // fresh direct clock estimate; otherwise normal multicast is the
-        // only safe delivery path for this frame.
-        let clock_failure = state.children(self.inner.self_id).iter().find_map(|child| {
-            let route = self
-                .inner
-                .routing
-                .load()
-                .lookup_with_metric(*child, level, routing_metric);
-            let Some(route) = route else {
-                return Some((*child, None, "route_missing"));
-            };
-            (!self
-                .inner
-                .neighbor
-                .has_mutual_fresh_peer_clock_offset(route.next_hop))
-            .then_some((*child, Some(route.next_hop), "peer_not_ready"))
-        });
-        let clock_ready = clock_failure.is_none();
-        if !capability_ready || !clock_ready {
-            let metric_context = distribution_metrics::DistributionMetricContext::new(
-                profile.id(),
-                tag,
-                self.inner.self_id,
-                Some(group),
-                distribution_metrics::EdgeDirection::Local,
-            );
-            if !capability_ready {
-                distribution_metrics::record_compatibility_fallback_with_context(
-                    metric_context,
-                    "capability_unsupported",
-                );
-            }
-            if !clock_ready {
-                let (child, next_hop, reason) = clock_failure.expect("clock failure");
-                if self
-                    .inner
-                    .should_log_tree_clock_fallback(child, next_hop, reason)
-                {
-                    tracing::debug!(
-                        source = %self.inner.self_id,
-                        profile = profile.id(),
-                        group,
-                        %child,
-                        ?next_hop,
-                        reason,
-                        "falling back from distribution tree because a first-hop peer is not mutually clock-ready"
-                    );
-                }
-                distribution_metrics::record_clock_offset_fallback_with_context(
-                    metric_context,
-                    "source_clock_unready",
-                );
-                distribution_metrics::record_compatibility_fallback_with_context(
-                    metric_context,
-                    "source_clock_unready",
-                );
-            }
-            return self
-                .send_multicast_unordered_with_routing_metric_and_options(
-                    &dsts,
-                    tag,
+        let routing = self.inner.routing.load_full();
+        let routing_generation = routing.generation();
+        let selected = if let Some(cached) = self
+            .inner
+            .distribution
+            .cached_candidate(scope, routing_generation)
+        {
+            cached
+        } else {
+            self.inner
+                .distribution
+                .prepare_routing_generation(scope, routing_generation);
+            let excluded = self.inner.distribution.failed_edges(scope);
+            let mut tree_dsts = dsts.clone();
+            let state = loop {
+                let edges = routing.multicast_tree_edges_avoiding(
+                    self.inner.self_id,
+                    &tree_dsts,
                     level,
                     routing_metric,
-                    class,
-                    body,
-                    options,
+                    &excluded,
+                );
+                let state = distribution::TreeState::new(
+                    self.inner.self_id,
+                    tree_dsts.iter().copied(),
+                    edges,
                 )
-                .await;
-        }
+                .with_hop_ttl(options.transport_ttl().unwrap_or(DISTRIBUTION_HOP_TTL));
+                let incompatible_relays: Vec<_> = state
+                    .nodes()
+                    .filter(|node| {
+                        *node != self.inner.self_id
+                            && !self.inner.lsdb.supports_distribution_profile(
+                                *node,
+                                crate::overlay::lsdb::DistributionCapabilities::PROTOCOL_VERSION,
+                                profile.id(),
+                            )
+                    })
+                    .collect();
+                let uncovered: HashSet<_> = tree_dsts
+                    .iter()
+                    .copied()
+                    .filter(|recipient| !state.is_reachable_from(self.inner.self_id, *recipient))
+                    .collect();
+                if incompatible_relays.is_empty() && uncovered.is_empty() {
+                    break state;
+                }
+                let mut affected: HashSet<_> = incompatible_relays
+                    .into_iter()
+                    .flat_map(|relay| state.descendant_members(relay))
+                    .collect();
+                affected.extend(uncovered);
+                if affected.is_empty() {
+                    break state;
+                }
+                tree_dsts.retain(|recipient| !affected.contains(recipient));
+                legacy_dsts.extend(affected);
+                legacy_dsts.sort_unstable();
+                legacy_dsts.dedup();
+                if tree_dsts.is_empty() {
+                    return self
+                        .send_multicast_unordered_with_routing_metric_and_options(
+                            &legacy_dsts,
+                            tag,
+                            level,
+                            routing_metric,
+                            class,
+                            body,
+                            options,
+                        )
+                        .await;
+                }
+            };
+            let recipient_path_cost = tree_dsts
+                .iter()
+                .filter_map(|recipient| {
+                    routing
+                        .lookup_with_metric(*recipient, level, routing_metric)
+                        .map(|route| route.cost)
+                })
+                .fold(0_u64, u64::saturating_add);
+            let key = distribution::TreeKey {
+                version: distribution::tree_version(
+                    self.inner.self_id,
+                    profile.id(),
+                    group,
+                    group_version,
+                    topology_epoch,
+                    &state,
+                ),
+                ..scope
+            };
+            let Some(selected) = self.inner.distribution.stage_candidate_with_legacy(
+                key,
+                state,
+                recipient_path_cost,
+                routing_generation,
+                legacy_dsts.iter().copied().collect(),
+            ) else {
+                distribution_metrics::record_compatibility_fallback_with_context(
+                    distribution_metrics::DistributionMetricContext::new(
+                        profile.id(),
+                        tag,
+                        self.inner.self_id,
+                        Some(group),
+                        distribution_metrics::EdgeDirection::Local,
+                    ),
+                    "invalid_tree",
+                );
+                let mut fallback_dsts = dsts.clone();
+                fallback_dsts.extend(legacy_dsts.iter().copied());
+                return self
+                    .send_multicast_unordered_with_routing_metric_and_options(
+                        &fallback_dsts,
+                        tag,
+                        level,
+                        routing_metric,
+                        class,
+                        body,
+                        options,
+                    )
+                    .await;
+            };
+            selected
+        };
+        legacy_dsts = selected.legacy_members().iter().copied().collect();
+        legacy_dsts.sort_unstable();
+        let key = selected.key();
+        let state = selected.state().clone();
         if self.inner.distribution.get(key).is_none() {
-            self.inner.distribution.install(key, state.clone());
+            self.inner.distribution.install(key, (*state).clone());
         }
-        if !self.inner.distribution.is_ready(key) {
+        let active = self.inner.distribution.active_tree(scope);
+        if active.as_ref().map(distribution::SelectedTree::key) != Some(key) {
             let peers: Vec<_> = state
                 .nodes()
                 .filter(|node| *node != self.inner.self_id)
@@ -1309,63 +1302,95 @@ impl OverlayNetwork {
                 );
                 let overlay = self.clone();
                 let control = distribution::encode_install(key, &state);
+                let mut peer_rtts: Vec<_> = peers
+                    .iter()
+                    .filter_map(|peer| {
+                        routing
+                            .lookup_with_metric(*peer, level, routing_metric)
+                            .map(|route| Duration::from_micros(route.latency_us))
+                    })
+                    .collect();
+                peer_rtts.sort_unstable();
+                let p95_index = peer_rtts
+                    .len()
+                    .saturating_mul(95)
+                    .div_ceil(100)
+                    .saturating_sub(1);
+                let p95 = peer_rtts
+                    .get(p95_index)
+                    .copied()
+                    .unwrap_or(Duration::from_millis(200));
+                let retry_delay = (p95.saturating_mul(2) + Duration::from_millis(100))
+                    .clamp(Duration::from_millis(500), Duration::from_secs(3));
+                let candidate_lifetime = Duration::from_secs(10).max(retry_delay.saturating_mul(4));
                 tokio::spawn(async move {
-                    let sends = peers.into_iter().map(|peer| {
-                        let overlay = overlay.clone();
-                        let control = control.clone();
-                        async move {
-                            overlay
-                                .send_unicast_unordered_with_routing_metric(
-                                    peer,
-                                    distribution::DISTRIBUTION_CONTROL_SERVICE_TAG,
-                                    ServiceLevel::ReliableLowLatency,
-                                    RoutingMetric::ReliableLowLatencyCost,
-                                    MessageClass::Control,
-                                    control,
-                                )
-                                .await
+                    let deadline = Instant::now() + candidate_lifetime;
+                    loop {
+                        let missing = overlay.inner.distribution.pending_peers(key);
+                        if missing.is_empty() {
+                            return;
                         }
-                    });
-                    if join_all(sends)
-                        .await
-                        .into_iter()
-                        .any(|result| result.is_err())
-                    {
-                        overlay.inner.distribution.abort_publish(key);
+                        let sends = missing.into_iter().map(|peer| {
+                            let overlay = overlay.clone();
+                            let control = control.clone();
+                            async move {
+                                let _ = overlay
+                                    .send_unicast_unordered_with_routing_metric(
+                                        peer,
+                                        distribution::DISTRIBUTION_CONTROL_SERVICE_TAG,
+                                        ServiceLevel::ReliableLowLatency,
+                                        RoutingMetric::ReliableLowLatencyCost,
+                                        MessageClass::Control,
+                                        control,
+                                    )
+                                    .await;
+                            }
+                        });
+                        join_all(sends).await;
+                        if Instant::now() >= deadline {
+                            distribution_metrics::record_candidate_build(
+                                key.profile,
+                                "ack_timeout",
+                            );
+                            overlay.inner.distribution.expire_candidate(key);
+                            return;
+                        }
+                        tokio::time::sleep(retry_delay).await;
                     }
                 });
             }
-            // Tree state is not active until every required ACK arrives. Do
-            // not stall realtime ingress; the compatibility path preserves
-            // frame pacing while the one coalesced install is in flight.
-            distribution_metrics::record_compatibility_fallback_with_context(
-                distribution_metrics::DistributionMetricContext::new(
-                    profile.id(),
-                    tag,
-                    self.inner.self_id,
-                    Some(group),
-                    distribution_metrics::EdgeDirection::Local,
-                ),
-                "tree_pending",
-            );
-            return self
-                .send_multicast_unordered_with_routing_metric_and_options(
-                    &dsts,
-                    tag,
-                    level,
-                    routing_metric,
-                    class,
-                    body,
-                    options,
-                )
-                .await;
+            if active.is_none() {
+                distribution_metrics::record_compatibility_fallback_with_context(
+                    distribution_metrics::DistributionMetricContext::new(
+                        profile.id(),
+                        tag,
+                        self.inner.self_id,
+                        Some(group),
+                        distribution_metrics::EdgeDirection::Local,
+                    ),
+                    "tree_pending",
+                );
+                let mut fallback_dsts = dsts.clone();
+                fallback_dsts.extend(legacy_dsts.iter().copied());
+                return self
+                    .send_multicast_unordered_with_routing_metric_and_options(
+                        &fallback_dsts,
+                        tag,
+                        level,
+                        routing_metric,
+                        class,
+                        body,
+                        options,
+                    )
+                    .await;
+            }
         }
-        let state = self
+        let active = self
             .inner
             .distribution
-            .get(key)
-            .expect("local tree installed");
-        messaging::send_multicast_tree_unordered_with_routing_metric_and_options(
+            .active_tree(scope)
+            .expect("distribution candidate activated or prior active retained");
+        let tree_send = messaging::send_multicast_tree_unordered_with_routing_metric_and_options(
             &self.inner.transport,
             &self.inner.routing,
             &self.inner.distribution,
@@ -1373,16 +1398,30 @@ impl OverlayNetwork {
             self.inner.self_id,
             self.inner.boot_epoch,
             self.inner.ordering(),
-            &state,
-            key,
+            active.state(),
+            active.key(),
+            tag,
+            level,
+            routing_metric,
+            class,
+            body.clone(),
+            options,
+        );
+        if legacy_dsts.is_empty() {
+            return tree_send.await;
+        }
+        let legacy_send = self.send_multicast_unordered_with_routing_metric_and_options(
+            &legacy_dsts,
             tag,
             level,
             routing_metric,
             class,
             body,
             options,
-        )
-        .await
+        );
+        let (tree_result, legacy_result) = tokio::join!(tree_send, legacy_send);
+        tree_result?;
+        legacy_result
     }
 
     /// Send to every alive peer.

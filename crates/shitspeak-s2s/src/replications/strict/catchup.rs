@@ -9,7 +9,6 @@
 //! `has_more = false`.
 
 use bytes::Bytes;
-use rand::seq::SliceRandom;
 use tracing::warn;
 
 use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
@@ -162,10 +161,10 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
 
 /// Apply an inbound `StrictCatchupResp`. Installs the snapshot if
 /// requested, then applies each op in order via `apply_committed`. If
-/// `has_more`, fires off another request to a random alive peer.
+/// `has_more`, continues pagination with the same validated peer.
 pub(crate) async fn apply_response<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
-    _from: NodeIdentifier,
+    from: NodeIdentifier,
     resp: StrictCatchupResp,
 ) {
     let apply_started_at = std::time::Instant::now();
@@ -181,6 +180,14 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         );
         return;
     };
+    if remote_node != from {
+        warn!(
+            from,
+            claimed = remote_node,
+            "strict catchup response origin mismatch"
+        );
+        return;
+    }
     let remote_rank = HistoryRank {
         version: resp.history_version,
         freshness: resp.history_freshness,
@@ -193,6 +200,22 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     let metadata_only_response =
         !resp.too_old_use_snapshot && resp.snapshot_msgpack.is_empty() && resp.ops.is_empty();
     if metadata_only_response {
+        let local_metadata = rt.repo.history_metadata();
+        let equal_version_metadata_diverged = !can_bootstrap
+            && remote_rank.version == local_metadata.version
+            && remote_rank.freshness != local_metadata.freshness;
+        if equal_version_metadata_diverged {
+            warn!(
+                from,
+                version = remote_rank.version,
+                local_freshness = local_metadata.freshness,
+                remote_freshness = remote_rank.freshness,
+                "strict anti-entropy found equal-version history metadata divergence"
+            );
+            rt.state.lock().request_history_election();
+            rt.wake_clock_tick_loop();
+            return;
+        }
         let outcome =
             rt.state
                 .lock()
@@ -218,6 +241,15 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     }
 
     if resp.too_old_use_snapshot {
+        if resp.snapshot_version != remote_rank.version {
+            warn!(
+                from,
+                snapshot_version = resp.snapshot_version,
+                history_version = remote_rank.version,
+                "strict catchup snapshot rank/version mismatch"
+            );
+            return;
+        }
         let outcome = if can_bootstrap {
             rt.state.lock().record_history_snapshot_response(
                 remote_node,
@@ -349,12 +381,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         }
     }
     if resp.has_more {
-        let alive = rt.net.alive_members();
-        let mut peers: Vec<NodeIdentifier> = alive
-            .into_iter()
-            .filter(|n| *n != rt.self_id && rt.net.has_route(*n, ServiceLevel::Reliable))
-            .collect();
-        if peers.is_empty() {
+        if from == rt.self_id || !rt.net.has_route(from, ServiceLevel::Reliable) {
             metrics::record_pipeline_stage(
                 ReplicationPipelineKind::Strict,
                 ReplicationPipelineStage::CatchupApply,
@@ -362,11 +389,6 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             );
             return;
         }
-        let dst = {
-            let mut rng = rand::rng();
-            peers.shuffle(&mut rng);
-            peers[0]
-        };
         let req = StrictCatchupReq {
             src_node: rt.self_id as u32,
             since_version: resp.next_chunk_token,
@@ -377,7 +399,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         metrics::record_catchup_request(CatchupMode::Strict);
         let _ = rt
             .net
-            .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))
+            .send_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
             .await;
     }
     metrics::record_pipeline_stage(

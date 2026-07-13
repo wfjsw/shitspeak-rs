@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use rand::seq::SliceRandom;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -113,6 +112,9 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
     ) -> Result<(), ReplicationError>;
     async fn send_broadcast(&self, topic: &str, body: StrictBody) -> Result<(), ReplicationError>;
     fn alive_members(&self) -> Vec<NodeIdentifier>;
+    fn member_boot_epoch(&self, _node: NodeIdentifier) -> Option<u64> {
+        None
+    }
     fn has_route(&self, _dst: NodeIdentifier, _level: ServiceLevel) -> bool {
         true
     }
@@ -257,6 +259,14 @@ impl StrictNet for OverlayStrictNet {
         self.overlay.strict_replication_members()
     }
 
+    fn member_boot_epoch(&self, node: NodeIdentifier) -> Option<u64> {
+        if node == self.overlay.local_node_id() {
+            Some(self.overlay.local_boot_epoch())
+        } else {
+            self.overlay.member(node).map(|member| member.boot_epoch())
+        }
+    }
+
     fn has_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
         self.overlay.has_route(dst, level)
     }
@@ -284,6 +294,8 @@ pub(crate) struct Proposal {
     pub ts_propose: u64,
     pub acks: HashMap<NodeIdentifier, u64>, // ack_node -> ts_local
     pub target_set: HashSet<NodeIdentifier>,
+    pub(super) target_epochs: HashMap<NodeIdentifier, u64>,
+    pub(super) invalid_targets: HashSet<NodeIdentifier>,
     pub accepted_waker: Option<oneshot::Sender<()>>,
     pub waker: Option<oneshot::Sender<Result<u64, ReplicationError>>>,
     pub committed: bool,
@@ -548,6 +560,24 @@ pub(crate) struct StrictState {
     history_election_requested: bool,
     history_election_phase: HistoryElectionPhase,
     pub history_alive_peers: HashSet<NodeIdentifier>,
+    /// Highest membership incarnation observed for each node, including a
+    /// tombstone after removal. Keeping tombstones prevents reordered events
+    /// from resurrecting an older process incarnation.
+    member_incarnations: HashMap<NodeIdentifier, AppliedMemberIncarnation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AppliedMemberIncarnation {
+    boot_epoch: u64,
+    alive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MembershipTransition {
+    Ignored,
+    Joined,
+    Removed,
+    Restarted,
 }
 
 impl StrictState {
@@ -565,7 +595,62 @@ impl StrictState {
             history_election_requested: true,
             history_election_phase: HistoryElectionPhase::Idle,
             history_alive_peers: HashSet::new(),
+            member_incarnations: HashMap::new(),
         }
+    }
+
+    fn apply_membership_event(&mut self, event: &MembershipEvent) -> MembershipTransition {
+        let (member, kind) = match event {
+            MembershipEvent::Joined(member) => (member, MembershipTransition::Joined),
+            MembershipEvent::Left(member) | MembershipEvent::Failed(member) => {
+                (member, MembershipTransition::Removed)
+            }
+            MembershipEvent::Restarted(member) => (member, MembershipTransition::Restarted),
+        };
+        let node = member.node_id();
+        let boot_epoch = member.incarnation();
+        let previous = self.member_incarnations.get(&node).copied();
+
+        let transition = match (kind, previous) {
+            (_, Some(previous)) if boot_epoch < previous.boot_epoch => {
+                MembershipTransition::Ignored
+            }
+            (MembershipTransition::Removed, Some(previous))
+                if boot_epoch == previous.boot_epoch && !previous.alive =>
+            {
+                MembershipTransition::Ignored
+            }
+            (MembershipTransition::Removed, _) => MembershipTransition::Removed,
+            (MembershipTransition::Restarted, Some(previous))
+                if boot_epoch <= previous.boot_epoch =>
+            {
+                MembershipTransition::Ignored
+            }
+            (MembershipTransition::Restarted, _) => MembershipTransition::Restarted,
+            (MembershipTransition::Joined, Some(previous))
+                if boot_epoch == previous.boot_epoch && previous.alive =>
+            {
+                MembershipTransition::Ignored
+            }
+            (MembershipTransition::Joined, Some(previous)) if boot_epoch > previous.boot_epoch => {
+                // A Joined event can be the first observation of a restarted
+                // process when the explicit Restarted event was missed.
+                MembershipTransition::Restarted
+            }
+            (MembershipTransition::Joined, _) => MembershipTransition::Joined,
+            (MembershipTransition::Ignored, _) => MembershipTransition::Ignored,
+        };
+
+        if transition != MembershipTransition::Ignored {
+            self.member_incarnations.insert(
+                node,
+                AppliedMemberIncarnation {
+                    boot_epoch,
+                    alive: transition != MembershipTransition::Removed,
+                },
+            );
+        }
+        transition
     }
 
     /// Tempo clock advance: `clock = max(clock, peer_clock) + 1`.
@@ -672,7 +757,11 @@ impl StrictState {
             let reachable_missing = p
                 .target_set
                 .iter()
-                .filter(|n| alive.contains(*n) && !p.acks.contains_key(*n))
+                .filter(|n| {
+                    alive.contains(*n)
+                        && !p.invalid_targets.contains(*n)
+                        && !p.acks.contains_key(*n)
+                })
                 .count();
             let possible_acks = p.acks.len() + reachable_missing;
             if possible_acks < fq {
@@ -699,7 +788,10 @@ impl StrictState {
             && self.proposals.is_empty()
             && self.commit_buffer.is_empty()
             && self.pending_proposes.is_empty()
-            && self.recovery_promises.is_empty()
+            && self
+                .recovery_promises
+                .keys()
+                .all(|op_id| self.committed_ids.contains(op_id))
     }
 
     pub fn can_start_history_election(&self) -> bool {
@@ -1050,6 +1142,8 @@ pub(crate) struct Recovery {
     /// Snapshot of alive members (∪ {self}) at recovery start, used for
     /// the recovery quorum size and to decide where to send Prepare.
     pub target_set: HashSet<NodeIdentifier>,
+    target_epochs: HashMap<NodeIdentifier, u64>,
+    invalid_targets: HashSet<NodeIdentifier>,
     pub prepare_acks: HashMap<NodeIdentifier, RecoveryPrepareAck>,
 }
 
@@ -1086,6 +1180,7 @@ pub struct StrictRuntime<R: StrictReplicable> {
     pub(super) clock_tick_signal: Notify,
     pub(super) propose_semaphore: Arc<Semaphore>,
     pub(super) next_op_counter: AtomicU64,
+    pub(super) steady_catchup_cursor: AtomicU64,
     /// Monotonically increasing per-takeover-attempt counter, used as the
     /// low 32 bits of `ballot` so retries always outrank prior attempts.
     pub(super) recovery_attempt_counter: AtomicU64,
@@ -1128,6 +1223,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             clock_tick_signal: Notify::new(),
             propose_semaphore,
             next_op_counter: AtomicU64::new(1),
+            steady_catchup_cursor: AtomicU64::new(0),
             recovery_attempt_counter: AtomicU64::new(1),
             recoveries: Mutex::new(HashMap::new()),
             weak_self: Mutex::new(None),
@@ -1149,7 +1245,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         spawn_steady_state_catchup_loop(self.clone());
     }
 
-    fn wake_clock_tick_loop(&self) {
+    pub(crate) fn seed_membership_snapshot(
+        &self,
+        members: impl IntoIterator<Item = crate::overlay::MemberIncarnation>,
+    ) {
+        let mut state = self.state.lock();
+        for member in members {
+            let _ = state.apply_membership_event(&MembershipEvent::Joined(member));
+        }
+    }
+
+    pub(crate) fn wake_clock_tick_loop(&self) {
         self.clock_tick_signal.notify_one();
     }
 
@@ -1252,6 +1358,69 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         (tgt, fq)
     }
 
+    pub(crate) fn snapshot_target_epochs(
+        &self,
+        target_set: &HashSet<NodeIdentifier>,
+    ) -> HashMap<NodeIdentifier, u64> {
+        target_set
+            .iter()
+            .map(|node| {
+                let epoch = if *node == self.self_id {
+                    self.boot_epoch
+                } else {
+                    self.net.member_boot_epoch(*node).unwrap_or(0)
+                };
+                (*node, epoch)
+            })
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn finish_history_election_for_test(&self) {
+        self.state.lock().finish_history_election();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn debug_state(&self) -> super::StrictDebugState {
+        let (
+            election_pending,
+            election_active,
+            can_start_election,
+            local_proposals,
+            pending_proposes,
+            buffered_commits,
+            unresolved_promises,
+        ) = {
+            let state = self.state.lock();
+            let unresolved_promises = state
+                .recovery_promises
+                .keys()
+                .filter(|op_id| !state.committed_ids.contains(op_id))
+                .count();
+            (
+                state.history_election_requested,
+                state.history_election_active(),
+                state.can_start_history_election(),
+                state.proposals.len(),
+                state.pending_proposes.len(),
+                state.commit_buffer.len(),
+                unresolved_promises,
+            )
+        };
+        let active_recoveries = self.recoveries.lock().len();
+        super::StrictDebugState {
+            election_pending,
+            election_active,
+            can_start_election,
+            local_proposals,
+            pending_proposes,
+            buffered_commits,
+            unresolved_promises,
+            active_recoveries,
+        }
+    }
+
     pub fn next_op_id(&self) -> OpId {
         let counter = self.next_op_counter.fetch_add(1, Ordering::Relaxed);
         make_op_id(self.self_id, self.boot_epoch, counter)
@@ -1310,7 +1479,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let dsts = p
             .target_set
             .iter()
-            .filter(|node| **node != self.self_id && !p.acks.contains_key(*node))
+            .filter(|node| {
+                **node != self.self_id
+                    && !p.invalid_targets.contains(*node)
+                    && !p.acks.contains_key(*node)
+            })
             .copied()
             .collect();
         Some(PendingProposeRetry {
@@ -1365,13 +1538,14 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             op_id_lo: p.op_id_lo,
             ts_local,
             src_clock: local_clock_after,
+            ack_boot_epoch: self.boot_epoch,
         });
         if let Err(e) = self.net.send_unicast(coord, &self.topic, ack).await {
             trace!(error=%e, "send propose-ack failed");
         }
     }
 
-    pub async fn recv_propose_ack(&self, _from: NodeIdentifier, ack: StrictProposeAck) {
+    pub async fn recv_propose_ack(&self, from: NodeIdentifier, ack: StrictProposeAck) {
         let op_id: OpId = (ack.op_id_hi, ack.op_id_lo);
         let ack_node = match node_from_u32(ack.ack_node) {
             Some(node) => node,
@@ -1397,15 +1571,33 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             trace!(coord, "strict propose ack ignored: not coordinator");
             return;
         }
-        // Update peer clock.
-        {
-            let mut s = self.state.lock();
-            s.observe_peer(ack_node, ack.src_clock);
+        if ack_node != from {
+            warn!(from, ack_node, "strict propose ack origin mismatch");
+            return;
         }
-
         // Decide whether quorum reached for this proposal we're coordinating.
         let mut to_send: Option<AcceptedProposal> = {
             let mut s = self.state.lock();
+
+            // Authenticate the physical sender and its frozen incarnation
+            // before accepting even its piggybacked logical clock.
+            {
+                let Some(p) = s.proposals.get(&op_id) else {
+                    return;
+                };
+                if p.committed
+                    || !p.target_set.contains(&ack_node)
+                    || p.target_epochs.get(&ack_node).copied().unwrap_or(0) != ack.ack_boot_epoch
+                    || p.invalid_targets.contains(&ack_node)
+                {
+                    trace!(
+                        ack_node,
+                        "strict propose ack ignored: invalid frozen target"
+                    );
+                    return;
+                }
+            }
+            s.observe_peer(ack_node, ack.src_clock);
 
             // Phase 1: read fields from the proposal entry and decide.
             let op_bytes: Bytes;
@@ -1421,13 +1613,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 let Some(p) = s.proposals.get_mut(&op_id) else {
                     return;
                 };
-                if p.committed {
-                    return;
-                }
-                if !p.target_set.contains(&ack_node) {
-                    trace!(ack_node, "strict propose ack ignored: outside target set");
-                    return;
-                }
                 p.acks.insert(ack_node, ack.ts_local);
                 target_count = p.target_set.len();
                 fast_quorum = fast_quorum_size(target_count);
@@ -1519,6 +1704,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
     pub async fn recv_commit(&self, from: NodeIdentifier, c: StrictCommit) {
         let op_id: OpId = (c.op_id_hi, c.op_id_lo);
+        // An ordinary commit is authoritative for this op. Cancel an active
+        // takeover before applying it so a later RecoveryCommit cannot race a
+        // history-election snapshot install with a second decision path.
+        self.recoveries.lock().remove(&op_id);
         let mut notify = false;
         let mut gossip: Option<StrictBody> = None;
         let mut buffered_log: Option<BufferedCommitLog> = None;
@@ -1678,6 +1867,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             ts_local,
             op_msgpack,
             src_clock,
+            ack_boot_epoch: self.boot_epoch,
         });
         if let Err(e) = self.net.send_unicast(takeover, &self.topic, body).await {
             trace!(error=%e, "send recovery-ack failed");
@@ -1688,10 +1878,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// once we have a recovery quorum.
     pub async fn recv_recovery_ack(&self, from: NodeIdentifier, ack: StrictRecoveryAck) {
         let op_id: OpId = (ack.op_id_hi, ack.op_id_lo);
-        // Update peer clock.
-        {
-            let mut s = self.state.lock();
-            s.observe_peer(from, ack.src_clock);
+        let Some(ack_node) = node_from_u32(ack.ack_node) else {
+            warn!(node = ack.ack_node, "recovery ack has invalid ack_node");
+            return;
+        };
+        let Some(coord_node) = node_from_u32(ack.coord_node) else {
+            warn!(node = ack.coord_node, "recovery ack has invalid coord_node");
+            return;
+        };
+        if ack_node != from {
+            warn!(from, ack_node, "recovery ack origin mismatch");
+            return;
         }
 
         // Decide whether quorum is now reached.
@@ -1700,11 +1897,20 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let Some(rec) = recoveries.get_mut(&op_id) else {
                 return;
             };
-            if ack.ballot != rec.ballot {
-                return; // stale ack from a previous attempt
+            if ack.ballot != rec.ballot
+                || coord_node != rec.coord_node
+                || !rec.target_set.contains(&ack_node)
+                || rec.invalid_targets.contains(&ack_node)
+                || rec.target_epochs.get(&ack_node).copied().unwrap_or(0) != ack.ack_boot_epoch
+            {
+                trace!(
+                    from,
+                    coord_node, "recovery ack ignored: does not match frozen recovery"
+                );
+                return;
             }
             rec.prepare_acks.insert(
-                from,
+                ack_node,
                 RecoveryPrepareAck {
                     promised: ack.promised,
                     has_committed: ack.has_committed,
@@ -1714,6 +1920,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     op_msgpack: ack.op_msgpack,
                 },
             );
+            self.state.lock().observe_peer(from, ack.src_clock);
             let rq = recovery_quorum_size(rec.target_set.len());
             if rec.prepare_acks.len() < rq {
                 return;
@@ -1984,6 +2191,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let mut prepare_acks = HashMap::new();
             prepare_acks.insert(self.self_id, self_ack);
             let target_set = alive_with_self.clone();
+            let target_epochs = self.snapshot_target_epochs(&target_set);
             {
                 let mut recoveries = self.recoveries.lock();
                 recoveries.insert(
@@ -1993,6 +2201,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                         ballot,
                         started_at: Instant::now(),
                         target_set: target_set.clone(),
+                        target_epochs,
+                        invalid_targets: Default::default(),
                         prepare_acks,
                     },
                 );
@@ -2056,6 +2266,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 ts_local: self_ack.ts_local,
                 op_msgpack: self_ack.op_msgpack.clone(),
                 src_clock: 0,
+                ack_boot_epoch: self.boot_epoch,
             }
         };
         // The ack handler will re-insert (idempotent), see quorum, decide.
@@ -2067,17 +2278,30 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// longer reach fast-quorum, and initiates slow-path recovery for any
     /// pending Propose whose coord just died.
     pub fn on_membership_change(&self, ev: &MembershipEvent) {
+        let transition = self.state.lock().apply_membership_event(ev);
+        if transition == MembershipTransition::Ignored {
+            trace!(event = ?ev, "ignored stale or duplicate strict membership event");
+            return;
+        }
         // If a coord died (Failed or Left), we may need to take over
         // recovery for any of its in-flight Proposes we hold.
-        let failed_coord = match ev {
-            MembershipEvent::Failed(n) | MembershipEvent::Left(n) => Some(*n),
-            _ => None,
+        let member = match ev {
+            MembershipEvent::Joined(member)
+            | MembershipEvent::Failed(member)
+            | MembershipEvent::Left(member)
+            | MembershipEvent::Restarted(member) => member,
         };
+        let failed_coord = matches!(
+            transition,
+            MembershipTransition::Removed | MembershipTransition::Restarted
+        )
+        .then_some(member.node_id());
         let peer_removed = matches!(
-            ev,
-            MembershipEvent::Failed(_) | MembershipEvent::Left(_) | MembershipEvent::Restarted(_)
+            transition,
+            MembershipTransition::Removed | MembershipTransition::Restarted
         );
         if peer_removed {
+            let node = member.node_id();
             let alive_set: HashSet<NodeIdentifier> = self
                 .net
                 .alive_members()
@@ -2086,8 +2310,25 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 .collect();
             let wakers = {
                 let mut s = self.state.lock();
+                s.peer_clocks.remove(&node);
+                for proposal in s.proposals.values_mut() {
+                    proposal.acks.remove(&node);
+                    if transition == MembershipTransition::Restarted
+                        && proposal.target_set.contains(&node)
+                    {
+                        proposal.invalid_targets.insert(node);
+                    }
+                }
                 s.fail_quorum_lost(&alive_set)
             };
+            for recovery in self.recoveries.lock().values_mut() {
+                recovery.prepare_acks.remove(&node);
+                if transition == MembershipTransition::Restarted
+                    && recovery.target_set.contains(&node)
+                {
+                    recovery.invalid_targets.insert(node);
+                }
+            }
             for (op_id, w) in wakers {
                 warn!(
                     topic = %self.topic,
@@ -2118,8 +2359,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // divergent strict histories, so the merged cluster must converge on
         // one rank before normal traffic resumes.
         let peer_added = matches!(
-            ev,
-            MembershipEvent::Joined(_) | MembershipEvent::Restarted(_),
+            transition,
+            MembershipTransition::Joined | MembershipTransition::Restarted
         );
         if peer_added {
             self.state.lock().request_history_election();
@@ -2169,6 +2410,16 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
 
     fn shutdown(&self) {
         self.shutdown.cancel();
+        self.propose_semaphore.close();
+        let proposals = {
+            let mut state = self.state.lock();
+            std::mem::take(&mut state.proposals)
+        };
+        for (_, mut proposal) in proposals {
+            if let Some(waker) = proposal.waker.take() {
+                let _ = waker.send(Err(ReplicationError::Shutdown));
+            }
+        }
     }
 }
 
@@ -2826,11 +3077,9 @@ async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntim
     if peers.is_empty() {
         return;
     }
-    let dst = {
-        let mut rng = rand::rng();
-        peers.shuffle(&mut rng);
-        peers[0]
-    };
+    peers.sort_unstable();
+    let cursor = rt.steady_catchup_cursor.fetch_add(1, Ordering::Relaxed) as usize;
+    let dst = peers[cursor % peers.len()];
     let req = StrictCatchupReq {
         src_node: rt.self_id as u32,
         since_version: rt.repo.current_version(),
@@ -3188,6 +3437,8 @@ mod tests {
         s.proposals.insert(
             op_id,
             Proposal {
+                target_epochs: HashMap::new(),
+                invalid_targets: HashSet::new(),
                 op_msgpack: Bytes::new(),
                 ts_propose: 1,
                 acks: HashMap::new(),
@@ -3220,6 +3471,8 @@ mod tests {
         s.proposals.insert(
             op_id,
             Proposal {
+                target_epochs: HashMap::new(),
+                invalid_targets: HashSet::new(),
                 op_msgpack: Bytes::new(),
                 ts_propose: 1,
                 acks: HashMap::new(),
@@ -3248,6 +3501,8 @@ mod tests {
         s.proposals.insert(
             op_id,
             Proposal {
+                target_epochs: HashMap::new(),
+                invalid_targets: HashSet::new(),
                 op_msgpack: Bytes::new(),
                 ts_propose: 1,
                 acks: HashMap::from([(10, 1), (30, 2)]),
@@ -3283,6 +3538,8 @@ mod tests {
         s.proposals.insert(
             op_id,
             Proposal {
+                target_epochs: HashMap::new(),
+                invalid_targets: HashSet::new(),
                 op_msgpack: Bytes::new(),
                 ts_propose: 1,
                 acks: HashMap::new(),
@@ -3389,6 +3646,19 @@ mod tests {
 
         s.record_pending_propose((1, 1), 10, Bytes::from_static(b"op"), 1, Instant::now());
         assert!(!s.can_bootstrap_catchup());
+    }
+
+    #[test]
+    fn committed_recovery_promise_does_not_permanently_fence_history_election() {
+        let mut s = StrictState::new();
+        let op_id = (1, 1);
+        s.recovery_promises.insert(op_id, 7);
+        assert!(!s.can_bootstrap_catchup());
+
+        assert!(s.mark_committed(op_id, 10));
+
+        assert!(s.can_bootstrap_catchup());
+        assert_eq!(s.recovery_promises[&op_id], 7);
     }
 
     #[tokio::test]
@@ -3656,7 +3926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_catchup_followup_targets_reliably_routable_peer() {
+    async fn strict_catchup_followup_does_not_transfer_token_to_another_peer() {
         let net = MockNet::new(1, vec![1, 2, 3]);
         net.set_reliable_routes([3]);
         let repo = CountingStrictRepo::new();
@@ -3694,17 +3964,10 @@ mod tests {
         )
         .await;
 
-        let captures = net.drain_captures();
-        assert_eq!(captures.len(), 1);
-        match &captures[0] {
-            crate::replications::test_support::CapturedFrame::StrictUnicast {
-                dst, body, ..
-            } => {
-                assert_eq!(*dst, 3);
-                assert!(matches!(body, StrictBody::CatchupReq(_)));
-            }
-            other => panic!("unexpected capture: {other:?}"),
-        }
+        assert!(
+            net.drain_captures().is_empty(),
+            "a continuation token is only valid with the peer that issued it"
+        );
     }
 
     #[test]
@@ -4078,6 +4341,420 @@ mod tests {
         .await;
 
         assert_eq!(repo.log(), vec![(1, 201), (2, 202)]);
+        assert!(rt.state.lock().history_election_pending());
+    }
+
+    #[tokio::test]
+    async fn restarted_coordinator_invalidates_old_state_and_starts_recovery() {
+        use crate::overlay::MemberIncarnation;
+        use crate::replications::test_support::CapturedFrame;
+
+        let net = MockNet::new(1, vec![1, 2]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            3,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let old_op = make_op_id(2, 7, 1);
+        {
+            let mut state = rt.state.lock();
+            state.peer_clocks.insert(2, 99);
+            state.record_pending_propose(
+                old_op,
+                2,
+                Bytes::from(rmp_serde::to_vec(&42u64).unwrap()),
+                12,
+                Instant::now(),
+            );
+        }
+
+        rt.on_membership_change(&MembershipEvent::Restarted(MemberIncarnation::new(2, 8)));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if net.captures().iter().any(|capture| {
+                    matches!(
+                        capture,
+                        CapturedFrame::StrictMulticast {
+                            body: StrictBody::RecoveryReq(req),
+                            ..
+                        } if (req.op_id_hi, req.op_id_lo) == old_op
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restart should start recovery for the old incarnation");
+
+        let state = rt.state.lock();
+        assert!(!state.peer_clocks.contains_key(&2));
+        assert!(state.pending_proposes.contains_key(&old_op));
+        assert!(state.history_election_pending());
+    }
+
+    #[test]
+    fn membership_incarnation_fence_rejects_duplicate_and_stale_events() {
+        use crate::overlay::MemberIncarnation;
+
+        let mut state = StrictState::new();
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Joined(MemberIncarnation::new(2, 7))),
+            MembershipTransition::Joined
+        );
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Joined(MemberIncarnation::new(2, 7))),
+            MembershipTransition::Ignored
+        );
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Restarted(MemberIncarnation::new(2, 8))),
+            MembershipTransition::Restarted
+        );
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Failed(MemberIncarnation::new(2, 7))),
+            MembershipTransition::Ignored,
+            "a delayed failure from the prior process must not remove the new one"
+        );
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Failed(MemberIncarnation::new(2, 8))),
+            MembershipTransition::Removed
+        );
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Restarted(MemberIncarnation::new(2, 8))),
+            MembershipTransition::Ignored,
+            "a duplicate restart must not resurrect a removed incarnation"
+        );
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Joined(MemberIncarnation::new(2, 8))),
+            MembershipTransition::Joined,
+            "an explicit same-incarnation join is a valid partition heal"
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_ack_requires_physical_sender_to_match_frozen_target_identity() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let op_id = (1, 9);
+        let permit = rt.propose_semaphore.clone().acquire_owned().await.unwrap();
+        rt.state.lock().proposals.insert(
+            op_id,
+            Proposal {
+                target_epochs: HashMap::new(),
+                invalid_targets: HashSet::new(),
+                op_msgpack: Bytes::from_static(b"op"),
+                ts_propose: 1,
+                acks: HashMap::new(),
+                target_set: HashSet::from([1, 2]),
+                accepted_waker: None,
+                waker: None,
+                committed: false,
+                started_at: Instant::now(),
+                _permit: permit,
+            },
+        );
+
+        rt.recv_propose_ack(
+            3,
+            StrictProposeAck {
+                ack_boot_epoch: 0,
+                ack_node: 2,
+                coord_node: 1,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ts_local: 2,
+                src_clock: 2,
+            },
+        )
+        .await;
+
+        let state = rt.state.lock();
+        assert!(state.proposals[&op_id].acks.is_empty());
+        assert!(!state.peer_clocks.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn target_restart_rejects_stale_ack_but_preserves_possible_proposal_quorum() {
+        use crate::overlay::MemberIncarnation;
+
+        let net = MockNet::new(1, vec![1, 2, 3, 4]);
+        net.set_epoch(2, 8);
+        net.set_epoch(3, 3);
+        net.set_epoch(4, 4);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let op_id = (1, 10);
+        let permit = rt.propose_semaphore.clone().acquire_owned().await.unwrap();
+        rt.state.lock().proposals.insert(
+            op_id,
+            Proposal {
+                op_msgpack: Bytes::from_static(b"op"),
+                ts_propose: 1,
+                acks: HashMap::from([(1, 1), (3, 3)]),
+                target_set: HashSet::from([1, 2, 3, 4]),
+                target_epochs: HashMap::from([(1, 1), (2, 7), (3, 3), (4, 4)]),
+                invalid_targets: HashSet::new(),
+                accepted_waker: None,
+                waker: None,
+                committed: false,
+                started_at: Instant::now(),
+                _permit: permit,
+            },
+        );
+
+        rt.on_membership_change(&MembershipEvent::Restarted(MemberIncarnation::new(2, 8)));
+        {
+            let state = rt.state.lock();
+            let proposal = state
+                .proposals
+                .get(&op_id)
+                .expect("quorum remains possible");
+            assert!(proposal.invalid_targets.contains(&2));
+        }
+
+        rt.recv_propose_ack(
+            2,
+            StrictProposeAck {
+                ack_node: 2,
+                coord_node: 1,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ts_local: 8,
+                src_clock: 8,
+                ack_boot_epoch: 7,
+            },
+        )
+        .await;
+        assert!(!rt.state.lock().proposals[&op_id].acks.contains_key(&2));
+
+        rt.recv_propose_ack(
+            4,
+            StrictProposeAck {
+                ack_node: 4,
+                coord_node: 1,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ts_local: 4,
+                src_clock: 4,
+                ack_boot_epoch: 4,
+            },
+        )
+        .await;
+        assert!(rt.state.lock().proposals[&op_id].committed);
+    }
+
+    #[tokio::test]
+    async fn recovery_ack_requires_physical_sender_and_frozen_recovery_target() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let op_id = (2, 9);
+        rt.recoveries.lock().insert(
+            op_id,
+            Recovery {
+                target_epochs: HashMap::new(),
+                invalid_targets: HashSet::new(),
+                coord_node: 2,
+                ballot: 11,
+                started_at: Instant::now(),
+                target_set: HashSet::from([1, 2]),
+                prepare_acks: HashMap::new(),
+            },
+        );
+
+        rt.recv_recovery_ack(
+            3,
+            StrictRecoveryAck {
+                ack_boot_epoch: 0,
+                ack_node: 2,
+                ballot: 11,
+                coord_node: 2,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                promised: true,
+                has_committed: false,
+                committed_ts_final: 0,
+                has_op: true,
+                ts_local: 4,
+                op_msgpack: Bytes::from_static(b"op"),
+                src_clock: 4,
+            },
+        )
+        .await;
+
+        rt.recv_recovery_ack(
+            3,
+            StrictRecoveryAck {
+                ack_boot_epoch: 0,
+                ack_node: 3,
+                ballot: 11,
+                coord_node: 2,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                promised: true,
+                has_committed: false,
+                committed_ts_final: 0,
+                has_op: true,
+                ts_local: 4,
+                op_msgpack: Bytes::from_static(b"op"),
+                src_clock: 4,
+            },
+        )
+        .await;
+
+        assert!(rt.recoveries.lock()[&op_id].prepare_acks.is_empty());
+        assert!(!rt.state.lock().peer_clocks.contains_key(&3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_stale_recovery_acks_cannot_enter_frozen_quorum() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let op_id = (2, 12);
+        rt.recoveries.lock().insert(
+            op_id,
+            Recovery {
+                coord_node: 2,
+                ballot: 13,
+                started_at: Instant::now(),
+                target_set: HashSet::from([1, 2, 3]),
+                target_epochs: HashMap::from([(1, 1), (2, 8), (3, 3)]),
+                invalid_targets: HashSet::new(),
+                prepare_acks: HashMap::new(),
+            },
+        );
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let rt = rt.clone();
+            tasks.push(tokio::spawn(async move {
+                rt.recv_recovery_ack(
+                    2,
+                    StrictRecoveryAck {
+                        ack_node: 2,
+                        ballot: 13,
+                        coord_node: 2,
+                        op_id_hi: op_id.0,
+                        op_id_lo: op_id.1,
+                        promised: true,
+                        has_committed: false,
+                        committed_ts_final: 0,
+                        has_op: true,
+                        ts_local: 4,
+                        op_msgpack: Bytes::from_static(b"old"),
+                        src_clock: 4,
+                        ack_boot_epoch: 7,
+                    },
+                )
+                .await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert!(rt.recoveries.lock()[&op_id].prepare_acks.is_empty());
+        assert!(!rt.state.lock().peer_clocks.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn ordinary_commit_cancels_matching_active_recovery() {
+        let net = MockNet::new(1, vec![1, 2]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let op_id = (2, 11);
+        rt.recoveries.lock().insert(
+            op_id,
+            Recovery {
+                coord_node: 2,
+                ballot: 12,
+                started_at: Instant::now(),
+                target_set: HashSet::from([1, 2]),
+                target_epochs: HashMap::from([(1, 1), (2, 2)]),
+                invalid_targets: HashSet::new(),
+                prepare_acks: HashMap::new(),
+            },
+        );
+
+        rt.recv_commit(
+            2,
+            StrictCommit {
+                coord_node: 2,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ts_final: 9,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&42u64).unwrap()),
+                src_clock: 9,
+            },
+        )
+        .await;
+
+        assert!(!rt.recoveries.lock().contains_key(&op_id));
+        assert!(rt.state.lock().committed_ids.contains(&op_id));
+    }
+
+    #[tokio::test]
+    async fn equal_version_metadata_divergence_rearms_validated_history_election() {
+        let net = MockNet::new(1, vec![1, 2]);
+        let repo = CountingStrictRepo::new();
+        repo.state.lock().0 = 4;
+        let rt = StrictRuntime::new(
+            repo,
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.state.lock().finish_history_election();
+
+        rt.recv_catchup_resp(2, strict_probe_resp(2, 4, 99, 2))
+            .await;
+
         assert!(rt.state.lock().history_election_pending());
     }
 

@@ -5,6 +5,7 @@ param(
     [int]$SeedCount = 2,
     [int]$ClientPortBase = 20000,
     [int]$StatusPortBase = 21000,
+    [switch]$PreReleaseWorkload,
     [switch]$Force
 )
 
@@ -33,11 +34,17 @@ if (-not ("System.Security.Cryptography.PemEncoding" -as [type])) {
 $scriptDir = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\.."))
 if (-not $BinaryPath) {
-    $BinaryPath = Join-Path $repoRoot "target\x86_64-unknown-linux-musl\debug\shitspeak-rs"
+    $targetRoot = if ($PreReleaseWorkload) { "target\pre-release-workload" } else { "target" }
+    $BinaryPath = Join-Path $repoRoot "$targetRoot\x86_64-unknown-linux-musl\debug\shitspeak-rs"
 }
 $BinaryPath = [System.IO.Path]::GetFullPath($BinaryPath)
 if (-not (Test-Path -LiteralPath $BinaryPath)) {
-    throw "Linux musl binary not found at $BinaryPath. Build it first, for example: cross build --target=x86_64-unknown-linux-musl"
+    $example = if ($PreReleaseWorkload) {
+        "cross build --target=x86_64-unknown-linux-musl --target-dir target/pre-release-workload --features pre-release-workload"
+    } else {
+        "cross build --target=x86_64-unknown-linux-musl"
+    }
+    throw "Linux musl binary not found at $BinaryPath. Build it first, for example: $example"
 }
 
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
@@ -452,6 +459,7 @@ function Write-ComposeFile {
         [void]$sb.AppendLine("    restart: unless-stopped")
         [void]$sb.AppendLine("    stop_signal: SIGINT")
         [void]$sb.AppendLine("    cap_add:")
+        [void]$sb.AppendLine("      - NET_ADMIN")
         [void]$sb.AppendLine("      - PERFMON")
         [void]$sb.AppendLine("      - SYS_PTRACE")
         [void]$sb.AppendLine("    security_opt:")
@@ -459,6 +467,11 @@ function Write-ComposeFile {
         [void]$sb.AppendLine("    working_dir: /app")
         [void]$sb.AppendLine("    environment:")
         [void]$sb.AppendLine("      RUST_LOG: shitspeak_rs=debug")
+        if ($PreReleaseWorkload) {
+            [void]$sb.AppendLine("      SHITSPEAK_PRE_RELEASE_ARTIFACT_PATH: /app/data/pre-release-workload.json")
+            [void]$sb.AppendLine("      SHITSPEAK_PRE_RELEASE_SEED: `${SHITSPEAK_PRE_RELEASE_SEED:-1}")
+            [void]$sb.AppendLine("      SHITSPEAK_PRE_RELEASE_LEGACY_AFTER_SECONDS: `${SHITSPEAK_PRE_RELEASE_LEGACY_AFTER_SECONDS:-450}")
+        }
         [void]$sb.AppendLine("    ports:")
         [void]$sb.AppendLine("      - `"${clientPort}:64738/tcp`"")
         [void]$sb.AppendLine("      - `"${clientPort}:64738/udp`"")
@@ -498,7 +511,7 @@ FROM alpine:3.20
 
 RUN addgroup -S shitspeak \
     && adduser -S -G shitspeak -h /app shitspeak \
-    && apk add --no-cache ca-certificates \
+    && apk add --no-cache ca-certificates iproute2 \
     && mkdir -p /app/data /app/s2s-state \
     && chown -R shitspeak:shitspeak /app
 
@@ -508,7 +521,7 @@ RUN chmod 755 /usr/local/bin/shitspeak-rs
 USER shitspeak
 WORKDIR /app
 
-EXPOSE 64738/tcp 64738/udp 64739/tcp 64740/udp 64741/tcp 64742/udp 64750/tcp
+EXPOSE 64738/tcp 64738/udp 64739/tcp 64740/udp 64741/udp 64742/udp 64750/tcp
 
 ENTRYPOINT ["/usr/local/bin/shitspeak-rs"]
 '@

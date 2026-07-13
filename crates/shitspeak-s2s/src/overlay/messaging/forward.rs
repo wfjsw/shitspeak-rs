@@ -365,6 +365,7 @@ pub(crate) async fn originate_tree(
     process_on_transit: bool,
     options: OverlaySendOptions,
 ) -> Result<(), OverlayError> {
+    let uses_hop_local_ttl = tree.hop_ttl().is_some();
     let data = pb::OverlayData {
         src: node_to_wire(self_id),
         dsts: vec![],
@@ -390,16 +391,16 @@ pub(crate) async fn originate_tree(
         distribution_deadline_unix_ms: None,
         distribution_repair: false,
         distribution_repair_target: None,
-        distribution_deadline_issuer: Some(node_to_wire(self_id)),
-        distribution_deadline_unix_us: Some(
+        distribution_deadline_issuer: (!uses_hop_local_ttl).then_some(node_to_wire(self_id)),
+        distribution_deadline_unix_us: (!uses_hop_local_ttl).then(|| {
             unix_time_us().saturating_add(
                 options
                     .transport_ttl()
                     .unwrap_or(VOICE_TRANSPORT_TTL)
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64,
-            ),
-        ),
+            )
+        }),
     };
     forward_tree_data(
         transport,
@@ -445,48 +446,55 @@ pub(crate) async fn handle_inbound_with_distribution(
         &data,
         crate::overlay::distribution_metrics::EdgeDirection::Inbound,
     );
-    let (remaining_deadline, translated_v2) = match inbound_distribution_deadline(
-        &mut data, monitor, self_id, from,
-    ) {
-        Ok(result) => result,
-        Err(DistributionDeadlineError::Expired) => {
-            if let Some(context) = metric_context {
-                crate::overlay::distribution_metrics::record_deadline_translation_with_context(
-                    context, "expired",
-                );
-                crate::overlay::distribution_metrics::record_deadline_expiry_with_context(
-                    context, "expired",
-                );
+    let uses_wall_clock_deadline = data.distribution_deadline_unix_ms.is_some()
+        || data.distribution_deadline_unix_us.is_some()
+        || data.distribution_deadline_issuer.is_some();
+    let (remaining_deadline, translated_v2) = if uses_wall_clock_deadline {
+        match inbound_distribution_deadline(&mut data, monitor, self_id, from) {
+            Ok(result) => result,
+            Err(DistributionDeadlineError::Expired) => {
+                if let Some(context) = metric_context {
+                    crate::overlay::distribution_metrics::record_deadline_translation_with_context(
+                        context, "expired",
+                    );
+                    crate::overlay::distribution_metrics::record_deadline_expiry_with_context(
+                        context, "expired",
+                    );
+                }
+                report_deadline_failure(distribution, &data, self_id);
+                tracing::debug!(profile, %from, "dropping expired distribution frame");
+                return;
             }
-            report_deadline_failure(distribution, &data, self_id);
-            tracing::debug!(profile, %from, "dropping expired distribution frame");
-            return;
-        }
-        Err(DistributionDeadlineError::MissingOffset) => {
-            if let Some(context) = metric_context {
-                crate::overlay::distribution_metrics::record_deadline_translation_with_context(
-                    context,
-                    "missing_offset",
-                );
-                crate::overlay::distribution_metrics::record_clock_offset_fallback_with_context(
-                    context,
-                    "child_clock_unready",
-                );
+            Err(DistributionDeadlineError::MissingOffset) => {
+                if let Some(context) = metric_context {
+                    crate::overlay::distribution_metrics::record_deadline_translation_with_context(
+                        context,
+                        "missing_offset",
+                    );
+                    crate::overlay::distribution_metrics::record_clock_offset_fallback_with_context(
+                        context,
+                        "child_clock_unready",
+                    );
+                }
+                report_deadline_failure(distribution, &data, self_id);
+                tracing::debug!(profile, %from, "dropping distribution frame without fresh direct-peer clock offset");
+                return;
             }
-            report_deadline_failure(distribution, &data, self_id);
-            tracing::debug!(profile, %from, "dropping distribution frame without fresh direct-peer clock offset");
-            return;
-        }
-        Err(DistributionDeadlineError::IssuerMismatch) => {
-            if let Some(context) = metric_context {
-                crate::overlay::distribution_metrics::record_deadline_translation_with_context(
-                    context,
-                    "issuer_mismatch",
-                );
+            Err(DistributionDeadlineError::IssuerMismatch) => {
+                if let Some(context) = metric_context {
+                    crate::overlay::distribution_metrics::record_deadline_translation_with_context(
+                        context,
+                        "issuer_mismatch",
+                    );
+                }
+                tracing::debug!(profile, %from, "dropping distribution frame with a non-direct deadline issuer");
+                return;
             }
-            tracing::debug!(profile, %from, "dropping distribution frame with a non-direct deadline issuer");
-            return;
         }
+    } else {
+        // Version 3 expiry is created locally when each adjacent tree edge is
+        // enqueued. It does not consult or carry a wall clock.
+        (VOICE_TRANSPORT_TTL, false)
     };
     if translated_v2 {
         if let Some(context) = metric_context {
@@ -1133,6 +1141,7 @@ async fn send_control_to(
     let packet_kind = crate::debug_io::classify_overlay_body(&body);
     let payload = encode_message(&wrap(body))?;
     let payload_len = payload.len();
+    crate::debug_io::record_send_attempt(self_id, next_hop, packet_kind.clone());
     let result = transport
         .try_send(
             next_hop,
@@ -1330,6 +1339,7 @@ async fn forward_pb_as(
         let payload_len = payload.len();
         let transport = transport.clone();
         sends.push(Box::pin(async move {
+            crate::debug_io::record_send_attempt(self_id, next_hop, packet_kind.clone());
             let result = transport
                 .try_send_with_options(
                     next_hop,
@@ -1367,6 +1377,176 @@ async fn forward_pb_as(
     Ok(())
 }
 
+#[derive(Debug)]
+enum TreeEdgeSendOutcome {
+    Sent,
+    NoRoute,
+    Loop,
+    Backpressure(SendError),
+    Transport(SendError),
+}
+
+impl TreeEdgeSendOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::NoRoute => "no_route",
+            Self::Loop => "loop",
+            Self::Backpressure(_) => "backpressure",
+            Self::Transport(_) => "transport",
+        }
+    }
+
+    fn into_error(self, child: NodeIdentifier, level: ServiceLevel) -> Option<OverlayError> {
+        match self {
+            Self::Sent => None,
+            Self::NoRoute | Self::Loop => Some(OverlayError::NoRoute { dst: child, level }),
+            Self::Backpressure(error) | Self::Transport(error) => Some(OverlayError::Send(error)),
+        }
+    }
+}
+
+async fn send_direct_tree_edge(
+    transport: &ConnectionManager,
+    self_id: NodeIdentifier,
+    child: NodeIdentifier,
+    data: &pb::OverlayData,
+    path_trace: Vec<u32>,
+    transport_class: MessageClass,
+    hop_ttl: Duration,
+) -> TreeEdgeSendOutcome {
+    if path_trace_set(&path_trace).contains(&child) {
+        return TreeEdgeSendOutcome::Loop;
+    }
+    let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
+    let routing_metric = route_metric_from_wire(data.route_metric, level)
+        .unwrap_or_else(|| RoutingMetric::default_for_level(level));
+    let pb_msg = reconstruct_forwarded_data(data, vec![node_to_wire(child)], path_trace);
+    let body = OverlayBody::Data(pb_msg);
+    let packet_kind = crate::debug_io::classify_overlay_body(&body);
+    let payload = match encode_message(&wrap(body)) {
+        Ok(payload) => payload,
+        Err(error) => return TreeEdgeSendOutcome::Transport(SendError::Encode(error)),
+    };
+    let payload_len = payload.len();
+    // `expire_after` captures a fresh monotonic Instant here, independently
+    // for this physical tree edge. No wall-clock translation is involved.
+    let options = transport_options_for_overlay_data(data, Some(hop_ttl));
+    crate::debug_io::record_send_attempt(self_id, child, packet_kind.clone());
+    match transport
+        .try_send_with_options(
+            child,
+            level,
+            Some(routing_metric),
+            transport_class,
+            payload,
+            options,
+        )
+        .await
+    {
+        Ok(()) => {
+            crate::debug_io::record_sent(self_id, child, packet_kind, payload_len);
+            TreeEdgeSendOutcome::Sent
+        }
+        Err(SendError::UnknownNode { .. } | SendError::NoSuitableTransport { .. }) => {
+            TreeEdgeSendOutcome::NoRoute
+        }
+        Err(error @ SendError::Backpressure { .. }) => TreeEdgeSendOutcome::Backpressure(error),
+        Err(error) => TreeEdgeSendOutcome::Transport(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_tree_data_v3(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    self_id: NodeIdentifier,
+    data: pb::OverlayData,
+    tree: &TreeState,
+    transport_class: MessageClass,
+    hop_ttl: Duration,
+) -> Result<(), OverlayError> {
+    let profile = data.distribution_profile.unwrap_or_default();
+    let is_repair = data.distribution_repair;
+    let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
+    let mut path_trace = data.path_trace.clone();
+    append_path_trace(&mut path_trace, self_id);
+    let mut sends = Vec::new();
+    for child in tree.children(self_id).iter().copied() {
+        let edge_data = &data;
+        let edge_path_trace = path_trace.clone();
+        sends.push(async move {
+            let outcome = send_direct_tree_edge(
+                transport,
+                self_id,
+                child,
+                edge_data,
+                edge_path_trace,
+                transport_class,
+                hop_ttl,
+            )
+            .await;
+            (child, outcome)
+        });
+    }
+
+    let mut first_err = None;
+    for (child, outcome) in join_all(sends).await {
+        let outcome_label = outcome.label();
+        crate::overlay::distribution_metrics::record_edge_forward(profile, outcome_label);
+        if matches!(&outcome, TreeEdgeSendOutcome::Sent) {
+            if let Some(key) = tree_key_from_data(&data) {
+                distribution.record_edge_success(key, self_id, child);
+            }
+            if is_repair {
+                crate::overlay::distribution_metrics::record_alternate_forward(profile);
+            } else {
+                crate::overlay::distribution_metrics::record_original_forward(profile);
+            }
+            trace!(parent = %self_id, %child, outcome = outcome_label, "sent direct distribution tree edge");
+            continue;
+        }
+
+        debug!(
+            parent = %self_id,
+            %child,
+            profile,
+            repair = is_repair,
+            outcome = outcome_label,
+            "direct distribution tree edge failed"
+        );
+        if let Some(key) = tree_key_from_data(&data) {
+            distribution.report_edge_failure(key, self_id, child);
+        }
+
+        let descendants = tree.descendant_members(child);
+        let fallback_result = if descendants.is_empty() {
+            outcome.into_error(child, level).map_or(Ok(()), Err)
+        } else {
+            let fallback = legacy_subtree_fallback_data(&data, descendants, path_trace.clone());
+            forward_pb_as(
+                transport,
+                routing,
+                self_id,
+                fallback,
+                transport_class,
+                false,
+                Some(hop_ttl),
+                None,
+            )
+            .await
+        };
+        if let Err(error) = fallback_result {
+            debug!(parent = %self_id, %child, %error, "distribution subtree fallback failed");
+            if first_err.is_none() {
+                first_err = Some(error);
+            }
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
 async fn forward_tree_data(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
@@ -1378,6 +1558,19 @@ async fn forward_tree_data(
     transport_class: MessageClass,
     transport_ttl: Option<std::time::Duration>,
 ) -> Result<(), OverlayError> {
+    if let Some(hop_ttl) = tree.hop_ttl() {
+        return forward_tree_data_v3(
+            transport,
+            routing,
+            distribution,
+            self_id,
+            data,
+            tree,
+            transport_class,
+            hop_ttl,
+        )
+        .await;
+    }
     let profile = data.distribution_profile.unwrap_or_default();
     let is_repair = data.distribution_repair;
     let metric_context = distribution_metric_context(
@@ -1474,6 +1667,11 @@ async fn forward_tree_data(
     }
     let mut first_err = None;
     for (child, result) in join_all(sends).await {
+        if result.is_ok() {
+            if let Some(key) = tree_key_from_data(&data) {
+                distribution.record_edge_success(key, self_id, child);
+            }
+        }
         if let Err(error) = result {
             tracing::debug!(
                 parent = %self_id,
@@ -1885,6 +2083,72 @@ mod tests {
         }
         routing.store(Arc::new(tables));
         routing
+    }
+
+    #[tokio::test]
+    async fn v3_tree_edge_sends_directly_to_the_adjacent_child() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let mut child_rx = receivers.pop().expect("child receiver");
+        let mut data = test_overlay_data(false);
+        data.dsts.clear();
+        data.distribution_profile = Some(1);
+
+        let outcome = send_direct_tree_edge(
+            &transport,
+            1,
+            2,
+            &data,
+            vec![node_to_wire(1)],
+            MessageClass::Regular,
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(matches!(outcome, TreeEdgeSendOutcome::Sent));
+        let forwarded = timeout(Duration::from_millis(50), child_rx.recv())
+            .await
+            .expect("direct child should receive promptly")
+            .expect("child stream should remain open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay frame");
+        let Some(OverlayBody::Data(forwarded)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(forwarded.dsts, vec![node_to_wire(2)]);
+    }
+
+    #[tokio::test]
+    async fn v3_tree_edge_reports_loop_before_transport_send() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let outcome = send_direct_tree_edge(
+            &transport,
+            1,
+            2,
+            &test_overlay_data(false),
+            vec![node_to_wire(1), node_to_wire(2)],
+            MessageClass::Regular,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(outcome, TreeEdgeSendOutcome::Loop));
+    }
+
+    #[tokio::test]
+    async fn v3_tree_edge_reports_missing_adjacent_peer_as_no_route() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 3, &[TransportKind::Tcp]);
+        let outcome = send_direct_tree_edge(
+            &transport,
+            1,
+            2,
+            &test_overlay_data(false),
+            vec![node_to_wire(1)],
+            MessageClass::Regular,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(outcome, TreeEdgeSendOutcome::NoRoute));
     }
 
     fn tables_with_direct_and_indirect_route() -> RoutingTables {

@@ -64,6 +64,8 @@ pub struct OverlayConfig {
     lsa_flood_max_batch_lsas: usize,
     lsa_refresh_reduction_enabled: bool,
     lsa_unchanged_refresh_interval: Duration,
+    lsa_metric_hold: Duration,
+    lsa_metric_min_emit_interval: Duration,
 
     // ── Anti-entropy ──
     anti_entropy_interval: Duration,
@@ -129,6 +131,8 @@ impl OverlayConfig {
             lsa_flood_max_batch_lsas: 4096,
             lsa_refresh_reduction_enabled: true,
             lsa_unchanged_refresh_interval: Duration::from_secs(90),
+            lsa_metric_hold: Duration::from_secs(5),
+            lsa_metric_min_emit_interval: Duration::from_secs(5),
 
             anti_entropy_interval: Duration::from_secs(60),
 
@@ -197,6 +201,12 @@ impl OverlayConfig {
     }
     pub fn lsa_unchanged_refresh_interval(&self) -> Duration {
         self.lsa_unchanged_refresh_interval
+    }
+    pub fn lsa_metric_hold(&self) -> Duration {
+        self.lsa_metric_hold
+    }
+    pub fn lsa_metric_min_emit_interval(&self) -> Duration {
+        self.lsa_metric_min_emit_interval
     }
     pub fn anti_entropy_interval(&self) -> Duration {
         self.anti_entropy_interval
@@ -326,6 +336,14 @@ impl OverlayConfig {
     }
     pub fn with_lsa_unchanged_refresh_interval(mut self, d: Duration) -> Self {
         self.lsa_unchanged_refresh_interval = d;
+        self
+    }
+    pub fn with_lsa_metric_hold(mut self, d: Duration) -> Self {
+        self.lsa_metric_hold = d;
+        self
+    }
+    pub fn with_lsa_metric_min_emit_interval(mut self, d: Duration) -> Self {
+        self.lsa_metric_min_emit_interval = d;
         self
     }
     pub fn with_anti_entropy_interval(mut self, d: Duration) -> Self {

@@ -73,6 +73,7 @@ impl DirectionCounters {
 
 #[derive(Default)]
 struct PacketCounter {
+    send_attempts: AtomicU64,
     sent: DirectionCounters,
     recv: DirectionCounters,
 }
@@ -118,6 +119,16 @@ impl PacketCounters {
     ) {
         let counter = self.counter_for(PacketKey::new(source, destination, kind));
         counter.sent.record(bytes);
+    }
+
+    fn record_send_attempt(
+        &self,
+        source: NodeIdentifier,
+        destination: NodeIdentifier,
+        kind: PacketKind,
+    ) {
+        let counter = self.counter_for(PacketKey::new(source, destination, kind));
+        counter.send_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_received(
@@ -184,6 +195,7 @@ pub struct PacketIoSnapshot {
     recv_bytes: u64,
     total_bytes: u64,
     sent_count: u64,
+    send_attempt_count: u64,
     recv_count: u64,
     total_count: u64,
     avg_sent_bps: f64,
@@ -197,6 +209,7 @@ impl PacketIoSnapshot {
         let recv_bytes = counter.recv.bytes.load(Ordering::Relaxed);
         let total_bytes = sent_bytes.saturating_add(recv_bytes);
         let sent_count = counter.sent.count.load(Ordering::Relaxed);
+        let send_attempt_count = counter.send_attempts.load(Ordering::Relaxed);
         let recv_count = counter.recv.count.load(Ordering::Relaxed);
         let total_count = sent_count.saturating_add(recv_count);
         Self {
@@ -207,6 +220,7 @@ impl PacketIoSnapshot {
             recv_bytes,
             total_bytes,
             sent_count,
+            send_attempt_count,
             recv_count,
             total_count,
             avg_sent_bps: sent_bytes as f64 / elapsed_secs,
@@ -259,6 +273,10 @@ pub fn record_sent(
     bytes: usize,
 ) {
     COUNTERS.record_sent(source, destination, kind, bytes);
+}
+
+pub fn record_send_attempt(source: NodeIdentifier, destination: NodeIdentifier, kind: PacketKind) {
+    COUNTERS.record_send_attempt(source, destination, kind);
 }
 
 pub fn record_received(

@@ -104,6 +104,7 @@ impl PeerAddressSnapshot {
 /// Inbound message handed to the caller via one of the mpscs in
 /// [`Inbound`]. The caller owns the receivers; the manager keeps the senders.
 #[derive(Debug)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Clone))]
 pub struct InboundMessage {
     from: NodeIdentifier,
     level: ServiceLevel,
@@ -147,6 +148,18 @@ impl InboundMessage {
 
     pub fn payload(&self) -> &Bytes {
         &self.payload
+    }
+
+    /// Construct an inbound frame for deterministic transport/overlay tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(
+        from: NodeIdentifier,
+        level: ServiceLevel,
+        transport: TransportKind,
+        class: MessageClass,
+        payload: Bytes,
+    ) -> Self {
+        Self::new(from, level, transport, class, payload)
     }
 }
 
@@ -542,6 +555,34 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
+    /// Force a transport kind down for a peer in fault-injection tests.
+    /// Reconnection remains owned by the normal transport supervisor.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_drop_transport_kind(&self, node: NodeIdentifier, kind: TransportKind) -> bool {
+        let Some(peer) = self.inner.get_peer(node) else {
+            return false;
+        };
+        let was_live = peer.live_kinds().contains(&kind);
+        peer.drop_stream(kind);
+        was_live
+    }
+
+    /// Test hook for a peer transport's link state. Taking it down cancels
+    /// the current stream. Bringing it up observes whether the normal
+    /// supervisor has reconnected it using retained peer addresses.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_set_transport_kind_up(
+        &self,
+        node: NodeIdentifier,
+        kind: TransportKind,
+        up: bool,
+    ) -> bool {
+        if up {
+            return self.has_live_transport_kind(node, kind);
+        }
+        self.test_drop_transport_kind(node, kind)
+    }
+
     /// Bring up listeners, build TLS configs, install peer table, and return
     /// the handle along with the two inbound receivers.
     pub async fn start(cfg: TransportConfig) -> Result<(Self, Inbound), TransportError> {
