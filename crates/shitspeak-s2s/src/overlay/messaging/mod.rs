@@ -16,6 +16,7 @@ use shitspeak_s2s_transport::{ConnectionManager, MessageClass, ServiceLevel};
 
 use self::ordering::OverlayOrdering;
 use super::LaneId;
+use super::distribution::{DistributionPlane, TreeKey, TreeState};
 use super::error::OverlayError;
 use super::routing::{RoutingHandle, RoutingMetric};
 
@@ -550,6 +551,44 @@ pub(crate) async fn send_multicast_with_routing_metric_unordered_and_options(
         body,
         None,
         process_on_transit,
+        options,
+    )
+    .await
+}
+
+/// Send an unordered multicast using a source-rooted forwarding tree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_multicast_tree_unordered_with_routing_metric_and_options(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    tree: &TreeState,
+    key: TreeKey,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    options: OverlaySendOptions,
+) -> Result<(), OverlayError> {
+    forward::originate_tree(
+        transport,
+        routing,
+        distribution,
+        self_id,
+        boot_epoch,
+        ordering,
+        tree,
+        key,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        false,
         options,
     )
     .await

@@ -65,7 +65,21 @@ impl MemberSnapshot {
     }
 
     pub fn application_services(&self) -> ApplicationServices {
-        self.application_services
+        self.application_services.clone()
+    }
+
+    /// Whether this alive member can relay the requested generic
+    /// distribution-tree profile.
+    pub fn supports_distribution_profile(
+        &self,
+        required_protocol_version: u32,
+        profile_id: u32,
+    ) -> bool {
+        self.status.is_reachable()
+            && self
+                .application_services
+                .distribution()
+                .supports(required_protocol_version, profile_id)
     }
 
     /// Phase-1 compatibility: callers expect an "incarnation"; we map it
@@ -145,7 +159,7 @@ impl MembershipTable {
                 boot_epoch: e.boot_epoch,
                 max_users: e.max_users,
                 replication_services: e.replication_services,
-                application_services: e.application_services,
+                application_services: e.application_services.clone(),
             })
             .collect();
         out.sort_by_key(|m| m.node_id);
@@ -164,7 +178,7 @@ impl MembershipTable {
             boot_epoch: e.boot_epoch,
             max_users: e.max_users,
             replication_services: e.replication_services,
-            application_services: e.application_services,
+            application_services: e.application_services.clone(),
         })
     }
 

@@ -95,32 +95,121 @@ impl Default for ReplicationServices {
     }
 }
 
-/// Application service kinds advertised by one overlay member.
+/// Versioned-tree protocol support advertised by one overlay member.
 ///
-/// Missing fields on the wire default to enabled to keep rolling upgrades
-/// compatible with existing full S2S nodes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Unlike the older application-service flags, an absent capability field
+/// means unsupported. Sending a tree frame through an older relay would
+/// otherwise make it silently treat the frame as an empty-destination
+/// overlay message.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DistributionCapabilities {
+    protocol_version: u32,
+    profile_ids: Vec<u32>,
+}
+
+impl DistributionCapabilities {
+    pub const PROTOCOL_VERSION: u32 = 1;
+
+    pub const UNSUPPORTED: Self = Self {
+        protocol_version: 0,
+        profile_ids: Vec::new(),
+    };
+
+    pub const V1_EMPTY: Self = Self {
+        protocol_version: Self::PROTOCOL_VERSION,
+        profile_ids: Vec::new(),
+    };
+
+    pub fn v1(profile_ids: impl IntoIterator<Item = u32>) -> Self {
+        let mut profile_ids: Vec<_> = profile_ids.into_iter().filter(|id| *id != 0).collect();
+        profile_ids.sort_unstable();
+        profile_ids.dedup();
+        Self {
+            protocol_version: Self::PROTOCOL_VERSION,
+            profile_ids,
+        }
+    }
+
+    pub fn from_wire(protocol_version: u32, profile_ids: impl IntoIterator<Item = u32>) -> Self {
+        if protocol_version == 0 {
+            return Self::UNSUPPORTED;
+        }
+        let mut profile_ids: Vec<_> = profile_ids.into_iter().filter(|id| *id != 0).collect();
+        profile_ids.sort_unstable();
+        profile_ids.dedup();
+        Self {
+            protocol_version,
+            profile_ids,
+        }
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn profile_ids(&self) -> &[u32] {
+        &self.profile_ids
+    }
+
+    pub fn supports(&self, required_protocol_version: u32, profile_id: u32) -> bool {
+        self.protocol_version >= required_protocol_version
+            && profile_id != 0
+            && self.profile_ids.binary_search(&profile_id).is_ok()
+    }
+}
+
+/// Application service kinds advertised by one overlay member.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplicationServices {
     voice: bool,
+    distribution: DistributionCapabilities,
 }
 
 impl ApplicationServices {
-    pub const ALL: Self = Self { voice: true };
+    pub const ALL: Self = Self {
+        voice: true,
+        distribution: DistributionCapabilities::V1_EMPTY,
+    };
 
-    pub const NONE: Self = Self { voice: false };
+    pub const NONE: Self = Self {
+        voice: false,
+        distribution: DistributionCapabilities::V1_EMPTY,
+    };
 
     pub fn new(voice: bool) -> Self {
-        Self { voice }
+        if voice { Self::ALL } else { Self::NONE }
     }
 
-    pub fn voice(self) -> bool {
+    pub fn with_distribution_capabilities(
+        voice: bool,
+        distribution: DistributionCapabilities,
+    ) -> Self {
+        Self {
+            voice,
+            distribution,
+        }
+    }
+
+    pub fn all() -> Self {
+        Self::ALL
+    }
+
+    pub fn none() -> Self {
+        Self::NONE
+    }
+
+    pub fn voice(&self) -> bool {
         self.voice
+    }
+
+    pub fn distribution(&self) -> &DistributionCapabilities {
+        &self.distribution
     }
 }
 
 impl Default for ApplicationServices {
     fn default() -> Self {
-        Self::ALL
+        Self::all()
     }
 }
 
@@ -256,6 +345,27 @@ fn describe_lsa_entry_delta(previous: Option<&LsaEntry>, current: &LsaEntry) -> 
         previous.application_services.voice(),
         current.application_services.voice(),
     );
+    push_scalar_change(
+        &mut changes,
+        "distribution_protocol_version",
+        previous
+            .application_services
+            .distribution()
+            .protocol_version(),
+        current
+            .application_services
+            .distribution()
+            .protocol_version(),
+    );
+    if previous.application_services.distribution().profile_ids()
+        != current.application_services.distribution().profile_ids()
+    {
+        changes.push(format!(
+            "distribution_profiles {:?}->{:?}",
+            previous.application_services.distribution().profile_ids(),
+            current.application_services.distribution().profile_ids(),
+        ));
+    }
     describe_address_delta(&mut changes, &previous.addresses, &current.addresses);
     describe_link_delta(&mut changes, &previous.links, &current.links);
 
@@ -529,7 +639,13 @@ impl LsaEntry {
                 !pb.content_replication_disabled,
                 !pb.owner_replication_disabled,
             ),
-            application_services: ApplicationServices::new(!pb.voice_service_disabled),
+            application_services: ApplicationServices::with_distribution_capabilities(
+                !pb.voice_service_disabled,
+                DistributionCapabilities::from_wire(
+                    pb.distribution_protocol_version,
+                    pb.distribution_profile_ids.iter().copied(),
+                ),
+            ),
         })
     }
 
@@ -578,6 +694,15 @@ impl LsaEntry {
             content_replication_disabled: !self.replication_services.content(),
             owner_replication_disabled: !self.replication_services.owner(),
             voice_service_disabled: !self.application_services.voice(),
+            distribution_protocol_version: self
+                .application_services
+                .distribution()
+                .protocol_version(),
+            distribution_profile_ids: self
+                .application_services
+                .distribution()
+                .profile_ids()
+                .to_vec(),
         }
     }
 }
@@ -994,13 +1119,13 @@ impl LinkStateDb {
 
     fn active_origins_by_application_kind(
         &self,
-        enabled: impl Fn(ApplicationServices) -> bool,
+        enabled: impl Fn(&ApplicationServices) -> bool,
     ) -> Vec<NodeIdentifier> {
         let mut out: Vec<_> = self
             .inner
             .read()
             .values()
-            .filter(|e| !e.tombstone && enabled(e.application_services))
+            .filter(|e| !e.tombstone && enabled(&e.application_services))
             .map(|e| e.origin)
             .collect();
         out.sort();
@@ -1025,6 +1150,32 @@ impl LinkStateDb {
     /// Set of active origins that advertise application voice service.
     pub fn voice_origins(&self) -> Vec<NodeIdentifier> {
         self.active_origins_by_application_kind(ApplicationServices::voice)
+    }
+
+    /// Capability snapshot for one active overlay member.
+    pub fn distribution_capabilities(
+        &self,
+        node: NodeIdentifier,
+    ) -> Option<DistributionCapabilities> {
+        self.inner
+            .read()
+            .get(&node)
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| entry.application_services.distribution().clone())
+    }
+
+    /// Whether one active member supports the requested generic distribution
+    /// protocol version and profile. Older LSAs decode as unsupported.
+    pub fn supports_distribution_profile(
+        &self,
+        node: NodeIdentifier,
+        required_protocol_version: u32,
+        profile_id: u32,
+    ) -> bool {
+        self.distribution_capabilities(node)
+            .is_some_and(|capabilities| {
+                capabilities.supports(required_protocol_version, profile_id)
+            })
     }
 }
 
@@ -1188,6 +1339,45 @@ mod tests {
                 64,
             )]
         );
+    }
+
+    #[test]
+    fn distribution_capabilities_roundtrip_and_gate_member_support() {
+        let mut lsa = entry(1, 100, 1, false);
+        lsa.application_services = ApplicationServices::with_distribution_capabilities(
+            true,
+            DistributionCapabilities::v1([9, 3, 9]),
+        );
+
+        let pb = lsa.to_pb();
+        assert_eq!(pb.distribution_protocol_version, 1);
+        assert_eq!(pb.distribution_profile_ids, vec![3, 9]);
+
+        let roundtrip = LsaEntry::from_pb(&pb).unwrap();
+        assert!(roundtrip.application_services.distribution().supports(1, 3));
+        assert!(roundtrip.application_services.distribution().supports(1, 9));
+        assert!(!roundtrip.application_services.distribution().supports(1, 8));
+
+        let db = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
+        assert_eq!(db.admit(roundtrip), AdmissionResult::Accepted);
+        assert!(db.supports_distribution_profile(1, 1, 3));
+        assert!(!db.supports_distribution_profile(1, 1, 8));
+    }
+
+    #[test]
+    fn missing_distribution_fields_are_unsupported() {
+        let pb = pb::LinkStateAdvert {
+            origin: 1,
+            boot_epoch: 100,
+            seq: 1,
+            ..Default::default()
+        };
+        let lsa = LsaEntry::from_pb(&pb).unwrap();
+        assert_eq!(
+            lsa.application_services.distribution().protocol_version(),
+            0
+        );
+        assert!(!lsa.application_services.distribution().supports(1, 1));
     }
 
     #[test]

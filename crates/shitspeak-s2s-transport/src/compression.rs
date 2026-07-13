@@ -1183,6 +1183,8 @@ mod tests {
                     content_replication_disabled: false,
                     owner_replication_disabled: false,
                     voice_service_disabled: false,
+                    distribution_protocol_version: 0,
+                    distribution_profile_ids: Vec::new(),
                 })
                 .collect(),
         };

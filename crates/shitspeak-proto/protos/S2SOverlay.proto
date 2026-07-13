@@ -52,6 +52,12 @@ message LinkStateAdvert {
   bool content_replication_disabled = 11; // origin does not run content/blob replication
   bool owner_replication_disabled = 12;   // origin does not run owner-scoped replication
   bool voice_service_disabled = 13;       // origin does not run application voice service
+  // Zero means this node does not support versioned distribution trees.
+  // This deliberately defaults to unsupported for rolling-upgrade safety.
+  uint32 distribution_protocol_version = 14;
+  // Stable distribution profile IDs supported by this node's generic tree
+  // transport. Empty means no distribution profile is active here.
+  repeated uint32 distribution_profile_ids = 15;
 }
 
 // One advertised edge from `origin` to `neighbor`.
@@ -135,6 +141,76 @@ message OverlayData {
   uint64 origin_boot_epoch = 14;
   uint64 origin_message_id = 15;
   bool allow_l1_compression = 16;
+  // Present only for a frame sent through the versioned distribution-tree
+  // plane. Forwarders resolve the tree out of their locally acknowledged
+  // control-plane cache; no tree topology is carried with a voice frame.
+  optional uint32 distribution_profile = 17;
+  optional uint64 distribution_tree_version = 18;
+  optional uint64 distribution_group = 19;
+  optional uint64 distribution_topology_epoch = 20;
+  optional uint64 distribution_group_version = 21;
+  optional uint64 distribution_deadline_unix_ms = 22;
+  bool distribution_repair = 23;
+  optional uint32 distribution_repair_target = 24;
+}
+
+message OverlayTreeEdge {
+  uint32 parent = 1;
+  uint32 child = 2;
+}
+
+// Internal, reliable control-plane messages for generic multicast trees.
+// They are transported as ordinary unicast OverlayData on a reserved service
+// tag so they remain routable through the same overlay as application data.
+message DistributionControl {
+  oneof body {
+    DistributionTreeInstall install = 1;
+    DistributionTreeAck ack = 2;
+    DistributionTreeRequest request = 3;
+    DistributionTreeFailure failure = 4;
+  }
+}
+
+message DistributionTreeInstall {
+  uint32 source = 1;
+  uint32 profile = 2;
+  uint64 version = 3;
+  repeated uint32 members = 4;
+  repeated OverlayTreeEdge edges = 5;
+  uint64 group = 6;
+  uint64 topology_epoch = 7;
+  uint64 group_version = 8;
+}
+
+message DistributionTreeAck {
+  uint32 source = 1;
+  uint32 profile = 2;
+  uint64 version = 3;
+  uint32 node = 4;
+  uint64 group = 5;
+  uint64 topology_epoch = 6;
+  uint64 group_version = 7;
+}
+
+message DistributionTreeRequest {
+  uint32 source = 1;
+  uint32 profile = 2;
+  uint64 version = 3;
+  uint32 requester = 4;
+  uint64 group = 5;
+  uint64 topology_epoch = 6;
+  uint64 group_version = 7;
+}
+
+message DistributionTreeFailure {
+  uint32 source = 1;
+  uint32 profile = 2;
+  uint64 version = 3;
+  uint64 group = 4;
+  uint64 group_version = 5;
+  uint64 topology_epoch = 6;
+  uint32 parent = 7;
+  uint32 child = 8;
 }
 
 message OverlayControl {

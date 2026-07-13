@@ -296,7 +296,7 @@ fn classify_overlay_data(data: &OverlayData) -> PacketKind {
     match data.service_tag {
         repl_proto::REPLICATION_SERVICE_TAG => classify_replication_payload(&data.payload),
         app_proto::MODERATION_SERVICE_TAG => classify_moderation_payload(&data.payload),
-        app_proto::VOICE_SERVICE_TAG => classify_voice_payload(&data.payload),
+        app_proto::VOICE_SERVICE_TAG => classify_voice_payload(data),
         app_proto::USER_STATS_SERVICE_TAG => classify_user_stats_payload(&data.payload),
         app_proto::PLUGIN_DATA_SERVICE_TAG => classify_plugin_data_payload(&data.payload),
         app_proto::TEXT_MESSAGE_SERVICE_TAG => classify_text_message_payload(&data.payload),
@@ -365,7 +365,14 @@ fn classify_moderation_payload(payload: &Bytes) -> PacketKind {
     )
 }
 
-fn classify_voice_payload(_payload: &Bytes) -> PacketKind {
+fn classify_voice_payload(data: &OverlayData) -> PacketKind {
+    if data.distribution_profile.is_some() {
+        return if data.distribution_repair {
+            PacketKind::from_static("application.voice.tree.repair")
+        } else {
+            PacketKind::from_static("application.voice.tree.original")
+        };
+    }
     PacketKind::from_static("application.voice.frame")
 }
 
@@ -533,6 +540,14 @@ mod tests {
             origin_boot_epoch: 0,
             origin_message_id: 0,
             allow_l1_compression: false,
+            distribution_profile: None,
+            distribution_tree_version: None,
+            distribution_group: None,
+            distribution_group_version: None,
+            distribution_topology_epoch: None,
+            distribution_deadline_unix_ms: None,
+            distribution_repair: false,
+            distribution_repair_target: None,
         }
     }
 
@@ -551,6 +566,22 @@ mod tests {
         let kind = classify_overlay_body(&body);
 
         assert_eq!(kind.into_name(), "replication.strict.clock_tick");
+    }
+
+    #[test]
+    fn classifies_tree_voice_original_and_repair_separately() {
+        let mut original = overlay_data(app_proto::VOICE_SERVICE_TAG, Bytes::new());
+        original.distribution_profile = Some(1);
+        assert_eq!(
+            classify_overlay_body(&OverlayBody::Data(original.clone())).into_name(),
+            "application.voice.tree.original"
+        );
+
+        original.distribution_repair = true;
+        assert_eq!(
+            classify_overlay_body(&OverlayBody::Data(original)).into_name(),
+            "application.voice.tree.repair"
+        );
     }
 
     #[test]

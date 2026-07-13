@@ -5,8 +5,9 @@ S2S topology metrics.
 
 - `dashboards/shitspeak-s2s-topology.json`: Grafana dashboard with node/link
   tables, build versions, direct metrics, route views, S2S queue status,
-  transport and replication internals, S2S voice metrics, native voice
-  internals, packet IO, and a node globe.
+  transport and replication internals, S2S voice metrics, versioned
+  distribution-tree control and forwarding metrics, native voice internals,
+  packet IO, and a node globe.
 - `provisioning/dashboards/shitspeak-s2s.yaml`: Grafana dashboard provider.
 - `provisioning/datasources/mimir.yaml`: configurable Prometheus/Mimir
   datasource.

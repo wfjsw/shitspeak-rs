@@ -39,8 +39,8 @@ use super::super::neighbor::monitor::{NeighborMonitor, NeighborSnapshot, Neighbo
 use super::super::proto::{OverlayBody, encode_message, wrap};
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 use super::store::{
-    AdmissionResult, ApplicationServices, LinkAdvertised, LinkStateDb, LinkTransportAdvertised,
-    LsaEntry, ReplicationServices, is_strictly_newer,
+    AdmissionResult, ApplicationServices, DistributionCapabilities, LinkAdvertised, LinkStateDb,
+    LinkTransportAdvertised, LsaEntry, ReplicationServices, is_strictly_newer,
 };
 
 const RTT_GATE_BUCKET_US: u64 = 25_000;
@@ -64,6 +64,7 @@ pub struct LsaEmitter {
     content_replication_enabled: AtomicBool,
     owner_replication_enabled: AtomicBool,
     voice_service_enabled: AtomicBool,
+    distribution_capabilities: parking_lot::RwLock<DistributionCapabilities>,
     /// Last cost/breakdown tuple per neighbor we published. Used to apply the
     /// cost-change-threshold filter.
     last_published: parking_lot::Mutex<HashMap<NodeIdentifier, LinkGate>>,
@@ -94,6 +95,9 @@ impl LsaEmitter {
             content_replication_enabled: AtomicBool::new(replication_services.content()),
             owner_replication_enabled: AtomicBool::new(replication_services.owner()),
             voice_service_enabled: AtomicBool::new(application_services.voice()),
+            distribution_capabilities: parking_lot::RwLock::new(
+                application_services.distribution().clone(),
+            ),
             next_seq: AtomicU64::new(1),
             last_published: parking_lot::Mutex::new(HashMap::new()),
             self_addresses,
@@ -135,7 +139,18 @@ impl LsaEmitter {
     }
 
     pub fn application_services(&self) -> ApplicationServices {
-        ApplicationServices::new(self.voice_service_enabled.load(Ordering::Relaxed))
+        ApplicationServices::with_distribution_capabilities(
+            self.voice_service_enabled.load(Ordering::Relaxed),
+            self.distribution_capabilities.read().clone(),
+        )
+    }
+
+    /// Publish a new generic distribution capability set in the next LSA.
+    /// Profile registration uses this to make activation decisions visible to
+    /// every potential relay through the normal LSDB flood path.
+    pub fn update_distribution_capabilities(&self, capabilities: DistributionCapabilities) {
+        *self.distribution_capabilities.write() = capabilities;
+        self.poke_force();
     }
 
     pub fn update_replication_services(&self, services: ReplicationServices) {
@@ -229,7 +244,7 @@ fn build_local_lsa_content(
             emitter.replication_services()
         },
         application_services: if tombstone {
-            ApplicationServices::NONE
+            ApplicationServices::none()
         } else {
             emitter.application_services()
         },
@@ -446,6 +461,16 @@ fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     content.replication_services.content().hash(&mut hasher);
     content.replication_services.owner().hash(&mut hasher);
     content.application_services.voice().hash(&mut hasher);
+    content
+        .application_services
+        .distribution()
+        .protocol_version()
+        .hash(&mut hasher);
+    content
+        .application_services
+        .distribution()
+        .profile_ids()
+        .hash(&mut hasher);
     hasher.finish()
 }
 
@@ -465,6 +490,16 @@ fn content_identity_fingerprint(content: &LsaContent) -> u64 {
     content.replication_services.content().hash(&mut hasher);
     content.replication_services.owner().hash(&mut hasher);
     content.application_services.voice().hash(&mut hasher);
+    content
+        .application_services
+        .distribution()
+        .protocol_version()
+        .hash(&mut hasher);
+    content
+        .application_services
+        .distribution()
+        .profile_ids()
+        .hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1137,6 +1172,22 @@ mod tests {
             ReplicationServices::ALL,
             ApplicationServices::ALL,
         )
+    }
+
+    #[test]
+    fn emitter_publishes_updated_distribution_capabilities() {
+        let emitter = test_emitter();
+        emitter.update_distribution_capabilities(DistributionCapabilities::v1([7, 3]));
+
+        let lsa = build_local_lsa(&emitter, &[], false);
+        assert_eq!(
+            lsa.application_services.distribution().protocol_version(),
+            1
+        );
+        assert_eq!(
+            lsa.application_services.distribution().profile_ids(),
+            &[3, 7]
+        );
     }
 
     fn pb_lsa(origin: NodeIdentifier, seq: u64) -> pb::LinkStateAdvert {

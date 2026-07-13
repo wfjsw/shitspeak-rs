@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::future::join_all;
@@ -13,12 +13,16 @@ use tracing::{debug, trace, warn};
 use crate::application::proto::VOICE_SERVICE_TAG;
 use crate::overlay::LaneId;
 use crate::overlay::config::OverlayConfig;
+use crate::overlay::distribution::{
+    DistributionPlane, PendingDistributionFrame, TreeKey, TreeState, UnknownTreeEnqueue,
+};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{
     ConnectionManager, MessageClass, SendOptions as TransportSendOptions, ServiceLevel,
 };
 
+use super::super::OverlayNetwork;
 use super::super::error::OverlayError;
 use super::super::proto::{
     OverlayBody, OverlayControlBody, class_from_wire, class_to_wire, encode_message,
@@ -34,6 +38,24 @@ const FORWARD_PAYLOAD_LOG_BYTES: usize = 256;
 const CONTROL_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
 const CONTROL_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
 const VOICE_TRANSPORT_TTL: Duration = Duration::from_millis(250);
+const DISTRIBUTION_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_millis(10);
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn distribution_remaining_deadline(data: &pb::OverlayData) -> Option<Duration> {
+    let deadline = data.distribution_deadline_unix_ms?;
+    let now = unix_time_ms();
+    let remaining = deadline.checked_sub(now)?;
+    let remaining = Duration::from_millis(remaining);
+    (remaining > DISTRIBUTION_CLOCK_SKEW_ALLOWANCE)
+        .then_some(remaining.saturating_sub(DISTRIBUTION_CLOCK_SKEW_ALLOWANCE))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForwardNextHop {
@@ -96,6 +118,14 @@ pub(crate) async fn originate(
             origin_boot_epoch: boot_epoch,
             origin_message_id: ordering.next_origin_message_id(),
             allow_l1_compression: options.l1_compression_allowed(),
+            distribution_profile: None,
+            distribution_tree_version: None,
+            distribution_group: None,
+            distribution_group_version: None,
+            distribution_topology_epoch: None,
+            distribution_deadline_unix_ms: None,
+            distribution_repair: false,
+            distribution_repair_target: None,
         };
         return forward_pb_as(
             transport,
@@ -142,6 +172,14 @@ pub(crate) async fn originate(
             origin_boot_epoch: boot_epoch,
             origin_message_id: message_id,
             allow_l1_compression: options.l1_compression_allowed(),
+            distribution_profile: None,
+            distribution_tree_version: None,
+            distribution_group: None,
+            distribution_group_version: None,
+            distribution_topology_epoch: None,
+            distribution_deadline_unix_ms: None,
+            distribution_repair: false,
+            distribution_repair_target: None,
         };
         ordering.store_pending(lane, data.clone()).await;
         ordering.cache_ordered_packet(&data).await;
@@ -167,6 +205,297 @@ pub(crate) async fn originate(
         return Err(err);
     }
     Ok(())
+}
+
+/// Originate an unordered source-rooted multicast tree after its control-plane
+/// state has been acknowledged by every tree node.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn originate_tree(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    tree: &TreeState,
+    key: TreeKey,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+    options: OverlaySendOptions,
+) -> Result<(), OverlayError> {
+    let data = pb::OverlayData {
+        src: node_to_wire(self_id),
+        dsts: vec![],
+        path_trace: vec![node_to_wire(self_id)],
+        service_tag: tag,
+        service_level: level_to_wire(level),
+        message_class: class_to_wire(class),
+        payload: body,
+        process_on_transit,
+        route_metric: route_metric_to_wire(routing_metric),
+        ordered_delivery: false,
+        ordering_seq: 0,
+        ordering_dst: 0,
+        lane_id: None,
+        origin_boot_epoch: boot_epoch,
+        origin_message_id: ordering.next_origin_message_id(),
+        allow_l1_compression: options.l1_compression_allowed(),
+        distribution_profile: Some(key.profile),
+        distribution_tree_version: Some(key.version),
+        distribution_group: Some(key.group),
+        distribution_group_version: Some(key.group_version),
+        distribution_topology_epoch: Some(key.topology_epoch),
+        distribution_deadline_unix_ms: Some(
+            unix_time_ms().saturating_add(
+                options
+                    .transport_ttl()
+                    .unwrap_or(VOICE_TRANSPORT_TTL)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+        ),
+        distribution_repair: false,
+        distribution_repair_target: None,
+    };
+    forward_tree_data(
+        transport,
+        routing,
+        distribution,
+        self_id,
+        data,
+        tree,
+        class,
+        options.transport_ttl(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_inbound_with_distribution(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    services: &ServiceRegistry,
+    ordering: &OverlayOrdering,
+    distribution: &DistributionPlane,
+    self_id: NodeIdentifier,
+    from: NodeIdentifier,
+    mut data: pb::OverlayData,
+    route_transit_messages: bool,
+) {
+    let Some(profile) = data.distribution_profile else {
+        return handle_inbound(
+            transport,
+            routing,
+            services,
+            ordering,
+            self_id,
+            from,
+            data,
+            route_transit_messages,
+        )
+        .await;
+    };
+    let Some(remaining_deadline) = distribution_remaining_deadline(&data) else {
+        tracing::debug!(profile, "dropping expired distribution frame");
+        return;
+    };
+    let (Some(version), Some(group), Some(group_version), Some(topology_epoch)) = (
+        data.distribution_tree_version,
+        data.distribution_group,
+        data.distribution_group_version,
+        data.distribution_topology_epoch,
+    ) else {
+        return;
+    };
+    let Ok(source) = NodeIdentifier::try_from(data.src) else {
+        return;
+    };
+    let key = TreeKey {
+        source,
+        profile,
+        group,
+        group_version,
+        topology_epoch,
+        version,
+    };
+    if data.distribution_repair {
+        let Some(target) = data
+            .distribution_repair_target
+            .and_then(|target| NodeIdentifier::try_from(target).ok())
+        else {
+            return;
+        };
+        if self_id != target {
+            data.dsts = vec![node_to_wire(target)];
+            let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
+            let _ = forward_pb_as(
+                transport,
+                routing,
+                self_id,
+                data,
+                class,
+                false,
+                Some(remaining_deadline),
+                None,
+            )
+            .await;
+            return;
+        }
+        data.dsts.clear();
+        data.distribution_repair_target = None;
+    }
+    if let Some(tree_hop) = data
+        .dsts
+        .first()
+        .and_then(|target| NodeIdentifier::try_from(*target).ok())
+    {
+        if tree_hop != self_id {
+            if !route_transit_messages {
+                return;
+            }
+            let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
+            let _ = forward_pb_as(
+                transport,
+                routing,
+                self_id,
+                data,
+                class,
+                false,
+                Some(remaining_deadline),
+                None,
+            )
+            .await;
+            return;
+        }
+        // `dsts` carries just the logical tree child while the ordinary
+        // overlay underlay routes this copy across physical hops.
+        data.dsts.clear();
+    }
+    let tree = match distribution.get(key) {
+        Some(tree) => tree,
+        None => match distribution.queue_unknown(
+            key,
+            PendingDistributionFrame::new(from, data, route_transit_messages),
+            remaining_deadline.min(Duration::from_millis(20)),
+        ) {
+            UnknownTreeEnqueue::Queued => {
+                tracing::debug!(%source, profile, group, topology_epoch, version, "queued frame while requesting exact distribution tree");
+                return;
+            }
+            UnknownTreeEnqueue::Full => {
+                tracing::debug!(%source, profile, group, topology_epoch, version, "dropping distribution frame because exact-state recovery queue is full");
+                return;
+            }
+            UnknownTreeEnqueue::AlreadyInstalled(frame) => {
+                let Some(tree) = distribution.get(key) else {
+                    return;
+                };
+                return process_distribution_frame(
+                    transport,
+                    routing,
+                    distribution,
+                    ordering,
+                    services,
+                    self_id,
+                    source,
+                    frame.data,
+                    tree,
+                    frame.route_transit_messages,
+                    remaining_deadline,
+                )
+                .await;
+            }
+        },
+    };
+    process_distribution_frame(
+        transport,
+        routing,
+        distribution,
+        ordering,
+        services,
+        self_id,
+        source,
+        data,
+        tree,
+        route_transit_messages,
+        remaining_deadline,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_distribution_frame(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    ordering: &OverlayOrdering,
+    services: &ServiceRegistry,
+    self_id: NodeIdentifier,
+    source: NodeIdentifier,
+    data: pb::OverlayData,
+    tree: Arc<TreeState>,
+    route_transit_messages: bool,
+    remaining_deadline: Duration,
+) {
+    let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
+    let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
+    if tree.is_member(self_id)
+        && ordering
+            .should_deliver_unordered(
+                source,
+                data.origin_boot_epoch,
+                data.origin_message_id,
+                data.service_tag,
+            )
+            .await
+    {
+        delivery::deliver(
+            services,
+            data.service_tag,
+            source,
+            level,
+            class,
+            data.payload.clone(),
+        );
+    }
+    if route_transit_messages {
+        let _ = forward_tree_data(
+            transport,
+            routing,
+            distribution,
+            self_id,
+            data,
+            &tree,
+            class,
+            Some(remaining_deadline),
+        )
+        .await;
+    }
+}
+
+/// Re-enter normal distribution delivery after an exact tree install drains a
+/// bounded unknown-state queue. The handler revalidates the version and wire
+/// deadline; it never substitutes a newer tree or group snapshot.
+pub(crate) async fn replay_distribution_frame(
+    overlay: OverlayNetwork,
+    frame: PendingDistributionFrame,
+) {
+    handle_inbound_with_distribution(
+        &overlay.inner.transport,
+        &overlay.inner.routing,
+        &overlay.inner.services,
+        overlay.inner.ordering(),
+        &overlay.inner.distribution,
+        overlay.inner.self_id,
+        frame.from,
+        frame.data,
+        frame.route_transit_messages,
+    )
+    .await;
 }
 
 /// Handle an inbound `OverlayData`: deliver locally if applicable, forward the remainder.
@@ -831,6 +1160,113 @@ async fn forward_pb_as(
     Ok(())
 }
 
+async fn forward_tree_data(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    self_id: NodeIdentifier,
+    data: pb::OverlayData,
+    tree: &TreeState,
+    transport_class: MessageClass,
+    transport_ttl: Option<std::time::Duration>,
+) -> Result<(), OverlayError> {
+    let profile = data.distribution_profile.unwrap_or_default();
+    let is_repair = data.distribution_repair;
+    let mut path_trace = data.path_trace.clone();
+    append_path_trace(&mut path_trace, self_id);
+    let visited = path_trace_set(&path_trace);
+    let mut sends = Vec::new();
+    for child in tree.children(self_id).iter().copied() {
+        if visited.contains(&child) {
+            continue;
+        }
+        let pb_msg =
+            reconstruct_forwarded_data(&data, vec![node_to_wire(child)], path_trace.clone());
+        sends.push(async move {
+            let result = forward_pb_as(
+                transport,
+                routing,
+                self_id,
+                pb_msg,
+                transport_class,
+                false,
+                transport_ttl,
+                None,
+            )
+            .await;
+            if result.is_ok() {
+                if is_repair {
+                    crate::overlay::distribution_metrics::record_alternate_forward(profile);
+                } else {
+                    crate::overlay::distribution_metrics::record_original_forward(profile);
+                }
+            }
+            (child, result)
+        });
+    }
+    let mut first_err = None;
+    for (child, result) in join_all(sends).await {
+        if let Err(error) = result {
+            tracing::debug!(
+                parent = %self_id,
+                %child,
+                profile,
+                repair = is_repair,
+                error = %error,
+                "distribution child-edge send failed"
+            );
+            if let Some(key) = tree_key_from_data(&data) {
+                distribution.report_edge_failure(key, self_id, child);
+                if should_attempt_alternate_tree_repair(&data) {
+                    let mut repair = reconstruct_forwarded_data(
+                        &data,
+                        vec![node_to_wire(child)],
+                        path_trace.clone(),
+                    );
+                    repair.distribution_repair = true;
+                    repair.distribution_repair_target = Some(node_to_wire(child));
+                    let remaining =
+                        distribution_remaining_deadline(&repair).expect("eligible repair deadline");
+                    let _ = forward_pb_as(
+                        transport,
+                        routing,
+                        self_id,
+                        repair,
+                        transport_class,
+                        false,
+                        Some(remaining),
+                        Some(child),
+                    )
+                    .await;
+                }
+            }
+            if first_err.is_none() {
+                first_err = Some(error);
+            }
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+fn should_attempt_alternate_tree_repair(data: &pb::OverlayData) -> bool {
+    !data.distribution_repair
+        && data.distribution_profile
+            == Some(crate::overlay::distribution::VOICE_REALTIME_PROFILE_ID)
+        && distribution_remaining_deadline(data)
+            .is_some_and(|remaining| remaining >= Duration::from_millis(80))
+}
+
+fn tree_key_from_data(data: &pb::OverlayData) -> Option<TreeKey> {
+    Some(TreeKey {
+        source: NodeIdentifier::try_from(data.src).ok()?,
+        profile: data.distribution_profile?,
+        group: data.distribution_group?,
+        group_version: data.distribution_group_version?,
+        topology_epoch: data.distribution_topology_epoch?,
+        version: data.distribution_tree_version?,
+    })
+}
+
 fn reconstruct_forwarded_data(
     data: &pb::OverlayData,
     dsts: Vec<u32>,
@@ -853,6 +1289,14 @@ fn reconstruct_forwarded_data(
         origin_boot_epoch: data.origin_boot_epoch,
         origin_message_id: data.origin_message_id,
         allow_l1_compression: data.allow_l1_compression,
+        distribution_profile: data.distribution_profile,
+        distribution_tree_version: data.distribution_tree_version,
+        distribution_group: data.distribution_group,
+        distribution_group_version: data.distribution_group_version,
+        distribution_topology_epoch: data.distribution_topology_epoch,
+        distribution_deadline_unix_ms: data.distribution_deadline_unix_ms,
+        distribution_repair: data.distribution_repair,
+        distribution_repair_target: data.distribution_repair_target,
     }
 }
 
@@ -1054,6 +1498,14 @@ mod tests {
             origin_boot_epoch: 11,
             origin_message_id: 22,
             allow_l1_compression,
+            distribution_profile: None,
+            distribution_tree_version: None,
+            distribution_group: None,
+            distribution_group_version: None,
+            distribution_topology_epoch: None,
+            distribution_deadline_unix_ms: None,
+            distribution_repair: false,
+            distribution_repair_target: None,
         }
     }
 
@@ -2057,5 +2509,27 @@ mod tests {
             panic!("not overlay data");
         };
         assert_eq!(forwarded_six_data.dsts, vec![node_to_wire(6)]);
+    }
+
+    #[test]
+    fn alternate_tree_repair_requires_realtime_profile_and_80ms_deadline() {
+        let eligible = pb::OverlayData {
+            distribution_profile: Some(crate::overlay::distribution::VOICE_REALTIME_PROFILE_ID),
+            distribution_deadline_unix_ms: Some(unix_time_ms().saturating_add(100)),
+            ..Default::default()
+        };
+        assert!(should_attempt_alternate_tree_repair(&eligible));
+
+        let too_late = pb::OverlayData {
+            distribution_deadline_unix_ms: Some(unix_time_ms().saturating_add(79)),
+            ..eligible.clone()
+        };
+        assert!(!should_attempt_alternate_tree_repair(&too_late));
+
+        let repair_copy = pb::OverlayData {
+            distribution_repair: true,
+            ..eligible
+        };
+        assert!(!should_attempt_alternate_tree_repair(&repair_copy));
     }
 }

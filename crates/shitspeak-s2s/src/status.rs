@@ -1106,6 +1106,7 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
     let mut out = Vec::new();
     out.extend(crate::replications::metrics::prometheus_samples());
     out.extend(crate::application::voice::metrics::prometheus_samples());
+    out.extend(crate::overlay::distribution_metrics::prometheus_samples());
     let local_node = snapshot.local_node.to_string();
     for node in snapshot
         .nodes

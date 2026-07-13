@@ -701,6 +701,14 @@ mod tests {
             origin_boot_epoch: 99,
             origin_message_id: seq + 10,
             allow_l1_compression: false,
+            distribution_profile: None,
+            distribution_tree_version: None,
+            distribution_group: None,
+            distribution_group_version: None,
+            distribution_topology_epoch: None,
+            distribution_deadline_unix_ms: None,
+            distribution_repair: false,
+            distribution_repair_target: None,
         }
     }
 

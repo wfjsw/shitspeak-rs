@@ -364,6 +364,91 @@ impl RoutingTables {
     ) -> bool {
         self.lookup_with_metric(dst, level, metric).is_some()
     }
+
+    /// Build the directed edges of a source-rooted shortest-path tree for a
+    /// multicast recipient set. The tree is derived from one routing snapshot
+    /// so every recipient shares prefix edges instead of being re-routed at
+    /// each relay.
+    #[cfg(test)]
+    pub(crate) fn multicast_tree_edges(
+        &self,
+        source: NodeIdentifier,
+        dsts: &[NodeIdentifier],
+        level: ServiceLevel,
+        metric: RoutingMetric,
+    ) -> Vec<(NodeIdentifier, NodeIdentifier)> {
+        self.multicast_tree_edges_avoiding(source, dsts, level, metric, &HashSet::new())
+    }
+
+    pub(crate) fn multicast_tree_edges_avoiding(
+        &self,
+        source: NodeIdentifier,
+        dsts: &[NodeIdentifier],
+        level: ServiceLevel,
+        metric: RoutingMetric,
+        excluded: &HashSet<(NodeIdentifier, NodeIdentifier)>,
+    ) -> Vec<(NodeIdentifier, NodeIdentifier)> {
+        let mut edges = HashSet::new();
+        let Some(key) = Self::metric_lookup_keys(metric, level)
+            .into_iter()
+            .flatten()
+            .find(|key| {
+                self.adjacency
+                    .get(key)
+                    .is_some_and(|adjacency| !adjacency.is_empty())
+            })
+        else {
+            return Vec::new();
+        };
+        let Some(adjacency) = self.adjacency.get(&key) else {
+            return Vec::new();
+        };
+
+        let mut dist: HashMap<NodeIdentifier, PathCost> = HashMap::new();
+        let mut prev: HashMap<NodeIdentifier, NodeIdentifier> = HashMap::new();
+        let mut heap: BinaryHeap<Reverse<(PathCost, NodeIdentifier)>> = BinaryHeap::new();
+        dist.insert(source, PathCost::ZERO);
+        heap.push(Reverse((PathCost::ZERO, source)));
+        while let Some(Reverse((cost, node))) = heap.pop() {
+            if dist.get(&node).is_some_and(|known| cost > *known) {
+                continue;
+            }
+            if node != source && self.transit_disabled.contains(&node) {
+                continue;
+            }
+            let Some(neighbors) = adjacency.get(&node) else {
+                continue;
+            };
+            for (neighbor, edge) in neighbors {
+                if excluded.contains(&(node, *neighbor)) {
+                    continue;
+                }
+                if *neighbor == source {
+                    continue;
+                }
+                let next = cost.add(*edge);
+                if dist.get(neighbor).map_or(true, |known| next < *known) {
+                    dist.insert(*neighbor, next);
+                    prev.insert(*neighbor, node);
+                    heap.push(Reverse((next, *neighbor)));
+                }
+            }
+        }
+
+        for dst in dsts.iter().copied().filter(|dst| *dst != source) {
+            let mut node = dst;
+            while let Some(parent) = prev.get(&node).copied() {
+                edges.insert((parent, node));
+                if parent == source {
+                    break;
+                }
+                node = parent;
+            }
+        }
+        let mut edges: Vec<_> = edges.into_iter().collect();
+        edges.sort_unstable();
+        edges
+    }
 }
 
 /// Concrete handle.
@@ -417,5 +502,36 @@ mod tests {
         assert!(!tables.has_route(3, ServiceLevel::Reliable));
         assert!(tables.has_route(3, ServiceLevel::BestEffort));
         assert!(!tables.has_route(4, ServiceLevel::Reliable));
+    }
+
+    #[test]
+    fn multicast_tree_shares_shortest_path_prefixes() {
+        let mut tables = RoutingTables::empty();
+        let edge = EdgeCost {
+            primary: 1,
+            latency_us: 1,
+        };
+        tables.insert_table_with_adjacency(
+            RoutingMetric::ConversationalQuality,
+            ServiceLevel::BestEffort,
+            HashMap::new(),
+            HashMap::from([
+                (1, vec![(2, edge), (3, edge)]),
+                (2, vec![(4, edge), (5, edge)]),
+                (3, vec![]),
+                (4, vec![]),
+                (5, vec![]),
+            ]),
+        );
+
+        assert_eq!(
+            tables.multicast_tree_edges(
+                1,
+                &[4, 5],
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            ),
+            vec![(1, 2), (2, 4), (2, 5)]
+        );
     }
 }

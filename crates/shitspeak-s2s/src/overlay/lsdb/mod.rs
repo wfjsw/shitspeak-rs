@@ -10,8 +10,9 @@ pub use advert::{
     spawn_emitter_task,
 };
 pub use store::{
-    AdmissionResult, ApplicationServices, LinkAdvertised, LinkStateDb, LinkTransportAdvertised,
-    LsaEntry, LsaFloor, OriginVersion, ReplicationServices, spawn_floor_persister,
+    AdmissionResult, ApplicationServices, DistributionCapabilities, LinkAdvertised, LinkStateDb,
+    LinkTransportAdvertised, LsaEntry, LsaFloor, OriginVersion, ReplicationServices,
+    spawn_floor_persister,
 };
 pub use sync::{
     full_pull, handle_request as handle_sync_request, handle_response as handle_sync_response,

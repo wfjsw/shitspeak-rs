@@ -530,6 +530,12 @@ no_progress_close_ms = 1500
 # recursive targets fall back to broadcast until the recipient snapshot covers
 # every current voice member.
 delivery_strategy = "broadcast"
+# Applies to both broadcast and targeted recipient sets. Enable only after
+# every relay in the cluster understands distribution-tree forwarding.
+# Broadcast uses the reserved group 0. Targeted traffic keeps a stable group
+# for its server/channel target and changes its group version only when the
+# resolved recipient-node set changes.
+tree_delivery_enabled = true
 repair_enabled = true
 repair_transport_ttl_ms = 120
 # Defaults to repair_transport_ttl_ms when omitted.

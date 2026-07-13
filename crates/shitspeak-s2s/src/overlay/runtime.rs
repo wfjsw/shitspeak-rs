@@ -23,12 +23,14 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{ConnectionManager, Inbound, PeerAddress};
 
 use super::config::OverlayConfig;
+use super::distribution::DistributionPlane;
 use super::duplicate::DuplicateDetector;
 use super::error::OverlayError;
 use super::lsdb::advert::{cost_changed_significantly, voice_cost_changed_significantly};
 use super::lsdb::{
-    ApplicationServices, LinkStateDb, LsaEmitter, LsaFloodPacer, LsaFloor, ReplicationServices,
-    capture_boot_epoch, emit_once, spawn_anti_entropy, spawn_emitter_task, spawn_floor_persister,
+    ApplicationServices, DistributionCapabilities, LinkStateDb, LsaEmitter, LsaFloodPacer,
+    LsaFloor, ReplicationServices, capture_boot_epoch, emit_once, spawn_anti_entropy,
+    spawn_emitter_task, spawn_floor_persister,
 };
 use super::membership::{MembershipTable, spawn_diff_watcher};
 use super::messaging::{ServiceRegistry, ordering::OverlayOrdering};
@@ -145,6 +147,7 @@ pub(crate) struct OverlayInner {
     pub table: Arc<MembershipTable>,
     pub neighbor: Arc<NeighborMonitor>,
     pub routing: RoutingHandle,
+    pub distribution: Arc<DistributionPlane>,
     pub services: Arc<ServiceRegistry>,
     pub duplicate_detector: Arc<DuplicateDetector>,
     ordering: Arc<OverlayOrdering>,
@@ -187,6 +190,7 @@ impl OverlayInner {
         ));
 
         let routing = new_routing_handle();
+        let distribution = Arc::new(DistributionPlane::default());
         let services = Arc::new(ServiceRegistry::new());
         let ordering = Arc::new(OverlayOrdering::new(&cfg));
 
@@ -199,6 +203,9 @@ impl OverlayInner {
             replication_services,
             application_services,
         ));
+        emitter.update_distribution_capabilities(DistributionCapabilities::v1([
+            super::distribution::VOICE_REALTIME_PROFILE_ID,
+        ]));
         let flood_pacer = Arc::new(LsaFloodPacer::new(self_id, transport.clone()));
 
         let shutdown = CancellationToken::new();
@@ -222,6 +229,7 @@ impl OverlayInner {
             table,
             neighbor,
             routing,
+            distribution,
             services,
             duplicate_detector,
             ordering,
@@ -395,6 +403,7 @@ impl OverlayInner {
             monitor: self.neighbor.clone(),
             lsdb: self.lsdb.clone(),
             routing: self.routing.clone(),
+            distribution: self.distribution.clone(),
             services: self.services.clone(),
             duplicate_detector: self.duplicate_detector.clone(),
             ordering: self.ordering.clone(),

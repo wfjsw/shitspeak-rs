@@ -24,6 +24,8 @@
 
 pub(crate) mod config;
 mod discovery;
+mod distribution;
+pub(crate) mod distribution_metrics;
 mod duplicate;
 mod error;
 mod inbound;
@@ -41,6 +43,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::future::join_all;
 use tokio::sync::broadcast;
 use tokio::time::{Instant, timeout};
 
@@ -276,12 +279,40 @@ impl OverlayNetwork {
             application_services,
         )
         .await?;
-        Ok(Self { inner })
+        let network = Self { inner };
+        distribution::register_control_handler(&network);
+        Ok(network)
     }
 
     /// Local node id derived from the transport's TLS cert CN.
     pub fn local_node_id(&self) -> NodeIdentifier {
         self.inner.self_id
+    }
+
+    fn distribution_topology_epoch(&self) -> u64 {
+        let mut entries = self.link_state_snapshot();
+        entries.sort_by_key(|entry| entry.origin);
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for entry in entries {
+            for value in [
+                u64::from(entry.origin),
+                entry.boot_epoch,
+                u64::from(entry.tombstone),
+                u64::from(entry.transit_disabled),
+            ] {
+                hash ^= value;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            let mut links = entry.links;
+            links.sort_by_key(|link| link.neighbor);
+            for link in links {
+                for value in [u64::from(link.neighbor), u64::from(link.transports_mask)] {
+                    hash ^= value;
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        hash.max(1)
     }
 
     /// Local node's `boot_epoch` (microseconds since UNIX epoch, captured
@@ -1040,6 +1071,193 @@ impl OverlayNetwork {
             class,
             body,
             false,
+            options,
+        )
+        .await
+    }
+
+    /// Send to a list of peers using one source-rooted multicast tree. This
+    /// is opt-in because every relay on the active tree must understand the
+    /// tree envelope before an operator enables it cluster-wide.
+    pub async fn send_multicast_tree_unordered_with_routing_metric_and_group_options(
+        &self,
+        dsts: &[NodeIdentifier],
+        group: u64,
+        group_version: u64,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+        options: OverlaySendOptions,
+    ) -> Result<(), OverlayError> {
+        let dsts: Vec<_> = dsts
+            .iter()
+            .copied()
+            .filter(|node| *node != self.inner.self_id)
+            .collect();
+        if dsts.is_empty() {
+            return Ok(());
+        }
+        let Some(profile) = distribution::profile_for_service(tag) else {
+            return self
+                .send_multicast_unordered_with_routing_metric_and_options(
+                    &dsts,
+                    tag,
+                    level,
+                    routing_metric,
+                    class,
+                    body,
+                    options,
+                )
+                .await;
+        };
+        let level = profile.level();
+        let routing_metric = profile.metric();
+        let topology_epoch = self.distribution_topology_epoch();
+        let scope = distribution::TreeKey {
+            source: self.inner.self_id,
+            profile: profile.id(),
+            group,
+            group_version,
+            topology_epoch,
+            version: 0,
+        };
+        let excluded = self.inner.distribution.failed_edges(scope);
+        let state = self.inner.distribution.select_tree(
+            scope,
+            distribution::TreeState::new(
+                self.inner.self_id,
+                dsts.iter().copied(),
+                self.inner.routing.load().multicast_tree_edges_avoiding(
+                    self.inner.self_id,
+                    &dsts,
+                    level,
+                    routing_metric,
+                    &excluded,
+                ),
+            ),
+        );
+        let key = distribution::TreeKey {
+            version: distribution::tree_version(
+                self.inner.self_id,
+                profile.id(),
+                group,
+                group_version,
+                topology_epoch,
+                &state,
+            ),
+            ..scope
+        };
+        let capability_ready = state.nodes().all(|node| {
+            node == self.inner.self_id
+                || self.inner.lsdb.supports_distribution_profile(
+                    node,
+                    crate::overlay::lsdb::DistributionCapabilities::PROTOCOL_VERSION,
+                    profile.id(),
+                )
+        });
+        if !capability_ready {
+            distribution_metrics::record_compatibility_fallback(profile.id());
+            return self
+                .send_multicast_unordered_with_routing_metric_and_options(
+                    &dsts,
+                    tag,
+                    level,
+                    routing_metric,
+                    class,
+                    body,
+                    options,
+                )
+                .await;
+        }
+        if self.inner.distribution.get(key).is_none() {
+            self.inner.distribution.install(key, state.clone());
+        }
+        if !self.inner.distribution.is_ready(key) {
+            let peers: Vec<_> = state
+                .nodes()
+                .filter(|node| *node != self.inner.self_id)
+                .collect();
+            if self
+                .inner
+                .distribution
+                .begin_publish(key, peers.iter().copied())
+            {
+                tracing::debug!(
+                    source = %self.inner.self_id,
+                    profile = profile.id(),
+                    group,
+                    group_version,
+                    topology_epoch,
+                    tree_version = key.version,
+                    recipients = dsts.len(),
+                    tree_nodes = peers.len(),
+                    "publishing distribution tree"
+                );
+                let overlay = self.clone();
+                let control = distribution::encode_install(key, &state);
+                tokio::spawn(async move {
+                    let sends = peers.into_iter().map(|peer| {
+                        let overlay = overlay.clone();
+                        let control = control.clone();
+                        async move {
+                            overlay
+                                .send_unicast_unordered_with_routing_metric(
+                                    peer,
+                                    distribution::DISTRIBUTION_CONTROL_SERVICE_TAG,
+                                    ServiceLevel::ReliableLowLatency,
+                                    RoutingMetric::ReliableLowLatencyCost,
+                                    MessageClass::Control,
+                                    control,
+                                )
+                                .await
+                        }
+                    });
+                    if join_all(sends)
+                        .await
+                        .into_iter()
+                        .any(|result| result.is_err())
+                    {
+                        overlay.inner.distribution.abort_publish(key);
+                    }
+                });
+            }
+            // Tree state is not active until every required ACK arrives. Do
+            // not stall realtime ingress; the compatibility path preserves
+            // frame pacing while the one coalesced install is in flight.
+            distribution_metrics::record_compatibility_fallback(profile.id());
+            return self
+                .send_multicast_unordered_with_routing_metric_and_options(
+                    &dsts,
+                    tag,
+                    level,
+                    routing_metric,
+                    class,
+                    body,
+                    options,
+                )
+                .await;
+        }
+        let state = self
+            .inner
+            .distribution
+            .get(key)
+            .expect("local tree installed");
+        messaging::send_multicast_tree_unordered_with_routing_metric_and_options(
+            &self.inner.transport,
+            &self.inner.routing,
+            &self.inner.distribution,
+            self.inner.self_id,
+            self.inner.boot_epoch,
+            self.inner.ordering(),
+            &state,
+            key,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
             options,
         )
         .await

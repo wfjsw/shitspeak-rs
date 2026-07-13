@@ -18,6 +18,10 @@ pub struct VoiceConfig {
     /// and fans out per channel/listener subscription.
     pub delivery_strategy: String,
 
+    /// Use the generic distribution-tree transport for either broadcast or
+    /// targeted voice recipient sets.
+    pub tree_delivery_enabled: bool,
+
     /// Per-(sender, epoch) max wait before emitting `pending` past a gap.
     /// Higher = more reorder tolerance, more glass-to-glass latency.
     pub reorder_max_delay_ms: u64,
@@ -88,6 +92,7 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             delivery_strategy: default_delivery_strategy(),
+            tree_delivery_enabled: default_tree_delivery_enabled(),
             reorder_max_delay_ms: default_reorder_max_delay_ms(),
             reorder_max_buffered_frames: default_reorder_max_buffered_frames(),
             reorder_max_drop_lag_frames: default_reorder_max_drop_lag_frames(),
@@ -116,6 +121,8 @@ impl Default for VoiceConfig {
 struct VoiceConfigWire {
     #[serde(default = "default_delivery_strategy")]
     delivery_strategy: String,
+    #[serde(default = "default_tree_delivery_enabled")]
+    tree_delivery_enabled: bool,
     #[serde(default = "default_reorder_max_delay_ms")]
     reorder_max_delay_ms: u64,
     #[serde(default = "default_reorder_max_buffered_frames")]
@@ -166,6 +173,7 @@ impl<'de> Deserialize<'de> for VoiceConfig {
         let raw = VoiceConfigWire::deserialize(deserializer)?;
         Ok(Self {
             delivery_strategy: raw.delivery_strategy,
+            tree_delivery_enabled: raw.tree_delivery_enabled,
             reorder_max_delay_ms: raw.reorder_max_delay_ms,
             reorder_max_buffered_frames: raw.reorder_max_buffered_frames,
             reorder_max_drop_lag_frames: raw.reorder_max_drop_lag_frames,
@@ -224,6 +232,9 @@ impl DeliveryStrategy {
 
 fn default_delivery_strategy() -> String {
     "broadcast".to_owned()
+}
+fn default_tree_delivery_enabled() -> bool {
+    true
 }
 fn default_reorder_max_delay_ms() -> u64 {
     20
@@ -287,6 +298,7 @@ mod tests {
     #[test]
     fn voice_repair_defaults_deserialize_enabled() {
         let cfg: ApplicationConfig = serde_json::from_str(r#"{"voice":{}}"#).unwrap();
+        assert!(cfg.voice.tree_delivery_enabled);
         assert!(cfg.voice.repair_enabled);
         assert_eq!(cfg.voice.repair_nack_delay_ms, 8);
         assert_eq!(cfg.voice.repair_cache_ms, 300);
@@ -305,6 +317,13 @@ mod tests {
             serde_json::from_str(r#"{"voice":{"transport_ttl_ms":180}}"#).unwrap();
         assert_eq!(cfg.voice.transport_ttl_ms(), 180);
         assert_eq!(cfg.voice.transport_ttl(), Duration::from_millis(180));
+    }
+
+    #[test]
+    fn tree_delivery_can_be_explicitly_disabled_for_legacy_rollout() {
+        let cfg: ApplicationConfig =
+            serde_json::from_str(r#"{"voice":{"tree_delivery_enabled":false}}"#).unwrap();
+        assert!(!cfg.voice.tree_delivery_enabled);
     }
 
     #[test]

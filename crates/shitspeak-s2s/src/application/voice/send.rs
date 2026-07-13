@@ -24,6 +24,105 @@ pub const VOICE_REPAIR_LEVEL: ServiceLevel = ServiceLevel::BestEffort;
 pub const VOICE_REPAIR_CLASS: MessageClass = MessageClass::HighPriority;
 pub const VOICE_REPAIR_ROUTING_METRIC: RoutingMetric = RoutingMetric::ConversationalQuality;
 
+/// Stable identity of a recipient group passed to the generic distribution
+/// transport. The recipient set itself is represented by `version`; callers
+/// retain the same group ID while its membership is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistributionGroup {
+    id: u64,
+    version: u64,
+    kind: DistributionGroupKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributionGroupKind {
+    Broadcast,
+    Targeted,
+    RecipientSnapshot,
+}
+
+impl DistributionGroup {
+    pub const fn broadcast() -> Self {
+        Self {
+            id: 0,
+            version: 0,
+            kind: DistributionGroupKind::Broadcast,
+        }
+    }
+
+    /// Build a stable group for a server-scoped channel target. Channel order
+    /// and duplicate channel IDs do not affect the group identity.
+    pub fn targeted(server_id: &str, channel_ids: &[u32], recipients: &[NodeIdentifier]) -> Self {
+        let mut channels = channel_ids.to_vec();
+        channels.sort_unstable();
+        channels.dedup();
+        Self {
+            id: hash_group_identity(server_id, &channels),
+            version: hash_recipient_snapshot(recipients),
+            kind: DistributionGroupKind::Targeted,
+        }
+    }
+
+    /// Use the recipient set itself as the identity for an ad-hoc multicast
+    /// that has no durable server/channel target.
+    pub fn recipient_snapshot(recipients: &[NodeIdentifier]) -> Self {
+        let version = hash_recipient_snapshot(recipients);
+        Self {
+            id: version,
+            version,
+            kind: DistributionGroupKind::RecipientSnapshot,
+        }
+    }
+
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+
+    pub const fn version(self) -> u64 {
+        self.version
+    }
+
+    pub const fn kind(self) -> DistributionGroupKind {
+        self.kind
+    }
+}
+
+fn hash_group_identity(server_id: &str, channel_ids: &[u32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash_bytes(&mut hash, b"shitspeak.voice.targeted-group.v1");
+    hash_bytes(&mut hash, server_id.as_bytes());
+    hash_word(&mut hash, channel_ids.len() as u64);
+    for channel_id in channel_ids {
+        hash_word(&mut hash, u64::from(*channel_id));
+    }
+    hash.max(1)
+}
+
+fn hash_recipient_snapshot(recipients: &[NodeIdentifier]) -> u64 {
+    let mut nodes: Vec<_> = recipients.iter().copied().collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash_bytes(&mut hash, b"shitspeak.voice.recipient-snapshot.v1");
+    hash_word(&mut hash, nodes.len() as u64);
+    for node in nodes {
+        hash_word(&mut hash, u64::from(node));
+    }
+    hash.max(1)
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+fn hash_word(hash: &mut u64, value: u64) {
+    hash_bytes(hash, &value.to_le_bytes());
+}
+
 /// Narrow send-only interface used by the voice service. Production
 /// impl: [`OverlayVoiceTransport`]. Test impl: see the unit tests below.
 #[async_trait]
@@ -41,6 +140,20 @@ pub trait VoiceTransport: Send + Sync + 'static {
         body: Bytes,
         ttl: Duration,
     ) -> Result<(), ApplicationError>;
+
+    /// Send a multicast through the generic source-rooted tree path. The
+    /// default keeps test transports and mixed-version deployments on the
+    /// legacy path until the production transport opts in.
+    async fn send_tree_multicast(
+        &self,
+        dsts: &[NodeIdentifier],
+        group: DistributionGroup,
+        body: Bytes,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        let _ = group;
+        self.send_multicast(dsts, body, ttl).await
+    }
 
     async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError>;
 
@@ -111,6 +224,33 @@ impl VoiceTransport for OverlayVoiceTransport {
         self.overlay
             .send_multicast_unordered_with_routing_metric_and_options(
                 dsts,
+                VOICE_SERVICE_TAG,
+                VOICE_LEVEL,
+                VOICE_ROUTING_METRIC,
+                VOICE_CLASS,
+                body,
+                options,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn send_tree_multicast(
+        &self,
+        dsts: &[NodeIdentifier],
+        group: DistributionGroup,
+        body: Bytes,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        if dsts.is_empty() {
+            return Ok(());
+        }
+        let options = OverlaySendOptions::default().expire_after(ttl);
+        self.overlay
+            .send_multicast_tree_unordered_with_routing_metric_and_group_options(
+                dsts,
+                group.id(),
+                group.version(),
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
                 VOICE_ROUTING_METRIC,
@@ -266,6 +406,12 @@ pub(crate) mod testing {
             body: Bytes,
             ttl: Duration,
         },
+        TreeMulticast {
+            dsts: Vec<NodeIdentifier>,
+            group: DistributionGroup,
+            body: Bytes,
+            ttl: Duration,
+        },
         Broadcast {
             body: Bytes,
             ttl: Duration,
@@ -330,6 +476,22 @@ pub(crate) mod testing {
         ) -> Result<(), ApplicationError> {
             self.calls.lock().unwrap().push(FakeCall::Multicast {
                 dsts: dsts.to_vec(),
+                body,
+                ttl,
+            });
+            Ok(())
+        }
+
+        async fn send_tree_multicast(
+            &self,
+            dsts: &[NodeIdentifier],
+            group: DistributionGroup,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.calls.lock().unwrap().push(FakeCall::TreeMulticast {
+                dsts: dsts.to_vec(),
+                group,
                 body,
                 ttl,
             });
@@ -429,5 +591,26 @@ mod tests {
             decoded.intent.and_then(|i| i.kind),
             Some(proto::VoiceIntentKind::Normal(n)) if n.source_channel == 5
         ));
+    }
+
+    #[test]
+    fn broadcast_distribution_group_is_reserved() {
+        let group = DistributionGroup::broadcast();
+        assert_eq!(group.id(), 0);
+        assert_eq!(group.version(), 0);
+        assert_eq!(group.kind(), DistributionGroupKind::Broadcast);
+    }
+
+    #[test]
+    fn targeted_distribution_group_keeps_identity_when_membership_is_unchanged() {
+        let first = DistributionGroup::targeted("tenant-a", &[9, 5, 9], &[7, 2, 7]);
+        let reordered = DistributionGroup::targeted("tenant-a", &[5, 9], &[2, 7]);
+        let changed_members = DistributionGroup::targeted("tenant-a", &[5, 9], &[2, 3]);
+
+        assert_eq!(first.kind(), DistributionGroupKind::Targeted);
+        assert_eq!(first.id(), reordered.id());
+        assert_eq!(first.version(), reordered.version());
+        assert_eq!(first.id(), changed_members.id());
+        assert_ne!(first.version(), changed_members.version());
     }
 }

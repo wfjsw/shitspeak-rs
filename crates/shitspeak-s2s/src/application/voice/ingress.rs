@@ -27,7 +27,9 @@ use crate::application::voice::metrics::{
 };
 use crate::application::voice::reorder::{self, GapReport, Reorderer, VoiceRouteHint};
 use crate::application::voice::repair::{RepairCache, RepairFrame};
-use crate::application::voice::send::{self, OverlayVoiceTransport, VoiceTransport};
+use crate::application::voice::send::{
+    self, DistributionGroup, OverlayVoiceTransport, VoiceTransport,
+};
 use crate::application::voice::sink::AudioSink;
 use crate::application::voice::targeted::{RecipientIndex, RemoteNodeLookup};
 use crate::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
@@ -250,10 +252,20 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        let result = self
-            .transport
-            .send_multicast(&dsts, bytes.clone(), self.cfg.transport_ttl())
-            .await;
+        let result = if self.cfg.tree_delivery_enabled {
+            self.transport
+                .send_tree_multicast(
+                    &dsts,
+                    DistributionGroup::broadcast(),
+                    bytes.clone(),
+                    self.cfg.transport_ttl(),
+                )
+                .await
+        } else {
+            self.transport
+                .send_multicast(&dsts, bytes.clone(), self.cfg.transport_ttl())
+                .await
+        };
         metrics::record_send(
             self.transport.local_node_id(),
             VoiceSendMode::Broadcast,
@@ -283,6 +295,31 @@ impl VoiceService {
         intent: VoiceIntent,
         dsts: &[NodeIdentifier],
     ) -> Result<(), ApplicationError> {
+        self.send_multicast_for_group(
+            sender_session,
+            server_id,
+            target_kind,
+            is_terminator,
+            payload,
+            intent,
+            dsts,
+            DistributionGroup::recipient_snapshot(dsts),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_multicast_for_group(
+        &self,
+        sender_session: u32,
+        server_id: String,
+        target_kind: u32,
+        is_terminator: bool,
+        payload: Bytes,
+        intent: VoiceIntent,
+        dsts: &[NodeIdentifier],
+        group: DistributionGroup,
+    ) -> Result<(), ApplicationError> {
         if dsts.is_empty() {
             metrics::record_send(
                 self.transport.local_node_id(),
@@ -301,10 +338,15 @@ impl VoiceService {
             payload,
             intent,
         )?;
-        let result = self
-            .transport
-            .send_multicast(dsts, bytes.clone(), self.cfg.transport_ttl())
-            .await;
+        let result = if self.cfg.tree_delivery_enabled {
+            self.transport
+                .send_tree_multicast(dsts, group, bytes.clone(), self.cfg.transport_ttl())
+                .await
+        } else {
+            self.transport
+                .send_multicast(dsts, bytes.clone(), self.cfg.transport_ttl())
+                .await
+        };
         metrics::record_send(
             self.transport.local_node_id(),
             VoiceSendMode::Multicast,
@@ -368,8 +410,9 @@ impl VoiceService {
                             );
                             return Ok(());
                         }
+                        let group = DistributionGroup::targeted(&server_id, &[channel_id], &dsts);
                         let result = self
-                            .send_multicast(
+                            .send_multicast_for_group(
                                 sender_session,
                                 server_id,
                                 0,
@@ -377,6 +420,7 @@ impl VoiceService {
                                 payload,
                                 intent,
                                 &dsts,
+                                group,
                             )
                             .await;
                         metrics::record_send(
@@ -545,8 +589,9 @@ impl VoiceService {
                     );
                     return Ok(());
                 }
+                let group = DistributionGroup::targeted(&server_id, &channel_ids, &dsts);
                 let result = self
-                    .send_multicast(
+                    .send_multicast_for_group(
                         sender_session,
                         server_id,
                         target_kind,
@@ -554,6 +599,7 @@ impl VoiceService {
                         payload,
                         intent,
                         &dsts,
+                        group,
                     )
                     .await;
                 metrics::record_send(
@@ -1131,10 +1177,19 @@ mod tests {
 
     use super::*;
 
-    use crate::application::voice::send::testing::{FakeCall, FakeVoiceTransport};
+    use crate::application::voice::send::{
+        DistributionGroupKind,
+        testing::{FakeCall, FakeVoiceTransport},
+    };
     use crate::application::voice::sink::testing::RecordingSink;
 
-    fn make_service(transport: Arc<FakeVoiceTransport>) -> Arc<VoiceService> {
+    fn make_legacy_service(transport: Arc<FakeVoiceTransport>) -> Arc<VoiceService> {
+        let mut cfg = VoiceConfig::default();
+        cfg.tree_delivery_enabled = false;
+        VoiceService::new_with_transport(transport, cfg, CancellationToken::new(), 42)
+    }
+
+    fn make_default_tree_service(transport: Arc<FakeVoiceTransport>) -> Arc<VoiceService> {
         VoiceService::new_with_transport(
             transport,
             VoiceConfig::default(),
@@ -1146,7 +1201,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_emits_envelope_and_advances_seq() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
 
         let payload = Bytes::from_static(b"opus-1");
         svc.send_broadcast(
@@ -1199,10 +1254,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_tree_delivery_routes_broadcast_and_explicit_groups() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_default_tree_service(transport.clone());
+
+        svc.send_broadcast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"broadcast"),
+            normal_intent(5),
+        )
+        .await
+        .unwrap();
+        svc.send_multicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            2,
+            false,
+            Bytes::from_static(b"explicit"),
+            normal_intent(5),
+            &[1, 3],
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2);
+        match &calls[0] {
+            FakeCall::TreeMulticast {
+                dsts,
+                group,
+                body,
+                ttl,
+            } => {
+                assert_eq!(dsts.as_slice(), &[1, 2, 3]);
+                assert_eq!(*group, DistributionGroup::broadcast());
+                assert_eq!(*ttl, VoiceConfig::default().transport_ttl());
+                assert_eq!(
+                    proto::decode_voice(body.as_ref()).unwrap().payload.as_ref(),
+                    b"broadcast"
+                );
+            }
+            other => panic!("expected TreeMulticast, got {other:?}"),
+        }
+        match &calls[1] {
+            FakeCall::TreeMulticast {
+                dsts,
+                group,
+                body,
+                ttl,
+            } => {
+                assert_eq!(dsts.as_slice(), &[1, 3]);
+                assert_eq!(group.kind(), DistributionGroupKind::RecipientSnapshot);
+                assert_eq!(group.id(), group.version());
+                assert_eq!(*ttl, VoiceConfig::default().transport_ttl());
+                assert_eq!(
+                    proto::decode_voice(body.as_ref()).unwrap().payload.as_ref(),
+                    b"explicit"
+                );
+            }
+            other => panic!("expected TreeMulticast, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn broadcast_uses_voice_members_not_all_alive_members() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3, 4]);
         transport.set_voice_members(vec![2, 4, 7]);
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
 
         svc.send_broadcast(
             0xABC,
@@ -1226,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn multicast_skips_when_dsts_empty() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
         svc.send_multicast(
             0xABC,
             shitspeak_core::default_server_id(),
@@ -1244,7 +1365,7 @@ mod tests {
     #[tokio::test]
     async fn multicast_emits_envelope_with_dsts() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
         svc.send_multicast(
             0xABC,
             shitspeak_core::default_server_id(),
@@ -1273,7 +1394,7 @@ mod tests {
     #[tokio::test]
     async fn unicast_emits_to_single_dst() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
         svc.send_unicast(
             0xABC,
             shitspeak_core::default_server_id(),
@@ -1302,6 +1423,7 @@ mod tests {
     async fn normal_sends_use_configured_transport_ttl() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let mut cfg = VoiceConfig::default();
+        cfg.tree_delivery_enabled = false;
         cfg.set_transport_ttl_ms(180);
         let svc =
             VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
@@ -1344,8 +1466,17 @@ mod tests {
         transport: Arc<FakeVoiceTransport>,
         strategy: &str,
     ) -> Arc<VoiceService> {
+        make_service_with_strategy_and_tree_delivery(transport, strategy, false)
+    }
+
+    fn make_service_with_strategy_and_tree_delivery(
+        transport: Arc<FakeVoiceTransport>,
+        strategy: &str,
+        tree_delivery_enabled: bool,
+    ) -> Arc<VoiceService> {
         let mut cfg = VoiceConfig::default();
         cfg.delivery_strategy = strategy.to_string();
+        cfg.tree_delivery_enabled = tree_delivery_enabled;
         VoiceService::new_with_transport(transport, cfg, CancellationToken::new(), 42)
     }
 
@@ -1409,7 +1540,7 @@ mod tests {
             2,
             crate::overlay::VoiceRouteQuality::new(2, TransportKind::Udp, 200_000, 5_000, 0),
         );
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
 
         svc.send_unicast(
             0xABC,
@@ -1521,7 +1652,7 @@ mod tests {
             2,
             crate::overlay::VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 5_000, 0),
         );
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
 
         svc.send_unicast(
             0xABC,
@@ -1603,6 +1734,70 @@ mod tests {
             }
             other => panic!("expected Multicast, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn targeted_tree_group_tracks_only_its_recipient_snapshot() {
+        use crate::application::voice::targeted::RecipientIndex;
+
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = make_service_with_strategy_and_tree_delivery(transport.clone(), "targeted", true);
+        let idx = RecipientIndex::new();
+        idx.add_in_server("tenant-a", 5, 1);
+        idx.add_in_server("tenant-a", 5, 2);
+        svc.set_recipient_index(idx.clone());
+
+        svc.send_for_channel(
+            0xABC,
+            "tenant-a".to_owned(),
+            5,
+            false,
+            Bytes::from_static(b"x"),
+        )
+        .await
+        .unwrap();
+
+        // This changes RecipientIndex generation but not the target's
+        // resolved membership, so the distribution group must be unchanged.
+        idx.add_in_server("tenant-a", 99, 3);
+        svc.send_for_channel(
+            0xABC,
+            "tenant-a".to_owned(),
+            5,
+            false,
+            Bytes::from_static(b"y"),
+        )
+        .await
+        .unwrap();
+
+        idx.add_in_server("tenant-a", 5, 3);
+        svc.send_for_channel(
+            0xABC,
+            "tenant-a".to_owned(),
+            5,
+            false,
+            Bytes::from_static(b"z"),
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 3);
+        let groups: Vec<_> = calls
+            .iter()
+            .map(|call| match call {
+                FakeCall::TreeMulticast { group, .. } => *group,
+                other => panic!("expected tree multicast, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            groups[0].kind(),
+            crate::application::voice::send::DistributionGroupKind::Targeted
+        );
+        assert_eq!(groups[0].id(), groups[1].id());
+        assert_eq!(groups[0].version(), groups[1].version());
+        assert_eq!(groups[1].id(), groups[2].id());
+        assert_ne!(groups[1].version(), groups[2].version());
     }
 
     #[tokio::test]
@@ -1950,7 +2145,7 @@ mod tests {
     #[tokio::test]
     async fn ingress_dispatches_decoded_frame_to_installed_sink() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        let svc = make_service(transport);
+        let svc = make_legacy_service(transport);
         let sink = RecordingSink::new();
         svc.set_audio_sink(sink.clone());
 
@@ -1994,7 +2189,7 @@ mod tests {
     #[tokio::test]
     async fn ingress_drops_when_no_sink_installed() {
         let transport = FakeVoiceTransport::new(7, vec![1]);
-        let svc = make_service(transport);
+        let svc = make_legacy_service(transport);
         let envelope = send::build_envelope(
             0xABC,
             shitspeak_core::default_server_id(),
@@ -2109,7 +2304,7 @@ mod tests {
     #[tokio::test]
     async fn repair_handler_replays_cached_exact_frame() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
         svc.send_unicast(
             0xABC,
             shitspeak_core::default_server_id(),
@@ -2158,7 +2353,7 @@ mod tests {
     #[tokio::test]
     async fn repair_handler_drops_stale_timestamped_request() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
         svc.send_unicast(
             0xABC,
             shitspeak_core::default_server_id(),
@@ -2193,7 +2388,7 @@ mod tests {
     #[tokio::test]
     async fn per_session_counters_independent() {
         let transport = FakeVoiceTransport::new(7, vec![1]);
-        let svc = make_service(transport.clone());
+        let svc = make_legacy_service(transport.clone());
         for session in [0xAAA, 0xBBB] {
             for _ in 0..3 {
                 svc.send_broadcast(

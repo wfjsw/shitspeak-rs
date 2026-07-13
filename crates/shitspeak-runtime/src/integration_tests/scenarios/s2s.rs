@@ -404,6 +404,12 @@ impl ConvergenceCluster {
 }
 
 async fn spawn_s2s_convergence_cluster() -> ConvergenceCluster {
+    spawn_s2s_convergence_cluster_with_tree_delivery(true).await
+}
+
+async fn spawn_s2s_convergence_cluster_with_tree_delivery(
+    tree_delivery_enabled: bool,
+) -> ConvergenceCluster {
     let node_ids: Vec<u16> = (1..=CONVERGENCE_NODE_COUNT).collect();
     let pki = Arc::new(mint_pki(&node_ids));
     let mut ports = Vec::with_capacity(node_ids.len());
@@ -428,6 +434,7 @@ async fn spawn_s2s_convergence_cluster() -> ConvergenceCluster {
         s2s.overlay.lsa_max_age_ms = CONVERGENCE_LSA_MAX_AGE_MS;
         s2s.overlay.lsa_flood_pacing_interval_ms = 50;
         s2s.overlay.cost_rerun_min_interval_ms = 50;
+        s2s.application.voice.tree_delivery_enabled = tree_delivery_enabled;
         servers.push(
             spawn_s2s_test_server_with_config(opts, Arc::clone(&pki), node_id, idx, s2s).await,
         );
@@ -1047,7 +1054,7 @@ struct S2SDebugVoiceIoSnapshot {
 
 #[cfg(debug_assertions)]
 impl S2SDebugVoiceIoSnapshot {
-    fn capture() -> Self {
+    fn capture(kind: &str) -> Self {
         shitspeak_s2s::debug_io::snapshot()
             .into_iter()
             .filter_map(|row| {
@@ -1055,10 +1062,10 @@ impl S2SDebugVoiceIoSnapshot {
                     .ok()
                     .and_then(|value| serde_json::from_value::<Self>(value).ok())
             })
-            .filter(|row| row.kind == "application.voice.frame")
+            .filter(|row| row.kind == kind)
             .fold(
                 Self {
-                    kind: "application.voice.frame".to_owned(),
+                    kind: kind.to_owned(),
                     ..Self::default()
                 },
                 |mut total, row| {
@@ -1083,6 +1090,16 @@ impl S2SDebugVoiceIoSnapshot {
             recv_count: self.recv_count.saturating_sub(before.recv_count),
             total_count: self.total_count.saturating_sub(before.total_count),
         }
+    }
+
+    fn saturating_add(mut self, other: &Self) -> Self {
+        self.sent_bytes = self.sent_bytes.saturating_add(other.sent_bytes);
+        self.recv_bytes = self.recv_bytes.saturating_add(other.recv_bytes);
+        self.total_bytes = self.total_bytes.saturating_add(other.total_bytes);
+        self.sent_count = self.sent_count.saturating_add(other.sent_count);
+        self.recv_count = self.recv_count.saturating_add(other.recv_count);
+        self.total_count = self.total_count.saturating_add(other.total_count);
+        self
     }
 }
 
@@ -2418,8 +2435,18 @@ async fn s2s_broadcast_shout_to_all_clients_survives_bad_node() {
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2s_root_children_shout_reports_cross_node_traffic_amplification() {
+    run_s2s_root_children_shout_traffic(false).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2s_root_children_shout_uses_tree_delivery_budget() {
+    run_s2s_root_children_shout_traffic(true).await;
+}
+
+async fn run_s2s_root_children_shout_traffic(tree_delivery_enabled: bool) {
     let _guard = s2s_network_test_guard().await;
-    let cluster = spawn_s2s_convergence_cluster().await;
+    let cluster = spawn_s2s_convergence_cluster_with_tree_delivery(tree_delivery_enabled).await;
     cluster.connect_full_mesh().await;
     wait_for_convergence_cluster(&cluster).await;
     let servers = cluster.servers.iter().collect::<Vec<_>>();
@@ -2516,7 +2543,9 @@ async fn s2s_root_children_shout_reports_cross_node_traffic_amplification() {
         S2S_SHOUT_MIN_SPEAK_SPAN
     );
 
-    let voice_before = S2SDebugVoiceIoSnapshot::capture();
+    let legacy_before = S2SDebugVoiceIoSnapshot::capture("application.voice.frame");
+    let tree_original_before = S2SDebugVoiceIoSnapshot::capture("application.voice.tree.original");
+    let tree_repair_before = S2SDebugVoiceIoSnapshot::capture("application.voice.tree.repair");
     let speak_start = Instant::now();
     let send_task =
         async { send_s2s_shout_voice_segment(&alice, S2S_SHOUT_TARGET_SLOT, &frames).await };
@@ -2532,8 +2561,16 @@ async fn s2s_root_children_shout_reports_cross_node_traffic_amplification() {
         .await
     };
     let (_sent_at, _deliveries) = tokio::join!(send_task, receive_task);
-    let voice_after = S2SDebugVoiceIoSnapshot::capture();
-    let voice_delta = voice_after.saturating_sub(&voice_before);
+    let legacy_delta =
+        S2SDebugVoiceIoSnapshot::capture("application.voice.frame").saturating_sub(&legacy_before);
+    let tree_original_delta = S2SDebugVoiceIoSnapshot::capture("application.voice.tree.original")
+        .saturating_sub(&tree_original_before);
+    let tree_repair_delta = S2SDebugVoiceIoSnapshot::capture("application.voice.tree.repair")
+        .saturating_sub(&tree_repair_before);
+    let voice_delta = legacy_delta
+        .clone()
+        .saturating_add(&tree_original_delta)
+        .saturating_add(&tree_repair_delta);
 
     let frame_count = frames.len() as u64;
     let remote_nodes = (servers.len() - 1) as u64;
@@ -2556,7 +2593,7 @@ async fn s2s_root_children_shout_reports_cross_node_traffic_amplification() {
     let estimated_duplicate_bytes =
         (voice_delta.sent_bytes as f64 - estimated_minimum_bytes).max(0.0);
     eprintln!(
-        "s2s_root_children_shout_traffic frames={} remote_nodes={} minimum_first_hops={} sent_packets={} minimum_packets={} duplicate_packets={} amplification={:.2}x sent_bytes={} estimated_minimum_bytes={:.0} estimated_duplicate_bytes={:.0} avg_packet_bytes={:.1} recv_packets={} recv_bytes={}",
+        "s2s_root_children_shout_traffic frames={} remote_nodes={} minimum_first_hops={} sent_packets={} minimum_packets={} duplicate_packets={} amplification={:.2}x sent_bytes={} estimated_minimum_bytes={:.0} estimated_duplicate_bytes={:.0} avg_packet_bytes={:.1} recv_packets={} recv_bytes={} legacy_packets={} tree_original_packets={} tree_repair_packets={}",
         frame_count,
         remote_nodes,
         minimum_first_hops,
@@ -2570,19 +2607,47 @@ async fn s2s_root_children_shout_reports_cross_node_traffic_amplification() {
         average_packet_bytes,
         voice_delta.recv_count,
         voice_delta.recv_bytes,
+        legacy_delta.sent_count,
+        tree_original_delta.sent_count,
+        tree_repair_delta.sent_count,
     );
 
     assert!(
         voice_delta.sent_count >= minimum_packet_budget,
         "root+children shout sent fewer than one multicast packet per frame"
     );
+    if tree_delivery_enabled {
+        assert!(
+            tree_original_delta.sent_count >= frame_count,
+            "tree delivery never became active after its compatibility window"
+        );
+        assert_eq!(
+            tree_repair_delta.sent_count, 0,
+            "healthy tree-delivery test should not use alternate repair"
+        );
+    }
+    // Tree edges are logical source-tree edges. The current underlay may
+    // route one logical edge across an alternate physical hop, so physical IO
+    // is bounded at two copies per remote node while exact tree use is proved
+    // by the separately classified original-frame counter above.
+    let packet_budget = repair_packet_budget;
     assert!(
-        voice_delta.sent_count <= repair_packet_budget,
-        "root+children shout exceeded the broadcast plus one repair-copy packet budget"
+        voice_delta.sent_count <= packet_budget,
+        "root+children shout exceeded the {} delivery packet budget",
+        if tree_delivery_enabled {
+            "tree"
+        } else {
+            "legacy"
+        }
     );
     assert!(
-        voice_delta.recv_count <= repair_packet_budget,
-        "root+children shout exceeded the broadcast plus one repair-copy receive budget"
+        voice_delta.recv_count <= packet_budget,
+        "root+children shout exceeded the {} delivery receive budget",
+        if tree_delivery_enabled {
+            "tree"
+        } else {
+            "legacy"
+        }
     );
 }
 

@@ -33,6 +33,7 @@ use tracing::warn;
 
 use shitspeak_s2s_transport::{AdaptiveInboundReceiver, Inbound};
 
+use super::distribution::DistributionPlane;
 use super::duplicate::DuplicateDetector;
 use super::lsdb::{
     LinkStateDb, LsaEmitter, LsaFloodPacer, handle_flood, handle_sync_request, handle_sync_response,
@@ -49,6 +50,7 @@ pub(crate) struct DispatcherCtx {
     pub monitor: Arc<NeighborMonitor>,
     pub lsdb: Arc<LinkStateDb>,
     pub routing: RoutingHandle,
+    pub distribution: Arc<DistributionPlane>,
     pub services: Arc<super::messaging::ServiceRegistry>,
     pub ordering: Arc<super::messaging::ordering::OverlayOrdering>,
     pub duplicate_detector: Arc<DuplicateDetector>,
@@ -161,11 +163,12 @@ async fn handle(
             .await
         }
         OverlayBody::Data(data) => {
-            messaging_forward::handle_inbound(
+            messaging_forward::handle_inbound_with_distribution(
                 &ctx.transport,
                 &ctx.routing,
                 &ctx.services,
                 &ctx.ordering,
+                &ctx.distribution,
                 ctx.self_id,
                 from,
                 data,

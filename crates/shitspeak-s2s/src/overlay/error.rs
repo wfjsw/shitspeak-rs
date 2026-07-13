@@ -38,4 +38,6 @@ pub enum OverlayError {
     OrderedWindowFull { dst: NodeIdentifier, lane: u32 },
     #[error("no service handler is registered for tag {tag}")]
     ServiceNotRegistered { tag: u32 },
+    #[error("distribution tree {profile}/{version} was not acknowledged by every relay")]
+    DistributionTreeUnacknowledged { profile: u32, version: u64 },
 }
