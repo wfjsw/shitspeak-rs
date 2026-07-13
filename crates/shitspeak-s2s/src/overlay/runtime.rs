@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -40,7 +41,16 @@ use super::routing::{RoutingHandle, new_handle as new_routing_handle, spawn_reco
 
 const METRIC_CHANGE_STABLE_CHECKS: u8 = 3;
 const VOICE_METRIC_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const TREE_CLOCK_FALLBACK_LOG_INTERVAL: Duration = Duration::from_secs(5);
 static LAST_PROCESS_BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreeClockFallbackLogState {
+    child: NodeIdentifier,
+    next_hop: Option<NodeIdentifier>,
+    reason: &'static str,
+    logged_at: Instant,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LocalBootEpochFileV1 {
@@ -156,6 +166,7 @@ pub(crate) struct OverlayInner {
     pub hello: Arc<HelloContext>,
     pub shutdown: CancellationToken,
     pub cfg: OverlayConfig,
+    tree_clock_fallback_log: Mutex<Option<TreeClockFallbackLogState>>,
 }
 
 impl OverlayInner {
@@ -238,7 +249,34 @@ impl OverlayInner {
             hello,
             shutdown,
             cfg,
+            tree_clock_fallback_log: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn should_log_tree_clock_fallback(
+        &self,
+        child: NodeIdentifier,
+        next_hop: Option<NodeIdentifier>,
+        reason: &'static str,
+    ) -> bool {
+        let now = Instant::now();
+        let mut last = self.tree_clock_fallback_log.lock();
+        let changed = last.is_none_or(|previous| {
+            previous.child != child || previous.next_hop != next_hop || previous.reason != reason
+        });
+        let interval_elapsed = last.is_none_or(|previous| {
+            now.saturating_duration_since(previous.logged_at) >= TREE_CLOCK_FALLBACK_LOG_INTERVAL
+        });
+        if !changed && !interval_elapsed {
+            return false;
+        }
+        *last = Some(TreeClockFallbackLogState {
+            child,
+            next_hop,
+            reason,
+            logged_at: now,
+        });
+        true
     }
 
     /// Spawn every long-running task: Hello ticker, link-up watcher,

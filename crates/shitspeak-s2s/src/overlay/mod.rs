@@ -1216,17 +1216,22 @@ impl OverlayNetwork {
         // Before originating a tree, ensure each initial physical peer has a
         // fresh direct clock estimate; otherwise normal multicast is the
         // only safe delivery path for this frame.
-        let clock_ready = state.children(self.inner.self_id).iter().all(|child| {
-            self.inner
+        let clock_failure = state.children(self.inner.self_id).iter().find_map(|child| {
+            let route = self
+                .inner
                 .routing
                 .load()
-                .lookup_with_metric(*child, level, routing_metric)
-                .is_some_and(|route| {
-                    self.inner
-                        .neighbor
-                        .has_mutual_fresh_peer_clock_offset(route.next_hop)
-                })
+                .lookup_with_metric(*child, level, routing_metric);
+            let Some(route) = route else {
+                return Some((*child, None, "route_missing"));
+            };
+            (!self
+                .inner
+                .neighbor
+                .has_mutual_fresh_peer_clock_offset(route.next_hop))
+            .then_some((*child, Some(route.next_hop), "peer_not_ready"))
         });
+        let clock_ready = clock_failure.is_none();
         if !capability_ready || !clock_ready {
             let metric_context = distribution_metrics::DistributionMetricContext::new(
                 profile.id(),
@@ -1242,12 +1247,21 @@ impl OverlayNetwork {
                 );
             }
             if !clock_ready {
-                tracing::debug!(
-                    source = %self.inner.self_id,
-                    profile = profile.id(),
-                    group,
-                    "falling back from distribution tree because a first-hop peer clock estimate is not mutually ready"
-                );
+                let (child, next_hop, reason) = clock_failure.expect("clock failure");
+                if self
+                    .inner
+                    .should_log_tree_clock_fallback(child, next_hop, reason)
+                {
+                    tracing::debug!(
+                        source = %self.inner.self_id,
+                        profile = profile.id(),
+                        group,
+                        %child,
+                        ?next_hop,
+                        reason,
+                        "falling back from distribution tree because a first-hop peer is not mutually clock-ready"
+                    );
+                }
                 distribution_metrics::record_clock_offset_fallback_with_context(
                     metric_context,
                     "source_clock_unready",

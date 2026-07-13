@@ -1017,9 +1017,17 @@ impl LinkStateDb {
     ///
     /// This represents only the active topology and eligibility state that
     /// can change a tree: member identity, transit and service eligibility,
-    /// distribution capability, and directed neighbor transport masks.
-    /// It intentionally omits LSA sequence numbers and sampled link metrics
-    /// so metric changes can remain subject to distribution hysteresis.
+    /// distribution capability, and the directed neighbor relationship.
+    ///
+    /// Transport masks intentionally do not participate. Individual
+    /// transports can flap while the logical neighbor relationship remains
+    /// routable; hashing those changes invalidates every source tree in the
+    /// mesh and keeps control installation permanently pending. A selected
+    /// edge that really becomes unusable is handled by the failure-report and
+    /// reparent path instead.
+    ///
+    /// LSA sequence numbers and sampled link metrics are also omitted so
+    /// route-quality changes remain subject to distribution hysteresis.
     pub fn distribution_epoch(&self) -> u64 {
         let entries = self.inner.read();
         let mut active: Vec<_> = entries.values().filter(|entry| !entry.tombstone).collect();
@@ -1055,11 +1063,10 @@ impl LinkStateDb {
                 .iter()
                 .filter(|link| active_origins.contains(&link.neighbor))
                 .collect();
-            links.sort_by_key(|link| (link.neighbor, link.transports_mask));
+            links.sort_by_key(|link| link.neighbor);
             distribution_epoch_hash_value(&mut hash, links.len() as u64);
             for link in links {
                 distribution_epoch_hash_value(&mut hash, u64::from(link.neighbor));
-                distribution_epoch_hash_value(&mut hash, u64::from(link.transports_mask));
             }
         }
         hash.max(1)
@@ -1357,13 +1364,36 @@ mod tests {
     }
 
     #[test]
-    fn distribution_epoch_changes_for_transit_service_capability_and_link_state() {
+    fn distribution_epoch_ignores_transport_mask_changes_but_tracks_link_membership() {
         let db = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
         let mut source = entry(1, 100, 1, false);
         source.links = vec![test_link(2, 1_000)];
         source.links[0].transports_mask = 0b01;
         assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
         assert_eq!(db.admit(entry(2, 100, 1, false)), AdmissionResult::Accepted);
+        assert_eq!(db.admit(entry(3, 100, 1, false)), AdmissionResult::Accepted);
+        let before_mask_change = db.distribution_epoch();
+
+        source.seq = 2;
+        source.links[0].transports_mask = 0b10;
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        assert_eq!(db.distribution_epoch(), before_mask_change);
+
+        source.seq = 3;
+        source.links.push(test_link(3, 1_000));
+        assert_eq!(db.admit(source), AdmissionResult::Accepted);
+        assert_ne!(db.distribution_epoch(), before_mask_change);
+    }
+
+    #[test]
+    fn distribution_epoch_changes_for_transit_service_capability_and_link_membership() {
+        let db = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
+        let mut source = entry(1, 100, 1, false);
+        source.links = vec![test_link(2, 1_000)];
+        source.links[0].transports_mask = 0b01;
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        assert_eq!(db.admit(entry(2, 100, 1, false)), AdmissionResult::Accepted);
+        assert_eq!(db.admit(entry(3, 100, 1, false)), AdmissionResult::Accepted);
         let initial = db.distribution_epoch();
 
         source.seq = 2;
@@ -1409,7 +1439,7 @@ mod tests {
         assert_ne!(profiles_changed, capability_changed);
 
         source.seq = 8;
-        source.links[0].transports_mask = 0b10;
+        source.links.push(test_link(3, 1_000));
         assert_eq!(db.admit(source), AdmissionResult::Accepted);
         assert_ne!(db.distribution_epoch(), profiles_changed);
     }
