@@ -108,7 +108,10 @@ pub struct DistributionCapabilities {
 }
 
 impl DistributionCapabilities {
-    pub const PROTOCOL_VERSION: u32 = 1;
+    /// Version 2 carries hop-rebased, peer-clock-aware distribution
+    /// deadlines. Version 1 remains readable for rolling-upgrade fallback.
+    pub const PROTOCOL_VERSION: u32 = 2;
+    pub const V1_PROTOCOL_VERSION: u32 = 1;
 
     pub const UNSUPPORTED: Self = Self {
         protocol_version: 0,
@@ -116,11 +119,21 @@ impl DistributionCapabilities {
     };
 
     pub const V1_EMPTY: Self = Self {
-        protocol_version: Self::PROTOCOL_VERSION,
+        protocol_version: Self::V1_PROTOCOL_VERSION,
         profile_ids: Vec::new(),
     };
 
     pub fn v1(profile_ids: impl IntoIterator<Item = u32>) -> Self {
+        let mut profile_ids: Vec<_> = profile_ids.into_iter().filter(|id| *id != 0).collect();
+        profile_ids.sort_unstable();
+        profile_ids.dedup();
+        Self {
+            protocol_version: Self::V1_PROTOCOL_VERSION,
+            profile_ids,
+        }
+    }
+
+    pub fn v2(profile_ids: impl IntoIterator<Item = u32>) -> Self {
         let mut profile_ids: Vec<_> = profile_ids.into_iter().filter(|id| *id != 0).collect();
         profile_ids.sort_unstable();
         profile_ids.dedup();
@@ -898,6 +911,11 @@ pub struct LinkStateDb {
     dirty_origins: RwLock<HashSet<NodeIdentifier>>,
 }
 
+fn distribution_epoch_hash_value(hash: &mut u64, value: u64) {
+    *hash ^= value;
+    *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+}
+
 impl LinkStateDb {
     pub fn new(floor: Arc<LsaFloor>) -> Self {
         Self {
@@ -993,6 +1011,58 @@ impl LinkStateDb {
         let mut out: Vec<LsaEntry> = self.inner.read().values().cloned().collect();
         out.sort_by_key(|e| e.origin);
         out
+    }
+
+    /// Stable structural epoch for profiled distribution trees.
+    ///
+    /// This represents only the active topology and eligibility state that
+    /// can change a tree: member identity, transit and service eligibility,
+    /// distribution capability, and directed neighbor transport masks.
+    /// It intentionally omits LSA sequence numbers and sampled link metrics
+    /// so metric changes can remain subject to distribution hysteresis.
+    pub fn distribution_epoch(&self) -> u64 {
+        let entries = self.inner.read();
+        let mut active: Vec<_> = entries.values().filter(|entry| !entry.tombstone).collect();
+        active.sort_by_key(|entry| entry.origin);
+        let active_origins: HashSet<_> = active.iter().map(|entry| entry.origin).collect();
+
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        distribution_epoch_hash_value(&mut hash, active.len() as u64);
+        for entry in active {
+            distribution_epoch_hash_value(&mut hash, u64::from(entry.origin));
+            distribution_epoch_hash_value(&mut hash, entry.boot_epoch);
+            distribution_epoch_hash_value(&mut hash, u64::from(entry.transit_disabled));
+            distribution_epoch_hash_value(
+                &mut hash,
+                u64::from(entry.replication_services.strict()),
+            );
+            distribution_epoch_hash_value(
+                &mut hash,
+                u64::from(entry.replication_services.content()),
+            );
+            distribution_epoch_hash_value(&mut hash, u64::from(entry.replication_services.owner()));
+            distribution_epoch_hash_value(&mut hash, u64::from(entry.application_services.voice()));
+
+            let distribution = entry.application_services.distribution();
+            distribution_epoch_hash_value(&mut hash, u64::from(distribution.protocol_version()));
+            distribution_epoch_hash_value(&mut hash, distribution.profile_ids().len() as u64);
+            for profile_id in distribution.profile_ids() {
+                distribution_epoch_hash_value(&mut hash, u64::from(*profile_id));
+            }
+
+            let mut links: Vec<_> = entry
+                .links
+                .iter()
+                .filter(|link| active_origins.contains(&link.neighbor))
+                .collect();
+            links.sort_by_key(|link| (link.neighbor, link.transports_mask));
+            distribution_epoch_hash_value(&mut hash, links.len() as u64);
+            for link in links {
+                distribution_epoch_hash_value(&mut hash, u64::from(link.neighbor));
+                distribution_epoch_hash_value(&mut hash, u64::from(link.transports_mask));
+            }
+        }
+        hash.max(1)
     }
 
     pub(crate) fn with_entries<R>(
@@ -1247,6 +1317,104 @@ mod tests {
     }
 
     #[test]
+    fn distribution_epoch_ignores_lsa_sequence_and_link_metric_changes() {
+        let db = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
+        let mut source = entry(1, 100, 1, false);
+        source.links = vec![test_link(2, 1_000), test_link(3, 2_000)];
+        source.links[0].transports_mask = 0b01;
+        source.links[1].transports_mask = 0b10;
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        assert_eq!(db.admit(entry(2, 100, 1, false)), AdmissionResult::Accepted);
+        assert_eq!(db.admit(entry(3, 100, 1, false)), AdmissionResult::Accepted);
+        let before = db.distribution_epoch();
+
+        source.seq = 2;
+        source.max_users = 500;
+        source.links.reverse();
+        for link in &mut source.links {
+            link.rtt_us = 99_000;
+            link.jitter_us = 9_000;
+            link.throughput_bps = 1_000_000;
+            link.observed_recv_bps = 900_000;
+            link.observed_sent_bps = 800_000;
+            link.throughput_confidence_ppm = 750_000;
+            link.loss_ppm = 200_000;
+            link.probe_loss_ppm = 100_000;
+            link.native_loss_ppm = 150_000;
+            link.data_health_ppm = 50_000;
+            link.loss_sample_count = 100;
+            link.transport_metrics = vec![LinkTransportAdvertised::new(
+                TransportKind::Udp,
+                99_000,
+                9_000,
+                200_000,
+                100,
+            )];
+        }
+        assert_eq!(db.admit(source), AdmissionResult::Accepted);
+
+        assert_eq!(db.distribution_epoch(), before);
+    }
+
+    #[test]
+    fn distribution_epoch_changes_for_transit_service_capability_and_link_state() {
+        let db = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
+        let mut source = entry(1, 100, 1, false);
+        source.links = vec![test_link(2, 1_000)];
+        source.links[0].transports_mask = 0b01;
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        assert_eq!(db.admit(entry(2, 100, 1, false)), AdmissionResult::Accepted);
+        let initial = db.distribution_epoch();
+
+        source.seq = 2;
+        source.boot_epoch = 101;
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        let identity_changed = db.distribution_epoch();
+        assert_ne!(identity_changed, initial);
+
+        source.seq = 3;
+        source.transit_disabled = true;
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        let transit_changed = db.distribution_epoch();
+        assert_ne!(transit_changed, identity_changed);
+
+        source.seq = 4;
+        source.replication_services = ReplicationServices::NONE;
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        let replication_service_changed = db.distribution_epoch();
+        assert_ne!(replication_service_changed, transit_changed);
+
+        source.seq = 5;
+        source.application_services = ApplicationServices::new(false);
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        let service_changed = db.distribution_epoch();
+        assert_ne!(service_changed, replication_service_changed);
+
+        source.seq = 6;
+        source.application_services = ApplicationServices::with_distribution_capabilities(
+            false,
+            DistributionCapabilities::v2([1, 7]),
+        );
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        let capability_changed = db.distribution_epoch();
+        assert_ne!(capability_changed, service_changed);
+
+        source.seq = 7;
+        source.application_services = ApplicationServices::with_distribution_capabilities(
+            false,
+            DistributionCapabilities::v2([1, 8]),
+        );
+        assert_eq!(db.admit(source.clone()), AdmissionResult::Accepted);
+        let profiles_changed = db.distribution_epoch();
+        assert_ne!(profiles_changed, capability_changed);
+
+        source.seq = 8;
+        source.links[0].transports_mask = 0b10;
+        assert_eq!(db.admit(source), AdmissionResult::Accepted);
+        assert_ne!(db.distribution_epoch(), profiles_changed);
+    }
+
+    #[test]
     fn admit_first_lsa() {
         let floor = Arc::new(LsaFloor::new(0, None));
         let db = LinkStateDb::new(floor);
@@ -1346,22 +1514,32 @@ mod tests {
         let mut lsa = entry(1, 100, 1, false);
         lsa.application_services = ApplicationServices::with_distribution_capabilities(
             true,
-            DistributionCapabilities::v1([9, 3, 9]),
+            DistributionCapabilities::v2([9, 3, 9]),
         );
 
         let pb = lsa.to_pb();
-        assert_eq!(pb.distribution_protocol_version, 1);
+        assert_eq!(
+            pb.distribution_protocol_version,
+            DistributionCapabilities::PROTOCOL_VERSION
+        );
         assert_eq!(pb.distribution_profile_ids, vec![3, 9]);
 
         let roundtrip = LsaEntry::from_pb(&pb).unwrap();
-        assert!(roundtrip.application_services.distribution().supports(1, 3));
-        assert!(roundtrip.application_services.distribution().supports(1, 9));
-        assert!(!roundtrip.application_services.distribution().supports(1, 8));
+        assert!(roundtrip.application_services.distribution().supports(2, 3));
+        assert!(roundtrip.application_services.distribution().supports(2, 9));
+        assert!(!roundtrip.application_services.distribution().supports(2, 8));
 
         let db = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
         assert_eq!(db.admit(roundtrip), AdmissionResult::Accepted);
-        assert!(db.supports_distribution_profile(1, 1, 3));
-        assert!(!db.supports_distribution_profile(1, 1, 8));
+        assert!(db.supports_distribution_profile(1, 2, 3));
+        assert!(!db.supports_distribution_profile(1, 2, 8));
+    }
+
+    #[test]
+    fn v1_distribution_capability_is_ineligible_for_v2_trees() {
+        let capability = DistributionCapabilities::v1([3]);
+        assert!(capability.supports(1, 3));
+        assert!(!capability.supports(DistributionCapabilities::PROTOCOL_VERSION, 3));
     }
 
     #[test]

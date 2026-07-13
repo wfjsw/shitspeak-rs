@@ -53,6 +53,10 @@ use shitspeak_s2s_transport::{
     ServiceLevel, TransportKind,
 };
 
+// A fresh LSA can briefly have no measured edge latency. Treat that as an
+// unknown long-haul leg, not a zero-latency leg, until probes converge.
+const UNKNOWN_TREE_EDGE_PLAYOUT_BASELINE_MS: u64 = 120;
+
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use duplicate::{DuplicateDetector, DuplicateEvidenceKind, DuplicateNodeSnapshot};
 pub use error::OverlayError;
@@ -289,30 +293,57 @@ impl OverlayNetwork {
         self.inner.self_id
     }
 
-    fn distribution_topology_epoch(&self) -> u64 {
-        let mut entries = self.link_state_snapshot();
-        entries.sort_by_key(|entry| entry.origin);
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for entry in entries {
-            for value in [
-                u64::from(entry.origin),
-                entry.boot_epoch,
-                u64::from(entry.tombstone),
-                u64::from(entry.transit_disabled),
-            ] {
-                hash ^= value;
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            let mut links = entry.links;
-            links.sort_by_key(|link| link.neighbor);
-            for link in links {
-                for value in [u64::from(link.neighbor), u64::from(link.transports_mask)] {
-                    hash ^= value;
-                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    pub(crate) fn peer_clock_offsets(
+        &self,
+    ) -> Vec<(NodeIdentifier, neighbor::monitor::PeerClockOffset)> {
+        self.inner.neighbor.peer_clock_offsets()
+    }
+
+    fn tree_playout_delays_ms(&self, tree: &distribution::TreeState) -> Vec<(NodeIdentifier, u64)> {
+        let source = self.inner.self_id;
+        let mut cumulative = std::collections::HashMap::from([(source, 0_u64)]);
+        let mut pending = std::collections::VecDeque::from([source]);
+        let mut delays = Vec::new();
+        while let Some(parent) = pending.pop_front() {
+            let parent_delay = cumulative.get(&parent).copied().unwrap_or_default();
+            for child in tree.children(parent) {
+                let measured_edge_delay = self
+                    .inner
+                    .lsdb
+                    .get(parent)
+                    .and_then(|entry| entry.links.into_iter().find(|link| link.neighbor == *child))
+                    .and_then(|link| {
+                        (link.rtt_us > 0).then_some(
+                            link.rtt_us
+                                .div_ceil(2_000)
+                                .saturating_add(link.jitter_us.saturating_mul(3).div_ceil(1_000))
+                                // Each logical tree edge can include forwarding
+                                // work at a relay, so leave a small fixed margin.
+                                .saturating_add(20),
+                        )
+                    });
+                let edge_delay = measured_edge_delay.unwrap_or_else(|| {
+                    self.inner
+                        .routing
+                        .load()
+                        .lookup_with_metric(
+                            *child,
+                            ServiceLevel::BestEffort,
+                            RoutingMetric::ConversationalQuality,
+                        )
+                        .map(|route| route.latency_us.div_ceil(1_000).saturating_add(20))
+                        .unwrap_or_default()
+                        .max(UNKNOWN_TREE_EDGE_PLAYOUT_BASELINE_MS)
+                });
+                let delay = parent_delay.saturating_add(edge_delay);
+                cumulative.insert(*child, delay);
+                if tree.is_member(*child) {
+                    delays.push((*child, delay));
                 }
+                pending.push_back(*child);
             }
         }
-        hash.max(1)
+        delays
     }
 
     /// Local node's `boot_epoch` (microseconds since UNIX epoch, captured
@@ -1114,7 +1145,7 @@ impl OverlayNetwork {
         };
         let level = profile.level();
         let routing_metric = profile.metric();
-        let topology_epoch = self.distribution_topology_epoch();
+        let topology_epoch = self.inner.lsdb.distribution_epoch();
         let scope = distribution::TreeKey {
             source: self.inner.self_id,
             profile: profile.id(),
@@ -1124,19 +1155,43 @@ impl OverlayNetwork {
             version: 0,
         };
         let excluded = self.inner.distribution.failed_edges(scope);
+        let routing = self.inner.routing.load();
+        let recipient_path_cost = dsts
+            .iter()
+            .filter_map(|recipient| {
+                routing
+                    .lookup_with_metric(*recipient, level, routing_metric)
+                    .map(|route| route.cost)
+            })
+            .fold(0_u64, u64::saturating_add);
+        let edges = routing.multicast_tree_edges_avoiding(
+            self.inner.self_id,
+            &dsts,
+            level,
+            routing_metric,
+            &excluded,
+        );
+        drop(routing);
+        let shape = distribution::TreeState::new(
+            self.inner.self_id,
+            dsts.iter().copied(),
+            edges.iter().copied(),
+        );
+        // The tree profile is generic, but voice consumes this optional
+        // receiver policy to latch a remote media playout delay. Calculate it
+        // directly along every selected directed tree edge, not from a
+        // source-to-recipient shortcut: one-way RTT, three jitter terms, and
+        // a relay margin accumulate through the selected tree path.
+        let playout_delays = self.tree_playout_delays_ms(&shape);
         let state = self.inner.distribution.select_tree(
             scope,
-            distribution::TreeState::new(
+            distribution::TreeState::new_with_playout(
                 self.inner.self_id,
                 dsts.iter().copied(),
-                self.inner.routing.load().multicast_tree_edges_avoiding(
-                    self.inner.self_id,
-                    &dsts,
-                    level,
-                    routing_metric,
-                    &excluded,
-                ),
-            ),
+                edges,
+                playout_delays,
+            )
+            .with_recipient_path_cost(recipient_path_cost),
         );
         let key = distribution::TreeKey {
             version: distribution::tree_version(
@@ -1157,8 +1212,51 @@ impl OverlayNetwork {
                     profile.id(),
                 )
         });
-        if !capability_ready {
-            distribution_metrics::record_compatibility_fallback(profile.id());
+        // The v2 tree wire format rebases deadlines at every physical hop.
+        // Before originating a tree, ensure each initial physical peer has a
+        // fresh direct clock estimate; otherwise normal multicast is the
+        // only safe delivery path for this frame.
+        let clock_ready = state.children(self.inner.self_id).iter().all(|child| {
+            self.inner
+                .routing
+                .load()
+                .lookup_with_metric(*child, level, routing_metric)
+                .is_some_and(|route| {
+                    self.inner
+                        .neighbor
+                        .has_mutual_fresh_peer_clock_offset(route.next_hop)
+                })
+        });
+        if !capability_ready || !clock_ready {
+            let metric_context = distribution_metrics::DistributionMetricContext::new(
+                profile.id(),
+                tag,
+                self.inner.self_id,
+                Some(group),
+                distribution_metrics::EdgeDirection::Local,
+            );
+            if !capability_ready {
+                distribution_metrics::record_compatibility_fallback_with_context(
+                    metric_context,
+                    "capability_unsupported",
+                );
+            }
+            if !clock_ready {
+                tracing::debug!(
+                    source = %self.inner.self_id,
+                    profile = profile.id(),
+                    group,
+                    "falling back from distribution tree because a first-hop peer clock estimate is not mutually ready"
+                );
+                distribution_metrics::record_clock_offset_fallback_with_context(
+                    metric_context,
+                    "source_clock_unready",
+                );
+                distribution_metrics::record_compatibility_fallback_with_context(
+                    metric_context,
+                    "source_clock_unready",
+                );
+            }
             return self
                 .send_multicast_unordered_with_routing_metric_and_options(
                     &dsts,
@@ -1226,7 +1324,16 @@ impl OverlayNetwork {
             // Tree state is not active until every required ACK arrives. Do
             // not stall realtime ingress; the compatibility path preserves
             // frame pacing while the one coalesced install is in flight.
-            distribution_metrics::record_compatibility_fallback(profile.id());
+            distribution_metrics::record_compatibility_fallback_with_context(
+                distribution_metrics::DistributionMetricContext::new(
+                    profile.id(),
+                    tag,
+                    self.inner.self_id,
+                    Some(group),
+                    distribution_metrics::EdgeDirection::Local,
+                ),
+                "tree_pending",
+            );
             return self
                 .send_multicast_unordered_with_routing_metric_and_options(
                     &dsts,
@@ -1248,6 +1355,7 @@ impl OverlayNetwork {
             &self.inner.transport,
             &self.inner.routing,
             &self.inner.distribution,
+            &self.inner.neighbor,
             self.inner.self_id,
             self.inner.boot_epoch,
             self.inner.ordering(),

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use shitspeak_core::ClientSessionIdentifier;
+use shitspeak_core::{ClientSessionIdentifier, NodeIdentifier};
 use shitspeak_s2s::status::PrometheusSample;
 
 use super::dispatch_tuning::{VoiceDispatchPlan, VoiceDispatchPlanSource};
@@ -391,6 +391,33 @@ pub(crate) enum S2SVoiceGatewayDropReason {
     FullOrClosed,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum RemotePlayoutResult {
+    TalkspurtStarted,
+    Scheduled,
+    Released,
+    OriginalTimelineRebased,
+    LateRepairDropped,
+    RepairBeforePlayout,
+    RepairAfterPlayout,
+    DecodeFailed,
+}
+
+impl RemotePlayoutResult {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TalkspurtStarted => "talkspurt_started",
+            Self::Scheduled => "scheduled",
+            Self::Released => "released",
+            Self::OriginalTimelineRebased => "original_timeline_rebased",
+            Self::LateRepairDropped => "late_repair_dropped",
+            Self::RepairBeforePlayout => "repair_before_playout",
+            Self::RepairAfterPlayout => "repair_after_playout",
+            Self::DecodeFailed => "decode_failed",
+        }
+    }
+}
+
 impl S2SVoiceGatewayDropReason {
     fn label(self) -> &'static str {
         match self {
@@ -422,6 +449,17 @@ const S2S_VOICE_GATEWAY_DROP_DIRECTION_COUNT: usize = 2;
 const S2S_VOICE_GATEWAY_DROP_REASON_COUNT: usize = 2;
 const VOICE_QUEUE_KIND_COUNT: usize = 4;
 const VOICE_QUEUE_ENQUEUE_RESULT_COUNT: usize = 4;
+
+const REMOTE_PLAYOUT_LATENESS_BUCKETS_MS: [(&str, u64); 8] = [
+    ("le_1", 1),
+    ("le_5", 5),
+    ("le_10", 10),
+    ("le_20", 20),
+    ("le_50", 50),
+    ("le_100", 100),
+    ("le_250", 250),
+    ("gt_250", u64::MAX),
+];
 
 const ROUTE_DIMENSIONS: [(VoiceRouteSource, VoiceRouteKind); 5] = [
     (VoiceRouteSource::Local, VoiceRouteKind::Normal),
@@ -519,6 +557,16 @@ const VOICE_BATCH_BYTES_BUCKETS: [(&str, u64); 8] = [
     ("le_65536", 65_536),
     ("gt_65536", u64::MAX),
 ];
+
+#[derive(Default)]
+struct RemotePlayoutMetrics {
+    events: HashMap<(NodeIdentifier, RemotePlayoutResult), u64>,
+    selected_delay_ms: HashMap<NodeIdentifier, u64>,
+    release_lateness_buckets: HashMap<(NodeIdentifier, &'static str), u64>,
+}
+
+static REMOTE_PLAYOUT: LazyLock<Mutex<RemotePlayoutMetrics>> =
+    LazyLock::new(|| Mutex::new(RemotePlayoutMetrics::default()));
 
 static INGRESS_PACKETS: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
 static INGRESS_BYTES: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
@@ -1190,6 +1238,38 @@ pub(crate) fn record_s2s_gateway_drop(
     );
 }
 
+pub(crate) fn record_remote_playout_event(
+    origin_node: NodeIdentifier,
+    result: RemotePlayoutResult,
+) {
+    let mut metrics = REMOTE_PLAYOUT.lock().unwrap();
+    *metrics.events.entry((origin_node, result)).or_default() += 1;
+}
+
+pub(crate) fn record_remote_playout_delay(origin_node: NodeIdentifier, delay_ms: u64) {
+    REMOTE_PLAYOUT
+        .lock()
+        .unwrap()
+        .selected_delay_ms
+        .insert(origin_node, delay_ms);
+}
+
+pub(crate) fn record_remote_playout_release(origin_node: NodeIdentifier, lateness_ms: u64) {
+    let mut metrics = REMOTE_PLAYOUT.lock().unwrap();
+    *metrics
+        .events
+        .entry((origin_node, RemotePlayoutResult::Released))
+        .or_default() += 1;
+    let bucket = REMOTE_PLAYOUT_LATENESS_BUCKETS_MS
+        .iter()
+        .find_map(|(label, upper)| (lateness_ms <= *upper).then_some(*label))
+        .unwrap_or("gt_250");
+    *metrics
+        .release_lateness_buckets
+        .entry((origin_node, bucket))
+        .or_default() += 1;
+}
+
 fn dispatch_tuning_source_label(value: u64) -> &'static str {
     match value {
         0 => VoiceDispatchPlanSource::StartupCalibrated.as_str(),
@@ -1566,6 +1646,37 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         }
     }
 
+    {
+        let state = REMOTE_PLAYOUT.lock().unwrap();
+        for ((origin_node, result), count) in &state.events {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_remote_playout_events_total",
+                vec![
+                    ("origin_node".to_owned(), origin_node.to_string()),
+                    ("result".to_owned(), result.label().to_owned()),
+                ],
+                *count as f64,
+            ));
+        }
+        for (origin_node, delay_ms) in &state.selected_delay_ms {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_remote_playout_selected_delay_ms",
+                vec![("origin_node".to_owned(), origin_node.to_string())],
+                *delay_ms as f64,
+            ));
+        }
+        for ((origin_node, bucket), count) in &state.release_lateness_buckets {
+            samples.push(PrometheusSample::new(
+                "shitspeak_voice_remote_playout_release_lateness_ms_bucket_total",
+                vec![
+                    ("origin_node".to_owned(), origin_node.to_string()),
+                    ("bucket".to_owned(), (*bucket).to_owned()),
+                ],
+                *count as f64,
+            ));
+        }
+    }
+
     for kind in [
         VoiceQueueKind::UdpProcessing,
         VoiceQueueKind::Routing,
@@ -1934,6 +2045,29 @@ mod tests {
             .filter(|sample| sample.name() == "shitspeak_voice_ingress_continuity_total")
         {
             assert_no_unbounded_voice_labels(sample);
+        }
+    }
+
+    #[test]
+    fn remote_playout_repair_outcomes_are_reported_separately() {
+        let origin_node = 77;
+        let before = prometheus_samples();
+        record_remote_playout_event(origin_node, RemotePlayoutResult::RepairBeforePlayout);
+        record_remote_playout_event(origin_node, RemotePlayoutResult::RepairAfterPlayout);
+        let after = prometheus_samples();
+
+        for result in ["repair_before_playout", "repair_after_playout"] {
+            assert!(
+                sample_value(
+                    &after,
+                    "shitspeak_voice_remote_playout_events_total",
+                    &[("origin_node", "77"), ("result", result)],
+                ) >= sample_value(
+                    &before,
+                    "shitspeak_voice_remote_playout_events_total",
+                    &[("origin_node", "77"), ("result", result)],
+                ) + 1.0
+            );
         }
     }
 }

@@ -495,6 +495,8 @@ mod tests {
                     level: USER_STATS_LEVEL,
                     class: USER_STATS_CLASS,
                     body,
+                    remote_playout_delay_ms: None,
+                    is_distribution_repair: false,
                 });
                 Ok(())
             }
@@ -564,6 +566,8 @@ mod tests {
             level: USER_STATS_LEVEL,
             class: USER_STATS_CLASS,
             body: bytes,
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
         });
 
         // The dispatch task should produce a reply unicast back to from=5.

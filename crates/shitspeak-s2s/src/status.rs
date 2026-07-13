@@ -599,6 +599,7 @@ pub fn render_prometheus_metrics(
     local_geo: Option<NodeGeo>,
 ) -> String {
     let snapshot = build_topology_snapshot(overlay, transport, local_geo);
+    crate::overlay::distribution_metrics::set_peer_clock_offsets(&overlay.peer_clock_offsets());
     let mut out = String::new();
     let mut writer = PrometheusWriter::new(&mut out);
     writer.render(&snapshot);
@@ -611,6 +612,7 @@ pub fn prometheus_samples(
     local_geo: Option<NodeGeo>,
 ) -> Vec<PrometheusSample> {
     let snapshot = build_topology_snapshot(overlay, transport, local_geo);
+    crate::overlay::distribution_metrics::set_peer_clock_offsets(&overlay.peer_clock_offsets());
     samples_from_snapshot(&snapshot)
 }
 
@@ -1062,6 +1064,36 @@ impl<'a> PrometheusWriter<'a> {
             "S2S client replication worker queue wait buckets.",
             "counter",
         );
+        self.header(
+            "shitspeak_s2s_distribution_events_total",
+            "Distribution-tree control, forwarding, deadline, and fallback events.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_distribution_pending_acks",
+            "Pending acknowledgements before a distribution tree activates.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_distribution_tree_edges",
+            "Tree edges in this node's local distribution snapshots; not cluster-unique edges.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_distribution_peer_clock_offset_us",
+            "Direct peer wall-clock offset in microseconds, positive when the peer is ahead.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_distribution_peer_clock_uncertainty_us",
+            "Direct peer clock estimate uncertainty in microseconds.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_distribution_peer_clock_estimate_age_seconds",
+            "Age of the selected fresh direct-peer clock estimate in seconds.",
+            "gauge",
+        );
 
         for sample in samples_from_snapshot(snapshot) {
             self.sample(sample);
@@ -1106,7 +1138,9 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
     let mut out = Vec::new();
     out.extend(crate::replications::metrics::prometheus_samples());
     out.extend(crate::application::voice::metrics::prometheus_samples());
-    out.extend(crate::overlay::distribution_metrics::prometheus_samples());
+    out.extend(crate::overlay::distribution_metrics::prometheus_samples(
+        snapshot.local_node,
+    ));
     let local_node = snapshot.local_node.to_string();
     for node in snapshot
         .nodes

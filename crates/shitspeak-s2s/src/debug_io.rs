@@ -548,6 +548,8 @@ mod tests {
             distribution_deadline_unix_ms: None,
             distribution_repair: false,
             distribution_repair_target: None,
+            distribution_deadline_issuer: None,
+            distribution_deadline_unix_us: None,
         }
     }
 

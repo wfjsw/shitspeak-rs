@@ -154,6 +154,7 @@ pub fn spawn_link_up_watcher(
 
 /// Inbound: respond to a Hello with a HelloAck echoing nonce + ts.
 pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: pb::Hello) {
+    let received_at_us = now_us();
     ctx.duplicate_detector.observe_epoch(
         from,
         hello.src_boot_epoch,
@@ -170,6 +171,9 @@ pub async fn respond_to_hello(ctx: &HelloContext, from: NodeIdentifier, hello: p
         src_boot_epoch: ctx.boot_epoch,
         nonce: hello.nonce,
         ts_send_us: hello.ts_send_us,
+        receive_ts_unix_us: received_at_us,
+        send_ts_unix_us: now_us(),
+        responder_has_fresh_peer_clock_offset: ctx.monitor.has_fresh_peer_clock_offset(from),
     });
     let packet_kind = crate::debug_io::classify_overlay_body(&body);
     let payload = match encode_message(&wrap(body)) {
@@ -218,6 +222,10 @@ pub fn handle_hello_ack(
         ack.src_boot_epoch,
         ack.nonce,
         ack.ts_send_us,
+        ack.receive_ts_unix_us,
+        ack.send_ts_unix_us,
+        now_us(),
+        ack.responder_has_fresh_peer_clock_offset,
         Some(transport_kind),
     );
 }

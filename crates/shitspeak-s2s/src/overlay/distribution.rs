@@ -25,6 +25,7 @@ const UNKNOWN_TREE_FRAMES_PER_KEY: usize = 8;
 const UNKNOWN_TREE_FRAMES_TOTAL: usize = 256;
 const UNKNOWN_TREE_RECOVERY_RETRY: Duration = Duration::from_millis(10);
 const METRIC_TREE_HYSTERESIS: Duration = Duration::from_secs(5);
+const EDGE_FAILURE_REPORT_DEDUP: Duration = Duration::from_secs(1);
 pub(crate) const DISTRIBUTION_CONTROL_SERVICE_TAG: u32 = 250;
 pub(crate) const VOICE_REALTIME_PROFILE_ID: u32 = 1;
 
@@ -102,6 +103,13 @@ pub(crate) struct TreeState {
     members: HashSet<NodeIdentifier>,
     children: HashMap<NodeIdentifier, Vec<NodeIdentifier>>,
     nodes: HashSet<NodeIdentifier>,
+    /// Source-computed, receiver-specific remote playout baseline. This is
+    /// installed out of band with the exact tree version and never appears on
+    /// individual voice data frames.
+    playout_delays_ms: HashMap<NodeIdentifier, u64>,
+    /// Summed source-to-recipient path cost from the routing snapshot that
+    /// selected this tree. It is source-local selection state, not wire state.
+    recipient_path_cost: Option<u64>,
 }
 
 impl TreeState {
@@ -109,6 +117,20 @@ impl TreeState {
         source: NodeIdentifier,
         members: impl IntoIterator<Item = NodeIdentifier>,
         edges: impl IntoIterator<Item = (NodeIdentifier, NodeIdentifier)>,
+    ) -> Self {
+        Self::new_with_playout(
+            source,
+            members,
+            edges,
+            std::iter::empty::<(NodeIdentifier, u64)>(),
+        )
+    }
+
+    pub(crate) fn new_with_playout(
+        source: NodeIdentifier,
+        members: impl IntoIterator<Item = NodeIdentifier>,
+        edges: impl IntoIterator<Item = (NodeIdentifier, NodeIdentifier)>,
+        playout_delays_ms: impl IntoIterator<Item = (NodeIdentifier, u64)>,
     ) -> Self {
         let members: HashSet<_> = members.into_iter().collect();
         let mut children: HashMap<NodeIdentifier, Vec<NodeIdentifier>> = HashMap::new();
@@ -126,10 +148,16 @@ impl TreeState {
             child_nodes.dedup();
         }
         nodes.extend(members.iter().copied());
+        let playout_delays_ms = playout_delays_ms
+            .into_iter()
+            .filter(|(node, delay_ms)| members.contains(node) && *delay_ms > 0)
+            .collect();
         Self {
             members,
             children,
             nodes,
+            playout_delays_ms,
+            recipient_path_cost: None,
         }
     }
 
@@ -154,6 +182,42 @@ impl TreeState {
             .iter()
             .flat_map(|(parent, children)| children.iter().map(move |child| (*parent, *child)))
     }
+
+    pub(crate) fn playout_delay_ms(&self, node: NodeIdentifier) -> Option<u64> {
+        self.playout_delays_ms.get(&node).copied()
+    }
+
+    pub(crate) fn playout_delays_ms(&self) -> impl Iterator<Item = (NodeIdentifier, u64)> + '_ {
+        self.playout_delays_ms
+            .iter()
+            .map(|(node, delay_ms)| (*node, *delay_ms))
+    }
+
+    /// Exact recipient members reachable through one direct child branch.
+    /// The source tree should be acyclic, but the visited set also bounds this
+    /// traversal when inspecting malformed remotely installed control state.
+    pub(crate) fn descendant_members(&self, child: NodeIdentifier) -> Vec<NodeIdentifier> {
+        let mut pending = vec![child];
+        let mut visited = HashSet::new();
+        let mut members = Vec::new();
+        while let Some(node) = pending.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            if self.members.contains(&node) {
+                members.push(node);
+            }
+            pending.extend(self.children(node).iter().copied());
+        }
+        members.sort_unstable();
+        members.dedup();
+        members
+    }
+
+    pub(crate) fn with_recipient_path_cost(mut self, cost: u64) -> Self {
+        self.recipient_path_cost = Some(cost);
+        self
+    }
 }
 
 #[derive(Default)]
@@ -165,6 +229,55 @@ struct PendingAcks {
 struct ActiveTree {
     state: TreeState,
     candidate: Option<(TreeState, Instant)>,
+    /// Failure edges already incorporated into the active replacement. A new
+    /// failure gets one structural bypass; unrelated future metric changes
+    /// remain subject to the five-second hysteresis.
+    applied_failures: HashSet<(NodeIdentifier, NodeIdentifier)>,
+}
+
+#[derive(Default)]
+struct VersionHistory {
+    installed: Vec<u64>,
+    activated: Vec<u64>,
+}
+
+impl VersionHistory {
+    fn record_install(&mut self, version: u64) {
+        self.installed.retain(|installed| *installed != version);
+        self.installed.push(version);
+    }
+
+    fn record_activation(&mut self, version: u64) {
+        self.activated.retain(|active| *active != version);
+        self.activated.push(version);
+        if self.activated.len() > RETAINED_VERSIONS {
+            let excess = self.activated.len() - RETAINED_VERSIONS;
+            self.activated.drain(..excess);
+        }
+    }
+
+    fn evicted_versions(&mut self) -> Vec<u64> {
+        // An installed replacement must survive until its ACK-gated
+        // activation. Keep the latest installation window for receivers that
+        // do not observe source activation, plus the source's active snapshot
+        // and its two exact predecessors.
+        let mut retained: HashSet<u64> = self
+            .installed
+            .iter()
+            .rev()
+            .take(RETAINED_VERSIONS)
+            .copied()
+            .collect();
+        retained.extend(self.activated.iter().copied());
+        let evicted: Vec<_> = self
+            .installed
+            .iter()
+            .copied()
+            .filter(|version| !retained.contains(version))
+            .collect();
+        self.installed.retain(|version| retained.contains(version));
+        evicted
+    }
 }
 
 /// A frame held only until the exact referenced tree state arrives. It is
@@ -252,7 +365,7 @@ impl RecoverySender {
     }
 }
 
-fn same_tree(left: &TreeState, right: &TreeState) -> bool {
+fn same_tree_structure(left: &TreeState, right: &TreeState) -> bool {
     let mut left_edges: Vec<_> = left.edges().collect();
     left_edges.sort_unstable();
     let mut right_edges: Vec<_> = right.edges().collect();
@@ -264,15 +377,32 @@ fn same_tree(left: &TreeState, right: &TreeState) -> bool {
     left_edges == right_edges && left_members == right_members
 }
 
+fn same_tree(left: &TreeState, right: &TreeState) -> bool {
+    same_tree_structure(left, right) && left.playout_delays_ms == right.playout_delays_ms
+}
+
+fn selection_cost_improves_materially(current: &TreeState, candidate: &TreeState) -> bool {
+    let (Some(current_cost), Some(candidate_cost)) =
+        (current.recipient_path_cost, candidate.recipient_path_cost)
+    else {
+        return false;
+    };
+    current_cost > 0 && candidate_cost.saturating_mul(100) <= current_cost.saturating_mul(90)
+}
+
 #[derive(Default)]
 pub(crate) struct DistributionPlane {
     trees: Mutex<HashMap<TreeKey, Arc<TreeState>>>,
-    versions: Mutex<HashMap<(NodeIdentifier, u32, u64, u64, u64), Vec<u64>>>,
+    versions: Mutex<HashMap<TreeScope, VersionHistory>>,
     pending: Mutex<HashMap<TreeKey, PendingAcks>>,
     unknown: Mutex<UnknownTreeFrames>,
     recovery_sender: Mutex<Option<RecoverySender>>,
     self_ref: Mutex<Weak<DistributionPlane>>,
     failed_edges: Mutex<HashMap<TreeScope, HashSet<(NodeIdentifier, NodeIdentifier)>>>,
+    /// Reports are deduplicated by source-owned directed edge, rather than by
+    /// exact tree version. A replacement can have a different version while
+    /// referring to the same physical child edge.
+    failure_reported_at: Mutex<HashMap<(NodeIdentifier, NodeIdentifier, NodeIdentifier), Instant>>,
     active_trees: Mutex<HashMap<TreeScope, ActiveTree>>,
 }
 
@@ -284,14 +414,29 @@ impl DistributionPlane {
 
     pub(crate) fn select_tree(&self, key: TreeKey, candidate: TreeState) -> TreeState {
         let scope = TreeScope::from(key);
-        let forced = self.failed_edges.lock().contains_key(&scope);
+        let failed_edges = self
+            .failed_edges
+            .lock()
+            .get(&scope)
+            .cloned()
+            .unwrap_or_default();
         let mut active = self.active_trees.lock();
         let Some(current) = active.get_mut(&scope) else {
+            let applied_failures = failed_edges
+                .iter()
+                .copied()
+                .filter(|edge| {
+                    !candidate
+                        .edges()
+                        .any(|candidate_edge| candidate_edge == *edge)
+                })
+                .collect();
             active.insert(
                 scope,
                 ActiveTree {
                     state: candidate.clone(),
                     candidate: None,
+                    applied_failures,
                 },
             );
             return candidate;
@@ -300,10 +445,30 @@ impl DistributionPlane {
             current.candidate = None;
             return current.state.clone();
         }
-        if forced {
+        // Membership/topology/reparent tree-shape changes are structural and
+        // immediately replace the active tree. Only a policy-only update on
+        // identical directed edges is subject to metric hysteresis.
+        if !same_tree_structure(&current.state, &candidate) {
+            let removed_failures: Vec<_> = failed_edges
+                .difference(&current.applied_failures)
+                .copied()
+                .filter(|edge| {
+                    !candidate
+                        .edges()
+                        .any(|candidate_edge| candidate_edge == *edge)
+                })
+                .collect();
             current.state = candidate.clone();
             current.candidate = None;
+            current.applied_failures.extend(removed_failures);
             return candidate;
+        }
+        // Pure path-cost/playout adjustments must prove a sustained 10%
+        // aggregate recipient-path-cost improvement before publication.
+        if !selection_cost_improves_materially(&current.state, &candidate) {
+            distribution_metrics::record_hysteresis_hold(key.profile);
+            current.candidate = None;
+            return current.state.clone();
         }
         match &current.candidate {
             Some((pending, since))
@@ -335,6 +500,26 @@ impl DistributionPlane {
         parent: NodeIdentifier,
         child: NodeIdentifier,
     ) {
+        if !self
+            .get(key)
+            .is_some_and(|tree| tree.edges().any(|edge| edge == (parent, child)))
+        {
+            return;
+        }
+        let now = Instant::now();
+        {
+            let mut reported = self.failure_reported_at.lock();
+            reported.retain(|_, reported_at| {
+                now.saturating_duration_since(*reported_at) < EDGE_FAILURE_REPORT_DEDUP
+            });
+            let report_key = (key.source, parent, child);
+            if reported.get(&report_key).is_some_and(|reported_at| {
+                now.saturating_duration_since(*reported_at) < EDGE_FAILURE_REPORT_DEDUP
+            }) {
+                return;
+            }
+            reported.insert(report_key, now);
+        }
         let scope = TreeScope::from(key);
         let inserted = self
             .failed_edges
@@ -380,24 +565,40 @@ impl DistributionPlane {
             unknown.in_flight_requests.remove(&key);
             frames
         };
-        let mut versions = self.versions.lock();
-        let retained = versions
-            .entry((
-                key.source,
-                key.profile,
-                key.group,
-                key.group_version,
-                key.topology_epoch,
-            ))
-            .or_default();
-        retained.retain(|version| *version != key.version);
-        retained.push(key.version);
-        while retained.len() > RETAINED_VERSIONS {
-            let version = retained.remove(0);
-            self.trees.lock().remove(&TreeKey { version, ..key });
-        }
+        self.record_installed_version(key);
         distribution_metrics::set_tree_edges(key.profile, tree_edges);
         recovered
+    }
+
+    fn record_installed_version(&self, key: TreeKey) {
+        let evicted = {
+            let mut versions = self.versions.lock();
+            let history = versions.entry(TreeScope::from(key)).or_default();
+            history.record_install(key.version);
+            history.evicted_versions()
+        };
+        if !evicted.is_empty() {
+            let mut trees = self.trees.lock();
+            for version in evicted {
+                trees.remove(&TreeKey { version, ..key });
+            }
+        }
+    }
+
+    fn record_activated_version(&self, key: TreeKey) {
+        let evicted = {
+            let mut versions = self.versions.lock();
+            let history = versions.entry(TreeScope::from(key)).or_default();
+            history.record_install(key.version);
+            history.record_activation(key.version);
+            history.evicted_versions()
+        };
+        if !evicted.is_empty() {
+            let mut trees = self.trees.lock();
+            for version in evicted {
+                trees.remove(&TreeKey { version, ..key });
+            }
+        }
     }
 
     pub(crate) fn get(&self, key: TreeKey) -> Option<Arc<TreeState>> {
@@ -421,6 +622,7 @@ impl DistributionPlane {
         distribution_metrics::set_pending_acks(key.profile, remaining_count);
         if remaining_count == 0 {
             distribution_metrics::record_activation(key.profile);
+            self.record_activated_version(key);
         }
         true
     }
@@ -451,13 +653,18 @@ impl DistributionPlane {
             let Some(entry) = pending.get_mut(&key) else {
                 return;
             };
+            let was_pending = !entry.remaining.is_empty();
             entry.remaining.remove(&node);
-            (entry.remaining.len(), entry.remaining.is_empty())
+            (
+                entry.remaining.len(),
+                was_pending && entry.remaining.is_empty(),
+            )
         };
         distribution_metrics::record_control_ack(key.profile);
         distribution_metrics::set_pending_acks(key.profile, remaining);
         if activated {
             distribution_metrics::record_activation(key.profile);
+            self.record_activated_version(key);
         }
     }
 
@@ -584,6 +791,8 @@ pub(crate) fn tree_version(
     members.sort_unstable();
     let mut edges: Vec<_> = state.edges().collect();
     edges.sort_unstable();
+    let mut playout_delays: Vec<_> = state.playout_delays_ms().collect();
+    playout_delays.sort_unstable();
     for value in std::iter::once(u64::from(source))
         .chain([u64::from(profile), group, group_version, topology_epoch])
         .chain(members.into_iter().map(u64::from))
@@ -591,6 +800,11 @@ pub(crate) fn tree_version(
             edges
                 .into_iter()
                 .flat_map(|(parent, child)| [u64::from(parent), u64::from(child)]),
+        )
+        .chain(
+            playout_delays
+                .into_iter()
+                .flat_map(|(node, delay_ms)| [u64::from(node), delay_ms]),
         )
     {
         hash ^= value;
@@ -630,6 +844,13 @@ pub(crate) fn encode_install(key: TreeKey, state: &TreeState) -> Bytes {
                 group_version: key.group_version,
                 topology_epoch: key.topology_epoch,
                 members: state.members().map(u32::from).collect(),
+                playout_delays: state
+                    .playout_delays_ms()
+                    .map(|(node, delay_ms)| pb::DistributionTreePlayoutDelay {
+                        node: node.into(),
+                        delay_ms: delay_ms.min(u64::from(u32::MAX)) as u32,
+                    })
+                    .collect(),
                 edges: state
                     .edges()
                     .map(|(parent, child)| pb::OverlayTreeEdge {
@@ -690,6 +911,7 @@ struct DistributionControlHandler {
 
 impl ServiceInbound for DistributionControlHandler {
     fn handle(&self, msg: OverlayInboundMessage) {
+        let reporter = msg.from;
         let Ok(control) = pb::DistributionControl::decode(msg.body) else {
             return;
         };
@@ -722,7 +944,16 @@ impl ServiceInbound for DistributionControlHandler {
                         topology_epoch: install.topology_epoch,
                         version: install.version,
                     };
-                    let recovered = plane.install(key, TreeState::new(source, members, edges));
+                    let playout_delays = install.playout_delays.into_iter().filter_map(|delay| {
+                        Some((
+                            NodeIdentifier::try_from(delay.node).ok()?,
+                            u64::from(delay.delay_ms),
+                        ))
+                    });
+                    let recovered = plane.install(
+                        key,
+                        TreeState::new_with_playout(source, members, edges, playout_delays),
+                    );
                     let ack = encode_control(pb::DistributionControl {
                         body: Some(pb::distribution_control::Body::Ack(
                             pb::DistributionTreeAck {
@@ -816,6 +1047,12 @@ impl ServiceInbound for DistributionControlHandler {
                     ) else {
                         return;
                     };
+                    // A relay reports its own failed send, while a receiver
+                    // can report expiry of its parent edge. Do not let an
+                    // unrelated control sender poison a source tree.
+                    if reporter != parent && reporter != child {
+                        return;
+                    }
                     if source == overlay.local_node_id() {
                         plane.report_edge_failure(
                             TreeKey {
@@ -864,6 +1101,118 @@ mod tests {
 
     fn state() -> TreeState {
         TreeState::new(1, [2], [(1, 2)])
+    }
+
+    fn state_with_delay(delay_ms: u64) -> TreeState {
+        TreeState::new_with_playout(1, [2], [(1, 2)], [(2, delay_ms)])
+    }
+
+    fn state_with_delay_and_cost(delay_ms: u64, cost: u64) -> TreeState {
+        state_with_delay(delay_ms).with_recipient_path_cost(cost)
+    }
+
+    #[test]
+    fn playout_delay_is_part_of_exact_tree_version() {
+        let lower = state_with_delay(100);
+        let higher = state_with_delay(120);
+        assert_ne!(
+            tree_version(1, VOICE_REALTIME_PROFILE_ID, 1, 1, 1, &lower),
+            tree_version(1, VOICE_REALTIME_PROFILE_ID, 1, 1, 1, &higher)
+        );
+    }
+
+    #[test]
+    fn metric_hysteresis_requires_ten_percent_path_cost_improvement() {
+        let current = state_with_delay_and_cost(100, 100);
+        assert!(!selection_cost_improves_materially(
+            &current,
+            &state_with_delay_and_cost(120, 91)
+        ));
+        assert!(selection_cost_improves_materially(
+            &current,
+            &state_with_delay_and_cost(120, 90)
+        ));
+        assert!(!selection_cost_improves_materially(
+            &current,
+            &state_with_delay_and_cost(120, 110)
+        ));
+    }
+
+    #[test]
+    fn descendant_members_are_exact_to_the_child_branch() {
+        let tree = TreeState::new(1, [2, 4, 5], [(1, 2), (1, 3), (3, 4), (3, 5)]);
+        assert_eq!(tree.descendant_members(2), vec![2]);
+        assert_eq!(tree.descendant_members(3), vec![4, 5]);
+        assert!(tree.descendant_members(99).is_empty());
+    }
+
+    #[test]
+    fn child_edge_failure_reports_are_deduplicated_by_source_directed_edge() {
+        let plane = DistributionPlane::default();
+        let first = key(1, 1);
+        let replacement = key(1, 2);
+        plane.install(first, state());
+        plane.install(replacement, state());
+        plane.report_edge_failure(first, 1, 2);
+        plane.report_edge_failure(replacement, 1, 2);
+        assert_eq!(plane.failure_reported_at.lock().len(), 1);
+        assert!(plane.failed_edges(first).contains(&(1, 2)));
+
+        plane.report_edge_failure(first, 1, 3);
+        assert!(plane.failed_edges(first).contains(&(1, 2)));
+        assert!(!plane.failed_edges(first).contains(&(1, 3)));
+    }
+
+    #[test]
+    fn structural_replacement_bypasses_hysteresis_once_then_metric_changes_hold() {
+        let plane = DistributionPlane::default();
+        let key = key(1, 1);
+        let initial = state_with_delay_and_cost(100, 100);
+        assert_eq!(
+            plane.select_tree(key, initial.clone()).playout_delay_ms(2),
+            Some(100)
+        );
+        plane.install(key, initial);
+        plane.report_edge_failure(key, 1, 2);
+
+        let replacement = TreeState::new_with_playout(1, [2], [(1, 3), (3, 2)], [(2, 120)])
+            .with_recipient_path_cost(90);
+        let selected = plane.select_tree(key, replacement.clone());
+        assert_eq!(selected.children(1), &[3]);
+
+        let metric_only = TreeState::new_with_playout(1, [2], [(1, 3), (3, 2)], [(2, 140)])
+            .with_recipient_path_cost(80);
+        assert_eq!(
+            plane.select_tree(key, metric_only).playout_delay_ms(2),
+            Some(120),
+            "the prior failure must not permanently bypass metric hysteresis"
+        );
+    }
+
+    #[test]
+    fn active_tree_and_two_predecessors_survive_until_replacement_activates() {
+        let plane = DistributionPlane::default();
+        let first = key(1, 1);
+        let second = key(1, 2);
+        let third = key(1, 3);
+        let replacement = key(1, 4);
+        for current in [first, second, third] {
+            plane.install(current, state());
+            assert!(plane.begin_publish(current, [2]));
+            plane.acknowledge(current, 2);
+        }
+
+        plane.install(replacement, state());
+        for retained in [first, second, third, replacement] {
+            assert!(plane.get(retained).is_some());
+        }
+
+        assert!(plane.begin_publish(replacement, [2]));
+        plane.acknowledge(replacement, 2);
+        assert!(plane.get(first).is_none());
+        for retained in [second, third, replacement] {
+            assert!(plane.get(retained).is_some());
+        }
     }
 
     #[test]

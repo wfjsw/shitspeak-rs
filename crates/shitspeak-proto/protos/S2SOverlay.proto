@@ -25,14 +25,25 @@ message Hello {
   uint32 src_node       = 1;
   uint64 src_boot_epoch = 2;
   uint64 nonce          = 3;
-  uint64 ts_send_us     = 4;  // sender's monotonic clock at send
+  uint64 ts_send_us     = 4;  // sender's Unix wall clock at send
 }
 
 message HelloAck {
   uint32 src_node       = 1;
   uint64 src_boot_epoch = 2;
   uint64 nonce          = 3;
-  uint64 ts_send_us     = 4;  // echoed from Hello
+  // t1: echoed Unix wall-clock timestamp from Hello.
+  uint64 ts_send_us     = 4;
+  // t2/t3: responder Unix wall-clock timestamps, captured immediately
+  // before handling Hello and immediately before transmitting this ack.
+  // Together with t4 at the initiator these form an NTP-style four-timestamp
+  // exchange for direct-link deadline translation.
+  uint64 receive_ts_unix_us = 5;
+  uint64 send_ts_unix_us = 6;
+  // True only when the responder has a fresh direct-peer clock estimate for
+  // this Hello sender. Sources require this reciprocal acknowledgement before
+  // emitting a version-2 tree frame to avoid bootstrap-time deadline drops.
+  bool responder_has_fresh_peer_clock_offset = 7;
 }
 
 // One link-state advertisement. (origin, boot_epoch, seq) identifies the
@@ -152,6 +163,11 @@ message OverlayData {
   optional uint64 distribution_deadline_unix_ms = 22;
   bool distribution_repair = 23;
   optional uint32 distribution_repair_target = 24;
+  // Version-2 distribution deadlines are expressed in the direct sender's
+  // wall clock. Each physical-hop receiver translates this value into its
+  // own clock, then becomes the issuer before forwarding.
+  optional uint32 distribution_deadline_issuer = 25;
+  optional uint64 distribution_deadline_unix_us = 26;
 }
 
 message OverlayTreeEdge {
@@ -180,6 +196,14 @@ message DistributionTreeInstall {
   uint64 group = 6;
   uint64 topology_epoch = 7;
   uint64 group_version = 8;
+  // Optional source-selected receiver playout policy. Missing values retain
+  // v1 behavior and must not delay local-only delivery.
+  repeated DistributionTreePlayoutDelay playout_delays = 9;
+}
+
+message DistributionTreePlayoutDelay {
+  uint32 node = 1;
+  uint32 delay_ms = 2;
 }
 
 message DistributionTreeAck {

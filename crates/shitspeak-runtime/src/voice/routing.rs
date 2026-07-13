@@ -1571,7 +1571,6 @@ pub(crate) async fn route_s2s_voice_frame(
     from_immediate: crate::types::NodeIdentifier,
     frame: VoiceFrame,
 ) {
-    let started_at = Instant::now();
     let sender_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
         frame.sender_session,
     );
@@ -1587,6 +1586,22 @@ pub(crate) async fn route_s2s_voice_frame(
             return;
         }
     };
+    route_s2s_voice_frame_decoded(server, from_immediate, frame, decoded).await;
+}
+
+/// Route a frame that the remote playout stage has already decoded. Keeping
+/// the decoded packet avoids re-parsing a packet solely to discover its media
+/// timeline before local recipient fan-out.
+pub(crate) async fn route_s2s_voice_frame_decoded(
+    server: &Arc<Box<Server>>,
+    from_immediate: crate::types::NodeIdentifier,
+    frame: VoiceFrame,
+    decoded: Audio,
+) {
+    let started_at = Instant::now();
+    let sender_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
+        frame.sender_session,
+    );
 
     let server_id = if frame.server_id.is_empty() {
         crate::types::default_server_id()

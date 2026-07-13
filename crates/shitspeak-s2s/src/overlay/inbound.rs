@@ -169,6 +169,7 @@ async fn handle(
                 &ctx.services,
                 &ctx.ordering,
                 &ctx.distribution,
+                &ctx.monitor,
                 ctx.self_id,
                 from,
                 data,

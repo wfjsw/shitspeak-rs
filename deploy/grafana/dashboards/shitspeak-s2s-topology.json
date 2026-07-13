@@ -7458,13 +7458,13 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum by (profile, event) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=~\"original_forward|alternate_forward|reparent|hysteresis_hold|compatibility_fallback\"}[$__rate_interval]))",
-          "legendFormat": "{{profile}} {{event}}",
+          "expr": "sum by (local_node, source, profile, service_tag, group_kind, edge_direction, event, result) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=~\"reparent|hysteresis_hold|compatibility_fallback|clock_offset_fallback|deadline_expiry\"}[$__rate_interval]))",
+          "legendFormat": "local {{local_node}} source {{source}} {{profile}} {{group_kind}} {{edge_direction}} {{event}} {{result}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Distribution Forwarding, Repair, and Reparenting",
+      "title": "Distribution Outcomes, Fallback, and Reparenting",
       "type": "timeseries"
     },
     {
@@ -7506,13 +7506,382 @@
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
           "expr": "sum by (profile) (shitspeak_s2s_distribution_tree_edges{job=~\"$job\"})",
-          "legendFormat": "{{profile}} tree edges",
+          "legendFormat": "{{profile}} tree edges (sum of local snapshots)",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "Distribution Tree State",
+      "title": "Distribution Tree State (Local Snapshots)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 241
+      },
+      "id": 78,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (local_node, source, profile, service_tag, group_kind, edge_direction, event, result) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=~\"deadline_translation|deadline_expiry|clock_offset_fallback\"}[$__rate_interval]))",
+          "legendFormat": "local {{local_node}} source {{source}} {{profile}} {{group_kind}} {{edge_direction}} {{event}} {{result}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Distribution Deadline and Clock Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 241
+      },
+      "id": 79,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (node, origin_node, result) (rate(shitspeak_voice_remote_playout_events_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "node {{node}} origin {{origin_node}} {{result}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Remote Voice Playout Events",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 249
+      },
+      "id": 80,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max by (node, origin_node) (shitspeak_voice_remote_playout_selected_delay_ms{job=~\"$job\"})",
+          "legendFormat": "node {{node}} origin {{origin_node}} selected delay",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Remote Voice Playout Delay",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 249
+      },
+      "id": 81,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (node, origin_node, bucket) (rate(shitspeak_voice_remote_playout_release_lateness_ms_bucket_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "node {{node}} origin {{origin_node}} {{bucket}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Remote Voice Playout Release Lateness",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "us"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 257
+      },
+      "id": 82,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max by (source, peer) (shitspeak_s2s_distribution_peer_clock_offset_us{job=~\"$job\"})",
+          "legendFormat": "{{source}} -> {{peer}} offset",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max by (source, peer) (shitspeak_s2s_distribution_peer_clock_uncertainty_us{job=~\"$job\"})",
+          "legendFormat": "{{source}} -> {{peer}} uncertainty",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Distribution Peer Clock Offset and Uncertainty",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 257
+      },
+      "id": 83,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max by (source, peer) (shitspeak_s2s_distribution_peer_clock_estimate_age_seconds{job=~\"$job\"})",
+          "legendFormat": "{{source}} -> {{peer}} estimate age",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Distribution Peer Clock Estimate Age",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 265
+      },
+      "id": 84,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, destination, packet_kind) (rate(shitspeak_s2s_debug_packet_io_packets_total{job=~\"$job\",direction=\"sent\",packet_kind=~\"application\\.voice\\.tree\\.(original|repair)\"}[$__rate_interval]))",
+          "legendFormat": "{{source}} -> {{destination}} {{packet_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Tree Voice Directed Edge Packets/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 265
+      },
+      "id": 85,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, destination, packet_kind) (rate(shitspeak_s2s_debug_packet_io_bytes_total{job=~\"$job\",direction=\"sent\",packet_kind=~\"application\\.voice\\.tree\\.(original|repair)\"}[$__rate_interval]))",
+          "legendFormat": "{{source}} -> {{destination}} {{packet_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Tree Voice Directed Edge Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 273
+      },
+      "id": 86,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [ "lastNotNull" ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum(max by (source, destination) (increase(shitspeak_s2s_debug_packet_io_packets_total{job=~\"$job\",direction=\"sent\",packet_kind=~\"application\\.voice\\.tree\\.(original|repair)\"}[$__rate_interval]) > bool 0)) or vector(0)",
+          "legendFormat": "active unique directed edges",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Active Unique Directed Tree Edges (Traffic Window)",
+      "type": "stat"
     }
   ],
   "preload": false,

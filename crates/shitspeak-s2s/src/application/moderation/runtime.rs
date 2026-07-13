@@ -400,6 +400,8 @@ mod tests {
             level: MODERATION_LEVEL,
             class: MODERATION_CLASS,
             body: bytes,
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
         });
 
         // Allow the dispatch task to drain.

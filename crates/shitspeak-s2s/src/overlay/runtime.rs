@@ -203,7 +203,7 @@ impl OverlayInner {
             replication_services,
             application_services,
         ));
-        emitter.update_distribution_capabilities(DistributionCapabilities::v1([
+        emitter.update_distribution_capabilities(DistributionCapabilities::v2([
             super::distribution::VOICE_REALTIME_PROFILE_ID,
         ]));
         let flood_pacer = Arc::new(LsaFloodPacer::new(self_id, transport.clone()));

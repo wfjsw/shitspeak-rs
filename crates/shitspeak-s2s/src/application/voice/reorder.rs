@@ -39,6 +39,43 @@ const ADAPTIVE_REPAIR_LOSS_BONUS_MAX_MS: u64 = 200;
 /// the audio sink.
 pub type Emission = (NodeIdentifier, VoiceFrame);
 
+/// Internal form of an emitted frame that preserves whether this exact copy
+/// was the tree's one alternate repair. The public reorder API intentionally
+/// retains its original tuple shape; only the voice ingress needs this
+/// additional delivery provenance.
+#[derive(Debug, Clone)]
+pub(crate) struct ReorderEmission {
+    from: NodeIdentifier,
+    frame: VoiceFrame,
+    is_repair: bool,
+}
+
+impl ReorderEmission {
+    fn new(from: NodeIdentifier, frame: VoiceFrame, is_repair: bool) -> Self {
+        Self {
+            from,
+            frame,
+            is_repair,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (NodeIdentifier, VoiceFrame, bool) {
+        (self.from, self.frame, self.is_repair)
+    }
+
+    pub(crate) fn from(&self) -> NodeIdentifier {
+        self.from
+    }
+
+    pub(crate) fn frame(&self) -> &VoiceFrame {
+        &self.frame
+    }
+
+    fn into_emission(self) -> Emission {
+        (self.from, self.frame)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReorderResultCount {
     result: VoiceReceiveResult,
@@ -61,14 +98,14 @@ impl ReorderResultCount {
 
 #[derive(Debug, Default)]
 pub(crate) struct ReorderReport {
-    emissions: Vec<Emission>,
+    emissions: Vec<ReorderEmission>,
     results: Vec<ReorderResultCount>,
     pending_total: usize,
 }
 
 impl ReorderReport {
     fn new(
-        emissions: Vec<Emission>,
+        emissions: Vec<ReorderEmission>,
         results: Vec<ReorderResultCount>,
         pending_total: usize,
     ) -> Self {
@@ -88,6 +125,13 @@ impl ReorderReport {
     }
 
     pub(crate) fn into_emissions(self) -> Vec<Emission> {
+        self.emissions
+            .into_iter()
+            .map(ReorderEmission::into_emission)
+            .collect()
+    }
+
+    pub(crate) fn into_marked_emissions(self) -> Vec<ReorderEmission> {
         self.emissions
     }
 }
@@ -134,7 +178,7 @@ struct ReorderInner {
 struct SenderState {
     epoch: u64,
     next_seq: u64,
-    pending: BTreeMap<u64, (NodeIdentifier, VoiceFrame)>,
+    pending: BTreeMap<u64, ReorderEmission>,
     deadline: Option<Instant>,
     adaptive_delay_ms: u64,
     route_repair_delay_ms: u64,
@@ -269,15 +313,25 @@ impl Reorderer {
         frame: VoiceFrame,
         route_hint: Option<VoiceRouteHint>,
     ) -> ReorderReport {
+        self.push_with_route_hint_report_with_repair(from, frame, route_hint, false)
+    }
+
+    pub(crate) fn push_with_route_hint_report_with_repair(
+        &self,
+        from: NodeIdentifier,
+        frame: VoiceFrame,
+        route_hint: Option<VoiceRouteHint>,
+        is_repair: bool,
+    ) -> ReorderReport {
         if self.cfg.reorder_disabled {
             return ReorderReport::new(
-                vec![(from, frame)],
+                vec![ReorderEmission::new(from, frame, is_repair)],
                 vec![ReorderResultCount::new(VoiceReceiveResult::InOrder, 1)],
                 0,
             );
         }
 
-        let mut emit: Vec<Emission> = Vec::new();
+        let mut emit: Vec<ReorderEmission> = Vec::new();
         let mut results: Vec<ReorderResultCount> = Vec::new();
         let mut state = self.state.lock();
         let session = frame.sender_session;
@@ -307,7 +361,7 @@ impl Reorderer {
         if arrived_epoch > entry.epoch {
             results.push(ReorderResultCount::new(VoiceReceiveResult::EpochReset, 1));
             // Flush pending under old epoch in seq order, then reset.
-            let drained: Vec<(NodeIdentifier, VoiceFrame)> = std::mem::take(&mut entry.pending)
+            let drained: Vec<ReorderEmission> = std::mem::take(&mut entry.pending)
                 .into_iter()
                 .map(|(_, e)| e)
                 .collect();
@@ -370,7 +424,7 @@ impl Reorderer {
         // ── 3. In-order match: emit + drain contiguous suffix ─────────
         if frame.s2s_seq == entry.next_seq {
             results.push(ReorderResultCount::new(VoiceReceiveResult::InOrder, 1));
-            emit.push((from, frame.clone()));
+            emit.push(ReorderEmission::new(from, frame.clone(), is_repair));
             entry.next_seq = entry.next_seq.saturating_add(1);
             let mut drained_count: usize = 0;
             loop {
@@ -423,7 +477,10 @@ impl Reorderer {
                 let was_empty_before_insert = entry.pending.is_empty();
                 let inserted_new = entry
                     .pending
-                    .insert(frame.s2s_seq, (from, frame.clone()))
+                    .insert(
+                        frame.s2s_seq,
+                        ReorderEmission::new(from, frame.clone(), is_repair),
+                    )
                     .is_none();
                 if inserted_new {
                     self.grow_adaptive_delay(entry);
@@ -454,7 +511,7 @@ impl Reorderer {
         // ── 7. Terminator: flush any pending for this sender now ──────
         if frame.is_terminator {
             let entry = state.per_sender.get_mut(&session).unwrap();
-            let drained: Vec<(NodeIdentifier, VoiceFrame)> = std::mem::take(&mut entry.pending)
+            let drained: Vec<ReorderEmission> = std::mem::take(&mut entry.pending)
                 .into_iter()
                 .map(|(_, e)| e)
                 .collect();
@@ -462,8 +519,8 @@ impl Reorderer {
             let entry = state.per_sender.get_mut(&session).unwrap();
             // Advance next_seq past the drained range so subsequent
             // late frames are dropped via the lag check.
-            if let Some((_, last_frame)) = drained.last() {
-                entry.next_seq = last_frame.s2s_seq.saturating_add(1);
+            if let Some(last) = drained.last() {
+                entry.next_seq = last.frame.s2s_seq.saturating_add(1);
             }
             entry.deadline = None;
             if !drained.is_empty() {
@@ -487,7 +544,7 @@ impl Reorderer {
     }
 
     pub(crate) fn drain_expired_report(&self) -> ReorderReport {
-        let mut emit: Vec<Emission> = Vec::new();
+        let mut emit: Vec<ReorderEmission> = Vec::new();
         let mut results: Vec<ReorderResultCount> = Vec::new();
         let mut state = self.state.lock();
         let now = Instant::now();
@@ -511,18 +568,15 @@ impl Reorderer {
 
             // Drain in seq order, jump next_seq past the highest seq
             // we drained.
-            let drained: Vec<(u64, NodeIdentifier, VoiceFrame)> = {
+            let drained: Vec<(u64, ReorderEmission)> = {
                 let entry = state.per_sender.get_mut(&session).unwrap();
-                let drained: Vec<(u64, NodeIdentifier, VoiceFrame)> =
-                    std::mem::take(&mut entry.pending)
-                        .into_iter()
-                        .map(|(s, (f, fr))| (s, f, fr))
-                        .collect();
+                let drained: Vec<(u64, ReorderEmission)> =
+                    std::mem::take(&mut entry.pending).into_iter().collect();
                 entry.deadline = None;
                 if !drained.is_empty() {
                     self.grow_adaptive_delay(entry);
                 }
-                if let Some((max_seq, _, _)) = drained.last() {
+                if let Some((max_seq, _)) = drained.last() {
                     entry.next_seq = max_seq.saturating_add(1);
                 }
                 drained
@@ -534,8 +588,8 @@ impl Reorderer {
                     drained.len(),
                 ));
             }
-            for (_, from, frame) in drained {
-                emit.push((from, frame));
+            for (_, emission) in drained {
+                emit.push(emission);
             }
         }
         ReorderReport::new(emit, results, state.total_pending)
@@ -686,6 +740,29 @@ mod tests {
         assert!(r.push(11, frame(0xABC, 1, 0, false)).is_empty());
         assert_eq!(r.push(11, frame(0xABC, 1, 1, false)).len(), 1);
         assert!(r.push(11, frame(0xABC, 1, 1, false)).is_empty());
+    }
+
+    #[test]
+    fn alternate_repair_provenance_survives_reordering() {
+        let r = Reorderer::new(cfg());
+        assert_eq!(r.push(11, frame(0xABC, 1, 0, false)).len(), 1);
+
+        assert!(
+            r.push_with_route_hint_report_with_repair(11, frame(0xABC, 1, 2, false), None, true)
+                .into_marked_emissions()
+                .is_empty()
+        );
+        let emissions = r
+            .push_with_route_hint_report_with_repair(11, frame(0xABC, 1, 1, false), None, false)
+            .into_marked_emissions();
+        let observed: Vec<_> = emissions
+            .into_iter()
+            .map(|emission| {
+                let (_, frame, is_repair) = emission.into_parts();
+                (frame.s2s_seq, is_repair)
+            })
+            .collect();
+        assert_eq!(observed, vec![(1, false), (2, true)]);
     }
 
     #[test]

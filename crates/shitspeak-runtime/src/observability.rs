@@ -628,6 +628,21 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "Total S2S voice gateway drops by bridge direction and reason.",
         "counter",
     ),
+    (
+        "shitspeak_voice_remote_playout_events_total",
+        "Remote S2S voice playout events by origin node and result.",
+        "counter",
+    ),
+    (
+        "shitspeak_voice_remote_playout_selected_delay_ms",
+        "Talkspurt-latched remote S2S voice playout delay by origin node.",
+        "gauge",
+    ),
+    (
+        "shitspeak_voice_remote_playout_release_lateness_ms_bucket_total",
+        "Bucketed scheduler lateness for remote S2S voice playout release by origin node.",
+        "counter",
+    ),
 ];
 
 fn render_prometheus_header(out: &mut String, name: &str, help: &str, kind: &str) {

@@ -50,6 +50,19 @@ pub struct VoiceConfig {
     /// Upper bound for the adaptive per-sender reorder delay.
     pub adaptive_jitter_max_delay_ms: u64,
 
+    /// Lowest remote-S2S playout delay. Local same-node delivery does not
+    /// enter this stage.
+    pub remote_playout_min_ms: u64,
+
+    /// Highest remote-S2S playout delay and freshness budget.
+    pub remote_playout_max_ms: u64,
+
+    /// Margin added to the observed remote arrival-delay p99.
+    pub remote_playout_p99_margin_ms: u64,
+
+    /// Inactivity that ends a remote talkspurt and permits a new delay latch.
+    pub remote_playout_idle_reset_ms: u64,
+
     /// Amount added after observed jitter/loss pressure.
     pub adaptive_jitter_growth_step_ms: u64,
 
@@ -101,6 +114,10 @@ impl Default for VoiceConfig {
             adaptive_jitter_enabled: default_adaptive_jitter_enabled(),
             adaptive_jitter_min_delay_ms: default_adaptive_jitter_min_delay_ms(),
             adaptive_jitter_max_delay_ms: default_adaptive_jitter_max_delay_ms(),
+            remote_playout_min_ms: default_remote_playout_min_ms(),
+            remote_playout_max_ms: default_remote_playout_max_ms(),
+            remote_playout_p99_margin_ms: default_remote_playout_p99_margin_ms(),
+            remote_playout_idle_reset_ms: default_remote_playout_idle_reset_ms(),
             adaptive_jitter_growth_step_ms: default_adaptive_jitter_growth_step_ms(),
             adaptive_jitter_decay_step_ms: default_adaptive_jitter_decay_step_ms(),
             repair_enabled: default_repair_enabled(),
@@ -139,6 +156,14 @@ struct VoiceConfigWire {
     adaptive_jitter_min_delay_ms: u64,
     #[serde(default = "default_adaptive_jitter_max_delay_ms")]
     adaptive_jitter_max_delay_ms: u64,
+    #[serde(default = "default_remote_playout_min_ms")]
+    remote_playout_min_ms: u64,
+    #[serde(default = "default_remote_playout_max_ms")]
+    remote_playout_max_ms: u64,
+    #[serde(default = "default_remote_playout_p99_margin_ms")]
+    remote_playout_p99_margin_ms: u64,
+    #[serde(default = "default_remote_playout_idle_reset_ms")]
+    remote_playout_idle_reset_ms: u64,
     #[serde(default = "default_adaptive_jitter_growth_step_ms")]
     adaptive_jitter_growth_step_ms: u64,
     #[serde(default = "default_adaptive_jitter_decay_step_ms")]
@@ -182,6 +207,10 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             adaptive_jitter_enabled: raw.adaptive_jitter_enabled,
             adaptive_jitter_min_delay_ms: raw.adaptive_jitter_min_delay_ms,
             adaptive_jitter_max_delay_ms: raw.adaptive_jitter_max_delay_ms,
+            remote_playout_min_ms: raw.remote_playout_min_ms,
+            remote_playout_max_ms: raw.remote_playout_max_ms,
+            remote_playout_p99_margin_ms: raw.remote_playout_p99_margin_ms,
+            remote_playout_idle_reset_ms: raw.remote_playout_idle_reset_ms,
             adaptive_jitter_growth_step_ms: raw.adaptive_jitter_growth_step_ms,
             adaptive_jitter_decay_step_ms: raw.adaptive_jitter_decay_step_ms,
             repair_enabled: raw.repair_enabled,
@@ -255,7 +284,19 @@ fn default_adaptive_jitter_min_delay_ms() -> u64 {
     40
 }
 fn default_adaptive_jitter_max_delay_ms() -> u64 {
-    600
+    750
+}
+fn default_remote_playout_min_ms() -> u64 {
+    80
+}
+fn default_remote_playout_max_ms() -> u64 {
+    750
+}
+fn default_remote_playout_p99_margin_ms() -> u64 {
+    60
+}
+fn default_remote_playout_idle_reset_ms() -> u64 {
+    2_000
 }
 fn default_adaptive_jitter_growth_step_ms() -> u64 {
     80
@@ -270,13 +311,13 @@ fn default_repair_nack_delay_ms() -> u64 {
     8
 }
 fn default_repair_cache_ms() -> u64 {
-    300
+    1_600
 }
 fn default_transport_ttl_ms() -> u64 {
-    250
+    750
 }
 fn default_repair_transport_ttl_ms() -> u64 {
-    250
+    750
 }
 fn default_repair_loss_start_ppm() -> u32 {
     10_000
@@ -301,10 +342,15 @@ mod tests {
         assert!(cfg.voice.tree_delivery_enabled);
         assert!(cfg.voice.repair_enabled);
         assert_eq!(cfg.voice.repair_nack_delay_ms, 8);
-        assert_eq!(cfg.voice.repair_cache_ms, 300);
-        assert_eq!(cfg.voice.transport_ttl_ms(), 250);
-        assert_eq!(cfg.voice.repair_transport_ttl_ms, 250);
-        assert_eq!(cfg.voice.repair_request_ttl_ms, 250);
+        assert_eq!(cfg.voice.repair_cache_ms, 1_600);
+        assert_eq!(cfg.voice.transport_ttl_ms(), 750);
+        assert_eq!(cfg.voice.repair_transport_ttl_ms, 750);
+        assert_eq!(cfg.voice.repair_request_ttl_ms, 750);
+        assert_eq!(cfg.voice.adaptive_jitter_max_delay_ms, 750);
+        assert_eq!(cfg.voice.remote_playout_min_ms, 80);
+        assert_eq!(cfg.voice.remote_playout_max_ms, 750);
+        assert_eq!(cfg.voice.remote_playout_p99_margin_ms, 60);
+        assert_eq!(cfg.voice.remote_playout_idle_reset_ms, 2_000);
         assert_eq!(cfg.voice.repair_loss_start_ppm, 10_000);
         assert_eq!(cfg.voice.repair_full_dup_loss_ppm, 30_000);
         assert_eq!(cfg.voice.repair_jitter_start_ms, 40);

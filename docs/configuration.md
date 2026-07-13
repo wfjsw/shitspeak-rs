@@ -537,9 +537,19 @@ delivery_strategy = "broadcast"
 # resolved recipient-node set changes.
 tree_delivery_enabled = true
 repair_enabled = true
-repair_transport_ttl_ms = 120
+transport_ttl_ms = 750
+repair_transport_ttl_ms = 750
 # Defaults to repair_transport_ttl_ms when omitted.
-repair_request_ttl_ms = 120
+repair_request_ttl_ms = 750
+repair_cache_ms = 1600
+adaptive_jitter_max_delay_ms = 750
+
+# Remote S2S playout policy. This applies after S2S ordering and before
+# the remote node fans voice out to its local listeners.
+remote_playout_min_ms = 80
+remote_playout_max_ms = 750
+remote_playout_p99_margin_ms = 60
+remote_playout_idle_reset_ms = 2000
 
 [s2s.overlay]
 hello_interval_ms = 1000
@@ -566,6 +576,47 @@ counts.
 `strict_bootstrap_retry_interval_ms` gates strict startup and partition-heal
 history-election retries. `strict_steady_state_catchup_interval_ms` controls the
 periodic strict catchup interval used after history election has finished.
+
+`transport_ttl_ms`, `repair_transport_ttl_ms`, and `repair_request_ttl_ms` are
+the remote S2S voice delivery budget. They are not a local listener playout
+delay. Set all three explicitly when the deployment includes long-haul links;
+the documented long-haul profile uses `750` ms. `repair_cache_ms` must cover that
+delivery window and the time needed to request a repair; it is `1600` ms in the
+deployment configuration.
+
+Remote voice is paced after S2S reordering so that a talkspurt reaches local
+listeners as a continuous stream rather than in an arrival burst. The selected
+delay is the larger of the path baseline and observed arrival-delay p99, plus
+`remote_playout_p99_margin_ms`, clamped to
+`remote_playout_min_ms..remote_playout_max_ms`. It is latched for a talkspurt
+and reset only after its terminator or `remote_playout_idle_reset_ms` of
+silence. Local same-node voice does not use this delay.
+
+The tracked `config.toml` enables the documented long-haul profile explicitly.
+The S2S dashboard reports deadline translation, expiry, and clock-offset
+fallbacks through `shitspeak_s2s_distribution_events_total`, labeled by local
+node, original tree source, profile, service tag, bounded group kind, edge
+direction, event, and bounded result. Direct peer clock health is available as
+`shitspeak_s2s_distribution_peer_clock_{offset,uncertainty}_us` and
+`shitspeak_s2s_distribution_peer_clock_estimate_age_seconds`, labeled by local
+`source` and direct `peer`. The tree-edge gauge is a sum of local tree
+snapshots; it is not a count of unique cluster edges. The dashboard's separate
+active-edge stat deduplicates sent tree-voice traffic by directed
+`source`/`destination` within its selected traffic window.
+
+Per-edge tree traffic comes from
+`shitspeak_s2s_debug_packet_io_{packets,bytes}_total`, filtered to
+`application.voice.tree.original` and `application.voice.tree.repair` with
+`direction="sent"`. It exposes original and repair frames/bytes separately by
+directed edge without adding group or tree-version label cardinality.
+
+Remote playout observability is separate from local voice routing:
+`shitspeak_voice_remote_playout_events_total`,
+`shitspeak_voice_remote_playout_selected_delay_ms`, and
+`shitspeak_voice_remote_playout_release_lateness_ms_bucket_total` are labeled
+by the receiving local node and remote origin node. Use those metrics to
+distinguish selected delay, scheduled/released frames, and late copies dropped
+after their playout time.
 
 See [Clustering](clustering.md) for certificate generation, local demos, and S2S operational notes.
 

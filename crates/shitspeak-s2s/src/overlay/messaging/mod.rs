@@ -18,6 +18,7 @@ use self::ordering::OverlayOrdering;
 use super::LaneId;
 use super::distribution::{DistributionPlane, TreeKey, TreeState};
 use super::error::OverlayError;
+use super::neighbor::NeighborMonitor;
 use super::routing::{RoutingHandle, RoutingMetric};
 
 /// Inbound message handed to a registered service handler.
@@ -27,6 +28,41 @@ pub struct OverlayInboundMessage {
     pub level: ServiceLevel,
     pub class: MessageClass,
     pub body: Bytes,
+    /// Source-installed remote playout baseline for a tree receiver. Legacy
+    /// and non-voice services leave this unset.
+    pub remote_playout_delay_ms: Option<u64>,
+    /// This frame is the one permitted alternate copy for a failed
+    /// distribution-tree child edge. It must retain that identity through
+    /// voice reordering so remote playout never releases it after the media
+    /// deadline.
+    pub(crate) is_distribution_repair: bool,
+}
+
+impl OverlayInboundMessage {
+    /// Build an ordinary inbound message. Distribution metadata is opt-in so
+    /// non-tree services never need to know about voice repair handling.
+    pub fn new(
+        from: NodeIdentifier,
+        level: ServiceLevel,
+        class: MessageClass,
+        body: Bytes,
+    ) -> Self {
+        Self {
+            from,
+            level,
+            class,
+            body,
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
+        }
+    }
+
+    /// Mark this as the alternate copy for a failed distribution-tree edge.
+    /// The marker is consumed only by remote voice playout.
+    pub fn with_distribution_repair(mut self, is_distribution_repair: bool) -> Self {
+        self.is_distribution_repair = is_distribution_repair;
+        self
+    }
 }
 
 /// Trait implemented by L3 services (replications, etc) to receive
@@ -562,6 +598,7 @@ pub(crate) async fn send_multicast_tree_unordered_with_routing_metric_and_option
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     distribution: &DistributionPlane,
+    monitor: &NeighborMonitor,
     self_id: NodeIdentifier,
     boot_epoch: u64,
     ordering: &OverlayOrdering,
@@ -578,6 +615,7 @@ pub(crate) async fn send_multicast_tree_unordered_with_routing_metric_and_option
         transport,
         routing,
         distribution,
+        monitor,
         self_id,
         boot_epoch,
         ordering,

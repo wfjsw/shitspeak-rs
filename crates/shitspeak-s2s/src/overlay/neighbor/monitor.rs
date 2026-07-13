@@ -31,6 +31,9 @@ use super::super::membership::MembershipEvent;
 use super::super::proto::transports_to_mask;
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 
+const CLOCK_OFFSET_SAMPLE_CAPACITY: usize = 16;
+const CLOCK_OFFSET_MAX_AGE: Duration = Duration::from_secs(10);
+
 /// Snapshot suitable for embedding as a `LinkAdvert` in an outbound LSA.
 #[derive(Clone, Debug)]
 pub struct NeighborSnapshot {
@@ -107,6 +110,42 @@ struct NeighborState {
     loss_samples: VecDeque<(Instant, bool)>,
     /// Pending pings by nonce -> when sent (for RTT calculation on ack).
     pending: HashMap<u64, Instant>,
+    /// Bounded NTP-style direct-peer clock observations. The best fresh
+    /// (lowest RTT) observation is used for deadline clock translation.
+    clock_offset_samples: VecDeque<ClockOffsetSample>,
+    /// Most recently advertised direct-peer clock readiness from this peer.
+    /// It is valid only while the direct link remains up.
+    remote_clock_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClockOffsetSample {
+    peer_ahead_us: i64,
+    rtt: Duration,
+    sampled_at: Instant,
+}
+
+/// Fresh direct-peer offset information suitable for translating a deadline
+/// stamped in the peer's wall clock into the local wall clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerClockOffset {
+    peer_ahead_us: i64,
+    uncertainty: Duration,
+    age: Duration,
+}
+
+impl PeerClockOffset {
+    pub fn peer_ahead_us(self) -> i64 {
+        self.peer_ahead_us
+    }
+
+    pub fn uncertainty(self) -> Duration {
+        self.uncertainty
+    }
+
+    pub fn age(self) -> Duration {
+        self.age
+    }
 }
 
 impl NeighborState {
@@ -119,6 +158,8 @@ impl NeighborState {
             transports_mask: 0,
             loss_samples: VecDeque::new(),
             pending: HashMap::new(),
+            clock_offset_samples: VecDeque::new(),
+            remote_clock_ready: false,
         }
     }
 
@@ -126,7 +167,59 @@ impl NeighborState {
         // Probes sent before a link is usable should not seed its route cost.
         self.loss_samples.clear();
         self.pending.clear();
+        self.clock_offset_samples.clear();
+        self.remote_clock_ready = false;
     }
+}
+
+fn ntp_clock_offset(
+    t1_local_send_us: u64,
+    t2_peer_receive_us: u64,
+    t3_peer_send_us: u64,
+    t4_local_receive_us: u64,
+) -> Option<(i64, Duration)> {
+    // Missing fields decode as zero on pre-v2 peers and must never become a
+    // plausible clock sample.
+    if t1_local_send_us == 0
+        || t2_peer_receive_us == 0
+        || t3_peer_send_us == 0
+        || t4_local_receive_us == 0
+    {
+        return None;
+    }
+    let peer_processing_us = t3_peer_send_us.checked_sub(t2_peer_receive_us)?;
+    let local_round_trip_us = t4_local_receive_us.checked_sub(t1_local_send_us)?;
+    let network_round_trip_us = local_round_trip_us.checked_sub(peer_processing_us)?;
+    let left = i128::from(t2_peer_receive_us) - i128::from(t1_local_send_us);
+    let right = i128::from(t3_peer_send_us) - i128::from(t4_local_receive_us);
+    let peer_ahead_us = i64::try_from((left + right) / 2).ok()?;
+    Some((peer_ahead_us, Duration::from_micros(network_round_trip_us)))
+}
+
+fn fresh_best_clock_offset(
+    samples: &VecDeque<ClockOffsetSample>,
+    now: Instant,
+) -> Option<PeerClockOffset> {
+    samples
+        .iter()
+        .filter_map(|sample| {
+            let age = now.checked_duration_since(sample.sampled_at)?;
+            (age <= CLOCK_OFFSET_MAX_AGE).then_some((sample, age))
+        })
+        .min_by_key(|(sample, _)| sample.rtt)
+        .map(|(sample, age)| PeerClockOffset {
+            peer_ahead_us: sample.peer_ahead_us,
+            // NTP's lowest-RTT estimate bounds asymmetric path error by half
+            // of the observed network round trip.
+            uncertainty: sample.rtt / 2,
+            age,
+        })
+}
+
+fn has_mutual_fresh_clock_offset(state: &NeighborState, now: Instant) -> bool {
+    state.is_up
+        && state.remote_clock_ready
+        && fresh_best_clock_offset(&state.clock_offset_samples, now).is_some()
 }
 
 fn record_loss_sample(st: &mut NeighborState, now: Instant, window: Duration, lost: bool) {
@@ -418,6 +511,52 @@ impl NeighborMonitor {
             .unwrap_or(false)
     }
 
+    /// Return the best fresh direct-peer wall-clock estimate. The result is
+    /// deliberately local-only: LSAs never advertise clock offsets.
+    pub fn peer_clock_offset(&self, node: NodeIdentifier) -> Option<PeerClockOffset> {
+        let now = Instant::now();
+        self.state
+            .lock()
+            .get(&node)
+            .filter(|state| state.is_up)
+            .and_then(|state| fresh_best_clock_offset(&state.clock_offset_samples, now))
+    }
+
+    /// Return every current direct-peer clock estimate in a stable order for
+    /// local observability. Clock state remains local and is never advertised.
+    pub fn peer_clock_offsets(&self) -> Vec<(NodeIdentifier, PeerClockOffset)> {
+        let now = Instant::now();
+        let mut offsets = self
+            .state
+            .lock()
+            .iter()
+            .filter_map(|(&node, state)| {
+                state
+                    .is_up
+                    .then(|| fresh_best_clock_offset(&state.clock_offset_samples, now))
+                    .flatten()
+                    .map(|offset| (node, offset))
+            })
+            .collect::<Vec<_>>();
+        offsets.sort_by_key(|(node, _)| *node);
+        offsets
+    }
+
+    pub fn has_fresh_peer_clock_offset(&self, node: NodeIdentifier) -> bool {
+        self.peer_clock_offset(node).is_some()
+    }
+
+    /// Both endpoints have independently confirmed a fresh direct-link clock
+    /// estimate. This prevents a newly upgraded source from sending v2 tree
+    /// frames before the receiver can translate their deadline.
+    pub fn has_mutual_fresh_peer_clock_offset(&self, node: NodeIdentifier) -> bool {
+        let now = Instant::now();
+        self.state
+            .lock()
+            .get(&node)
+            .is_some_and(|state| has_mutual_fresh_clock_offset(state, now))
+    }
+
     /// Record an outbound Hello so we can match its ack later.
     pub fn record_outbound_ping(&self, dst: NodeIdentifier, nonce: u64) {
         let now = Instant::now();
@@ -477,7 +616,11 @@ impl NeighborMonitor {
         from: NodeIdentifier,
         boot_epoch: u64,
         nonce: u64,
-        _ts_send_us: u64,
+        hello_send_ts_unix_us: u64,
+        peer_receive_ts_unix_us: u64,
+        peer_send_ts_unix_us: u64,
+        local_receive_ts_unix_us: u64,
+        peer_has_fresh_clock_offset: bool,
         peer_metrics_target: Option<TransportKind>,
     ) {
         let now = Instant::now();
@@ -508,10 +651,26 @@ impl NeighborMonitor {
                 record_loss_sample(st, now, self.cfg.hello_dead_interval(), false);
             }
             st.is_up = true;
+            st.remote_clock_ready = peer_has_fresh_clock_offset;
             // Cap pending table size — drop stale entries occasionally.
             if st.pending.len() > 32 {
                 let cutoff = now - Duration::from_secs(60);
                 st.pending.retain(|_, t| *t > cutoff);
+            }
+            if let Some((peer_ahead_us, rtt)) = ntp_clock_offset(
+                hello_send_ts_unix_us,
+                peer_receive_ts_unix_us,
+                peer_send_ts_unix_us,
+                local_receive_ts_unix_us,
+            ) {
+                st.clock_offset_samples.push_back(ClockOffsetSample {
+                    peer_ahead_us,
+                    rtt,
+                    sampled_at: now,
+                });
+                while st.clock_offset_samples.len() > CLOCK_OFFSET_SAMPLE_CAPACITY {
+                    st.clock_offset_samples.pop_front();
+                }
             }
             (was_up, sent_at_instant, restarted)
         };
@@ -561,6 +720,7 @@ impl NeighborMonitor {
                         st.is_up = false;
                         st.miss_count = 0;
                         st.transports_mask = 0;
+                        st.reset_quality_samples();
                         transitions.push((*nid, false));
                     }
                     // L1 also dropped; eventually purge.
@@ -586,6 +746,7 @@ impl NeighborMonitor {
                             st.is_up = false;
                             st.miss_count = 0;
                             st.transports_mask = 0;
+                            st.reset_quality_samples();
                             transitions.push((*nid, false));
                         }
                     } else {
@@ -746,5 +907,72 @@ mod tests {
         assert_eq!(state.miss_count, 2);
         assert!(note_stale_hello_window(&mut state, 3));
         assert_eq!(state.miss_count, 3);
+    }
+
+    #[test]
+    fn ntp_clock_offset_calculates_peer_ahead_and_network_rtt() {
+        // Peer is 5 ms ahead. Each network direction costs 10 ms and the
+        // peer spends 2 ms handling the hello.
+        let (offset, rtt) = ntp_clock_offset(1_000_000, 1_015_000, 1_017_000, 1_022_000)
+            .expect("valid four-timestamp sample");
+        assert_eq!(offset, 5_000);
+        assert_eq!(rtt, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn ntp_clock_offset_rejects_missing_v1_ack_timestamps() {
+        assert_eq!(ntp_clock_offset(1_000, 0, 0, 1_020), None);
+    }
+
+    #[test]
+    fn ntp_clock_offset_handles_coarse_positive_and_negative_clock_steps() {
+        let (peer_ahead, _) = ntp_clock_offset(1_000_000, 1_510_000, 1_510_000, 1_020_000)
+            .expect("peer ahead sample");
+        assert_eq!(peer_ahead, 500_000);
+
+        let (peer_behind, _) =
+            ntp_clock_offset(1_000_000, 510_000, 510_000, 1_020_000).expect("peer behind sample");
+        assert_eq!(peer_behind, -500_000);
+    }
+
+    #[test]
+    fn best_fresh_clock_offset_prefers_lowest_rtt_and_expires_after_ten_seconds() {
+        let now = Instant::now();
+        let samples = VecDeque::from([
+            ClockOffsetSample {
+                peer_ahead_us: 7_000,
+                rtt: Duration::from_millis(30),
+                sampled_at: now - Duration::from_secs(1),
+            },
+            ClockOffsetSample {
+                peer_ahead_us: 5_000,
+                rtt: Duration::from_millis(10),
+                sampled_at: now - Duration::from_secs(2),
+            },
+        ]);
+        let best = fresh_best_clock_offset(&samples, now).expect("fresh estimate");
+        assert_eq!(best.peer_ahead_us(), 5_000);
+        assert_eq!(best.uncertainty(), Duration::from_millis(5));
+        assert!(fresh_best_clock_offset(&samples, now + Duration::from_secs(11)).is_none());
+    }
+
+    #[test]
+    fn mutual_clock_readiness_requires_remote_ack_and_resets_with_link_state() {
+        let now = Instant::now();
+        let mut state = NeighborState::new();
+        state.is_up = true;
+        state.clock_offset_samples.push_back(ClockOffsetSample {
+            peer_ahead_us: 2_000,
+            rtt: Duration::from_millis(8),
+            sampled_at: now,
+        });
+
+        assert!(!has_mutual_fresh_clock_offset(&state, now));
+        state.remote_clock_ready = true;
+        assert!(has_mutual_fresh_clock_offset(&state, now));
+
+        state.reset_quality_samples();
+        assert!(!has_mutual_fresh_clock_offset(&state, now));
+        assert!(!state.remote_clock_ready);
     }
 }

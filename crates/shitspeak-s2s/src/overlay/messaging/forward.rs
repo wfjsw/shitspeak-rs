@@ -1,6 +1,8 @@
 //! Routing-aware forwarding for `OverlayData` and ordered-lane repair control.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,10 +18,11 @@ use crate::overlay::config::OverlayConfig;
 use crate::overlay::distribution::{
     DistributionPlane, PendingDistributionFrame, TreeKey, TreeState, UnknownTreeEnqueue,
 };
+use crate::overlay::neighbor::NeighborMonitor;
 use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{
-    ConnectionManager, MessageClass, SendOptions as TransportSendOptions, ServiceLevel,
+    ConnectionManager, MessageClass, SendError, SendOptions as TransportSendOptions, ServiceLevel,
 };
 
 use super::super::OverlayNetwork;
@@ -37,8 +40,8 @@ use super::{OverlaySendOptions, ServiceRegistry};
 const FORWARD_PAYLOAD_LOG_BYTES: usize = 256;
 const CONTROL_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
 const CONTROL_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
-const VOICE_TRANSPORT_TTL: Duration = Duration::from_millis(250);
-const DISTRIBUTION_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_millis(10);
+const VOICE_TRANSPORT_TTL: Duration = Duration::from_millis(750);
+const DISTRIBUTION_PROCESSING_GUARD: Duration = Duration::from_millis(20);
 
 fn unix_time_ms() -> u64 {
     SystemTime::now()
@@ -48,13 +51,143 @@ fn unix_time_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn distribution_remaining_deadline(data: &pb::OverlayData) -> Option<Duration> {
-    let deadline = data.distribution_deadline_unix_ms?;
-    let now = unix_time_ms();
-    let remaining = deadline.checked_sub(now)?;
-    let remaining = Duration::from_millis(remaining);
-    (remaining > DISTRIBUTION_CLOCK_SKEW_ALLOWANCE)
-        .then_some(remaining.saturating_sub(DISTRIBUTION_CLOCK_SKEW_ALLOWANCE))
+    if let Some(deadline) = data.distribution_deadline_unix_us {
+        let remaining = deadline.checked_sub(unix_time_us())?;
+        return Some(Duration::from_micros(remaining));
+    }
+    legacy_distribution_remaining_deadline(data.distribution_deadline_unix_ms?, unix_time_ms())
+}
+
+fn legacy_distribution_remaining_deadline(
+    deadline_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Option<Duration> {
+    deadline_unix_ms
+        .checked_sub(now_unix_ms)
+        .map(Duration::from_millis)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DistributionDeadlineError {
+    Expired,
+    MissingOffset,
+    IssuerMismatch,
+}
+
+fn rebase_deadline_us(peer_deadline_us: u64, peer_ahead_us: i64) -> Option<u64> {
+    u64::try_from(i128::from(peer_deadline_us) - i128::from(peer_ahead_us)).ok()
+}
+
+fn remaining_after_clock_guard(
+    local_deadline_us: u64,
+    local_now_us: u64,
+    uncertainty: Duration,
+) -> Result<Duration, DistributionDeadlineError> {
+    let remaining_us = local_deadline_us
+        .checked_sub(local_now_us)
+        .ok_or(DistributionDeadlineError::Expired)?;
+    let remaining = Duration::from_micros(remaining_us);
+    let guard = uncertainty.saturating_add(DISTRIBUTION_PROCESSING_GUARD);
+    (remaining > guard)
+        .then_some(remaining.saturating_sub(guard))
+        .ok_or(DistributionDeadlineError::Expired)
+}
+
+fn translate_v2_deadline_for_local_hop(
+    data: &mut pb::OverlayData,
+    monitor: &NeighborMonitor,
+    self_id: NodeIdentifier,
+    from: NodeIdentifier,
+) -> Result<Duration, DistributionDeadlineError> {
+    let issuer = data
+        .distribution_deadline_issuer
+        .and_then(|issuer| NodeIdentifier::try_from(issuer).ok())
+        .ok_or(DistributionDeadlineError::IssuerMismatch)?;
+    let peer_deadline_us = data
+        .distribution_deadline_unix_us
+        .ok_or(DistributionDeadlineError::IssuerMismatch)?;
+    if issuer == self_id {
+        let remaining = peer_deadline_us
+            .checked_sub(unix_time_us())
+            .ok_or(DistributionDeadlineError::Expired)?;
+        return (remaining > 0)
+            .then_some(Duration::from_micros(remaining))
+            .ok_or(DistributionDeadlineError::Expired);
+    }
+    if issuer != from {
+        return Err(DistributionDeadlineError::IssuerMismatch);
+    }
+    let offset = monitor
+        .peer_clock_offset(from)
+        .ok_or(DistributionDeadlineError::MissingOffset)?;
+    // `peer_ahead_us` is peer_clock - local_clock. Convert the peer-issued
+    // timestamp into this node's clock before making this node the issuer.
+    let local_deadline_us = rebase_deadline_us(peer_deadline_us, offset.peer_ahead_us())
+        .ok_or(DistributionDeadlineError::Expired)?;
+    let remaining =
+        remaining_after_clock_guard(local_deadline_us, unix_time_us(), offset.uncertainty())?;
+    data.distribution_deadline_issuer = Some(node_to_wire(self_id));
+    data.distribution_deadline_unix_us = Some(local_deadline_us);
+    // New frames must not be evaluated by the legacy millisecond deadline
+    // rule after their issuer has been rebased.
+    data.distribution_deadline_unix_ms = None;
+    Ok(remaining)
+}
+
+fn inbound_distribution_deadline(
+    data: &mut pb::OverlayData,
+    monitor: &NeighborMonitor,
+    self_id: NodeIdentifier,
+    from: NodeIdentifier,
+) -> Result<(Duration, bool), DistributionDeadlineError> {
+    if data.distribution_deadline_unix_us.is_some() || data.distribution_deadline_issuer.is_some() {
+        return translate_v2_deadline_for_local_hop(data, monitor, self_id, from)
+            .map(|remaining| (remaining, true));
+    }
+    distribution_remaining_deadline(data)
+        .map(|remaining| (remaining, false))
+        .ok_or(DistributionDeadlineError::Expired)
+}
+
+fn report_deadline_failure(
+    distribution: &DistributionPlane,
+    data: &pb::OverlayData,
+    self_id: NodeIdentifier,
+) {
+    let Some(key) = tree_key_from_data(data) else {
+        return;
+    };
+    let Some(tree) = distribution.get(key) else {
+        return;
+    };
+    let Some((parent, _)) = tree.edges().find(|(_, child)| *child == self_id) else {
+        return;
+    };
+    distribution.report_edge_failure(key, parent, self_id);
+}
+
+fn distribution_metric_context(
+    data: &pb::OverlayData,
+    direction: crate::overlay::distribution_metrics::EdgeDirection,
+) -> Option<crate::overlay::distribution_metrics::DistributionMetricContext> {
+    Some(
+        crate::overlay::distribution_metrics::DistributionMetricContext::new(
+            data.distribution_profile?,
+            data.service_tag,
+            NodeIdentifier::try_from(data.src).ok()?,
+            data.distribution_group,
+            direction,
+        ),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +259,8 @@ pub(crate) async fn originate(
             distribution_deadline_unix_ms: None,
             distribution_repair: false,
             distribution_repair_target: None,
+            distribution_deadline_issuer: None,
+            distribution_deadline_unix_us: None,
         };
         return forward_pb_as(
             transport,
@@ -180,6 +315,8 @@ pub(crate) async fn originate(
             distribution_deadline_unix_ms: None,
             distribution_repair: false,
             distribution_repair_target: None,
+            distribution_deadline_issuer: None,
+            distribution_deadline_unix_us: None,
         };
         ordering.store_pending(lane, data.clone()).await;
         ordering.cache_ordered_packet(&data).await;
@@ -214,6 +351,7 @@ pub(crate) async fn originate_tree(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     distribution: &DistributionPlane,
+    monitor: &NeighborMonitor,
     self_id: NodeIdentifier,
     boot_epoch: u64,
     ordering: &OverlayOrdering,
@@ -249,22 +387,25 @@ pub(crate) async fn originate_tree(
         distribution_group: Some(key.group),
         distribution_group_version: Some(key.group_version),
         distribution_topology_epoch: Some(key.topology_epoch),
-        distribution_deadline_unix_ms: Some(
-            unix_time_ms().saturating_add(
+        distribution_deadline_unix_ms: None,
+        distribution_repair: false,
+        distribution_repair_target: None,
+        distribution_deadline_issuer: Some(node_to_wire(self_id)),
+        distribution_deadline_unix_us: Some(
+            unix_time_us().saturating_add(
                 options
                     .transport_ttl()
                     .unwrap_or(VOICE_TRANSPORT_TTL)
-                    .as_millis()
+                    .as_micros()
                     .min(u128::from(u64::MAX)) as u64,
             ),
         ),
-        distribution_repair: false,
-        distribution_repair_target: None,
     };
     forward_tree_data(
         transport,
         routing,
         distribution,
+        monitor,
         self_id,
         data,
         tree,
@@ -281,6 +422,7 @@ pub(crate) async fn handle_inbound_with_distribution(
     services: &ServiceRegistry,
     ordering: &OverlayOrdering,
     distribution: &DistributionPlane,
+    monitor: &NeighborMonitor,
     self_id: NodeIdentifier,
     from: NodeIdentifier,
     mut data: pb::OverlayData,
@@ -299,10 +441,61 @@ pub(crate) async fn handle_inbound_with_distribution(
         )
         .await;
     };
-    let Some(remaining_deadline) = distribution_remaining_deadline(&data) else {
-        tracing::debug!(profile, "dropping expired distribution frame");
-        return;
+    let metric_context = distribution_metric_context(
+        &data,
+        crate::overlay::distribution_metrics::EdgeDirection::Inbound,
+    );
+    let (remaining_deadline, translated_v2) = match inbound_distribution_deadline(
+        &mut data, monitor, self_id, from,
+    ) {
+        Ok(result) => result,
+        Err(DistributionDeadlineError::Expired) => {
+            if let Some(context) = metric_context {
+                crate::overlay::distribution_metrics::record_deadline_translation_with_context(
+                    context, "expired",
+                );
+                crate::overlay::distribution_metrics::record_deadline_expiry_with_context(
+                    context, "expired",
+                );
+            }
+            report_deadline_failure(distribution, &data, self_id);
+            tracing::debug!(profile, %from, "dropping expired distribution frame");
+            return;
+        }
+        Err(DistributionDeadlineError::MissingOffset) => {
+            if let Some(context) = metric_context {
+                crate::overlay::distribution_metrics::record_deadline_translation_with_context(
+                    context,
+                    "missing_offset",
+                );
+                crate::overlay::distribution_metrics::record_clock_offset_fallback_with_context(
+                    context,
+                    "child_clock_unready",
+                );
+            }
+            report_deadline_failure(distribution, &data, self_id);
+            tracing::debug!(profile, %from, "dropping distribution frame without fresh direct-peer clock offset");
+            return;
+        }
+        Err(DistributionDeadlineError::IssuerMismatch) => {
+            if let Some(context) = metric_context {
+                crate::overlay::distribution_metrics::record_deadline_translation_with_context(
+                    context,
+                    "issuer_mismatch",
+                );
+            }
+            tracing::debug!(profile, %from, "dropping distribution frame with a non-direct deadline issuer");
+            return;
+        }
     };
+    if translated_v2 {
+        if let Some(context) = metric_context {
+            crate::overlay::distribution_metrics::record_deadline_translation_with_context(
+                context,
+                "translated",
+            );
+        }
+    }
     let (Some(version), Some(group), Some(group_version), Some(topology_epoch)) = (
         data.distribution_tree_version,
         data.distribution_group,
@@ -398,6 +591,7 @@ pub(crate) async fn handle_inbound_with_distribution(
                     transport,
                     routing,
                     distribution,
+                    monitor,
                     ordering,
                     services,
                     self_id,
@@ -415,6 +609,7 @@ pub(crate) async fn handle_inbound_with_distribution(
         transport,
         routing,
         distribution,
+        monitor,
         ordering,
         services,
         self_id,
@@ -432,6 +627,7 @@ async fn process_distribution_frame(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     distribution: &DistributionPlane,
+    monitor: &NeighborMonitor,
     ordering: &OverlayOrdering,
     services: &ServiceRegistry,
     self_id: NodeIdentifier,
@@ -453,13 +649,15 @@ async fn process_distribution_frame(
             )
             .await
     {
-        delivery::deliver(
+        delivery::deliver_with_remote_playout(
             services,
             data.service_tag,
             source,
             level,
             class,
             data.payload.clone(),
+            tree.playout_delay_ms(self_id),
+            data.distribution_repair,
         );
     }
     if route_transit_messages {
@@ -467,6 +665,7 @@ async fn process_distribution_frame(
             transport,
             routing,
             distribution,
+            monitor,
             self_id,
             data,
             &tree,
@@ -490,6 +689,7 @@ pub(crate) async fn replay_distribution_frame(
         &overlay.inner.services,
         overlay.inner.ordering(),
         &overlay.inner.distribution,
+        &overlay.inner.neighbor,
         overlay.inner.self_id,
         frame.from,
         frame.data,
@@ -557,13 +757,15 @@ pub(crate) async fn handle_inbound(
             )
             .await
         {
-            delivery::deliver(
+            delivery::deliver_with_remote_playout(
                 services,
                 data.service_tag,
                 src,
                 level,
                 class,
                 data.payload.clone(),
+                None,
+                data.distribution_repair,
             );
         }
     } else if data.process_on_transit && transit_local_processing_allowed(data.service_tag) {
@@ -1077,7 +1279,9 @@ async fn forward_pb_as(
 
     let mut new_trace = data.path_trace.clone();
     append_path_trace(&mut new_trace, self_id);
-    let mut sends = Vec::with_capacity(buckets.len());
+    let mut sends: Vec<
+        Pin<Box<dyn Future<Output = (NodeIdentifier, Result<(), SendError>)> + Send>>,
+    > = Vec::with_capacity(buckets.len());
     for (next_hop, bucket_dsts) in buckets {
         let pb_msg = reconstruct_forwarded_data(&data, bucket_dsts, new_trace.clone());
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -1122,7 +1326,7 @@ async fn forward_pb_as(
         };
         let payload_len = payload.len();
         let transport = transport.clone();
-        sends.push(async move {
+        sends.push(Box::pin(async move {
             let result = transport
                 .try_send_with_options(
                     next_hop,
@@ -1137,7 +1341,7 @@ async fn forward_pb_as(
                 crate::debug_io::record_sent(self_id, next_hop, packet_kind, payload_len);
             }
             (next_hop, result)
-        });
+        }));
     }
 
     for (next_hop, result) in join_all(sends).await {
@@ -1164,6 +1368,7 @@ async fn forward_tree_data(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     distribution: &DistributionPlane,
+    monitor: &NeighborMonitor,
     self_id: NodeIdentifier,
     data: pb::OverlayData,
     tree: &TreeState,
@@ -1172,17 +1377,77 @@ async fn forward_tree_data(
 ) -> Result<(), OverlayError> {
     let profile = data.distribution_profile.unwrap_or_default();
     let is_repair = data.distribution_repair;
+    let metric_context = distribution_metric_context(
+        &data,
+        crate::overlay::distribution_metrics::EdgeDirection::Outbound,
+    );
+    let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
+    let routing_metric = route_metric_from_wire(data.route_metric, level)
+        .unwrap_or_else(|| RoutingMetric::default_for_level(level));
+    let requires_clock_offset =
+        data.distribution_deadline_unix_us.is_some() || data.distribution_deadline_issuer.is_some();
     let mut path_trace = data.path_trace.clone();
     append_path_trace(&mut path_trace, self_id);
     let visited = path_trace_set(&path_trace);
-    let mut sends = Vec::new();
+    let mut sends: Vec<
+        Pin<Box<dyn Future<Output = (NodeIdentifier, Result<(), OverlayError>)> + Send + '_>>,
+    > = Vec::new();
     for child in tree.children(self_id).iter().copied() {
         if visited.contains(&child) {
             continue;
         }
+        if requires_clock_offset {
+            let next_hop = routing
+                .load()
+                .lookup_with_metric(child, level, routing_metric)
+                .map(|route| route.next_hop);
+            if !next_hop.is_some_and(|peer| monitor.has_mutual_fresh_peer_clock_offset(peer)) {
+                // The owning tree state identifies this child subtree exactly,
+                // so this node can fall back only that branch to ordinary
+                // multicast without duplicating the rest of the tree.
+                if let Some(context) = metric_context {
+                    crate::overlay::distribution_metrics::record_clock_offset_fallback_with_context(
+                        context,
+                        "child_clock_unready",
+                    );
+                    crate::overlay::distribution_metrics::record_compatibility_fallback_with_context(
+                        context,
+                        "child_clock_unready",
+                    );
+                }
+                let descendants = tree.descendant_members(child);
+                let descendant_count = descendants.len();
+                if !descendants.is_empty() {
+                    let fallback =
+                        legacy_subtree_fallback_data(&data, descendants, path_trace.clone());
+                    sends.push(Box::pin(async move {
+                        let result = forward_pb_as(
+                            transport,
+                            routing,
+                            self_id,
+                            fallback,
+                            transport_class,
+                            false,
+                            Some(VOICE_TRANSPORT_TTL),
+                            None,
+                        )
+                        .await;
+                        (child, result)
+                    }));
+                }
+                tracing::debug!(
+                    parent = %self_id,
+                    %child,
+                    profile,
+                    descendants = descendant_count,
+                    "falling back distribution child subtree without mutual direct-peer clock readiness"
+                );
+                continue;
+            }
+        }
         let pb_msg =
             reconstruct_forwarded_data(&data, vec![node_to_wire(child)], path_trace.clone());
-        sends.push(async move {
+        sends.push(Box::pin(async move {
             let result = forward_pb_as(
                 transport,
                 routing,
@@ -1202,7 +1467,7 @@ async fn forward_tree_data(
                 }
             }
             (child, result)
-        });
+        }));
     }
     let mut first_err = None;
     for (child, result) in join_all(sends).await {
@@ -1267,6 +1532,35 @@ fn tree_key_from_data(data: &pb::OverlayData) -> Option<TreeKey> {
     })
 }
 
+/// Convert one unavailable tree branch into ordinary destination routing. The
+/// recipient list is restricted to the logical child's subtree, so healthy
+/// tree branches keep their single-copy forwarding behavior.
+fn legacy_subtree_fallback_data(
+    data: &pb::OverlayData,
+    recipients: Vec<NodeIdentifier>,
+    path_trace: Vec<u32>,
+) -> pb::OverlayData {
+    let mut fallback = reconstruct_forwarded_data(
+        data,
+        recipients.into_iter().map(node_to_wire).collect(),
+        path_trace,
+    );
+    fallback.distribution_profile = None;
+    fallback.distribution_tree_version = None;
+    fallback.distribution_group = None;
+    fallback.distribution_group_version = None;
+    fallback.distribution_topology_epoch = None;
+    fallback.distribution_deadline_unix_ms = None;
+    // A repair is still a direct repair after its tree envelope is removed.
+    // The receiver-side playout stage needs this classification to reject a
+    // repair that arrives after the scheduled release.
+    fallback.distribution_repair = data.distribution_repair;
+    fallback.distribution_repair_target = None;
+    fallback.distribution_deadline_issuer = None;
+    fallback.distribution_deadline_unix_us = None;
+    fallback
+}
+
 fn reconstruct_forwarded_data(
     data: &pb::OverlayData,
     dsts: Vec<u32>,
@@ -1297,6 +1591,8 @@ fn reconstruct_forwarded_data(
         distribution_deadline_unix_ms: data.distribution_deadline_unix_ms,
         distribution_repair: data.distribution_repair,
         distribution_repair_target: data.distribution_repair_target,
+        distribution_deadline_issuer: data.distribution_deadline_issuer,
+        distribution_deadline_unix_us: data.distribution_deadline_unix_us,
     }
 }
 
@@ -1469,8 +1765,9 @@ mod tests {
     use super::super::super::routing::{RouteEntry, dijkstra::EdgeCost, new_handle};
     use super::super::{OverlayInboundMessage, ServiceInbound};
     use super::*;
+    use crate::overlay::duplicate::DuplicateDetector;
     use shitspeak_s2s_transport::{SendError, TransportKind};
-    use tokio::sync::mpsc;
+    use tokio::sync::{broadcast, mpsc};
     use tokio::time::timeout;
 
     fn edge(cost: u64) -> EdgeCost {
@@ -1506,7 +1803,44 @@ mod tests {
             distribution_deadline_unix_ms: None,
             distribution_repair: false,
             distribution_repair_target: None,
+            distribution_deadline_issuer: None,
+            distribution_deadline_unix_us: None,
         }
+    }
+
+    fn test_monitor() -> NeighborMonitor {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(2, 1, &[TransportKind::Tcp]);
+        let (membership_events, _) = broadcast::channel(8);
+        NeighborMonitor::new(
+            2,
+            transport,
+            Arc::new(DuplicateDetector::new(2, Duration::from_secs(1))),
+            OverlayConfig::new(Vec::new()),
+            membership_events,
+        )
+    }
+
+    fn monitor_with_peer_clock_offset(peer_ahead_us: i64) -> NeighborMonitor {
+        let monitor = test_monitor();
+        let local_receive = unix_time_us();
+        let local_send = local_receive.saturating_sub(20_000);
+        let peer_receive = u64::try_from(
+            i128::from(local_send) + i128::from(peer_ahead_us) + i128::from(10_000_u64),
+        )
+        .expect("test clock offset should keep timestamps positive");
+        monitor.record_hello_ack(
+            1,
+            1,
+            7,
+            local_send,
+            peer_receive,
+            peer_receive,
+            local_receive,
+            true,
+            None,
+        );
+        monitor
     }
 
     fn routing_with_route(dst: NodeIdentifier, next_hop: NodeIdentifier) -> RoutingHandle {
@@ -1746,9 +2080,9 @@ mod tests {
         let before = std::time::Instant::now();
         let options = transport_options_for_overlay_data(&data, None);
         let expires_at = options.expires_at().expect("voice fallback ttl");
-        assert_eq!(VOICE_TRANSPORT_TTL, Duration::from_millis(250));
+        assert_eq!(VOICE_TRANSPORT_TTL, Duration::from_millis(750));
         assert!(expires_at > before);
-        assert!(expires_at <= before + Duration::from_millis(275));
+        assert!(expires_at <= before + Duration::from_millis(775));
         assert!(!options.is_expired());
     }
 
@@ -2531,5 +2865,200 @@ mod tests {
             ..eligible
         };
         assert!(!should_attempt_alternate_tree_repair(&repair_copy));
+    }
+
+    #[test]
+    fn v2_deadline_rebases_from_direct_peer_clock() {
+        // The issuer is 25 ms ahead, so its 1.025 s deadline means 1.000 s
+        // in our local wall clock.
+        assert_eq!(rebase_deadline_us(1_025_000, 25_000), Some(1_000_000));
+        assert_eq!(rebase_deadline_us(1_000_000, -25_000), Some(1_025_000));
+        assert_eq!(rebase_deadline_us(1, 2), None);
+    }
+
+    #[test]
+    fn v2_deadline_rebases_htpdate_sized_clock_steps() {
+        // htpdate can leave node 1 hundreds of milliseconds away from the
+        // rest of the overlay. Signed rebasing must remain exact in either
+        // direction and never underflow a deadline.
+        assert_eq!(rebase_deadline_us(2_250_000, 500_000), Some(1_750_000));
+        assert_eq!(rebase_deadline_us(1_750_000, -500_000), Some(2_250_000));
+        assert_eq!(rebase_deadline_us(499_999, 500_000), None);
+    }
+
+    #[tokio::test]
+    async fn v2_deadline_translation_rebases_issuer_and_charges_measured_guard() {
+        let monitor = monitor_with_peer_clock_offset(500_000);
+        let local_deadline = unix_time_us().saturating_add(300_000);
+        let mut data = pb::OverlayData {
+            distribution_deadline_unix_ms: Some(unix_time_ms().saturating_add(300)),
+            distribution_deadline_issuer: Some(node_to_wire(1)),
+            distribution_deadline_unix_us: Some(local_deadline.saturating_add(500_000)),
+            ..Default::default()
+        };
+
+        let remaining = translate_v2_deadline_for_local_hop(&mut data, &monitor, 2, 1)
+            .expect("fresh direct-peer estimate should translate v2 deadline");
+
+        assert_eq!(data.distribution_deadline_issuer, Some(node_to_wire(2)));
+        assert_eq!(data.distribution_deadline_unix_us, Some(local_deadline));
+        assert_eq!(data.distribution_deadline_unix_ms, None);
+        // The sample has 20 ms network RTT, so the local forwarding budget is
+        // the rebased deadline minus 10 ms uncertainty and the 20 ms guard.
+        assert!(remaining <= Duration::from_millis(270));
+        assert!(remaining > Duration::from_millis(220));
+    }
+
+    #[tokio::test]
+    async fn v2_deadline_without_fresh_direct_peer_estimate_requires_legacy_path() {
+        let monitor = test_monitor();
+        let mut data = pb::OverlayData {
+            distribution_deadline_issuer: Some(node_to_wire(1)),
+            distribution_deadline_unix_us: Some(unix_time_us().saturating_add(750_000)),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            translate_v2_deadline_for_local_hop(&mut data, &monitor, 2, 1),
+            Err(DistributionDeadlineError::MissingOffset)
+        );
+    }
+
+    #[test]
+    fn clock_fallback_clears_tree_state_for_only_the_child_subtree() {
+        let mut data = test_overlay_data(false);
+        data.distribution_profile = Some(crate::overlay::distribution::VOICE_REALTIME_PROFILE_ID);
+        data.distribution_tree_version = Some(9);
+        data.distribution_group = Some(0);
+        data.distribution_group_version = Some(4);
+        data.distribution_topology_epoch = Some(7);
+        data.distribution_deadline_unix_ms = Some(unix_time_ms().saturating_add(750));
+        data.distribution_deadline_issuer = Some(node_to_wire(1));
+        data.distribution_deadline_unix_us = Some(unix_time_us().saturating_add(750_000));
+        let fallback = legacy_subtree_fallback_data(&data, vec![2, 3], vec![node_to_wire(1)]);
+
+        assert_eq!(fallback.dsts, vec![node_to_wire(2), node_to_wire(3)]);
+        assert_eq!(fallback.path_trace, vec![node_to_wire(1)]);
+        assert_eq!(fallback.distribution_profile, None);
+        assert_eq!(fallback.distribution_tree_version, None);
+        assert_eq!(fallback.distribution_group, None);
+        assert_eq!(fallback.distribution_group_version, None);
+        assert_eq!(fallback.distribution_topology_epoch, None);
+        assert_eq!(fallback.distribution_deadline_unix_ms, None);
+        assert!(!fallback.distribution_repair);
+        assert_eq!(fallback.distribution_repair_target, None);
+        assert_eq!(fallback.distribution_deadline_issuer, None);
+        assert_eq!(fallback.distribution_deadline_unix_us, None);
+
+        data.distribution_repair = true;
+        let repair = legacy_subtree_fallback_data(&data, vec![2], Vec::new());
+        assert!(repair.distribution_repair);
+        assert_eq!(repair.distribution_profile, None);
+    }
+
+    #[tokio::test]
+    async fn clock_unready_tree_children_fall_back_once_to_their_exact_subtrees() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let mut to_two = receivers.pop().expect("node 2 stream");
+        let mut to_three = transport.test_install_live_stream(3, TransportKind::Tcp);
+        let mut to_four = transport.test_install_live_stream(4, TransportKind::Tcp);
+        let routing = routing_with_routes(&[(2, 2), (3, 3), (4, 4)]);
+        let tree = TreeState::new(1, [2, 3, 4], [(1, 2), (2, 3), (1, 4)]);
+        let distribution = DistributionPlane::default();
+        let monitor = test_monitor();
+        let mut data = test_overlay_data(false);
+        data.dsts.clear();
+        data.service_tag = VOICE_SERVICE_TAG;
+        data.distribution_profile = Some(crate::overlay::distribution::VOICE_REALTIME_PROFILE_ID);
+        data.distribution_tree_version = Some(9);
+        data.distribution_group = Some(0);
+        data.distribution_group_version = Some(1);
+        data.distribution_topology_epoch = Some(1);
+        data.distribution_deadline_issuer = Some(node_to_wire(1));
+        data.distribution_deadline_unix_us = Some(unix_time_us().saturating_add(750_000));
+
+        forward_tree_data(
+            &transport,
+            &routing,
+            &distribution,
+            &monitor,
+            1,
+            data,
+            &tree,
+            MessageClass::HighPriority,
+            None,
+        )
+        .await
+        .expect("clock fallback should use normal destination forwarding");
+
+        for (dst, receiver) in [(2, &mut to_two), (3, &mut to_three), (4, &mut to_four)] {
+            let forwarded = timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .expect("legacy subtree recipient should receive a frame")
+                .expect("receiver should remain open");
+            let decoded = decode_message(forwarded.payload()).expect("overlay data");
+            let Some(OverlayBody::Data(data)) = decoded.body else {
+                panic!("not overlay data");
+            };
+            assert_eq!(data.dsts, vec![node_to_wire(dst)]);
+            assert_eq!(data.distribution_profile, None);
+            assert_eq!(data.distribution_tree_version, None);
+            assert_eq!(data.distribution_deadline_issuer, None);
+            assert_eq!(data.distribution_deadline_unix_us, None);
+        }
+
+        assert!(
+            timeout(Duration::from_millis(20), to_two.recv())
+                .await
+                .is_err(),
+            "the fallback must not duplicate the node 2 branch"
+        );
+        assert!(
+            timeout(Duration::from_millis(20), to_three.recv())
+                .await
+                .is_err(),
+            "the fallback must not duplicate the node 3 branch"
+        );
+        assert!(
+            timeout(Duration::from_millis(20), to_four.recv())
+                .await
+                .is_err(),
+            "the fallback must not duplicate the node 4 branch"
+        );
+    }
+
+    #[test]
+    fn v2_deadline_requires_uncertainty_plus_processing_guard() {
+        let uncertainty = Duration::from_millis(10);
+        assert_eq!(
+            remaining_after_clock_guard(31_000, 0, uncertainty),
+            Ok(Duration::from_millis(1))
+        );
+        assert_eq!(
+            remaining_after_clock_guard(30_000, 0, uncertainty),
+            Err(DistributionDeadlineError::Expired)
+        );
+    }
+
+    #[test]
+    fn v1_deadline_still_uses_legacy_millisecond_fallback() {
+        assert_eq!(
+            legacy_distribution_remaining_deadline(1_100, 1_000),
+            Some(Duration::from_millis(100)),
+            "legacy v1 must not consume a fixed skew budget at each hop"
+        );
+        let data = pb::OverlayData {
+            distribution_deadline_unix_ms: Some(unix_time_ms().saturating_add(100)),
+            ..Default::default()
+        };
+        let remaining = distribution_remaining_deadline(&data).expect("legacy deadline");
+        assert!(remaining <= Duration::from_millis(100));
+        assert!(remaining > Duration::from_millis(50));
+    }
+
+    #[test]
+    fn voice_transport_default_allows_long_haul_budget() {
+        assert_eq!(VOICE_TRANSPORT_TTL, Duration::from_millis(750));
     }
 }

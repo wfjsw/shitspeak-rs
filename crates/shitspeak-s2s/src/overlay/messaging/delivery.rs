@@ -23,12 +23,30 @@ pub fn deliver(
     class: MessageClass,
     body: Bytes,
 ) {
+    deliver_with_remote_playout(services, tag, from, level, class, body, None, false);
+}
+
+/// Deliver a local service frame with optional source-installed remote voice
+/// playout state. The state belongs to the versioned tree control plane, not
+/// the per-frame data envelope.
+pub fn deliver_with_remote_playout(
+    services: &ServiceRegistry,
+    tag: u32,
+    from: NodeIdentifier,
+    level: ServiceLevel,
+    class: MessageClass,
+    body: Bytes,
+    remote_playout_delay_ms: Option<u64>,
+    is_distribution_repair: bool,
+) {
     if let Some(h) = services.get(tag) {
         h.handle(OverlayInboundMessage {
             from,
             level,
             class,
             body,
+            remote_playout_delay_ms,
+            is_distribution_repair,
         });
     } else if !NO_SERVICE_REGISTERED_WARNED.load(Ordering::Relaxed) {
         warn!(tag, %from, "no service registered; dropping inbound overlay data");

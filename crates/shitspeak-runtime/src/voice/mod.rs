@@ -10,10 +10,11 @@
 pub use shitspeak_voice::{codec, ping, routing_queue, udp_batch};
 pub(crate) mod dispatch_tuning;
 pub(crate) mod metrics;
+pub(crate) mod playout;
 mod routing;
 
-pub(crate) use routing::route_s2s_voice_frame;
 pub use routing::route_voice;
 pub use routing::spawn_voice_routing_task;
 pub use routing::spawn_voice_tcp_task;
+pub(crate) use routing::{route_s2s_voice_frame, route_s2s_voice_frame_decoded};
 pub use shitspeak_voice::routing_queue::VoiceRoutingPayload;
