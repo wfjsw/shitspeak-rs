@@ -28,12 +28,8 @@ pub(super) async fn handle_udp_tunnel(
                 crate::voice::metrics::VoiceIngressTransport::TcpTunnel,
                 data.len(),
             );
-            crate::voice::metrics::record_native_ingress_continuity(
+            crate::voice::metrics::record_native_ingress_event(
                 crate::voice::metrics::VoiceIngressTransport::TcpTunnel,
-                audio
-                    .sender_session
-                    .unwrap_or_else(|| sender.get_session_id()),
-                audio.frame_number,
                 matches!(
                     &audio.audio_payload,
                     crate::voice::codec::AudioPayload::Opus(payload) if payload.is_terminator

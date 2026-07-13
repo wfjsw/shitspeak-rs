@@ -932,10 +932,10 @@ impl<'a> PrometheusWriter<'a> {
         // sum by (source, mode, result) (
         //   rate(shitspeak_s2s_voice_send_events_total{source="12"}[1m])
         // )
-        // Compare against native ingress gaps on the same node:
-        // sum by (node, origin_node, result) (
-        //   rate(shitspeak_voice_ingress_continuity_total{
-        //     node="12", result!="frame"
+        // Compare against receiver-side S2S reorder outcomes:
+        // sum by (source, origin_node, from_immediate, result) (
+        //   rate(shitspeak_s2s_voice_receive_events_total{
+        //     source="12", origin_node="12", result=~"gap_buffered|gap_filled|deadline_flush|buffer_drop"
         //   }[1m])
         // )
         // Search with: rg "CHOPPY_VOICE_PROMQL source_node_egress"

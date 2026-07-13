@@ -26,9 +26,11 @@ pub fn deliver(
     deliver_with_remote_playout(services, tag, from, level, class, body, None, false);
 }
 
-/// Deliver a local service frame with optional source-installed remote voice
-/// playout state. The state belongs to the versioned tree control plane, not
-/// the per-frame data envelope.
+/// Deliver a local service frame with compatibility distribution metadata.
+///
+/// `remote_playout_delay_ms` is retained for mixed-version API compatibility.
+/// New overlay delivery paths leave it unset: voice is released by the S2S
+/// reorderer without a server-side playout schedule.
 pub fn deliver_with_remote_playout(
     services: &ServiceRegistry,
     tag: u32,

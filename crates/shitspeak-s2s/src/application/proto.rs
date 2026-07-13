@@ -155,6 +155,7 @@ mod tests {
                     source_channel: 7,
                 })),
             }),
+            proactive_copy: false,
         };
         let bytes = encode_voice(&frame).unwrap();
         let decoded = decode_voice(&bytes).unwrap();

@@ -1055,12 +1055,8 @@ impl Server {
                             crate::voice::metrics::VoiceIngressTransport::Udp,
                             packet.len(),
                         );
-                        crate::voice::metrics::record_native_ingress_continuity(
+                        crate::voice::metrics::record_native_ingress_event(
                             crate::voice::metrics::VoiceIngressTransport::Udp,
-                            decoded_audio
-                                .sender_session
-                                .unwrap_or_else(|| client.get_session_id()),
-                            decoded_audio.frame_number,
                             matches!(
                                 &decoded_audio.audio_payload,
                                 crate::voice::codec::AudioPayload::Opus(payload)

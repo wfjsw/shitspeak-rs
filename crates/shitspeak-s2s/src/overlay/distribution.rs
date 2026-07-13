@@ -24,7 +24,6 @@ const RETAINED_VERSIONS: usize = 3;
 const UNKNOWN_TREE_FRAMES_PER_KEY: usize = 8;
 const UNKNOWN_TREE_FRAMES_TOTAL: usize = 256;
 const UNKNOWN_TREE_RECOVERY_RETRY: Duration = Duration::from_millis(10);
-const METRIC_TREE_HYSTERESIS: Duration = Duration::from_secs(5);
 const EDGE_FAILURE_REPORT_DEDUP: Duration = Duration::from_secs(1);
 pub(crate) const DISTRIBUTION_CONTROL_SERVICE_TAG: u32 = 250;
 pub(crate) const VOICE_REALTIME_PROFILE_ID: u32 = 1;
@@ -103,13 +102,6 @@ pub(crate) struct TreeState {
     members: HashSet<NodeIdentifier>,
     children: HashMap<NodeIdentifier, Vec<NodeIdentifier>>,
     nodes: HashSet<NodeIdentifier>,
-    /// Source-computed, receiver-specific remote playout baseline. This is
-    /// installed out of band with the exact tree version and never appears on
-    /// individual voice data frames.
-    playout_delays_ms: HashMap<NodeIdentifier, u64>,
-    /// Summed source-to-recipient path cost from the routing snapshot that
-    /// selected this tree. It is source-local selection state, not wire state.
-    recipient_path_cost: Option<u64>,
 }
 
 impl TreeState {
@@ -117,20 +109,6 @@ impl TreeState {
         source: NodeIdentifier,
         members: impl IntoIterator<Item = NodeIdentifier>,
         edges: impl IntoIterator<Item = (NodeIdentifier, NodeIdentifier)>,
-    ) -> Self {
-        Self::new_with_playout(
-            source,
-            members,
-            edges,
-            std::iter::empty::<(NodeIdentifier, u64)>(),
-        )
-    }
-
-    pub(crate) fn new_with_playout(
-        source: NodeIdentifier,
-        members: impl IntoIterator<Item = NodeIdentifier>,
-        edges: impl IntoIterator<Item = (NodeIdentifier, NodeIdentifier)>,
-        playout_delays_ms: impl IntoIterator<Item = (NodeIdentifier, u64)>,
     ) -> Self {
         let members: HashSet<_> = members.into_iter().collect();
         let mut children: HashMap<NodeIdentifier, Vec<NodeIdentifier>> = HashMap::new();
@@ -148,17 +126,22 @@ impl TreeState {
             child_nodes.dedup();
         }
         nodes.extend(members.iter().copied());
-        let playout_delays_ms = playout_delays_ms
-            .into_iter()
-            .filter(|(node, delay_ms)| members.contains(node) && *delay_ms > 0)
-            .collect();
         Self {
             members,
             children,
             nodes,
-            playout_delays_ms,
-            recipient_path_cost: None,
         }
+    }
+
+    /// Retained while mixed-version callers still supply the retired metadata.
+    /// The values are deliberately ignored: tree state owns topology only.
+    pub(crate) fn new_with_playout(
+        source: NodeIdentifier,
+        members: impl IntoIterator<Item = NodeIdentifier>,
+        edges: impl IntoIterator<Item = (NodeIdentifier, NodeIdentifier)>,
+        _playout_delays_ms: impl IntoIterator<Item = (NodeIdentifier, u64)>,
+    ) -> Self {
+        Self::new(source, members, edges)
     }
 
     pub(crate) fn is_member(&self, node: NodeIdentifier) -> bool {
@@ -183,16 +166,6 @@ impl TreeState {
             .flat_map(|(parent, children)| children.iter().map(move |child| (*parent, *child)))
     }
 
-    pub(crate) fn playout_delay_ms(&self, node: NodeIdentifier) -> Option<u64> {
-        self.playout_delays_ms.get(&node).copied()
-    }
-
-    pub(crate) fn playout_delays_ms(&self) -> impl Iterator<Item = (NodeIdentifier, u64)> + '_ {
-        self.playout_delays_ms
-            .iter()
-            .map(|(node, delay_ms)| (*node, *delay_ms))
-    }
-
     /// Exact recipient members reachable through one direct child branch.
     /// The source tree should be acyclic, but the visited set also bounds this
     /// traversal when inspecting malformed remotely installed control state.
@@ -214,8 +187,9 @@ impl TreeState {
         members
     }
 
-    pub(crate) fn with_recipient_path_cost(mut self, cost: u64) -> Self {
-        self.recipient_path_cost = Some(cost);
+    /// Retained until source-side route construction stops supplying the
+    /// retired playout-selection input. Path costs do not alter tree state.
+    pub(crate) fn with_recipient_path_cost(self, _cost: u64) -> Self {
         self
     }
 }
@@ -228,10 +202,7 @@ struct PendingAcks {
 #[derive(Clone)]
 struct ActiveTree {
     state: TreeState,
-    candidate: Option<(TreeState, Instant)>,
-    /// Failure edges already incorporated into the active replacement. A new
-    /// failure gets one structural bypass; unrelated future metric changes
-    /// remain subject to the five-second hysteresis.
+    /// Failure edges already incorporated into the active replacement.
     applied_failures: HashSet<(NodeIdentifier, NodeIdentifier)>,
 }
 
@@ -377,19 +348,6 @@ fn same_tree_structure(left: &TreeState, right: &TreeState) -> bool {
     left_edges == right_edges && left_members == right_members
 }
 
-fn same_tree(left: &TreeState, right: &TreeState) -> bool {
-    same_tree_structure(left, right) && left.playout_delays_ms == right.playout_delays_ms
-}
-
-fn selection_cost_improves_materially(current: &TreeState, candidate: &TreeState) -> bool {
-    let (Some(current_cost), Some(candidate_cost)) =
-        (current.recipient_path_cost, candidate.recipient_path_cost)
-    else {
-        return false;
-    };
-    current_cost > 0 && candidate_cost.saturating_mul(100) <= current_cost.saturating_mul(90)
-}
-
 #[derive(Default)]
 pub(crate) struct DistributionPlane {
     trees: Mutex<HashMap<TreeKey, Arc<TreeState>>>,
@@ -435,55 +393,29 @@ impl DistributionPlane {
                 scope,
                 ActiveTree {
                     state: candidate.clone(),
-                    candidate: None,
                     applied_failures,
                 },
             );
             return candidate;
         };
-        if same_tree(&current.state, &candidate) {
-            current.candidate = None;
+        if same_tree_structure(&current.state, &candidate) {
             return current.state.clone();
         }
-        // Membership/topology/reparent tree-shape changes are structural and
-        // immediately replace the active tree. Only a policy-only update on
-        // identical directed edges is subject to metric hysteresis.
-        if !same_tree_structure(&current.state, &candidate) {
-            let removed_failures: Vec<_> = failed_edges
-                .difference(&current.applied_failures)
-                .copied()
-                .filter(|edge| {
-                    !candidate
-                        .edges()
-                        .any(|candidate_edge| candidate_edge == *edge)
-                })
-                .collect();
-            current.state = candidate.clone();
-            current.candidate = None;
-            current.applied_failures.extend(removed_failures);
-            return candidate;
-        }
-        // Pure path-cost/playout adjustments must prove a sustained 10%
-        // aggregate recipient-path-cost improvement before publication.
-        if !selection_cost_improves_materially(&current.state, &candidate) {
-            distribution_metrics::record_hysteresis_hold(key.profile);
-            current.candidate = None;
-            return current.state.clone();
-        }
-        match &current.candidate {
-            Some((pending, since))
-                if same_tree(pending, &candidate) && since.elapsed() >= METRIC_TREE_HYSTERESIS =>
-            {
-                current.state = candidate.clone();
-                current.candidate = None;
-                candidate
-            }
-            Some((pending, _)) if same_tree(pending, &candidate) => current.state.clone(),
-            _ => {
-                current.candidate = Some((candidate, Instant::now()));
-                current.state.clone()
-            }
-        }
+        // Membership, topology, and reparent changes are structural and
+        // immediately replace the active tree. Per-recipient playout policy
+        // is no longer part of tree state or publication.
+        let removed_failures: Vec<_> = failed_edges
+            .difference(&current.applied_failures)
+            .copied()
+            .filter(|edge| {
+                !candidate
+                    .edges()
+                    .any(|candidate_edge| candidate_edge == *edge)
+            })
+            .collect();
+        current.state = candidate.clone();
+        current.applied_failures.extend(removed_failures);
+        candidate
     }
 
     pub(crate) fn failed_edges(&self, key: TreeKey) -> HashSet<(NodeIdentifier, NodeIdentifier)> {
@@ -791,8 +723,6 @@ pub(crate) fn tree_version(
     members.sort_unstable();
     let mut edges: Vec<_> = state.edges().collect();
     edges.sort_unstable();
-    let mut playout_delays: Vec<_> = state.playout_delays_ms().collect();
-    playout_delays.sort_unstable();
     for value in std::iter::once(u64::from(source))
         .chain([u64::from(profile), group, group_version, topology_epoch])
         .chain(members.into_iter().map(u64::from))
@@ -800,11 +730,6 @@ pub(crate) fn tree_version(
             edges
                 .into_iter()
                 .flat_map(|(parent, child)| [u64::from(parent), u64::from(child)]),
-        )
-        .chain(
-            playout_delays
-                .into_iter()
-                .flat_map(|(node, delay_ms)| [u64::from(node), delay_ms]),
         )
     {
         hash ^= value;
@@ -844,13 +769,9 @@ pub(crate) fn encode_install(key: TreeKey, state: &TreeState) -> Bytes {
                 group_version: key.group_version,
                 topology_epoch: key.topology_epoch,
                 members: state.members().map(u32::from).collect(),
-                playout_delays: state
-                    .playout_delays_ms()
-                    .map(|(node, delay_ms)| pb::DistributionTreePlayoutDelay {
-                        node: node.into(),
-                        delay_ms: delay_ms.min(u64::from(u32::MAX)) as u32,
-                    })
-                    .collect(),
+                // Reserved wire field for mixed-version compatibility. New
+                // senders intentionally do not publish playout policy.
+                playout_delays: Vec::new(),
                 edges: state
                     .edges()
                     .map(|(parent, child)| pb::OverlayTreeEdge {
@@ -904,6 +825,25 @@ fn encode_control(control: pb::DistributionControl) -> Bytes {
     buf.freeze()
 }
 
+fn installed_tree_state(
+    source: NodeIdentifier,
+    install: &pb::DistributionTreeInstall,
+) -> TreeState {
+    let members = install
+        .members
+        .iter()
+        .filter_map(|node| NodeIdentifier::try_from(*node).ok());
+    let edges = install.edges.iter().filter_map(|edge| {
+        Some((
+            NodeIdentifier::try_from(edge.parent).ok()?,
+            NodeIdentifier::try_from(edge.child).ok()?,
+        ))
+    });
+    // `playout_delays` remains decodable on the wire for mixed deployments,
+    // but remote playout is no longer a distribution-tree concern.
+    TreeState::new(source, members, edges)
+}
+
 struct DistributionControlHandler {
     overlay: OverlayNetwork,
     plane: Arc<DistributionPlane>,
@@ -926,16 +866,6 @@ impl ServiceInbound for DistributionControlHandler {
                     let Ok(source) = NodeIdentifier::try_from(install.source) else {
                         return;
                     };
-                    let members = install
-                        .members
-                        .into_iter()
-                        .filter_map(|node| NodeIdentifier::try_from(node).ok());
-                    let edges = install.edges.into_iter().filter_map(|edge| {
-                        Some((
-                            NodeIdentifier::try_from(edge.parent).ok()?,
-                            NodeIdentifier::try_from(edge.child).ok()?,
-                        ))
-                    });
                     let key = TreeKey {
                         source,
                         profile: install.profile,
@@ -944,16 +874,7 @@ impl ServiceInbound for DistributionControlHandler {
                         topology_epoch: install.topology_epoch,
                         version: install.version,
                     };
-                    let playout_delays = install.playout_delays.into_iter().filter_map(|delay| {
-                        Some((
-                            NodeIdentifier::try_from(delay.node).ok()?,
-                            u64::from(delay.delay_ms),
-                        ))
-                    });
-                    let recovered = plane.install(
-                        key,
-                        TreeState::new_with_playout(source, members, edges, playout_delays),
-                    );
+                    let recovered = plane.install(key, installed_tree_state(source, &install));
                     let ack = encode_control(pb::DistributionControl {
                         body: Some(pb::distribution_control::Body::Ack(
                             pb::DistributionTreeAck {
@@ -1103,39 +1024,53 @@ mod tests {
         TreeState::new(1, [2], [(1, 2)])
     }
 
-    fn state_with_delay(delay_ms: u64) -> TreeState {
+    fn state_with_ignored_playout(delay_ms: u64) -> TreeState {
         TreeState::new_with_playout(1, [2], [(1, 2)], [(2, delay_ms)])
     }
 
-    fn state_with_delay_and_cost(delay_ms: u64, cost: u64) -> TreeState {
-        state_with_delay(delay_ms).with_recipient_path_cost(cost)
-    }
-
     #[test]
-    fn playout_delay_is_part_of_exact_tree_version() {
-        let lower = state_with_delay(100);
-        let higher = state_with_delay(120);
-        assert_ne!(
-            tree_version(1, VOICE_REALTIME_PROFILE_ID, 1, 1, 1, &lower),
-            tree_version(1, VOICE_REALTIME_PROFILE_ID, 1, 1, 1, &higher)
+    fn ignored_playout_metadata_does_not_change_exact_tree_version() {
+        let plain = state();
+        let with_legacy_metadata = state_with_ignored_playout(120);
+        assert_eq!(
+            tree_version(1, VOICE_REALTIME_PROFILE_ID, 1, 1, 1, &plain),
+            tree_version(1, VOICE_REALTIME_PROFILE_ID, 1, 1, 1, &with_legacy_metadata)
         );
     }
 
     #[test]
-    fn metric_hysteresis_requires_ten_percent_path_cost_improvement() {
-        let current = state_with_delay_and_cost(100, 100);
-        assert!(!selection_cost_improves_materially(
-            &current,
-            &state_with_delay_and_cost(120, 91)
-        ));
-        assert!(selection_cost_improves_materially(
-            &current,
-            &state_with_delay_and_cost(120, 90)
-        ));
-        assert!(!selection_cost_improves_materially(
-            &current,
-            &state_with_delay_and_cost(120, 110)
-        ));
+    fn install_ignores_legacy_playout_metadata() {
+        let install = pb::DistributionTreeInstall {
+            source: 1,
+            members: vec![2],
+            edges: vec![pb::OverlayTreeEdge {
+                parent: 1,
+                child: 2,
+            }],
+            playout_delays: vec![pb::DistributionTreePlayoutDelay {
+                node: 2,
+                delay_ms: 750,
+            }],
+            ..Default::default()
+        };
+        let installed = installed_tree_state(1, &install);
+
+        assert_eq!(installed.children(1), &[2]);
+        assert!(installed.is_member(2));
+        assert_eq!(
+            tree_version(1, VOICE_REALTIME_PROFILE_ID, 1, 1, 1, &installed),
+            tree_version(1, VOICE_REALTIME_PROFILE_ID, 1, 1, 1, &state())
+        );
+    }
+
+    #[test]
+    fn install_encoding_leaves_legacy_playout_metadata_empty() {
+        let control = pb::DistributionControl::decode(encode_install(key(1, 1), &state())).unwrap();
+        let Some(pb::distribution_control::Body::Install(install)) = control.body else {
+            panic!("expected tree install");
+        };
+
+        assert!(install.playout_delays.is_empty());
     }
 
     #[test]
@@ -1164,28 +1099,23 @@ mod tests {
     }
 
     #[test]
-    fn structural_replacement_bypasses_hysteresis_once_then_metric_changes_hold() {
+    fn structural_replacement_remains_immediate_when_legacy_playout_differs() {
         let plane = DistributionPlane::default();
         let key = key(1, 1);
-        let initial = state_with_delay_and_cost(100, 100);
-        assert_eq!(
-            plane.select_tree(key, initial.clone()).playout_delay_ms(2),
-            Some(100)
-        );
+        let initial = state_with_ignored_playout(100);
+        assert_eq!(plane.select_tree(key, initial.clone()).children(1), &[2]);
         plane.install(key, initial);
         plane.report_edge_failure(key, 1, 2);
 
-        let replacement = TreeState::new_with_playout(1, [2], [(1, 3), (3, 2)], [(2, 120)])
-            .with_recipient_path_cost(90);
+        let replacement = TreeState::new_with_playout(1, [2], [(1, 3), (3, 2)], [(2, 120)]);
         let selected = plane.select_tree(key, replacement.clone());
         assert_eq!(selected.children(1), &[3]);
 
-        let metric_only = TreeState::new_with_playout(1, [2], [(1, 3), (3, 2)], [(2, 140)])
-            .with_recipient_path_cost(80);
+        let unchanged_topology = TreeState::new_with_playout(1, [2], [(1, 3), (3, 2)], [(2, 140)]);
         assert_eq!(
-            plane.select_tree(key, metric_only).playout_delay_ms(2),
-            Some(120),
-            "the prior failure must not permanently bypass metric hysteresis"
+            plane.select_tree(key, unchanged_topology).children(1),
+            &[3],
+            "ignored playout metadata does not republish an unchanged tree"
         );
     }
 

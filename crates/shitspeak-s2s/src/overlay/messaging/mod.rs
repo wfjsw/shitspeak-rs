@@ -28,13 +28,12 @@ pub struct OverlayInboundMessage {
     pub level: ServiceLevel,
     pub class: MessageClass,
     pub body: Bytes,
-    /// Source-installed remote playout baseline for a tree receiver. Legacy
-    /// and non-voice services leave this unset.
+    /// Reserved compatibility metadata from older tree delivery versions.
+    /// New delivery paths leave it unset and must not use it for timing.
     pub remote_playout_delay_ms: Option<u64>,
-    /// This frame is the one permitted alternate copy for a failed
-    /// distribution-tree child edge. It must retain that identity through
-    /// voice reordering so remote playout never releases it after the media
-    /// deadline.
+    /// This frame is a voice repair copy. It must retain that identity through
+    /// voice reordering so an already-resolved gap cannot be reopened by a
+    /// late NACK replay or alternate distribution-tree copy.
     pub(crate) is_distribution_repair: bool,
 }
 
@@ -57,8 +56,7 @@ impl OverlayInboundMessage {
         }
     }
 
-    /// Mark this as the alternate copy for a failed distribution-tree edge.
-    /// The marker is consumed only by remote voice playout.
+    /// Mark this as a voice repair copy for S2S reordering.
     pub fn with_distribution_repair(mut self, is_distribution_repair: bool) -> Self {
         self.is_distribution_repair = is_distribution_repair;
         self
@@ -113,6 +111,7 @@ pub struct OverlaySendOptions {
     allow_l1_compression: bool,
     transport_ttl: Option<std::time::Duration>,
     avoid_first_hop: Option<NodeIdentifier>,
+    distribution_repair: bool,
 }
 
 impl OverlaySendOptions {
@@ -141,6 +140,20 @@ impl OverlaySendOptions {
 
     pub fn avoided_first_hop(&self) -> Option<NodeIdentifier> {
         self.avoid_first_hop
+    }
+
+    /// Mark an ordinary overlay send as an application repair copy.
+    ///
+    /// This maps to the existing `OverlayData.distribution_repair` wire bit
+    /// without adding a protocol field. Distribution-tree alternate repairs
+    /// continue to set the bit internally with their target metadata.
+    pub fn as_distribution_repair(mut self) -> Self {
+        self.distribution_repair = true;
+        self
+    }
+
+    pub fn is_distribution_repair(&self) -> bool {
+        self.distribution_repair
     }
 }
 

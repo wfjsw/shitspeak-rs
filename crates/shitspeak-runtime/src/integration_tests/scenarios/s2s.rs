@@ -29,7 +29,7 @@ use crate::voice::metrics::{
 use shitspeak_runtime_config::{S2sConfig, S2sSeedAddressConfig, S2sTransportKindConfig};
 use shitspeak_s2s::testing::{
     LinkChaos, MessageType, Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port,
-    s2s_network_test_guard, wait_until,
+    s2s_network_test_guard, wait_until, wait_until_with,
 };
 use shitspeak_s2s::{
     application::proto::{self, VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal},
@@ -62,8 +62,11 @@ const S2S_SHOUT_ROUTE_CPU_BUDGET: f64 = 0.40;
 const S2S_LONG_HAUL_ONE_WAY_LATENCY: Duration = Duration::from_millis(104);
 const S2S_LONG_HAUL_JITTER: Duration = Duration::from_millis(4);
 const S2S_LONG_HAUL_FRAME_COUNT: usize = 48;
-const S2S_LONG_HAUL_PACING_FLOOR: Duration = Duration::from_millis(700);
+const S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET: Duration = Duration::from_millis(400);
 const S2S_LONG_HAUL_REPAIR_FRAME_OFFSET: usize = 4;
+const S2S_LOW_RTT_GAP_OBSERVE_BUDGET: Duration = Duration::from_millis(30);
+const S2S_LOW_RTT_REPAIR_RELEASE_BUDGET: Duration = Duration::from_millis(40);
+const S2S_LOW_RTT_SUFFIX_BURST_BUDGET: Duration = Duration::from_millis(20);
 const S2S_ROOT_SHOUT_TRAFFIC_CHANNELS: &[(u32, u32, &str)] = &[
     (10, 0, "General"),
     (11, 10, "General East"),
@@ -236,6 +239,61 @@ async fn spawn_s2s_long_haul_pair() -> (TestServer, TestServer) {
     .await;
 
     (node_8, node_1)
+}
+
+/// Start a direct, healthy tree path for the geographically-near node 8 to
+/// node 3 regression. This intentionally has no link chaos: any observed
+/// voice gap here must come from the application path, not transport delay.
+async fn spawn_s2s_low_rtt_pair() -> (TestServer, TestServer) {
+    let pki = Arc::new(mint_pki(&[8, 3]));
+    let node_8_port = pick_free_port().await;
+    let node_3_port = pick_free_port().await;
+
+    let mut node_8_config = S2sConfig {
+        enabled: true,
+        tcp_listen: vec![loopback(node_8_port)],
+        seed_addresses: vec![S2sSeedAddressConfig::new(
+            S2sTransportKindConfig::Tcp,
+            loopback(node_3_port),
+        )],
+        ..S2sConfig::default()
+    };
+    node_8_config.application.voice.tree_delivery_enabled = true;
+    let mut node_3_config = S2sConfig {
+        enabled: true,
+        tcp_listen: vec![loopback(node_3_port)],
+        seed_addresses: vec![S2sSeedAddressConfig::new(
+            S2sTransportKindConfig::Tcp,
+            loopback(node_8_port),
+        )],
+        ..S2sConfig::default()
+    };
+    node_3_config.application.voice.tree_delivery_enabled = true;
+
+    let node_8 = spawn_s2s_test_server_with_config(
+        TestServerOpts {
+            max_users: 16,
+            ..TestServerOpts::default()
+        },
+        Arc::clone(&pki),
+        8,
+        0,
+        node_8_config,
+    )
+    .await;
+    let node_3 = spawn_s2s_test_server_with_config(
+        TestServerOpts {
+            max_users: 16,
+            ..TestServerOpts::default()
+        },
+        pki,
+        3,
+        1,
+        node_3_config,
+    )
+    .await;
+
+    (node_8, node_3)
 }
 
 async fn spawn_s2s_three_node_with_opts(
@@ -1124,26 +1182,7 @@ fn s2s_prometheus_total(server: &TestServer, metric: &str, labels: &[(&str, &str
         .sum()
 }
 
-fn runtime_prometheus_total(metric: &str, labels: &[(&str, &str)]) -> f64 {
-    crate::voice::metrics::prometheus_samples()
-        .into_iter()
-        .filter(|sample| {
-            sample.name() == metric
-                && labels.iter().all(|(key, value)| {
-                    sample.labels().iter().any(|(sample_key, sample_value)| {
-                        sample_key == key && sample_value == value
-                    })
-                })
-        })
-        .map(|sample| sample.value())
-        .sum()
-}
-
-fn s2s_long_haul_native_voice_payload(
-    frame_number: u64,
-    opus: Bytes,
-    is_terminator: bool,
-) -> Bytes {
+fn s2s_native_voice_payload(frame_number: u64, opus: Bytes, is_terminator: bool) -> Bytes {
     use crate::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
     use prost::Message as _;
 
@@ -1165,7 +1204,7 @@ fn s2s_long_haul_native_voice_payload(
     body.freeze()
 }
 
-fn s2s_long_haul_repair_frame(
+fn s2s_repair_frame(
     sender_session: u32,
     sender_epoch: u64,
     s2s_seq: u64,
@@ -1179,12 +1218,13 @@ fn s2s_long_haul_repair_frame(
         s2s_seq,
         target_kind: 0,
         is_terminator: false,
-        payload: s2s_long_haul_native_voice_payload(frame_number, opus, false),
+        payload: s2s_native_voice_payload(frame_number, opus, false),
         intent: Some(VoiceIntent {
             kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
                 source_channel: 0,
             })),
         }),
+        proactive_copy: false,
     }
 }
 
@@ -2438,10 +2478,10 @@ async fn s2s_cross_node_voice_target_shout_stream_is_contiguous_under_load() {
 
 /// Verifies the deployed long-haul path from node 8 to node 1. The path has
 /// roughly 208 ms RTT with bounded jitter, so a v2 distribution tree must
-/// rebase its deadline at the receiving peer and feed remote voice through the
-/// frame-number playout timeline rather than releasing a delayed burst.
+/// rebase its deadline at the receiving peer and deliver every ordered frame
+/// without adding a server-side media timeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn s2s_tree_voice_long_haul_node_8_to_node_1_is_paced_without_expiry() {
+async fn s2s_tree_voice_long_haul_node_8_to_node_1_is_immediate_without_expiry() {
     let _guard = s2s_network_test_guard().await;
     let (node_8, node_1) = spawn_s2s_long_haul_pair().await;
     wait_for_s2s_cluster(&[(&node_8, 8), (&node_1, 1)]).await;
@@ -2539,11 +2579,8 @@ async fn s2s_tree_voice_long_haul_node_8_to_node_1_is_paced_without_expiry() {
     let first_latency = delivery.first_at.saturating_duration_since(sent_at[0]);
     let max_latency = max_s2s_shout_frame_latency(std::slice::from_ref(&delivery), &sent_at);
     let tail_latency = delivery.last_at.saturating_duration_since(send_end);
-    let playout_span = delivery
-        .last_at
-        .saturating_duration_since(delivery.first_at);
     eprintln!(
-        "s2s_long_haul_tree_voice_metrics source=8 destination=1 rtt_ms={} jitter_ms={} frames={} tree_original_frames={:.0} deadline_translations={:.0} deadline_expiries={:.0} first_latency_ms={} max_latency_ms={} tail_latency_ms={} playout_span_ms={} max_gap_ms={}",
+        "s2s_long_haul_tree_voice_metrics source=8 destination=1 rtt_ms={} jitter_ms={} frames={} tree_original_frames={:.0} deadline_translations={:.0} deadline_expiries={:.0} first_latency_ms={} max_latency_ms={} tail_latency_ms={} max_gap_ms={}",
         S2S_LONG_HAUL_ONE_WAY_LATENCY.as_millis() * 2,
         S2S_LONG_HAUL_JITTER.as_millis(),
         frames.len(),
@@ -2553,7 +2590,6 @@ async fn s2s_tree_voice_long_haul_node_8_to_node_1_is_paced_without_expiry() {
         first_latency.as_millis(),
         max_latency.as_millis(),
         tail_latency.as_millis(),
-        playout_span.as_millis(),
         delivery.max_frame_gap.as_millis(),
     );
 
@@ -2570,21 +2606,20 @@ async fn s2s_tree_voice_long_haul_node_8_to_node_1_is_paced_without_expiry() {
         "node 1 expired a tree voice frame on the 208 ms RTT path"
     );
     assert!(
-        max_latency <= Duration::from_millis(750),
-        "long-haul tree voice exceeded the accepted 750 ms remote freshness ceiling: {max_latency:?}"
+        max_latency <= S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET,
+        "long-haul tree voice was held for {:?}, expected <= {:?}",
+        max_latency,
+        S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET
     );
     assert!(
-        tail_latency <= Duration::from_millis(750),
-        "long-haul tree voice tail exceeded the accepted 750 ms remote freshness ceiling: {tail_latency:?}"
-    );
-    assert!(
-        playout_span >= S2S_LONG_HAUL_PACING_FLOOR,
-        "long-haul remote playout released {} frames in {playout_span:?}, indicating a burst",
-        frames.len()
+        tail_latency <= S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET,
+        "long-haul tree voice tail was held for {:?}, expected <= {:?}",
+        tail_latency,
+        S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET
     );
     assert!(
         delivery.max_frame_gap <= S2S_SHOUT_STREAM_GAP_BUDGET,
-        "long-haul remote playout had a gap of {:?}, expected <= {:?}",
+        "long-haul immediate delivery had a gap of {:?}, expected <= {:?}",
         delivery.max_frame_gap,
         S2S_SHOUT_STREAM_GAP_BUDGET
     );
@@ -2595,10 +2630,10 @@ async fn s2s_tree_voice_long_haul_node_8_to_node_1_is_paced_without_expiry() {
 /// test reserves one real source sequence and injects its exact alternate copy
 /// through node 1's registered `VoiceInbound` after the following tree frame
 /// has opened the reorder gap. The injection therefore covers production
-/// reorder, native decode, remote playout, and local fan-out while retaining
-/// the explicit repair identity needed to reject repairs after playout.
+/// reorder, native decode, and local fan-out while retaining repair
+/// provenance through the S2S ingress path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn s2s_tree_voice_long_haul_repair_is_paced_before_playout() {
+async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
     let _guard = s2s_network_test_guard().await;
     let (node_8, node_1) = spawn_s2s_long_haul_pair().await;
     wait_for_s2s_cluster(&[(&node_8, 8), (&node_1, 1)]).await;
@@ -2653,15 +2688,6 @@ async fn s2s_tree_voice_long_haul_repair_is_paced_before_playout() {
         "shitspeak_s2s_distribution_events_total",
         &[("profile", "voice_realtime"), ("event", "deadline_expiry")],
     );
-    let repair_before_playout_before = runtime_prometheus_total(
-        "shitspeak_voice_remote_playout_events_total",
-        &[("origin_node", "8"), ("result", "repair_before_playout")],
-    );
-    let repair_after_playout_before = runtime_prometheus_total(
-        "shitspeak_voice_remote_playout_events_total",
-        &[("origin_node", "8"), ("result", "repair_after_playout")],
-    );
-
     let frames = (0..S2S_LONG_HAUL_FRAME_COUNT)
         .map(|offset| {
             let frame_number = 100_000 + offset as u64;
@@ -2701,7 +2727,7 @@ async fn s2s_tree_voice_long_haul_repair_is_paced_before_playout() {
         // the receiver reorder gap. This alternate then arrives before its
         // media deadline, as a successful fast edge repair would.
         tokio::time::sleep(Duration::from_millis(120)).await;
-        let body = proto::encode_voice(&s2s_long_haul_repair_frame(
+        let body = proto::encode_voice(&s2s_repair_frame(
             sender_session,
             sender_epoch,
             missing_s2s_seq,
@@ -2735,7 +2761,7 @@ async fn s2s_tree_voice_long_haul_repair_is_paced_before_playout() {
                         crate::types::default_server_id(),
                         0,
                         offset + 1 == frames.len(),
-                        s2s_long_haul_native_voice_payload(
+                        s2s_native_voice_payload(
                             *frame_number,
                             opus.clone(),
                             offset + 1 == frames.len(),
@@ -2780,32 +2806,18 @@ async fn s2s_tree_voice_long_haul_repair_is_paced_before_playout() {
         "shitspeak_s2s_distribution_events_total",
         &[("profile", "voice_realtime"), ("event", "deadline_expiry")],
     ) - deadline_expiry_before;
-    let repair_before_playout_delta = runtime_prometheus_total(
-        "shitspeak_voice_remote_playout_events_total",
-        &[("origin_node", "8"), ("result", "repair_before_playout")],
-    ) - repair_before_playout_before;
-    let repair_after_playout_delta = runtime_prometheus_total(
-        "shitspeak_voice_remote_playout_events_total",
-        &[("origin_node", "8"), ("result", "repair_after_playout")],
-    ) - repair_after_playout_before;
     let max_latency = max_s2s_shout_frame_latency(std::slice::from_ref(&delivery), &sent_at);
     let tail_latency = delivery.last_at.saturating_duration_since(send_end);
-    let playout_span = delivery
-        .last_at
-        .saturating_duration_since(delivery.first_at);
     eprintln!(
-        "s2s_long_haul_tree_repair_metrics source=8 destination=1 rtt_ms={} jitter_ms={} frames={} tree_original_frames={:.0} deadline_translations={:.0} deadline_expiries={:.0} repair_before_playout={:.0} repair_after_playout={:.0} max_latency_ms={} tail_latency_ms={} playout_span_ms={} max_gap_ms={}",
+        "s2s_long_haul_tree_repair_metrics source=8 destination=1 rtt_ms={} jitter_ms={} frames={} tree_original_frames={:.0} deadline_translations={:.0} deadline_expiries={:.0} max_latency_ms={} tail_latency_ms={} max_gap_ms={}",
         S2S_LONG_HAUL_ONE_WAY_LATENCY.as_millis() * 2,
         S2S_LONG_HAUL_JITTER.as_millis(),
         frames.len(),
         tree_original_delta,
         deadline_translation_delta,
         deadline_expiry_delta,
-        repair_before_playout_delta,
-        repair_after_playout_delta,
         max_latency.as_millis(),
         tail_latency.as_millis(),
-        playout_span.as_millis(),
         delivery.max_frame_gap.as_millis(),
     );
 
@@ -2821,32 +2833,252 @@ async fn s2s_tree_voice_long_haul_repair_is_paced_before_playout() {
         deadline_expiry_delta, 0.0,
         "node 1 expired a tree voice frame during repaired long-haul delivery"
     );
-    assert_eq!(
-        repair_before_playout_delta, 1.0,
-        "the injected alternate did not enter remote playout before its media deadline"
-    );
-    assert_eq!(
-        repair_after_playout_delta, 0.0,
-        "the repaired frame arrived after its scheduled playout position"
+    assert!(
+        max_latency <= S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET,
+        "repaired long-haul voice was held for {:?}, expected <= {:?}",
+        max_latency,
+        S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET
     );
     assert!(
-        max_latency <= Duration::from_millis(750),
-        "repaired long-haul voice exceeded the accepted 750 ms remote freshness ceiling: {max_latency:?}"
-    );
-    assert!(
-        tail_latency <= Duration::from_millis(750),
-        "repaired long-haul voice tail exceeded the accepted 750 ms remote freshness ceiling: {tail_latency:?}"
-    );
-    assert!(
-        playout_span >= S2S_LONG_HAUL_PACING_FLOOR,
-        "repaired long-haul playout released {} frames in {playout_span:?}, indicating a burst",
-        frames.len()
+        tail_latency <= S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET,
+        "repaired long-haul voice tail was held for {:?}, expected <= {:?}",
+        tail_latency,
+        S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET
     );
     assert!(
         delivery.max_frame_gap <= S2S_SHOUT_STREAM_GAP_BUDGET,
-        "repaired long-haul playout had a gap of {:?}, expected <= {:?}",
+        "repaired long-haul immediate delivery had a gap of {:?}, expected <= {:?}",
         delivery.max_frame_gap,
         S2S_SHOUT_STREAM_GAP_BUDGET
+    );
+}
+
+/// A healthy nearby path must not add a media clock after S2S reordering.
+/// The native Mumble frame numbers and Opus packet durations are deliberately
+/// irregular here: the only server-side hold allowed is an actual missing
+/// `s2s_seq`, and its buffered suffix must release as one immediate batch
+/// when the marked repair fills that sequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_media_pacing() {
+    let _guard = s2s_network_test_guard().await;
+    let (node_8, node_3) = spawn_s2s_low_rtt_pair().await;
+    wait_for_s2s_cluster(&[(&node_8, 8), (&node_3, 3)]).await;
+    wait_for_s2s_voice_send_ready(&node_8, &[3]).await;
+
+    node_8.authenticator.register_superuser(
+        "low-rtt-speaker",
+        None,
+        Some(80_003),
+        vec!["admin".into()],
+    );
+    node_3
+        .authenticator
+        .register_user("low-rtt-listener", None, Some(10_003), Vec::new());
+    let listener = TestClient::connect_and_authenticate(&node_3, "low-rtt-listener", None)
+        .await
+        .expect("node 3 low-RTT listener");
+    let speaker = TestClient::connect_and_authenticate(&node_8, "low-rtt-speaker", None)
+        .await
+        .expect("node 8 low-RTT speaker");
+    wait_for_server_to_track_client(&node_8, listener.server_session).await;
+    wait_for_server_to_track_client(&node_3, speaker.server_session).await;
+
+    speaker
+        .set_voice_target(s2s_voice_target(
+            S2S_SHOUT_TARGET_SLOT,
+            vec![s2s_voice_target_channel(0, true, false, None)],
+        ))
+        .await;
+    wait_for_s2s_voice_target_installed(&node_8, &speaker, S2S_SHOUT_TARGET_SLOT).await;
+    listener.drain_now().await;
+    wait_for_s2s_tree_voice_forwarding(&node_8, &speaker, S2S_SHOUT_TARGET_SLOT).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    listener.drain_now().await;
+
+    // Valid Opus TOCs for 2.5, 60, 20, 40, and 10 ms packets. The frame
+    // numbers intentionally do not advance with any of those durations.
+    let frames = vec![
+        (410_000, Bytes::from_static(&[0x80, 0xA0])),
+        (410_037, Bytes::from_static(&[0x18, 0xB0])),
+        (410_038, Bytes::from_static(&[0x08, 0xC0])),
+        (410_116, Bytes::from_static(&[0x10, 0xD0])),
+        (410_117, Bytes::from_static(&[0x00, 0xE0])),
+    ];
+    let sender_session = u32::from(speaker.server_session);
+    let sender_epoch = node_8
+        .server
+        .s2s_manager()
+        .overlay()
+        .expect("node 8 overlay")
+        .local_boot_epoch();
+    let source_voice = node_8
+        .server
+        .s2s_manager()
+        .application()
+        .expect("node 8 application")
+        .voice()
+        .clone();
+    let repair_handler = node_3
+        .server
+        .s2s_manager()
+        .application()
+        .expect("node 3 application")
+        .voice()
+        .inbound_handler();
+    let gap_buffered_before = s2s_prometheus_total(
+        &node_3,
+        "shitspeak_s2s_voice_receive_events_total",
+        &[
+            ("source", "3"),
+            ("origin_node", "8"),
+            ("from_immediate", "8"),
+            ("result", "gap_buffered"),
+        ],
+    );
+    let gap_filled_before = s2s_prometheus_total(
+        &node_3,
+        "shitspeak_s2s_voice_receive_events_total",
+        &[
+            ("source", "3"),
+            ("origin_node", "8"),
+            ("from_immediate", "8"),
+            ("result", "gap_filled"),
+        ],
+    );
+
+    let receive_task = receive_s2s_shout_stream(&listener, &speaker, 0, &frames);
+    let send_task = async {
+        let first_sent_at = Instant::now();
+        source_voice
+            .send_for_channel(
+                sender_session,
+                crate::types::default_server_id(),
+                0,
+                false,
+                s2s_native_voice_payload(frames[0].0, frames[0].1.clone(), false),
+            )
+            .await
+            .expect("send low-RTT first voice frame");
+
+        // Reserve sequence one without sending it, then put the remaining
+        // originals on the active tree. This creates a real receiver-side
+        // S2S gap while leaving the native frame-number timeline irrelevant.
+        let missing_s2s_seq = source_voice.next_seq(sender_session);
+        for (offset, (frame_number, opus)) in frames.iter().enumerate().skip(2) {
+            let is_terminator = offset + 1 == frames.len();
+            source_voice
+                .send_for_channel(
+                    sender_session,
+                    crate::types::default_server_id(),
+                    0,
+                    is_terminator,
+                    s2s_native_voice_payload(*frame_number, opus.clone(), is_terminator),
+                )
+                .await
+                .expect("send low-RTT later voice frame");
+        }
+
+        assert!(
+            wait_until_with(
+                S2S_LOW_RTT_GAP_OBSERVE_BUDGET,
+                Duration::from_millis(1),
+                || {
+                    s2s_prometheus_total(
+                        &node_3,
+                        "shitspeak_s2s_voice_receive_events_total",
+                        &[
+                            ("source", "3"),
+                            ("origin_node", "8"),
+                            ("from_immediate", "8"),
+                            ("result", "gap_buffered"),
+                        ],
+                    ) > gap_buffered_before
+                },
+            )
+            .await,
+            "node 3 did not observe the intended S2S sequence gap before its 40 ms repair window"
+        );
+
+        let repair_injected_at = Instant::now();
+        let body = proto::encode_voice(&s2s_repair_frame(
+            sender_session,
+            sender_epoch,
+            missing_s2s_seq,
+            frames[1].0,
+            frames[1].1.clone(),
+        ))
+        .expect("encode low-RTT injected repair frame");
+        repair_handler.handle(
+            OverlayInboundMessage::new(
+                8,
+                ServiceLevel::BestEffort,
+                MessageClass::HighPriority,
+                body,
+            )
+            .with_distribution_repair(true),
+        );
+        (first_sent_at, repair_injected_at)
+    };
+    let ((first_sent_at, repair_injected_at), delivery) = tokio::join!(send_task, receive_task);
+
+    let gap_buffered_delta = s2s_prometheus_total(
+        &node_3,
+        "shitspeak_s2s_voice_receive_events_total",
+        &[
+            ("source", "3"),
+            ("origin_node", "8"),
+            ("from_immediate", "8"),
+            ("result", "gap_buffered"),
+        ],
+    ) - gap_buffered_before;
+    let gap_filled_delta = s2s_prometheus_total(
+        &node_3,
+        "shitspeak_s2s_voice_receive_events_total",
+        &[
+            ("source", "3"),
+            ("origin_node", "8"),
+            ("from_immediate", "8"),
+            ("result", "gap_filled"),
+        ],
+    ) - gap_filled_before;
+    let repair_release = delivery.received_at[1]
+        .1
+        .saturating_duration_since(repair_injected_at);
+    let suffix_burst = delivery.received_at[1..]
+        .windows(2)
+        .map(|window| window[1].1.saturating_duration_since(window[0].1))
+        .max()
+        .unwrap_or_default();
+    let first_release = delivery.first_at.saturating_duration_since(first_sent_at);
+    eprintln!(
+        "s2s_low_rtt_tree_reorder_metrics source=8 destination=3 frames={} gap_buffered={:.0} gap_filled={:.0} first_release_ms={} repair_release_ms={} suffix_burst_ms={}",
+        frames.len(),
+        gap_buffered_delta,
+        gap_filled_delta,
+        first_release.as_millis(),
+        repair_release.as_millis(),
+        suffix_burst.as_millis(),
+    );
+
+    assert!(
+        gap_buffered_delta >= (frames.len() - 2) as f64,
+        "node 3 should buffer only the three originals after the missing S2S sequence"
+    );
+    assert!(
+        gap_filled_delta >= (frames.len() - 2) as f64,
+        "the marked repair should drain every buffered suffix frame immediately"
+    );
+    assert!(
+        repair_release <= S2S_LOW_RTT_REPAIR_RELEASE_BUDGET,
+        "repair release was {:?}, expected <= {:?}; a healthy remote stream must not use media pacing",
+        repair_release,
+        S2S_LOW_RTT_REPAIR_RELEASE_BUDGET
+    );
+    assert!(
+        suffix_burst <= S2S_LOW_RTT_SUFFIX_BURST_BUDGET,
+        "drained suffix had an artificial {:?} inter-packet gap, expected <= {:?}",
+        suffix_burst,
+        S2S_LOW_RTT_SUFFIX_BURST_BUDGET
     );
 }
 

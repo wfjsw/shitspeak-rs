@@ -126,21 +126,23 @@ message TextMessageEnvelope {
 // encryption. Codec-agnostic at this layer.
 message VoiceFrame {
   uint32 sender_session = 1;   // composite ClientSessionIdentifier
-  uint64 sender_epoch   = 2;   // sender's overlay boot_epoch; receiver
-                                // resets per-sender reorder state when it
-                                // sees a strictly greater epoch.
+  uint64 sender_epoch   = 2;   // sender's overlay boot_epoch; opaque
+                                // repair-cache correlation metadata.
   uint64 s2s_seq        = 3;   // monotonic per (sender_session, sender_epoch);
                                 // independent of the in-payload Mumble
                                 // frame_number.
   uint32 target_kind    = 4;   // mirrors AudioContext: 0=NORMAL, 1=SHOUT,
                                 // 2=WHISPER, 3=LISTEN
-  bool   is_terminator  = 5;   // last frame of an utterance; receiver
-                                // flushes its reorder pending immediately.
+  bool   is_terminator  = 5;   // last frame of an utterance.
   bytes  payload        = 6;   // encoded UDP audio body, codec-agnostic
   VoiceIntent intent    = 7;   // unresolved routing intent. Receivers
                                 // resolve this against local/replicated
                                 // client and channel state.
   string server_id      = 8;   // empty/absent means "default" for legacy peers
+  // Alternate copy proactively sent before a receiver requests repair. It may
+  // bootstrap an empty reorder state but must not rebase an established cursor.
+  // Absent is false for peers predating this field.
+  bool proactive_copy   = 9;
 }
 
 // Best-effort request for the origin node to replay recently-sent voice

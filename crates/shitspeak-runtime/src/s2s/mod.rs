@@ -24,7 +24,6 @@ use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier, StrictReplicationMetadata}
 use crate::voice::metrics::{
     S2SVoiceGatewayDropDirection, S2SVoiceGatewayDropReason, record_s2s_gateway_drop,
 };
-use crate::voice::playout::RemoteVoicePlayout;
 use shitspeak_state::{BanEntry, BanOp, BanOperation, BanRepository};
 use shitspeak_state::{ChannelOp, ChannelOperation, ChannelRepository};
 
@@ -37,7 +36,6 @@ use shitspeak_s2s::application::proto::{
 };
 use shitspeak_s2s::application::voice::{
     AudioSink, RecipientIndex, RecipientIndexSnapshot, RecipientIndexUpdate,
-    RemoteVoicePlayoutPolicy,
 };
 use shitspeak_s2s::overlay as s2s_overlay;
 use shitspeak_s2s::overlay::OverlayNetwork;
@@ -143,8 +141,6 @@ enum S2SNativeCommand {
     DeliverVoice {
         from_immediate: NodeIdentifier,
         frame: VoiceFrame,
-        playout: RemoteVoicePlayoutPolicy,
-        is_repair: bool,
     },
 }
 
@@ -2759,18 +2755,10 @@ impl ModerationApplier for S2SNativeGatewaySink {
 
 #[async_trait]
 impl AudioSink for S2SNativeGatewaySink {
-    async fn deliver(
-        &self,
-        from_immediate: NodeIdentifier,
-        frame: VoiceFrame,
-        playout: RemoteVoicePlayoutPolicy,
-        is_repair: bool,
-    ) {
+    async fn deliver(&self, from_immediate: NodeIdentifier, frame: VoiceFrame, _is_repair: bool) {
         self.try_send_voice(S2SNativeCommand::DeliverVoice {
             from_immediate,
             frame,
-            playout,
-            is_repair,
         });
     }
 }
@@ -2857,52 +2845,28 @@ async fn run_native_voice_gateway(
     mut rx: S2SAdaptiveReceiver<S2SNativeCommand>,
     mut shutdown: watch::Receiver<()>,
 ) {
-    let mut playout = RemoteVoicePlayout::default();
     loop {
-        let command = match playout.next_deadline() {
-            Some(deadline) => tokio::select! {
-                _ = shutdown.changed() => return,
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => None,
-                next = rx.recv() => match next {
-                    Some(command) => Some(command),
-                    None => return,
-                },
-            },
-            None => tokio::select! {
-                _ = shutdown.changed() => return,
-                next = rx.recv() => match next {
-                    Some(command) => Some(command),
-                    None => return,
-                },
+        let command = tokio::select! {
+            _ = shutdown.changed() => return,
+            next = rx.recv() => match next {
+                Some(command) => command,
+                None => return,
             },
         };
         let Some(server) = server.upgrade() else {
             return;
         };
-        if let Some(command) = command {
-            match command {
-                S2SNativeCommand::DeliverVoice {
-                    from_immediate,
-                    frame,
-                    playout: policy,
-                    is_repair,
-                } => {
-                    playout.schedule(from_immediate, frame, policy, is_repair);
-                }
-                other => warn!(
-                    label = other.label(),
-                    "unexpected command on native voice gateway lane"
-                ),
+        match command {
+            S2SNativeCommand::DeliverVoice {
+                from_immediate,
+                frame,
+            } => {
+                crate::voice::route_s2s_voice_frame(&server, from_immediate, frame).await;
             }
-        }
-        for release in playout.release_due() {
-            crate::voice::route_s2s_voice_frame_decoded(
-                &server,
-                release.from_immediate,
-                release.frame,
-                release.decoded,
-            )
-            .await;
+            other => warn!(
+                label = other.label(),
+                "unexpected command on native voice gateway lane"
+            ),
         }
     }
 }

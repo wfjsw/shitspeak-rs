@@ -1,9 +1,7 @@
-use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use shitspeak_core::{ClientSessionIdentifier, NodeIdentifier};
 use shitspeak_s2s::status::PrometheusSample;
 
 use super::dispatch_tuning::{VoiceDispatchPlan, VoiceDispatchPlanSource};
@@ -313,21 +311,17 @@ impl VoiceUdpSendResult {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(crate) enum VoiceContinuityResult {
+#[derive(Clone, Copy)]
+pub(crate) enum NativeIngressEvent {
     Frame,
-    ForwardGap,
-    DuplicateOrOld,
-    ResetOrTerminator,
+    Terminator,
 }
 
-impl VoiceContinuityResult {
+impl NativeIngressEvent {
     fn label(self) -> &'static str {
         match self {
             Self::Frame => "frame",
-            Self::ForwardGap => "forward_gap",
-            Self::DuplicateOrOld => "duplicate_or_old",
-            Self::ResetOrTerminator => "reset_or_terminator",
+            Self::Terminator => "terminator",
         }
     }
 }
@@ -391,33 +385,6 @@ pub(crate) enum S2SVoiceGatewayDropReason {
     FullOrClosed,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(crate) enum RemotePlayoutResult {
-    TalkspurtStarted,
-    Scheduled,
-    Released,
-    OriginalTimelineRebased,
-    LateRepairDropped,
-    RepairBeforePlayout,
-    RepairAfterPlayout,
-    DecodeFailed,
-}
-
-impl RemotePlayoutResult {
-    fn label(self) -> &'static str {
-        match self {
-            Self::TalkspurtStarted => "talkspurt_started",
-            Self::Scheduled => "scheduled",
-            Self::Released => "released",
-            Self::OriginalTimelineRebased => "original_timeline_rebased",
-            Self::LateRepairDropped => "late_repair_dropped",
-            Self::RepairBeforePlayout => "repair_before_playout",
-            Self::RepairAfterPlayout => "repair_after_playout",
-            Self::DecodeFailed => "decode_failed",
-        }
-    }
-}
-
 impl S2SVoiceGatewayDropReason {
     fn label(self) -> &'static str {
         match self {
@@ -449,17 +416,7 @@ const S2S_VOICE_GATEWAY_DROP_DIRECTION_COUNT: usize = 2;
 const S2S_VOICE_GATEWAY_DROP_REASON_COUNT: usize = 2;
 const VOICE_QUEUE_KIND_COUNT: usize = 4;
 const VOICE_QUEUE_ENQUEUE_RESULT_COUNT: usize = 4;
-
-const REMOTE_PLAYOUT_LATENESS_BUCKETS_MS: [(&str, u64); 8] = [
-    ("le_1", 1),
-    ("le_5", 5),
-    ("le_10", 10),
-    ("le_20", 20),
-    ("le_50", 50),
-    ("le_100", 100),
-    ("le_250", 250),
-    ("gt_250", u64::MAX),
-];
+const NATIVE_INGRESS_EVENT_COUNT: usize = 2;
 
 const ROUTE_DIMENSIONS: [(VoiceRouteSource, VoiceRouteKind); 5] = [
     (VoiceRouteSource::Local, VoiceRouteKind::Normal),
@@ -558,18 +515,10 @@ const VOICE_BATCH_BYTES_BUCKETS: [(&str, u64); 8] = [
     ("gt_65536", u64::MAX),
 ];
 
-#[derive(Default)]
-struct RemotePlayoutMetrics {
-    events: HashMap<(NodeIdentifier, RemotePlayoutResult), u64>,
-    selected_delay_ms: HashMap<NodeIdentifier, u64>,
-    release_lateness_buckets: HashMap<(NodeIdentifier, &'static str), u64>,
-}
-
-static REMOTE_PLAYOUT: LazyLock<Mutex<RemotePlayoutMetrics>> =
-    LazyLock::new(|| Mutex::new(RemotePlayoutMetrics::default()));
-
 static INGRESS_PACKETS: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
 static INGRESS_BYTES: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
+static NATIVE_INGRESS_EVENTS: [[AtomicU64; NATIVE_INGRESS_EVENT_COUNT]; INGRESS_TRANSPORT_COUNT] =
+    [const { [const { AtomicU64::new(0) }; NATIVE_INGRESS_EVENT_COUNT] }; INGRESS_TRANSPORT_COUNT];
 static UDP_DECRYPT_ATTEMPTS: [[AtomicU64; UDP_DECRYPT_RESULT_COUNT]; UDP_DECRYPT_PATH_COUNT] =
     [const { [const { AtomicU64::new(0) }; UDP_DECRYPT_RESULT_COUNT] }; UDP_DECRYPT_PATH_COUNT];
 static UDP_IP_FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -661,14 +610,6 @@ static QUEUE_STATUS: [Mutex<VoiceQueueStatus>; VOICE_QUEUE_KIND_COUNT] =
 static QUEUE_ENQUEUES: [[AtomicU64; VOICE_QUEUE_ENQUEUE_RESULT_COUNT]; VOICE_QUEUE_KIND_COUNT] =
     [const { [const { AtomicU64::new(0) }; VOICE_QUEUE_ENQUEUE_RESULT_COUNT] };
         VOICE_QUEUE_KIND_COUNT];
-static CONTINUITY: LazyLock<Mutex<VoiceContinuityState>> =
-    LazyLock::new(|| Mutex::new(VoiceContinuityState::default()));
-
-#[derive(Default)]
-struct VoiceContinuityState {
-    sessions: HashMap<(VoiceIngressTransport, u32), u64>,
-    counters: HashMap<(VoiceIngressTransport, u16, VoiceContinuityResult), u64>,
-}
 
 #[derive(Clone, Copy)]
 struct VoiceQueueStatus {
@@ -695,6 +636,13 @@ fn transport_index(transport: VoiceIngressTransport) -> usize {
     match transport {
         VoiceIngressTransport::Udp => 0,
         VoiceIngressTransport::TcpTunnel => 1,
+    }
+}
+
+fn native_ingress_event_index(event: NativeIngressEvent) -> usize {
+    match event {
+        NativeIngressEvent::Frame => 0,
+        NativeIngressEvent::Terminator => 1,
     }
 }
 
@@ -1177,49 +1125,20 @@ pub(crate) fn record_queue_enqueue(kind: VoiceQueueKind, result: VoiceQueueEnque
     );
 }
 
-pub(crate) fn record_native_ingress_continuity(
-    transport: VoiceIngressTransport,
-    session: ClientSessionIdentifier,
-    frame_number: u64,
-    is_terminator: bool,
-) {
-    let origin_node = session.get_node_id();
-    let session_key = (transport, session.to_u32());
-    let mut state = CONTINUITY.lock().unwrap();
-    *state
-        .counters
-        .entry((transport, origin_node, VoiceContinuityResult::Frame))
-        .or_default() += 1;
-
-    match state.sessions.insert(session_key, frame_number) {
-        Some(previous) if frame_number > previous.saturating_add(1) => {
-            *state
-                .counters
-                .entry((transport, origin_node, VoiceContinuityResult::ForwardGap))
-                .or_default() += frame_number.saturating_sub(previous.saturating_add(1));
-        }
-        Some(previous) if frame_number <= previous => {
-            *state
-                .counters
-                .entry((
-                    transport,
-                    origin_node,
-                    VoiceContinuityResult::DuplicateOrOld,
-                ))
-                .or_default() += 1;
-        }
-        _ => {}
-    }
-
+pub(crate) fn record_native_ingress_event(transport: VoiceIngressTransport, is_terminator: bool) {
+    // Native frame numbers encode media time, not a consecutive transport sequence.
+    // S2S reorder metrics are the only loss/reordering signal for remote voice.
+    increment(
+        &NATIVE_INGRESS_EVENTS[transport_index(transport)]
+            [native_ingress_event_index(NativeIngressEvent::Frame)],
+        1,
+    );
     if is_terminator {
-        *state
-            .counters
-            .entry((
-                transport,
-                origin_node,
-                VoiceContinuityResult::ResetOrTerminator,
-            ))
-            .or_default() += 1;
+        increment(
+            &NATIVE_INGRESS_EVENTS[transport_index(transport)]
+                [native_ingress_event_index(NativeIngressEvent::Terminator)],
+            1,
+        );
     }
 }
 
@@ -1236,38 +1155,6 @@ pub(crate) fn record_s2s_gateway_drop(
             [s2s_gateway_drop_reason_index(reason)],
         1,
     );
-}
-
-pub(crate) fn record_remote_playout_event(
-    origin_node: NodeIdentifier,
-    result: RemotePlayoutResult,
-) {
-    let mut metrics = REMOTE_PLAYOUT.lock().unwrap();
-    *metrics.events.entry((origin_node, result)).or_default() += 1;
-}
-
-pub(crate) fn record_remote_playout_delay(origin_node: NodeIdentifier, delay_ms: u64) {
-    REMOTE_PLAYOUT
-        .lock()
-        .unwrap()
-        .selected_delay_ms
-        .insert(origin_node, delay_ms);
-}
-
-pub(crate) fn record_remote_playout_release(origin_node: NodeIdentifier, lateness_ms: u64) {
-    let mut metrics = REMOTE_PLAYOUT.lock().unwrap();
-    *metrics
-        .events
-        .entry((origin_node, RemotePlayoutResult::Released))
-        .or_default() += 1;
-    let bucket = REMOTE_PLAYOUT_LATENESS_BUCKETS_MS
-        .iter()
-        .find_map(|(label, upper)| (lateness_ms <= *upper).then_some(*label))
-        .unwrap_or("gt_250");
-    *metrics
-        .release_lateness_buckets
-        .entry((origin_node, bucket))
-        .or_default() += 1;
 }
 
 fn dispatch_tuning_source_label(value: u64) -> &'static str {
@@ -1631,48 +1518,16 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         ));
     }
 
-    {
-        let state = CONTINUITY.lock().unwrap();
-        for ((transport, origin_node, result), count) in &state.counters {
+    for transport in [VoiceIngressTransport::Udp, VoiceIngressTransport::TcpTunnel] {
+        for event in [NativeIngressEvent::Frame, NativeIngressEvent::Terminator] {
             samples.push(PrometheusSample::new(
-                "shitspeak_voice_ingress_continuity_total",
+                "shitspeak_voice_native_ingress_events_total",
                 vec![
                     ("transport".to_owned(), transport.label().to_owned()),
-                    ("origin_node".to_owned(), origin_node.to_string()),
-                    ("result".to_owned(), result.label().to_owned()),
+                    ("event".to_owned(), event.label().to_owned()),
                 ],
-                *count as f64,
-            ));
-        }
-    }
-
-    {
-        let state = REMOTE_PLAYOUT.lock().unwrap();
-        for ((origin_node, result), count) in &state.events {
-            samples.push(PrometheusSample::new(
-                "shitspeak_voice_remote_playout_events_total",
-                vec![
-                    ("origin_node".to_owned(), origin_node.to_string()),
-                    ("result".to_owned(), result.label().to_owned()),
-                ],
-                *count as f64,
-            ));
-        }
-        for (origin_node, delay_ms) in &state.selected_delay_ms {
-            samples.push(PrometheusSample::new(
-                "shitspeak_voice_remote_playout_selected_delay_ms",
-                vec![("origin_node".to_owned(), origin_node.to_string())],
-                *delay_ms as f64,
-            ));
-        }
-        for ((origin_node, bucket), count) in &state.release_lateness_buckets {
-            samples.push(PrometheusSample::new(
-                "shitspeak_voice_remote_playout_release_lateness_ms_bucket_total",
-                vec![
-                    ("origin_node".to_owned(), origin_node.to_string()),
-                    ("bucket".to_owned(), (*bucket).to_owned()),
-                ],
-                *count as f64,
+                NATIVE_INGRESS_EVENTS[transport_index(transport)][native_ingress_event_index(event)]
+                    .load(Ordering::Relaxed) as f64,
             ));
         }
     }
@@ -1953,121 +1808,48 @@ mod tests {
     }
 
     #[test]
-    fn native_ingress_continuity_aggregates_by_origin_node_only() {
-        let session = ClientSessionIdentifier::new(4094, 77).expect("test session id");
+    fn native_ingress_events_count_packets_without_inferring_frame_continuity() {
         let before = prometheus_samples();
 
-        record_native_ingress_continuity(VoiceIngressTransport::Udp, session, 10, false);
-        record_native_ingress_continuity(VoiceIngressTransport::Udp, session, 12, false);
-        record_native_ingress_continuity(VoiceIngressTransport::Udp, session, 12, false);
-        record_native_ingress_continuity(VoiceIngressTransport::Udp, session, 13, true);
+        record_native_ingress_event(VoiceIngressTransport::Udp, false);
+        record_native_ingress_event(VoiceIngressTransport::Udp, false);
+        record_native_ingress_event(VoiceIngressTransport::Udp, false);
+        record_native_ingress_event(VoiceIngressTransport::Udp, true);
 
         let after = prometheus_samples();
         assert!(
             sample_value(
                 &after,
-                "shitspeak_voice_ingress_continuity_total",
-                &[
-                    ("transport", "udp"),
-                    ("origin_node", "4094"),
-                    ("result", "frame"),
-                ]
+                "shitspeak_voice_native_ingress_events_total",
+                &[("transport", "udp"), ("event", "frame")]
             ) >= sample_value(
                 &before,
-                "shitspeak_voice_ingress_continuity_total",
-                &[
-                    ("transport", "udp"),
-                    ("origin_node", "4094"),
-                    ("result", "frame"),
-                ]
+                "shitspeak_voice_native_ingress_events_total",
+                &[("transport", "udp"), ("event", "frame")]
             ) + 4.0
         );
         assert!(
             sample_value(
                 &after,
-                "shitspeak_voice_ingress_continuity_total",
-                &[
-                    ("transport", "udp"),
-                    ("origin_node", "4094"),
-                    ("result", "forward_gap"),
-                ]
+                "shitspeak_voice_native_ingress_events_total",
+                &[("transport", "udp"), ("event", "terminator")]
             ) >= sample_value(
                 &before,
-                "shitspeak_voice_ingress_continuity_total",
-                &[
-                    ("transport", "udp"),
-                    ("origin_node", "4094"),
-                    ("result", "forward_gap"),
-                ]
-            ) + 1.0
-        );
-        assert!(
-            sample_value(
-                &after,
-                "shitspeak_voice_ingress_continuity_total",
-                &[
-                    ("transport", "udp"),
-                    ("origin_node", "4094"),
-                    ("result", "duplicate_or_old"),
-                ]
-            ) >= sample_value(
-                &before,
-                "shitspeak_voice_ingress_continuity_total",
-                &[
-                    ("transport", "udp"),
-                    ("origin_node", "4094"),
-                    ("result", "duplicate_or_old"),
-                ]
-            ) + 1.0
-        );
-        assert!(
-            sample_value(
-                &after,
-                "shitspeak_voice_ingress_continuity_total",
-                &[
-                    ("transport", "udp"),
-                    ("origin_node", "4094"),
-                    ("result", "reset_or_terminator"),
-                ]
-            ) >= sample_value(
-                &before,
-                "shitspeak_voice_ingress_continuity_total",
-                &[
-                    ("transport", "udp"),
-                    ("origin_node", "4094"),
-                    ("result", "reset_or_terminator"),
-                ]
+                "shitspeak_voice_native_ingress_events_total",
+                &[("transport", "udp"), ("event", "terminator")]
             ) + 1.0
         );
 
         for sample in after
             .iter()
-            .filter(|sample| sample.name() == "shitspeak_voice_ingress_continuity_total")
+            .filter(|sample| sample.name() == "shitspeak_voice_native_ingress_events_total")
         {
             assert_no_unbounded_voice_labels(sample);
         }
-    }
-
-    #[test]
-    fn remote_playout_repair_outcomes_are_reported_separately() {
-        let origin_node = 77;
-        let before = prometheus_samples();
-        record_remote_playout_event(origin_node, RemotePlayoutResult::RepairBeforePlayout);
-        record_remote_playout_event(origin_node, RemotePlayoutResult::RepairAfterPlayout);
-        let after = prometheus_samples();
-
-        for result in ["repair_before_playout", "repair_after_playout"] {
-            assert!(
-                sample_value(
-                    &after,
-                    "shitspeak_voice_remote_playout_events_total",
-                    &[("origin_node", "77"), ("result", result)],
-                ) >= sample_value(
-                    &before,
-                    "shitspeak_voice_remote_playout_events_total",
-                    &[("origin_node", "77"), ("result", result)],
-                ) + 1.0
-            );
-        }
+        assert!(
+            !after
+                .iter()
+                .any(|sample| sample.name() == "shitspeak_voice_ingress_continuity_total")
+        );
     }
 }

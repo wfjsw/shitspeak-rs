@@ -172,6 +172,17 @@ pub trait VoiceTransport: Send + Sync + 'static {
         ttl: Duration,
     ) -> Result<(), ApplicationError>;
 
+    /// Send an already-marked proactive alternate copy. The caller is
+    /// responsible for deriving it from the original envelope once and may
+    /// reuse those bytes for every proactive destination.
+    async fn send_proactive_repair_frame(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        avoid_first_hop: Option<NodeIdentifier>,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError>;
+
     fn alive_members(&self) -> Vec<NodeIdentifier>;
 
     fn voice_members(&self) -> Vec<NodeIdentifier> {
@@ -316,6 +327,33 @@ impl VoiceTransport for OverlayVoiceTransport {
         avoid_first_hop: Option<NodeIdentifier>,
         ttl: Duration,
     ) -> Result<(), ApplicationError> {
+        let mut options = OverlaySendOptions::default()
+            .expire_after(ttl)
+            .as_distribution_repair();
+        if let Some(first_hop) = avoid_first_hop {
+            options = options.avoid_first_hop(first_hop);
+        }
+        self.overlay
+            .send_unicast_unordered_with_routing_metric_and_options(
+                dst,
+                VOICE_SERVICE_TAG,
+                VOICE_LEVEL,
+                VOICE_ROUTING_METRIC,
+                VOICE_CLASS,
+                body,
+                options,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn send_proactive_repair_frame(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        avoid_first_hop: Option<NodeIdentifier>,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
         let mut options = OverlaySendOptions::default().expire_after(ttl);
         if let Some(first_hop) = avoid_first_hop {
             options = options.avoid_first_hop(first_hop);
@@ -372,8 +410,18 @@ pub fn build_envelope(
         is_terminator,
         payload,
         intent: Some(intent),
+        proactive_copy: false,
     };
     proto::encode_voice(&frame)
+}
+
+/// Derive the wire envelope for a proactive alternate copy without changing
+/// the cached original used by NACK repair. This marker distinguishes an
+/// early duplicate from a true original at the receiver.
+pub fn mark_proactive_copy(body: &Bytes) -> Result<Bytes, ApplicationError> {
+    let mut frame = proto::decode_voice(body)?;
+    frame.proactive_copy = true;
+    Ok(proto::encode_voice(&frame)?)
 }
 
 #[cfg(test)]
@@ -426,6 +474,7 @@ pub(crate) mod testing {
             body: Bytes,
             avoid_first_hop: Option<NodeIdentifier>,
             ttl: Duration,
+            is_repair: bool,
         },
     }
 
@@ -531,6 +580,24 @@ pub(crate) mod testing {
                 body,
                 avoid_first_hop,
                 ttl,
+                is_repair: true,
+            });
+            Ok(())
+        }
+
+        async fn send_proactive_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.calls.lock().unwrap().push(FakeCall::RepairFrame {
+                dst,
+                body,
+                avoid_first_hop,
+                ttl,
+                is_repair: false,
             });
             Ok(())
         }
@@ -586,11 +653,92 @@ mod tests {
         assert_eq!(decoded.s2s_seq, 42);
         assert_eq!(decoded.target_kind, 0);
         assert!(!decoded.is_terminator);
+        assert!(!decoded.proactive_copy);
         assert_eq!(decoded.payload, payload.as_ref());
         assert!(matches!(
             decoded.intent.and_then(|i| i.kind),
             Some(proto::VoiceIntentKind::Normal(n)) if n.source_channel == 5
         ));
+    }
+
+    #[test]
+    fn proactive_copy_has_a_distinct_wire_marker_without_changing_the_original() {
+        let original = build_envelope(
+            7,
+            shitspeak_core::default_server_id(),
+            11,
+            13,
+            0,
+            false,
+            Bytes::from_static(b"opus"),
+            VoiceIntent {
+                kind: Some(proto::VoiceIntentKind::Normal(proto::VoiceIntentNormal {
+                    source_channel: 5,
+                })),
+            },
+        )
+        .unwrap();
+
+        let proactive = mark_proactive_copy(&original).unwrap();
+        assert!(!proto::decode_voice(&original).unwrap().proactive_copy);
+
+        let mut marked = proto::decode_voice(&proactive).unwrap();
+        assert!(marked.proactive_copy);
+        marked.proactive_copy = false;
+        assert_eq!(marked, proto::decode_voice(&original).unwrap());
+    }
+
+    #[tokio::test]
+    async fn proactive_send_keeps_the_marked_copy_while_nack_replay_keeps_the_cached_original() {
+        let transport = testing::FakeVoiceTransport::new(1, vec![1, 2]);
+        let original = build_envelope(
+            7,
+            shitspeak_core::default_server_id(),
+            11,
+            13,
+            0,
+            false,
+            Bytes::from_static(b"opus"),
+            VoiceIntent {
+                kind: Some(proto::VoiceIntentKind::Normal(proto::VoiceIntentNormal {
+                    source_channel: 5,
+                })),
+            },
+        )
+        .unwrap();
+
+        let marked = mark_proactive_copy(&original).unwrap();
+        transport
+            .send_proactive_repair_frame(2, marked.clone(), None, Duration::from_millis(40))
+            .await
+            .unwrap();
+        transport
+            .send_repair_frame(2, original.clone(), None, Duration::from_millis(40))
+            .await
+            .unwrap();
+
+        let calls = transport.calls();
+        let testing::FakeCall::RepairFrame {
+            body: sent_proactive,
+            is_repair: false,
+            ..
+        } = &calls[0]
+        else {
+            panic!("expected marked proactive copy");
+        };
+        assert_eq!(sent_proactive, &marked);
+        assert!(proto::decode_voice(sent_proactive).unwrap().proactive_copy);
+
+        let testing::FakeCall::RepairFrame {
+            body: reactive,
+            is_repair: true,
+            ..
+        } = &calls[1]
+        else {
+            panic!("expected unmodified NACK replay");
+        };
+        assert_eq!(reactive, &original);
+        assert!(!proto::decode_voice(reactive).unwrap().proactive_copy);
     }
 
     #[test]

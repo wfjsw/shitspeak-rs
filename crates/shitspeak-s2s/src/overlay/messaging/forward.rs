@@ -257,7 +257,7 @@ pub(crate) async fn originate(
             distribution_group_version: None,
             distribution_topology_epoch: None,
             distribution_deadline_unix_ms: None,
-            distribution_repair: false,
+            distribution_repair: options.is_distribution_repair(),
             distribution_repair_target: None,
             distribution_deadline_issuer: None,
             distribution_deadline_unix_us: None,
@@ -313,7 +313,7 @@ pub(crate) async fn originate(
             distribution_group_version: None,
             distribution_topology_epoch: None,
             distribution_deadline_unix_ms: None,
-            distribution_repair: false,
+            distribution_repair: options.is_distribution_repair(),
             distribution_repair_target: None,
             distribution_deadline_issuer: None,
             distribution_deadline_unix_us: None,
@@ -649,6 +649,9 @@ async fn process_distribution_frame(
             )
             .await
     {
+        // `remote_playout_delay_ms` remains part of the inbound message for
+        // wire/API compatibility, but the server no longer paces remote voice.
+        // S2S reordering is the only remote buffering policy.
         delivery::deliver_with_remote_playout(
             services,
             data.service_tag,
@@ -656,7 +659,7 @@ async fn process_distribution_frame(
             level,
             class,
             data.payload.clone(),
-            tree.playout_delay_ms(self_id),
+            None,
             data.distribution_repair,
         );
     }
@@ -2670,6 +2673,106 @@ mod tests {
         assert!(!data.ordered_delivery);
         assert_eq!(data.origin_boot_epoch, 1234);
         assert_ne!(data.origin_message_id, 0);
+        assert!(!data.distribution_repair);
+    }
+
+    #[tokio::test]
+    async fn originated_unordered_repair_copy_sets_existing_wire_marker() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        let mut to_four = receivers.pop().unwrap();
+        let routing = routing_with_route(4, 4);
+        let ordering = OverlayOrdering::default();
+
+        originate(
+            &transport,
+            &routing,
+            1,
+            1234,
+            &ordering,
+            vec![4],
+            VOICE_SERVICE_TAG,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::Regular,
+            Bytes::from_static(b"repair"),
+            None,
+            false,
+            OverlaySendOptions::default().as_distribution_repair(),
+        )
+        .await
+        .expect("originated repair copy");
+
+        let forwarded = timeout(Duration::from_millis(50), to_four.recv())
+            .await
+            .expect("destination 4 should receive repair copy")
+            .expect("receiver 4 should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert!(data.distribution_repair);
+        assert_eq!(data.distribution_repair_target, None);
+    }
+
+    #[tokio::test]
+    async fn ordinary_repair_copy_reaches_receiver_with_repair_provenance() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(2, 1, &[TransportKind::Tcp]);
+        let routing = new_handle();
+        let (services, mut delivered) = capture_services_for(VOICE_SERVICE_TAG);
+        let ordering = OverlayOrdering::default();
+        let mut data = test_overlay_data(false);
+        data.service_tag = VOICE_SERVICE_TAG;
+        data.dsts = vec![node_to_wire(2)];
+        data.distribution_repair = true;
+
+        handle_inbound(
+            &transport, &routing, &services, &ordering, 2, 1, data, false,
+        )
+        .await;
+
+        let msg = timeout(Duration::from_millis(50), delivered.recv())
+            .await
+            .expect("local service should receive repair copy")
+            .expect("capture receiver should stay open");
+        assert!(msg.is_distribution_repair);
+    }
+
+    #[tokio::test]
+    async fn tree_delivery_ignores_legacy_remote_playout_metadata() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(2, 1, &[TransportKind::Tcp]);
+        let routing = new_handle();
+        let distribution = DistributionPlane::default();
+        let monitor = test_monitor();
+        let (services, mut delivered) = capture_services_for(VOICE_SERVICE_TAG);
+        let ordering = OverlayOrdering::default();
+        let mut data = test_overlay_data(false);
+        data.service_tag = VOICE_SERVICE_TAG;
+
+        let tree = Arc::new(TreeState::new_with_playout(1, [2], [(1, 2)], [(2, 750)]));
+        process_distribution_frame(
+            &transport,
+            &routing,
+            &distribution,
+            &monitor,
+            &ordering,
+            &services,
+            2,
+            1,
+            data,
+            tree,
+            false,
+            Duration::from_millis(750),
+        )
+        .await;
+
+        let msg = timeout(Duration::from_millis(50), delivered.recv())
+            .await
+            .expect("tree member should receive frame")
+            .expect("capture receiver should stay open");
+        assert_eq!(msg.remote_playout_delay_ms, None);
     }
 
     #[tokio::test]

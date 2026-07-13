@@ -232,9 +232,10 @@ compression_adaptive_dictionary_enabled = true
 # negotiation, so configure identical bytes before using static dictionaries on UDP.
 # compression_dictionary_path = "s2s-transport.zdict"
 
-# ── L3 voice distribution and playout ─────────────────────────────────
-# Long-haul S2S profile. These are remote delivery and playout budgets; they
-# do not delay voice between listeners connected to the same node.
+# ── L3 voice distribution and repair ──────────────────────────────────
+# Long-haul S2S transport and repair budgets. In-order remote voice is fanned
+# out immediately; only an observed S2S sequence gap waits in its per-speaker
+# reorder buffer.
 [s2s.application.voice]
 tree_delivery_enabled = true
 transport_ttl_ms = 750
@@ -242,11 +243,16 @@ repair_enabled = true
 repair_transport_ttl_ms = 750
 repair_request_ttl_ms = 750
 repair_cache_ms = 1600
-adaptive_jitter_max_delay_ms = 750
-remote_playout_min_ms = 80
-remote_playout_max_ms = 750
-remote_playout_p99_margin_ms = 60
-remote_playout_idle_reset_ms = 2000
+# Only an observed S2S sequence gap is held. The delay adapts per speaker
+# within this narrow range; ordinary contiguous frames are never paced.
+reorder_max_delay_ms = 40
+adaptive_jitter_min_delay_ms = 40
+adaptive_jitter_max_delay_ms = 120
+adaptive_jitter_growth_step_ms = 20
+adaptive_jitter_decay_step_ms = 10
+reorder_idle_reset_ms = 2000
+reorder_max_buffered_frames = 48
+reorder_max_total_buffer = 4096
 
 # ── L2 overlay tunables ───────────────────────────────────────────────
 [s2s.overlay]

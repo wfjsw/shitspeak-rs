@@ -36,7 +36,7 @@
 //! | `0xF4–0xF7`      | 9 byte | 64-bit positive integer                            |
 //! | `0xF8–0xFF`      | special/negative — rejected                         |
 
-use std::{fmt::Display, io::Cursor};
+use std::{fmt::Display, io::Cursor, time::Duration};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -51,6 +51,110 @@ use crate::{
 pub struct OpusPayload {
     pub frame: Bytes,
     pub is_terminator: bool,
+}
+
+impl OpusPayload {
+    /// Return the encoded duration represented by this Opus packet.
+    ///
+    /// This validates the packet framing sufficiently to distinguish valid
+    /// code-0 through code-3 packets from malformed packets. Empty frames are
+    /// still valid Opus framing, so only an absent TOC or invalid length layout
+    /// returns `None`.
+    pub fn packet_duration(&self) -> Option<Duration> {
+        opus_packet_duration(&self.frame)
+    }
+}
+
+/// Parse an Opus packet duration from its TOC and framing layout.
+///
+/// Opus permits at most 120 ms of encoded audio per packet. The parser does
+/// not decode audio; it verifies the packet's framing so callers can safely
+/// use its returned duration as a media-clock increment.
+fn opus_packet_duration(packet: &[u8]) -> Option<Duration> {
+    let toc = *packet.first()?;
+    let frame_duration = opus_frame_duration(toc);
+    let frame_count = match toc & 0x03 {
+        0 => 1,
+        1 => {
+            if (packet.len() - 1) % 2 != 0 {
+                return None;
+            }
+            2
+        }
+        2 => {
+            let mut remaining = packet.get(1..)?;
+            let first_frame_len = opus_frame_length(&mut remaining)?;
+            if first_frame_len > remaining.len() {
+                return None;
+            }
+            2
+        }
+        3 => opus_code_three_frame_count(packet.get(1..)?)?,
+        _ => unreachable!("the low two TOC bits select the Opus packet code"),
+    };
+
+    let duration = frame_duration.checked_mul(frame_count)?;
+    (duration <= Duration::from_millis(120)).then_some(duration)
+}
+
+fn opus_frame_duration(toc: u8) -> Duration {
+    let config = toc >> 3;
+    let micros = if config < 12 {
+        [10_000, 20_000, 40_000, 60_000][usize::from(config & 0x03)]
+    } else if config < 16 {
+        [10_000, 20_000][usize::from(config & 0x01)]
+    } else {
+        [2_500, 5_000, 10_000, 20_000][usize::from(config & 0x03)]
+    };
+    Duration::from_micros(micros)
+}
+
+/// Decode a packet-frame length in the variable-size Opus layout.
+fn opus_frame_length<'a>(remaining: &mut &'a [u8]) -> Option<usize> {
+    let first = *remaining.first()?;
+    *remaining = &remaining[1..];
+    if first < 252 {
+        return Some(usize::from(first));
+    }
+
+    let second = *remaining.first()?;
+    *remaining = &remaining[1..];
+    Some(usize::from(first) + 4 * usize::from(second))
+}
+
+/// Validate code-3 padding and VBR/CBR framing, then return its frame count.
+fn opus_code_three_frame_count(mut remaining: &[u8]) -> Option<u32> {
+    let control = *remaining.first()?;
+    remaining = &remaining[1..];
+
+    let frame_count = u32::from(control & 0x3F);
+    if frame_count == 0 || frame_count > 48 {
+        return None;
+    }
+
+    if control & 0x40 != 0 {
+        let mut padding = 0usize;
+        loop {
+            let byte = *remaining.first()?;
+            remaining = &remaining[1..];
+            padding = padding.checked_add(if byte == 255 { 254 } else { usize::from(byte) })?;
+            if byte != 255 {
+                break;
+            }
+        }
+        remaining = remaining.get(padding..)?;
+    }
+
+    if control & 0x80 != 0 {
+        for _ in 1..frame_count {
+            let frame_len = opus_frame_length(&mut remaining)?;
+            remaining = remaining.get(frame_len..)?;
+        }
+    } else if remaining.len() % usize::try_from(frame_count).ok()? != 0 {
+        return None;
+    }
+
+    Some(frame_count)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -847,6 +951,93 @@ impl Audio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Opus packet duration ─────────────────────────────────────────────
+
+    #[test]
+    fn opus_packet_duration_reads_twenty_millisecond_silk_frame() {
+        let payload = OpusPayload {
+            // SILK config 1, code 0: one 20 ms frame.
+            frame: Bytes::from_static(&[0x08, 0x00]),
+            is_terminator: false,
+        };
+
+        assert_eq!(payload.packet_duration(), Some(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn opus_packet_duration_reads_forty_and_sixty_millisecond_silk_frames() {
+        let forty_ms = OpusPayload {
+            // SILK config 2, code 0.
+            frame: Bytes::from_static(&[0x10, 0x00]),
+            is_terminator: false,
+        };
+        let sixty_ms = OpusPayload {
+            // SILK config 3, code 0.
+            frame: Bytes::from_static(&[0x18, 0x00]),
+            is_terminator: false,
+        };
+
+        assert_eq!(forty_ms.packet_duration(), Some(Duration::from_millis(40)));
+        assert_eq!(sixty_ms.packet_duration(), Some(Duration::from_millis(60)));
+    }
+
+    #[test]
+    fn opus_packet_duration_handles_all_multiframe_packet_codes() {
+        let two_equal_frames = OpusPayload {
+            // Code 1: two equal-size 20 ms frames.
+            frame: Bytes::from_static(&[0x09, 0xAA, 0xBB]),
+            is_terminator: false,
+        };
+        let two_variable_frames = OpusPayload {
+            // Code 2: one-byte length for the first 20 ms frame, then the
+            // remainder is the second frame.
+            frame: Bytes::from_static(&[0x0A, 0x01, 0xAA, 0xBB]),
+            is_terminator: false,
+        };
+        let three_cbr_frames = OpusPayload {
+            // Code 3, CBR count 3: three 20 ms frames.
+            frame: Bytes::from_static(&[0x0B, 0x03, 0xAA, 0xBB, 0xCC]),
+            is_terminator: false,
+        };
+
+        assert_eq!(
+            two_equal_frames.packet_duration(),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            two_variable_frames.packet_duration(),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            three_cbr_frames.packet_duration(),
+            Some(Duration::from_millis(60))
+        );
+    }
+
+    #[test]
+    fn opus_packet_duration_rejects_malformed_code_three_packets() {
+        let zero_frame_count = OpusPayload {
+            frame: Bytes::from_static(&[0x0B, 0x00]),
+            is_terminator: false,
+        };
+        let truncated_vbr_lengths = OpusPayload {
+            // Code 3 VBR, count 3, but it is missing both length fields.
+            frame: Bytes::from_static(&[0x8B, 0x83]),
+            is_terminator: false,
+        };
+
+        assert_eq!(zero_frame_count.packet_duration(), None);
+        assert_eq!(truncated_vbr_lengths.packet_duration(), None);
+        assert_eq!(
+            OpusPayload {
+                frame: Bytes::new(),
+                is_terminator: false,
+            }
+            .packet_duration(),
+            None
+        );
+    }
 
     // ── Varint encoding ──────────────────────────────────────────────────
 

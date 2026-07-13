@@ -1586,13 +1586,11 @@ pub(crate) async fn route_s2s_voice_frame(
             return;
         }
     };
-    route_s2s_voice_frame_decoded(server, from_immediate, frame, decoded).await;
+    route_decoded_s2s_voice_frame(server, from_immediate, frame, decoded).await;
 }
 
-/// Route a frame that the remote playout stage has already decoded. Keeping
-/// the decoded packet avoids re-parsing a packet solely to discover its media
-/// timeline before local recipient fan-out.
-pub(crate) async fn route_s2s_voice_frame_decoded(
+/// Route an already decoded S2S voice frame to local recipients.
+async fn route_decoded_s2s_voice_frame(
     server: &Arc<Box<Server>>,
     from_immediate: crate::types::NodeIdentifier,
     frame: VoiceFrame,

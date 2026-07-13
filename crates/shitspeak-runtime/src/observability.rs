@@ -450,23 +450,9 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "Total UDP packets dropped before voice processing by reason.",
         "counter",
     ),
-    // CHOPPY_VOICE_PROMQL speaker_to_node:
-    // Source node native ingress gaps and duplicates from node 12:
-    // sum by (origin_node, transport, result) (
-    //   rate(shitspeak_voice_ingress_continuity_total{
-    //     origin_node="12", result!="frame"
-    //   }[1m])
-    // )
-    // Node 12 vs sibling China nodes:
-    // sum by (node, origin_node, result) (
-    //   rate(shitspeak_voice_ingress_continuity_total{
-    //     origin_node=~"1|11|12|13|14", result!="frame"
-    //   }[5m])
-    // )
-    // Search with: rg "CHOPPY_VOICE_PROMQL speaker_to_node"
     (
-        "shitspeak_voice_ingress_continuity_total",
-        "Native voice ingress continuity events by origin node, transport, and result.",
+        "shitspeak_voice_native_ingress_events_total",
+        "Native voice ingress packet and terminator counts by transport. Native frame numbers are not transport sequence numbers and are not used to infer loss or duplication.",
         "counter",
     ),
     (
@@ -626,21 +612,6 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
     (
         "shitspeak_voice_s2s_gateway_drops_total",
         "Total S2S voice gateway drops by bridge direction and reason.",
-        "counter",
-    ),
-    (
-        "shitspeak_voice_remote_playout_events_total",
-        "Remote S2S voice playout events by origin node and result.",
-        "counter",
-    ),
-    (
-        "shitspeak_voice_remote_playout_selected_delay_ms",
-        "Talkspurt-latched remote S2S voice playout delay by origin node.",
-        "gauge",
-    ),
-    (
-        "shitspeak_voice_remote_playout_release_lateness_ms_bucket_total",
-        "Bucketed scheduler lateness for remote S2S voice playout release by origin node.",
         "counter",
     ),
 ];
@@ -1411,7 +1382,8 @@ mod tests {
         let mut rendered = String::new();
         render_voice_metrics_into(&mut rendered, &[]);
 
-        assert!(rendered.contains("# TYPE shitspeak_voice_ingress_continuity_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_voice_native_ingress_events_total counter\n"));
+        assert!(!rendered.contains("shitspeak_voice_ingress_continuity_total"));
         assert!(rendered.contains("# TYPE shitspeak_voice_udp_recv_batches_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_voice_udp_recv_datagrams_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_voice_udp_egress_batches_total counter\n"));
