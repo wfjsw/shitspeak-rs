@@ -135,7 +135,10 @@ fn local_fanout_snapshot_is_current(
     current: Option<(ClientInstanceId, &LocalFanoutGeneration)>,
 ) -> bool {
     current.is_some_and(|(instance_id, generation)| {
-        instance_id == expected_instance_id && generation == expected_generation
+        instance_id == expected_instance_id
+            && generation.channel_acl_generation == expected_generation.channel_acl_generation
+            && generation.sender_acl_generation == expected_generation.sender_acl_generation
+            && generation.sender_channel == expected_generation.sender_channel
     })
 }
 
@@ -2646,6 +2649,11 @@ mod tests {
             sender_channel: 5,
         };
         assert!(!local_fanout_snapshot_is_current(7, &expected, None));
+        assert!(!local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            Some((8, &expected)),
+        ));
 
         let mut moved = LocalFanoutGeneration { ..expected };
         moved.sender_channel = 6;
@@ -2673,6 +2681,28 @@ mod tests {
             7,
             &expected,
             Some((7, &expected)),
+        ));
+    }
+
+    #[test]
+    fn local_fanout_generation_ignores_unrelated_routing_and_channel_changes() {
+        let expected = LocalFanoutGeneration {
+            channel_version: 1,
+            channel_acl_generation: 2,
+            voice_routing_generation: 3,
+            sender_acl_generation: 4,
+            sender_channel: 5,
+        };
+        let unrelated_changes = LocalFanoutGeneration {
+            channel_version: expected.channel_version + 1,
+            voice_routing_generation: expected.voice_routing_generation + 1,
+            ..expected
+        };
+
+        assert!(local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            Some((7, &unrelated_changes)),
         ));
     }
 

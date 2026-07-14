@@ -46,6 +46,8 @@ type RecipientIndexSlot = Arc<RwLock<Option<Arc<RecipientIndex>>>>;
 
 const REPAIR_REQUEST_QUEUE_CAPACITY: usize = 256;
 const REPAIR_RESPONSE_QUEUE_CAPACITY: usize = 256;
+const REPAIR_RESPONSE_MIN_CONCURRENCY: usize = 2;
+const REPAIR_RESPONSE_MAX_CONCURRENCY: usize = 16;
 const DISTANT_REPAIR_PATH_LATENCY_US: u64 = 150_000;
 const PROACTIVE_WORKER_CONCURRENCY: usize = 4;
 
@@ -1547,54 +1549,112 @@ fn spawn_repair_request_worker(
 }
 
 fn spawn_repair_response_worker(
-    mut rx: mpsc::Receiver<RepairResponseRequest>,
+    rx: mpsc::Receiver<RepairResponseRequest>,
     transport: Arc<dyn VoiceTransport>,
     repair_cache: Arc<RepairCache>,
     cfg: VoiceConfig,
     shutdown: CancellationToken,
 ) {
+    let concurrency = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(REPAIR_RESPONSE_MIN_CONCURRENCY)
+        .clamp(
+            REPAIR_RESPONSE_MIN_CONCURRENCY,
+            REPAIR_RESPONSE_MAX_CONCURRENCY,
+        );
+    spawn_repair_response_worker_with_concurrency(
+        rx,
+        transport,
+        repair_cache,
+        cfg,
+        shutdown,
+        concurrency,
+    );
+}
+
+fn spawn_repair_response_worker_with_concurrency(
+    mut rx: mpsc::Receiver<RepairResponseRequest>,
+    transport: Arc<dyn VoiceTransport>,
+    repair_cache: Arc<RepairCache>,
+    cfg: VoiceConfig,
+    shutdown: CancellationToken,
+    concurrency: usize,
+) {
+    let concurrency = concurrency.max(1);
     tokio::spawn(async move {
+        let mut jobs = tokio::task::JoinSet::new();
+        let mut rx_open = true;
         loop {
-            let work = tokio::select! {
-                _ = shutdown.cancelled() => return,
-                work = rx.recv() => match work {
-                    Some(work) => work,
-                    None => return,
-                },
-            };
-            let source = transport.local_node_id();
-            let frames = repair_cache.lookup_range(
-                work.request.sender_session,
-                work.request.sender_epoch,
-                work.request.first_seq,
-                work.request.last_seq,
-            );
-            if frames.is_empty() {
-                metrics::record_repair(source, work.from, VoiceRepairResult::FrameMissed, 1);
+            if !rx_open && jobs.is_empty() {
+                return;
+            }
+
+            if !rx_open || jobs.len() >= concurrency {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    result = jobs.join_next() => {
+                        if let Some(Err(error)) = result {
+                            trace!(%error, "voice repair: response job failed");
+                        }
+                    }
+                }
                 continue;
             }
-            let avoid_first_hop = transport
-                .voice_route_quality(work.from)
-                .map(|quality| quality.next_hop());
-            let ttl = Duration::from_millis(cfg.repair_transport_ttl_ms);
-            for frame in frames {
-                if transport
-                    .send_repair_frame(work.from, frame.body().clone(), avoid_first_hop, ttl)
-                    .await
-                    .is_err()
-                {
-                    metrics::record_repair(
-                        source,
-                        work.from,
-                        VoiceRepairResult::FrameSendFailed,
-                        1,
-                    );
-                } else {
-                    metrics::record_repair(source, work.from, VoiceRepairResult::FrameServed, 1);
+
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                result = jobs.join_next(), if !jobs.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        trace!(%error, "voice repair: response job failed");
+                    }
                 }
+                work = rx.recv() => match work {
+                    Some(work) => {
+                        let transport = transport.clone();
+                        let repair_cache = repair_cache.clone();
+                        let ttl = Duration::from_millis(cfg.repair_transport_ttl_ms);
+                        jobs.spawn(async move {
+                            send_repair_response(work, transport, repair_cache, ttl).await;
+                        });
+                    }
+                    None => rx_open = false,
+                },
             }
         }
     });
+}
+
+async fn send_repair_response(
+    work: RepairResponseRequest,
+    transport: Arc<dyn VoiceTransport>,
+    repair_cache: Arc<RepairCache>,
+    ttl: Duration,
+) {
+    let source = transport.local_node_id();
+    let frames = repair_cache.lookup_range(
+        work.request.sender_session,
+        work.request.sender_epoch,
+        work.request.first_seq,
+        work.request.last_seq,
+    );
+    if frames.is_empty() {
+        metrics::record_repair(source, work.from, VoiceRepairResult::FrameMissed, 1);
+        return;
+    }
+    let avoid_first_hop = transport
+        .voice_route_quality(work.from)
+        .map(|quality| quality.next_hop());
+    for frame in frames {
+        if transport
+            .send_repair_frame(work.from, frame.body().clone(), avoid_first_hop, ttl)
+            .await
+            .is_err()
+        {
+            metrics::record_repair(source, work.from, VoiceRepairResult::FrameSendFailed, 1);
+        } else {
+            metrics::record_repair(source, work.from, VoiceRepairResult::FrameServed, 1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1688,6 +1748,110 @@ mod tests {
             self.inner
                 .send_repair_frame(dst, body, avoid_first_hop, ttl)
                 .await
+        }
+
+        async fn send_proactive_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .send_proactive_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await
+        }
+
+        fn alive_members(&self) -> Vec<NodeIdentifier> {
+            self.inner.alive_members()
+        }
+
+        fn local_node_id(&self) -> NodeIdentifier {
+            self.inner.local_node_id()
+        }
+
+        fn voice_route_quality(
+            &self,
+            dst: NodeIdentifier,
+        ) -> Option<crate::overlay::VoiceRouteQuality> {
+            self.inner.voice_route_quality(dst)
+        }
+    }
+
+    struct ControlledRepairTransport {
+        inner: Arc<FakeVoiceTransport>,
+        repair_entered: Semaphore,
+        repair_release: Semaphore,
+        active_repairs: AtomicU64,
+        max_active_repairs: AtomicU64,
+    }
+
+    impl ControlledRepairTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: FakeVoiceTransport::new(7, vec![2, 3, 4]),
+                repair_entered: Semaphore::new(0),
+                repair_release: Semaphore::new(0),
+                active_repairs: AtomicU64::new(0),
+                max_active_repairs: AtomicU64::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceTransport for ControlledRepairTransport {
+        async fn send_unicast(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_unicast(dst, body, ttl).await
+        }
+
+        async fn send_multicast(
+            &self,
+            dsts: &[NodeIdentifier],
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_multicast(dsts, body, ttl).await
+        }
+
+        async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError> {
+            self.inner.send_broadcast(body, ttl).await
+        }
+
+        async fn send_repair_request(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_repair_request(dst, body, ttl).await
+        }
+
+        async fn send_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            let active = self.active_repairs.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_repairs.fetch_max(active, Ordering::SeqCst);
+            let result = self
+                .inner
+                .send_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await;
+            self.repair_entered.add_permits(1);
+            self.repair_release
+                .acquire()
+                .await
+                .expect("test release semaphore remains open")
+                .forget();
+            self.active_repairs.fetch_sub(1, Ordering::SeqCst);
+            result
         }
 
         async fn send_proactive_repair_frame(
@@ -3114,6 +3278,91 @@ mod tests {
             }
             other => panic!("expected RepairFrame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn repair_responses_overlap_across_requests_with_bounded_concurrency() {
+        let transport = ControlledRepairTransport::new();
+        let repair_cache = Arc::new(RepairCache::new(Duration::from_secs(1)));
+        for (sender_session, s2s_seq, body) in [
+            (100, 0, Bytes::from_static(b"a0")),
+            (100, 1, Bytes::from_static(b"a1")),
+            (200, 0, Bytes::from_static(b"b0")),
+            (300, 0, Bytes::from_static(b"c0")),
+        ] {
+            repair_cache.insert(RepairFrame::new(sender_session, 42, s2s_seq, body));
+        }
+
+        let (tx, rx) = mpsc::channel(3);
+        let shutdown = CancellationToken::new();
+        spawn_repair_response_worker_with_concurrency(
+            rx,
+            transport.clone(),
+            repair_cache,
+            VoiceConfig::default(),
+            shutdown.clone(),
+            2,
+        );
+        for (from, sender_session, last_seq) in [(2, 100, 1), (3, 200, 0), (4, 300, 0)] {
+            tx.send(RepairResponseRequest {
+                from,
+                request: VoiceRepairRequest {
+                    sender_session,
+                    sender_epoch: 42,
+                    first_seq: 0,
+                    last_seq,
+                    request_sent_unix_ms: 0,
+                    request_ttl_ms: 0,
+                },
+            })
+            .await
+            .unwrap();
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.repair_entered.acquire_many(2),
+        )
+        .await
+        .expect("two independent repair requests should overlap")
+        .unwrap()
+        .forget();
+        assert_eq!(transport.active_repairs.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.max_active_repairs.load(Ordering::SeqCst), 2);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                transport.repair_entered.acquire()
+            )
+            .await
+            .is_err(),
+            "the third request must wait for a response slot"
+        );
+
+        transport.repair_release.add_permits(4);
+        let calls = wait_for_call_count(&transport.inner, 4).await;
+        for _ in 0..50 {
+            if transport.active_repairs.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(transport.active_repairs.load(Ordering::SeqCst), 0);
+        assert!(transport.max_active_repairs.load(Ordering::SeqCst) <= 2);
+
+        let first_request_bodies: Vec<Bytes> = calls
+            .iter()
+            .filter_map(|call| match call {
+                FakeCall::RepairFrame { dst: 2, body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            first_request_bodies,
+            vec![Bytes::from_static(b"a0"), Bytes::from_static(b"a1")],
+            "frames within one request must retain cache sequence order"
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]
