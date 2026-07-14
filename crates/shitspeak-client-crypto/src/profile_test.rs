@@ -254,6 +254,22 @@ fn profile_ocb2_phases() {
     });
 
     // Reference: full Ocb2::encrypt (no per-state overhead from CryptState)
+    let scalar_ocb = Ocb2::from_key_with_backend(KEY, BackendKind::Scalar).expect("scalar ocb2");
+    batch_time("ref_scalar_Ocb2::encrypt (no CryptState wrapper)", |i| {
+        let mut out = vec![0u8; PLAINTEXT_LEN + 3];
+        let mut nonce = IV;
+        nonce[0] ^= i as u8;
+        super::CryptoMode::encrypt(
+            black_box(&scalar_ocb),
+            black_box(&mut out),
+            black_box(&plaintext),
+            black_box(&nonce),
+        )
+        .unwrap();
+        black_box(out);
+    });
+
+    // Reference: full runtime-dispatched Ocb2::encrypt.
     batch_time("ref_full_Ocb2::encrypt (no CryptState wrapper)", |i| {
         let mut out = vec![0u8; PLAINTEXT_LEN + 3];
         let mut nonce = IV;

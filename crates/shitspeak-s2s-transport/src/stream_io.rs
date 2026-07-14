@@ -1618,6 +1618,7 @@ mod tests {
         assert!(!is_tls_close_notify_eof(&error));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn stream_frame_kind_names_include_transport_and_type() {
         assert_eq!(

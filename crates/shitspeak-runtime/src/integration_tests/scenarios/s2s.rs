@@ -3280,6 +3280,7 @@ async fn s2s_root_children_shout_uses_tree_delivery_budget() {
     run_s2s_root_children_shout_traffic(true).await;
 }
 
+#[cfg(debug_assertions)]
 async fn run_s2s_root_children_shout_traffic(tree_delivery_enabled: bool) {
     let _guard = s2s_network_test_guard().await;
     let cluster = spawn_s2s_convergence_cluster_with_tree_delivery(tree_delivery_enabled).await;

@@ -54,7 +54,7 @@ impl Ocb2 {
     }
 
     #[cfg(test)]
-    fn from_key_with_backend(
+    pub(crate) fn from_key_with_backend(
         key: [u8; BLOCK_SIZE],
         backend: crate::xor_backend::BackendKind,
     ) -> Result<Self, CryptError> {

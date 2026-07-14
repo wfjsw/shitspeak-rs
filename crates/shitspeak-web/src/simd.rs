@@ -380,8 +380,15 @@ mod tests {
         }
         let scan_ns = started.elapsed().as_nanos() as f64 / ITERATIONS as f64;
 
+        let started = Instant::now();
+        let mut scalar_result = None;
+        for _ in 0..ITERATIONS {
+            scalar_result = find_header_end_scalar(black_box(&header));
+        }
+        let scalar_scan_ns = started.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+
         println!(
-            "signaling SIMD profile: backend={:?} mask_runtime={runtime_ns:.2} ns mask_scalar={scalar_ns:.2} ns header_scan={scan_ns:.2} ns result={result:?}",
+            "signaling SIMD profile: backend={:?} mask_runtime={runtime_ns:.2} ns mask_scalar={scalar_ns:.2} ns header_runtime={scan_ns:.2} ns header_scalar={scalar_scan_ns:.2} ns result={result:?}/{scalar_result:?}",
             backend_for_len(current_backend(), PAYLOAD_LEN),
         );
     }
