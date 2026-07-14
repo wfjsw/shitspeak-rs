@@ -19,7 +19,10 @@ use tokio_util::sync::CancellationToken;
 use crate::types::NodeIdentifier;
 
 use super::SendOptions;
-use super::adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
+use super::adaptive_queue::{
+    AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender, Queued, SendAdaptiveError,
+    TryAdaptiveSendError,
+};
 use super::metrics::{
     ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
     MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueStatusSnapshot, QueueWatermark,
@@ -139,6 +142,139 @@ impl OutboundEnvelope {
 
     pub fn into_frame(self) -> OutboundFrame {
         OutboundFrame::with_options(self.class, self.payload, self.options)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PeerOutboundSender {
+    control: AdaptiveQueueSender<OutboundEnvelope>,
+    high_priority: AdaptiveQueueSender<OutboundEnvelope>,
+    regular: AdaptiveQueueSender<OutboundEnvelope>,
+    capacity_bytes: usize,
+}
+
+impl PeerOutboundSender {
+    fn new(budget: AdaptiveQueueBudget) -> (Self, PeerOutboundReceiver) {
+        let capacity_bytes = budget.max_bytes();
+        let [control, high_priority, regular] = [
+            budget.split_exact(capacity_bytes),
+            budget.split_exact(capacity_bytes.saturating_mul(3) / 4),
+            budget.split_exact(capacity_bytes / 2),
+        ];
+        let (control, control_receiver) = AdaptiveQueueSender::new(control);
+        let (high_priority, high_priority_receiver) = AdaptiveQueueSender::new(high_priority);
+        let (regular, regular_receiver) = AdaptiveQueueSender::new(regular);
+        (
+            Self {
+                control,
+                high_priority,
+                regular,
+                capacity_bytes,
+            },
+            PeerOutboundReceiver {
+                control: control_receiver,
+                high_priority: high_priority_receiver,
+                regular: regular_receiver,
+                control_open: true,
+                high_priority_open: true,
+                regular_open: true,
+            },
+        )
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        envelope: OutboundEnvelope,
+    ) -> Result<(), TryAdaptiveSendError<OutboundEnvelope>> {
+        match envelope.class() {
+            MessageClass::Control => self.control.try_send(envelope),
+            MessageClass::HighPriority => self.high_priority.try_send(envelope),
+            MessageClass::Regular => self.regular.try_send(envelope),
+        }
+    }
+
+    pub(crate) async fn send(
+        &self,
+        envelope: OutboundEnvelope,
+    ) -> Result<(), SendAdaptiveError<OutboundEnvelope>> {
+        match envelope.class() {
+            MessageClass::Control => self.control.send(envelope).await,
+            MessageClass::HighPriority => self.high_priority.send(envelope).await,
+            MessageClass::Regular => self.regular.send(envelope).await,
+        }
+    }
+
+    pub(crate) fn depth_bytes(&self) -> usize {
+        self.control
+            .depth_bytes()
+            .saturating_add(self.high_priority.depth_bytes())
+            .saturating_add(self.regular.depth_bytes())
+    }
+
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+}
+
+pub(crate) struct PeerOutboundReceiver {
+    control: AdaptiveQueueReceiver<OutboundEnvelope>,
+    high_priority: AdaptiveQueueReceiver<OutboundEnvelope>,
+    regular: AdaptiveQueueReceiver<OutboundEnvelope>,
+    control_open: bool,
+    high_priority_open: bool,
+    regular_open: bool,
+}
+
+impl PeerOutboundReceiver {
+    pub(crate) fn try_recv(
+        &mut self,
+        class: MessageClass,
+    ) -> Result<Queued<OutboundEnvelope>, tokio::sync::mpsc::error::TryRecvError> {
+        let (receiver, open) = match class {
+            MessageClass::Control => (&mut self.control, &mut self.control_open),
+            MessageClass::HighPriority => (&mut self.high_priority, &mut self.high_priority_open),
+            MessageClass::Regular => (&mut self.regular, &mut self.regular_open),
+        };
+        match receiver.try_recv_queued() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                *open = false;
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        !self.control_open && !self.high_priority_open && !self.regular_open
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<Queued<OutboundEnvelope>> {
+        loop {
+            if self.is_closed() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                queued = self.control.recv_queued(), if self.control_open => {
+                    match queued {
+                        Some(queued) => return Some(queued),
+                        None => self.control_open = false,
+                    }
+                }
+                queued = self.high_priority.recv_queued(), if self.high_priority_open => {
+                    match queued {
+                        Some(queued) => return Some(queued),
+                        None => self.high_priority_open = false,
+                    }
+                }
+                queued = self.regular.recv_queued(), if self.regular_open => {
+                    match queued {
+                        Some(queued) => return Some(queued),
+                        None => self.regular_open = false,
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -416,8 +552,8 @@ pub(crate) struct PeerState {
     addresses: Mutex<Vec<PeerAddress>>,
     advertised_addresses: Mutex<HashSet<PeerAddress>>,
     streams: Mutex<HashMap<StreamKey, ActiveStream>>,
-    outbound_sender: AdaptiveQueueSender<OutboundEnvelope>,
-    outbound_receiver: Mutex<Option<AdaptiveQueueReceiver<OutboundEnvelope>>>,
+    outbound_sender: PeerOutboundSender,
+    outbound_receiver: Mutex<Option<PeerOutboundReceiver>>,
     udp_seen_at: Mutex<Option<Instant>>,
     udp_addr: Mutex<Option<std::net::SocketAddr>>,
     /// Authenticated inbound remote IPs by transport. Source ports are often
@@ -447,8 +583,7 @@ impl PeerState {
         outbound_queue_bytes: usize,
     ) -> Arc<Self> {
         let outbound_budget = AdaptiveQueueBudget::new(outbound_queue_bytes);
-        let (outbound_sender, outbound_receiver) =
-            AdaptiveQueueSender::new(outbound_budget.split(outbound_budget.max_bytes()));
+        let (outbound_sender, outbound_receiver) = PeerOutboundSender::new(outbound_budget);
         Arc::new(Self {
             node_id,
             addresses: Mutex::new(Vec::new()),
@@ -480,11 +615,11 @@ impl PeerState {
         &self.metrics
     }
 
-    pub fn take_outbound_receiver(&self) -> Option<AdaptiveQueueReceiver<OutboundEnvelope>> {
+    pub fn take_outbound_receiver(&self) -> Option<PeerOutboundReceiver> {
         self.outbound_receiver.lock().take()
     }
 
-    pub fn outbound_sender(&self) -> AdaptiveQueueSender<OutboundEnvelope> {
+    pub fn outbound_sender(&self) -> PeerOutboundSender {
         self.outbound_sender.clone()
     }
 
@@ -497,7 +632,7 @@ impl PeerState {
     }
 
     pub fn notify_outbound_dispatch(&self) {
-        self.outbound_dispatch_notify.notify_waiters();
+        self.outbound_dispatch_notify.notify_one();
     }
 
     pub async fn wait_for_outbound_dispatch_signal(&self) {

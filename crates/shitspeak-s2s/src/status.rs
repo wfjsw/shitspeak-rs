@@ -969,6 +969,21 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_voice_repair_cache_occupancy",
+            "Current number of original S2S voice frames retained for repair.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_repair_cache_capacity",
+            "Maximum number of original S2S voice frames retained for repair.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_repair_cache_evictions_total",
+            "Original S2S voice frames evicted because the repair cache reached capacity.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_voice_reorder_pending",
             "Current S2S voice reorder pending frame count by local node.",
             "gauge",
@@ -2555,6 +2570,11 @@ mod tests {
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_send_events_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_receive_events_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_events_total counter\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_cache_occupancy gauge\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_cache_capacity gauge\n"));
+        assert!(
+            rendered.contains("# TYPE shitspeak_s2s_voice_repair_cache_evictions_total counter\n")
+        );
         assert!(
             rendered.contains("# TYPE shitspeak_s2s_voice_ingress_admission_drops_total counter\n")
         );

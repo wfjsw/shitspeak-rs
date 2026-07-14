@@ -266,6 +266,8 @@ impl VoiceEgressResult {
 pub(crate) enum VoiceAgeStage {
     UdpPacket,
     RoutingQueue,
+    S2sEnqueue,
+    LocalFanoutQueue,
 }
 
 impl VoiceAgeStage {
@@ -273,6 +275,8 @@ impl VoiceAgeStage {
         match self {
             Self::UdpPacket => "udp_packet",
             Self::RoutingQueue => "routing_queue",
+            Self::S2sEnqueue => "s2s_enqueue",
+            Self::LocalFanoutQueue => "local_fanout_queue",
         }
     }
 }
@@ -281,6 +285,7 @@ impl VoiceAgeStage {
 pub(crate) enum VoiceSchedulerStage {
     UdpProcessing,
     RoutingTask,
+    LocalFanoutWorker,
 }
 
 impl VoiceSchedulerStage {
@@ -288,6 +293,7 @@ impl VoiceSchedulerStage {
         match self {
             Self::UdpProcessing => "udp_processing",
             Self::RoutingTask => "routing_task",
+            Self::LocalFanoutWorker => "local_fanout_worker",
         }
     }
 }
@@ -332,6 +338,7 @@ pub(crate) enum VoiceQueueKind {
     Routing,
     TcpFallback,
     UdpFanout,
+    LocalFanout,
 }
 
 impl VoiceQueueKind {
@@ -341,6 +348,7 @@ impl VoiceQueueKind {
             Self::Routing => "routing",
             Self::TcpFallback => "tcp_fallback",
             Self::UdpFanout => "udp_fanout",
+            Self::LocalFanout => "local_fanout",
         }
     }
 }
@@ -409,12 +417,12 @@ const VOICE_PIPELINE_PATH_COUNT: usize = 4;
 const VOICE_PIPELINE_STAGE_COUNT: usize = 11;
 const VOICE_EGRESS_TRANSPORT_COUNT: usize = 2;
 const VOICE_EGRESS_RESULT_COUNT: usize = 4;
-const VOICE_AGE_STAGE_COUNT: usize = 2;
-const VOICE_SCHEDULER_STAGE_COUNT: usize = 2;
+const VOICE_AGE_STAGE_COUNT: usize = 4;
+const VOICE_SCHEDULER_STAGE_COUNT: usize = 3;
 const VOICE_UDP_SEND_RESULT_COUNT: usize = 4;
 const S2S_VOICE_GATEWAY_DROP_DIRECTION_COUNT: usize = 2;
 const S2S_VOICE_GATEWAY_DROP_REASON_COUNT: usize = 2;
-const VOICE_QUEUE_KIND_COUNT: usize = 4;
+const VOICE_QUEUE_KIND_COUNT: usize = 5;
 const VOICE_QUEUE_ENQUEUE_RESULT_COUNT: usize = 4;
 const NATIVE_INGRESS_EVENT_COUNT: usize = 2;
 
@@ -616,6 +624,7 @@ struct VoiceQueueStatus {
     depth: u64,
     high_watermark: u64,
     capacity: u64,
+    instances: u64,
     samples: u64,
     full_samples: u64,
 }
@@ -626,6 +635,7 @@ impl VoiceQueueStatus {
             depth: 0,
             high_watermark: 0,
             capacity: 0,
+            instances: 0,
             samples: 0,
             full_samples: 0,
         }
@@ -780,6 +790,8 @@ fn age_stage_index(stage: VoiceAgeStage) -> usize {
     match stage {
         VoiceAgeStage::UdpPacket => 0,
         VoiceAgeStage::RoutingQueue => 1,
+        VoiceAgeStage::S2sEnqueue => 2,
+        VoiceAgeStage::LocalFanoutQueue => 3,
     }
 }
 
@@ -787,6 +799,7 @@ fn scheduler_stage_index(stage: VoiceSchedulerStage) -> usize {
     match stage {
         VoiceSchedulerStage::UdpProcessing => 0,
         VoiceSchedulerStage::RoutingTask => 1,
+        VoiceSchedulerStage::LocalFanoutWorker => 2,
     }
 }
 
@@ -805,6 +818,7 @@ fn queue_kind_index(kind: VoiceQueueKind) -> usize {
         VoiceQueueKind::Routing => 1,
         VoiceQueueKind::TcpFallback => 2,
         VoiceQueueKind::UdpFanout => 3,
+        VoiceQueueKind::LocalFanout => 4,
     }
 }
 
@@ -1118,6 +1132,45 @@ pub(crate) fn record_queue_status(kind: VoiceQueueKind, depth: usize, capacity: 
     }
 }
 
+pub(crate) fn record_queue_instance_created(kind: VoiceQueueKind, capacity: usize) {
+    let mut status = QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+    status.capacity = status.capacity.saturating_add(capacity as u64);
+    status.instances = status.instances.saturating_add(1);
+    status.samples = status.samples.saturating_add(1);
+}
+
+pub(crate) fn record_queue_depth_change(kind: VoiceQueueKind, delta: isize) {
+    let mut status = QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+    status.depth = if delta >= 0 {
+        status.depth.saturating_add(delta as u64)
+    } else {
+        status.depth.saturating_sub(delta.unsigned_abs() as u64)
+    };
+    status.high_watermark = status.high_watermark.max(status.depth);
+    status.samples = status.samples.saturating_add(1);
+    if status.capacity > 0 && status.depth >= status.capacity {
+        status.full_samples = status.full_samples.saturating_add(1);
+    }
+}
+
+pub(crate) fn record_queue_full_sample(kind: VoiceQueueKind) {
+    let mut status = QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+    status.samples = status.samples.saturating_add(1);
+    status.full_samples = status.full_samples.saturating_add(1);
+}
+
+pub(crate) fn record_queue_instance_closed(
+    kind: VoiceQueueKind,
+    capacity: usize,
+    remaining_depth: usize,
+) {
+    let mut status = QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+    status.depth = status.depth.saturating_sub(remaining_depth as u64);
+    status.capacity = status.capacity.saturating_sub(capacity as u64);
+    status.instances = status.instances.saturating_sub(1);
+    status.samples = status.samples.saturating_add(1);
+}
+
 pub(crate) fn record_queue_enqueue(kind: VoiceQueueKind, result: VoiceQueueEnqueueResult) {
     increment(
         &QUEUE_ENQUEUES[queue_kind_index(kind)][queue_enqueue_result_index(result)],
@@ -1242,7 +1295,12 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         ));
     }
 
-    for stage in [VoiceAgeStage::UdpPacket, VoiceAgeStage::RoutingQueue] {
+    for stage in [
+        VoiceAgeStage::UdpPacket,
+        VoiceAgeStage::RoutingQueue,
+        VoiceAgeStage::S2sEnqueue,
+        VoiceAgeStage::LocalFanoutQueue,
+    ] {
         for (bucket_index, (bucket, _)) in PACKET_AGE_BUCKETS_MS.iter().enumerate() {
             samples.push(PrometheusSample::new(
                 "shitspeak_voice_packet_age_ms_bucket_total",
@@ -1342,6 +1400,7 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
     for stage in [
         VoiceSchedulerStage::UdpProcessing,
         VoiceSchedulerStage::RoutingTask,
+        VoiceSchedulerStage::LocalFanoutWorker,
     ] {
         for (bucket_index, (bucket, _)) in SCHEDULER_DELAY_BUCKETS_US.iter().enumerate() {
             samples.push(PrometheusSample::new(
@@ -1537,12 +1596,14 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         VoiceQueueKind::Routing,
         VoiceQueueKind::TcpFallback,
         VoiceQueueKind::UdpFanout,
+        VoiceQueueKind::LocalFanout,
     ] {
         let status = *QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
         for (metric, value) in [
             ("depth", status.depth),
             ("high_watermark", status.high_watermark),
             ("capacity", status.capacity),
+            ("instances", status.instances),
             ("samples", status.samples),
             ("full_samples", status.full_samples),
         ] {
@@ -1805,6 +1866,97 @@ mod tests {
         }) {
             assert_no_unbounded_voice_labels(sample);
         }
+    }
+
+    #[test]
+    fn early_s2s_and_local_fanout_metrics_are_exported_without_speaker_labels() {
+        let before = prometheus_samples();
+
+        record_packet_age(VoiceAgeStage::S2sEnqueue, Duration::from_millis(7));
+        record_packet_age(VoiceAgeStage::LocalFanoutQueue, Duration::from_millis(17));
+        record_scheduler_delay(
+            VoiceSchedulerStage::LocalFanoutWorker,
+            Duration::from_micros(700),
+        );
+        record_queue_enqueue(
+            VoiceQueueKind::LocalFanout,
+            VoiceQueueEnqueueResult::Dropped,
+        );
+
+        let after = prometheus_samples();
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_packet_age_ms_bucket_total",
+                &[("stage", "s2s_enqueue"), ("bucket", "le_10")],
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_packet_age_ms_bucket_total",
+                &[("stage", "s2s_enqueue"), ("bucket", "le_10")],
+            ) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_packet_age_ms_bucket_total",
+                &[("stage", "local_fanout_queue"), ("bucket", "le_20")],
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_packet_age_ms_bucket_total",
+                &[("stage", "local_fanout_queue"), ("bucket", "le_20")],
+            ) + 1.0
+        );
+        assert!(
+            sample_value(
+                &after,
+                "shitspeak_voice_queue_enqueues_total",
+                &[("queue", "local_fanout"), ("result", "dropped")],
+            ) >= sample_value(
+                &before,
+                "shitspeak_voice_queue_enqueues_total",
+                &[("queue", "local_fanout"), ("result", "dropped")],
+            ) + 1.0
+        );
+
+        for sample in after.iter().filter(|sample| {
+            sample
+                .labels()
+                .iter()
+                .any(|(key, value)| key == "stage" && value.contains("fanout"))
+                || sample
+                    .labels()
+                    .iter()
+                    .any(|(key, value)| key == "queue" && value == "local_fanout")
+        }) {
+            assert_no_unbounded_voice_labels(sample);
+        }
+    }
+
+    #[test]
+    fn local_fanout_queue_status_aggregates_instances_and_lifecycle() {
+        let kind = VoiceQueueKind::LocalFanout;
+        let before = *QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+
+        record_queue_instance_created(kind, 8);
+        record_queue_instance_created(kind, 8);
+        record_queue_depth_change(kind, 3);
+        record_queue_depth_change(kind, 5);
+
+        let active = *QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+        assert_eq!(active.instances, before.instances + 2);
+        assert_eq!(active.capacity, before.capacity + 16);
+        assert_eq!(active.depth, before.depth + 8);
+        assert!(active.high_watermark >= before.depth + 8);
+
+        record_queue_depth_change(kind, -3);
+        record_queue_instance_closed(kind, 8, 0);
+        record_queue_depth_change(kind, -5);
+        record_queue_instance_closed(kind, 8, 0);
+
+        let closed = *QUEUE_STATUS[queue_kind_index(kind)].lock().unwrap();
+        assert_eq!(closed.instances, before.instances);
+        assert_eq!(closed.capacity, before.capacity);
+        assert_eq!(closed.depth, before.depth);
     }
 
     #[test]

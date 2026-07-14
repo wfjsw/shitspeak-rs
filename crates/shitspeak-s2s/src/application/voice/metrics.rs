@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Instant;
 
 use shitspeak_core::NodeIdentifier;
 
@@ -28,6 +29,44 @@ const BYTE_BUCKETS: [(&str, u64); 8] = [
 
 static METRICS: LazyLock<Mutex<VoiceAppMetrics>> =
     LazyLock::new(|| Mutex::new(VoiceAppMetrics::default()));
+static REPAIR_CACHE_SOURCES: LazyLock<Mutex<Vec<Weak<dyn RepairCacheTelemetrySource>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub(crate) trait RepairCacheTelemetrySource: Send + Sync {
+    fn snapshot(&self, now: Instant) -> (usize, usize);
+}
+
+pub(crate) fn register_repair_cache_telemetry_source(source: Arc<dyn RepairCacheTelemetrySource>) {
+    REPAIR_CACHE_SOURCES
+        .lock()
+        .unwrap()
+        .push(Arc::downgrade(&source));
+}
+
+fn repair_cache_telemetry_snapshot() -> (usize, usize) {
+    let sources = {
+        let mut registry = REPAIR_CACHE_SOURCES.lock().unwrap();
+        let mut sources = Vec::with_capacity(registry.len());
+        registry.retain(|source| {
+            let Some(source) = source.upgrade() else {
+                return false;
+            };
+            sources.push(source);
+            true
+        });
+        sources
+    };
+    let now = Instant::now();
+    sources.into_iter().map(|source| source.snapshot(now)).fold(
+        (0_usize, 0_usize),
+        |(occupancy, capacity), next| {
+            (
+                occupancy.saturating_add(next.0),
+                capacity.saturating_add(next.1),
+            )
+        },
+    )
+}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum VoiceSendMode {
@@ -156,8 +195,10 @@ pub(crate) enum VoiceRepairResult {
     GapDetected,
     RequestScheduled,
     RequestSent,
+    RequestFailed,
     RequestSuppressed,
     FrameServed,
+    FrameSendFailed,
     FrameMissed,
     ProactiveCopySent,
 }
@@ -168,8 +209,10 @@ impl VoiceRepairResult {
             Self::GapDetected => "gap_detected",
             Self::RequestScheduled => "request_scheduled",
             Self::RequestSent => "request_sent",
+            Self::RequestFailed => "request_failed",
             Self::RequestSuppressed => "request_suppressed",
             Self::FrameServed => "frame_served",
+            Self::FrameSendFailed => "frame_send_failed",
             Self::FrameMissed => "frame_missed",
             Self::ProactiveCopySent => "proactive_copy_sent",
         }
@@ -215,6 +258,11 @@ struct ProactiveBudget {
 }
 
 #[derive(Debug, Default)]
+struct RepairCacheTelemetry {
+    evictions: u64,
+}
+
+#[derive(Debug, Default)]
 struct VoiceAppMetrics {
     sends: HashMap<SendKey, u64>,
     receives: HashMap<ReceiveKey, u64>,
@@ -228,6 +276,7 @@ struct VoiceAppMetrics {
     deadline_wakes: HashMap<VoiceDeadlineWakeResult, u64>,
     proactive_budget: ProactiveBudget,
     proactive_outcomes: HashMap<VoiceProactiveResult, u64>,
+    repair_cache: RepairCacheTelemetry,
 }
 
 pub(crate) fn record_send(
@@ -340,7 +389,16 @@ pub(crate) fn record_proactive_outcome(result: VoiceProactiveResult) {
     *metrics.proactive_outcomes.entry(result).or_default() += 1;
 }
 
+pub(crate) fn record_repair_cache_evictions(count: u64) {
+    if count == 0 {
+        return;
+    }
+    let mut metrics = METRICS.lock().unwrap();
+    metrics.repair_cache.evictions = metrics.repair_cache.evictions.saturating_add(count);
+}
+
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
+    let (repair_cache_occupancy, repair_cache_capacity) = repair_cache_telemetry_snapshot();
     let metrics = METRICS.lock().unwrap();
     let mut out = Vec::new();
 
@@ -465,6 +523,21 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             *count as f64,
         ));
     }
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_repair_cache_occupancy",
+        Vec::new(),
+        repair_cache_occupancy as f64,
+    ));
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_repair_cache_capacity",
+        Vec::new(),
+        repair_cache_capacity as f64,
+    ));
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_repair_cache_evictions_total",
+        Vec::new(),
+        metrics.repair_cache.evictions as f64,
+    ));
 
     out
 }
@@ -533,6 +606,8 @@ mod tests {
     fn receive_repair_and_pending_metrics_use_bounded_labels() {
         record_receive(4094, 4093, 4092, VoiceReceiveResult::GapBuffered, 3);
         record_repair(4094, 4092, VoiceRepairResult::RequestSuppressed, 2);
+        record_repair(4094, 4092, VoiceRepairResult::RequestFailed, 1);
+        record_repair(4094, 4092, VoiceRepairResult::FrameSendFailed, 1);
         set_reorder_pending(4094, 9);
 
         let receive = find_sample(
@@ -560,6 +635,16 @@ mod tests {
         assert!(repair.value() >= 2.0);
         assert_no_unbounded_voice_labels(&repair);
 
+        for result in ["request_failed", "frame_send_failed"] {
+            let failure = find_sample(
+                "shitspeak_s2s_voice_repair_events_total",
+                &[("source", "4094"), ("peer", "4092"), ("result", result)],
+            )
+            .expect("explicit repair failure sample");
+            assert!(failure.value() >= 1.0);
+            assert_no_unbounded_voice_labels(&failure);
+        }
+
         let pending = find_sample("shitspeak_s2s_voice_reorder_pending", &[("source", "4094")])
             .expect("pending gauge");
         assert_eq!(pending.value(), 9.0);
@@ -585,6 +670,7 @@ mod tests {
         record_deadline_wake(VoiceDeadlineWakeResult::Coalesced);
         set_proactive_queue_budget(320_000, 65_536);
         set_proactive_credit(32_768, 80_000);
+        record_repair_cache_evictions(3);
         record_proactive_outcome(VoiceProactiveResult::Queued);
         record_proactive_outcome(VoiceProactiveResult::Sent);
         record_proactive_outcome(VoiceProactiveResult::BudgetShed);
@@ -650,6 +736,18 @@ mod tests {
             proactive_sent.labels(),
             &[("result".to_owned(), "sent".to_owned())]
         );
+
+        let repair_cache_occupancy = find_sample("shitspeak_s2s_voice_repair_cache_occupancy", &[])
+            .expect("repair cache occupancy");
+        assert!(repair_cache_occupancy.value() >= 0.0);
+        assert!(repair_cache_occupancy.labels().is_empty());
+        let repair_cache_capacity = find_sample("shitspeak_s2s_voice_repair_cache_capacity", &[])
+            .expect("repair cache capacity");
+        assert!(repair_cache_capacity.value() >= 0.0);
+        let repair_cache_evictions =
+            find_sample("shitspeak_s2s_voice_repair_cache_evictions_total", &[])
+                .expect("repair cache evictions");
+        assert!(repair_cache_evictions.value() >= 0.0);
 
         for sample in prometheus_samples().into_iter().filter(|sample| {
             sample.name().starts_with("shitspeak_s2s_voice_ingress_")

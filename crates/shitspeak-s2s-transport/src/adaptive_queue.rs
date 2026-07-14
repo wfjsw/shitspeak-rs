@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use tokio::sync::{Notify, mpsc};
 
@@ -60,10 +61,19 @@ impl AdaptiveQueueBudget {
     }
 
     pub fn split(&self, max_bytes: usize) -> AdaptiveLaneBudget {
+        self.split_with_min(max_bytes, MIN_LANE_BYTES)
+    }
+
+    pub(crate) fn split_exact(&self, max_bytes: usize) -> AdaptiveLaneBudget {
+        self.split_with_min(max_bytes, 1)
+    }
+
+    fn split_with_min(&self, max_bytes: usize, min_bytes: usize) -> AdaptiveLaneBudget {
         AdaptiveLaneBudget {
             global: self.clone(),
-            max_bytes: max_bytes.max(MIN_LANE_BYTES).min(self.inner.max_bytes),
+            max_bytes: max_bytes.max(min_bytes).min(self.inner.max_bytes),
             used_bytes: Arc::new(AtomicUsize::new(0)),
+            allow_oversize_when_empty: min_bytes == 1,
         }
     }
 }
@@ -73,28 +83,26 @@ pub struct AdaptiveLaneBudget {
     global: AdaptiveQueueBudget,
     max_bytes: usize,
     used_bytes: Arc<AtomicUsize>,
+    allow_oversize_when_empty: bool,
 }
 
 impl AdaptiveLaneBudget {
-    pub(crate) async fn reserve(&self, bytes: usize) -> Option<AdaptiveQueuePermit> {
-        let bytes = bytes.max(1);
-        if bytes > self.max_bytes || bytes > self.global.inner.max_bytes {
-            return None;
-        }
-        loop {
-            if let Some(permit) = self.try_reserve(bytes) {
-                return Some(permit);
-            }
-            self.global.inner.notify.notified().await;
-        }
-    }
-
     pub(crate) fn try_reserve(&self, bytes: usize) -> Option<AdaptiveQueuePermit> {
         let bytes = bytes.max(1);
-        if bytes > self.max_bytes || bytes > self.global.inner.max_bytes {
+        if bytes > self.global.inner.max_bytes {
             return None;
         }
-        try_add_with_limit(&self.used_bytes, bytes, self.max_bytes)?;
+        let lane_limit = if bytes <= self.max_bytes {
+            self.max_bytes
+        } else if self.allow_oversize_when_empty
+            && self.used_bytes.load(Ordering::Acquire) == 0
+            && self.global.inner.used_bytes.load(Ordering::Acquire) == 0
+        {
+            self.global.inner.max_bytes
+        } else {
+            return None;
+        };
+        try_add_with_limit(&self.used_bytes, bytes, lane_limit)?;
         if try_add_with_limit(
             &self.global.inner.used_bytes,
             bytes,
@@ -139,9 +147,33 @@ impl Drop for AdaptiveQueuePermit {
     }
 }
 
-struct Queued<T> {
+pub(crate) struct Queued<T> {
     item: T,
-    _permit: AdaptiveQueuePermit,
+    permit: AdaptiveQueuePermit,
+    enqueued_at: Instant,
+}
+
+impl<T> Queued<T> {
+    pub(crate) fn item(&self) -> &T {
+        &self.item
+    }
+
+    pub(crate) fn enqueued_at(&self) -> Instant {
+        self.enqueued_at
+    }
+
+    pub(crate) fn try_consume(self, consume: impl FnOnce(T) -> Result<(), T>) -> Result<(), Self> {
+        let Self {
+            item,
+            permit,
+            enqueued_at,
+        } = self;
+        consume(item).map_err(|item| Self {
+            item,
+            permit,
+            enqueued_at,
+        })
+    }
 }
 
 pub struct AdaptiveQueueSender<T> {
@@ -172,25 +204,47 @@ where
     }
 
     pub(crate) fn try_send(&self, item: T) -> Result<(), TryAdaptiveSendError<T>> {
+        if self.tx.is_closed() {
+            return Err(TryAdaptiveSendError::Closed(item));
+        }
         let Some(permit) = self.budget.try_reserve(item.estimated_queue_bytes()) else {
-            return Err(TryAdaptiveSendError::Full(item));
+            return if self.tx.is_closed() {
+                Err(TryAdaptiveSendError::Closed(item))
+            } else {
+                Err(TryAdaptiveSendError::Full(item))
+            };
         };
         self.tx
             .send(Queued {
                 item,
-                _permit: permit,
+                permit,
+                enqueued_at: Instant::now(),
             })
             .map_err(|err| TryAdaptiveSendError::Closed(err.0.item))
     }
 
     pub async fn send(&self, item: T) -> Result<(), SendAdaptiveError<T>> {
-        let Some(permit) = self.budget.reserve(item.estimated_queue_bytes()).await else {
+        let bytes = item.estimated_queue_bytes().max(1);
+        if bytes > self.budget.global.inner.max_bytes {
             return Err(SendAdaptiveError(item));
+        }
+        let permit = loop {
+            let notified = self.budget.global.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(permit) = self.budget.try_reserve(bytes) {
+                break permit;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = self.tx.closed() => return Err(SendAdaptiveError(item)),
+            }
         };
         self.tx
             .send(Queued {
                 item,
-                _permit: permit,
+                permit,
+                enqueued_at: Instant::now(),
             })
             .map_err(|err| SendAdaptiveError(err.0.item))
     }
@@ -213,8 +267,16 @@ impl<T> AdaptiveQueueReceiver<T> {
         self.rx.recv().await.map(|queued| queued.item)
     }
 
+    pub(crate) async fn recv_queued(&mut self) -> Option<Queued<T>> {
+        self.rx.recv().await
+    }
+
     pub fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
         self.rx.try_recv().map(|queued| queued.item)
+    }
+
+    pub(crate) fn try_recv_queued(&mut self) -> Result<Queued<T>, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
     }
 }
 
@@ -336,5 +398,53 @@ mod tests {
         ));
         assert_eq!(rx.recv().await, Some(Item(768 * 1024)));
         assert!(tx.try_send(Item(512 * 1024)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn queued_receive_retains_permit_until_wrapper_is_dropped() {
+        let budget = AdaptiveQueueBudget::new(1024 * 1024);
+        let (tx, mut rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
+
+        tx.try_send(Item(768 * 1024)).expect("first item fits");
+        let queued = rx.recv_queued().await.expect("queued item");
+        assert!(matches!(
+            tx.try_send(Item(512 * 1024)),
+            Err(TryAdaptiveSendError::Full(_))
+        ));
+
+        drop(queued);
+        assert!(tx.try_send(Item(512 * 1024)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn blocked_send_returns_when_receiver_closes() {
+        let budget = AdaptiveQueueBudget::new(1024 * 1024);
+        let (tx, rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
+        tx.try_send(Item(768 * 1024)).expect("first item fits");
+
+        let blocked_tx = tx.clone();
+        let blocked = tokio::spawn(async move { blocked_tx.send(Item(512 * 1024)).await });
+        tokio::task::yield_now().await;
+        drop(rx);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+                .await
+                .expect("closed receiver should wake sender")
+                .expect("send task")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn try_send_reports_closed_before_full() {
+        let budget = AdaptiveQueueBudget::new(1024 * 1024);
+        let (tx, rx) = AdaptiveQueueSender::new(budget.split(1024 * 1024));
+        drop(rx);
+
+        assert!(matches!(
+            tx.try_send(Item(1024 * 1024)),
+            Err(TryAdaptiveSendError::Closed(_))
+        ));
     }
 }

@@ -1035,7 +1035,7 @@ pub fn spawn_emitter_task(
         )
         .await;
 
-        let mut refresh = interval(cfg.lsa_refresh_interval());
+        let mut refresh = interval(effective_lsa_refresh_interval(&cfg));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; we already emitted, so absorb it.
         refresh.tick().await;
@@ -1133,6 +1133,11 @@ enum EmitReason {
     Metric,
     Periodic,
     Tombstone,
+}
+
+fn effective_lsa_refresh_interval(cfg: &OverlayConfig) -> Duration {
+    cfg.lsa_refresh_interval()
+        .min((cfg.lsa_max_age() / 3).max(Duration::from_millis(1)))
 }
 
 fn unchanged_refresh_deadline(cfg: &OverlayConfig) -> Duration {
@@ -1859,6 +1864,39 @@ mod tests {
             .with_lsa_unchanged_refresh_interval(Duration::from_secs(90));
 
         assert_eq!(unchanged_refresh_deadline(&cfg), Duration::from_secs(5) / 3);
+    }
+
+    #[test]
+    fn effective_refresh_interval_leaves_room_before_lsa_expiry() {
+        let cfg = OverlayConfig::new(vec![])
+            .with_lsa_refresh_interval(Duration::from_secs(90))
+            .with_lsa_max_age(Duration::from_secs(5));
+
+        assert_eq!(
+            effective_lsa_refresh_interval(&cfg),
+            Duration::from_secs(5) / 3
+        );
+    }
+
+    #[test]
+    fn effective_refresh_interval_preserves_shorter_configured_cadence() {
+        let cfg = OverlayConfig::new(vec![])
+            .with_lsa_refresh_interval(Duration::from_secs(1))
+            .with_lsa_max_age(Duration::from_secs(120));
+
+        assert_eq!(effective_lsa_refresh_interval(&cfg), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn effective_refresh_interval_has_one_millisecond_floor_for_age_cap() {
+        let cfg = OverlayConfig::new(vec![])
+            .with_lsa_refresh_interval(Duration::from_secs(1))
+            .with_lsa_max_age(Duration::from_millis(1));
+
+        assert_eq!(
+            effective_lsa_refresh_interval(&cfg),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]

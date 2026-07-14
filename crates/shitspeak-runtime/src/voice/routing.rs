@@ -1,14 +1,15 @@
 //! Voice routing logic — determines recipients and dispatches audio packets.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use scc::HashCache;
 use shitspeak_client_crypto::CryptState;
+use tokio::sync::Notify;
 use tracing::Instrument;
 
 use super::codec::{self, Audio, PacketFormat};
@@ -57,6 +58,215 @@ static S2S_NORMAL_RECIPIENT_CACHE: LazyLock<
         S2S_RECIPIENT_CACHE_MAX_CAPACITY,
     )
 });
+
+const LOCAL_FANOUT_QUEUE_CAPACITY: usize = 8;
+
+enum BoundedPushResult<T> {
+    Accepted,
+    EvictedNonTerminator,
+    NeedsSpace(T),
+}
+
+fn push_bounded<T>(
+    entries: &mut VecDeque<T>,
+    capacity: usize,
+    item: T,
+    is_terminator: impl Fn(&T) -> bool,
+) -> BoundedPushResult<T> {
+    debug_assert!(capacity > 0);
+    if entries.len() == capacity {
+        let Some(index) = entries.iter().position(|entry| !is_terminator(entry)) else {
+            return BoundedPushResult::NeedsSpace(item);
+        };
+        entries.remove(index);
+        entries.push_back(item);
+        return BoundedPushResult::EvictedNonTerminator;
+    }
+    entries.push_back(item);
+    BoundedPushResult::Accepted
+}
+
+fn audio_is_terminator(audio: &Audio) -> bool {
+    matches!(
+        &audio.audio_payload,
+        codec::AudioPayload::Opus(payload) if payload.is_terminator
+    )
+}
+
+struct LocalFanoutWork {
+    audio: Audio,
+    recipients: Arc<[ResolvedVoiceTargetRecipient]>,
+    server_id: String,
+    sender_id: ClientSessionIdentifier,
+    sender_instance_id: ClientInstanceId,
+    generation: LocalFanoutGeneration,
+    route_kind: VoiceRouteKind,
+    route_started_at: Instant,
+    age_at_enqueue: Duration,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LocalFanoutGeneration {
+    channel_version: u64,
+    channel_acl_generation: u64,
+    voice_routing_generation: u64,
+    sender_acl_generation: u64,
+    sender_channel: u32,
+}
+
+impl LocalFanoutGeneration {
+    fn capture(server: &Arc<Box<Server>>, sender: &Client, server_id: &str) -> Self {
+        Self {
+            channel_version: server.get_channels().current_version_in_server(server_id),
+            channel_acl_generation: server.get_channels().channel_acl_generation(),
+            voice_routing_generation: server
+                .get_clients()
+                .voice_routing_generation_in_server(server_id),
+            sender_acl_generation: sender.get_acl_generation(),
+            sender_channel: sender.get_current_channel_id(),
+        }
+    }
+}
+
+fn local_fanout_snapshot_is_current(
+    expected_instance_id: ClientInstanceId,
+    expected_generation: &LocalFanoutGeneration,
+    current: Option<(ClientInstanceId, &LocalFanoutGeneration)>,
+) -> bool {
+    current.is_some_and(|(instance_id, generation)| {
+        instance_id == expected_instance_id && generation == expected_generation
+    })
+}
+
+struct LocalFanoutQueue {
+    state: Mutex<LocalFanoutQueueState>,
+    changed: Notify,
+    space_available: Notify,
+}
+
+struct LocalFanoutQueueState {
+    entries: VecDeque<LocalFanoutWork>,
+    closed: bool,
+}
+
+impl LocalFanoutQueue {
+    fn new() -> Self {
+        super::metrics::record_queue_instance_created(
+            super::metrics::VoiceQueueKind::LocalFanout,
+            LOCAL_FANOUT_QUEUE_CAPACITY,
+        );
+        Self {
+            state: Mutex::new(LocalFanoutQueueState {
+                entries: VecDeque::with_capacity(LOCAL_FANOUT_QUEUE_CAPACITY),
+                closed: false,
+            }),
+            changed: Notify::new(),
+            space_available: Notify::new(),
+        }
+    }
+
+    async fn push(&self, mut work: LocalFanoutWork) {
+        loop {
+            let space_available = self.space_available.notified();
+            let incoming_is_terminator = audio_is_terminator(&work.audio);
+            let result = {
+                let mut state = self.state.lock();
+                if state.closed {
+                    super::metrics::record_queue_enqueue(
+                        super::metrics::VoiceQueueKind::LocalFanout,
+                        super::metrics::VoiceQueueEnqueueResult::Closed,
+                    );
+                    return;
+                }
+                push_bounded(
+                    &mut state.entries,
+                    LOCAL_FANOUT_QUEUE_CAPACITY,
+                    work,
+                    |entry| audio_is_terminator(&entry.audio),
+                )
+            };
+            match result {
+                BoundedPushResult::Accepted => {
+                    super::metrics::record_queue_depth_change(
+                        super::metrics::VoiceQueueKind::LocalFanout,
+                        1,
+                    );
+                }
+                BoundedPushResult::EvictedNonTerminator => {
+                    super::metrics::record_queue_full_sample(
+                        super::metrics::VoiceQueueKind::LocalFanout,
+                    );
+                    super::metrics::record_queue_enqueue(
+                        super::metrics::VoiceQueueKind::LocalFanout,
+                        super::metrics::VoiceQueueEnqueueResult::Dropped,
+                    );
+                }
+                BoundedPushResult::NeedsSpace(returned) if incoming_is_terminator => {
+                    super::metrics::record_queue_full_sample(
+                        super::metrics::VoiceQueueKind::LocalFanout,
+                    );
+                    work = returned;
+                    space_available.await;
+                    continue;
+                }
+                BoundedPushResult::NeedsSpace(_) => {
+                    super::metrics::record_queue_full_sample(
+                        super::metrics::VoiceQueueKind::LocalFanout,
+                    );
+                    super::metrics::record_queue_enqueue(
+                        super::metrics::VoiceQueueKind::LocalFanout,
+                        super::metrics::VoiceQueueEnqueueResult::Dropped,
+                    );
+                    return;
+                }
+            }
+            super::metrics::record_queue_enqueue(
+                super::metrics::VoiceQueueKind::LocalFanout,
+                super::metrics::VoiceQueueEnqueueResult::Accepted,
+            );
+            self.changed.notify_one();
+            return;
+        }
+    }
+
+    async fn pop(&self) -> Option<LocalFanoutWork> {
+        loop {
+            let notified = self.changed.notified();
+            {
+                let mut state = self.state.lock();
+                if let Some(work) = state.entries.pop_front() {
+                    super::metrics::record_queue_depth_change(
+                        super::metrics::VoiceQueueKind::LocalFanout,
+                        -1,
+                    );
+                    self.space_available.notify_one();
+                    return Some(work);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+        self.changed.notify_waiters();
+        self.space_available.notify_waiters();
+    }
+}
+
+impl Drop for LocalFanoutQueue {
+    fn drop(&mut self) {
+        super::metrics::record_queue_instance_closed(
+            super::metrics::VoiceQueueKind::LocalFanout,
+            LOCAL_FANOUT_QUEUE_CAPACITY,
+            self.state.get_mut().entries.len(),
+        );
+    }
+}
 
 struct AdaptiveHashCache<K, V> {
     state: RwLock<AdaptiveHashCacheState<K, V>>,
@@ -1346,6 +1556,16 @@ async fn resolved_voice_target_recipients(
 }
 
 pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, audio: &Audio) {
+    route_voice_inner(server, sender, audio, Duration::ZERO, None).await;
+}
+
+async fn route_voice_inner(
+    server: &Arc<Box<Server>>,
+    sender: &Arc<Box<Client>>,
+    audio: &Audio,
+    ingress_age: Duration,
+    local_fanout_queue: Option<&LocalFanoutQueue>,
+) {
     let started_at = Instant::now();
     let sender_id = sender.get_session_id();
     let server_id = sender.server_id();
@@ -1371,6 +1591,7 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         target = %audio.target,
         "routing voice packet"
     );
+    let local_fanout_generation = LocalFanoutGeneration::capture(server, sender, &server_id);
 
     let (
         intent,
@@ -1496,17 +1717,10 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         "resolved local voice recipients"
     );
     let resolution_duration = started_at.elapsed();
-    flush_voice_batch(server, audio, &targets).await;
     super::metrics::record_route_resolution(
         VoiceRouteSource::Local,
         route_kind,
         resolution_duration,
-    );
-    super::metrics::record_route(
-        VoiceRouteSource::Local,
-        route_kind,
-        targets.len(),
-        started_at.elapsed(),
     );
     super::metrics::record_route_scope(VoiceRouteSource::Local, voice_intent_scope(&intent));
 
@@ -1523,6 +1737,10 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
             codec::AudioPayload::Opus(payload) if payload.is_terminator
         );
         let enqueue_started_at = Instant::now();
+        super::metrics::record_packet_age(
+            VoiceAgeStage::S2sEnqueue,
+            ingress_age.saturating_add(started_at.elapsed()),
+        );
         let sent = if let Some(target_channels) = s2s_target_channels {
             server.s2s_manager().send_voice_for_target_channels(
                 u32::from(sender_id),
@@ -1563,6 +1781,32 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
         if !sent {
             tracing::trace!("voice s2s send dropped: S2S gateway unavailable");
         }
+    }
+
+    if let Some(queue) = local_fanout_queue {
+        let recipients = cacheable_recipients_from_targets(&targets);
+        queue
+            .push(LocalFanoutWork {
+                audio: audio.clone(),
+                recipients,
+                server_id: server_id.clone(),
+                sender_id,
+                sender_instance_id: sender.client_instance_id(),
+                generation: local_fanout_generation,
+                route_kind,
+                route_started_at: started_at,
+                age_at_enqueue: ingress_age.saturating_add(started_at.elapsed()),
+                enqueued_at: Instant::now(),
+            })
+            .await;
+    } else {
+        flush_voice_batch(server, audio, &targets).await;
+        super::metrics::record_route(
+            VoiceRouteSource::Local,
+            route_kind,
+            targets.len(),
+            started_at.elapsed(),
+        );
     }
 }
 
@@ -2145,6 +2389,75 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
         }
     };
     let weak_sender = Arc::downgrade(&sender);
+    let local_fanout_queue = Arc::new(LocalFanoutQueue::new());
+    let fanout_server = server.clone();
+    let fanout_queue = local_fanout_queue.clone();
+    tokio::spawn(
+        async move {
+            while let Some(work) = fanout_queue.pop().await {
+                let local_queue_age = work.enqueued_at.elapsed();
+                let packet_age = work.age_at_enqueue.saturating_add(local_queue_age);
+                super::metrics::record_packet_age(VoiceAgeStage::LocalFanoutQueue, packet_age);
+                super::metrics::record_scheduler_delay(
+                    VoiceSchedulerStage::LocalFanoutWorker,
+                    local_queue_age,
+                );
+                if packet_age > fanout_server.read_config().voice.max_routing_queue_age() {
+                    super::metrics::record_stale_drop(VoiceAgeStage::LocalFanoutQueue);
+                    continue;
+                }
+                let Some(current_sender) = fanout_server
+                    .get_clients()
+                    .get_client_in_server(&work.server_id, work.sender_id)
+                    .await
+                else {
+                    continue;
+                };
+                let current_generation = LocalFanoutGeneration::capture(
+                    &fanout_server,
+                    &current_sender,
+                    &work.server_id,
+                );
+                if !local_fanout_snapshot_is_current(
+                    work.sender_instance_id,
+                    &work.generation,
+                    Some((current_sender.client_instance_id(), &current_generation)),
+                ) {
+                    continue;
+                }
+                let targets = live_targets_from_cached_recipients(
+                    &fanout_server,
+                    &work.server_id,
+                    &work.recipients,
+                )
+                .await;
+                let Some(latest_sender) = fanout_server
+                    .get_clients()
+                    .get_client_in_server(&work.server_id, work.sender_id)
+                    .await
+                else {
+                    continue;
+                };
+                let latest_generation =
+                    LocalFanoutGeneration::capture(&fanout_server, &latest_sender, &work.server_id);
+                if !local_fanout_snapshot_is_current(
+                    work.sender_instance_id,
+                    &work.generation,
+                    Some((latest_sender.client_instance_id(), &latest_generation)),
+                ) {
+                    continue;
+                }
+                flush_voice_batch(&fanout_server, &work.audio, &targets).await;
+                super::metrics::record_route(
+                    VoiceRouteSource::Local,
+                    work.route_kind,
+                    targets.len(),
+                    work.route_started_at.elapsed(),
+                );
+            }
+        }
+        .instrument(span.clone()),
+    );
     tokio::spawn(
         async move {
             while let Some(payload) = rx.recv().await {
@@ -2158,8 +2471,16 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
                     super::metrics::record_stale_drop(VoiceAgeStage::RoutingQueue);
                     continue;
                 }
-                route_voice(&server, &sender, payload.decoded_audio()).await;
+                route_voice_inner(
+                    &server,
+                    &sender,
+                    payload.decoded_audio(),
+                    queue_age,
+                    Some(&local_fanout_queue),
+                )
+                .await;
             }
+            local_fanout_queue.close();
         }
         .instrument(span),
     );
@@ -2213,6 +2534,147 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_local_fanout_queue_evicts_oldest_and_retains_fifo_order() {
+        let mut queue = VecDeque::new();
+        for frame in 0..LOCAL_FANOUT_QUEUE_CAPACITY {
+            assert!(matches!(
+                push_bounded(&mut queue, LOCAL_FANOUT_QUEUE_CAPACITY, frame, |_| false,),
+                BoundedPushResult::Accepted
+            ));
+        }
+
+        assert!(matches!(
+            push_bounded(
+                &mut queue,
+                LOCAL_FANOUT_QUEUE_CAPACITY,
+                LOCAL_FANOUT_QUEUE_CAPACITY,
+                |_| false,
+            ),
+            BoundedPushResult::EvictedNonTerminator
+        ));
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            (1..=LOCAL_FANOUT_QUEUE_CAPACITY).collect::<Vec<_>>()
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestQueuedFrame {
+        id: usize,
+        terminator: bool,
+    }
+
+    #[test]
+    fn bounded_local_fanout_queue_never_evicts_a_terminator() {
+        let mut queue = VecDeque::from([
+            TestQueuedFrame {
+                id: 0,
+                terminator: true,
+            },
+            TestQueuedFrame {
+                id: 1,
+                terminator: false,
+            },
+            TestQueuedFrame {
+                id: 2,
+                terminator: true,
+            },
+        ]);
+
+        assert!(matches!(
+            push_bounded(
+                &mut queue,
+                3,
+                TestQueuedFrame {
+                    id: 3,
+                    terminator: false
+                },
+                |frame| frame.terminator,
+            ),
+            BoundedPushResult::EvictedNonTerminator
+        ));
+        assert_eq!(
+            queue.iter().map(|frame| frame.id).collect::<Vec<_>>(),
+            [0, 2, 3]
+        );
+        assert!(
+            queue
+                .iter()
+                .filter(|frame| frame.terminator)
+                .all(|frame| { frame.id == 0 || frame.id == 2 })
+        );
+    }
+
+    #[test]
+    fn all_terminator_queue_waits_for_space_without_mutation() {
+        let mut queue = VecDeque::from([
+            TestQueuedFrame {
+                id: 0,
+                terminator: true,
+            },
+            TestQueuedFrame {
+                id: 1,
+                terminator: true,
+            },
+        ]);
+
+        let result = push_bounded(
+            &mut queue,
+            2,
+            TestQueuedFrame {
+                id: 2,
+                terminator: true,
+            },
+            |frame| frame.terminator,
+        );
+        assert!(matches!(result, BoundedPushResult::NeedsSpace(_)));
+        assert_eq!(
+            queue.iter().map(|frame| frame.id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn local_fanout_generation_rejects_disconnect_move_and_acl_change() {
+        let expected = LocalFanoutGeneration {
+            channel_version: 1,
+            channel_acl_generation: 2,
+            voice_routing_generation: 3,
+            sender_acl_generation: 4,
+            sender_channel: 5,
+        };
+        assert!(!local_fanout_snapshot_is_current(7, &expected, None));
+
+        let mut moved = LocalFanoutGeneration { ..expected };
+        moved.sender_channel = 6;
+        assert!(!local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            Some((7, &moved))
+        ));
+
+        let mut acl_changed = LocalFanoutGeneration { ..expected };
+        acl_changed.sender_acl_generation = 5;
+        assert!(!local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            Some((7, &acl_changed)),
+        ));
+        let mut channel_acl_changed = LocalFanoutGeneration { ..expected };
+        channel_acl_changed.channel_acl_generation = 3;
+        assert!(!local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            Some((7, &channel_acl_changed)),
+        ));
+        assert!(local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            Some((7, &expected)),
+        ));
+    }
 
     fn base_s2s_normal_cache_key() -> S2SVoiceNormalResolutionCacheKey {
         S2SVoiceNormalResolutionCacheKey {

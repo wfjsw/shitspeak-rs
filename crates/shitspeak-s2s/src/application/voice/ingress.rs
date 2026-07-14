@@ -60,16 +60,18 @@ pub struct VoiceDelivery {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RepairRequestKey {
-    from: NodeIdentifier,
+    destination: NodeIdentifier,
     sender_session: u32,
+    sender_epoch: u64,
     first_seq: u64,
 }
 
-impl From<GapReport> for RepairRequestKey {
-    fn from(gap: GapReport) -> Self {
+impl RepairRequestKey {
+    fn new(gap: GapReport) -> Self {
         Self {
-            from: gap.from,
+            destination: repair_destination(gap.sender_session),
             sender_session: gap.sender_session,
+            sender_epoch: gap.sender_epoch,
             first_seq: gap.first_seq,
         }
     }
@@ -83,24 +85,38 @@ struct RepairRequestScheduler {
 
 impl RepairRequestScheduler {
     fn schedule(&self, source: NodeIdentifier, gap: GapReport) {
-        if gap.from == source {
-            metrics::record_repair(source, gap.from, VoiceRepairResult::RequestSuppressed, 1);
+        let destination = repair_destination(gap.sender_session);
+        if destination == source {
+            metrics::record_repair(source, destination, VoiceRepairResult::RequestSuppressed, 1);
             return;
         }
-        let key = RepairRequestKey::from(gap);
+        let key = RepairRequestKey::new(gap);
         if !self.outstanding.lock().insert(key) {
+            metrics::record_repair(source, destination, VoiceRepairResult::RequestSuppressed, 1);
             return;
         }
         match self.tx.try_send(gap) {
-            Ok(()) => {
-                metrics::record_repair(source, key.from, VoiceRepairResult::RequestScheduled, 1)
-            }
+            Ok(()) => metrics::record_repair(
+                source,
+                key.destination,
+                VoiceRepairResult::RequestScheduled,
+                1,
+            ),
             Err(_) => {
                 self.outstanding.lock().remove(&key);
-                metrics::record_repair(source, key.from, VoiceRepairResult::RequestSuppressed, 1);
+                metrics::record_repair(
+                    source,
+                    key.destination,
+                    VoiceRepairResult::RequestSuppressed,
+                    1,
+                );
             }
         }
     }
+}
+
+fn repair_destination(sender_session: u32) -> NodeIdentifier {
+    shitspeak_core::ClientSessionIdentifier::from(sender_session).get_node_id()
 }
 
 #[derive(Debug, Clone)]
@@ -410,6 +426,7 @@ impl VoiceService {
             intent,
         )?;
         let bytes = envelope.original_body();
+        self.cache_original(sender_session, seq, bytes.clone());
         let result = if self.cfg.tree_delivery_enabled {
             self.transport
                 .send_tree_multicast(
@@ -436,7 +453,7 @@ impl VoiceService {
             },
         );
         result?;
-        self.cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &dsts);
+        self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &dsts);
         Ok(())
     }
 
@@ -496,6 +513,7 @@ impl VoiceService {
             intent,
         )?;
         let bytes = envelope.original_body();
+        self.cache_original(sender_session, seq, bytes.clone());
         let result = if self.cfg.tree_delivery_enabled {
             self.transport
                 .send_tree_multicast(dsts, group, bytes.clone(), self.cfg.transport_ttl())
@@ -517,7 +535,7 @@ impl VoiceService {
             },
         );
         result?;
-        self.cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, dsts);
+        self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, dsts);
         Ok(())
     }
 
@@ -816,6 +834,7 @@ impl VoiceService {
             intent,
         )?;
         let bytes = envelope.original_body();
+        self.cache_original(sender_session, seq, bytes.clone());
         let result = self
             .transport
             .send_unicast(dst, bytes.clone(), self.cfg.transport_ttl())
@@ -832,7 +851,7 @@ impl VoiceService {
             },
         );
         result?;
-        self.cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &[dst]);
+        self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &[dst]);
         Ok(())
     }
 
@@ -868,7 +887,19 @@ impl VoiceService {
             .collect()
     }
 
-    fn cache_and_queue_proactive_repairs(
+    fn cache_original(&self, sender_session: u32, s2s_seq: u64, body: Bytes) {
+        if !self.cfg.repair_enabled {
+            return;
+        }
+        self.repair_cache.insert(RepairFrame::new(
+            sender_session,
+            self.sender_epoch,
+            s2s_seq,
+            body,
+        ));
+    }
+
+    fn refresh_cache_and_queue_proactive_repairs(
         &self,
         sender_session: u32,
         s2s_seq: u64,
@@ -879,12 +910,7 @@ impl VoiceService {
             return;
         }
         let original_body = envelope.original_body();
-        self.repair_cache.insert(RepairFrame::new(
-            sender_session,
-            self.sender_epoch,
-            s2s_seq,
-            original_body.clone(),
-        ));
+        self.cache_original(sender_session, s2s_seq, original_body.clone());
         // Credit belongs to locally originated ordinary frames only. Received
         // originals never create proactive work on this node, so minting for
         // them would violate the source-side 25% traffic ratio.
@@ -1250,7 +1276,12 @@ fn spawn_dispatch_task(
                     if cfg.repair_enabled
                         && let Some(gap) = report.opened_gap()
                     {
-                        metrics::record_repair(source, gap.from, VoiceRepairResult::GapDetected, 1);
+                        metrics::record_repair(
+                            source,
+                            repair_destination(gap.sender_session),
+                            VoiceRepairResult::GapDetected,
+                            1,
+                        );
                         repair_request_scheduler.schedule(source, gap);
                     }
                     (report, Some((origin_node, from)), Some(_permit))
@@ -1456,6 +1487,7 @@ fn spawn_repair_request_worker(
                 },
             };
             let source = transport.local_node_id();
+            let destination = repair_destination(gap.sender_session);
             if reorderer.gap_still_missing(gap) {
                 let request = VoiceRepairRequest {
                     sender_session: gap.sender_session,
@@ -1469,7 +1501,7 @@ fn spawn_repair_request_worker(
                     Ok(body) => {
                         if transport
                             .send_repair_request(
-                                gap.from,
+                                destination,
                                 body,
                                 Duration::from_millis(request_ttl_ms),
                             )
@@ -1478,15 +1510,15 @@ fn spawn_repair_request_worker(
                         {
                             metrics::record_repair(
                                 source,
-                                gap.from,
+                                destination,
                                 VoiceRepairResult::RequestSent,
                                 1,
                             );
                         } else {
                             metrics::record_repair(
                                 source,
-                                gap.from,
-                                VoiceRepairResult::RequestSuppressed,
+                                destination,
+                                VoiceRepairResult::RequestFailed,
                                 1,
                             );
                         }
@@ -1494,7 +1526,7 @@ fn spawn_repair_request_worker(
                     Err(error) => {
                         metrics::record_repair(
                             source,
-                            gap.from,
+                            destination,
                             VoiceRepairResult::RequestSuppressed,
                             1,
                         );
@@ -1502,9 +1534,14 @@ fn spawn_repair_request_worker(
                     }
                 }
             } else {
-                metrics::record_repair(source, gap.from, VoiceRepairResult::RequestSuppressed, 1);
+                metrics::record_repair(
+                    source,
+                    destination,
+                    VoiceRepairResult::RequestSuppressed,
+                    1,
+                );
             }
-            outstanding.lock().remove(&RepairRequestKey::from(gap));
+            outstanding.lock().remove(&RepairRequestKey::new(gap));
         }
     });
 }
@@ -1536,12 +1573,6 @@ fn spawn_repair_response_worker(
                 metrics::record_repair(source, work.from, VoiceRepairResult::FrameMissed, 1);
                 continue;
             }
-            metrics::record_repair(
-                source,
-                work.from,
-                VoiceRepairResult::FrameServed,
-                frames.len(),
-            );
             let avoid_first_hop = transport
                 .voice_route_quality(work.from)
                 .map(|quality| quality.next_hop());
@@ -1555,9 +1586,11 @@ fn spawn_repair_response_worker(
                     metrics::record_repair(
                         source,
                         work.from,
-                        VoiceRepairResult::RequestSuppressed,
+                        VoiceRepairResult::FrameSendFailed,
                         1,
                     );
+                } else {
+                    metrics::record_repair(source, work.from, VoiceRepairResult::FrameServed, 1);
                 }
             }
         }
@@ -1571,12 +1604,119 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use tokio::sync::Semaphore;
 
     use crate::application::voice::send::{
         DistributionGroupKind,
         testing::{FakeCall, FakeVoiceTransport},
     };
     use crate::application::voice::sink::testing::RecordingSink;
+
+    struct ControlledUnicastTransport {
+        inner: Arc<FakeVoiceTransport>,
+        primary_entered: Semaphore,
+        primary_release: Semaphore,
+        fail_primary: bool,
+    }
+
+    impl ControlledUnicastTransport {
+        fn new(fail_primary: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: FakeVoiceTransport::new(7, vec![2, 3]),
+                primary_entered: Semaphore::new(0),
+                primary_release: Semaphore::new(0),
+                fail_primary,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceTransport for ControlledUnicastTransport {
+        async fn send_unicast(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .calls
+                .lock()
+                .unwrap()
+                .push(FakeCall::Unicast { dst, body, ttl });
+            self.primary_entered.add_permits(1);
+            self.primary_release
+                .acquire()
+                .await
+                .expect("test release semaphore remains open")
+                .forget();
+            if self.fail_primary {
+                Err(ApplicationError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn send_multicast(
+            &self,
+            dsts: &[NodeIdentifier],
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_multicast(dsts, body, ttl).await
+        }
+
+        async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError> {
+            self.inner.send_broadcast(body, ttl).await
+        }
+
+        async fn send_repair_request(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_repair_request(dst, body, ttl).await
+        }
+
+        async fn send_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .send_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await
+        }
+
+        async fn send_proactive_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .send_proactive_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await
+        }
+
+        fn alive_members(&self) -> Vec<NodeIdentifier> {
+            self.inner.alive_members()
+        }
+
+        fn local_node_id(&self) -> NodeIdentifier {
+            self.inner.local_node_id()
+        }
+
+        fn voice_route_quality(
+            &self,
+            dst: NodeIdentifier,
+        ) -> Option<crate::overlay::VoiceRouteQuality> {
+            self.inner.voice_route_quality(dst)
+        }
+    }
 
     fn make_legacy_service(transport: Arc<FakeVoiceTransport>) -> Arc<VoiceService> {
         let mut cfg = VoiceConfig::default();
@@ -1916,6 +2056,29 @@ mod tests {
         assert_eq!(cfg.repair_full_dup_loss_ppm, 30_000);
         assert_eq!(cfg.repair_jitter_start_ms, 40);
         assert_eq!(cfg.repair_max_extra_copies_per_frame, 1);
+    }
+
+    #[test]
+    fn repair_request_dedup_key_distinguishes_sender_epochs() {
+        let gap = GapReport {
+            from: 11,
+            sender_session: shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+                .unwrap()
+                .to_u32(),
+            sender_epoch: 42,
+            first_seq: 7,
+            last_seq: 9,
+        };
+        let mut restarted = gap;
+        restarted.sender_epoch = 43;
+
+        let first = RepairRequestKey::new(gap);
+        let second = RepairRequestKey::new(restarted);
+        assert_ne!(first, second);
+        let mut outstanding = HashSet::new();
+        assert!(outstanding.insert(first));
+        assert!(outstanding.insert(second));
+        assert!(!outstanding.insert(first));
     }
 
     #[tokio::test]
@@ -2800,10 +2963,13 @@ mod tests {
             42,
         );
         let inbound = svc.inbound_handler();
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
 
         for seq in [0, 2] {
             let envelope = send::build_envelope(
-                0xABC,
+                sender_session,
                 shitspeak_core::default_server_id(),
                 42,
                 seq,
@@ -2826,13 +2992,13 @@ mod tests {
         let calls = wait_for_call_count(&transport, 1).await;
         match &calls[0] {
             FakeCall::RepairRequest { dst, body, ttl } => {
-                assert_eq!(*dst, 11);
+                assert_eq!(*dst, 12, "repair must target the origin, not relay 11");
                 assert_eq!(
                     *ttl,
                     Duration::from_millis(VoiceConfig::default().repair_request_ttl_ms)
                 );
                 let request = proto::decode_voice_repair_request(body.as_ref()).unwrap();
-                assert_eq!(request.sender_session, 0xABC);
+                assert_eq!(request.sender_session, sender_session);
                 assert_eq!(request.sender_epoch, 42);
                 assert_eq!(request.first_seq, 1);
                 assert_eq!(request.last_seq, 1);
@@ -2856,10 +3022,13 @@ mod tests {
             42,
         );
         let inbound = svc.inbound_handler();
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
 
         for seq in [0, 2, 3, 4] {
             let envelope = send::build_envelope(
-                0xABC,
+                sender_session,
                 shitspeak_core::default_server_id(),
                 42,
                 seq,
@@ -2945,6 +3114,103 @@ mod tests {
             }
             other => panic!("expected RepairFrame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn nack_can_replay_exact_original_before_primary_send_completes() {
+        let transport = ControlledUnicastTransport::new(false);
+        let svc = VoiceService::new_with_transport(
+            transport.clone(),
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let send = tokio::spawn({
+            let svc = svc.clone();
+            async move {
+                svc.send_unicast(
+                    0xABC,
+                    shitspeak_core::default_server_id(),
+                    0,
+                    false,
+                    Bytes::from_static(b"pending-original"),
+                    normal_intent(5),
+                    2,
+                )
+                .await
+            }
+        });
+        transport.primary_entered.acquire().await.unwrap().forget();
+        let original = match &transport.inner.calls()[0] {
+            FakeCall::Unicast { body, .. } => body.clone(),
+            other => panic!("expected pending unicast, got {other:?}"),
+        };
+        let request = VoiceRepairRequest {
+            sender_session: 0xABC,
+            sender_epoch: 42,
+            first_seq: 0,
+            last_seq: 0,
+            request_sent_unix_ms: 0,
+            request_ttl_ms: 0,
+        };
+        svc.repair_inbound_handler().handle(OverlayInboundMessage {
+            from: 3,
+            level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+            class: shitspeak_s2s_transport::MessageClass::HighPriority,
+            body: proto::encode_voice_repair_request(&request).unwrap(),
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
+        });
+        let calls = wait_for_call_count(&transport.inner, 2).await;
+        match &calls[1] {
+            FakeCall::RepairFrame {
+                body, is_repair, ..
+            } => {
+                assert_eq!(body, &original);
+                assert!(*is_repair);
+                assert!(!proto::decode_voice(body).unwrap().proactive_copy);
+            }
+            other => panic!("expected repair while primary is pending, got {other:?}"),
+        }
+        transport.primary_release.add_permits(1);
+        send.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_primary_send_mints_no_credit_and_queues_no_proactive_copy() {
+        let transport = ControlledUnicastTransport::new(true);
+        transport.inner.set_voice_route_quality(
+            2,
+            crate::overlay::VoiceRouteQuality::new(
+                2,
+                TransportKind::Udp,
+                20_000,
+                VoiceConfig::default().repair_full_dup_loss_ppm,
+                0,
+            ),
+        );
+        let svc = VoiceService::new_with_transport(
+            transport.clone(),
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        transport.primary_release.add_permits(1);
+        let result = svc
+            .send_unicast(
+                0xABC,
+                shitspeak_core::default_server_id(),
+                0,
+                false,
+                Bytes::from_static(b"failed-original"),
+                normal_intent(5),
+                2,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(svc.voice_budget.proactive_credit_balance_quarters(), 0);
+        assert_eq!(transport.inner.calls().len(), 1);
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -66,6 +67,8 @@ const S2S_GATEWAY_MAX_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 const S2S_GATEWAY_COMMAND_OVERHEAD_BYTES: usize = 512;
 const S2S_GATEWAY_CONTROL_MIN_BYTES: usize = 1024 * 1024;
 const S2S_GATEWAY_LANE_MIN_BYTES: usize = 512 * 1024;
+const S2S_VOICE_GATEWAY_MIN_SHARDS: usize = 2;
+const S2S_VOICE_GATEWAY_MAX_SHARDS: usize = 16;
 
 fn strict_proposal_gateway_response_timeout(cfg: &s2s_replications::ReplicationConfig) -> Duration {
     let slack = cfg
@@ -328,6 +331,15 @@ impl NativeToS2SCommand {
                 .saturating_add(server_id.len())
                 .saturating_add(payload.len())
                 .saturating_add(intent.encoded_len()),
+        }
+    }
+
+    fn voice_sender_session(&self) -> Option<u32> {
+        match self {
+            Self::SendVoiceForChannel { sender_session, .. }
+            | Self::SendVoiceForTargetChannels { sender_session, .. }
+            | Self::SendVoiceBroadcast { sender_session, .. } => Some(*sender_session),
+            _ => None,
         }
     }
 }
@@ -726,6 +738,10 @@ where
 impl<T> S2SAdaptiveReceiver<T> {
     async fn recv(&mut self) -> Option<T> {
         self.rx.recv().await.map(|queued| queued.command)
+    }
+
+    async fn recv_queued(&mut self) -> Option<S2SQueued<T>> {
+        self.rx.recv().await
     }
 }
 
@@ -2523,11 +2539,69 @@ async fn run_s2s_bulk_gateway(
 }
 
 async fn run_s2s_voice_gateway(
-    mut rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
+    rx: S2SAdaptiveReceiver<NativeToS2SCommand>,
     application: Arc<s2s_application::ApplicationLayer>,
 ) {
-    while let Some(command) = rx.recv().await {
-        run_s2s_voice_command(application.clone(), command).await;
+    run_sender_sharded_gateway(
+        rx,
+        s2s_voice_gateway_shard_count(),
+        |command| command.voice_sender_session().unwrap_or_default(),
+        move |command| {
+            let application = application.clone();
+            async move { run_s2s_voice_command(application, command).await }
+        },
+    )
+    .await;
+}
+
+fn s2s_voice_gateway_shard_count() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(S2S_VOICE_GATEWAY_MIN_SHARDS)
+        .clamp(S2S_VOICE_GATEWAY_MIN_SHARDS, S2S_VOICE_GATEWAY_MAX_SHARDS)
+}
+
+async fn run_sender_sharded_gateway<T, K, H, F>(
+    mut rx: S2SAdaptiveReceiver<T>,
+    shard_count: usize,
+    shard_key: K,
+    handler: H,
+) where
+    T: Send + 'static,
+    K: Fn(&T) -> u32,
+    H: Fn(T) -> F + Send + Sync + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let shard_count = shard_count.max(1);
+    let handler = Arc::new(handler);
+    let mut shard_txs = Vec::with_capacity(shard_count);
+    let mut workers = Vec::with_capacity(shard_count);
+
+    for _ in 0..shard_count {
+        let (tx, mut shard_rx) = mpsc::unbounded_channel::<S2SQueued<T>>();
+        shard_txs.push(tx);
+        let handler = Arc::clone(&handler);
+        workers.push(tokio::spawn(async move {
+            while let Some(queued) = shard_rx.recv().await {
+                let S2SQueued { command, _permit } = queued;
+                handler(command).await;
+                drop(_permit);
+            }
+        }));
+    }
+
+    while let Some(queued) = rx.recv_queued().await {
+        let shard = shard_key(&queued.command) as usize % shard_count;
+        if shard_txs[shard].send(queued).is_err() {
+            warn!(shard, "s2s voice gateway shard stopped; dropping command");
+        }
+    }
+
+    drop(shard_txs);
+    for worker in workers {
+        if let Err(error) = worker.await {
+            warn!(%error, "s2s voice gateway shard failed");
+        }
     }
 }
 
@@ -4098,6 +4172,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ShardedTestCommand {
+        sender_session: u32,
+        sequence: usize,
+        bytes: usize,
+    }
+
+    impl EstimatedS2SCommand for ShardedTestCommand {
+        fn label(&self) -> &'static str {
+            "test_voice"
+        }
+
+        fn estimated_bytes(&self) -> usize {
+            self.bytes
+        }
+    }
+
     #[test]
     fn queue_budget_releases_permits_when_command_is_dropped() {
         let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
@@ -4150,6 +4241,122 @@ mod tests {
             })
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn sender_sharded_gateway_preserves_same_sender_fifo() {
+        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
+        let (tx, rx) = S2SAdaptiveSender::new(budget.split(S2S_GATEWAY_LANE_MIN_BYTES));
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let handler_observed = Arc::clone(&observed);
+        let runner = tokio::spawn(run_sender_sharded_gateway(
+            rx,
+            2,
+            |command: &ShardedTestCommand| command.sender_session,
+            move |command| {
+                let observed = Arc::clone(&handler_observed);
+                async move {
+                    observed.lock().await.push(command.sequence);
+                }
+            },
+        ));
+
+        for sequence in 0..4 {
+            assert!(tx.try_send(ShardedTestCommand {
+                sender_session: 7,
+                sequence,
+                bytes: 1,
+            }));
+        }
+        drop(tx);
+        runner.await.expect("shard runner completes");
+
+        assert_eq!(*observed.lock().await, vec![0, 1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sender_sharded_gateway_overlaps_different_senders() {
+        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
+        let (tx, rx) = S2SAdaptiveSender::new(budget.split(S2S_GATEWAY_LANE_MIN_BYTES));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
+        let runner = tokio::spawn(run_sender_sharded_gateway(
+            rx,
+            2,
+            |command: &ShardedTestCommand| command.sender_session,
+            {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                let rendezvous = Arc::clone(&rendezvous);
+                move |_command| {
+                    let active = Arc::clone(&active);
+                    let max_active = Arc::clone(&max_active);
+                    let rendezvous = Arc::clone(&rendezvous);
+                    async move {
+                        let now_active = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        max_active.fetch_max(now_active, Ordering::AcqRel);
+                        rendezvous.wait().await;
+                        active.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+            },
+        ));
+
+        for sender_session in [0, 1] {
+            assert!(tx.try_send(ShardedTestCommand {
+                sender_session,
+                sequence: 0,
+                bytes: 1,
+            }));
+        }
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), runner)
+            .await
+            .expect("different sender shards should overlap")
+            .expect("shard runner completes");
+
+        assert_eq!(max_active.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn sender_sharded_gateway_retains_permit_until_handler_completes() {
+        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
+        let lane = budget.split(S2S_GATEWAY_LANE_MIN_BYTES);
+        let (tx, rx) = S2SAdaptiveSender::new(lane.clone());
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let handler_release = Arc::clone(&release);
+        let runner = tokio::spawn(run_sender_sharded_gateway(
+            rx,
+            2,
+            |command: &ShardedTestCommand| command.sender_session,
+            move |_command| {
+                let started_tx = started_tx.clone();
+                let release = Arc::clone(&handler_release);
+                async move {
+                    started_tx.send(()).expect("test observer remains open");
+                    let permit = release.acquire().await.expect("release semaphore open");
+                    permit.forget();
+                }
+            },
+        ));
+
+        assert!(tx.try_send(ShardedTestCommand {
+            sender_session: 3,
+            sequence: 0,
+            bytes: S2S_GATEWAY_LANE_MIN_BYTES * 3 / 4,
+        }));
+        started_rx.recv().await.expect("handler starts");
+        assert!(
+            lane.try_reserve(S2S_GATEWAY_LANE_MIN_BYTES / 2).is_none(),
+            "the queued byte permit must remain held during command execution"
+        );
+
+        release.add_permits(1);
+        drop(tx);
+        runner.await.expect("shard runner completes");
+        assert!(lane.try_reserve(S2S_GATEWAY_LANE_MIN_BYTES / 2).is_some());
     }
 
     #[test]

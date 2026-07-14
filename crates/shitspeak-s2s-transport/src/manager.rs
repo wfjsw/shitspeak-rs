@@ -5,7 +5,7 @@
 //! (TLS configs, bound listener, `quinn::Endpoint`, etc.) so the manager
 //! itself stays free of transport-specific fields.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -15,18 +15,21 @@ use parking_lot::{Mutex, RwLock};
 use scc::HashMap as SccMap;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::types::NodeIdentifier;
 
 use super::SendOptions;
 use super::adaptive_queue::{
-    AdaptiveQueueBudget, AdaptiveQueueItem, AdaptiveQueueReceiver, AdaptiveQueueSender,
+    AdaptiveQueueBudget, AdaptiveQueueItem, AdaptiveQueueReceiver, AdaptiveQueueSender, Queued,
     SendAdaptiveError, TryAdaptiveSendError,
 };
 use super::config::{KcpTuning, TransportConfig, TransportRoutingPolicy};
 use super::connection::OutboundEnvelope;
-use super::connection::{AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerState};
+use super::connection::{
+    AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerOutboundReceiver, PeerOutboundSender,
+    PeerState,
+};
 use super::endpoint::{
     EndpointRegistry,
     kcp::KcpEndpoint,
@@ -50,6 +53,11 @@ use super::tls::build_tls_configs;
 const OUTBOUND_DISPATCH_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC: f64 = 16.0 * 1024.0;
 const DEADLINE_NEAR_EXPIRED_TTL: Duration = Duration::from_millis(20);
+const MAX_CONSECUTIVE_HIGH_PRIORITY: usize = 32;
+const MAX_OUTBOUND_INGRESS_PER_TURN: usize = 256;
+const MAX_OUTBOUND_DISPATCH_ATTEMPTS_PER_TURN: usize = 128;
+const MAX_OUTBOUND_EXPIRY_PURGES_PER_TURN: usize = 256;
+const MAX_BLOCKED_LANE_PASSES: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct TransportSelectionConfig {
@@ -1941,56 +1949,413 @@ fn spawn_peer_outbound_dispatcher(inner: Arc<ManagerInner>, peer: Arc<PeerState>
     tokio::spawn(run_peer_outbound_dispatcher(inner, peer, receiver));
 }
 
-async fn run_peer_outbound_dispatcher(
-    inner: Arc<ManagerInner>,
-    peer: Arc<PeerState>,
-    mut receiver: AdaptiveQueueReceiver<OutboundEnvelope>,
-) {
-    let mut retry_tick = interval(OUTBOUND_DISPATCH_RETRY_INTERVAL);
-    retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+#[derive(Default)]
+struct OutboundScheduler {
+    control: SchedulerLane,
+    high_priority: SchedulerLane,
+    regular: SchedulerLane,
+    consecutive_high_priority: usize,
+    next_id: u64,
+    next_purge_lane: usize,
+}
 
-    loop {
-        let maybe_envelope = tokio::select! {
-            biased;
-            _ = inner.shutdown().cancelled() => return,
-            envelope = receiver.recv() => envelope,
-        };
-        let Some(mut envelope) = maybe_envelope else {
-            return;
-        };
+struct SchedulerNode {
+    queued: Queued<OutboundEnvelope>,
+    previous: Option<u64>,
+    next: Option<u64>,
+    expires_at: Option<Instant>,
+}
 
-        loop {
-            if inner.shutdown().is_cancelled() {
-                return;
+#[derive(Default)]
+struct SchedulerLane {
+    nodes: HashMap<u64, SchedulerNode>,
+    head: Option<u64>,
+    tail: Option<u64>,
+    expirations: BTreeSet<(Instant, u64)>,
+}
+
+impl SchedulerLane {
+    fn push_back(&mut self, id: u64, queued: Queued<OutboundEnvelope>) {
+        let expires_at = queued.item().options().expires_at();
+        if let Some(deadline) = expires_at {
+            self.expirations.insert((deadline, id));
+        }
+        let previous = self.tail;
+        self.nodes.insert(
+            id,
+            SchedulerNode {
+                queued,
+                previous,
+                next: None,
+                expires_at,
+            },
+        );
+        if let Some(previous) = previous {
+            self.nodes.get_mut(&previous).expect("lane tail").next = Some(id);
+        } else {
+            self.head = Some(id);
+        }
+        self.tail = Some(id);
+    }
+
+    fn push_front(&mut self, id: u64, node: SchedulerNode) {
+        if let Some(deadline) = node.expires_at {
+            self.expirations.insert((deadline, id));
+        }
+        let old_head = self.head;
+        let mut node = node;
+        node.previous = None;
+        node.next = old_head;
+        self.nodes.insert(id, node);
+        if let Some(old_head) = old_head {
+            self.nodes.get_mut(&old_head).expect("lane head").previous = Some(id);
+        } else {
+            self.tail = Some(id);
+        }
+        self.head = Some(id);
+    }
+
+    fn pop_front(&mut self) -> Option<(u64, SchedulerNode)> {
+        let id = self.head?;
+        self.remove(id).map(|node| (id, node))
+    }
+
+    fn remove(&mut self, id: u64) -> Option<SchedulerNode> {
+        let node = self.nodes.remove(&id)?;
+        if let Some(deadline) = node.expires_at {
+            self.expirations.remove(&(deadline, id));
+        }
+        if let Some(previous) = node.previous {
+            self.nodes
+                .get_mut(&previous)
+                .expect("lane predecessor")
+                .next = node.next;
+        } else {
+            self.head = node.next;
+        }
+        if let Some(next) = node.next {
+            self.nodes.get_mut(&next).expect("lane successor").previous = node.previous;
+        } else {
+            self.tail = node.previous;
+        }
+        Some(node)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn purge_expired(&mut self, peer: &PeerState, now: Instant, limit: usize) -> usize {
+        let mut purged = 0;
+        while purged < limit {
+            let Some((deadline, id)) = self.expirations.first().copied() else {
+                break;
+            };
+            if deadline > now {
+                break;
             }
-            match try_dispatch_envelope(
-                &peer,
-                envelope,
-                TransportSelectionConfig::from_config(inner.cfg()),
-            ) {
-                Ok(()) => break,
-                Err(envelope_back) => {
-                    envelope = envelope_back;
+            let node = self.remove(id).expect("expiry index entry");
+            let envelope = node.queued.item();
+            peer.record_expired_outbound_drop(
+                ExpiredOutboundDropStage::PeerQueueDispatch,
+                envelope.target_transport(),
+                envelope.class(),
+            );
+            purged += 1;
+        }
+        purged
+    }
+
+    fn has_expired(&self, now: Instant) -> bool {
+        self.expirations
+            .first()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DispatchAttempt {
+    Empty,
+    Dispatched,
+    Blocked,
+}
+
+impl OutboundScheduler {
+    fn push(&mut self, queued: Queued<OutboundEnvelope>) {
+        if self.is_empty() {
+            self.consecutive_high_priority = 0;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        match queued.item().class() {
+            MessageClass::Control => self.control.push_back(id, queued),
+            MessageClass::HighPriority => self.high_priority.push_back(id, queued),
+            MessageClass::Regular => self.regular.push_back(id, queued),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.control.is_empty() && self.high_priority.is_empty() && self.regular.is_empty()
+    }
+
+    fn purge_expired(&mut self, peer: &PeerState, now: Instant, limit: usize) -> bool {
+        let start = self.next_purge_lane;
+        let mut remaining = limit;
+        for offset in 0..3 {
+            let purged = match (start + offset) % 3 {
+                0 => self.control.purge_expired(peer, now, remaining),
+                1 => self.high_priority.purge_expired(peer, now, remaining),
+                _ => self.regular.purge_expired(peer, now, remaining),
+            };
+            remaining -= purged;
+            if remaining == 0 {
+                break;
+            }
+        }
+        self.next_purge_lane = (start + 1) % 3;
+        self.control.has_expired(now)
+            || self.high_priority.has_expired(now)
+            || self.regular.has_expired(now)
+    }
+
+    fn dispatch_ready(
+        &mut self,
+        peer: &Arc<PeerState>,
+        selection: TransportSelectionConfig,
+        max_attempts: usize,
+    ) -> bool {
+        let mut control_blocked = false;
+        let mut high_blocked = false;
+        let mut regular_blocked = false;
+        let mut attempts = 0;
+        let mut blocked_passes = 0;
+        let mut made_progress = false;
+
+        while attempts < max_attempts {
+            if !control_blocked {
+                attempts += 1;
+                match try_dispatch_lane(&mut self.control, peer, selection, false) {
+                    DispatchAttempt::Dispatched => {
+                        made_progress = true;
+                        continue;
+                    }
+                    DispatchAttempt::Blocked => control_blocked = true,
+                    DispatchAttempt::Empty => {}
                 }
             }
 
-            tokio::select! {
-                biased;
-                _ = inner.shutdown().cancelled() => return,
-                _ = peer.wait_for_outbound_dispatch_signal() => {}
-                _ = retry_tick.tick() => {}
+            let regular_first = self.consecutive_high_priority >= MAX_CONSECUTIVE_HIGH_PRIORITY
+                && !self.regular.is_empty();
+            let regular_waiting = !self.regular.is_empty();
+            let first = if regular_first {
+                (&mut self.regular, &mut regular_blocked, false)
+            } else {
+                (&mut self.high_priority, &mut high_blocked, true)
+            };
+            if !*first.1 {
+                if attempts == max_attempts {
+                    break;
+                }
+                attempts += 1;
+                let allow_regular_backlog = !first.2 && regular_first;
+                match try_dispatch_lane(first.0, peer, selection, allow_regular_backlog) {
+                    DispatchAttempt::Dispatched => {
+                        made_progress = true;
+                        if first.2 {
+                            if !regular_waiting {
+                                self.consecutive_high_priority = 0;
+                            } else {
+                                self.consecutive_high_priority =
+                                    self.consecutive_high_priority.saturating_add(1);
+                            }
+                        } else {
+                            self.consecutive_high_priority = 0;
+                        }
+                        continue;
+                    }
+                    DispatchAttempt::Blocked => *first.1 = true,
+                    DispatchAttempt::Empty => {}
+                }
             }
+
+            let second = if regular_first {
+                (&mut self.high_priority, &mut high_blocked, true)
+            } else {
+                (&mut self.regular, &mut regular_blocked, false)
+            };
+            if !*second.1 {
+                if attempts == max_attempts {
+                    break;
+                }
+                attempts += 1;
+                let allow_regular_backlog = !second.2 && regular_first;
+                match try_dispatch_lane(second.0, peer, selection, allow_regular_backlog) {
+                    DispatchAttempt::Dispatched => {
+                        made_progress = true;
+                        if second.2 {
+                            if !regular_waiting {
+                                self.consecutive_high_priority = 0;
+                            } else {
+                                self.consecutive_high_priority =
+                                    self.consecutive_high_priority.saturating_add(1);
+                            }
+                        } else {
+                            self.consecutive_high_priority = 0;
+                        }
+                        continue;
+                    }
+                    DispatchAttempt::Blocked => *second.1 = true,
+                    DispatchAttempt::Empty => {}
+                }
+            }
+
+            if made_progress && blocked_passes < MAX_BLOCKED_LANE_PASSES {
+                control_blocked = false;
+                high_blocked = false;
+                regular_blocked = false;
+                blocked_passes += 1;
+                made_progress = false;
+            } else {
+                break;
+            }
+        }
+        if self.is_empty() {
+            self.consecutive_high_priority = 0;
+        }
+        attempts >= max_attempts && !self.is_empty()
+    }
+}
+
+fn try_dispatch_lane(
+    lane: &mut SchedulerLane,
+    peer: &Arc<PeerState>,
+    selection: TransportSelectionConfig,
+    allow_regular_backlog: bool,
+) -> DispatchAttempt {
+    let Some((id, node)) = lane.pop_front() else {
+        return DispatchAttempt::Empty;
+    };
+    let queued = node.queued;
+    let class = queued.item().class();
+    let queue_age = queued.enqueued_at().elapsed();
+    match queued.try_consume(|envelope| {
+        try_dispatch_envelope_with_policy(peer, envelope, selection, allow_regular_backlog)
+    }) {
+        Ok(()) => {
+            trace!(
+                peer = %peer.node_id(),
+                ?class,
+                queue_age_ms = queue_age.as_millis(),
+                "dispatched queued outbound peer frame"
+            );
+            DispatchAttempt::Dispatched
+        }
+        Err(queued) => {
+            lane.push_front(
+                id,
+                SchedulerNode {
+                    expires_at: queued.item().options().expires_at(),
+                    queued,
+                    previous: None,
+                    next: None,
+                },
+            );
+            DispatchAttempt::Blocked
         }
     }
 }
 
+async fn run_peer_outbound_dispatcher(
+    inner: Arc<ManagerInner>,
+    peer: Arc<PeerState>,
+    mut receiver: PeerOutboundReceiver,
+) {
+    let mut retry_tick = interval(OUTBOUND_DISPATCH_RETRY_INTERVAL);
+    retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut scheduler = OutboundScheduler::default();
+    loop {
+        if inner.shutdown().is_cancelled() {
+            return;
+        }
+
+        let mut drained = 0;
+        'drain: while drained < MAX_OUTBOUND_INGRESS_PER_TURN {
+            let mut found = false;
+            for class in [
+                MessageClass::Control,
+                MessageClass::HighPriority,
+                MessageClass::Regular,
+            ] {
+                match receiver.try_recv(class) {
+                    Ok(queued) => {
+                        scheduler.push(queued);
+                        drained += 1;
+                        found = true;
+                        if drained == MAX_OUTBOUND_INGRESS_PER_TURN {
+                            break 'drain;
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
+                }
+            }
+            if !found {
+                break;
+            }
+        }
+
+        let more_expired =
+            scheduler.purge_expired(&peer, Instant::now(), MAX_OUTBOUND_EXPIRY_PURGES_PER_TURN);
+        let more_dispatch = scheduler.dispatch_ready(
+            &peer,
+            TransportSelectionConfig::from_config(inner.cfg()),
+            MAX_OUTBOUND_DISPATCH_ATTEMPTS_PER_TURN,
+        );
+
+        if scheduler.is_empty() && receiver.is_closed() {
+            return;
+        }
+
+        if drained == MAX_OUTBOUND_INGRESS_PER_TURN || more_expired || more_dispatch {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        tokio::select! {
+            biased;
+            _ = inner.shutdown().cancelled() => return,
+            queued = receiver.recv(), if !receiver.is_closed() => {
+                if let Some(queued) = queued {
+                    scheduler.push(queued);
+                }
+            }
+            _ = peer.wait_for_outbound_dispatch_signal(), if !scheduler.is_empty() => {}
+            _ = retry_tick.tick(), if !scheduler.is_empty() => {}
+        }
+    }
+}
+
+#[cfg(test)]
 fn try_dispatch_envelope(
     peer: &Arc<PeerState>,
     envelope: OutboundEnvelope,
     selection: impl Into<TransportSelectionConfig>,
 ) -> Result<(), OutboundEnvelope> {
+    try_dispatch_envelope_with_policy(peer, envelope, selection.into(), false)
+}
+
+fn try_dispatch_envelope_with_policy(
+    peer: &Arc<PeerState>,
+    envelope: OutboundEnvelope,
+    selection: TransportSelectionConfig,
+    allow_regular_backlog: bool,
+) -> Result<(), OutboundEnvelope> {
     let now = Instant::now();
-    let selection = selection.into();
     if envelope.is_expired_at(now) {
         peer.record_expired_outbound_drop(
             ExpiredOutboundDropStage::PeerQueueDispatch,
@@ -2061,6 +2426,7 @@ fn try_dispatch_envelope(
             continue;
         };
         if class == MessageClass::Regular
+            && !allow_regular_backlog
             && frame.options().expires_at().is_none()
             && sender.depth_bytes() > 0
         {
@@ -2301,10 +2667,11 @@ fn test_inbound_dispatch() -> (InboundDispatch, Inbound) {
 fn record_outbound_queue_sample(
     peer: &PeerState,
     class: MessageClass,
-    sender: &AdaptiveQueueSender<OutboundEnvelope>,
+    sender: &PeerOutboundSender,
     is_full: bool,
 ) {
-    let (depth, max_capacity) = sender_queue_depth(sender);
+    let depth = sender.depth_bytes();
+    let max_capacity = sender.capacity_bytes();
     peer.record_outbound_queue_sample(class, depth, max_capacity, is_full);
 }
 
@@ -2480,6 +2847,371 @@ mod tests {
     fn age_zero_wire_metric(peer: &PeerState, kind: TransportKind, age: Duration) {
         peer.metrics().record_rtt(kind, Duration::from_millis(40));
         std::thread::sleep(age);
+    }
+
+    fn queued_envelope(
+        transport: TransportKind,
+        class: MessageClass,
+        payload: &'static [u8],
+        options: SendOptions,
+    ) -> Queued<OutboundEnvelope> {
+        let budget = AdaptiveQueueBudget::new(1024 * 1024);
+        let (sender, mut receiver) = AdaptiveQueueSender::new(budget.split(budget.max_bytes()));
+        sender
+            .try_send(OutboundEnvelope::fixed_transport(
+                transport,
+                class,
+                Bytes::from_static(payload),
+                options,
+            ))
+            .expect("test envelope should fit");
+        receiver
+            .try_recv_queued()
+            .expect("test envelope should be queued")
+    }
+
+    #[test]
+    fn outbound_scheduler_skips_blocked_regular_lane() {
+        let (peer, mut receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Quic]);
+        fill_stream_queue(&peer, TransportKind::Tcp, 1024 * 1024 - 512);
+        let mut scheduler = OutboundScheduler::default();
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::Regular,
+            b"blocked regular",
+            SendOptions::default(),
+        ));
+        scheduler.push(queued_envelope(
+            TransportKind::Quic,
+            MessageClass::HighPriority,
+            b"ready high",
+            SendOptions::default(),
+        ));
+
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+
+        assert_eq!(scheduler.regular.len(), 1);
+        assert!(scheduler.high_priority.is_empty());
+        assert_eq!(
+            receivers[1].try_recv().unwrap().payload(),
+            &Bytes::from_static(b"ready high")
+        );
+    }
+
+    #[test]
+    fn outbound_scheduler_dispatches_control_before_other_classes() {
+        let (peer, mut receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let mut scheduler = OutboundScheduler::default();
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::Regular,
+            b"regular",
+            SendOptions::default(),
+        ));
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::HighPriority,
+            b"high",
+            SendOptions::default(),
+        ));
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::Control,
+            b"control",
+            SendOptions::default(),
+        ));
+
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+
+        assert_eq!(
+            receivers[0].try_recv().unwrap().class(),
+            MessageClass::Control
+        );
+        assert_eq!(
+            receivers[0].try_recv().unwrap().class(),
+            MessageClass::HighPriority
+        );
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+        assert_eq!(
+            receivers[0].try_recv().unwrap().class(),
+            MessageClass::Regular
+        );
+    }
+
+    #[test]
+    fn outbound_scheduler_serves_regular_after_thirty_two_high_priority_frames() {
+        let (peer, mut receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let mut scheduler = OutboundScheduler::default();
+        for _ in 0..33 {
+            scheduler.push(queued_envelope(
+                TransportKind::Tcp,
+                MessageClass::HighPriority,
+                b"high",
+                SendOptions::default(),
+            ));
+        }
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::Regular,
+            b"regular",
+            SendOptions::default(),
+        ));
+
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+
+        for _ in 0..32 {
+            assert_eq!(
+                receivers[0].try_recv().unwrap().class(),
+                MessageClass::HighPriority
+            );
+        }
+        assert_eq!(
+            receivers[0].try_recv().unwrap().class(),
+            MessageClass::Regular
+        );
+        assert_eq!(
+            receivers[0].try_recv().unwrap().class(),
+            MessageClass::HighPriority
+        );
+    }
+
+    #[test]
+    fn outbound_scheduler_purges_expiring_high_while_regular_is_blocked() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        fill_stream_queue(&peer, TransportKind::Tcp, 1024 * 1024 - 512);
+        let mut scheduler = OutboundScheduler::default();
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::Regular,
+            b"blocked regular",
+            SendOptions::default(),
+        ));
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::HighPriority,
+            b"expiring high",
+            SendOptions::default().expire_after(Duration::from_millis(1)),
+        ));
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+
+        std::thread::sleep(Duration::from_millis(5));
+        scheduler.purge_expired(&peer, Instant::now(), 128);
+
+        assert_eq!(scheduler.regular.len(), 1);
+        assert!(scheduler.high_priority.is_empty());
+        assert!(peer.expired_outbound_drop_status().iter().any(|drop| {
+            drop.stage() == ExpiredOutboundDropStage::PeerQueueDispatch
+                && drop.transport() == Some(TransportKind::Tcp)
+                && drop.class() == MessageClass::HighPriority
+                && drop.frames() == 1
+        }));
+    }
+
+    #[test]
+    fn regular_admission_saturation_leaves_capacity_for_control() {
+        let peer = PeerState::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+            MetricsTuning::default(),
+            1024 * 1024,
+        );
+        let sender = peer.outbound_sender();
+        sender
+            .try_send(OutboundEnvelope::fixed_transport(
+                TransportKind::Tcp,
+                MessageClass::Regular,
+                Bytes::from(vec![0; 512 * 1024 - 256]),
+                SendOptions::default(),
+            ))
+            .expect("regular reserved share");
+        assert!(matches!(
+            sender.try_send(OutboundEnvelope::fixed_transport(
+                TransportKind::Tcp,
+                MessageClass::Regular,
+                Bytes::from_static(b"regular overflow"),
+                SendOptions::default(),
+            )),
+            Err(TryAdaptiveSendError::Full(_))
+        ));
+        sender
+            .try_send(OutboundEnvelope::fixed_transport(
+                TransportKind::Tcp,
+                MessageClass::Control,
+                Bytes::from_static(b"control"),
+                SendOptions::default(),
+            ))
+            .expect("control keeps reserved admission");
+    }
+
+    #[test]
+    fn late_control_is_visible_behind_large_regular_ingress_burst() {
+        let peer = PeerState::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+            MetricsTuning::default(),
+            1024 * 1024,
+        );
+        let sender = peer.outbound_sender();
+        for _ in 0..300 {
+            sender
+                .try_send(OutboundEnvelope::fixed_transport(
+                    TransportKind::Tcp,
+                    MessageClass::Regular,
+                    Bytes::from_static(b"regular"),
+                    SendOptions::default(),
+                ))
+                .expect("regular burst fits reserved share");
+        }
+        sender
+            .try_send(OutboundEnvelope::fixed_transport(
+                TransportKind::Tcp,
+                MessageClass::Control,
+                Bytes::from_static(b"late control"),
+                SendOptions::default(),
+            ))
+            .expect("late control fits");
+        let mut receiver = peer.take_outbound_receiver().expect("peer receiver");
+
+        let queued = receiver
+            .try_recv(MessageClass::Control)
+            .expect("control has a separate ingress lane");
+        assert_eq!(queued.item().class(), MessageClass::Control);
+    }
+
+    #[test]
+    fn late_priority_is_not_buried_under_regular_stream_staging() {
+        let (peer, mut receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let mut scheduler = OutboundScheduler::default();
+        for _ in 0..100 {
+            scheduler.push(queued_envelope(
+                TransportKind::Tcp,
+                MessageClass::Regular,
+                b"regular",
+                SendOptions::default(),
+            ));
+        }
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::HighPriority,
+            b"late high",
+            SendOptions::default(),
+        ));
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::Control,
+            b"late control",
+            SendOptions::default(),
+        ));
+
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+
+        assert_eq!(
+            receivers[0].try_recv().unwrap().class(),
+            MessageClass::Regular
+        );
+        assert_eq!(
+            receivers[0].try_recv().unwrap().class(),
+            MessageClass::Control
+        );
+        assert_eq!(
+            receivers[0].try_recv().unwrap().class(),
+            MessageClass::HighPriority
+        );
+        assert!(receivers[0].try_recv().is_err());
+    }
+
+    #[test]
+    fn scheduler_bounds_dispatch_and_expiry_work_per_turn() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let mut scheduler = OutboundScheduler::default();
+        for _ in 0..200 {
+            scheduler.push(queued_envelope(
+                TransportKind::Tcp,
+                MessageClass::HighPriority,
+                b"high",
+                SendOptions::default(),
+            ));
+        }
+        assert!(scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 10,));
+        assert!(!scheduler.high_priority.is_empty());
+
+        let mut expiring = OutboundScheduler::default();
+        for _ in 0..257 {
+            expiring.push(queued_envelope(
+                TransportKind::Tcp,
+                MessageClass::Regular,
+                b"expired",
+                SendOptions::default().expire_after(Duration::ZERO),
+            ));
+        }
+        assert!(expiring.purge_expired(&peer, Instant::now(), 256));
+        assert_eq!(expiring.regular.len(), 1);
+        assert!(!expiring.purge_expired(&peer, Instant::now(), 256));
+        assert!(expiring.is_empty());
+    }
+
+    #[test]
+    fn separated_high_priority_bursts_do_not_carry_fairness_debt() {
+        let (peer, mut receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let mut scheduler = OutboundScheduler::default();
+        for _ in 0..32 {
+            scheduler.push(queued_envelope(
+                TransportKind::Tcp,
+                MessageClass::HighPriority,
+                b"old high",
+                SendOptions::default(),
+            ));
+        }
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+        while receivers[0].try_recv().is_ok() {}
+        assert_eq!(scheduler.consecutive_high_priority, 0);
+
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::HighPriority,
+            b"new high",
+            SendOptions::default(),
+        ));
+        scheduler.push(queued_envelope(
+            TransportKind::Tcp,
+            MessageClass::Regular,
+            b"regular",
+            SendOptions::default(),
+        ));
+        scheduler.dispatch_ready(&peer, TransportRoutingPolicy::default().into(), 128);
+        assert_eq!(
+            receivers[0].try_recv().expect("new burst head").class(),
+            MessageClass::HighPriority
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_remains_responsive_with_outbound_backlog() {
+        let (transport, _receivers) = ConnectionManager::test_with_live_streams_bytes(
+            1,
+            2,
+            &[TransportKind::Tcp],
+            1024 * 1024,
+        );
+        for _ in 0..300 {
+            let _ = transport
+                .try_send(
+                    2,
+                    ServiceLevel::Reliable,
+                    None,
+                    MessageClass::Regular,
+                    Bytes::from_static(b"backlog"),
+                )
+                .await;
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), transport.shutdown())
+            .await
+            .expect("shutdown should not wait for scheduler backlog");
     }
 
     #[tokio::test]
