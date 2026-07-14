@@ -26,13 +26,13 @@ persistence_dir = "s2s-state"
 
 tcp_listen = "0.0.0.0:64739"
 kcp_listen = "0.0.0.0:64740"
-quic_listen = "0.0.0.0:64741"
-udp_listen = "0.0.0.0:64742"
+quic_listen = "0.0.0.0:64740"
+udp_listen = "0.0.0.0:64740"
 
 tcp_advertise = "node-1.example.com:64739"
 kcp_advertise = "node-1.example.com:64740"
-quic_advertise = "node-1.example.com:64741"
-udp_advertise = "node-1.example.com:64742"
+quic_advertise = "node-1.example.com:64740"
+udp_advertise = "node-1.example.com:64740"
 
 status_http_listen = "0.0.0.0:64750"
 
@@ -41,6 +41,11 @@ seed_addresses = [
   { transport = "quic", addr = "node-3.example.com:64741" },
 ]
 ```
+
+KCP, QUIC, and packet-encrypted UDP can share one local UDP port. The server
+binds one UDP socket and demultiplexes protocol frames in userspace using
+`0x81` for KCP, `0x82` for QUIC, and `0x80` for UDP. Upgrade participating
+nodes together because legacy unprefixed UDP-family traffic is rejected.
 
 Every clustered node needs a unique S2S leaf certificate whose Common Name is the numeric node id. When S2S is disabled or no S2S certificate is configured, the local node id defaults to `0`.
 

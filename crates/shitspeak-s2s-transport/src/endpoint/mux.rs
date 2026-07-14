@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::{
-    bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
+    bind_ephemeral_udp_dial_socket, bind_udp_socket_with_ipv6_only,
     udp_batch::{
         RecvDatagramBatch, UDP_RECV_BATCH_MAX_DATAGRAMS, UdpBatchDatagram, recv_udp_batch,
         send_udp_batch,
@@ -75,12 +75,6 @@ impl UdpMuxQueueTuning {
     pub(crate) fn hard_capacity(&self) -> usize {
         self.hard_capacity
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UdpDialMode {
-    Direct,
-    Muxed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +244,13 @@ impl UdpMuxSocket {
         let protocol = MuxProtocol::from_transport(kind).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "transport is not UDP-family")
         })?;
+        if !self.slots.contains_key(&kind) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{kind:?} is not registered on UDP mux {}", self.addr),
+            ));
+        }
+        let socket = self.ensure_socket(shutdown).await?;
         let slot = self.slots.get(&kind).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -257,7 +258,6 @@ impl UdpMuxSocket {
             )
         })?;
         let rx = slot.take_rx()?;
-        let socket = self.ensure_socket(shutdown).await?;
         Ok(UdpMuxHandle::new(socket, protocol, rx))
     }
 
@@ -270,8 +270,7 @@ impl UdpMuxSocket {
             return Ok(socket.clone());
         }
 
-        let socket =
-            Arc::new(bind_reusable_udp_socket_with_ipv6_only(self.addr, self.ipv6_only).await?);
+        let socket = Arc::new(bind_udp_socket_with_ipv6_only(self.addr, self.ipv6_only).await?);
         tokio::spawn(run_mux_read_loop(self.clone(), socket.clone(), shutdown));
         *guard = Some(socket.clone());
         Ok(socket)
@@ -281,13 +280,14 @@ impl UdpMuxSocket {
 #[derive(Debug, Clone)]
 pub(crate) struct UdpMuxSet {
     sockets: Arc<Vec<Arc<UdpMuxSocket>>>,
+    aliases: Arc<HashMap<SocketAddr, SocketAddr>>,
 }
 
 impl UdpMuxSet {
     pub(crate) fn new(
         listen_addrs: &[(TransportKind, SocketAddr)],
         queue_tuning: UdpMuxQueueTuning,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let mut by_addr: HashMap<SocketAddr, Vec<TransportKind>> = HashMap::new();
         for (kind, addr) in listen_addrs.iter().copied() {
             if MuxProtocol::from_transport(kind).is_some() {
@@ -298,16 +298,21 @@ impl UdpMuxSet {
             }
         }
 
-        let all_addrs = listen_addrs
-            .iter()
-            .map(|(_, addr)| *addr)
-            .collect::<Vec<_>>();
-        let mut sockets = Vec::new();
+        let aliases = canonical_udp_bind_aliases(by_addr.keys().copied())?;
+        let mut canonical_protocols: HashMap<SocketAddr, Vec<TransportKind>> = HashMap::new();
         for (addr, protocols) in by_addr {
-            if protocols.len() < 2 {
-                continue;
+            let canonical = aliases.get(&addr).copied().unwrap_or(addr);
+            let target = canonical_protocols.entry(canonical).or_default();
+            for protocol in protocols {
+                if !target.contains(&protocol) {
+                    target.push(protocol);
+                }
             }
-            let ipv6_only = ipv6_only_for_address(addr, &all_addrs);
+        }
+
+        let mut sockets = Vec::new();
+        for (addr, protocols) in canonical_protocols {
+            let ipv6_only = addr.is_ipv6() && !addr.ip().is_unspecified();
             sockets.push(Arc::new(UdpMuxSocket::new(
                 addr,
                 ipv6_only,
@@ -316,9 +321,10 @@ impl UdpMuxSet {
             )));
         }
 
-        Self {
+        Ok(Self {
             sockets: Arc::new(sockets),
-        }
+            aliases: Arc::new(aliases),
+        })
     }
 
     pub(crate) async fn take_handle(
@@ -326,17 +332,83 @@ impl UdpMuxSet {
         addr: SocketAddr,
         kind: TransportKind,
         shutdown: CancellationToken,
-    ) -> io::Result<Option<UdpMuxHandle>> {
+    ) -> io::Result<UdpMuxHandle> {
+        let canonical = self.aliases.get(&addr).copied().unwrap_or(addr);
         let Some(socket) = self
             .sockets
             .iter()
-            .find(|socket| socket.addr == addr && socket.has_protocol(kind))
+            .find(|socket| socket.addr == canonical && socket.has_protocol(kind))
             .cloned()
         else {
-            return Ok(None);
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{kind:?} is not configured on UDP mux {addr}"),
+            ));
         };
-        socket.take_handle(kind, shutdown).await.map(Some)
+        socket.take_handle(kind, shutdown).await
     }
+
+    pub(crate) fn binding_for(&self, addr: SocketAddr) -> io::Result<(SocketAddr, bool)> {
+        let canonical = self.aliases.get(&addr).copied().unwrap_or(addr);
+        let socket = self
+            .sockets
+            .iter()
+            .find(|socket| socket.addr == canonical)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("UDP-family listener {addr} is not configured"),
+                )
+            })?;
+        Ok((canonical, socket.ipv6_only))
+    }
+
+    pub(crate) fn supports_remote(&self, addr: SocketAddr, remote: SocketAddr) -> bool {
+        self.binding_for(addr)
+            .map(|(local, ipv6_only)| super::socket_addr_supports_remote(local, ipv6_only, remote))
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn socket_count(&self) -> usize {
+        self.sockets.len()
+    }
+}
+
+fn canonical_udp_bind_aliases(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> io::Result<HashMap<SocketAddr, SocketAddr>> {
+    let mut by_port: HashMap<u16, Vec<SocketAddr>> = HashMap::new();
+    for addr in addrs {
+        let entries = by_port.entry(addr.port()).or_default();
+        if !entries.contains(&addr) {
+            entries.push(addr);
+        }
+    }
+
+    let mut aliases = HashMap::new();
+    for (port, addrs) in by_port {
+        let canonical = if addrs.len() == 1 {
+            addrs[0]
+        } else if addrs.iter().all(|addr| {
+            addr.is_ipv4() && addr.ip().is_unspecified()
+                || (addr.is_ipv6() && addr.ip().is_unspecified())
+        }) && addrs
+            .iter()
+            .any(|addr| addr.is_ipv6() && addr.ip().is_unspecified())
+        {
+            SocketAddr::from(([0u16; 8], port))
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("UDP-family listeners on port {port} cannot share one socket: {addrs:?}"),
+            ));
+        };
+        for addr in addrs {
+            aliases.insert(addr, canonical);
+        }
+    }
+    Ok(aliases)
 }
 
 async fn run_mux_read_loop(
@@ -850,6 +922,123 @@ mod tests {
     }
 
     #[test]
+    fn mux_set_creates_one_socket_for_a_single_protocol() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 64738));
+        let mux = UdpMuxSet::new(
+            &[(TransportKind::Udp, addr)],
+            UdpMuxQueueTuning::for_max_users(1),
+        )
+        .unwrap();
+
+        assert_eq!(mux.socket_count(), 1);
+    }
+
+    #[test]
+    fn mux_set_canonicalizes_dual_stack_wildcards() {
+        let v4 = SocketAddr::from(([0, 0, 0, 0], 64738));
+        let v6 = SocketAddr::from(([0u16; 8], 64738));
+        let mux = UdpMuxSet::new(
+            &[
+                (TransportKind::Kcp, v4),
+                (TransportKind::Quic, v6),
+                (TransportKind::Udp, v4),
+            ],
+            UdpMuxQueueTuning::for_max_users(1),
+        )
+        .unwrap();
+
+        assert_eq!(mux.socket_count(), 1);
+        assert_eq!(mux.binding_for(v4).unwrap().0, v6);
+        assert_eq!(mux.binding_for(v6).unwrap().0, v6);
+        assert!(!mux.binding_for(v6).unwrap().1);
+    }
+
+    #[test]
+    fn mux_set_rejects_conflicting_same_port_bindings() {
+        let v4 = SocketAddr::from(([127, 0, 0, 1], 64738));
+        let v6 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 64738));
+        let error = UdpMuxSet::new(
+            &[(TransportKind::Udp, v4), (TransportKind::Kcp, v6)],
+            UdpMuxQueueTuning::for_max_users(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn protocol_handles_share_one_underlying_socket() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mux = UdpMuxSet::new(
+            &[
+                (TransportKind::Udp, addr),
+                (TransportKind::Kcp, addr),
+                (TransportKind::Quic, addr),
+            ],
+            UdpMuxQueueTuning::for_max_users(1),
+        )
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        let udp = mux
+            .take_handle(addr, TransportKind::Udp, shutdown.child_token())
+            .await
+            .unwrap();
+        let kcp = mux
+            .take_handle(addr, TransportKind::Kcp, shutdown.child_token())
+            .await
+            .unwrap();
+        let quic = mux
+            .take_handle(addr, TransportKind::Quic, shutdown.child_token())
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&udp.socket, &kcp.socket));
+        assert!(Arc::ptr_eq(&kcp.socket, &quic.socket));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn single_protocol_handle_receives_prefixed_datagrams() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mux = UdpMuxSet::new(
+            &[(TransportKind::Udp, addr)],
+            UdpMuxQueueTuning::for_max_users(1),
+        )
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        let handle = mux
+            .take_handle(addr, TransportKind::Udp, shutdown.child_token())
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let target = handle.local_addr().unwrap();
+        sender
+            .send_to(&prefixed_datagram(MuxProtocol::Udp, b"single"), target)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 32];
+        let (len, peer_addr) = handle.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"single");
+        assert_eq!(peer_addr, sender.local_addr().unwrap());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn configured_udp_bind_is_exclusive() {
+        let first = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let error = bind_udp_socket_with_ipv6_only(first.local_addr().unwrap(), false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
     fn prefixed_empty_payload_decodes() {
         let datagram = prefixed_datagram(MuxProtocol::Udp, &[]);
         assert_eq!(
@@ -921,6 +1110,84 @@ mod tests {
         assert_eq!(first.peer_addr, peer_addr);
         assert_eq!(second.payload, b"second");
         assert_eq!(second.peer_addr, peer_addr);
+    }
+
+    #[tokio::test]
+    async fn mux_datagram_handler_demultiplexes_all_protocols() {
+        let tuning = UdpMuxQueueTuning::for_max_users(1);
+        let mux = UdpMuxSocket::new(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            false,
+            vec![TransportKind::Udp, TransportKind::Kcp, TransportKind::Quic],
+            tuning,
+        );
+        let mut udp = mux
+            .slots
+            .get(&TransportKind::Udp)
+            .unwrap()
+            .take_rx()
+            .unwrap();
+        let mut kcp = mux
+            .slots
+            .get(&TransportKind::Kcp)
+            .unwrap()
+            .take_rx()
+            .unwrap();
+        let mut quic = mux
+            .slots
+            .get(&TransportKind::Quic)
+            .unwrap()
+            .take_rx()
+            .unwrap();
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 64738));
+
+        handle_mux_datagram(
+            &mux,
+            &prefixed_datagram(MuxProtocol::Udp, b"udp"),
+            peer_addr,
+        );
+        handle_mux_datagram(
+            &mux,
+            &prefixed_datagram(MuxProtocol::Kcp, b"kcp"),
+            peer_addr,
+        );
+        handle_mux_datagram(
+            &mux,
+            &prefixed_datagram(MuxProtocol::Quic, b"quic"),
+            peer_addr,
+        );
+
+        assert_eq!(udp.recv().await.unwrap().payload, b"udp");
+        assert_eq!(kcp.recv().await.unwrap().payload, b"kcp");
+        assert_eq!(quic.recv().await.unwrap().payload, b"quic");
+    }
+
+    #[test]
+    fn mux_datagram_handler_drops_invalid_and_unconfigured_protocols() {
+        let tuning = UdpMuxQueueTuning::for_max_users(1);
+        let mux = UdpMuxSocket::new(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            false,
+            vec![TransportKind::Udp],
+            tuning,
+        );
+        let mut udp = mux
+            .slots
+            .get(&TransportKind::Udp)
+            .unwrap()
+            .take_rx()
+            .unwrap();
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 64738));
+
+        handle_mux_datagram(&mux, &[], peer_addr);
+        handle_mux_datagram(&mux, &[0x00, b'x'], peer_addr);
+        handle_mux_datagram(
+            &mux,
+            &prefixed_datagram(MuxProtocol::Kcp, b"unconfigured"),
+            peer_addr,
+        );
+
+        assert!(udp.try_recv().is_err());
     }
 
     #[test]

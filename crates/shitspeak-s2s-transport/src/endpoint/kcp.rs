@@ -20,10 +20,8 @@ use super::super::manager::ManagerInner;
 use super::super::native_stats;
 use super::super::service_level::TransportKind;
 use super::{
-    Endpoint, bind_ephemeral_udp_dial_socket, bind_reusable_udp_socket_with_ipv6_only,
-    install_stream_session, ipv6_only_for_address,
-    mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpDialMode, UdpMuxSet},
-    remote_udp_addr_is_muxed, seed_udp_addr_is_muxed,
+    Endpoint, install_stream_session,
+    mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxSet},
 };
 
 const KCP_MAX_LISTENER_SESSIONS: usize = 512;
@@ -64,28 +62,15 @@ impl Endpoint for KcpEndpoint {
         async move {
             let acceptor = TlsAcceptor::from(self.server_tls.clone());
             for addr in self.listen_addrs.iter().copied() {
-                let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
-                let listener = match self
+                let handle = self
                     .mux
                     .take_handle(addr, TransportKind::Kcp, inner.shutdown().child_token())
-                    .await?
-                {
-                    Some(handle) => {
-                        let cfg = kcp_config_for_mode(UdpDialMode::Muxed, self.kcp_tuning);
-                        KcpListener::from_io(cfg, Arc::new(handle))
-                            .await
-                            .map_err(|e| io::Error::other(format!("kcp mux bind {addr}: {e}")))?
-                    }
-                    None => {
-                        let cfg = kcp_config_for_mode(UdpDialMode::Direct, self.kcp_tuning);
-                        let socket =
-                            bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?;
-                        KcpListener::from_socket(cfg, socket)
-                            .await
-                            .map_err(|e| io::Error::other(format!("kcp bind {addr}: {e}")))?
-                    }
-                };
-                debug!(%addr, %ipv6_only, "kcp listener up");
+                    .await?;
+                let cfg = kcp_config(self.kcp_tuning);
+                let listener = KcpListener::from_io(cfg, Arc::new(handle))
+                    .await
+                    .map_err(|e| io::Error::other(format!("kcp mux bind {addr}: {e}")))?;
+                debug!(%addr, "kcp listener up");
                 tokio::spawn(accept_loop(
                     listener,
                     acceptor.clone(),
@@ -104,14 +89,8 @@ impl Endpoint for KcpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let mode =
-                if remote_udp_addr_is_muxed(&peer.snapshot_addresses(), addr, TransportKind::Kcp) {
-                    UdpDialMode::Muxed
-                } else {
-                    UdpDialMode::Direct
-                };
-            let cfg = kcp_config_for_mode(mode, self.kcp_tuning);
-            let sock = connect_kcp_stream(&cfg, mode, addr)
+            let cfg = kcp_config(self.kcp_tuning);
+            let sock = connect_kcp_stream(&cfg, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
             let native_sampler = native_stats::kcp_sampler(&sock);
@@ -153,14 +132,8 @@ impl Endpoint for KcpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
         async move {
-            let mode =
-                if seed_udp_addr_is_muxed(&inner.cfg().seed_targets(), addr, TransportKind::Kcp) {
-                    UdpDialMode::Muxed
-                } else {
-                    UdpDialMode::Direct
-                };
-            let cfg = kcp_config_for_mode(mode, self.kcp_tuning);
-            let sock = connect_kcp_stream(&cfg, mode, addr)
+            let cfg = kcp_config(self.kcp_tuning);
+            let sock = connect_kcp_stream(&cfg, addr)
                 .await
                 .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
             let native_sampler = native_stats::kcp_sampler(&sock);
@@ -193,7 +166,7 @@ impl Endpoint for KcpEndpoint {
     }
 }
 
-fn kcp_config_for_mode(mode: UdpDialMode, tuning: KcpTuning) -> KcpConfig {
+fn kcp_config(tuning: KcpTuning) -> KcpConfig {
     let mut cfg = KcpConfig::default();
     cfg.nodelay = KcpNoDelayConfig {
         nodelay: tuning.nodelay(),
@@ -204,28 +177,17 @@ fn kcp_config_for_mode(mode: UdpDialMode, tuning: KcpTuning) -> KcpConfig {
     cfg.flush_write = tuning.flush_write();
     cfg.flush_acks_input = tuning.flush_acks_input();
     cfg.no_progress_timeout = tuning.no_progress_close();
-    if mode == UdpDialMode::Muxed {
-        cfg.mtu = cfg.mtu.saturating_sub(DISCRIMINATOR_LEN);
-    }
+    cfg.mtu = cfg.mtu.saturating_sub(DISCRIMINATOR_LEN);
     cfg.with_max_sessions(KCP_MAX_LISTENER_SESSIONS)
         .with_max_sessions_per_ip(KCP_MAX_LISTENER_SESSIONS_PER_IP)
 }
 
 async fn connect_kcp_stream(
     cfg: &KcpConfig,
-    mode: UdpDialMode,
     addr: SocketAddr,
 ) -> Result<KcpStream, Box<dyn std::error::Error + Send + Sync>> {
-    match mode {
-        UdpDialMode::Direct => {
-            let socket = bind_ephemeral_udp_dial_socket(addr).await?;
-            Ok(KcpStream::connect_with_socket(cfg, socket, addr).await?)
-        }
-        UdpDialMode::Muxed => {
-            let socket = PrefixedUdpSocket::bind_ephemeral(addr, TransportKind::Kcp).await?;
-            Ok(KcpStream::connect_with_io(cfg, Arc::new(socket), addr).await?)
-        }
-    }
+    let socket = PrefixedUdpSocket::bind_ephemeral(addr, TransportKind::Kcp).await?;
+    Ok(KcpStream::connect_with_io(cfg, Arc::new(socket), addr).await?)
 }
 
 async fn accept_loop(
@@ -304,7 +266,7 @@ mod tests {
 
     #[test]
     fn kcp_config_applies_realtime_defaults() {
-        let cfg = kcp_config_for_mode(UdpDialMode::Direct, KcpTuning::default());
+        let cfg = kcp_config(KcpTuning::default());
 
         assert!(cfg.nodelay.nodelay);
         assert_eq!(cfg.nodelay.interval, 10);
@@ -315,10 +277,8 @@ mod tests {
     }
 
     #[test]
-    fn muxed_kcp_config_preserves_discriminator_mtu_budget() {
-        let direct = kcp_config_for_mode(UdpDialMode::Direct, KcpTuning::default());
-        let muxed = kcp_config_for_mode(UdpDialMode::Muxed, KcpTuning::default());
-
-        assert_eq!(muxed.mtu, direct.mtu - DISCRIMINATOR_LEN);
+    fn kcp_config_reserves_discriminator_mtu_budget() {
+        let cfg = kcp_config(KcpTuning::default());
+        assert_eq!(cfg.mtu, KcpConfig::default().mtu - DISCRIMINATOR_LEN);
     }
 }

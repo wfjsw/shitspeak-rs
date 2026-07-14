@@ -25,7 +25,6 @@ use bytes::Bytes;
 use prost::Message as _;
 use rustls::SignatureScheme;
 use rustls_pki_types::CertificateDer;
-use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{Instant as TokioInstant, Interval, interval_at, sleep};
 use tokio_util::sync::CancellationToken;
@@ -51,13 +50,9 @@ use super::super::metrics::{
 use super::super::service_level::{MessageClass, ServiceLevel, TransportKind};
 use super::super::tls;
 use super::{
-    Endpoint, bind_reusable_udp_socket_with_ipv6_only, ipv6_only_for_address,
+    Endpoint,
     mux::{DISCRIMINATOR_LEN, PrefixedUdpSocket, UdpMuxHandle, UdpMuxSet},
-    remote_udp_addr_is_muxed, socket_addr_supports_remote,
-    udp_batch::{
-        RecvDatagramBatch, UDP_RECV_BATCH_MAX_DATAGRAMS, UdpBatchDatagram, recv_udp_batch,
-        send_udp_batch,
-    },
+    udp_batch::{RecvDatagramBatch, UDP_RECV_BATCH_MAX_DATAGRAMS},
 };
 
 const MAGIC: [u8; 4] = *b"SSU1";
@@ -110,23 +105,18 @@ impl UdpEndpoint {
         addr: SocketAddr,
         inner: Arc<ManagerInner>,
     ) -> io::Result<Arc<UdpSocketState>> {
-        let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
+        let (canonical_addr, ipv6_only) = self.mux.binding_for(addr)?;
         let mut sockets = self.sockets.lock().await;
-        if let Some(existing) = sockets.for_bound_addr(addr, ipv6_only) {
+        if let Some(existing) = sockets.for_bound_addr(canonical_addr, ipv6_only) {
             return Ok(existing.clone());
         }
 
-        let state = Arc::new(
-            match self
-                .mux
-                .take_handle(addr, TransportKind::Udp, inner.shutdown().child_token())
-                .await?
-            {
-                Some(handle) => UdpSocketState::from_mux(handle),
-                None => UdpSocketState::bind(addr, ipv6_only).await?,
-            },
-        );
-        sockets.insert(addr, ipv6_only, state.clone());
+        let handle = self
+            .mux
+            .take_handle(addr, TransportKind::Udp, inner.shutdown().child_token())
+            .await?;
+        let state = Arc::new(UdpSocketState::from_mux(handle));
+        sockets.insert(canonical_addr, ipv6_only, state.clone());
         let local_node = inner.self_id();
         tokio::spawn(run_socket_read_loop(
             state.clone(),
@@ -141,26 +131,33 @@ impl UdpEndpoint {
         &self,
         remote_addr: SocketAddr,
         inner: Arc<ManagerInner>,
-        muxed_remote: bool,
     ) -> io::Result<Arc<UdpSocketState>> {
-        let mut sockets = self.sockets.lock().await;
-        if let Some(existing) = sockets.for_addr(remote_addr, muxed_remote) {
-            return Ok(existing.clone());
+        {
+            let sockets = self.sockets.lock().await;
+            if let Some(existing) = sockets.for_addr(remote_addr) {
+                return Ok(existing.clone());
+            }
         }
 
-        let (state, bind) = if muxed_remote {
-            Arc::new(UdpSocketState::from_prefixed(
-                PrefixedUdpSocket::bind_ephemeral(remote_addr, TransportKind::Udp).await?,
-            ))
-            .with_bind_addr()?
-        } else {
-            let bind = bind_addr_for_udp_socket(&self.listen_addrs, remote_addr);
-            (
-                Arc::new(UdpSocketState::bind(bind.addr, bind.ipv6_only).await?),
-                bind,
-            )
-        };
-        sockets.insert(bind.addr, bind.ipv6_only, state.clone());
+        if let Some(addr) = self
+            .listen_addrs
+            .iter()
+            .copied()
+            .find(|addr| self.mux.supports_remote(*addr, remote_addr))
+        {
+            return self.ensure_listen_socket(addr, inner).await;
+        }
+
+        let state = Arc::new(UdpSocketState::from_prefixed(
+            PrefixedUdpSocket::bind_ephemeral(remote_addr, TransportKind::Udp).await?,
+        ));
+        let bind_addr = state.socket.local_addr()?;
+        let ipv6_only = false;
+        let mut sockets = self.sockets.lock().await;
+        if let Some(existing) = sockets.for_addr(remote_addr) {
+            return Ok(existing.clone());
+        }
+        sockets.insert(bind_addr, ipv6_only, state.clone());
         let local_node = inner.self_id();
         tokio::spawn(run_socket_read_loop(
             state.clone(),
@@ -179,9 +176,8 @@ impl Endpoint for UdpEndpoint {
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
             for addr in self.listen_addrs.iter().copied() {
-                let ipv6_only = ipv6_only_for_address(addr, &self.listen_addrs);
                 self.ensure_listen_socket(addr, inner.clone()).await?;
-                debug!(%addr, %ipv6_only, "udp packet-encryption listener up");
+                debug!(%addr, "udp packet-encryption listener up");
             }
             Ok(())
         }
@@ -194,11 +190,7 @@ impl Endpoint for UdpEndpoint {
         addr: SocketAddr,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            let muxed_remote =
-                remote_udp_addr_is_muxed(&peer.snapshot_addresses(), addr, TransportKind::Udp);
-            let socket = self
-                .ensure_socket(addr, inner.clone(), muxed_remote)
-                .await?;
+            let socket = self.ensure_socket(addr, inner.clone()).await?;
             let completion =
                 start_key_exchange(&inner, &self.identity, socket, peer.node_id(), addr).await?;
             completion.await.map_err(|_| {
@@ -232,18 +224,14 @@ struct UdpSocketSet {
 struct UdpSocketEntry {
     addr: SocketAddr,
     ipv6_only: bool,
-    muxed: bool,
     state: Arc<UdpSocketState>,
 }
 
 impl UdpSocketSet {
-    fn for_addr(&self, addr: SocketAddr, muxed: bool) -> Option<&Arc<UdpSocketState>> {
+    fn for_addr(&self, addr: SocketAddr) -> Option<&Arc<UdpSocketState>> {
         self.entries
             .iter()
-            .find(|entry| {
-                entry.muxed == muxed
-                    && socket_addr_supports_remote(entry.addr, entry.ipv6_only, addr)
-            })
+            .find(|entry| super::socket_addr_supports_remote(entry.addr, entry.ipv6_only, addr))
             .map(|entry| &entry.state)
     }
 
@@ -255,43 +243,19 @@ impl UdpSocketSet {
     }
 
     fn insert(&mut self, addr: SocketAddr, ipv6_only: bool, state: Arc<UdpSocketState>) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| {
-            entry.addr == addr
-                && entry.ipv6_only == ipv6_only
-                && entry.muxed == state.socket.is_muxed()
-        }) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.addr == addr && entry.ipv6_only == ipv6_only)
+        {
             entry.state = state;
         } else {
             self.entries.push(UdpSocketEntry {
                 addr,
                 ipv6_only,
-                muxed: state.socket.is_muxed(),
                 state,
             });
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct UdpBindAddr {
-    addr: SocketAddr,
-    ipv6_only: bool,
-}
-
-fn bind_addr_for_udp_socket(listen_addrs: &[SocketAddr], remote_addr: SocketAddr) -> UdpBindAddr {
-    for addr in listen_addrs.iter().copied() {
-        let ipv6_only = ipv6_only_for_address(addr, listen_addrs);
-        if socket_addr_supports_remote(addr, ipv6_only, remote_addr) {
-            return UdpBindAddr { addr, ipv6_only };
-        }
-    }
-    UdpBindAddr {
-        addr: if remote_addr.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        } else {
-            SocketAddr::from(([0u16; 8], 0))
-        },
-        ipv6_only: false,
     }
 }
 
@@ -304,18 +268,6 @@ struct UdpSocketState {
 }
 
 impl UdpSocketState {
-    async fn bind(addr: SocketAddr, ipv6_only: bool) -> io::Result<Self> {
-        Ok(Self {
-            socket: UdpIo::Direct(Arc::new(
-                bind_reusable_udp_socket_with_ipv6_only(addr, ipv6_only).await?,
-            )),
-            sessions: Mutex::new(HashMap::new()),
-            exchanges: Mutex::new(HashMap::new()),
-            exchange_retransmit: Notify::new(),
-            shutdown: CancellationToken::new(),
-        })
-    }
-
     fn from_mux(handle: UdpMuxHandle) -> Self {
         Self {
             socket: UdpIo::Mux(Arc::new(handle)),
@@ -372,22 +324,10 @@ impl UdpSocketState {
             self.exchanges.lock().await.remove(&node);
         }
     }
-
-    fn with_bind_addr(self: Arc<Self>) -> io::Result<(Arc<Self>, UdpBindAddr)> {
-        let addr = self.socket.local_addr()?;
-        Ok((
-            self,
-            UdpBindAddr {
-                addr,
-                ipv6_only: false,
-            },
-        ))
-    }
 }
 
 #[derive(Clone, Debug)]
 enum UdpIo {
-    Direct(Arc<UdpSocket>),
     Mux(Arc<UdpMuxHandle>),
     Prefixed(Arc<PrefixedUdpSocket>),
 }
@@ -402,7 +342,6 @@ struct UdpIoBatchSendOutcome {
 impl UdpIo {
     async fn recv_batch_from(&self, batch: &mut RecvDatagramBatch) -> io::Result<usize> {
         match self {
-            Self::Direct(socket) => recv_udp_batch(socket, batch).await,
             Self::Mux(handle) => {
                 batch.clear();
                 let (len, peer_addr) = handle.recv_from(batch.first_buffer_mut()).await?;
@@ -420,7 +359,6 @@ impl UdpIo {
 
     async fn send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<usize> {
         match self {
-            Self::Direct(socket) => socket.send_to(payload, target).await,
             Self::Mux(handle) => handle.send_to(payload, target).await,
             Self::Prefixed(socket) => socket.send_to(payload, target).await,
         }
@@ -432,25 +370,6 @@ impl UdpIo {
         target: SocketAddr,
     ) -> io::Result<UdpIoBatchSendOutcome> {
         match self {
-            Self::Direct(socket) => {
-                let batch = payloads
-                    .iter()
-                    .map(|payload| UdpBatchDatagram::new(payload, target))
-                    .collect::<Vec<_>>();
-                let stats = send_udp_batch(socket, &batch).await?;
-                if stats.would_block_count() > 0 || stats.partial_count() > 0 {
-                    debug!(
-                        would_block = stats.would_block_count(),
-                        partial = stats.partial_count(),
-                        "S2S UDP direct batch send observed socket backpressure"
-                    );
-                }
-                Ok(UdpIoBatchSendOutcome {
-                    bytes: payloads.iter().map(|payload| payload.len()).sum(),
-                    would_block: stats.would_block_count(),
-                    partial: stats.partial_count(),
-                })
-            }
             Self::Mux(handle) => {
                 handle
                     .send_batch_to(payloads, target)
@@ -474,7 +393,6 @@ impl UdpIo {
 
     fn overhead(&self) -> usize {
         match self {
-            Self::Direct(_) => 0,
             Self::Mux(_) | Self::Prefixed(_) => DISCRIMINATOR_LEN,
         }
     }
@@ -483,13 +401,8 @@ impl UdpIo {
         udp_mtu.saturating_sub(self.overhead())
     }
 
-    fn is_muxed(&self) -> bool {
-        matches!(self, Self::Mux(_) | Self::Prefixed(_))
-    }
-
     fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
-            Self::Direct(socket) => socket.local_addr(),
             Self::Mux(handle) => handle.local_addr(),
             Self::Prefixed(socket) => socket.local_addr(),
         }
@@ -3086,6 +2999,17 @@ fn now_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_socket_state() -> Arc<UdpSocketState> {
+        Arc::new(UdpSocketState::from_prefixed(
+            PrefixedUdpSocket::bind_ephemeral(
+                SocketAddr::from(([127, 0, 0, 1], 9)),
+                TransportKind::Udp,
+            )
+            .await
+            .unwrap(),
+        ))
+    }
     use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
     use std::fs::File;
     use std::io::Write;
@@ -3314,11 +3238,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_retransmit_collector_respects_packet_pacing() {
-        let state = Arc::new(
-            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
-                .await
-                .unwrap(),
-        );
+        let state = test_socket_state().await;
         let mut exchange = test_exchange(false);
         assert_eq!(
             exchange_packets_due(&mut exchange, Instant::now(), 1, 2),
@@ -3351,11 +3271,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_retransmit_collector_stops_after_budget_exhaustion() {
-        let state = Arc::new(
-            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
-                .await
-                .unwrap(),
-        );
+        let state = test_socket_state().await;
         let mut exchange = test_exchange(false);
         let first_sent = Instant::now() - UDP_KEX_RETRANSMIT_INTERVAL;
         exchange.send_budget.offer.first_sent = Some(first_sent);
@@ -3378,11 +3294,7 @@ mod tests {
     #[tokio::test]
     async fn higher_node_buffers_stale_key_ready_for_lower_restart() {
         let identity = test_identity("2");
-        let state = Arc::new(
-            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
-                .await
-                .unwrap(),
-        );
+        let state = test_socket_state().await;
         state.exchanges.lock().await.insert(1, test_exchange(false));
         let header = UdpPacketHeader {
             kind: UdpPacketKind::KeyReady,
@@ -3422,11 +3334,7 @@ mod tests {
     #[tokio::test]
     async fn lower_node_restarts_key_exchange_on_stale_ready() {
         let identity = test_identity("1");
-        let state = Arc::new(
-            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
-                .await
-                .unwrap(),
-        );
+        let state = test_socket_state().await;
         state.exchanges.lock().await.insert(2, test_exchange(false));
         let header = UdpPacketHeader {
             kind: UdpPacketKind::KeyReady,
@@ -3470,11 +3378,7 @@ mod tests {
     #[tokio::test]
     async fn lower_node_defers_changed_higher_offer_while_candidate_active() {
         let identity = test_identity("1");
-        let state = Arc::new(
-            UdpSocketState::bind(SocketAddr::from(([127, 0, 0, 1], 0)), false)
-                .await
-                .unwrap(),
-        );
+        let state = test_socket_state().await;
         state.exchanges.lock().await.insert(2, test_exchange(false));
         let (_, public_key) = generate_ephemeral_keypair().unwrap();
 

@@ -2346,10 +2346,19 @@ fn build_endpoints(
     server_tls: Arc<rustls::ServerConfig>,
     client_tls: Arc<rustls::ClientConfig>,
 ) -> Result<EndpointRegistry, TransportError> {
+    let udp_family_addrs = udp_family_listen_addrs(cfg);
+    let mux_error_addr = udp_family_addrs
+        .first()
+        .map(|(_, addr)| *addr)
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let mux = UdpMuxSet::new(
-        &udp_family_listen_addrs(cfg),
+        &udp_family_addrs,
         UdpMuxQueueTuning::for_max_users(cfg.max_users()),
-    );
+    )
+    .map_err(|source| TransportError::Bind {
+        addr: mux_error_addr,
+        source,
+    })?;
     let has_seed = |kind| {
         cfg.seed_targets()
             .iter()
