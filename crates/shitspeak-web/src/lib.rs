@@ -4,6 +4,7 @@ pub mod peer;
 pub mod protocol;
 pub mod session;
 pub mod signaling;
+mod simd;
 pub mod voice;
 
 use std::sync::Arc;

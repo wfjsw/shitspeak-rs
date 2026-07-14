@@ -8,6 +8,7 @@ mod gf128;
 mod ocb2;
 #[cfg(test)]
 mod profile_test;
+mod xor_backend;
 
 pub use aes_backend::probe as probe_aes_backend;
 pub use crypt_state::CryptState;

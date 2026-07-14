@@ -1,6 +1,8 @@
 use aws_lc_rs::rand::SecureRandom;
 
-use crate::{CryptoMode, aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops};
+use crate::{
+    CryptoMode, aes_backend::Aes128, errors::CryptError, gf128::Gf128Ops, xor_backend::XorOps,
+};
 
 const BLOCK_SIZE: usize = 16;
 /// Hard upper bound on plaintext we ever encrypt in one OCB2 call. The Mumble
@@ -22,16 +24,11 @@ fn stage_full_blocks<'a>(
     data: &[u8],
     delta_chain: &[[u8; BLOCK_SIZE]],
     n_main: usize,
+    xor: XorOps,
 ) -> &'a mut [u8] {
     let bulk_len = n_main * BLOCK_SIZE;
     let bulk = &mut dest_ciphertext[..bulk_len];
-    for i in 0..n_main {
-        let block = &data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
-        let d = &delta_chain[i + 1];
-        for j in 0..BLOCK_SIZE {
-            bulk[i * BLOCK_SIZE + j] = block[j] ^ d[j];
-        }
-    }
+    xor.xor_chain_into(bulk, &data[..bulk_len], &delta_chain[1..n_main + 1]);
     bulk
 }
 
@@ -39,6 +36,7 @@ pub struct Ocb2 {
     key: [u8; BLOCK_SIZE],
     aes: Aes128,
     gf128: Gf128Ops,
+    xor: XorOps,
 }
 
 impl Ocb2 {
@@ -51,6 +49,20 @@ impl Ocb2 {
             key,
             aes: Aes128::new(&key)?,
             gf128: Gf128Ops::new(),
+            xor: XorOps::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn from_key_with_backend(
+        key: [u8; BLOCK_SIZE],
+        backend: crate::xor_backend::BackendKind,
+    ) -> Result<Self, CryptError> {
+        Ok(Ocb2 {
+            key,
+            aes: Aes128::new(&key)?,
+            gf128: Gf128Ops::new(),
+            xor: XorOps::for_test(backend),
         })
     }
 
@@ -77,11 +89,7 @@ impl Ocb2 {
         let remaining = plaintext.len() - last_pos;
 
         let mut checksum = [0u8; BLOCK_SIZE];
-        for i in 0..n_main {
-            for j in 0..BLOCK_SIZE {
-                checksum[j] ^= plaintext[i * BLOCK_SIZE + j];
-            }
-        }
+        XorOps::new().xor_fold(&mut checksum, &plaintext[..last_pos]);
         for j in 0..remaining {
             checksum[j] ^= plaintext[last_pos + j];
         }
@@ -137,7 +145,7 @@ impl Ocb2 {
         let tag_size = self.overhead();
         let dest_ciphertext = &mut dest[tag_size..];
 
-        let bulk = stage_full_blocks(dest_ciphertext, data, &delta_chain, n_main);
+        let bulk = stage_full_blocks(dest_ciphertext, data, &delta_chain, n_main, self.xor);
 
         if !bulk.is_empty() {
             self.aes.encrypt_blocks(bulk)?;
@@ -158,12 +166,10 @@ impl Ocb2 {
         // If you want fewer loops, fuse Phase 3 with this one (both are
         // pure delta-XOR with simple access patterns) — but never the
         // checksum fold.
-        for i in 0..n_main {
-            let d = &delta_chain[i + 1];
-            for j in 0..BLOCK_SIZE {
-                dest_ciphertext[i * BLOCK_SIZE + j] ^= d[j];
-            }
-        }
+        self.xor.xor_chain_in_place(
+            &mut dest_ciphertext[..n_main * BLOCK_SIZE],
+            &delta_chain[1..n_main + 1],
+        );
 
         // ── Phase 6: pad encrypt — same as `encrypt`.
         let final_delta = delta_chain[n_main + 1];
@@ -302,6 +308,7 @@ impl Ocb2 {
                 datas[i],
                 &delta_chains[i],
                 meta.n_main,
+                self.xor,
             );
         }
 
@@ -313,14 +320,12 @@ impl Ocb2 {
             let meta = &metas[i];
             let dest_ciphertext = &mut dests[i][tag_size..tag_size + meta.cleartext_len];
             let bulk_start = meta.bulk_block_offset * BLOCK_SIZE;
-            for block_i in 0..meta.n_main {
-                let d = &delta_chains[i][block_i + 1];
-                let src = bulk_start + block_i * BLOCK_SIZE;
-                let dst = block_i * BLOCK_SIZE;
-                for j in 0..BLOCK_SIZE {
-                    dest_ciphertext[dst + j] = bulk[src + j] ^ d[j];
-                }
-            }
+            let bulk_len = meta.n_main * BLOCK_SIZE;
+            self.xor.xor_chain_into(
+                &mut dest_ciphertext[..bulk_len],
+                &bulk[bulk_start..bulk_start + bulk_len],
+                &delta_chains[i][1..meta.n_main + 1],
+            );
         }
 
         let mut pads = vec![0u8; count * BLOCK_SIZE];
@@ -449,7 +454,7 @@ impl CryptoMode for Ocb2 {
 
         // ── Phase 3: pre-XOR every main-loop block with its delta into one
         // contiguous buffer. Pure Rust, no FFI.
-        let bulk = stage_full_blocks(dest_ciphertext, data, &delta_chain, n_main);
+        let bulk = stage_full_blocks(dest_ciphertext, data, &delta_chain, n_main, self.xor);
 
         // ── Phase 4: ONE batched ECB encrypt for all main-loop blocks.
         if !bulk.is_empty() {
@@ -468,13 +473,12 @@ impl CryptoMode for Ocb2 {
         // the phase profile in `client::crypt::profile_test`. Do not "unify"
         // these two encrypt paths back into one body without re-measuring;
         // their optimal shapes differ.
-        for i in 0..n_main {
-            let d = &delta_chain[i + 1];
-            for j in 0..BLOCK_SIZE {
-                dest_ciphertext[i * BLOCK_SIZE + j] ^= d[j];
-                checksum[j] ^= data[i * BLOCK_SIZE + j];
-            }
-        }
+        self.xor.xor_chain_in_place_and_fold_input(
+            &mut dest_ciphertext[..n_main * BLOCK_SIZE],
+            &data[..n_main * BLOCK_SIZE],
+            &delta_chain[1..n_main + 1],
+            &mut checksum,
+        );
 
         // ── Phase 6: partial (or final empty) block. 1 AES call.
         let final_delta = delta_chain[n_main + 1];
@@ -552,13 +556,11 @@ impl CryptoMode for Ocb2 {
         // into one contiguous buffer.
         let mut bulk = [0u8; MAX_PLAINTEXT_BYTES];
         let bulk_len = n_main * BLOCK_SIZE;
-        for i in 0..n_main {
-            let block = &ciphertext[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
-            let d = &delta_chain[i + 1];
-            for j in 0..BLOCK_SIZE {
-                bulk[i * BLOCK_SIZE + j] = block[j] ^ d[j];
-            }
-        }
+        self.xor.xor_chain_into(
+            &mut bulk[..bulk_len],
+            &ciphertext[..bulk_len],
+            &delta_chain[1..n_main + 1],
+        );
 
         // ── Phase 4: ONE batched ECB decrypt.
         if bulk_len > 0 {
@@ -566,14 +568,12 @@ impl CryptoMode for Ocb2 {
         }
 
         // ── Phase 5: post-XOR to produce plaintext, accumulate checksum.
-        for i in 0..n_main {
-            let d = &delta_chain[i + 1];
-            for j in 0..BLOCK_SIZE {
-                let plain = bulk[i * BLOCK_SIZE + j] ^ d[j];
-                dest[i * BLOCK_SIZE + j] = plain;
-                checksum[j] ^= plain;
-            }
-        }
+        self.xor.xor_chain_into_and_fold_output(
+            &mut dest[..bulk_len],
+            &bulk[..bulk_len],
+            &delta_chain[1..n_main + 1],
+            &mut checksum,
+        );
 
         // ── Phase 6: partial (or final empty) block. 1 AES call (encrypt).
         let final_delta = delta_chain[n_main + 1];
@@ -748,7 +748,7 @@ mod tests {
         // plaintexts on either side of n_main = 0..6. 1024 is the configured
         // MAX_PLAINTEXT_BYTES upper bound.
         let lengths: &[usize] = &[
-            0, 1, 7, 15, 16, 17, 31, 32, 33, 47, 48, 64, 80, 96, 175, 256, 1023, 1024,
+            0, 1, 7, 15, 16, 17, 31, 32, 33, 47, 48, 64, 80, 96, 175, 256, 768, 1023, 1024,
         ];
         for &len in lengths {
             let plain: Vec<u8> = (0..len)
@@ -771,6 +771,127 @@ mod tests {
             let mut dec = vec![0u8; plain.len()];
             ocb.decrypt(&mut dec, &b, &nonce).unwrap();
             assert_eq!(dec, plain, "decrypt round-trip failed at len={}", len);
+        }
+    }
+
+    #[test]
+    fn runtime_xor_backends_match_scalar_ocb2() {
+        use crate::xor_backend::{BackendKind, XorOps};
+
+        const LENGTHS: &[usize] = &[0, 1, 15, 16, 17, 31, 32, 175, 768, 1024];
+        let key = [0x42u8; BLOCK_SIZE];
+        let nonce = [0xa5u8; BLOCK_SIZE];
+        let scalar = Ocb2::from_key_with_backend(key, BackendKind::Scalar).unwrap();
+
+        for &len in LENGTHS {
+            let plaintext: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(29) ^ 0x6d)
+                .collect();
+            let checksum = Ocb2::compute_plaintext_checksum(&plaintext);
+
+            let mut expected = vec![0u8; len + scalar.overhead()];
+            scalar
+                .encrypt_with_plaintext_checksum(&mut expected, &plaintext, &nonce, &checksum)
+                .unwrap();
+
+            for &kind in &[BackendKind::Scalar, BackendKind::Sse2, BackendKind::Avx2] {
+                if !XorOps::is_available(kind) {
+                    continue;
+                }
+                let ocb = Ocb2::from_key_with_backend(key, kind).unwrap();
+                let mut actual = vec![0u8; len + ocb.overhead()];
+                ocb.encrypt_with_plaintext_checksum(&mut actual, &plaintext, &nonce, &checksum)
+                    .unwrap();
+                assert_eq!(actual, expected, "encrypt backend {kind:?} len={len}");
+
+                let mut decrypted = vec![0u8; len];
+                ocb.decrypt(&mut decrypted, &actual, &nonce).unwrap();
+                assert_eq!(decrypted, plaintext, "decrypt backend {kind:?} len={len}");
+
+                let mut tampered = actual.clone();
+                tampered[0] ^= 1;
+                let mut rejected = vec![0u8; len];
+                assert!(matches!(
+                    ocb.decrypt(&mut rejected, &tampered, &nonce),
+                    Err(CryptError::TagMismatch)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_xor_backends_match_scalar_sequence_encryption() {
+        use crate::xor_backend::{BackendKind, XorOps};
+
+        const LENGTHS: &[usize] = &[0, 1, 15, 16, 17, 31, 32, 175, 768, 1024];
+        let key = [0x27u8; BLOCK_SIZE];
+        let plaintexts: Vec<Vec<u8>> = LENGTHS
+            .iter()
+            .enumerate()
+            .map(|(packet, &len)| {
+                (0..len)
+                    .map(|i| (i as u8).wrapping_mul(13) ^ packet as u8)
+                    .collect()
+            })
+            .collect();
+        let datas: Vec<&[u8]> = plaintexts.iter().map(Vec::as_slice).collect();
+        let nonces: Vec<[u8; BLOCK_SIZE]> = LENGTHS
+            .iter()
+            .enumerate()
+            .map(|(packet, _)| [packet as u8; BLOCK_SIZE])
+            .collect();
+        let checksums: Vec<[u8; BLOCK_SIZE]> = plaintexts
+            .iter()
+            .map(|data| Ocb2::compute_plaintext_checksum(data))
+            .collect();
+
+        let scalar = Ocb2::from_key_with_backend(key, BackendKind::Scalar).unwrap();
+        let mut expected_outputs: Vec<Vec<u8>> = LENGTHS
+            .iter()
+            .map(|&len| vec![0u8; len + scalar.overhead()])
+            .collect();
+        let mut expected_refs: Vec<&mut [u8]> =
+            expected_outputs.iter_mut().map(Vec::as_mut_slice).collect();
+        scalar
+            .encrypt_sequence_with_plaintext_checksums(
+                &mut expected_refs,
+                &datas,
+                &nonces,
+                &checksums,
+            )
+            .unwrap();
+        drop(expected_refs);
+
+        for &kind in &[BackendKind::Scalar, BackendKind::Sse2, BackendKind::Avx2] {
+            if !XorOps::is_available(kind) {
+                continue;
+            }
+            let ocb = Ocb2::from_key_with_backend(key, kind).unwrap();
+            let mut actual_outputs: Vec<Vec<u8>> = LENGTHS
+                .iter()
+                .map(|&len| vec![0u8; len + ocb.overhead()])
+                .collect();
+            let mut actual_refs: Vec<&mut [u8]> =
+                actual_outputs.iter_mut().map(Vec::as_mut_slice).collect();
+            ocb.encrypt_sequence_with_plaintext_checksums(
+                &mut actual_refs,
+                &datas,
+                &nonces,
+                &checksums,
+            )
+            .unwrap();
+            drop(actual_refs);
+
+            assert_eq!(
+                actual_outputs, expected_outputs,
+                "sequence backend {kind:?}"
+            );
+
+            for ((output, data), nonce) in actual_outputs.iter().zip(&plaintexts).zip(&nonces) {
+                let mut decrypted = vec![0u8; data.len()];
+                ocb.decrypt(&mut decrypted, output, nonce).unwrap();
+                assert_eq!(decrypted, *data, "sequence decrypt backend {kind:?}");
+            }
         }
     }
 

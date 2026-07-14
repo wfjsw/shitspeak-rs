@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use super::aes_backend::Aes128;
 use super::gf128::Gf128Ops;
+use super::xor_backend::{BackendKind, XorOps};
 use super::{CryptState, Ocb2};
 
 const BLOCK_SIZE: usize = 16;
@@ -194,6 +195,41 @@ fn profile_ocb2_phases() {
             black_box(checksum);
         },
     );
+
+    // Compare the runtime-dispatched backend with the scalar reference for
+    // one large hot-path buffer and one short full-vector buffer. The profile
+    // is intentionally observational: CPU frequency and timer resolution
+    // vary across development hosts, so it reports rather than asserts wins.
+    let scalar_xor = XorOps::for_test(BackendKind::Scalar);
+    let runtime_xor = XorOps::new();
+    batch_time("phase3_scalar_xor_backend: 160 B", |i| {
+        let mut bulk = [0u8; 160];
+        let mut chain = [[0xa5u8; 16]; 12];
+        chain[0][0] ^= i as u8;
+        scalar_xor.xor_chain_into(&mut bulk, &plaintext[..160], &chain[1..n_main + 1]);
+        black_box(bulk);
+    });
+    batch_time("phase3_runtime_xor_backend: 160 B", |i| {
+        let mut bulk = [0u8; 160];
+        let mut chain = [[0xa5u8; 16]; 12];
+        chain[0][0] ^= i as u8;
+        runtime_xor.xor_chain_into(&mut bulk, &plaintext[..160], &chain[1..n_main + 1]);
+        black_box(bulk);
+    });
+    batch_time("phase3_runtime_xor_backend: 16 B", |i| {
+        let mut bulk = [0u8; 16];
+        let mut chain = [[0xa5u8; 16]; 2];
+        chain[0][0] ^= i as u8;
+        runtime_xor.xor_chain_into(&mut bulk, &plaintext[..16], &chain[1..2]);
+        black_box(bulk);
+    });
+    batch_time("phase3_scalar_xor_backend: 16 B", |i| {
+        let mut bulk = [0u8; 16];
+        let mut chain = [[0xa5u8; 16]; 2];
+        chain[0][0] ^= i as u8;
+        scalar_xor.xor_chain_into(&mut bulk, &plaintext[..16], &chain[1..2]);
+        black_box(bulk);
+    });
 
     // Phase 6: pad encrypt. 1 AES block.
     batch_time("phase6_pad_aes:        aes.encrypt_blocks(16 B)", |i| {

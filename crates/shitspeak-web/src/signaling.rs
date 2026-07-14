@@ -13,6 +13,7 @@ use crate::protocol::{
     WebGatewayConfig, WebMoqGatewayConfig, WebPermissionDenied, WebServerConfig, WebServerSync,
     WebTransportKind, WebUserRemove, WebUserState, WebVolumeAdjustment, encode_server_event,
 };
+use crate::simd;
 use shitspeak_runtime::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     canonical_authenticator_ip,
@@ -2169,9 +2170,7 @@ async fn read_websocket_frame(
 
     let mut payload = vec![0u8; payload_len as usize];
     reader.read_exact(stream, &mut payload).await?;
-    for (i, byte) in payload.iter_mut().enumerate() {
-        *byte ^= mask[i % 4];
-    }
+    simd::xor_mask(&mut payload, mask);
 
     match opcode {
         WebSocketOpcode::Text => {
@@ -2210,7 +2209,7 @@ async fn write_websocket_frame(
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|window| window == b"\r\n\r\n")
+    simd::find_header_end(buf)
 }
 
 #[cfg(test)]
