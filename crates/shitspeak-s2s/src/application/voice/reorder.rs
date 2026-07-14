@@ -177,11 +177,19 @@ pub struct GapReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VoiceRouteHint;
+pub struct VoiceRouteHint {
+    path_latency_us: u64,
+    jitter_us: u64,
+    loss_ppm: u32,
+}
 
 impl VoiceRouteHint {
-    pub fn new(_path_latency_us: u64, _jitter_us: u64, _loss_ppm: u32) -> Self {
-        Self
+    pub fn new(path_latency_us: u64, jitter_us: u64, loss_ppm: u32) -> Self {
+        Self {
+            path_latency_us,
+            jitter_us,
+            loss_ppm,
+        }
     }
 }
 
@@ -259,6 +267,41 @@ impl Reorderer {
         self.state.lock().per_sender.len()
     }
 
+    /// Cheap preflight for computing route quality outside the reorder lock.
+    /// The subsequent push remains authoritative if state changes meanwhile.
+    pub(crate) fn may_arm_gap(&self, frame: &VoiceFrame, copy_kind: VoiceCopyKind) -> bool {
+        if self.cfg.reorder_disabled || copy_kind != VoiceCopyKind::Original {
+            return false;
+        }
+        let state = self.state.lock();
+        let Some(entry) = state.per_sender.get(&frame.sender_session) else {
+            return false;
+        };
+        if entry.deadline.is_some() || frame.s2s_seq <= entry.next_seq {
+            return false;
+        }
+        if let Some(existing) = entry.pending.get(&frame.s2s_seq) {
+            return copy_kind > existing.copy_kind;
+        }
+        let per_sender_cap = self.cfg.reorder_max_buffered_frames;
+        if per_sender_cap == 0 {
+            return false;
+        }
+        let evicts_tail = if entry.pending.len() >= per_sender_cap {
+            let Some(farthest_seq) = entry.pending.keys().next_back().copied() else {
+                return false;
+            };
+            if frame.s2s_seq > farthest_seq {
+                return false;
+            }
+            true
+        } else {
+            false
+        };
+        let pending_after_eviction = state.total_pending.saturating_sub(usize::from(evicts_tail));
+        pending_after_eviction < self.cfg.reorder_max_total_buffer
+    }
+
     /// Earliest gap or idle-pruning deadline. Used by the deadline task to
     /// decide how long to sleep.
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -284,13 +327,19 @@ impl Reorderer {
         self.cfg.reorder_max_delay_ms.clamp(min, max)
     }
 
-    /// Kept for source compatibility while callers migrate away from route
-    /// hints. Geographic RTT and link quality must not extend the short local
-    /// reorder/repair grace period.
-    pub fn route_repair_delay_ms_for_config(cfg: &VoiceConfig, _hint: VoiceRouteHint) -> u64 {
+    pub fn route_repair_delay_ms_for_config(cfg: &VoiceConfig, hint: VoiceRouteHint) -> u64 {
         let min = cfg.adaptive_jitter_min_delay_ms;
-        cfg.reorder_max_delay_ms
-            .clamp(min, cfg.adaptive_jitter_max_delay_ms.max(min))
+        let base = cfg
+            .reorder_max_delay_ms
+            .clamp(min, cfg.adaptive_jitter_max_delay_ms.max(min));
+        let path_ms = hint.path_latency_us.saturating_add(999) / 1_000;
+        let jitter_ms = hint.jitter_us.saturating_add(999) / 1_000;
+        let loss_margin_ms = u64::from(hint.loss_ppm / 1_000).min(100);
+        let route_delay = path_ms
+            .saturating_add(jitter_ms.saturating_mul(3))
+            .saturating_add(loss_margin_ms)
+            .saturating_add(20);
+        base.max(route_delay).min(cfg.repair_cache_ms.max(base))
     }
 
     pub fn route_repair_delay_ms(&self, hint: VoiceRouteHint) -> u64 {
@@ -302,6 +351,49 @@ impl Reorderer {
             entry.adaptive_delay_ms
         } else {
             self.initial_adaptive_delay_ms()
+        }
+    }
+
+    fn effective_route_delay_ms(
+        &self,
+        entry: &SenderState,
+        route_hint: Option<VoiceRouteHint>,
+    ) -> u64 {
+        let base = self.effective_delay_ms(entry);
+        let Some(hint) = route_hint else {
+            return base;
+        };
+        base.max(self.route_repair_delay_ms(hint))
+            .min(self.cfg.repair_cache_ms.max(base))
+    }
+
+    fn arm_gap(
+        &self,
+        state: &mut ReorderInner,
+        entry: &mut SenderState,
+        session: u32,
+        from: NodeIdentifier,
+        sender_epoch: u64,
+        route_hint: Option<VoiceRouteHint>,
+        now: Instant,
+    ) -> GapReport {
+        let deadline =
+            now + Duration::from_millis(self.effective_route_delay_ms(entry, route_hint));
+        entry.deadline = Some(deadline);
+        state.deadlines.push(Reverse((deadline, session)));
+        self.deadline_notify.notify_one();
+        let first_pending = entry
+            .pending
+            .keys()
+            .next()
+            .copied()
+            .expect("a gap is armed only after buffering a suffix");
+        GapReport {
+            from,
+            sender_session: session,
+            sender_epoch,
+            first_seq: entry.next_seq,
+            last_seq: first_pending.saturating_sub(1),
         }
     }
 
@@ -442,7 +534,7 @@ impl Reorderer {
         &self,
         from: NodeIdentifier,
         frame: VoiceFrame,
-        _route_hint: Option<VoiceRouteHint>,
+        route_hint: Option<VoiceRouteHint>,
         copy_kind: VoiceCopyKind,
     ) -> ReorderReport {
         if self.cfg.reorder_disabled {
@@ -598,6 +690,22 @@ impl Reorderer {
                         .pending
                         .insert(frame_seq, ReorderEmission::new(from, frame, copy_kind));
                     results.push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
+
+                    let gap = if entry.deadline.is_none() && copy_kind == VoiceCopyKind::Original {
+                        Some(self.arm_gap(
+                            &mut state,
+                            &mut entry,
+                            session,
+                            from,
+                            sender_epoch,
+                            route_hint,
+                            now,
+                        ))
+                    } else {
+                        None
+                    };
+                    state.per_sender.insert(session, entry);
+                    return ReorderReport::new(emit, results, state.total_pending, gap);
                 } else {
                     results.push(ReorderResultCount::new(
                         VoiceReceiveResult::DuplicateOrLate,
@@ -643,7 +751,6 @@ impl Reorderer {
                 return ReorderReport::new(emit, results, state.total_pending, None);
             }
 
-            let opened_gap = entry.pending.is_empty();
             entry
                 .pending
                 .insert(frame_seq, ReorderEmission::new(from, frame, copy_kind));
@@ -651,18 +758,16 @@ impl Reorderer {
             results.push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
             state.total_pending = state.total_pending.saturating_add(1);
 
-            let gap = if opened_gap {
-                let deadline = now + Duration::from_millis(self.effective_delay_ms(&entry));
-                entry.deadline = Some(deadline);
-                state.deadlines.push(Reverse((deadline, session)));
-                self.deadline_notify.notify_one();
-                Some(GapReport {
+            let gap = if entry.deadline.is_none() && copy_kind == VoiceCopyKind::Original {
+                Some(self.arm_gap(
+                    &mut state,
+                    &mut entry,
+                    session,
                     from,
-                    sender_session: session,
                     sender_epoch,
-                    first_seq: entry.next_seq,
-                    last_seq: frame_seq.saturating_sub(1),
-                })
+                    route_hint,
+                    now,
+                ))
             } else {
                 None
             };
@@ -972,6 +1077,62 @@ mod tests {
         let (_, frame, is_repair) = emissions.into_iter().next().unwrap().into_parts();
         assert_eq!(frame.s2s_seq, 42);
         assert!(!is_repair);
+    }
+
+    #[test]
+    fn proactive_suffix_waits_for_an_original_to_confirm_the_gap() {
+        let r = Reorderer::new(cfg());
+        r.push(11, frame(0xABC, 1, 0, false));
+
+        let proactive = r.push_with_route_hint_report_with_copy_kind(
+            12,
+            frame(0xABC, 1, 2, false),
+            None,
+            VoiceCopyKind::Proactive,
+        );
+        assert!(proactive.opened_gap().is_none());
+
+        let original = r.push_with_route_hint_report_with_copy_kind(
+            11,
+            frame(0xABC, 1, 3, false),
+            None,
+            VoiceCopyKind::Original,
+        );
+        let gap = original.opened_gap().expect("original confirms the gap");
+        assert_eq!((gap.first_seq, gap.last_seq), (1, 1));
+
+        let emissions = r.push(11, frame(0xABC, 1, 1, false));
+        assert_eq!(
+            emissions
+                .iter()
+                .map(|(_, frame)| frame.s2s_seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn original_replacing_same_sequence_proactive_confirms_the_gap() {
+        let r = Reorderer::new(cfg());
+        r.push(11, frame(0xABC, 1, 0, false));
+        let proactive = r.push_with_route_hint_report_with_copy_kind(
+            12,
+            frame(0xABC, 1, 2, false),
+            None,
+            VoiceCopyKind::Proactive,
+        );
+        assert!(proactive.opened_gap().is_none());
+
+        let original = r.push_with_route_hint_report_with_copy_kind(
+            11,
+            frame(0xABC, 1, 2, false),
+            None,
+            VoiceCopyKind::Original,
+        );
+        let gap = original
+            .opened_gap()
+            .expect("same-sequence original confirms the gap");
+        assert_eq!((gap.first_seq, gap.last_seq), (1, 1));
     }
 
     #[test]
@@ -1406,25 +1567,65 @@ mod tests {
     }
 
     #[test]
-    fn route_hint_does_not_extend_gap_deadline() {
+    fn route_hint_extends_gap_deadline_beyond_adaptive_max() {
         let mut c = cfg();
         c.reorder_max_delay_ms = 5;
         c.adaptive_jitter_enabled = false;
         c.adaptive_jitter_min_delay_ms = 40;
-        c.adaptive_jitter_max_delay_ms = 600;
+        c.adaptive_jitter_max_delay_ms = 120;
         let r = Reorderer::new(c);
 
         r.push(11, frame(0xABC, 1, 0, false));
-        let hint = VoiceRouteHint::new(90_000, 30_000, 20_000);
+        let hint = VoiceRouteHint::new(237_000, 0, 0);
         assert!(
             r.push_with_route_hint(11, frame(0xABC, 1, 2, false), Some(hint))
                 .is_empty()
         );
 
-        let route_delay = r.adaptive_delay_ms_for(0xABC).unwrap();
-        assert_eq!(route_delay, 40);
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(130));
+        assert!(r.drain_expired().is_empty());
+        std::thread::sleep(Duration::from_millis(150));
         assert_eq!(r.drain_expired().len(), 1);
+    }
+
+    #[test]
+    fn route_delay_uses_quality_margin_and_cache_cap() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 40;
+        c.adaptive_jitter_min_delay_ms = 40;
+        c.adaptive_jitter_max_delay_ms = 120;
+        c.repair_cache_ms = 300;
+
+        assert_eq!(
+            Reorderer::route_repair_delay_ms_for_config(
+                &c,
+                VoiceRouteHint::new(90_001, 10_001, 20_999),
+            ),
+            164
+        );
+        assert_eq!(
+            Reorderer::route_repair_delay_ms_for_config(
+                &c,
+                VoiceRouteHint::new(1_000_000, 100_000, 1_000_000),
+            ),
+            300
+        );
+    }
+
+    #[test]
+    fn gap_preflight_identifies_only_originals_that_may_arm() {
+        let r = Reorderer::new(cfg());
+        let seq0 = frame(0xABC, 1, 0, false);
+        assert!(!r.may_arm_gap(&seq0, VoiceCopyKind::Original));
+        r.push(11, seq0);
+        assert!(!r.may_arm_gap(&frame(0xABC, 1, 1, false), VoiceCopyKind::Original));
+
+        let proactive = frame(0xABC, 1, 2, false);
+        assert!(!r.may_arm_gap(&proactive, VoiceCopyKind::Proactive));
+        r.push_with_route_hint_report_with_copy_kind(12, proactive, None, VoiceCopyKind::Proactive);
+        assert!(r.may_arm_gap(&frame(0xABC, 1, 3, false), VoiceCopyKind::Original));
+        assert!(r.may_arm_gap(&frame(0xABC, 1, 2, false), VoiceCopyKind::Original));
+        assert!(!r.may_arm_gap(&frame(0xABC, 1, 3, false), VoiceCopyKind::ReactiveRepair));
     }
 
     #[test]

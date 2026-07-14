@@ -1407,6 +1407,15 @@ fn pick_transports(
         payload_len,
         selection.routing,
     );
+    enforce_expiring_voice_admission(
+        peer,
+        &mut ranked,
+        level,
+        routing_metric,
+        class,
+        options,
+        selection.routing,
+    );
 
     if options.expires_at().is_some() {
         ranked.sort_by_key(|kind| deadline_queue_penalty(peer, *kind, options, now));
@@ -1710,6 +1719,33 @@ fn is_expiring_conversational_voice(
         && options.expires_at().is_some()
 }
 
+fn enforce_expiring_voice_admission(
+    peer: &PeerState,
+    ranked: &mut Vec<TransportKind>,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    options: SendOptions,
+    policy: TransportRoutingPolicy,
+) {
+    if !is_expiring_conversational_voice(level, routing_metric, class, options) {
+        return;
+    }
+
+    let snapshot = peer.metrics().snapshot_per_transport();
+    if udp_family_health(peer, ranked, &snapshot, policy) == UdpFamilyHealth::Viable {
+        return;
+    }
+
+    let usable_tcp = ranked.contains(&TransportKind::Tcp)
+        && tcp_transport_usable(peer, snapshot.get(&TransportKind::Tcp), policy);
+    if usable_tcp {
+        ranked.retain(|kind| *kind == TransportKind::Tcp);
+    } else {
+        ranked.clear();
+    }
+}
+
 fn peer_bulk_backlog_bytes(peer: &PeerState) -> usize {
     [TransportKind::Tcp, TransportKind::Kcp, TransportKind::Quic]
         .into_iter()
@@ -1727,9 +1763,15 @@ fn udp_family_health(
 ) -> UdpFamilyHealth {
     const UDP_FAMILY: [TransportKind; 3] =
         [TransportKind::Kcp, TransportKind::Quic, TransportKind::Udp];
-    const RELIABLE_UDP_FAMILY: [TransportKind; 2] = [TransportKind::Kcp, TransportKind::Quic];
 
-    if peer.max_consecutive_failures_for_transports(&UDP_FAMILY)
+    let eligible_udp = UDP_FAMILY
+        .into_iter()
+        .filter(|transport| ranked.contains(transport))
+        .collect::<Vec<_>>();
+    if eligible_udp.is_empty() {
+        return UdpFamilyHealth::Blocked;
+    }
+    if peer.max_consecutive_failures_for_transports(&eligible_udp)
         >= policy.udp_family_probe_loss_block_count()
     {
         return UdpFamilyHealth::Blocked;
@@ -1741,15 +1783,15 @@ fn udp_family_health(
         .filter(|link| link.loss_sample_count() >= min_samples)
         .map(LinkMetrics::effective_packet_loss_ppm);
 
-    let mut live_reliable_udp = false;
-    let mut sampled_reliable_udp = false;
+    let mut live_udp = false;
+    let mut sampled_udp = false;
     let mut has_degraded_loss = false;
 
     for transport in UDP_FAMILY {
-        let live = ranked.contains(&transport);
-        if RELIABLE_UDP_FAMILY.contains(&transport) && live {
-            live_reliable_udp = true;
+        if !ranked.contains(&transport) {
+            continue;
         }
+        live_udp = true;
 
         let Some(link) = snapshot.get(&transport) else {
             continue;
@@ -1770,16 +1812,14 @@ fn udp_family_health(
         }) {
             has_degraded_loss = true;
         }
-        if RELIABLE_UDP_FAMILY.contains(&transport) && live {
-            sampled_reliable_udp = true;
-        }
+        sampled_udp = true;
     }
 
     if has_degraded_loss {
         UdpFamilyHealth::Degraded
-    } else if sampled_reliable_udp {
+    } else if sampled_udp {
         UdpFamilyHealth::Viable
-    } else if live_reliable_udp {
+    } else if live_udp {
         UdpFamilyHealth::Probing
     } else {
         UdpFamilyHealth::Blocked
@@ -1822,7 +1862,10 @@ fn udp_family_promotion_position(
     };
 
     let Some((udp_pos, udp, udp_cost)) = ranked.iter().enumerate().find_map(|(pos, transport)| {
-        if !matches!(transport, TransportKind::Kcp | TransportKind::Quic) {
+        if !matches!(
+            transport,
+            TransportKind::Kcp | TransportKind::Quic | TransportKind::Udp
+        ) {
             return None;
         }
         let link = snapshot.get(transport)?;
@@ -3730,6 +3773,64 @@ mod tests {
     }
 
     #[test]
+    fn expiring_best_effort_voice_rejects_only_probing_udp_family() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Quic]);
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_millis(250)),
+            0,
+            TransportRoutingPolicy::default(),
+        );
+
+        assert!(ranked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generic_ranking_keeps_probing_udp_but_expiring_voice_rejects_it() {
+        let (manager, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Quic]);
+
+        assert_eq!(
+            manager.ranked_live_transports_for(
+                2,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            ),
+            vec![TransportKind::Quic]
+        );
+        assert!(matches!(
+            manager
+                .try_send_with_options(
+                    2,
+                    ServiceLevel::BestEffort,
+                    Some(RoutingMetric::ConversationalQuality),
+                    MessageClass::HighPriority,
+                    Bytes::from_static(b"voice"),
+                    SendOptions::default().expire_after(Duration::from_millis(750)),
+                )
+                .await,
+            Err(SendError::NoSuitableTransport { node: 2 })
+        ));
+
+        let peer = manager.inner.get_peer(2).expect("test peer");
+        for _ in 0..TransportRoutingPolicy::default().udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+        assert_eq!(
+            manager.ranked_live_transports_for(
+                2,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            ),
+            vec![TransportKind::Quic]
+        );
+    }
+
+    #[test]
     fn expiring_best_effort_voice_prefers_tcp_when_udp_family_degraded() {
         let (peer, _receivers) =
             peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Quic]);
@@ -3756,7 +3857,38 @@ mod tests {
             policy,
         );
 
-        assert_eq!(ranked.first().copied(), Some(TransportKind::Tcp));
+        assert_eq!(ranked, vec![TransportKind::Tcp]);
+    }
+
+    #[test]
+    fn expiring_best_effort_voice_rejects_blocked_udp_when_tcp_is_unusable() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Quic]);
+        let policy = TransportRoutingPolicy::default();
+
+        for _ in 0..policy.udp_family_probe_loss_block_count() {
+            peer.metrics().record_probe_lost(TransportKind::Quic);
+        }
+        peer.record_outbound_stream_queue_sample(
+            TransportKind::Tcp,
+            MessageClass::HighPriority,
+            1024 * 1024,
+            1024 * 1024,
+            true,
+        );
+        fill_stream_queue(&peer, TransportKind::Tcp, 1);
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_millis(250)),
+            0,
+            policy,
+        );
+
+        assert!(ranked.is_empty());
     }
 
     #[test]
@@ -3786,6 +3918,106 @@ mod tests {
         );
 
         assert_eq!(ranked.first().copied(), Some(TransportKind::Quic));
+        assert!(ranked.contains(&TransportKind::Tcp));
+    }
+
+    #[test]
+    fn expiring_best_effort_voice_accepts_healthy_sampled_udp_without_tcp() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Quic]);
+        let policy = TransportRoutingPolicy::default();
+
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_millis(250)),
+            0,
+            policy,
+        );
+
+        assert_eq!(ranked, vec![TransportKind::Quic]);
+    }
+
+    #[test]
+    fn expiring_best_effort_voice_accepts_healthy_sampled_raw_udp() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Udp]);
+        let policy = TransportRoutingPolicy::default();
+
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Udp);
+        }
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_millis(250)),
+            0,
+            policy,
+        );
+
+        assert_eq!(ranked, vec![TransportKind::Udp]);
+    }
+
+    #[test]
+    fn expiring_best_effort_voice_can_promote_healthy_raw_udp_over_tcp() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Udp]);
+        let policy = TransportRoutingPolicy::default();
+
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(180));
+        peer.metrics()
+            .record_rtt(TransportKind::Udp, Duration::from_millis(60));
+        peer.metrics()
+            .record_payload_sent(TransportKind::Udp, 4 * 1024 * 1024);
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Udp);
+        }
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_millis(250)),
+            0,
+            policy,
+        );
+
+        assert_eq!(ranked.first().copied(), Some(TransportKind::Udp));
+        assert!(ranked.contains(&TransportKind::Tcp));
+    }
+
+    #[test]
+    fn dead_bad_kcp_does_not_poison_live_healthy_quic() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Quic]);
+        let policy = TransportRoutingPolicy::default();
+
+        for _ in 0..policy.udp_family_probe_loss_block_count() {
+            peer.metrics().record_probe_lost(TransportKind::Kcp);
+        }
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            SendOptions::default().expire_after(Duration::from_millis(250)),
+            0,
+            policy,
+        );
+
+        assert_eq!(ranked, vec![TransportKind::Quic]);
     }
 
     #[test]

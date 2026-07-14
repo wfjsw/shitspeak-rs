@@ -144,6 +144,7 @@ enum DispatchEvent {
 /// A low-priority proactive alternate held behind a byte permit until its
 /// dedicated worker submits it to the transport.
 struct ProactiveSendWork {
+    sender_session: u32,
     dst: NodeIdentifier,
     body: Bytes,
     avoid_first_hop: Option<NodeIdentifier>,
@@ -968,6 +969,7 @@ impl VoiceService {
                     }
                 }
                 let work = ProactiveSendWork {
+                    sender_session,
                     dst,
                     body: proactive_body
                         .as_ref()
@@ -1269,10 +1271,18 @@ fn spawn_dispatch_task(
                     )
                     .get_node_id();
                     let from = delivery.from;
+                    let route_hint = reorderer
+                        .may_arm_gap(&delivery.frame, delivery.copy_kind)
+                        .then(|| {
+                            transport
+                                .voice_route_quality(origin_node)
+                                .map(route_hint_from_quality)
+                        })
+                        .flatten();
                     let report = reorderer.push_with_route_hint_report_with_copy_kind(
                         from,
                         delivery.frame,
-                        None,
+                        route_hint,
                         delivery.copy_kind,
                     );
                     if cfg.repair_enabled
@@ -1390,82 +1400,81 @@ fn publish_proactive_budget(budget: &AdaptiveVoiceBudget) {
 
 /// Send proactively-marked alternates outside the foreground voice path.
 /// The unbounded work queue is bounded by `VoiceBytePermit`; at most four
-/// sends await transport completion concurrently.
+/// speaker/destination lanes await transport completion concurrently.
 fn spawn_proactive_worker(
     mut rx: mpsc::UnboundedReceiver<ProactiveSendWork>,
     transport: Arc<dyn VoiceTransport>,
     voice_budget: AdaptiveVoiceBudget,
     shutdown: CancellationToken,
 ) {
-    tokio::spawn(async move {
-        let source = transport.local_node_id();
-        let mut in_flight = tokio::task::JoinSet::new();
-        let mut input_open = true;
-        loop {
-            if !input_open && in_flight.is_empty() {
-                publish_proactive_budget(&voice_budget);
-                return;
-            }
-            if in_flight.len() >= PROACTIVE_WORKER_CONCURRENCY {
-                tokio::select! {
+    let mut lane_txs = Vec::with_capacity(PROACTIVE_WORKER_CONCURRENCY);
+    for _ in 0..PROACTIVE_WORKER_CONCURRENCY {
+        let (lane_tx, mut lane_rx) = mpsc::unbounded_channel::<ProactiveSendWork>();
+        lane_txs.push(lane_tx);
+        let transport = transport.clone();
+        let voice_budget = voice_budget.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let source = transport.local_node_id();
+            loop {
+                let work = tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    joined = in_flight.join_next() => {
-                        if joined.is_none() {
-                            return;
-                        }
-                        publish_proactive_budget(&voice_budget);
+                    work = lane_rx.recv() => match work {
+                        Some(work) => work,
+                        None => return,
+                    },
+                };
+                let ProactiveSendWork {
+                    sender_session: _,
+                    dst,
+                    body,
+                    avoid_first_hop,
+                    transport_ttl,
+                    _permit,
+                } = work;
+                let send_result = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    result = transport.send_proactive_repair_frame(
+                        dst,
+                        body,
+                        avoid_first_hop,
+                        transport_ttl,
+                    ) => result,
+                };
+                match send_result {
+                    Ok(()) => {
+                        metrics::record_repair(
+                            source,
+                            dst,
+                            VoiceRepairResult::ProactiveCopySent,
+                            1,
+                        );
+                        metrics::record_proactive_outcome(VoiceProactiveResult::Sent);
+                    }
+                    Err(_) => {
+                        metrics::record_proactive_outcome(VoiceProactiveResult::SendFailed);
                     }
                 }
-                continue;
+                drop(_permit);
+                publish_proactive_budget(&voice_budget);
             }
-            tokio::select! {
+        });
+    }
+
+    tokio::spawn(async move {
+        loop {
+            let work = tokio::select! {
                 _ = shutdown.cancelled() => return,
-                work = rx.recv(), if input_open => match work {
-                    Some(work) => {
-                        let transport = transport.clone();
-                        in_flight.spawn(async move {
-                            let ProactiveSendWork {
-                                dst,
-                                body,
-                                avoid_first_hop,
-                                transport_ttl,
-                                _permit,
-                            } = work;
-                            match transport
-                                .send_proactive_repair_frame(
-                                    dst,
-                                    body,
-                                    avoid_first_hop,
-                                    transport_ttl,
-                                )
-                                .await
-                            {
-                                Ok(()) => {
-                                    metrics::record_repair(
-                                        source,
-                                        dst,
-                                        VoiceRepairResult::ProactiveCopySent,
-                                        1,
-                                    );
-                                    metrics::record_proactive_outcome(VoiceProactiveResult::Sent);
-                                }
-                                Err(_) => {
-                                    metrics::record_proactive_outcome(
-                                        VoiceProactiveResult::SendFailed,
-                                    );
-                                }
-                            }
-                            drop(_permit);
-                        });
-                    }
-                    None => input_open = false,
+                work = rx.recv() => match work {
+                    Some(work) => work,
+                    None => return,
                 },
-                joined = in_flight.join_next(), if !in_flight.is_empty() => {
-                    if joined.is_none() {
-                        return;
-                    }
-                    publish_proactive_budget(&voice_budget);
-                }
+            };
+            let lane = (work.sender_session as usize
+                ^ usize::try_from(u32::from(work.dst)).unwrap_or(0))
+                % PROACTIVE_WORKER_CONCURRENCY;
+            if lane_txs[lane].send(work).is_err() {
+                return;
             }
         }
     });
@@ -1676,6 +1685,8 @@ mod tests {
         inner: Arc<FakeVoiceTransport>,
         primary_entered: Semaphore,
         primary_release: Semaphore,
+        proactive_entered: Semaphore,
+        proactive_release: Semaphore,
         fail_primary: bool,
     }
 
@@ -1685,6 +1696,8 @@ mod tests {
                 inner: FakeVoiceTransport::new(7, vec![2, 3]),
                 primary_entered: Semaphore::new(0),
                 primary_release: Semaphore::new(0),
+                proactive_entered: Semaphore::new(0),
+                proactive_release: Semaphore::new(0),
                 fail_primary,
             })
         }
@@ -1757,9 +1770,17 @@ mod tests {
             avoid_first_hop: Option<NodeIdentifier>,
             ttl: Duration,
         ) -> Result<(), ApplicationError> {
-            self.inner
+            let result = self
+                .inner
                 .send_proactive_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await;
+            self.proactive_entered.add_permits(1);
+            self.proactive_release
+                .acquire()
                 .await
+                .expect("test release semaphore remains open")
+                .forget();
+            result
         }
 
         fn alive_members(&self) -> Vec<NodeIdentifier> {
@@ -2387,6 +2408,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proactive_worker_preserves_same_key_fifo_and_cross_key_concurrency() {
+        let transport = ControlledUnicastTransport::new(false);
+        let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        let shutdown = CancellationToken::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        spawn_proactive_worker(rx, transport.clone(), budget.clone(), shutdown.clone());
+
+        let work = |sender_session, dst, body: &'static [u8]| {
+            let body = Bytes::from_static(body);
+            let permit = budget
+                .try_reserve_proactive(body.len())
+                .expect("test proactive work fits byte budget");
+            ProactiveSendWork {
+                sender_session,
+                dst,
+                body,
+                avoid_first_hop: None,
+                transport_ttl: Duration::from_secs(1),
+                _permit: permit,
+            }
+        };
+        tx.send(work(100, 2, b"a0")).unwrap();
+        tx.send(work(100, 2, b"a1")).unwrap();
+        tx.send(work(101, 2, b"b0")).unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.proactive_entered.acquire_many(2),
+        )
+        .await
+        .expect("different proactive keys should overlap")
+        .unwrap()
+        .forget();
+        let first_bodies: Vec<Bytes> = transport
+            .inner
+            .calls()
+            .iter()
+            .filter_map(|call| match call {
+                FakeCall::RepairFrame { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first_bodies.len(), 2);
+        assert!(first_bodies.contains(&Bytes::from_static(b"a0")));
+        assert!(first_bodies.contains(&Bytes::from_static(b"b0")));
+        assert!(!first_bodies.contains(&Bytes::from_static(b"a1")));
+
+        transport.proactive_release.add_permits(2);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.proactive_entered.acquire(),
+        )
+        .await
+        .expect("second same-key frame should start after the first completes")
+        .unwrap()
+        .forget();
+        let bodies: Vec<Bytes> = transport
+            .inner
+            .calls()
+            .iter()
+            .filter_map(|call| match call {
+                FakeCall::RepairFrame { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies.last(), Some(&Bytes::from_static(b"a1")));
+        transport.proactive_release.add_permits(1);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn proactive_worker_cancellation_releases_hung_send_permit() {
+        let transport = ControlledUnicastTransport::new(false);
+        let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        let shutdown = CancellationToken::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        spawn_proactive_worker(rx, transport.clone(), budget.clone(), shutdown.clone());
+        let body = Bytes::from_static(b"hung");
+        let permit = budget
+            .try_reserve_proactive(body.len())
+            .expect("test proactive work fits byte budget");
+        tx.send(ProactiveSendWork {
+            sender_session: 100,
+            dst: 2,
+            body,
+            avoid_first_hop: None,
+            transport_ttl: Duration::from_secs(1),
+            _permit: permit,
+        })
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.proactive_entered.acquire(),
+        )
+        .await
+        .expect("proactive send should enter transport")
+        .unwrap()
+        .forget();
+        assert!(budget.proactive_reserved_bytes() > 0);
+
+        shutdown.cancel();
+        for _ in 0..50 {
+            if budget.proactive_reserved_bytes() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(budget.proactive_reserved_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn live_capacity_reduction_keeps_queued_primary_and_rejects_new_work() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let max_users = Arc::new(AtomicU64::new(5_000));
@@ -2957,6 +3089,67 @@ mod tests {
         assert_eq!(frame.s2s_seq, 5);
         assert!(frame.is_terminator);
         assert_eq!(frame.payload, b"opus-bytes".as_ref());
+    }
+
+    #[tokio::test]
+    async fn ingress_uses_origin_route_quality_for_reorder_deadline() {
+        let transport = FakeVoiceTransport::new(7, vec![11, 12]);
+        transport.set_voice_route_quality(
+            11,
+            crate::overlay::VoiceRouteQuality::new(11, TransportKind::Tcp, 1_000, 0, 0),
+        );
+        transport.set_voice_route_quality(
+            12,
+            crate::overlay::VoiceRouteQuality::new(11, TransportKind::Tcp, 237_000, 0, 0),
+        );
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let sink = RecordingSink::new();
+        svc.set_audio_sink(sink.clone());
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
+        let inbound = svc.inbound_handler();
+
+        for seq in [0, 2] {
+            let body = send::build_envelope(
+                sender_session,
+                shitspeak_core::default_server_id(),
+                42,
+                seq,
+                0,
+                false,
+                Bytes::from_static(b"opus"),
+                normal_intent(5),
+            )
+            .unwrap();
+            inbound.handle(OverlayInboundMessage {
+                from: 11,
+                level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+                class: shitspeak_s2s_transport::MessageClass::HighPriority,
+                body,
+                remote_playout_delay_ms: None,
+                is_distribution_repair: false,
+            });
+        }
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            sink.len(),
+            1,
+            "relay RTT must not shorten the origin deadline"
+        );
+        for _ in 0..100 {
+            if sink.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(sink.len(), 2);
     }
 
     #[tokio::test]
