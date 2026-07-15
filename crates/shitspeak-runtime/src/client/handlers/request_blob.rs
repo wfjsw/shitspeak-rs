@@ -169,7 +169,9 @@ pub async fn handle_request_blob(
 
     // ── Channel descriptions ─────────────────────────────────────────────
     for channel_id in &msg.channel_description {
-        if !crate::channel_handler::can_view_channel(server, sender, *channel_id).await {
+        if !crate::channel_handler::can_view_channel_with_ancestors(server, sender, *channel_id)
+            .await
+        {
             continue;
         }
         let Some(ch) = server
@@ -194,7 +196,9 @@ pub async fn handle_request_blob(
 
         let mut links = Vec::with_capacity(ch.links.len());
         for linked_id in &ch.links {
-            if crate::channel_handler::can_view_channel(server, sender, *linked_id).await {
+            if crate::channel_handler::can_view_channel_with_ancestors(server, sender, *linked_id)
+                .await
+            {
                 links.push(*linked_id);
             }
         }

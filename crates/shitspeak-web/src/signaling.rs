@@ -476,6 +476,7 @@ struct SignalingSession {
     >,
     channel_log_rx:
         Option<tokio::sync::broadcast::Receiver<Arc<shitspeak_state::ChannelOperation>>>,
+    visibility_reload_rx: Option<tokio::sync::broadcast::Receiver<()>>,
     channel_tree_shadow: ChannelTreeShadow,
     channel_shadow: SessionChannelShadow,
     user_visibility: UserVisibilityState,
@@ -493,6 +494,7 @@ impl Default for SignalingSession {
             outbound_rx: None,
             client_log_rx: None,
             channel_log_rx: None,
+            visibility_reload_rx: None,
             channel_tree_shadow: ChannelTreeShadow::new(),
             channel_shadow: SessionChannelShadow::new(),
             user_visibility: UserVisibilityState::default(),
@@ -606,6 +608,35 @@ where
                     }
                     Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
                         send_websocket_error(&mut stream, "web channel update stream closed").await?;
+                    }
+                }
+            }
+            visibility_reload = async {
+                match session.visibility_reload_rx.as_mut() {
+                    Some(rx) => Some(rx.recv().await),
+                    None => std::future::pending::<Option<
+                        Result<(), tokio::sync::broadcast::error::RecvError>,
+                    >>().await,
+                }
+            }, if session.visibility_reload_rx.is_some() => {
+                match visibility_reload {
+                    Some(Ok(())) | Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                        if let (Some(server), Some(client)) = (context.server.as_ref(), session.client.as_ref()) {
+                            let messages = shitspeak_runtime::client::visibility::visibility_config_reload_messages(
+                                server,
+                                client,
+                                &mut session.user_visibility,
+                                &mut session.channel_tree_shadow,
+                                &mut session.channel_shadow,
+                            )
+                            .await;
+                            for message in messages {
+                                send_web_outbound_message(&mut stream, session.peer.as_ref(), message).await?;
+                            }
+                        }
+                    }
+                    Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
+                        session.visibility_reload_rx = None;
                     }
                 }
             }
@@ -1326,6 +1357,7 @@ async fn handle_successful_password_auth(
     send_authentication_success(stream, session.session_id, display_name).await?;
     session.authenticated = true;
     if let Some((server, client)) = initial_state_client {
+        session.visibility_reload_rx = Some(server.subscribe_visibility_reload());
         send_initial_server_state(
             stream,
             &server,

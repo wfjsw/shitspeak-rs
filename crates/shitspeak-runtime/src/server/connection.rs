@@ -37,6 +37,7 @@ use super::extensions::{ALPN_MUMBLE, AlpnConnectionInfo};
 
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
+type VisibilityReloadReceiver = tokio::sync::broadcast::Receiver<()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelLogReceiveOutcome {
@@ -131,20 +132,14 @@ pub(super) async fn activate_client_subscriptions(
             session = u32::from(client_session_id),
             "post-auth baseline missing; rebuilding subscription shadows from repositories"
         );
-        session_channel_shadow.clear();
-        session_channel_shadow.extend(
-            server
-                .clients
-                .get_all_clients_in_server(&server_id)
-                .await
-                .into_iter()
-                .filter(|client| client.is_authenticated() && client.is_published())
-                .map(|client| (client.get_session_id(), client.get_current_channel_id())),
-        );
         let channels = server.channels.get_all_in_server(&server_id).await;
         if server.get_hide_channels_without_traverse() {
             for channel in channels {
-                if crate::channel_handler::can_view_channel(server, client, channel.id).await {
+                if crate::channel_handler::can_view_channel_with_ancestors(
+                    server, client, channel.id,
+                )
+                .await
+                {
                     channel_tree_shadow.insert(channel.id);
                 }
             }
@@ -159,6 +154,16 @@ pub(super) async fn activate_client_subscriptions(
                 session_channel_shadow,
             )
             .await;
+        } else {
+            session_channel_shadow.extend(
+                server
+                    .clients
+                    .get_all_clients_in_server(&server_id)
+                    .await
+                    .into_iter()
+                    .filter(|client| client.is_authenticated() && client.is_published())
+                    .map(|client| (client.get_session_id(), client.get_current_channel_id())),
+            );
         }
     }
 
@@ -1445,6 +1450,9 @@ impl Server {
         // Subscriptions start as None — they're activated after auth.
         let mut client_log_rx: Option<ClientLogReceiver> = None;
         let mut channel_log_rx: Option<ChannelLogReceiver> = None;
+        let mut visibility_reload_rx: Option<VisibilityReloadReceiver> =
+            Some(self.subscribe_visibility_reload());
+        let mut visibility_reload_pending = false;
         let mut writer_task = spawn_native_client_writer_task(&client);
         let mut channel_tree_shadow = ChannelTreeShadow::default();
         let mut session_channel_shadow = SessionChannelShadow::new();
@@ -1500,6 +1508,27 @@ impl Server {
                             result,
                         )
                         .await?;
+                        if visibility_reload_pending
+                            && client.is_authenticated()
+                            && client_log_rx.is_some()
+                        {
+                            visibility_reload_pending = false;
+                            let messages =
+                                crate::client::visibility::visibility_config_reload_messages(
+                                    self,
+                                    &client,
+                                    &mut user_visibility,
+                                    &mut channel_tree_shadow,
+                                    &mut session_channel_shadow,
+                                )
+                                .await;
+                            if !messages.is_empty() {
+                                client
+                                    .write_proto_message_batch(&messages)
+                                    .await
+                                    .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                            }
+                        }
                         client.touch_activity();
                         continue_deferred_client_messages(
                             &mut handler_tasks,
@@ -1528,6 +1557,36 @@ impl Server {
                             Ok(Ok(())) => return Ok(()),
                             Ok(Err(err)) => return Err(HandleIncomingConnectionError::ClientWriteFailed(err)),
                             Err(err) => return Err(HandleIncomingConnectionError::ClientWriterTaskFailed(err)),
+                        }
+                    }
+
+                    // ── Visibility policy change notification ───────────────
+                    result = recv_optional(visibility_reload_rx.as_mut()), if visibility_reload_rx.is_some() => {
+                        match result {
+                            Some(Ok(())) | Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                                if client.is_authenticated() && client_log_rx.is_some() {
+                                    visibility_reload_pending = false;
+                                    let messages = crate::client::visibility::visibility_config_reload_messages(
+                                        self,
+                                        &client,
+                                        &mut user_visibility,
+                                        &mut channel_tree_shadow,
+                                        &mut session_channel_shadow,
+                                    )
+                                    .await;
+                                    if !messages.is_empty() {
+                                        client
+                                            .write_proto_message_batch(&messages)
+                                            .await
+                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
+                                    }
+                                } else {
+                                    visibility_reload_pending = true;
+                                }
+                            }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
+                                visibility_reload_rx = None;
+                            }
                         }
                     }
 

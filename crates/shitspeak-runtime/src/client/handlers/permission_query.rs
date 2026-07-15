@@ -25,7 +25,9 @@ pub async fn handle_permission_query(
     );
 
     if let Some(channel_id) = msg.channel_id {
-        if !crate::channel_handler::can_view_channel(server, sender, channel_id).await {
+        if !crate::channel_handler::can_view_channel_with_ancestors(server, sender, channel_id)
+            .await
+        {
             return Ok(());
         }
 

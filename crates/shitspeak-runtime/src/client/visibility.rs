@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::channel_handler::SessionChannelShadow;
+use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use crate::client::Client;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
@@ -737,6 +737,25 @@ pub async fn can_view_user(
     perms.contains(ACLPermissions::Traverse)
 }
 
+async fn can_project_user(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    target: &Arc<Box<Client>>,
+) -> bool {
+    if !can_view_user(server, viewer, target).await {
+        return false;
+    }
+    if !server.get_hide_channels_without_traverse() {
+        return true;
+    }
+    crate::channel_handler::can_view_channel_with_ancestors(
+        server,
+        viewer,
+        target.get_current_channel_id(),
+    )
+    .await
+}
+
 pub async fn get_visible_client_in_server(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,
@@ -747,7 +766,7 @@ pub async fn get_visible_client_in_server(
         .get_clients()
         .get_client_in_server(server_id, session)
         .await?;
-    if can_view_user(server, viewer, &target).await {
+    if can_project_user(server, viewer, &target).await {
         Some(target)
     } else {
         None
@@ -765,9 +784,16 @@ pub async fn visible_listener_channels(
 
     let mut visible = HashSet::new();
     for channel_id in channels {
-        let perms =
-            crate::client::acl::compute_permissions_for_client(server, viewer, channel_id).await;
-        if perms.contains(ACLPermissions::Traverse) {
+        let traversable = if server.get_hide_channels_without_traverse() {
+            crate::channel_handler::can_view_channel_with_ancestors(server, viewer, channel_id)
+                .await
+        } else {
+            crate::client::acl::compute_permissions_for_client(server, viewer, channel_id)
+                .await
+                .contains(ACLPermissions::Traverse)
+        };
+
+        if traversable {
             visible.insert(channel_id);
         }
     }
@@ -819,7 +845,7 @@ pub async fn initialize(
         if !target.is_authenticated() {
             continue;
         }
-        if !can_view_user(server, viewer, &target).await {
+        if !can_project_user(server, viewer, &target).await {
             continue;
         }
         let listener_channels =
@@ -829,6 +855,224 @@ pub async fn initialize(
         visibility.insert(session, channel_id, listener_channels);
         channel_shadow.insert(session, channel_id);
     }
+}
+
+/// Reconcile a live session after either visibility flag changes in a config
+/// reload. The transport loops own their shadows, so this builds one ordered
+/// transition for each session instead of asking clients to reconnect.
+///
+/// Removal order is users/listeners, then channels. Additions use the reverse
+/// order: channels first, then complete user states.
+pub async fn visibility_config_reload_messages(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+) -> Vec<Message> {
+    let server_id = viewer.server_id();
+    let hide_users_without_traverse = server.get_hide_users_without_traverse();
+    let hiding_users_before = visibility.registered_viewer_id(&server_id).is_some();
+    // A channel-only toggle can change which users/listeners qualify because
+    // user visibility is evaluated against the target's current channel.
+    // Rebuild the user projection whenever filtering is active; config reloads
+    // are infrequent, so this avoids leaving stale users online.
+    let users_mode_changed = hide_users_without_traverse || hiding_users_before;
+
+    let old_sessions = session_channel_shadow
+        .iter()
+        .map(|(session, _)| *session)
+        .collect::<HashSet<_>>();
+    let old_channel_ids = channel_tree_shadow.channel_ids().clone();
+
+    let channels = server.get_channels().get_all_in_server(&server_id).await;
+    let mut visible_channel_ids = HashSet::with_capacity(channels.len());
+    for channel in &channels {
+        if crate::channel_handler::can_view_channel_with_ancestors(server, viewer, channel.id).await
+        {
+            visible_channel_ids.insert(channel.id);
+        }
+    }
+
+    let mut visible_targets = Vec::new();
+    let mut new_sessions = HashSet::new();
+    if users_mode_changed {
+        for target in server
+            .get_clients()
+            .get_all_clients_in_server(&server_id)
+            .await
+        {
+            if !target.is_authenticated()
+                || !target.is_published()
+                || !can_project_user(server, viewer, &target).await
+            {
+                continue;
+            }
+            new_sessions.insert(target.get_session_id());
+            visible_targets.push(target);
+        }
+        visible_targets.sort_by_key(|target| u32::from(target.get_session_id()));
+    }
+
+    let mut messages = Vec::new();
+
+    let removed_channel_id_set = old_channel_ids
+        .difference(&visible_channel_ids)
+        .copied()
+        .collect::<HashSet<_>>();
+    let added_channel_id_set = visible_channel_ids
+        .difference(&old_channel_ids)
+        .copied()
+        .collect::<HashSet<_>>();
+    let ordered_channels = crate::channel_handler::ordered_snapshot_channels(&channels);
+    let mut link_updates_before_removals = Vec::new();
+    let mut link_updates_after_additions = Vec::new();
+    if !removed_channel_id_set.is_empty() || !added_channel_id_set.is_empty() {
+        for channel in &ordered_channels {
+            if !old_channel_ids.contains(&channel.id) || !visible_channel_ids.contains(&channel.id)
+            {
+                continue;
+            }
+            let links_removed = channel
+                .links
+                .iter()
+                .any(|linked_id| removed_channel_id_set.contains(linked_id));
+            let links_added = channel
+                .links
+                .iter()
+                .any(|linked_id| added_channel_id_set.contains(linked_id));
+
+            if links_removed {
+                let mut state =
+                    crate::channel_handler::build_channel_state_message(server, viewer, channel)
+                        .await;
+                state.links.retain(|linked_id| {
+                    old_channel_ids.contains(linked_id)
+                        && !removed_channel_id_set.contains(linked_id)
+                });
+                link_updates_before_removals.push(state.into());
+            }
+            if links_added {
+                let mut state =
+                    crate::channel_handler::build_channel_state_message(server, viewer, channel)
+                        .await;
+                state
+                    .links
+                    .retain(|linked_id| visible_channel_ids.contains(linked_id));
+                link_updates_after_additions.push(state.into());
+            }
+        }
+    }
+
+    let old_listener_channels = if hiding_users_before {
+        visible_targets
+            .iter()
+            .filter_map(|target| {
+                visibility
+                    .get(target.get_session_id())
+                    .map(|known| (target.get_session_id(), known.listener_channels.clone()))
+            })
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    let mut listener_channels_by_session = HashMap::new();
+    if users_mode_changed {
+        for target in &visible_targets {
+            let session = target.get_session_id();
+            let listener_channels =
+                visible_listener_channels(server, viewer, target.get_listening_channel_ids()).await;
+            let old = old_listener_channels
+                .get(&session)
+                .cloned()
+                .unwrap_or_else(|| target.get_listening_channel_ids());
+            let removed = sorted_difference(&old, &listener_channels);
+            if !removed.is_empty() {
+                messages.push(
+                    UserState {
+                        session: Some(session),
+                        listening_channel_remove: removed,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
+            listener_channels_by_session.insert(session, listener_channels);
+        }
+    }
+
+    if users_mode_changed {
+        let mut removed_sessions = old_sessions
+            .difference(&new_sessions)
+            .copied()
+            .collect::<Vec<_>>();
+        removed_sessions.sort_by_key(|session| u32::from(*session));
+        messages.extend(removed_sessions.into_iter().map(hidden_user_remove));
+    }
+
+    messages.extend(link_updates_before_removals);
+
+    let mut removed_channel_ids = old_channel_ids
+        .difference(&visible_channel_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    removed_channel_ids.sort_unstable_by(|left, right| right.cmp(left));
+    for channel_id in &removed_channel_ids {
+        channel_tree_shadow.remove(channel_id);
+        messages.push(
+            crate::messages::encoder::ChannelRemove {
+                channel_id: *channel_id,
+            }
+            .into(),
+        );
+    }
+
+    let final_visible_channel_ids = visible_channel_ids.clone();
+    for channel in &ordered_channels {
+        if !visible_channel_ids.contains(&channel.id) || old_channel_ids.contains(&channel.id) {
+            continue;
+        }
+        let mut state =
+            crate::channel_handler::build_channel_state_message(server, viewer, &channel).await;
+        state
+            .links
+            .retain(|linked_id| final_visible_channel_ids.contains(linked_id));
+        channel_tree_shadow.insert(channel.id);
+        messages.push(state.into());
+    }
+
+    messages.extend(link_updates_after_additions);
+
+    if users_mode_changed {
+        visibility.clear();
+        if !hide_users_without_traverse {
+            // Stop indexing this viewer once user filtering is disabled.
+            visibility.registration.take();
+        } else {
+            visibility.ensure_registered_for_server(server, &server_id);
+        }
+        session_channel_shadow.clear();
+
+        for target in visible_targets {
+            let session = target.get_session_id();
+            let listener_channels = listener_channels_by_session
+                .remove(&session)
+                .unwrap_or_else(|| target.get_listening_channel_ids());
+            if hide_users_without_traverse {
+                visibility.insert(
+                    session,
+                    target.get_current_channel_id(),
+                    listener_channels.clone(),
+                );
+            }
+            session_channel_shadow.insert(session, target.get_current_channel_id());
+            let mut state = build_visible_user_state(server, viewer, &target).await;
+            state.listening_channel_remove.clear();
+            messages.push(state.into());
+        }
+    }
+
+    messages
 }
 
 pub async fn project_message(
@@ -1159,7 +1403,24 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
         }
         ChannelOp::UpdateChannel { id, patch } | ChannelOp::EditChannel { id, patch, .. } => {
             if patch.parent_id.is_some() {
-                scope.include_channels(channels.subtree_ids_in_server(&op.server_id, *id).await);
+                // Reparenting can change the viewer's home-channel hierarchy when
+                // the viewer is in the moved subtree. Refresh the unrelated
+                // channels whose ACL chains depend on that hierarchy as well as
+                // the moved subtree itself. The repository owns this affected-set
+                // calculation so visibility and ACL-cache invalidation stay aligned.
+                let moved_subtree = channels.subtree_ids_in_server(&op.server_id, *id).await;
+                if server.get_hide_users_without_traverse() {
+                    if let Some(affected_channel_ids) = channels
+                        .acl_affected_channel_ids_for_op(&op.server_id, &op.op)
+                        .await
+                    {
+                        scope.include_channels(affected_channel_ids);
+                    } else {
+                        scope.include_channels(moved_subtree);
+                    }
+                } else {
+                    scope.include_channels(moved_subtree);
+                }
             }
         }
         ChannelOp::SetAcls { channel_id, .. } => {
@@ -1309,7 +1570,7 @@ async fn project_user_state(
         return Vec::new();
     };
 
-    let visible = can_view_user(server, viewer, &target).await;
+    let visible = can_project_user(server, viewer, &target).await;
     let known_before = visibility.get(session).cloned();
     if !visible {
         if visibility.remove(session) {
@@ -1355,7 +1616,7 @@ async fn refresh_target_visibility(
 ) -> Vec<Message> {
     let session = target.get_session_id();
     let known_before = visibility.get(session).cloned();
-    let visible = can_view_user(server, viewer, target).await;
+    let visible = can_project_user(server, viewer, target).await;
 
     if !visible {
         if visibility.remove(session) {
@@ -1425,7 +1686,7 @@ async fn visible_actor(
         .get_clients()
         .get_client_in_server(&server_id, actor)
         .await?;
-    can_view_user(server, viewer, &target)
+    can_project_user(server, viewer, &target)
         .await
         .then_some(actor)
 }

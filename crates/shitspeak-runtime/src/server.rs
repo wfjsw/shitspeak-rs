@@ -9,6 +9,7 @@ use parking_lot::{Mutex, RwLock as ParkingRwLock};
 
 use cidr::AnyIpCidr;
 use prost::{EncodeError, Message as _};
+use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
@@ -183,6 +184,7 @@ pub struct Server {
     s2s_manager: Arc<S2SManager>,
     geoip_resolver: ParkingRwLock<Arc<GeoIpResolver>>,
     shutdown_tx: tokio::sync::watch::Sender<()>,
+    visibility_reload_tx: broadcast::Sender<()>,
 }
 
 impl Server {
@@ -293,6 +295,7 @@ impl Server {
             &config.read().expect("Config RwLock poisoned"),
         ));
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(());
+        let (visibility_reload_tx, _visibility_reload_rx) = broadcast::channel(64);
 
         let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
@@ -327,6 +330,7 @@ impl Server {
                 config.read().expect("Config RwLock poisoned").geoip.clone(),
             ))),
             shutdown_tx,
+            visibility_reload_tx,
         }));
 
         // Wire cross-repo causal notification: ChannelRepository notifies
@@ -376,6 +380,13 @@ impl Server {
 
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
+    }
+
+    /// Subscribe to live visibility-policy changes. Each active transport
+    /// keeps its own channel/user shadows, so it must reconcile locally when
+    /// either hide flag changes during a config reload.
+    pub fn subscribe_visibility_reload(&self) -> broadcast::Receiver<()> {
+        self.visibility_reload_tx.subscribe()
     }
 
     pub async fn lookup_ip_geo_metadata(&self, ip: std::net::IpAddr) -> Option<IpGeoMetadata> {
@@ -1484,9 +1495,10 @@ impl Server {
 
                 self.apply_entrypoint_config(&new_config).await?;
 
-                let (root_channel_config_update, invalidate_acl_cache) = {
+                let (root_channel_config_update, invalidate_acl_cache, visibility_reload) = {
                     let mut invalidate_acl_cache = false;
                     let mut root_channel_config_update = None;
+                    let mut visibility_reload = false;
                     let mut current = self.config.write().expect("Config RwLock poisoned");
                     // Log notable changes
                     if current.welcome_text != new_config.welcome_text {
@@ -1605,6 +1617,7 @@ impl Server {
                     }
                     if current.hide_users_without_traverse != new_config.hide_users_without_traverse
                     {
+                        visibility_reload = true;
                         tracing::info!(
                             "config reload: hide_users_without_traverse {} -> {}",
                             current.hide_users_without_traverse,
@@ -1614,6 +1627,7 @@ impl Server {
                     if current.hide_channels_without_traverse
                         != new_config.hide_channels_without_traverse
                     {
+                        visibility_reload = true;
                         tracing::info!(
                             "config reload: hide_channels_without_traverse {} -> {}",
                             current.hide_channels_without_traverse,
@@ -1694,7 +1708,11 @@ impl Server {
                     self.replace_c2s_tls_acceptor(next_tls_acceptor);
                     tracing::info!("config reload: C2S TLS identity refreshed");
                     *current = new_config;
-                    (root_channel_config_update, invalidate_acl_cache)
+                    (
+                        root_channel_config_update,
+                        invalidate_acl_cache,
+                        visibility_reload,
+                    )
                 };
                 if let Some(root_channel_config) = root_channel_config_update {
                     self.channels
@@ -1703,6 +1721,9 @@ impl Server {
                 }
                 if invalidate_acl_cache {
                     self.channels.invalidate_all_acl_cache().await;
+                }
+                if visibility_reload {
+                    let _ = self.visibility_reload_tx.send(());
                 }
                 self.auth_finalization_queue
                     .apply_prepared_authenticator_reload(prepared_authenticator);

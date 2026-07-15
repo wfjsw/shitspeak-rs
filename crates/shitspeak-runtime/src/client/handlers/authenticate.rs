@@ -458,8 +458,9 @@ pub async fn handle_authenticate(
             if !client.is_authenticated() {
                 continue;
             }
-            session_channel_shadow.insert(client.get_session_id(), client.get_current_channel_id());
             if viewer_independent_user_state {
+                session_channel_shadow
+                    .insert(client.get_session_id(), client.get_current_channel_id());
                 push_burst(client.build_user_state_for_broadcast().into());
             } else {
                 let us: Message = client.build_user_state_for_broadcast().into();

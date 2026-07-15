@@ -563,6 +563,7 @@ pub struct MoqSessionRuntime {
     >,
     channel_log_rx:
         Option<tokio::sync::broadcast::Receiver<Arc<shitspeak_state::ChannelOperation>>>,
+    visibility_reload_rx: Option<tokio::sync::broadcast::Receiver<()>>,
     voice_rx: Option<mpsc::Receiver<Bytes>>,
     channel_tree_shadow: ChannelTreeShadow,
     channel_shadow: SessionChannelShadow,
@@ -579,6 +580,7 @@ impl MoqSessionRuntime {
             outbound_rx: None,
             client_log_rx: None,
             channel_log_rx: None,
+            visibility_reload_rx: None,
             voice_rx: None,
             channel_tree_shadow: ChannelTreeShadow::new(),
             channel_shadow: SessionChannelShadow::new(),
@@ -670,6 +672,7 @@ impl MoqSessionRuntime {
         self.outbound_rx = Some(outbound_rx);
         self.voice_rx = client.take_voice_tcp_rx();
         self.client = Some(Arc::clone(&client));
+        self.visibility_reload_rx = Some(server.subscribe_visibility_reload());
 
         let mut events = vec![ServerEvent::Authenticated {
             session,
@@ -894,6 +897,23 @@ impl MoqSessionRuntime {
     #[cfg(feature = "moq")]
     async fn next_background_events(&mut self) -> Result<Vec<ServerEvent>, String> {
         let mut events = self.drain_outbound_events().await?;
+        if recv_visibility_reload_now(self.visibility_reload_rx.as_mut()).await? {
+            if let (Some(server), Some(client)) = (
+                self.context.server().cloned(),
+                self.client.as_ref().cloned(),
+            ) {
+                let messages =
+                    shitspeak_runtime::client::visibility::visibility_config_reload_messages(
+                        &server,
+                        &client,
+                        &mut self.user_visibility,
+                        &mut self.channel_tree_shadow,
+                        &mut self.channel_shadow,
+                    )
+                    .await;
+                events.extend(messages.into_iter().filter_map(server_event_from_message));
+            }
+        }
         if let Some(op) = recv_broadcast_now(self.channel_log_rx.as_mut()).await? {
             events.extend(self.channel_log_events(op).await?);
         }
@@ -1396,6 +1416,22 @@ async fn recv_broadcast_now<T: Clone>(
         Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => Ok(None),
         Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
             Err("MoQ update stream closed".to_string())
+        }
+    }
+}
+
+#[cfg(feature = "moq")]
+async fn recv_visibility_reload_now(
+    rx: Option<&mut tokio::sync::broadcast::Receiver<()>>,
+) -> Result<bool, String> {
+    let Some(rx) = rx else {
+        return Ok(false);
+    };
+    match rx.try_recv() {
+        Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => Ok(true),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => Ok(false),
+        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+            Err("MoQ visibility update stream closed".to_string())
         }
     }
 }

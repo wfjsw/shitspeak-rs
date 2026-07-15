@@ -43,7 +43,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
-use crate::{ACL, ACLPermissions, Channel, ChannelPatch, ChannelRepoError, PendingDeleteState};
+use crate::{
+    ACL, ACLPermissions, Channel, ChannelPatch, ChannelRepoError, PendingDeleteState,
+    group_depends_on_home_channel,
+};
 use shitspeak_core::{DEFAULT_SERVER_ID, StrictReplicationMetadata, default_server_id};
 use shitspeak_messages::messages::{Message, encoder};
 
@@ -3277,14 +3280,14 @@ fn collect_home_channel_dependent_acl_channel_ids(
                 && acl
                     .group
                     .as_deref()
-                    .is_some_and(group_depends_on_home_channel_for_cache_scope)
+                    .is_some_and(group_depends_on_home_channel)
         });
     let applies_to_subs = channel.acls.iter().any(|acl| {
         acl.apply_subs
             && acl
                 .group
                 .as_deref()
-                .is_some_and(group_depends_on_home_channel_for_cache_scope)
+                .is_some_and(group_depends_on_home_channel)
     });
 
     if applies_here {
@@ -3303,17 +3306,6 @@ fn collect_home_channel_dependent_acl_channel_ids(
             );
         }
     }
-}
-
-fn group_depends_on_home_channel_for_cache_scope(group: &str) -> bool {
-    let mut group = group;
-    while let Some(stripped) = group.strip_prefix('!') {
-        group = stripped;
-    }
-    if let Some(stripped) = group.strip_prefix('~') {
-        group = stripped;
-    }
-    matches!(group, "in" | "out") || group.starts_with("sub")
 }
 
 /// Collect `root_id` and all of its descendants (BFS), returning their IDs.
@@ -3527,6 +3519,56 @@ mod tests {
         channels.insert(10, Channel::new(10, "legacy-child", 0, 0, Some(temp_id)));
 
         assert_eq!(collect_subtree(&channels, temp_id), vec![temp_id]);
+    }
+
+    #[tokio::test]
+    async fn reparent_acl_scope_includes_home_channel_dependent_channels() {
+        let repo = repo();
+        for id in 1..=3 {
+            repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
+                .await
+                .unwrap();
+        }
+        repo.set_acls(
+            3,
+            true,
+            vec![ACL {
+                user_id: None,
+                group: Some("in".to_owned()),
+                apply_here: true,
+                apply_subs: false,
+                allow: enumflags2::BitFlags::empty(),
+                deny: enumflags2::BitFlags::empty(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        repo.update_channel(
+            1,
+            ChannelPatch {
+                name: None,
+                position: None,
+                max_users: None,
+                description_hash: None,
+                parent_id: Some(Some(2)),
+            },
+        )
+        .await
+        .unwrap();
+
+        let op = repo
+            .get_log_since(0)
+            .await
+            .into_iter()
+            .find(|op| matches!(op.op, ChannelOp::UpdateChannel { id: 1, .. }))
+            .expect("reparent operation");
+        let affected = repo
+            .acl_affected_channel_ids_for_op(DEFAULT_SERVER_ID, &op.op)
+            .await
+            .expect("server channel map");
+
+        assert_eq!(affected, HashSet::from([1, 3]));
     }
 
     #[tokio::test]

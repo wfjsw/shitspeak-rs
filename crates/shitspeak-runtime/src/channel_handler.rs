@@ -178,6 +178,82 @@ pub async fn can_view_channel(
         .contains(shitspeak_state::ACLPermissions::Traverse)
 }
 
+/// Returns whether a channel and every parent up to root are traversable.
+/// ACL evaluation intentionally remains per-channel; the ancestor walk is
+/// only performed for surfaces that emit a complete channel reference.
+pub async fn can_view_channel_with_ancestors(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+) -> bool {
+    if !server.get_hide_channels_without_traverse() {
+        return true;
+    }
+
+    let channels = server.get_channels();
+    let server_id = client.server_id();
+    let mut current_id = channel_id;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current_id) || !can_view_channel(server, client, current_id).await {
+            return false;
+        }
+        let Some(channel) = channels.get_channel_in_server(&server_id, current_id).await else {
+            return current_id == 0;
+        };
+        let Some(parent_id) = channel.parent_id else {
+            return true;
+        };
+        current_id = parent_id;
+    }
+}
+
+async fn channel_is_visible_in_shadow(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &ChannelTreeShadow,
+    channel_id: u32,
+) -> bool {
+    if !server.get_hide_channels_without_traverse() {
+        return true;
+    }
+
+    let channels = server.get_channels();
+    let server_id = client.server_id();
+    let mut current_id = channel_id;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current_id)
+            || !channel_tree_shadow.contains(&current_id)
+            || !can_view_channel(server, client, current_id).await
+        {
+            return false;
+        }
+        let Some(channel) = channels.get_channel_in_server(&server_id, current_id).await else {
+            return current_id == 0;
+        };
+        let Some(parent_id) = channel.parent_id else {
+            return true;
+        };
+        current_id = parent_id;
+    }
+}
+
+async fn filter_visible_channel_links(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &ChannelTreeShadow,
+    links: &mut Vec<u32>,
+) {
+    let mut visible_links = Vec::with_capacity(links.len());
+    for linked_id in links.iter().copied() {
+        if channel_is_visible_in_shadow(server, client, channel_tree_shadow, linked_id).await {
+            visible_links.push(linked_id);
+        }
+    }
+    *links = visible_links;
+}
+
 /// Builds a channel snapshot containing only the tree visible to this client.
 /// The shadow records exactly the channel IDs emitted to the socket.
 pub async fn build_visible_channel_snapshot_messages(
@@ -196,6 +272,7 @@ pub async fn build_visible_channel_snapshot_messages(
                 visible_channel_ids.insert(channel.id);
             }
         }
+        close_visible_channel_ancestors(snapshot, &mut visible_channel_ids);
     } else {
         visible_channel_ids.extend(snapshot.iter().map(|channel| channel.id));
     }
@@ -239,19 +316,21 @@ pub async fn project_channel_message(
             let Some(channel_id) = channel_state.channel_id else {
                 return Vec::new();
             };
-            if !channel_tree_shadow.contains(&channel_id)
-                || !can_view_channel(server, client, channel_id).await
+            if !channel_is_visible_in_shadow(server, client, channel_tree_shadow, channel_id).await
             {
                 return Vec::new();
             }
 
             let mut projected = channel_state.clone();
-            projected
-                .links
-                .retain(|linked_id| channel_tree_shadow.contains(linked_id));
-            projected
-                .links_add
-                .retain(|linked_id| channel_tree_shadow.contains(linked_id));
+            filter_visible_channel_links(server, client, channel_tree_shadow, &mut projected.links)
+                .await;
+            filter_visible_channel_links(
+                server,
+                client,
+                channel_tree_shadow,
+                &mut projected.links_add,
+            )
+            .await;
             projected
                 .links_remove
                 .retain(|linked_id| channel_tree_shadow.contains(linked_id));
@@ -264,8 +343,13 @@ pub async fn project_channel_message(
         Message::PermissionQuery(permission_query) => match permission_query.channel_id {
             None => vec![message.clone()],
             Some(channel_id)
-                if channel_tree_shadow.contains(&channel_id)
-                    && can_view_channel(server, client, channel_id).await =>
+                if channel_is_visible_in_shadow(
+                    server,
+                    client,
+                    channel_tree_shadow,
+                    channel_id,
+                )
+                .await =>
             {
                 vec![message.clone()]
             }
@@ -378,17 +462,26 @@ pub async fn prepare_channel_visibility_refresh(
         affected_channel_ids.extend(channels.iter().map(|channel| channel.id));
         channels
     } else {
-        let mut channels = Vec::with_capacity(affected_channel_ids.len());
-        for channel_id in &affected_channel_ids {
+        // Include each candidate's ancestors.  A directly traversable child
+        // must not be introduced (or retained) when one of those ancestors
+        // is hidden or absent from this socket's tree.
+        let mut channels_by_id = HashMap::with_capacity(affected_channel_ids.len());
+        let mut pending = affected_channel_ids.iter().copied().collect::<Vec<_>>();
+        while let Some(channel_id) = pending.pop() {
             if let Some(channel) = server
                 .get_channels()
-                .get_channel_in_server(&server_id, *channel_id)
+                .get_channel_in_server(&server_id, channel_id)
                 .await
             {
-                channels.push(channel);
+                if channels_by_id.insert(channel.id, channel.clone()).is_none() {
+                    if let Some(parent_id) = channel.parent_id {
+                        pending.push(parent_id);
+                        affected_channel_ids.insert(parent_id);
+                    }
+                }
             }
         }
-        channels
+        channels_by_id.into_values().collect()
     };
 
     let mut visible_channel_ids = HashSet::with_capacity(candidate_channels.len());
@@ -397,6 +490,7 @@ pub async fn prepare_channel_visibility_refresh(
             visible_channel_ids.insert(channel.id);
         }
     }
+    close_visible_channel_ancestors(&candidate_channels, &mut visible_channel_ids);
 
     let mut removed_channel_ids = channel_tree_shadow
         .channel_ids()
@@ -1149,6 +1243,49 @@ pub fn ordered_snapshot_channels(
     out
 }
 
+/// A channel is only useful to a client when its complete parent chain is
+/// present too.  ACLs may make a non-inheriting child traversable while its
+/// parent is not, so close the direct visibility result over the channel tree
+/// before emitting any ChannelState messages.
+fn close_visible_channel_ancestors(
+    channels: &[shitspeak_state::Channel],
+    visible_channel_ids: &mut HashSet<u32>,
+) {
+    let by_id: HashMap<u32, &shitspeak_state::Channel> = channels
+        .iter()
+        .map(|channel| (channel.id, channel))
+        .collect();
+    let initially_visible = visible_channel_ids.clone();
+    let mut hidden = Vec::new();
+
+    for channel_id in initially_visible {
+        let mut current_id = channel_id;
+        let mut visited = HashSet::new();
+        let mut closed = true;
+        loop {
+            if !visited.insert(current_id) || !visible_channel_ids.contains(&current_id) {
+                closed = false;
+                break;
+            }
+            let Some(channel) = by_id.get(&current_id) else {
+                closed = false;
+                break;
+            };
+            let Some(parent_id) = channel.parent_id else {
+                break;
+            };
+            current_id = parent_id;
+        }
+        if !closed {
+            hidden.push(channel_id);
+        }
+    }
+
+    for channel_id in hidden {
+        visible_channel_ids.remove(&channel_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -1161,7 +1298,8 @@ mod tests {
 
     use super::{
         ChannelTreeShadow, SessionChannelShadow, channels_affected_by_home_channel_move,
-        channels_with_home_channel_dependent_acls, ordered_snapshot_channels,
+        channels_with_home_channel_dependent_acls, close_visible_channel_ancestors,
+        ordered_snapshot_channels,
     };
 
     fn channel(id: u32, parent_id: Option<u32>, position: i32) -> Channel {
@@ -1282,6 +1420,35 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ordered_ids, vec![0, 2, 3, 5, 4, 6, 7]);
+    }
+
+    #[test]
+    fn visible_channel_ids_are_closed_over_ancestors() {
+        let channels = vec![
+            channel(0, None, 0),
+            channel(1, Some(0), 0),
+            channel(2, Some(1), 0),
+            channel(3, Some(99), 0),
+        ];
+        let mut visible = HashSet::from([0, 2, 3]);
+
+        close_visible_channel_ancestors(&channels, &mut visible);
+
+        assert_eq!(visible, HashSet::from([0]));
+    }
+
+    #[test]
+    fn visible_channel_ids_keep_children_when_the_full_chain_is_visible() {
+        let channels = vec![
+            channel(0, None, 0),
+            channel(1, Some(0), 0),
+            channel(2, Some(1), 0),
+        ];
+        let mut visible = HashSet::from([0, 1, 2]);
+
+        close_visible_channel_ancestors(&channels, &mut visible);
+
+        assert_eq!(visible, HashSet::from([0, 1, 2]));
     }
 
     #[test]
