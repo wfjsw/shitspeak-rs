@@ -1380,6 +1380,7 @@ async fn forward_pb_as(
 #[derive(Debug)]
 enum TreeEdgeSendOutcome {
     Sent,
+    FallbackSent,
     NoRoute,
     Loop,
     Backpressure(SendError),
@@ -1390,6 +1391,7 @@ impl TreeEdgeSendOutcome {
     fn label(&self) -> &'static str {
         match self {
             Self::Sent => "sent",
+            Self::FallbackSent => "fallback_sent",
             Self::NoRoute => "no_route",
             Self::Loop => "loop",
             Self::Backpressure(_) => "backpressure",
@@ -1399,15 +1401,39 @@ impl TreeEdgeSendOutcome {
 
     fn into_error(self, child: NodeIdentifier, level: ServiceLevel) -> Option<OverlayError> {
         match self {
-            Self::Sent => None,
+            Self::Sent | Self::FallbackSent => None,
             Self::NoRoute | Self::Loop => Some(OverlayError::NoRoute { dst: child, level }),
             Self::Backpressure(error) | Self::Transport(error) => Some(OverlayError::Send(error)),
         }
     }
 }
 
+#[cfg(test)]
 async fn send_direct_tree_edge(
     transport: &ConnectionManager,
+    self_id: NodeIdentifier,
+    child: NodeIdentifier,
+    data: &pb::OverlayData,
+    path_trace: Vec<u32>,
+    transport_class: MessageClass,
+    hop_ttl: Duration,
+) -> TreeEdgeSendOutcome {
+    send_direct_tree_edge_with_routing(
+        transport,
+        None,
+        self_id,
+        child,
+        data,
+        path_trace,
+        transport_class,
+        hop_ttl,
+    )
+    .await
+}
+
+async fn send_direct_tree_edge_with_routing(
+    transport: &ConnectionManager,
+    routing: Option<&RoutingHandle>,
     self_id: NodeIdentifier,
     child: NodeIdentifier,
     data: &pb::OverlayData,
@@ -1421,7 +1447,7 @@ async fn send_direct_tree_edge(
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
     let routing_metric = route_metric_from_wire(data.route_metric, level)
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
-    let pb_msg = reconstruct_forwarded_data(data, vec![node_to_wire(child)], path_trace);
+    let pb_msg = reconstruct_forwarded_data(data, vec![node_to_wire(child)], path_trace.clone());
     let body = OverlayBody::Data(pb_msg);
     let packet_kind = crate::debug_io::classify_overlay_body(&body);
     let payload = match encode_message(&wrap(body)) {
@@ -1432,6 +1458,70 @@ async fn send_direct_tree_edge(
     // `expire_after` captures a fresh monotonic Instant here, independently
     // for this physical tree edge. No wall-clock translation is involved.
     let options = transport_options_for_overlay_data(data, Some(hop_ttl));
+
+    // A tree edge is normally sent directly to its child so the child can
+    // continue the tree without another route calculation. Under queue
+    // pressure, however, the direct peer queue can accept the frame and let
+    // it expire before dispatch. Expiring voice traffic must use the same
+    // pressure-aware alternate first hop as ordinary forwarding, with the
+    // tree metadata removed for that one branch.
+    if data.service_tag == VOICE_SERVICE_TAG
+        && options.expires_at().is_some()
+        && let Some(routing) = routing
+        && let Some(next_hop) = select_forward_next_hop_for_send(
+            &routing.load(),
+            self_id,
+            child,
+            level,
+            routing_metric,
+            &path_trace_set(&path_trace),
+            true,
+            Some(transport),
+            transport_class,
+            options,
+            None,
+        )
+        .ok()
+        .and_then(|next_hop| match next_hop {
+            ForwardNextHop::Send { next_hop } => Some(next_hop),
+            ForwardNextHop::DropAlreadyVisited
+            | ForwardNextHop::DropNoRoute
+            | ForwardNextHop::DropLoop { .. } => None,
+        })
+        .filter(|next_hop| *next_hop != child)
+    {
+        trace!(
+            parent = %self_id,
+            %child,
+            %next_hop,
+            "using pressure-aware alternate for voice tree edge"
+        );
+        let fallback = legacy_subtree_fallback_data(data, vec![child], path_trace.clone());
+        return match forward_pb_as(
+            transport,
+            routing,
+            self_id,
+            fallback,
+            transport_class,
+            true,
+            Some(hop_ttl),
+            None,
+        )
+        .await
+        {
+            Ok(()) => TreeEdgeSendOutcome::FallbackSent,
+            Err(OverlayError::NoRoute { .. }) => TreeEdgeSendOutcome::NoRoute,
+            Err(OverlayError::Send(error)) => match error {
+                SendError::UnknownNode { .. } | SendError::NoSuitableTransport { .. } => {
+                    TreeEdgeSendOutcome::NoRoute
+                }
+                error @ SendError::Backpressure { .. } => TreeEdgeSendOutcome::Backpressure(error),
+                error => TreeEdgeSendOutcome::Transport(error),
+            },
+            Err(_) => TreeEdgeSendOutcome::NoRoute,
+        };
+    }
+
     crate::debug_io::record_send_attempt(self_id, child, packet_kind.clone());
     match transport
         .try_send_with_options(
@@ -1477,8 +1567,9 @@ async fn forward_tree_data_v3(
         let edge_data = &data;
         let edge_path_trace = path_trace.clone();
         sends.push(async move {
-            let outcome = send_direct_tree_edge(
+            let outcome = send_direct_tree_edge_with_routing(
                 transport,
+                Some(routing),
                 self_id,
                 child,
                 edge_data,
@@ -1505,6 +1596,15 @@ async fn forward_tree_data_v3(
                 crate::overlay::distribution_metrics::record_original_forward(profile);
             }
             trace!(parent = %self_id, %child, outcome = outcome_label, "sent direct distribution tree edge");
+            continue;
+        }
+        if matches!(&outcome, TreeEdgeSendOutcome::FallbackSent) {
+            trace!(
+                parent = %self_id,
+                %child,
+                outcome = outcome_label,
+                "sent pressure-aware distribution subtree fallback"
+            );
             continue;
         }
 
@@ -2085,6 +2185,33 @@ mod tests {
         routing
     }
 
+    fn voice_routing_with_direct_and_indirect_route() -> RoutingHandle {
+        let routing = new_handle();
+        let mut tables = RoutingTables::empty();
+        let table = HashMap::from([(
+            4,
+            RouteEntry {
+                next_hop: 4,
+                cost: 1,
+                latency_us: 1,
+            },
+        )]);
+        let adjacency = HashMap::from([
+            (1, vec![(4, edge(1)), (3, edge(5))]),
+            (3, vec![(4, edge(1))]),
+        ]);
+        for level in ServiceLevel::ALL {
+            tables.insert_table_with_adjacency(
+                RoutingMetric::ConversationalQuality,
+                level,
+                table.clone(),
+                adjacency.clone(),
+            );
+        }
+        routing.store(Arc::new(tables));
+        routing
+    }
+
     #[tokio::test]
     async fn v3_tree_edge_sends_directly_to_the_adjacent_child() {
         let (transport, mut receivers) =
@@ -2149,6 +2276,47 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, TreeEdgeSendOutcome::NoRoute));
+    }
+
+    #[tokio::test]
+    async fn pressured_voice_tree_edge_uses_an_alternate_first_hop() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        let _direct_rx = receivers.pop().expect("direct child receiver");
+        let mut alternate_rx = transport.test_install_live_stream(3, TransportKind::Tcp);
+        build_deadline_stream_pressure(&transport, 4).await;
+
+        let routing = voice_routing_with_direct_and_indirect_route();
+        let mut data = test_overlay_data(false);
+        data.service_tag = VOICE_SERVICE_TAG;
+        data.service_level = level_to_wire(ServiceLevel::BestEffort);
+        data.message_class = class_to_wire(MessageClass::HighPriority);
+        data.route_metric = route_metric_to_wire(RoutingMetric::ConversationalQuality);
+        data.distribution_profile = Some(1);
+
+        let outcome = send_direct_tree_edge_with_routing(
+            &transport,
+            Some(&routing),
+            1,
+            4,
+            &data,
+            vec![node_to_wire(1)],
+            MessageClass::HighPriority,
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(matches!(outcome, TreeEdgeSendOutcome::FallbackSent));
+        let forwarded = timeout(Duration::from_millis(50), alternate_rx.recv())
+            .await
+            .expect("alternate first hop should receive the fallback")
+            .expect("alternate stream should remain open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay frame");
+        let Some(OverlayBody::Data(forwarded)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(forwarded.dsts, vec![node_to_wire(4)]);
+        assert_eq!(forwarded.distribution_profile, None);
     }
 
     fn tables_with_direct_and_indirect_route() -> RoutingTables {

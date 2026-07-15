@@ -18,7 +18,7 @@ use shitspeak_runtime::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     canonical_authenticator_ip,
 };
-use shitspeak_runtime::channel_handler::SessionChannelShadow;
+use shitspeak_runtime::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use shitspeak_runtime::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOperation};
 use shitspeak_runtime::client::visibility::UserVisibilityState;
@@ -476,6 +476,7 @@ struct SignalingSession {
     >,
     channel_log_rx:
         Option<tokio::sync::broadcast::Receiver<Arc<shitspeak_state::ChannelOperation>>>,
+    channel_tree_shadow: ChannelTreeShadow,
     channel_shadow: SessionChannelShadow,
     user_visibility: UserVisibilityState,
     peer: Option<WebRtcPeer>,
@@ -492,6 +493,7 @@ impl Default for SignalingSession {
             outbound_rx: None,
             client_log_rx: None,
             channel_log_rx: None,
+            channel_tree_shadow: ChannelTreeShadow::new(),
             channel_shadow: SessionChannelShadow::new(),
             user_visibility: UserVisibilityState::default(),
             peer: None,
@@ -1328,6 +1330,7 @@ async fn handle_successful_password_auth(
             stream,
             &server,
             &client,
+            &mut session.channel_tree_shadow,
             &mut session.channel_shadow,
             &mut session.user_visibility,
         )
@@ -1354,17 +1357,22 @@ async fn send_initial_server_state(
     stream: &mut (impl AsyncWrite + Unpin),
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
 ) -> io::Result<()> {
     let server_id = client.server_id();
     let channels = server.get_channels().get_all_in_server(&server_id).await;
-    for channel in shitspeak_runtime::channel_handler::ordered_snapshot_channels(&channels) {
-        let channel_state = shitspeak_runtime::channel_handler::build_channel_state_message(
-            server, client, &channel,
-        )
-        .await;
-        send_web_outbound_message(stream, None, channel_state.into()).await?;
+    for message in shitspeak_runtime::channel_handler::build_visible_channel_snapshot_messages(
+        server,
+        client,
+        &channels,
+        channel_tree_shadow,
+        server.get_send_permission_info(),
+    )
+    .await
+    {
+        send_web_outbound_message(stream, None, message).await?;
     }
 
     let session_id = client.get_session_id();
@@ -1380,9 +1388,10 @@ async fn send_initial_server_state(
             continue;
         }
         let user_state: Message = visible.build_user_state_for_broadcast().into();
-        for message in shitspeak_runtime::client::visibility::project_message_with_shadow(
+        for message in shitspeak_runtime::channel_handler::project_message_with_visibility_shadows(
             server,
             client,
+            channel_tree_shadow,
             user_visibility,
             channel_shadow,
             &server_id,
@@ -1395,9 +1404,10 @@ async fn send_initial_server_state(
     }
 
     let self_state: Message = client.build_user_state_for_broadcast().into();
-    for message in shitspeak_runtime::client::visibility::project_message_with_shadow(
+    for message in shitspeak_runtime::channel_handler::project_message_with_visibility_shadows(
         server,
         client,
+        channel_tree_shadow,
         user_visibility,
         channel_shadow,
         &server_id,
@@ -1481,6 +1491,20 @@ async fn send_web_channel_log_update(
         }
     }
 
+    let refresh_scope =
+        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+            &server,
+            &op,
+            &mut session.user_visibility,
+        )
+        .await;
+    let channel_refresh = shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+        &server,
+        &client,
+        &session.channel_tree_shadow,
+        &refresh_scope,
+    )
+    .await;
     let messages =
         shitspeak_runtime::channel_handler::convert_channel_operation_to_messages_with_shadow(
             &server,
@@ -1490,12 +1514,26 @@ async fn send_web_channel_log_update(
             Some(&mut session.channel_shadow),
         )
         .await;
+    let mut deferred_channel_removals = Vec::new();
     for message in messages {
+        if matches!(message, Message::ChannelRemove(_)) {
+            deferred_channel_removals.extend(
+                shitspeak_runtime::channel_handler::project_channel_message(
+                    &server,
+                    &client,
+                    &session.channel_tree_shadow,
+                    &message,
+                )
+                .await,
+            );
+            continue;
+        }
         send_web_outbound_message_with_synthetic(
             stream,
             &server,
             &client,
             session.peer.as_ref(),
+            &mut session.channel_tree_shadow,
             &mut session.channel_shadow,
             &mut session.user_visibility,
             &server_id,
@@ -1503,24 +1541,36 @@ async fn send_web_channel_log_update(
         )
         .await?;
     }
-    let refresh_scope =
-        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
-            &server,
-            &op,
-            &mut session.user_visibility,
-        )
-        .await;
-    send_web_visibility_refresh(
+    send_prepared_web_visibility_refresh(
         stream,
         &server,
         &client,
         session.peer.as_ref(),
+        &mut session.channel_tree_shadow,
         &mut session.channel_shadow,
         &mut session.user_visibility,
         &server_id,
+        channel_refresh,
         refresh_scope,
     )
     .await?;
+    for message in deferred_channel_removals {
+        if let Message::ChannelRemove(channel_remove) = &message {
+            if !session
+                .channel_tree_shadow
+                .contains(&channel_remove.channel_id)
+            {
+                continue;
+            }
+        }
+        session.channel_tree_shadow.sync_message(&message);
+        send_web_outbound_message(stream, session.peer.as_ref(), message).await?;
+    }
+    shitspeak_runtime::channel_handler::remove_deleted_channels_from_shadow(
+        server.get_channels(),
+        &op,
+        &mut session.channel_tree_shadow,
+    );
     client.set_last_channel_version(op.version).await;
     Ok(())
 }
@@ -1549,6 +1599,21 @@ async fn send_web_channel_log_gap(
     }
 
     for op in missed {
+        let refresh_scope =
+            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+                &server,
+                &op,
+                &mut session.user_visibility,
+            )
+            .await;
+        let channel_refresh =
+            shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+                &server,
+                &client,
+                &session.channel_tree_shadow,
+                &refresh_scope,
+            )
+            .await;
         let messages =
             shitspeak_runtime::channel_handler::convert_channel_operation_to_messages_with_shadow(
                 &server,
@@ -1558,12 +1623,26 @@ async fn send_web_channel_log_gap(
                 Some(&mut session.channel_shadow),
             )
             .await;
+        let mut deferred_channel_removals = Vec::new();
         for message in messages {
+            if matches!(message, Message::ChannelRemove(_)) {
+                deferred_channel_removals.extend(
+                    shitspeak_runtime::channel_handler::project_channel_message(
+                        &server,
+                        &client,
+                        &session.channel_tree_shadow,
+                        &message,
+                    )
+                    .await,
+                );
+                continue;
+            }
             send_web_outbound_message_with_synthetic(
                 stream,
                 &server,
                 &client,
                 session.peer.as_ref(),
+                &mut session.channel_tree_shadow,
                 &mut session.channel_shadow,
                 &mut session.user_visibility,
                 &server_id,
@@ -1571,24 +1650,36 @@ async fn send_web_channel_log_gap(
             )
             .await?;
         }
-        let refresh_scope =
-            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
-                &server,
-                &op,
-                &mut session.user_visibility,
-            )
-            .await;
-        send_web_visibility_refresh(
+        send_prepared_web_visibility_refresh(
             stream,
             &server,
             &client,
             session.peer.as_ref(),
+            &mut session.channel_tree_shadow,
             &mut session.channel_shadow,
             &mut session.user_visibility,
             &server_id,
+            channel_refresh,
             refresh_scope,
         )
         .await?;
+        for message in deferred_channel_removals {
+            if let Message::ChannelRemove(channel_remove) = &message {
+                if !session
+                    .channel_tree_shadow
+                    .contains(&channel_remove.channel_id)
+                {
+                    continue;
+                }
+            }
+            session.channel_tree_shadow.sync_message(&message);
+            send_web_outbound_message(stream, session.peer.as_ref(), message).await?;
+        }
+        shitspeak_runtime::channel_handler::remove_deleted_channels_from_shadow(
+            server.get_channels(),
+            &op,
+            &mut session.channel_tree_shadow,
+        );
         client.set_last_channel_version(op.version).await;
     }
     Ok(())
@@ -1648,6 +1739,7 @@ async fn send_web_client_log_update(
         &server,
         &client,
         session.peer.as_ref(),
+        &mut session.channel_tree_shadow,
         &mut session.channel_shadow,
         &mut session.user_visibility,
         &server_id,
@@ -1787,6 +1879,7 @@ async fn send_web_client_log_gap(
             &server,
             &client,
             session.peer.as_ref(),
+            &mut session.channel_tree_shadow,
             &mut session.channel_shadow,
             &mut session.user_visibility,
             &server_id,
@@ -1807,6 +1900,7 @@ async fn send_web_client_log_message_with_acl_refresh_scope(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     peer: Option<&WebRtcPeer>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
@@ -1819,6 +1913,7 @@ async fn send_web_client_log_message_with_acl_refresh_scope(
             server,
             client,
             peer,
+            channel_tree_shadow,
             channel_shadow,
             user_visibility,
             server_id,
@@ -1832,6 +1927,7 @@ async fn send_web_client_log_message_with_acl_refresh_scope(
         server,
         client,
         peer,
+        channel_tree_shadow,
         channel_shadow,
         user_visibility,
         server_id,
@@ -1845,6 +1941,7 @@ async fn send_scoped_web_permission_refresh(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     peer: Option<&WebRtcPeer>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
@@ -1856,6 +1953,7 @@ async fn send_scoped_web_permission_refresh(
             server,
             client,
             peer,
+            channel_tree_shadow,
             channel_shadow,
             user_visibility,
             server_id,
@@ -1871,6 +1969,7 @@ async fn send_web_client_log_entry(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     peer: Option<&WebRtcPeer>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
@@ -1890,6 +1989,28 @@ async fn send_web_client_log_entry(
                 scope => scope,
             })
             .unwrap_or(PermissionInfoRefreshScope::All);
+    let visibility_refresh_scope =
+        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
+            server,
+            client,
+            entry,
+            old_viewer_channel_id,
+        )
+        .await;
+    let channel_refresh = shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+        server,
+        client,
+        channel_tree_shadow,
+        &visibility_refresh_scope,
+    )
+    .await;
+
+    let mut channel_additions = Vec::new();
+    channel_refresh.append_additions_to(&mut channel_additions);
+    channel_refresh.apply_additions(channel_tree_shadow);
+    for message in channel_additions {
+        send_web_outbound_message(stream, peer, message).await?;
+    }
 
     for message in entry
         .messages_for_client(
@@ -1904,6 +2025,7 @@ async fn send_web_client_log_entry(
             server,
             client,
             peer,
+            channel_tree_shadow,
             channel_shadow,
             user_visibility,
             server_id,
@@ -1913,22 +2035,16 @@ async fn send_web_client_log_entry(
         .await?;
     }
 
-    let visibility_refresh_scope =
-        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
-            server,
-            client,
-            entry,
-            old_viewer_channel_id,
-        )
-        .await;
-    send_web_visibility_refresh(
+    send_prepared_web_visibility_refresh_without_additions(
         stream,
         server,
         client,
         peer,
+        channel_tree_shadow,
         channel_shadow,
         user_visibility,
         server_id,
+        channel_refresh,
         visibility_refresh_scope,
     )
     .await
@@ -1939,14 +2055,16 @@ async fn send_web_outbound_message_with_synthetic(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     peer: Option<&WebRtcPeer>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
     message: &Message,
 ) -> io::Result<()> {
-    for message in shitspeak_runtime::client::visibility::project_message_with_shadow(
+    for message in shitspeak_runtime::channel_handler::project_message_with_visibility_shadows(
         server,
         client,
+        channel_tree_shadow,
         user_visibility,
         channel_shadow,
         server_id,
@@ -1959,14 +2077,50 @@ async fn send_web_outbound_message_with_synthetic(
     Ok(())
 }
 
-async fn send_web_visibility_refresh(
+async fn send_prepared_web_visibility_refresh(
     stream: &mut (impl AsyncWrite + Unpin),
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     peer: Option<&WebRtcPeer>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
+    channel_refresh: shitspeak_runtime::channel_handler::ChannelVisibilityRefresh,
+    scope: shitspeak_runtime::client::visibility::VisibilityRefreshScope,
+) -> io::Result<()> {
+    let mut additions = Vec::new();
+    channel_refresh.append_additions_to(&mut additions);
+    channel_refresh.apply_additions(channel_tree_shadow);
+    for message in additions {
+        send_web_outbound_message(stream, peer, message).await?;
+    }
+
+    send_prepared_web_visibility_refresh_without_additions(
+        stream,
+        server,
+        client,
+        peer,
+        channel_tree_shadow,
+        channel_shadow,
+        user_visibility,
+        server_id,
+        channel_refresh,
+        scope,
+    )
+    .await
+}
+
+async fn send_prepared_web_visibility_refresh_without_additions(
+    stream: &mut (impl AsyncWrite + Unpin),
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    peer: Option<&WebRtcPeer>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    channel_refresh: shitspeak_runtime::channel_handler::ChannelVisibilityRefresh,
     scope: shitspeak_runtime::client::visibility::VisibilityRefreshScope,
 ) -> io::Result<()> {
     for message in shitspeak_runtime::client::visibility::visibility_refresh_messages_with_shadow(
@@ -1979,6 +2133,13 @@ async fn send_web_visibility_refresh(
     )
     .await
     {
+        send_web_outbound_message(stream, peer, message).await?;
+    }
+
+    let mut removals = Vec::new();
+    channel_refresh.apply_removals(channel_tree_shadow);
+    channel_refresh.append_removals_to(&mut removals);
+    for message in removals {
         send_web_outbound_message(stream, peer, message).await?;
     }
     Ok(())
@@ -2925,6 +3086,7 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
+            hide_channels_without_traverse: false,
             show_node_id_for_superusers: true,
             acl: shitspeak_runtime_config::AclConfig::default(),
             privacy: shitspeak_runtime_config::PrivacyConfig::default(),

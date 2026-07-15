@@ -169,6 +169,9 @@ pub async fn handle_request_blob(
 
     // ── Channel descriptions ─────────────────────────────────────────────
     for channel_id in &msg.channel_description {
+        if !crate::channel_handler::can_view_channel(server, sender, *channel_id).await {
+            continue;
+        }
         let Some(ch) = server
             .get_channels()
             .get_channel_in_server(&server_id, *channel_id)
@@ -189,11 +192,18 @@ pub async fn handle_request_blob(
             None => None,
         };
 
+        let mut links = Vec::with_capacity(ch.links.len());
+        for linked_id in &ch.links {
+            if crate::channel_handler::can_view_channel(server, sender, *linked_id).await {
+                links.push(*linked_id);
+            }
+        }
+
         let mut cs = crate::messages::encoder::ChannelState {
             channel_id: Some(ch.id),
             parent: ch.parent_id,
             name: Some(ch.name.clone()),
-            links: ch.links.iter().copied().collect(),
+            links,
             description: desc_data
                 .as_ref()
                 .and_then(|b| String::from_utf8(b.to_vec()).ok()),

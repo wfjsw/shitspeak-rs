@@ -102,12 +102,23 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         required_groups: Vec::new(),
         send_permission_info: false,
         hide_users_without_traverse: false,
+        hide_channels_without_traverse: false,
         show_node_id_for_superusers: true,
         acl: shitspeak_runtime_config::AclConfig::default(),
         s2s: shitspeak_runtime_config::S2sConfig::default(),
         web: shitspeak_runtime_config::WebConfig::default(),
         privacy: shitspeak_runtime_config::PrivacyConfig::default(),
     }
+}
+
+#[test]
+fn channel_visibility_requires_user_visibility() {
+    let mut config = test_config(Vec::new());
+    config.hide_channels_without_traverse = true;
+    assert!(validate_visibility_config(&config).is_err());
+
+    config.hide_users_without_traverse = true;
+    assert!(validate_visibility_config(&config).is_ok());
 }
 
 struct TestIdentityFixture {

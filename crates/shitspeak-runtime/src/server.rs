@@ -65,6 +65,16 @@ const UDP_PROCESSING_MIN_HARD_CAPACITY: usize =
     UDP_PROCESSING_MIN_BASELINE_CAPACITY * UDP_PROCESSING_BURST_MULTIPLIER;
 const UDP_PROCESSING_PACKETS_PER_USER_HARD_CAP: usize = 128;
 
+fn validate_visibility_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.hide_channels_without_traverse && !config.hide_users_without_traverse {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hide_channels_without_traverse requires hide_users_without_traverse",
+        )));
+    }
+    Ok(())
+}
+
 fn channel_repo_tuning(config: &Config) -> ChannelRepoTuning {
     ChannelRepoTuning {
         log_max_entries: config.channel_log_max_entries.max(1),
@@ -235,6 +245,7 @@ impl Server {
             .iter()
             .map(|proxy| AnyIpCidr::from_str(proxy))
             .collect::<Result<Vec<_>, _>>()?;
+        validate_visibility_config(&config)?;
         validate_privacy_config(&config)?;
 
         let tls_acceptor = load_c2s_tls_acceptor(&config, &extensions)?;
@@ -1460,6 +1471,7 @@ impl Server {
     pub async fn reload_config(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
         match Config::reload() {
             Ok(Some(new_config)) => {
+                validate_visibility_config(&new_config)?;
                 validate_privacy_config(&new_config)?;
                 new_config.voice.dispatch().validate().map_err(|error| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
@@ -1597,6 +1609,15 @@ impl Server {
                             "config reload: hide_users_without_traverse {} -> {}",
                             current.hide_users_without_traverse,
                             new_config.hide_users_without_traverse
+                        );
+                    }
+                    if current.hide_channels_without_traverse
+                        != new_config.hide_channels_without_traverse
+                    {
+                        tracing::info!(
+                            "config reload: hide_channels_without_traverse {} -> {}",
+                            current.hide_channels_without_traverse,
+                            new_config.hide_channels_without_traverse
                         );
                     }
                     if current.show_node_id_for_superusers != new_config.show_node_id_for_superusers
@@ -1802,6 +1823,11 @@ impl Server {
 
     pub fn get_hide_users_without_traverse(&self) -> bool {
         self.read_config().hide_users_without_traverse
+    }
+
+    pub fn get_hide_channels_without_traverse(&self) -> bool {
+        let config = self.read_config();
+        config.hide_channels_without_traverse && config.hide_users_without_traverse
     }
 
     pub fn get_show_node_id_for_superusers(&self) -> bool {

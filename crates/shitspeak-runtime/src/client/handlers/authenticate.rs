@@ -5,8 +5,8 @@ use bytes::Bytes;
 use crate::{
     api::{AuthenticateAuxiliaryData, AuthenticationRejection, canonical_authenticator_ip},
     channel_handler::{
-        SessionChannelShadow, build_channel_permission_info_refresh_messages,
-        build_channel_state_message_without_permission_info, ordered_snapshot_channels,
+        ChannelTreeShadow, SessionChannelShadow, build_channel_permission_info_refresh_messages,
+        build_visible_channel_snapshot_messages,
     },
     client::{Client, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
@@ -417,8 +417,7 @@ pub async fn handle_authenticate(
         .snapshot_with_version_and_subscription_in_server(&server_id);
     sender.stage_channel_state_subscription(channel_version, channel_state_rx);
 
-    let channel_tree_shadow = all_channels.iter().map(|channel| channel.id).collect();
-    let ordered_channels = ordered_snapshot_channels(&all_channels);
+    let mut channel_tree_shadow = ChannelTreeShadow::new();
     let mut session_channel_shadow = SessionChannelShadow::new();
     let mut user_visibility = crate::client::visibility::UserVisibilityState::default();
     let viewer_independent_user_state =
@@ -432,10 +431,16 @@ pub async fn handle_authenticate(
 
     // 1. Channel tree — BFS from root
     {
-        for channel in &ordered_channels {
-            let cs =
-                build_channel_state_message_without_permission_info(server, sender, channel).await;
-            push_burst(cs.into());
+        for message in build_visible_channel_snapshot_messages(
+            server,
+            sender,
+            &all_channels,
+            &mut channel_tree_shadow,
+            false,
+        )
+        .await
+        {
+            push_burst(message);
         }
     }
 

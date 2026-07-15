@@ -1204,6 +1204,11 @@ pub struct Config {
     #[serde(default)]
     pub hide_users_without_traverse: bool,
 
+    /// When `true`, clients only receive channels they can Traverse. Default:
+    /// `false`.
+    #[serde(default)]
+    pub hide_channels_without_traverse: bool,
+
     /// When `true`, superusers see the hosting S2S node id appended to each
     /// user's display name in outgoing `UserState` messages. Default: `true`.
     #[serde(default = "default_true")]

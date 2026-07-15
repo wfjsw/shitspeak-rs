@@ -458,6 +458,14 @@ impl VisibilityRefreshScope {
         self.include_user_state_names = true;
     }
 
+    pub(crate) fn channel_ids(&self) -> &HashSet<u32> {
+        &self.channels
+    }
+
+    pub(crate) fn includes_all_channels(&self) -> bool {
+        self.include_all_channels
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
             && self.channels.is_empty()
@@ -1206,6 +1214,7 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
         }
         ChannelOp::InstallSnapshot { channels, .. } => {
             scope.include_channels(channels.iter().map(|channel| channel.id));
+            scope.include_all_channels();
             scope.include_known_users();
         }
         ChannelOp::MarkPendingDelete { .. }

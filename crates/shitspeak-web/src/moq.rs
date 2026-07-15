@@ -17,7 +17,7 @@ use crate::session::{
 };
 use crate::voice::{InboundVoiceMetadata, SsrcAllocator, VoiceTargetKind};
 use shitspeak_runtime::api::Authenticator;
-use shitspeak_runtime::channel_handler::SessionChannelShadow;
+use shitspeak_runtime::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOperation};
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{Client, client_session_identifier::ClientSessionIdentifier};
@@ -564,6 +564,7 @@ pub struct MoqSessionRuntime {
     channel_log_rx:
         Option<tokio::sync::broadcast::Receiver<Arc<shitspeak_state::ChannelOperation>>>,
     voice_rx: Option<mpsc::Receiver<Bytes>>,
+    channel_tree_shadow: ChannelTreeShadow,
     channel_shadow: SessionChannelShadow,
     user_visibility: UserVisibilityState,
     inbound_voice: InboundVoiceMetadata,
@@ -579,6 +580,7 @@ impl MoqSessionRuntime {
             client_log_rx: None,
             channel_log_rx: None,
             voice_rx: None,
+            channel_tree_shadow: ChannelTreeShadow::new(),
             channel_shadow: SessionChannelShadow::new(),
             user_visibility: UserVisibilityState::default(),
             inbound_voice: InboundVoiceMetadata::new(),
@@ -677,6 +679,7 @@ impl MoqSessionRuntime {
             initial_server_events(
                 &server,
                 &client,
+                &mut self.channel_tree_shadow,
                 &mut self.channel_shadow,
                 &mut self.user_visibility,
             )
@@ -919,6 +922,21 @@ impl MoqSessionRuntime {
         if op.version > last + 1 {
             return self.channel_log_gap_events().await;
         }
+        let refresh_scope =
+            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+                &server,
+                &op,
+                &mut self.user_visibility,
+            )
+            .await;
+        let channel_refresh =
+            shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+                &server,
+                &client,
+                &self.channel_tree_shadow,
+                &refresh_scope,
+            )
+            .await;
         let messages =
             shitspeak_runtime::channel_handler::convert_channel_operation_to_messages_with_shadow(
                 &server,
@@ -929,11 +947,25 @@ impl MoqSessionRuntime {
             )
             .await;
         let mut events = Vec::new();
+        let mut deferred_channel_removals = Vec::new();
         for message in messages {
+            if matches!(message, Message::ChannelRemove(_)) {
+                deferred_channel_removals.extend(
+                    shitspeak_runtime::channel_handler::project_channel_message(
+                        &server,
+                        &client,
+                        &self.channel_tree_shadow,
+                        &message,
+                    )
+                    .await,
+                );
+                continue;
+            }
             events.extend(
                 message_with_synthetic_events(
                     &server,
                     &client,
+                    &mut self.channel_tree_shadow,
                     &mut self.channel_shadow,
                     &mut self.user_visibility,
                     &server_id,
@@ -942,23 +974,37 @@ impl MoqSessionRuntime {
                 .await,
             );
         }
-        let refresh_scope =
-            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
-                &server,
-                &op,
-                &mut self.user_visibility,
-            )
-            .await;
         events.extend(
-            visibility_refresh_events(
+            prepared_visibility_refresh_events(
                 &server,
                 &client,
+                &mut self.channel_tree_shadow,
                 &mut self.channel_shadow,
                 &mut self.user_visibility,
                 &server_id,
+                channel_refresh,
                 refresh_scope,
             )
             .await,
+        );
+        for message in deferred_channel_removals {
+            if let Message::ChannelRemove(channel_remove) = &message {
+                if !self
+                    .channel_tree_shadow
+                    .contains(&channel_remove.channel_id)
+                {
+                    continue;
+                }
+            }
+            self.channel_tree_shadow.sync_message(&message);
+            if let Some(event) = server_event_from_message(message) {
+                events.push(event);
+            }
+        }
+        shitspeak_runtime::channel_handler::remove_deleted_channels_from_shadow(
+            server.get_channels(),
+            &op,
+            &mut self.channel_tree_shadow,
         );
         client.set_last_channel_version(op.version).await;
         Ok(events)
@@ -983,6 +1029,21 @@ impl MoqSessionRuntime {
         }
         let mut events = Vec::new();
         for op in missed {
+            let refresh_scope =
+                shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+                    &server,
+                    &op,
+                    &mut self.user_visibility,
+                )
+                .await;
+            let channel_refresh =
+                shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+                    &server,
+                    &client,
+                    &self.channel_tree_shadow,
+                    &refresh_scope,
+                )
+                .await;
             let messages =
                 shitspeak_runtime::channel_handler::convert_channel_operation_to_messages_with_shadow(
                     &server,
@@ -992,11 +1053,25 @@ impl MoqSessionRuntime {
                     Some(&mut self.channel_shadow),
                 )
                 .await;
+            let mut deferred_channel_removals = Vec::new();
             for message in messages {
+                if matches!(message, Message::ChannelRemove(_)) {
+                    deferred_channel_removals.extend(
+                        shitspeak_runtime::channel_handler::project_channel_message(
+                            &server,
+                            &client,
+                            &self.channel_tree_shadow,
+                            &message,
+                        )
+                        .await,
+                    );
+                    continue;
+                }
                 events.extend(
                     message_with_synthetic_events(
                         &server,
                         &client,
+                        &mut self.channel_tree_shadow,
                         &mut self.channel_shadow,
                         &mut self.user_visibility,
                         &server_id,
@@ -1005,23 +1080,37 @@ impl MoqSessionRuntime {
                     .await,
                 );
             }
-            let refresh_scope =
-                shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
-                    &server,
-                    &op,
-                    &mut self.user_visibility,
-                )
-                .await;
             events.extend(
-                visibility_refresh_events(
+                prepared_visibility_refresh_events(
                     &server,
                     &client,
+                    &mut self.channel_tree_shadow,
                     &mut self.channel_shadow,
                     &mut self.user_visibility,
                     &server_id,
+                    channel_refresh,
                     refresh_scope,
                 )
                 .await,
+            );
+            for message in deferred_channel_removals {
+                if let Message::ChannelRemove(channel_remove) = &message {
+                    if !self
+                        .channel_tree_shadow
+                        .contains(&channel_remove.channel_id)
+                    {
+                        continue;
+                    }
+                }
+                self.channel_tree_shadow.sync_message(&message);
+                if let Some(event) = server_event_from_message(message) {
+                    events.push(event);
+                }
+            }
+            shitspeak_runtime::channel_handler::remove_deleted_channels_from_shadow(
+                server.get_channels(),
+                &op,
+                &mut self.channel_tree_shadow,
             );
             client.set_last_channel_version(op.version).await;
         }
@@ -1072,6 +1161,7 @@ impl MoqSessionRuntime {
         let events = client_log_entry_events(
             &server,
             &client,
+            &mut self.channel_tree_shadow,
             &mut self.channel_shadow,
             &mut self.user_visibility,
             &server_id,
@@ -1108,6 +1198,7 @@ impl MoqSessionRuntime {
                 client_log_entry_events(
                     &server,
                     &client,
+                    &mut self.channel_tree_shadow,
                     &mut self.channel_shadow,
                     &mut self.user_visibility,
                     &server_id,
@@ -1313,14 +1404,16 @@ async fn recv_broadcast_now<T: Clone>(
 async fn message_with_synthetic_events(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
     message: &Message,
 ) -> Vec<ServerEvent> {
-    shitspeak_runtime::client::visibility::project_message_with_shadow(
+    shitspeak_runtime::channel_handler::project_message_with_visibility_shadows(
         server,
         client,
+        channel_tree_shadow,
         user_visibility,
         channel_shadow,
         server_id,
@@ -1341,6 +1434,7 @@ fn is_acl_cache_flush_message(message: &Message) -> bool {
 async fn client_log_message_events_with_acl_refresh(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
@@ -1360,6 +1454,7 @@ async fn client_log_message_events_with_acl_refresh(
                 message_with_synthetic_events(
                     server,
                     client,
+                    channel_tree_shadow,
                     channel_shadow,
                     user_visibility,
                     server_id,
@@ -1381,6 +1476,7 @@ async fn client_log_message_events_with_acl_refresh(
                     message_with_synthetic_events(
                         server,
                         client,
+                        channel_tree_shadow,
                         channel_shadow,
                         user_visibility,
                         server_id,
@@ -1396,6 +1492,7 @@ async fn client_log_message_events_with_acl_refresh(
     message_with_synthetic_events(
         server,
         client,
+        channel_tree_shadow,
         channel_shadow,
         user_visibility,
         server_id,
@@ -1405,15 +1502,56 @@ async fn client_log_message_events_with_acl_refresh(
 }
 
 #[cfg(feature = "moq")]
-async fn visibility_refresh_events(
+async fn prepared_visibility_refresh_events(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
+    channel_refresh: shitspeak_runtime::channel_handler::ChannelVisibilityRefresh,
     scope: shitspeak_runtime::client::visibility::VisibilityRefreshScope,
 ) -> Vec<ServerEvent> {
-    shitspeak_runtime::client::visibility::visibility_refresh_messages_with_shadow(
+    let mut events = Vec::new();
+    let mut additions = Vec::new();
+    channel_refresh.append_additions_to(&mut additions);
+    channel_refresh.apply_additions(channel_tree_shadow);
+    for message in additions {
+        if let Some(event) = server_event_from_message(message) {
+            events.push(event);
+        }
+    }
+
+    events.extend(
+        visibility_refresh_events_without_channel_additions(
+            server,
+            client,
+            channel_tree_shadow,
+            channel_shadow,
+            user_visibility,
+            server_id,
+            channel_refresh,
+            scope,
+        )
+        .await,
+    );
+    events
+}
+
+#[cfg(feature = "moq")]
+async fn visibility_refresh_events_without_channel_additions(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    channel_refresh: shitspeak_runtime::channel_handler::ChannelVisibilityRefresh,
+    scope: shitspeak_runtime::client::visibility::VisibilityRefreshScope,
+) -> Vec<ServerEvent> {
+    let mut events = Vec::new();
+
+    for message in shitspeak_runtime::client::visibility::visibility_refresh_messages_with_shadow(
         server,
         client,
         user_visibility,
@@ -1422,22 +1560,59 @@ async fn visibility_refresh_events(
         scope,
     )
     .await
-    .into_iter()
-    .filter_map(server_event_from_message)
-    .collect()
+    {
+        if let Some(event) = server_event_from_message(message) {
+            events.push(event);
+        }
+    }
+
+    let mut removals = Vec::new();
+    channel_refresh.apply_removals(channel_tree_shadow);
+    channel_refresh.append_removals_to(&mut removals);
+    for message in removals {
+        if let Some(event) = server_event_from_message(message) {
+            events.push(event);
+        }
+    }
+    events
 }
 
 #[cfg(feature = "moq")]
 async fn client_log_entry_events(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
     server_id: &str,
     entry: &ClientStateLogEntry,
 ) -> Vec<ServerEvent> {
     let old_viewer_channel_id = channel_shadow.get(&client.get_session_id()).copied();
+    let scope =
+        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
+            server,
+            client,
+            entry,
+            old_viewer_channel_id,
+        )
+        .await;
+    let channel_refresh = shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+        server,
+        client,
+        channel_tree_shadow,
+        &scope,
+    )
+    .await;
     let mut events = Vec::new();
+    let mut additions = Vec::new();
+    channel_refresh.append_additions_to(&mut additions);
+    channel_refresh.apply_additions(channel_tree_shadow);
+    for message in additions {
+        if let Some(event) = server_event_from_message(message) {
+            events.push(event);
+        }
+    }
+
     for message in entry
         .messages_for_client(
             server.get_clients(),
@@ -1450,6 +1625,7 @@ async fn client_log_entry_events(
             client_log_message_events_with_acl_refresh(
                 server,
                 client,
+                channel_tree_shadow,
                 channel_shadow,
                 user_visibility,
                 server_id,
@@ -1458,21 +1634,15 @@ async fn client_log_entry_events(
             .await,
         );
     }
-    let scope =
-        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
-            server,
-            client,
-            entry,
-            old_viewer_channel_id,
-        )
-        .await;
     events.extend(
-        visibility_refresh_events(
+        visibility_refresh_events_without_channel_additions(
             server,
             client,
+            channel_tree_shadow,
             channel_shadow,
             user_visibility,
             server_id,
+            channel_refresh,
             scope,
         )
         .await,
@@ -2119,6 +2289,7 @@ mod tests {
             required_groups: Vec::new(),
             send_permission_info: false,
             hide_users_without_traverse: false,
+            hide_channels_without_traverse: false,
             show_node_id_for_superusers: true,
             acl: shitspeak_runtime_config::AclConfig::default(),
             privacy: shitspeak_runtime_config::PrivacyConfig::default(),

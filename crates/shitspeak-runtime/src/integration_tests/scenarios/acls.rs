@@ -739,13 +739,6 @@ async fn traverse_visibility_delete_refresh_removes_deleted_listener_channel() {
     alice.remove_channel(91).await;
     alice
         .recv_until(
-            |m| matches!(m, Message::ChannelRemove(cr) if cr.channel_id == 91),
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("alice sees parent removed");
-    let listener_remove = alice
-        .recv_until(
             |m| {
                 matches!(m, Message::UserState(us)
                     if us.session == Some(bob.session_id)
@@ -754,11 +747,15 @@ async fn traverse_visibility_delete_refresh_removes_deleted_listener_channel() {
             },
             Duration::from_secs(2),
         )
-        .await;
-    assert!(
-        listener_remove.is_some(),
-        "delete refresh should remove listener-only stale channels without a full refresh"
-    );
+        .await
+        .expect("delete refresh should remove listener-only stale channels before channel removal");
+    alice
+        .recv_until(
+            |m| matches!(m, Message::ChannelRemove(cr) if cr.channel_id == 91),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees parent removed after listener removal");
 }
 
 #[tokio::test]
@@ -923,6 +920,74 @@ async fn traverse_visibility_initial_sync_filters_hidden_users() {
             .any(|state| state.session == Some(bob.session_id)),
         "initial sync should omit users whose current channel is not traversable"
     );
+    assert!(
+        alice
+            .initial_channel_states
+            .iter()
+            .any(|channel| channel.channel_id == Some(80)),
+        "hide_users_without_traverse alone should preserve channel visibility"
+    );
+}
+
+#[tokio::test]
+async fn traverse_visibility_filters_hidden_channel_requests() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    create_secret_channel(&server, 86).await;
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    alice.drain_now().await;
+
+    alice
+        .send(
+            crate::messages::encoder::PermissionQuery {
+                channel_id: Some(86),
+                permissions: None,
+                flush: None,
+            }
+            .into(),
+        )
+        .await;
+    assert!(
+        alice
+            .recv_until(
+                |m| matches!(m, Message::PermissionQuery(query) if query.channel_id == Some(86)),
+                Duration::from_millis(300),
+            )
+            .await
+            .is_none(),
+        "hidden channel permission queries should not disclose channel state"
+    );
+
+    alice
+        .send(
+            crate::messages::encoder::RequestBlob {
+                session_texture: Vec::new(),
+                session_comment: Vec::new(),
+                channel_description: vec![86],
+            }
+            .into(),
+        )
+        .await;
+    assert!(
+        alice
+            .recv_until(
+                |m| matches!(m, Message::ChannelState(state) if state.channel_id == Some(86)),
+                Duration::from_millis(300),
+            )
+            .await
+            .is_none(),
+        "hidden channel descriptions should not disclose channel state"
+    );
 }
 
 #[tokio::test]
@@ -969,6 +1034,7 @@ async fn traverse_visibility_allows_viewers_with_traverse() {
 async fn traverse_visibility_reconciles_acl_changes() {
     let server = spawn_test_server(TestServerOpts {
         hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
         ..TestServerOpts::default()
     })
     .await;
@@ -1026,28 +1092,76 @@ async fn traverse_visibility_reconciles_acl_changes() {
             true,
         )
         .await;
-    alice
-        .recv_until(
-            |m| matches!(m, Message::UserRemove(ur) if ur.session == bob.session_id),
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("ACL update should hide bob from alice");
+    expect_channel_and_user_hidden(&alice, 82, bob.session_id).await;
     alice.drain_now().await;
 
     carol.set_acls(82, Vec::new(), true).await;
-    alice
-        .recv_until(
-            |m| {
-                matches!(m, Message::UserState(us)
-                    if us.session == Some(bob.session_id)
-                        && us.channel_id == Some(82)
-                        && us.name.as_deref() == Some("bob"))
-            },
-            Duration::from_secs(2),
-        )
+    expect_channel_and_user_revealed(&alice, 82, bob.session_id, "bob").await;
+}
+
+#[tokio::test]
+async fn traverse_visibility_reconciles_online_group_changes() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec!["secret".into()]);
+
+    create_secret_channel(&server, 87).await;
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
         .await
-        .expect("removing the ACL deny should reveal bob again");
+        .expect("bob");
+    bob.move_to_channel(87).await;
+    bob.recv_until(
+        |m| {
+            matches!(m, Message::UserState(us)
+                if us.session == Some(bob.session_id) && us.channel_id == Some(87))
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("bob enters secret channel");
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    assert!(
+        !alice
+            .initial_channel_states
+            .iter()
+            .any(|channel| channel.channel_id == Some(87)),
+        "initial sync should omit channels Alice cannot traverse"
+    );
+    assert!(
+        !alice
+            .initial_user_states
+            .iter()
+            .any(|state| state.session == Some(bob.session_id)),
+        "initial sync should omit users in channels Alice cannot traverse"
+    );
+    alice.drain_now().await;
+
+    let live_alice = connected_client(&server, &alice).await;
+    {
+        let mut state = live_alice.write_global_state(server.server.get_clients());
+        state.set_groups(["secret".to_owned()].into_iter().collect());
+    }
+    expect_channel_and_user_revealed(&alice, 87, bob.session_id, "bob").await;
+    alice.drain_now().await;
+
+    {
+        let mut state = live_alice.write_global_state(server.server.get_clients());
+        state.set_groups(Default::default());
+    }
+    expect_channel_and_user_hidden(&alice, 87, bob.session_id).await;
 }
 
 #[tokio::test]
@@ -1361,6 +1475,89 @@ fn acl_for_group(
         allow,
         deny,
     }
+}
+
+async fn expect_channel_and_user_hidden(client: &TestClient, channel_id: u32, session_id: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut channel_removed = false;
+    let mut user_removed = false;
+    let mut sequence = Vec::new();
+
+    while tokio::time::Instant::now() < deadline && !(channel_removed && user_removed) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = client.recv(remaining).await else {
+            break;
+        };
+        if matches!(&message, Message::ChannelRemove(cr) if cr.channel_id == channel_id) {
+            channel_removed = true;
+            sequence.push("channel-remove");
+        }
+        if matches!(&message, Message::UserRemove(ur) if ur.session == session_id) {
+            user_removed = true;
+            sequence.push("user-remove");
+        }
+    }
+
+    assert!(
+        channel_removed,
+        "channel {channel_id} should be removed when it is no longer traversable"
+    );
+    assert!(
+        user_removed,
+        "user {session_id} should be removed when their channel is no longer traversable"
+    );
+    assert_eq!(
+        sequence,
+        vec!["user-remove", "channel-remove"],
+        "user/listener removals must precede channel removal"
+    );
+}
+
+async fn expect_channel_and_user_revealed(
+    client: &TestClient,
+    channel_id: u32,
+    session_id: u32,
+    user_name: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut channel_revealed = false;
+    let mut user_revealed = false;
+    let mut sequence = Vec::new();
+
+    while tokio::time::Instant::now() < deadline && !(channel_revealed && user_revealed) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = client.recv(remaining).await else {
+            break;
+        };
+        if matches!(&message, Message::ChannelState(cs)
+            if cs.channel_id == Some(channel_id) && cs.name.is_some())
+        {
+            channel_revealed = true;
+            sequence.push("channel-state");
+        }
+        if matches!(&message, Message::UserState(us)
+            if us.session == Some(session_id)
+                && us.channel_id == Some(channel_id)
+                && us.name.as_deref() == Some(user_name))
+        {
+            user_revealed = true;
+            sequence.push("user-state");
+        }
+    }
+
+    assert!(
+        channel_revealed,
+        "channel {channel_id} should be republished when it becomes traversable"
+    );
+    assert!(
+        user_revealed,
+        "user {session_id} should be republished when their channel becomes traversable"
+    );
+    assert_eq!(
+        sequence,
+        vec!["channel-state", "user-state"],
+        "channel must be republished before user state"
+    );
 }
 
 async fn create_secret_channel(

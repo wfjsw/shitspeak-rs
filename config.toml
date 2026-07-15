@@ -33,8 +33,12 @@ cert_required = false
 # (`is_enter_restricted` and `can_enter`), and ACL/enter changes send
 # PermissionQuery refreshes.
 send_permission_info = false
-# When enabled, clients only see users in channels they can Traverse.
+# When enabled, clients only see users/listeners in channels they can Traverse.
 hide_users_without_traverse = false
+# When enabled, clients only see channels they can Traverse. This is separate
+# from hide_users_without_traverse so existing user-only filtering is preserved;
+# it requires hide_users_without_traverse = true.
+hide_channels_without_traverse = false
 # When enabled, superusers see each user's hosting node id appended to display names.
 show_node_id_for_superusers = true
 

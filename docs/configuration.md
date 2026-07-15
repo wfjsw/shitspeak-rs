@@ -107,6 +107,7 @@ blob_storage_dir = "/var/lib/shitspeak-rs"
 required_groups = ["member"]
 send_permission_info = true
 hide_users_without_traverse = true
+hide_channels_without_traverse = true
 show_node_id_for_superusers = true
 
 [authenticator]
@@ -331,10 +332,11 @@ If this list is empty, any authenticated user can connect. If it is non-empty, t
 ```toml
 send_permission_info = true
 hide_users_without_traverse = true
+hide_channels_without_traverse = true
 show_node_id_for_superusers = true
 ```
 
-`send_permission_info` includes per-client channel enter hints in `ChannelState` messages. `hide_users_without_traverse` hides users whose current channel the viewer cannot traverse. `show_node_id_for_superusers` appends a compact node marker such as `[n2]` to display names in `UserState` messages sent to superusers.
+`send_permission_info` includes per-client channel enter hints in `ChannelState` messages. `hide_users_without_traverse` hides users and listeners whose channels the viewer cannot traverse. `hide_channels_without_traverse` separately hides channels the viewer cannot traverse; enable both options to hide the channel and its users/listeners together. The server rejects `hide_channels_without_traverse = true` unless `hide_users_without_traverse = true`. Visibility is reevaluated for affected channels and online users when ACLs or the viewer's user, group, token, or superuser state changes. `show_node_id_for_superusers` appends a compact node marker such as `[n2]` to display names in `UserState` messages sent to superusers.
 
 ### ACL Behavior Toggles
 
@@ -756,6 +758,7 @@ Reloaded successfully at runtime:
 - `geoip`
 - `send_permission_info`
 - `hide_users_without_traverse`
+- `hide_channels_without_traverse`
 - `show_node_id_for_superusers`
 - `[acl]` behavior toggles
 - `[privacy]` certificate hash protection and secret

@@ -141,14 +141,16 @@ pub(super) async fn activate_client_subscriptions(
                 .filter(|client| client.is_authenticated() && client.is_published())
                 .map(|client| (client.get_session_id(), client.get_current_channel_id())),
         );
-        channel_tree_shadow.extend(
-            server
-                .channels
-                .get_all_in_server(&server_id)
-                .await
-                .into_iter()
-                .map(|channel| channel.id),
-        );
+        let channels = server.channels.get_all_in_server(&server_id).await;
+        if server.get_hide_channels_without_traverse() {
+            for channel in channels {
+                if crate::channel_handler::can_view_channel(server, client, channel.id).await {
+                    channel_tree_shadow.insert(channel.id);
+                }
+            }
+        } else {
+            channel_tree_shadow.extend(channels.into_iter().map(|channel| channel.id));
+        }
         if server.get_hide_users_without_traverse() {
             crate::client::visibility::initialize(
                 server,
@@ -565,15 +567,17 @@ async fn write_projected_client_log_message_with_acl_refresh_scope(
 async fn projected_client_log_messages_with_acl_refresh_scope(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     user_visibility: &mut UserVisibilityState,
     session_channel_shadow: &mut SessionChannelShadow,
     server_id: &str,
     message: &Message,
     refresh_scope: PermissionInfoRefreshScope,
 ) -> Vec<Message> {
-    let mut out = crate::client::visibility::project_message_with_shadow(
+    let mut out = project_message_with_visibility_shadows(
         server,
         client,
+        channel_tree_shadow,
         user_visibility,
         session_channel_shadow,
         server_id,
@@ -589,9 +593,10 @@ async fn projected_client_log_messages_with_acl_refresh_scope(
     if should_refresh_permissions {
         for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
             out.extend(
-                crate::client::visibility::project_message_with_shadow(
+                project_message_with_visibility_shadows(
                     server,
                     client,
+                    channel_tree_shadow,
                     user_visibility,
                     session_channel_shadow,
                     server_id,
@@ -603,6 +608,27 @@ async fn projected_client_log_messages_with_acl_refresh_scope(
     }
 
     out
+}
+
+async fn project_message_with_visibility_shadows(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: &Message,
+) -> Vec<Message> {
+    crate::channel_handler::project_message_with_visibility_shadows(
+        server,
+        client,
+        channel_tree_shadow,
+        user_visibility,
+        session_channel_shadow,
+        server_id,
+        message,
+    )
+    .await
 }
 
 async fn append_visibility_refresh_messages(
@@ -682,6 +708,25 @@ async fn append_client_log_entry_messages(
     })
     .unwrap_or(PermissionInfoRefreshScope::All);
 
+    let visibility_refresh_scope =
+        crate::client::visibility::visibility_refresh_scope_for_client_log_entry(
+            server,
+            client,
+            entry,
+            old_viewer_channel_id,
+        )
+        .await;
+    let channel_refresh = crate::channel_handler::prepare_channel_visibility_refresh(
+        server,
+        client,
+        channel_tree_shadow,
+        &visibility_refresh_scope,
+    )
+    .await;
+
+    channel_refresh.apply_additions(channel_tree_shadow);
+    channel_refresh.append_additions_to(out);
+
     for msg in entry
         .messages_for_client(
             &server.clients,
@@ -694,6 +739,7 @@ async fn append_client_log_entry_messages(
             projected_client_log_messages_with_acl_refresh_scope(
                 server,
                 client,
+                channel_tree_shadow,
                 user_visibility,
                 session_channel_shadow,
                 server_id,
@@ -704,14 +750,6 @@ async fn append_client_log_entry_messages(
         );
     }
 
-    let visibility_refresh_scope =
-        crate::client::visibility::visibility_refresh_scope_for_client_log_entry(
-            server,
-            client,
-            entry,
-            old_viewer_channel_id,
-        )
-        .await;
     append_visibility_refresh_messages(
         server,
         client,
@@ -722,6 +760,9 @@ async fn append_client_log_entry_messages(
         out,
     )
     .await;
+
+    channel_refresh.apply_removals(channel_tree_shadow);
+    channel_refresh.append_removals_to(out);
     Ok(())
 }
 
@@ -883,6 +924,20 @@ async fn process_channel_log_result(
                 return Ok(ChannelLogReceiveOutcome::Continue);
             }
 
+            let refresh_scope =
+                crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+                    server,
+                    &op,
+                    user_visibility,
+                )
+                .await;
+            let channel_refresh = crate::channel_handler::prepare_channel_visibility_refresh(
+                server,
+                client,
+                channel_tree_shadow,
+                &refresh_scope,
+            )
+            .await;
             let messages =
                 crate::channel_handler::convert_channel_operation_to_messages_with_shadow(
                     server,
@@ -893,28 +948,41 @@ async fn process_channel_log_result(
                 )
                 .await;
             let mut outbound = Vec::new();
+            let mut deferred_channel_removals = Vec::new();
             for msg in messages {
-                let projected = crate::client::visibility::project_message_with_shadow(
+                if matches!(msg, Message::ChannelRemove(_)) {
+                    deferred_channel_removals.extend(
+                        crate::channel_handler::project_channel_message(
+                            server,
+                            client,
+                            channel_tree_shadow,
+                            &msg,
+                        )
+                        .await,
+                    );
+                    continue;
+                }
+                for projected in project_message_with_visibility_shadows(
                     server,
                     client,
+                    channel_tree_shadow,
                     user_visibility,
                     session_channel_shadow,
                     &client.server_id(),
                     &msg,
                 )
-                .await;
-                for msg in projected {
-                    channel_tree_shadow.sync_message(&msg);
-                    outbound.push(msg);
+                .await
+                {
+                    if matches!(&projected, Message::ChannelRemove(_)) {
+                        deferred_channel_removals.push(projected);
+                    } else {
+                        outbound.push(projected);
+                    }
                 }
             }
-            let refresh_scope =
-                crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
-                    server,
-                    &op,
-                    user_visibility,
-                )
-                .await;
+
+            channel_refresh.apply_additions(channel_tree_shadow);
+            channel_refresh.append_additions_to(&mut outbound);
             let projected = crate::client::visibility::visibility_refresh_messages_with_shadow(
                 server,
                 client,
@@ -928,6 +996,22 @@ async fn process_channel_log_result(
                 channel_tree_shadow.sync_message(&msg);
                 outbound.push(msg);
             }
+            channel_refresh.apply_removals(channel_tree_shadow);
+            channel_refresh.append_removals_to(&mut outbound);
+            for message in deferred_channel_removals {
+                if let Message::ChannelRemove(channel_remove) = &message {
+                    if !channel_tree_shadow.contains(&channel_remove.channel_id) {
+                        continue;
+                    }
+                }
+                channel_tree_shadow.sync_message(&message);
+                outbound.push(message);
+            }
+            crate::channel_handler::remove_deleted_channels_from_shadow(
+                server.get_channels(),
+                &op,
+                channel_tree_shadow,
+            );
             client
                 .write_proto_message_batch(&outbound)
                 .await

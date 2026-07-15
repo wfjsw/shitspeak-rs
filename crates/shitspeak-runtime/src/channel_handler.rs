@@ -145,6 +145,10 @@ impl ChannelTreeShadow {
         self.channel_ids.difference(&other.channel_ids)
     }
 
+    pub(crate) fn channel_ids(&self) -> &HashSet<u32> {
+        &self.channel_ids
+    }
+
     pub fn sync_message(&mut self, message: &Message) {
         match message {
             Message::ChannelState(channel_state) => {
@@ -158,6 +162,308 @@ impl ChannelTreeShadow {
             _ => {}
         }
     }
+}
+
+pub async fn can_view_channel(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+) -> bool {
+    if !server.get_hide_channels_without_traverse() {
+        return true;
+    }
+
+    crate::client::acl::compute_permissions_for_client(server, client, channel_id)
+        .await
+        .contains(shitspeak_state::ACLPermissions::Traverse)
+}
+
+/// Builds a channel snapshot containing only the tree visible to this client.
+/// The shadow records exactly the channel IDs emitted to the socket.
+pub async fn build_visible_channel_snapshot_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    snapshot: &[Channel],
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    include_permission_info: bool,
+) -> Vec<Message> {
+    channel_tree_shadow.clear();
+
+    let mut visible_channel_ids = HashSet::with_capacity(snapshot.len());
+    if server.get_hide_channels_without_traverse() {
+        for channel in snapshot {
+            if can_view_channel(server, client, channel.id).await {
+                visible_channel_ids.insert(channel.id);
+            }
+        }
+    } else {
+        visible_channel_ids.extend(snapshot.iter().map(|channel| channel.id));
+    }
+
+    let mut messages = Vec::with_capacity(visible_channel_ids.len());
+    for channel in ordered_snapshot_channels(snapshot) {
+        if !visible_channel_ids.contains(&channel.id) {
+            continue;
+        }
+        let mut state = build_channel_state_message_with_options(
+            server,
+            client,
+            &channel,
+            include_permission_info,
+        )
+        .await;
+        state
+            .links
+            .retain(|channel_id| visible_channel_ids.contains(channel_id));
+        channel_tree_shadow.insert(channel.id);
+        messages.push(state.into());
+    }
+    messages
+}
+
+/// Filters a channel-scoped message against the state already sent to a
+/// socket. Newly visible channels are introduced by reconciliation with a
+/// complete ChannelState, never by a partial operation delta.
+pub async fn project_channel_message(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &ChannelTreeShadow,
+    message: &Message,
+) -> Vec<Message> {
+    if !server.get_hide_channels_without_traverse() {
+        return vec![message.clone()];
+    }
+
+    match message {
+        Message::ChannelState(channel_state) => {
+            let Some(channel_id) = channel_state.channel_id else {
+                return Vec::new();
+            };
+            if !channel_tree_shadow.contains(&channel_id)
+                || !can_view_channel(server, client, channel_id).await
+            {
+                return Vec::new();
+            }
+
+            let mut projected = channel_state.clone();
+            projected
+                .links
+                .retain(|linked_id| channel_tree_shadow.contains(linked_id));
+            projected
+                .links_add
+                .retain(|linked_id| channel_tree_shadow.contains(linked_id));
+            projected
+                .links_remove
+                .retain(|linked_id| channel_tree_shadow.contains(linked_id));
+            vec![Message::ChannelState(projected)]
+        }
+        Message::ChannelRemove(channel_remove) => channel_tree_shadow
+            .contains(&channel_remove.channel_id)
+            .then(|| vec![message.clone()])
+            .unwrap_or_default(),
+        Message::PermissionQuery(permission_query) => match permission_query.channel_id {
+            None => vec![message.clone()],
+            Some(channel_id)
+                if channel_tree_shadow.contains(&channel_id)
+                    && can_view_channel(server, client, channel_id).await =>
+            {
+                vec![message.clone()]
+            }
+            Some(_) => Vec::new(),
+        },
+        _ => vec![message.clone()],
+    }
+}
+
+pub async fn project_message_with_visibility_shadows(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    user_visibility: &mut crate::client::visibility::UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: &Message,
+) -> Vec<Message> {
+    let channel_projected =
+        project_channel_message(server, client, channel_tree_shadow, message).await;
+    let mut out = Vec::new();
+    for message in channel_projected {
+        let projected = crate::client::visibility::project_message_with_shadow(
+            server,
+            client,
+            user_visibility,
+            session_channel_shadow,
+            server_id,
+            &message,
+        )
+        .await;
+        for message in projected {
+            channel_tree_shadow.sync_message(&message);
+            out.push(message);
+        }
+    }
+    out
+}
+
+/// Remove every channel in a committed delete subtree from the socket-local
+/// shadow. Mumble's wire message names only the deleted parent, while the
+/// client removes its descendants implicitly.
+pub fn remove_deleted_channels_from_shadow(
+    channels: &Arc<ChannelRepository>,
+    op: &ChannelOperation,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+) {
+    let Some(deleted_channel_ids) = channels.delete_visibility_hint_for_operation(op) else {
+        return;
+    };
+    for channel_id in deleted_channel_ids.iter() {
+        channel_tree_shadow.remove(channel_id);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ChannelVisibilityRefresh {
+    additions: Vec<Message>,
+    addition_ids: Vec<u32>,
+    removals: Vec<Message>,
+    removal_ids: Vec<u32>,
+}
+
+impl ChannelVisibilityRefresh {
+    pub fn is_empty(&self) -> bool {
+        self.additions.is_empty() && self.removals.is_empty()
+    }
+
+    pub fn append_additions_to(&self, messages: &mut Vec<Message>) {
+        messages.extend(self.additions.iter().cloned());
+    }
+
+    pub fn append_removals_to(&self, messages: &mut Vec<Message>) {
+        messages.extend(self.removals.iter().cloned());
+    }
+
+    pub fn apply_additions(&self, channel_tree_shadow: &mut ChannelTreeShadow) {
+        for channel_id in &self.addition_ids {
+            channel_tree_shadow.insert(*channel_id);
+        }
+    }
+
+    pub fn apply_removals(&self, channel_tree_shadow: &mut ChannelTreeShadow) {
+        for channel_id in &self.removal_ids {
+            channel_tree_shadow.remove(channel_id);
+        }
+    }
+}
+
+/// Computes visible channel additions/removals after an ACL-sensitive change.
+/// ACL channel operations scope this to their affected subtree; only a change
+/// to the viewing client's ACL inputs asks for the full tree.
+pub async fn prepare_channel_visibility_refresh(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &ChannelTreeShadow,
+    scope: &crate::client::visibility::VisibilityRefreshScope,
+) -> ChannelVisibilityRefresh {
+    if !server.get_hide_channels_without_traverse()
+        || (!scope.includes_all_channels() && scope.channel_ids().is_empty())
+    {
+        return ChannelVisibilityRefresh::default();
+    }
+
+    let server_id = client.server_id();
+    let mut affected_channel_ids = scope.channel_ids().clone();
+    let candidate_channels = if scope.includes_all_channels() {
+        let channels = server.get_channels().get_all_in_server(&server_id).await;
+        affected_channel_ids.extend(channel_tree_shadow.channel_ids().iter().copied());
+        affected_channel_ids.extend(channels.iter().map(|channel| channel.id));
+        channels
+    } else {
+        let mut channels = Vec::with_capacity(affected_channel_ids.len());
+        for channel_id in &affected_channel_ids {
+            if let Some(channel) = server
+                .get_channels()
+                .get_channel_in_server(&server_id, *channel_id)
+                .await
+            {
+                channels.push(channel);
+            }
+        }
+        channels
+    };
+
+    let mut visible_channel_ids = HashSet::with_capacity(candidate_channels.len());
+    for channel in &candidate_channels {
+        if can_view_channel(server, client, channel.id).await {
+            visible_channel_ids.insert(channel.id);
+        }
+    }
+
+    let mut removed_channel_ids = channel_tree_shadow
+        .channel_ids()
+        .iter()
+        .filter(|channel_id| {
+            affected_channel_ids.contains(channel_id) && !visible_channel_ids.contains(channel_id)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    removed_channel_ids.sort_unstable_by(|left, right| right.cmp(left));
+
+    let mut final_visible_channel_ids = channel_tree_shadow.channel_ids().clone();
+    for channel_id in &removed_channel_ids {
+        final_visible_channel_ids.remove(channel_id);
+    }
+    final_visible_channel_ids.extend(visible_channel_ids.iter().copied());
+
+    let mut additions = Vec::with_capacity(visible_channel_ids.len());
+    let mut addition_ids = Vec::with_capacity(visible_channel_ids.len());
+    for channel in ordered_snapshot_channels(&candidate_channels) {
+        if !visible_channel_ids.contains(&channel.id) || channel_tree_shadow.contains(&channel.id) {
+            continue;
+        }
+        let mut state = build_channel_state_message(server, client, &channel).await;
+        state
+            .links
+            .retain(|linked_id| final_visible_channel_ids.contains(linked_id));
+        addition_ids.push(channel.id);
+        additions.push(state.into());
+    }
+
+    let removals = removed_channel_ids
+        .iter()
+        .copied()
+        .map(|channel_id| crate::messages::encoder::ChannelRemove { channel_id }.into())
+        .collect::<Vec<_>>();
+
+    ChannelVisibilityRefresh {
+        additions,
+        addition_ids,
+        removals,
+        removal_ids: removed_channel_ids,
+    }
+}
+
+/// Reconciles the visible channel tree in a single transition order. New
+/// callers that also refresh users should use `prepare_channel_visibility_refresh`
+/// so removals can be placed after the user/listener removals.
+pub async fn reconcile_channel_visibility(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    scope: &crate::client::visibility::VisibilityRefreshScope,
+) -> Vec<Message> {
+    let refresh =
+        prepare_channel_visibility_refresh(server, client, channel_tree_shadow, scope).await;
+    refresh.apply_removals(channel_tree_shadow);
+    refresh.apply_additions(channel_tree_shadow);
+    let mut messages = Vec::with_capacity(
+        refresh
+            .removals
+            .len()
+            .saturating_add(refresh.additions.len()),
+    );
+    refresh.append_removals_to(&mut messages);
+    refresh.append_additions_to(&mut messages);
+    messages
 }
 
 impl FromIterator<u32> for ChannelTreeShadow {
@@ -652,6 +958,16 @@ pub async fn replay_channel_log_gap(
         if entry.version >= current {
             break;
         }
+        let refresh_scope =
+            crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+                server,
+                entry,
+                user_visibility,
+            )
+            .await;
+        let channel_refresh =
+            prepare_channel_visibility_refresh(server, client, channel_tree_shadow, &refresh_scope)
+                .await;
         let messages = convert_channel_operation_to_messages_with_shadow(
             server,
             client,
@@ -660,28 +976,34 @@ pub async fn replay_channel_log_gap(
             Some(session_channel_shadow),
         )
         .await;
+        let mut deferred_channel_removals = Vec::new();
         for msg in messages {
-            let projected = crate::client::visibility::project_message_with_shadow(
+            if matches!(msg, Message::ChannelRemove(_)) {
+                deferred_channel_removals.extend(
+                    project_channel_message(server, client, channel_tree_shadow, &msg).await,
+                );
+                continue;
+            }
+            for projected in project_message_with_visibility_shadows(
                 server,
                 client,
+                channel_tree_shadow,
                 user_visibility,
                 session_channel_shadow,
                 &server_id,
                 &msg,
             )
-            .await;
-            for msg in projected {
-                channel_tree_shadow.sync_message(&msg);
-                outbound.push(msg);
+            .await
+            {
+                if matches!(&projected, Message::ChannelRemove(_)) {
+                    deferred_channel_removals.push(projected);
+                } else {
+                    outbound.push(projected);
+                }
             }
         }
-        let refresh_scope =
-            crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
-                server,
-                entry,
-                user_visibility,
-            )
-            .await;
+        channel_refresh.apply_additions(channel_tree_shadow);
+        channel_refresh.append_additions_to(&mut outbound);
         let projected = crate::client::visibility::visibility_refresh_messages_with_shadow(
             server,
             client,
@@ -695,6 +1017,18 @@ pub async fn replay_channel_log_gap(
             channel_tree_shadow.sync_message(&msg);
             outbound.push(msg);
         }
+        channel_refresh.apply_removals(channel_tree_shadow);
+        channel_refresh.append_removals_to(&mut outbound);
+        for message in deferred_channel_removals {
+            if let Message::ChannelRemove(channel_remove) = &message {
+                if !channel_tree_shadow.contains(&channel_remove.channel_id) {
+                    continue;
+                }
+            }
+            channel_tree_shadow.sync_message(&message);
+            outbound.push(message);
+        }
+        remove_deleted_channels_from_shadow(channels, entry, channel_tree_shadow);
         client.set_last_channel_version(entry.version).await;
     }
 
@@ -717,40 +1051,40 @@ async fn replay_channel_snapshot(
     latest: u64,
 ) -> Result<(), ChannelReplayError> {
     let snapshot = channels.get_all_in_server(server_id).await;
-    let current: ChannelTreeShadow = snapshot.iter().map(|channel| channel.id).collect();
-    let mut removed = channel_tree_shadow
-        .difference(&current)
-        .copied()
-        .collect::<Vec<_>>();
+    let previous = channel_tree_shadow.clone();
+    let mut current = ChannelTreeShadow::new();
+    let messages = build_visible_channel_snapshot_messages(
+        server,
+        client,
+        &snapshot,
+        &mut current,
+        server.get_send_permission_info(),
+    )
+    .await;
+    let mut removed = previous.difference(&current).copied().collect::<Vec<_>>();
     removed.sort_unstable();
 
-    let mut messages = Vec::with_capacity(snapshot.len() + removed.len());
-    for channel in ordered_snapshot_channels(&snapshot) {
-        messages.push(
-            build_channel_state_message(server, client, &channel)
-                .await
-                .into(),
-        );
-    }
-    for channel_id in removed {
-        messages.push(crate::messages::encoder::ChannelRemove { channel_id }.into());
-    }
+    let mut outbound = Vec::with_capacity(messages.len() + removed.len());
+    *channel_tree_shadow = current;
+    outbound.extend(messages);
 
-    let mut outbound = Vec::new();
-    for msg in messages {
-        let projected = crate::client::visibility::project_message_with_shadow(
+    let mut visibility_scope = crate::client::visibility::VisibilityRefreshScope::new();
+    visibility_scope.include_all_channels();
+    visibility_scope.include_known_users();
+    outbound.extend(
+        crate::client::visibility::visibility_refresh_messages_with_shadow(
             server,
             client,
             user_visibility,
             session_channel_shadow,
             server_id,
-            &msg,
+            visibility_scope,
         )
-        .await;
-        for msg in projected {
-            channel_tree_shadow.sync_message(&msg);
-            outbound.push(msg);
-        }
+        .await,
+    );
+
+    for channel_id in removed {
+        outbound.push(crate::messages::encoder::ChannelRemove { channel_id }.into());
     }
 
     client
@@ -758,7 +1092,6 @@ async fn replay_channel_snapshot(
         .await
         .map_err(ChannelReplayError::ClientWriteFailed)?;
 
-    *channel_tree_shadow = current;
     client.set_last_channel_version(latest).await;
     Ok(())
 }

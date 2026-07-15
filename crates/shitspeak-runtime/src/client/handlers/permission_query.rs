@@ -25,6 +25,10 @@ pub async fn handle_permission_query(
     );
 
     if let Some(channel_id) = msg.channel_id {
+        if !crate::channel_handler::can_view_channel(server, sender, channel_id).await {
+            return Ok(());
+        }
+
         // Compute effective permissions using the ACL system
         let perms =
             crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;

@@ -12,7 +12,7 @@ use shitspeak_runtime::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     canonical_authenticator_ip,
 };
-use shitspeak_runtime::channel_handler::SessionChannelShadow;
+use shitspeak_runtime::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use shitspeak_runtime::client::user_info::Credential;
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
@@ -556,6 +556,7 @@ pub fn web_permission_denied(
 pub async fn initial_server_events(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
 ) -> Vec<ServerEvent> {
@@ -563,14 +564,16 @@ pub async fn initial_server_events(
     let mut events = Vec::new();
 
     let channels = server.get_channels().get_all_in_server(&server_id).await;
-    for channel in shitspeak_runtime::channel_handler::ordered_snapshot_channels(&channels) {
-        let channel_state = shitspeak_runtime::channel_handler::build_channel_state_message(
-            server, client, &channel,
-        )
-        .await;
-        if let Some(event) = server_event_from_message(channel_state.into()) {
-            events.push(event);
-        }
+    for message in shitspeak_runtime::channel_handler::build_visible_channel_snapshot_messages(
+        server,
+        client,
+        &channels,
+        channel_tree_shadow,
+        server.get_send_permission_info(),
+    )
+    .await
+    {
+        push_message_event(&mut events, message);
     }
 
     let session_id = client.get_session_id();
@@ -586,9 +589,10 @@ pub async fn initial_server_events(
             continue;
         }
         let user_state: Message = visible.build_user_state_for_broadcast().into();
-        for message in shitspeak_runtime::client::visibility::project_message_with_shadow(
+        for message in shitspeak_runtime::channel_handler::project_message_with_visibility_shadows(
             server,
             client,
+            channel_tree_shadow,
             user_visibility,
             channel_shadow,
             &server_id,
@@ -601,9 +605,10 @@ pub async fn initial_server_events(
     }
 
     let self_state: Message = client.build_user_state_for_broadcast().into();
-    for message in shitspeak_runtime::client::visibility::project_message_with_shadow(
+    for message in shitspeak_runtime::channel_handler::project_message_with_visibility_shadows(
         server,
         client,
+        channel_tree_shadow,
         user_visibility,
         channel_shadow,
         &server_id,
@@ -658,10 +663,19 @@ pub async fn send_initial_server_state_with(
     mut send: impl FnMut(ServerEvent) -> io::Result<()>,
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
 ) -> io::Result<()> {
-    for event in initial_server_events(server, client, channel_shadow, user_visibility).await {
+    for event in initial_server_events(
+        server,
+        client,
+        channel_tree_shadow,
+        channel_shadow,
+        user_visibility,
+    )
+    .await
+    {
         send(event)?;
     }
     Ok(())
