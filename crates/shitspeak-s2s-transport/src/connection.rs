@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -54,6 +54,14 @@ impl OutboundFrame {
         }
     }
 
+    pub(crate) fn from_variant(
+        class: MessageClass,
+        variant: &TransportPayloadVariant,
+        options: SendOptions,
+    ) -> Self {
+        Self::with_options(class, variant.primary.clone(), options)
+    }
+
     pub fn class(&self) -> MessageClass {
         self.class
     }
@@ -67,6 +75,95 @@ impl OutboundFrame {
     }
 }
 
+/// A primary transport payload plus optional disposable sidecars.
+#[derive(Debug, Clone)]
+pub struct TransportPayloadVariant {
+    primary: Bytes,
+    sidecars: Vec<Bytes>,
+}
+
+impl TransportPayloadVariant {
+    pub fn new(primary: Bytes) -> Self {
+        Self {
+            primary,
+            sidecars: Vec::new(),
+        }
+    }
+
+    pub fn with_sidecars(mut self, sidecars: impl IntoIterator<Item = Bytes>) -> Self {
+        self.sidecars = sidecars.into_iter().collect();
+        self
+    }
+
+    pub fn primary(&self) -> &Bytes {
+        &self.primary
+    }
+
+    pub fn sidecars(&self) -> &[Bytes] {
+        &self.sidecars
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        self.primary
+            .len()
+            .saturating_add(self.sidecars.iter().map(Bytes::len).sum::<usize>())
+    }
+}
+
+/// Payload variants selected after the manager chooses a transport.
+#[derive(Debug, Clone)]
+pub struct TransportPayloadPlan {
+    default: TransportPayloadVariant,
+    variants: Vec<(TransportKind, TransportPayloadVariant)>,
+}
+
+impl TransportPayloadPlan {
+    pub fn new(primary: Bytes) -> Self {
+        Self {
+            default: TransportPayloadVariant::new(primary),
+            variants: Vec::new(),
+        }
+    }
+
+    pub fn with_variant(
+        mut self,
+        transport: TransportKind,
+        variant: TransportPayloadVariant,
+    ) -> Self {
+        if let Some(existing) = self
+            .variants
+            .iter_mut()
+            .find(|(kind, _)| *kind == transport)
+        {
+            existing.1 = variant;
+        } else {
+            self.variants.push((transport, variant));
+        }
+        self
+    }
+
+    pub fn default_variant(&self) -> &TransportPayloadVariant {
+        &self.default
+    }
+
+    pub fn variant(&self, transport: TransportKind) -> &TransportPayloadVariant {
+        self.variants
+            .iter()
+            .find(|(kind, _)| *kind == transport)
+            .map(|(_, variant)| variant)
+            .unwrap_or(&self.default)
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        self.default.estimated_bytes().saturating_add(
+            self.variants
+                .iter()
+                .map(|(_, variant)| variant.estimated_bytes())
+                .sum::<usize>(),
+        )
+    }
+}
+
 /// A durable outbound message queued before selecting a transport.
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundEnvelope {
@@ -74,11 +171,12 @@ pub(crate) struct OutboundEnvelope {
     routing_metric: RoutingMetric,
     fixed_transport: Option<TransportKind>,
     class: MessageClass,
-    payload: Bytes,
+    payloads: TransportPayloadPlan,
     options: SendOptions,
 }
 
 impl OutboundEnvelope {
+    #[allow(dead_code)]
     pub fn routed(
         level: ServiceLevel,
         routing_metric: RoutingMetric,
@@ -86,12 +184,28 @@ impl OutboundEnvelope {
         payload: Bytes,
         options: SendOptions,
     ) -> Self {
+        Self::routed_with_payloads(
+            level,
+            routing_metric,
+            class,
+            TransportPayloadPlan::new(payload),
+            options,
+        )
+    }
+
+    pub fn routed_with_payloads(
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        payloads: TransportPayloadPlan,
+        options: SendOptions,
+    ) -> Self {
         Self {
             level,
             routing_metric,
             fixed_transport: None,
             class,
-            payload,
+            payloads,
             options,
         }
     }
@@ -102,12 +216,26 @@ impl OutboundEnvelope {
         payload: Bytes,
         options: SendOptions,
     ) -> Self {
+        Self::fixed_transport_with_payloads(
+            transport,
+            class,
+            TransportPayloadPlan::new(payload),
+            options,
+        )
+    }
+
+    pub fn fixed_transport_with_payloads(
+        transport: TransportKind,
+        class: MessageClass,
+        payloads: TransportPayloadPlan,
+        options: SendOptions,
+    ) -> Self {
         Self {
             level: transport.service_level(),
             routing_metric: RoutingMetric::default_for_level(transport.service_level()),
             fixed_transport: Some(transport),
             class,
-            payload,
+            payloads,
             options,
         }
     }
@@ -129,7 +257,11 @@ impl OutboundEnvelope {
     }
 
     pub fn payload(&self) -> &Bytes {
-        &self.payload
+        self.payloads.default_variant().primary()
+    }
+
+    pub fn payloads(&self) -> &TransportPayloadPlan {
+        &self.payloads
     }
 
     pub fn options(&self) -> SendOptions {
@@ -138,10 +270,6 @@ impl OutboundEnvelope {
 
     pub fn is_expired_at(&self, now: Instant) -> bool {
         self.options.is_expired_at(now)
-    }
-
-    pub fn into_frame(self) -> OutboundFrame {
-        OutboundFrame::with_options(self.class, self.payload, self.options)
     }
 }
 
@@ -565,6 +693,13 @@ pub(crate) struct PeerState {
     address_backoffs: Mutex<HashMap<PeerAddress, BackoffState>>,
     outbound_queue_watermark: Mutex<QueueWatermark>,
     outbound_stream_queue_watermarks: Mutex<HashMap<TransportKind, QueueWatermark>>,
+    /// Current encrypted UDP datagram ceiling for this peer. The UDP endpoint
+    /// lowers it after a packet-too-large error; the manager uses it while
+    /// building transport-specific payload variants.
+    udp_datagram_mtu: AtomicUsize,
+    /// Largest UDP datagram budget we will try after an authenticated probe.
+    udp_datagram_mtu_ceiling: AtomicUsize,
+    udp_datagram_mtu_last_probe: Mutex<Option<Instant>>,
     expired_outbound_drops: ExpiredOutboundDropCounters,
     transport_health_exclusions:
         Mutex<HashMap<(TransportKind, TransportHealthExclusionReason), u64>>,
@@ -600,6 +735,9 @@ impl PeerState {
             address_backoffs: Mutex::new(HashMap::new()),
             outbound_queue_watermark: Mutex::new(QueueWatermark::new(Instant::now())),
             outbound_stream_queue_watermarks: Mutex::new(HashMap::new()),
+            udp_datagram_mtu: AtomicUsize::new(1200),
+            udp_datagram_mtu_ceiling: AtomicUsize::new(1200),
+            udp_datagram_mtu_last_probe: Mutex::new(None),
             expired_outbound_drops: ExpiredOutboundDropCounters::default(),
             transport_health_exclusions: Mutex::new(HashMap::new()),
             outbound_dispatch_notify: Notify::new(),
@@ -629,6 +767,77 @@ impl PeerState {
 
     pub fn outbound_queue_capacity_bytes(&self) -> usize {
         self.outbound_sender.capacity_bytes()
+    }
+
+    pub(crate) fn udp_datagram_mtu(&self) -> usize {
+        self.udp_datagram_mtu.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_udp_datagram_mtu_limits(&self, mtu: usize, ceiling: usize) {
+        self.udp_datagram_mtu.store(mtu, Ordering::Relaxed);
+        self.udp_datagram_mtu_ceiling
+            .store(ceiling.max(mtu), Ordering::Relaxed);
+        *self.udp_datagram_mtu_last_probe.lock() = None;
+    }
+
+    pub(crate) fn reduce_udp_datagram_mtu(&self, rejected_datagram_bytes: usize) -> usize {
+        let mut current = self.udp_datagram_mtu();
+        loop {
+            let reduced = current
+                .min(rejected_datagram_bytes.saturating_sub(64))
+                .max(576);
+            if reduced >= current {
+                return current;
+            }
+            match self.udp_datagram_mtu.compare_exchange_weak(
+                current,
+                reduced,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return reduced,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn claim_udp_datagram_mtu_probe(
+        &self,
+        now: Instant,
+        interval: Duration,
+        step: usize,
+    ) -> Option<usize> {
+        let current = self.udp_datagram_mtu();
+        let ceiling = self.udp_datagram_mtu_ceiling.load(Ordering::Relaxed);
+        if interval.is_zero() || step == 0 || current >= ceiling {
+            return None;
+        }
+        let mut last_probe = self.udp_datagram_mtu_last_probe.lock();
+        if last_probe.is_some_and(|last| now.saturating_duration_since(last) < interval) {
+            return None;
+        }
+        *last_probe = Some(now);
+        Some(current.saturating_add(step).min(ceiling))
+    }
+
+    pub(crate) fn confirm_udp_datagram_mtu(&self, confirmed_mtu: usize) -> usize {
+        let ceiling = self.udp_datagram_mtu_ceiling.load(Ordering::Relaxed);
+        let mut current = self.udp_datagram_mtu();
+        loop {
+            let confirmed = confirmed_mtu.min(ceiling);
+            if confirmed <= current {
+                return current;
+            }
+            match self.udp_datagram_mtu.compare_exchange_weak(
+                current,
+                confirmed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return confirmed,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn notify_outbound_dispatch(&self) {
@@ -1523,6 +1732,33 @@ mod tests {
             MetricsTuning::default(),
             1024 * 1024,
         )
+    }
+
+    #[test]
+    fn udp_mtu_probe_promotes_only_after_confirmation() {
+        let peer = peer_for_address_tests();
+        peer.set_udp_datagram_mtu_limits(1136, 1436);
+        let now = Instant::now();
+
+        assert_eq!(
+            peer.claim_udp_datagram_mtu_probe(now, Duration::from_secs(1), 64),
+            Some(1200)
+        );
+        assert_eq!(peer.udp_datagram_mtu(), 1136);
+        assert_eq!(peer.confirm_udp_datagram_mtu(1200), 1200);
+        assert_eq!(
+            peer.claim_udp_datagram_mtu_probe(now, Duration::from_secs(1), 64),
+            None
+        );
+    }
+
+    #[test]
+    fn rejected_larger_probe_keeps_the_confirmed_udp_budget() {
+        let peer = peer_for_address_tests();
+        peer.set_udp_datagram_mtu_limits(1136, 1436);
+
+        assert_eq!(peer.reduce_udp_datagram_mtu(1200), 1136);
+        assert_eq!(peer.udp_datagram_mtu(), 1136);
     }
 
     #[test]

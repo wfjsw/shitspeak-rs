@@ -22,6 +22,8 @@
 //! register a [`messaging::ServiceInbound`] handler keyed by a
 //! `service_tag` (replications uses `tag = 1`).
 
+pub(crate) mod attachment_metrics;
+pub(crate) mod attachments;
 pub(crate) mod config;
 mod discovery;
 mod distribution;
@@ -62,7 +64,10 @@ pub use error::OverlayError;
 pub use lane::LaneId;
 pub use lsdb::{ApplicationServices, ReplicationServices};
 pub use membership::{MemberIncarnation, MemberSnapshot, MemberStatus, MembershipEvent};
-pub use messaging::{OverlayInboundMessage, OverlaySendOptions, ServiceInbound};
+pub use messaging::{
+    OVERLAY_ATTACHMENT_SERVICE_TAG, OverlayAttachment, OverlayInboundMessage, OverlaySendOptions,
+    ServiceInbound,
+};
 
 /// Dedicated reliable generic-tree service used only by the pre-release gate.
 #[cfg(feature = "pre-release-workload")]
@@ -770,6 +775,38 @@ impl OverlayNetwork {
         .await
     }
 
+    /// Send an unordered unicast with optional opaque attachments. The
+    /// attachment bytes are opportunistically packed by the forwarding path.
+    pub async fn send_unicast_unordered_with_routing_metric_and_attachments(
+        &self,
+        dst: NodeIdentifier,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+        attachments: Vec<OverlayAttachment>,
+        options: OverlaySendOptions,
+    ) -> Result<(), OverlayError> {
+        messaging::send_unicast_unordered_with_routing_metric_and_attachments(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            self.inner.boot_epoch,
+            self.inner.ordering(),
+            dst,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+            attachments,
+            options,
+        )
+        .await
+    }
+
     /// Send to a list of peers — fanned out per next-hop.
     pub async fn send_multicast(
         &self,
@@ -811,6 +848,37 @@ impl OverlayNetwork {
             level,
             class,
             body,
+            options,
+        )
+        .await
+    }
+
+    /// Send a multicast with optional opaque attachments.
+    pub async fn send_multicast_with_routing_metric_and_attachments(
+        &self,
+        dsts: &[NodeIdentifier],
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+        attachments: Vec<OverlayAttachment>,
+        options: OverlaySendOptions,
+    ) -> Result<(), OverlayError> {
+        messaging::send_multicast_with_routing_metric_unordered_and_attachments(
+            &self.inner.transport,
+            &self.inner.routing,
+            self.inner.self_id,
+            self.inner.boot_epoch,
+            self.inner.ordering(),
+            dsts,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            false,
+            attachments,
             options,
         )
         .await
@@ -1093,6 +1161,36 @@ impl OverlayNetwork {
         body: Bytes,
         options: OverlaySendOptions,
     ) -> Result<(), OverlayError> {
+        self.send_multicast_tree_unordered_with_routing_metric_and_group_options_and_attachments(
+            dsts,
+            group,
+            group_version,
+            tag,
+            level,
+            routing_metric,
+            class,
+            body,
+            Vec::new(),
+            options,
+        )
+        .await
+    }
+
+    /// Send a source-rooted multicast tree with optional opaque attachments.
+    /// Attachments are trimmed per logical branch as the tree is forwarded.
+    pub async fn send_multicast_tree_unordered_with_routing_metric_and_group_options_and_attachments(
+        &self,
+        dsts: &[NodeIdentifier],
+        group: u64,
+        group_version: u64,
+        tag: u32,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        body: Bytes,
+        attachments: Vec<OverlayAttachment>,
+        options: OverlaySendOptions,
+    ) -> Result<(), OverlayError> {
         let dsts: Vec<_> = dsts
             .iter()
             .copied()
@@ -1103,13 +1201,14 @@ impl OverlayNetwork {
         }
         let Some(profile) = distribution::profile_for_service(tag) else {
             return self
-                .send_multicast_unordered_with_routing_metric_and_options(
+                .send_multicast_with_routing_metric_and_attachments(
                     &dsts,
                     tag,
                     level,
                     routing_metric,
                     class,
                     body,
+                    attachments.clone(),
                     options,
                 )
                 .await;
@@ -1124,13 +1223,14 @@ impl OverlayNetwork {
         });
         if dsts.is_empty() {
             return self
-                .send_multicast_unordered_with_routing_metric_and_options(
+                .send_multicast_with_routing_metric_and_attachments(
                     &legacy_dsts,
                     tag,
                     level,
                     routing_metric,
                     class,
                     body,
+                    attachments.clone(),
                     options,
                 )
                 .await;
@@ -1207,13 +1307,14 @@ impl OverlayNetwork {
                 legacy_dsts.dedup();
                 if tree_dsts.is_empty() {
                     return self
-                        .send_multicast_unordered_with_routing_metric_and_options(
+                        .send_multicast_with_routing_metric_and_attachments(
                             &legacy_dsts,
                             tag,
                             level,
                             routing_metric,
                             class,
                             body,
+                            attachments.clone(),
                             options,
                         )
                         .await;
@@ -1258,13 +1359,14 @@ impl OverlayNetwork {
                 let mut fallback_dsts = dsts.clone();
                 fallback_dsts.extend(legacy_dsts.iter().copied());
                 return self
-                    .send_multicast_unordered_with_routing_metric_and_options(
+                    .send_multicast_with_routing_metric_and_attachments(
                         &fallback_dsts,
                         tag,
                         level,
                         routing_metric,
                         class,
                         body,
+                        attachments.clone(),
                         options,
                     )
                     .await;
@@ -1373,13 +1475,14 @@ impl OverlayNetwork {
                 let mut fallback_dsts = dsts.clone();
                 fallback_dsts.extend(legacy_dsts.iter().copied());
                 return self
-                    .send_multicast_unordered_with_routing_metric_and_options(
+                    .send_multicast_with_routing_metric_and_attachments(
                         &fallback_dsts,
                         tag,
                         level,
                         routing_metric,
                         class,
                         body,
+                        attachments.clone(),
                         options,
                     )
                     .await;
@@ -1390,33 +1493,36 @@ impl OverlayNetwork {
             .distribution
             .active_tree(scope)
             .expect("distribution candidate activated or prior active retained");
-        let tree_send = messaging::send_multicast_tree_unordered_with_routing_metric_and_options(
-            &self.inner.transport,
-            &self.inner.routing,
-            &self.inner.distribution,
-            &self.inner.neighbor,
-            self.inner.self_id,
-            self.inner.boot_epoch,
-            self.inner.ordering(),
-            active.state(),
-            active.key(),
-            tag,
-            level,
-            routing_metric,
-            class,
-            body.clone(),
-            options,
-        );
+        let tree_send =
+            messaging::send_multicast_tree_unordered_with_routing_metric_and_attachments(
+                &self.inner.transport,
+                &self.inner.routing,
+                &self.inner.distribution,
+                &self.inner.neighbor,
+                self.inner.self_id,
+                self.inner.boot_epoch,
+                self.inner.ordering(),
+                active.state(),
+                active.key(),
+                tag,
+                level,
+                routing_metric,
+                class,
+                body.clone(),
+                attachments.clone(),
+                options,
+            );
         if legacy_dsts.is_empty() {
             return tree_send.await;
         }
-        let legacy_send = self.send_multicast_unordered_with_routing_metric_and_options(
+        let legacy_send = self.send_multicast_with_routing_metric_and_attachments(
             &legacy_dsts,
             tag,
             level,
             routing_metric,
             class,
             body,
+            attachments,
             options,
         );
         let (tree_result, legacy_result) = tokio::join!(tree_send, legacy_send);

@@ -198,6 +198,61 @@ impl TreeState {
         self.hop_ttl
     }
 
+    pub(crate) fn is_valid_for_source(&self, source: NodeIdentifier) -> bool {
+        self.is_valid(source)
+    }
+
+    /// Return the portion of this tree needed by the relay below `child`.
+    /// The path from the original source to the child is retained so the
+    /// existing whole-tree validation rules remain applicable to the hint.
+    pub(crate) fn branch_for_child(
+        &self,
+        source: NodeIdentifier,
+        child: NodeIdentifier,
+    ) -> Option<Self> {
+        if !self.is_reachable_from(source, child) {
+            return None;
+        }
+
+        let all_edges: Vec<_> = self.edges().collect();
+        let mut path_edges = Vec::new();
+        let mut current = child;
+        while current != source {
+            let parent = all_edges
+                .iter()
+                .find_map(|(parent, edge_child)| (*edge_child == current).then_some(*parent))?;
+            path_edges.push((parent, current));
+            current = parent;
+        }
+        path_edges.reverse();
+
+        let mut branch_nodes = HashSet::from([child]);
+        let mut pending = vec![child];
+        while let Some(node) = pending.pop() {
+            for descendant in self.children(node) {
+                if branch_nodes.insert(*descendant) {
+                    pending.push(*descendant);
+                }
+            }
+        }
+        let mut edges = path_edges;
+        edges.extend(all_edges.iter().copied().filter(|(parent, edge_child)| {
+            branch_nodes.contains(parent) && branch_nodes.contains(edge_child)
+        }));
+        let members = self
+            .members
+            .iter()
+            .copied()
+            .filter(|member| branch_nodes.contains(member));
+        let branch = Self::new(source, members, edges).with_hop_ttl_opt(self.hop_ttl);
+        branch.is_valid(source).then_some(branch)
+    }
+
+    fn with_hop_ttl_opt(mut self, hop_ttl: Option<Duration>) -> Self {
+        self.hop_ttl = hop_ttl;
+        self
+    }
+
     fn is_valid(&self, source: NodeIdentifier) -> bool {
         if !self.nodes.contains(&source) || self.members.contains(&source) {
             return false;

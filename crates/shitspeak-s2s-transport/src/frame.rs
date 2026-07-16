@@ -190,6 +190,38 @@ pub fn build_frame(
     }
 }
 
+/// Return the encoded length of an identity-encoded data frame without
+/// allocating a payload-sized buffer. The caller supplies the exact timestamp
+/// used by the frame builder so UDP fit checks share protobuf sizing with the
+/// actual writer.
+pub fn encoded_data_frame_len(
+    src: NodeIdentifier,
+    dst: NodeIdentifier,
+    level: ServiceLevel,
+    class: MessageClass,
+    ts_us: u64,
+    payload_len: usize,
+) -> usize {
+    let empty = build_frame(src, dst, level, FrameType::Data, class, ts_us, Bytes::new());
+    let payload_field_len = if payload_len == 0 {
+        0
+    } else {
+        1usize
+            .saturating_add(encoded_varint_len(payload_len as u64))
+            .saturating_add(payload_len)
+    };
+    empty.encoded_len().saturating_add(payload_field_len)
+}
+
+fn encoded_varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@
 //! exists only to hold send queues, AEAD keys, replay windows, and probe
 //! bookkeeping; it does not represent a DTLS-style connection.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -58,6 +58,18 @@ use super::{
 const MAGIC: [u8; 4] = *b"SSU1";
 const HEADER_LEN: usize = 20;
 const TAG_LEN: usize = 16;
+pub(crate) const UDP_ENCRYPTED_OVERHEAD: usize = HEADER_LEN + TAG_LEN;
+pub(crate) const UDP_MTU_SAFETY_MARGIN: usize = 64;
+pub(crate) const UDP_MIN_DATAGRAM_MTU: usize = 576;
+const UDP_AUTOFIT_PROBE_MTU: usize = 1500;
+const UDP_MTU_PROBE_STEP: usize = 64;
+const UDP_MTU_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const UDP_FRAGMENT_MAGIC: [u8; 4] = *b"SSUF";
+const UDP_FRAGMENT_HEADER_LEN: usize = 20;
+const UDP_FRAGMENT_TTL: Duration = Duration::from_secs(2);
+const UDP_FRAGMENT_MAX_IN_FLIGHT: usize = 64;
+const UDP_FRAGMENT_MAX_COUNT: usize = 2048;
+const UDP_FRAGMENT_MAX_FRAME_ENVELOPE_BYTES: usize = 64;
 const X25519_PUBLIC_KEY_LEN: usize = 32;
 const MAX_HANDSHAKE_DATAGRAM: usize = 16 * 1024;
 const UDP_KEEPALIVE_MISS_CLOSE_THRESHOLD: usize = 3;
@@ -78,6 +90,20 @@ const SUPPORTED_SIGNATURE_SCHEMES: &[SignatureScheme] = &[
     SignatureScheme::RSA_PSS_SHA256,
     SignatureScheme::RSA_PKCS1_SHA256,
 ];
+
+pub(crate) fn initial_udp_datagram_mtu(configured_mtu: usize) -> usize {
+    configured_mtu
+        .saturating_sub(UDP_MTU_SAFETY_MARGIN)
+        .max(UDP_MIN_DATAGRAM_MTU)
+        .min(udp_datagram_mtu_ceiling(configured_mtu))
+}
+
+pub(crate) fn udp_datagram_mtu_ceiling(configured_mtu: usize) -> usize {
+    configured_mtu
+        .max(UDP_AUTOFIT_PROBE_MTU)
+        .saturating_sub(UDP_MTU_SAFETY_MARGIN)
+        .max(UDP_MIN_DATAGRAM_MTU)
+}
 
 pub(crate) struct UdpEndpoint {
     identity: Arc<NodeIdentity>,
@@ -411,11 +437,30 @@ impl UdpIo {
 
 struct PreparedUdpData {
     datagram: Vec<u8>,
+    plaintext: Bytes,
     #[cfg(debug_assertions)]
     frame_type: i32,
     class: MessageClass,
     expires_at: Option<Instant>,
     original_payload_len: usize,
+}
+
+#[derive(Default)]
+struct UdpFragmentCache {
+    entries: HashMap<u64, UdpFragmentEntry>,
+}
+
+struct UdpFragmentEntry {
+    total_bytes: usize,
+    fragment_count: usize,
+    fragments: BTreeMap<usize, Bytes>,
+    expires_at: Instant,
+}
+
+enum UdpFragmentOutcome {
+    Whole(Vec<u8>),
+    Pending,
+    Drop,
 }
 
 #[derive(Default)]
@@ -490,8 +535,10 @@ struct UdpCryptoSession {
     seal_key: LessSafeKey,
     open_key: LessSafeKey,
     send_seq: AtomicU64,
+    next_fragment_id: AtomicU64,
     consecutive_keepalive_misses: AtomicUsize,
     replay: parking_lot::Mutex<ReplayWindow>,
+    fragments: parking_lot::Mutex<UdpFragmentCache>,
     pending: Arc<parking_lot::Mutex<PendingPings>>,
     startup_probe_ready: Notify,
 }
@@ -514,8 +561,10 @@ impl UdpCryptoSession {
             seal_key,
             open_key,
             send_seq: AtomicU64::new(1),
+            next_fragment_id: AtomicU64::new(1),
             consecutive_keepalive_misses: AtomicUsize::new(0),
             replay: parking_lot::Mutex::new(ReplayWindow::default()),
+            fragments: parking_lot::Mutex::new(UdpFragmentCache::default()),
             pending: Arc::new(parking_lot::Mutex::new(PendingPings::new(
                 max_pending_pings,
             ))),
@@ -546,6 +595,10 @@ impl UdpCryptoSession {
                     TransportIoPressureResult::Error,
                     1,
                 );
+                if is_packet_too_large(&e) {
+                    peer.reduce_udp_datagram_mtu(self.socket.overhead() + datagram.len());
+                    return Err(e);
+                }
                 return Err(io::Error::other(format!("udp send: {e}")));
             }
         };
@@ -602,6 +655,15 @@ impl UdpCryptoSession {
                     TransportIoPressureResult::Error,
                     1,
                 );
+                if is_packet_too_large(&e) {
+                    let largest = batch
+                        .iter()
+                        .map(|entry| self.socket.overhead() + entry.datagram.len())
+                        .max()
+                        .unwrap_or(0);
+                    peer.reduce_udp_datagram_mtu(largest);
+                    return Err(e);
+                }
                 return Err(io::Error::other(format!("udp send batch: {e}")));
             }
         };
@@ -664,11 +726,97 @@ impl UdpCryptoSession {
             encode_started_at.elapsed(),
         );
 
+        self.encrypt_plaintext(
+            frame.src_node as NodeIdentifier,
+            frame.dst_node as NodeIdentifier,
+            plaintext,
+            udp_mtu,
+        )
+    }
+
+    fn frame_datagram_mtu(&self, frame: &pb::Frame) -> usize {
+        self.socket.overhead() + HEADER_LEN + frame.encoded_len() + TAG_LEN
+    }
+
+    fn encrypt_data_frame(
+        &self,
+        frame: &pb::Frame,
+        udp_mtu: usize,
+    ) -> io::Result<Vec<(Vec<u8>, Bytes)>> {
+        let mut plaintext = Vec::with_capacity(frame.encoded_len());
+        let encode_started_at = Instant::now();
+        frame
+            .encode(&mut plaintext)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        record_transport_pipeline_stage(
+            TransportKind::Udp,
+            TransportPipelineStage::FrameEncode,
+            encode_started_at.elapsed(),
+        );
+        self.encrypt_plaintext_or_fragments(
+            frame.src_node as NodeIdentifier,
+            frame.dst_node as NodeIdentifier,
+            Bytes::from(plaintext),
+            udp_mtu,
+        )
+    }
+
+    fn encrypt_plaintext_or_fragments(
+        &self,
+        src: NodeIdentifier,
+        dst: NodeIdentifier,
+        plaintext: Bytes,
+        udp_mtu: usize,
+    ) -> io::Result<Vec<(Vec<u8>, Bytes)>> {
+        if HEADER_LEN + plaintext.len() + TAG_LEN <= udp_mtu {
+            let datagram = self.encrypt_plaintext(src, dst, plaintext.to_vec(), udp_mtu)?;
+            return Ok(vec![(datagram, plaintext)]);
+        }
+
+        let fragment_payload_len =
+            udp_mtu.saturating_sub(HEADER_LEN + TAG_LEN + UDP_FRAGMENT_HEADER_LEN);
+        if fragment_payload_len == 0 || plaintext.len() > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "udp frame cannot be fragmented within the datagram budget",
+            ));
+        }
+        let fragment_count = plaintext.len().div_ceil(fragment_payload_len);
+        if fragment_count > UDP_FRAGMENT_MAX_COUNT || fragment_count > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "udp frame exceeds the fragmentation limit",
+            ));
+        }
+        let fragment_id = self.next_fragment_id.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut datagrams = Vec::with_capacity(fragment_count);
+        for (index, chunk) in plaintext.chunks(fragment_payload_len).enumerate() {
+            let mut fragment = Vec::with_capacity(UDP_FRAGMENT_HEADER_LEN + chunk.len());
+            fragment.extend_from_slice(&UDP_FRAGMENT_MAGIC);
+            fragment.extend_from_slice(&fragment_id.to_be_bytes());
+            fragment.extend_from_slice(&(index as u16).to_be_bytes());
+            fragment.extend_from_slice(&(fragment_count as u16).to_be_bytes());
+            fragment.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+            fragment.extend_from_slice(chunk);
+            let fragment = Bytes::from(fragment);
+            let datagram = self.encrypt_plaintext(src, dst, fragment.to_vec(), udp_mtu)?;
+            datagrams.push((datagram, fragment));
+        }
+        Ok(datagrams)
+    }
+
+    fn encrypt_plaintext(
+        &self,
+        src: NodeIdentifier,
+        dst: NodeIdentifier,
+        plaintext: Vec<u8>,
+        udp_mtu: usize,
+    ) -> io::Result<Vec<u8>> {
         let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
         let header = UdpPacketHeader {
             kind: UdpPacketKind::Data,
-            src: frame.src_node as NodeIdentifier,
-            dst: frame.dst_node as NodeIdentifier,
+            src,
+            dst,
             seq,
         };
         let header_bytes = header.encode();
@@ -699,6 +847,81 @@ impl UdpCryptoSession {
         datagram.extend_from_slice(&header_bytes);
         datagram.extend_from_slice(&ciphertext);
         Ok(datagram)
+    }
+
+    fn accept_fragment(&self, plaintext: Vec<u8>, max_frame_bytes: usize) -> UdpFragmentOutcome {
+        if !plaintext.starts_with(&UDP_FRAGMENT_MAGIC) {
+            return UdpFragmentOutcome::Whole(plaintext);
+        }
+        if plaintext.len() < UDP_FRAGMENT_HEADER_LEN {
+            return UdpFragmentOutcome::Drop;
+        }
+        let fragment_id = u64::from_be_bytes(plaintext[4..12].try_into().expect("fragment id"));
+        let fragment_index = usize::from(u16::from_be_bytes(
+            plaintext[12..14].try_into().expect("fragment index"),
+        ));
+        let fragment_count = usize::from(u16::from_be_bytes(
+            plaintext[14..16].try_into().expect("fragment count"),
+        ));
+        let total_bytes = usize::try_from(u32::from_be_bytes(
+            plaintext[16..20].try_into().expect("fragment total bytes"),
+        ))
+        .expect("u32 fits usize");
+        let payload = Bytes::copy_from_slice(&plaintext[UDP_FRAGMENT_HEADER_LEN..]);
+        if fragment_count == 0
+            || fragment_count > UDP_FRAGMENT_MAX_COUNT
+            || fragment_index >= fragment_count
+            || total_bytes == 0
+            || total_bytes > max_frame_bytes.saturating_add(UDP_FRAGMENT_MAX_FRAME_ENVELOPE_BYTES)
+            || payload.len() > total_bytes
+        {
+            return UdpFragmentOutcome::Drop;
+        }
+
+        let mut cache = self.fragments.lock();
+        let now = Instant::now();
+        cache.entries.retain(|_, entry| entry.expires_at > now);
+        if !cache.entries.contains_key(&fragment_id)
+            && cache.entries.len() >= UDP_FRAGMENT_MAX_IN_FLIGHT
+            && let Some(oldest) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(id, _)| *id)
+        {
+            cache.entries.remove(&oldest);
+        }
+        let entry = cache
+            .entries
+            .entry(fragment_id)
+            .or_insert_with(|| UdpFragmentEntry {
+                total_bytes,
+                fragment_count,
+                fragments: BTreeMap::new(),
+                expires_at: now + UDP_FRAGMENT_TTL,
+            });
+        if entry.total_bytes != total_bytes || entry.fragment_count != fragment_count {
+            cache.entries.remove(&fragment_id);
+            return UdpFragmentOutcome::Drop;
+        }
+        entry.expires_at = now + UDP_FRAGMENT_TTL;
+        entry.fragments.entry(fragment_index).or_insert(payload);
+        let received = entry.fragments.values().map(Bytes::len).sum::<usize>();
+        if entry.fragments.len() != fragment_count || received != total_bytes {
+            return UdpFragmentOutcome::Pending;
+        }
+        let mut assembled = Vec::with_capacity(total_bytes);
+        for index in 0..fragment_count {
+            let Some(fragment) = entry.fragments.get(&index) else {
+                return UdpFragmentOutcome::Pending;
+            };
+            assembled.extend_from_slice(fragment);
+        }
+        cache.entries.remove(&fragment_id);
+        (assembled.len() == total_bytes)
+            .then_some(assembled)
+            .map(UdpFragmentOutcome::Whole)
+            .unwrap_or(UdpFragmentOutcome::Drop)
     }
 
     fn decrypt_packet(&self, packet: &[u8], header: UdpPacketHeader) -> io::Result<Vec<u8>> {
@@ -860,6 +1083,10 @@ fn packet_nonce(
         .map_err(|_| io::Error::other("udp nonce construction failed"))
 }
 
+fn is_packet_too_large(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(40 | 90 | 10040))
+}
+
 #[derive(Default)]
 struct ReplayWindow {
     max_seen: u64,
@@ -904,7 +1131,9 @@ async fn run_socket_read_loop(
     inner: Arc<ManagerInner>,
     identity: Arc<NodeIdentity>,
 ) {
-    let buffer_size = inner.cfg().udp_mtu().max(MAX_HANDSHAKE_DATAGRAM) + HEADER_LEN + TAG_LEN;
+    let buffer_size = udp_datagram_mtu_ceiling(inner.cfg().udp_mtu()).max(MAX_HANDSHAKE_DATAGRAM)
+        + HEADER_LEN
+        + TAG_LEN;
     let mut batch = RecvDatagramBatch::new(UDP_RECV_BATCH_MAX_DATAGRAMS, buffer_size);
     loop {
         tokio::select! {
@@ -1161,6 +1390,16 @@ async fn handle_udp_datagram(
         },
     };
 
+    let mut fragment_input = plaintext;
+    let plaintext = loop {
+        match session.accept_fragment(fragment_input, inner.cfg().max_frame_bytes()) {
+            UdpFragmentOutcome::Whole(next) if next.starts_with(&UDP_FRAGMENT_MAGIC) => {
+                fragment_input = next;
+            }
+            UdpFragmentOutcome::Whole(next) => break next,
+            UdpFragmentOutcome::Pending | UdpFragmentOutcome::Drop => return Ok(()),
+        }
+    };
     let decode_started_at = Instant::now();
     let decoded_frame = pb::Frame::decode(&plaintext[..]);
     record_transport_pipeline_stage(
@@ -1205,7 +1444,7 @@ async fn handle_udp_datagram(
         TransportKind::Udp.service_level(),
         inner.cfg().max_frame_bytes(),
         inner.cfg().compression_config(),
-        inner.cfg().udp_mtu(),
+        peer.udp_datagram_mtu(),
     )
     .await
 }
@@ -2548,7 +2787,7 @@ async fn run_write(
         .saturating_mul(2)
         .max(Duration::from_secs(1));
     let mut ping_tick = MaybeInterval::maybe(active_ping_interval);
-    let mut pending_udp_data = None;
+    let mut pending_udp_data = VecDeque::new();
 
     let hello = build_frame(
         inner.self_id(),
@@ -2563,7 +2802,7 @@ async fn run_write(
         biased;
 
         _ = closed.cancelled() => return,
-        result = session.send_frame(&hello, &peer, inner.cfg().udp_mtu()) => result,
+        result = session.send_frame(&hello, &peer, peer.udp_datagram_mtu()) => result,
     };
     if let Err(e) = hello_result {
         warn!(peer=%peer.node_id(), error=%e, "udp encrypted hello failed");
@@ -2576,7 +2815,7 @@ async fn run_write(
 
     let mut remove_session_on_exit = false;
     loop {
-        if let Some(first) = pending_udp_data.take() {
+        if let Some(first) = pending_udp_data.pop_front() {
             let Some(first) = drop_expired_prepared_udp_data(first, &peer) else {
                 continue;
             };
@@ -2592,6 +2831,10 @@ async fn run_write(
             .await
             {
                 warn!(peer=%peer.node_id(), error=%e, "udp encrypted write failed");
+                if is_packet_too_large(&e) {
+                    warn!(peer=%peer.node_id(), mtu=peer.udp_datagram_mtu(), "reduced udp datagram budget after packet-too-large error");
+                    continue;
+                }
                 remove_session_on_exit = true;
                 break;
             }
@@ -2604,15 +2847,18 @@ async fn run_write(
 
             maybe_out = rx.recv() => {
                 let Some(out) = maybe_out else { break };
-                let first = match prepare_udp_data_frame(out, &session, &peer, &inner, level) {
-                    Ok(Some(first)) => first,
-                    Ok(None) => continue,
+                let mut prepared = match prepare_udp_data_frames(out, &session, &peer, &inner, level) {
+                    Ok(prepared) => prepared,
                     Err(e) => {
                         warn!(peer=%peer.node_id(), error=%e, "udp outbound frame preparation failed");
                         remove_session_on_exit = true;
                         break;
                     }
                 };
+                let Some(first) = prepared.pop_front() else {
+                    continue;
+                };
+                pending_udp_data.extend(prepared);
                 match send_udp_data_batch(
                     &session,
                     &peer,
@@ -2625,6 +2871,10 @@ async fn run_write(
                     Ok(()) => {}
                     Err(e) => {
                         warn!(peer=%peer.node_id(), error=%e, "udp encrypted write failed");
+                        if is_packet_too_large(&e) {
+                            warn!(peer=%peer.node_id(), mtu=peer.udp_datagram_mtu(), "reduced udp datagram budget after packet-too-large error");
+                            continue;
+                        }
                         remove_session_on_exit = true;
                         break;
                     }
@@ -2647,19 +2897,33 @@ async fn run_write(
                     break;
                 }
                 let ts = now_us();
-                let frame = build_frame(
-                    inner.self_id(), peer.node_id(), level,
-                    FrameType::KeepAlive, MessageClass::Regular,
-                    ts, Bytes::new(),
+                let probe_mtu = peer.claim_udp_datagram_mtu_probe(
+                    Instant::now(),
+                    UDP_MTU_PROBE_INTERVAL,
+                    UDP_MTU_PROBE_STEP,
                 );
-                match session.send_frame(&frame, &peer, inner.cfg().udp_mtu()).await {
+                let udp_mtu = probe_mtu.unwrap_or_else(|| peer.udp_datagram_mtu());
+                let frame = match probe_mtu {
+                    Some(mtu) => udp_mtu_probe_frame(
+                        inner.self_id(), peer.node_id(), level, ts, mtu, &session,
+                    ),
+                    None => build_frame(
+                        inner.self_id(), peer.node_id(), level,
+                        FrameType::KeepAlive, MessageClass::Regular,
+                        ts, Bytes::new(),
+                    ),
+                };
+                match session.send_frame(&frame, &peer, udp_mtu).await {
                     Ok(_) => {
-                        if session.pending.lock().insert(ts).is_some() {
+                        if session.pending.lock().insert(ts, probe_mtu).is_some() {
                             peer.metrics().record_probe_lost(TransportKind::Udp);
                         }
                     }
                     Err(e) => {
                         warn!(peer=%peer.node_id(), error=%e, "udp encrypted keepalive failed");
+                        if is_packet_too_large(&e) {
+                            continue;
+                        }
                         remove_session_on_exit = true;
                         break;
                     }
@@ -2677,13 +2941,49 @@ async fn run_write(
     trace!(peer=%peer.node_id(), "udp encrypted write pump exited");
 }
 
-fn prepare_udp_data_frame(
+fn udp_mtu_probe_frame(
+    src: NodeIdentifier,
+    dst: NodeIdentifier,
+    level: ServiceLevel,
+    ts: u64,
+    udp_mtu: usize,
+    session: &UdpCryptoSession,
+) -> pb::Frame {
+    let mut frame = build_frame(
+        src,
+        dst,
+        level,
+        FrameType::KeepAlive,
+        MessageClass::Regular,
+        ts,
+        Bytes::new(),
+    );
+    let encoded_budget = session
+        .socket
+        .payload_mtu(udp_mtu)
+        .saturating_sub(UDP_ENCRYPTED_OVERHEAD);
+    let mut low = 0usize;
+    let mut high = encoded_budget.saturating_sub(frame.encoded_len());
+    while low < high {
+        let candidate = low + (high - low).div_ceil(2);
+        frame.payload = Bytes::from(vec![0; candidate]);
+        if frame.encoded_len() <= encoded_budget {
+            low = candidate;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    frame.payload = Bytes::from(vec![0; low]);
+    frame
+}
+
+fn prepare_udp_data_frames(
     out: OutboundFrame,
     session: &UdpCryptoSession,
     peer: &PeerState,
     inner: &ManagerInner,
     level: ServiceLevel,
-) -> io::Result<Option<PreparedUdpData>> {
+) -> io::Result<VecDeque<PreparedUdpData>> {
     let options = out.options();
     if options.is_expired() {
         peer.record_expired_outbound_drop(
@@ -2692,7 +2992,7 @@ fn prepare_udp_data_frame(
             out.class(),
         );
         trace!(peer=%peer.node_id(), "dropping expired outbound udp frame");
-        return Ok(None);
+        return Ok(VecDeque::new());
     }
 
     let original_payload_len = out.payload().len();
@@ -2720,16 +3020,50 @@ fn prepare_udp_data_frame(
     );
     compress_result?;
 
-    let datagram =
-        session.encrypt_frame(&frame, session.socket.payload_mtu(inner.cfg().udp_mtu()))?;
-    Ok(Some(PreparedUdpData {
-        datagram,
-        #[cfg(debug_assertions)]
-        frame_type: frame.frame_type,
-        class,
-        expires_at: options.expires_at(),
-        original_payload_len,
-    }))
+    let datagrams =
+        session.encrypt_data_frame(&frame, session.socket.payload_mtu(peer.udp_datagram_mtu()))?;
+    Ok(datagrams
+        .into_iter()
+        .enumerate()
+        .map(|(index, (datagram, plaintext))| PreparedUdpData {
+            datagram,
+            plaintext,
+            #[cfg(debug_assertions)]
+            frame_type: frame.frame_type,
+            class,
+            expires_at: options.expires_at(),
+            original_payload_len: (index == 0).then_some(original_payload_len).unwrap_or(0),
+        })
+        .collect())
+}
+
+fn reprepare_udp_data(
+    prepared: PreparedUdpData,
+    session: &UdpCryptoSession,
+    peer: &PeerState,
+    inner: &ManagerInner,
+) -> io::Result<VecDeque<PreparedUdpData>> {
+    let datagrams = session.encrypt_plaintext_or_fragments(
+        inner.self_id(),
+        peer.node_id(),
+        prepared.plaintext,
+        session.socket.payload_mtu(peer.udp_datagram_mtu()),
+    )?;
+    Ok(datagrams
+        .into_iter()
+        .enumerate()
+        .map(|(index, (datagram, plaintext))| PreparedUdpData {
+            datagram,
+            plaintext,
+            #[cfg(debug_assertions)]
+            frame_type: prepared.frame_type,
+            class: prepared.class,
+            expires_at: prepared.expires_at,
+            original_payload_len: (index == 0)
+                .then_some(prepared.original_payload_len)
+                .unwrap_or(0),
+        })
+        .collect())
 }
 
 fn drop_expired_prepared_udp_data(
@@ -2756,7 +3090,7 @@ async fn send_udp_data_batch(
     peer: &PeerState,
     inner: &ManagerInner,
     rx: &mut AdaptiveQueueReceiver<OutboundFrame>,
-    pending_udp_data: &mut Option<PreparedUdpData>,
+    pending_udp_data: &mut VecDeque<PreparedUdpData>,
     first: PreparedUdpData,
     level: ServiceLevel,
 ) -> io::Result<()> {
@@ -2765,21 +3099,43 @@ async fn send_udp_data_batch(
     batch.push(first);
 
     while batch.len() < UDP_WRITE_BATCH_MAX_FRAMES && batch_bytes < UDP_WRITE_BATCH_MAX_BYTES {
-        let out = match rx.try_recv() {
-            Ok(out) => out,
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        let prepared = if let Some(prepared) = pending_udp_data.pop_front() {
+            prepared
+        } else {
+            let out = match rx.try_recv() {
+                Ok(out) => out,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            };
+            let mut prepared = prepare_udp_data_frames(out, session, peer, inner, level)?;
+            let Some(first) = prepared.pop_front() else {
+                continue;
+            };
+            pending_udp_data.extend(prepared);
+            first
         };
-        let Some(prepared) = prepare_udp_data_frame(out, session, peer, inner, level)? else {
+        let Some(prepared) = drop_expired_prepared_udp_data(prepared, peer) else {
             continue;
         };
         if let Err(prepared) = push_prepared_udp_data(&mut batch, &mut batch_bytes, prepared) {
-            *pending_udp_data = Some(prepared);
+            pending_udp_data.push_front(prepared);
             break;
         }
     }
 
-    session.send_data_batch(&batch, peer).await?;
+    if let Err(error) = session.send_data_batch(&batch, peer).await {
+        if is_packet_too_large(&error) {
+            let mut retry = VecDeque::new();
+            for prepared in batch {
+                retry.extend(reprepare_udp_data(prepared, session, peer, inner)?);
+            }
+            while let Some(prepared) = retry.pop_back() {
+                pending_udp_data.push_front(prepared);
+            }
+            return Ok(());
+        }
+        return Err(error);
+    }
     for entry in batch {
         peer.metrics()
             .record_payload_sent(TransportKind::Udp, entry.original_payload_len);
@@ -2871,14 +3227,19 @@ async fn handle_frame(
                 frame.ts_us,
                 frame.payload.clone(),
             );
-            session.send_frame(&pong, peer, udp_mtu).await?;
+            session
+                .send_frame(&pong, peer, udp_mtu.max(session.frame_datagram_mtu(&pong)))
+                .await?;
         }
         pb::FrameType::FramePong => {
             let now = now_us();
             if now > frame.ts_us {
                 let rtt = Duration::from_micros(now - frame.ts_us);
                 peer.metrics().record_rtt(TransportKind::Udp, rtt);
-                if session.pending.lock().take(frame.ts_us).is_some() {
+                if let Some(pending) = session.pending.lock().take(frame.ts_us) {
+                    if let Some(mtu) = pending.mtu_probe {
+                        peer.confirm_udp_datagram_mtu(mtu);
+                    }
                     session
                         .consecutive_keepalive_misses
                         .store(0, Ordering::Relaxed);
@@ -2910,6 +3271,7 @@ struct ExpiredPings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingPing {
     sent_at: Instant,
+    mtu_probe: Option<usize>,
 }
 
 impl PendingPings {
@@ -2920,7 +3282,7 @@ impl PendingPings {
         }
     }
 
-    fn insert(&mut self, ts: u64) -> Option<PendingPing> {
+    fn insert(&mut self, ts: u64, mtu_probe: Option<usize>) -> Option<PendingPing> {
         if self.cap == 0 {
             return None;
         }
@@ -2933,6 +3295,7 @@ impl PendingPings {
             ts,
             PendingPing {
                 sent_at: Instant::now(),
+                mtu_probe,
             },
         ));
         evicted
@@ -2955,9 +3318,9 @@ impl PendingPings {
             .front()
             .is_some_and(|(_, pending)| now.saturating_duration_since(pending.sent_at) >= timeout)
         {
-            if self.inner.pop_front().is_some() {
+            if let Some((_, pending)) = self.inner.pop_front() {
                 expired.total += 1;
-                expired.keepalive += 1;
+                expired.keepalive += usize::from(pending.mtu_probe.is_none());
             }
         }
         expired
@@ -3009,6 +3372,112 @@ mod tests {
             .await
             .unwrap(),
         ))
+    }
+
+    async fn test_session() -> UdpCryptoSession {
+        let state = test_socket_state().await;
+        UdpCryptoSession::new(
+            2,
+            SocketAddr::from(([127, 0, 0, 1], 9)),
+            state.socket.clone(),
+            [7; 32],
+            [7; 32],
+            8,
+        )
+        .expect("test crypto session")
+    }
+
+    #[test]
+    fn initial_udp_budget_reserves_a_pppoe_safe_margin() {
+        assert_eq!(initial_udp_datagram_mtu(1200), 1136);
+        assert_eq!(initial_udp_datagram_mtu(600), UDP_MIN_DATAGRAM_MTU);
+        assert_eq!(udp_datagram_mtu_ceiling(1200), 1436);
+    }
+
+    #[tokio::test]
+    async fn mtu_probe_frame_fills_the_candidate_datagram() {
+        let session = test_session().await;
+        let frame = udp_mtu_probe_frame(1, 2, ServiceLevel::BestEffort, 1, 1200, &session);
+
+        assert!(session.frame_datagram_mtu(&frame) <= 1200);
+        assert!(session.frame_datagram_mtu(&frame) > 1200 - 8);
+    }
+
+    #[tokio::test]
+    async fn oversized_data_frame_fragments_and_reassembles_out_of_order() {
+        let session = test_session().await;
+        let body = Bytes::from(vec![0xab; 4096]);
+        let frame = build_frame(
+            1,
+            2,
+            ServiceLevel::BestEffort,
+            FrameType::Data,
+            MessageClass::HighPriority,
+            1,
+            body.clone(),
+        );
+        let fragments = session
+            .encrypt_data_frame(&frame, 575)
+            .expect("fragment oversized frame");
+        assert!(fragments.len() > 1);
+
+        let mut reassembled = None;
+        for (_, fragment) in fragments.into_iter().rev() {
+            if let UdpFragmentOutcome::Whole(frame) =
+                session.accept_fragment(fragment.to_vec(), 16 * 1024)
+            {
+                reassembled = Some(frame);
+            }
+        }
+        let decoded = pb::Frame::decode(reassembled.expect("reassembled frame").as_slice())
+            .expect("decoded transport frame");
+        assert_eq!(decoded.payload, body);
+    }
+
+    #[tokio::test]
+    async fn refragmented_udp_data_reassembles_without_losing_the_original_frame() {
+        let session = test_session().await;
+        let body = Bytes::from(vec![0xcd; 4096]);
+        let frame = build_frame(
+            1,
+            2,
+            ServiceLevel::BestEffort,
+            FrameType::Data,
+            MessageClass::HighPriority,
+            1,
+            body.clone(),
+        );
+        let mut fragments = session
+            .encrypt_data_frame(&frame, 575)
+            .expect("fragment oversized frame");
+        let (_, first_outer_fragment) = fragments.remove(0);
+        let nested = session
+            .encrypt_plaintext_or_fragments(1, 2, first_outer_fragment, 300)
+            .expect("refragment rejected datagram");
+
+        let mut reassembled = None;
+        for (_, nested_fragment) in nested.into_iter().rev() {
+            if let UdpFragmentOutcome::Whole(outer_fragment) =
+                session.accept_fragment(nested_fragment.to_vec(), 16 * 1024)
+            {
+                if let UdpFragmentOutcome::Whole(frame) =
+                    session.accept_fragment(outer_fragment, 16 * 1024)
+                {
+                    reassembled = Some(frame);
+                }
+            }
+        }
+        for (_, outer_fragment) in fragments {
+            if let UdpFragmentOutcome::Whole(frame) =
+                session.accept_fragment(outer_fragment.to_vec(), 16 * 1024)
+            {
+                reassembled = Some(frame);
+            }
+        }
+
+        let decoded = pb::Frame::decode(reassembled.expect("reassembled frame").as_slice())
+            .expect("decoded transport frame");
+        assert_eq!(decoded.payload, body);
     }
     use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
     use std::fs::File;
@@ -3118,12 +3587,12 @@ mod tests {
     fn pending_expiration_counts_keepalives_separately() {
         let mut pending = PendingPings::new(4);
 
-        pending.insert(1);
-        pending.insert(2);
+        pending.insert(1, None);
+        pending.insert(2, Some(1200));
 
         let expired = pending.expire_older_than(Duration::ZERO);
         assert_eq!(expired.total, 2);
-        assert_eq!(expired.keepalive, 2);
+        assert_eq!(expired.keepalive, 1);
     }
 
     #[test]

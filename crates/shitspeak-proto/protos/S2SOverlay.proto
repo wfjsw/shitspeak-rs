@@ -172,6 +172,31 @@ message OverlayData {
   // own clock, then becomes the issuer before forwarding.
   optional uint32 distribution_deadline_issuer = 25;
   optional uint64 distribution_deadline_unix_us = 26;
+  // Optional opaque metadata. The base payload remains valid when an
+  // attachment is omitted, unknown, or delivered separately as a sidecar.
+  repeated OverlayAttachment inline_attachments = 27;
+}
+
+// Opaque metadata opportunistically carried with an OverlayData message.
+// `kind` is owned by the attachment consumer; `attachment_id` identifies the
+// attachment version within the originating message.
+message OverlayAttachment {
+  uint32 kind = 1;
+  uint64 attachment_id = 2;
+  bytes payload = 3;
+}
+
+// One independently routed chunk of an attachment sidecar. The outer
+// OverlayData envelope carries the sidecar service tag and destination route.
+message AttachmentChunk {
+  uint64 base_origin_boot_epoch = 1;
+  uint64 base_origin_message_id = 2;
+  uint32 kind = 3;
+  uint64 attachment_id = 4;
+  uint32 chunk_index = 5;
+  uint32 chunk_count = 6;
+  uint32 total_bytes = 7;
+  bytes payload = 8;
 }
 
 message OverlayTreeEdge {

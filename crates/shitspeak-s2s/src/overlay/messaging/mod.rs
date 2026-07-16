@@ -12,6 +12,7 @@ use bytes::Bytes;
 use scc::HashMap as SccMap;
 
 use shitspeak_core::NodeIdentifier;
+use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{ConnectionManager, MessageClass, ServiceLevel};
 
 use self::ordering::OverlayOrdering;
@@ -20,6 +21,59 @@ use super::distribution::{DistributionPlane, TreeKey, TreeState};
 use super::error::OverlayError;
 use super::neighbor::NeighborMonitor;
 use super::routing::{RoutingHandle, RoutingMetric};
+
+/// Reserved ordinary-unicast service tag for disposable attachment chunks.
+pub const OVERLAY_ATTACHMENT_SERVICE_TAG: u32 = 252;
+
+/// Opaque metadata attached to an overlay payload. Priority is local packing
+/// policy and is not carried on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayAttachment {
+    kind: u32,
+    attachment_id: u64,
+    priority: u32,
+    payload: Bytes,
+}
+
+impl OverlayAttachment {
+    pub fn new(kind: u32, attachment_id: u64, payload: Bytes) -> Self {
+        Self {
+            kind,
+            attachment_id,
+            priority: 0,
+            payload,
+        }
+    }
+
+    pub fn with_priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub fn kind(&self) -> u32 {
+        self.kind
+    }
+
+    pub fn attachment_id(&self) -> u64 {
+        self.attachment_id
+    }
+
+    pub fn priority(&self) -> u32 {
+        self.priority
+    }
+
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+
+    pub(crate) fn to_proto(&self) -> pb::OverlayAttachment {
+        pb::OverlayAttachment {
+            kind: self.kind,
+            attachment_id: self.attachment_id,
+            payload: self.payload.to_vec(),
+        }
+    }
+}
 
 /// Inbound message handed to a registered service handler.
 #[derive(Debug, Clone)]
@@ -185,6 +239,43 @@ pub(crate) async fn send_unicast_with_options(
         body,
         None,
         false,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_unicast_unordered_with_routing_metric_and_attachments(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    dst: NodeIdentifier,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+    attachments: Vec<OverlayAttachment>,
+    options: OverlaySendOptions,
+) -> Result<(), OverlayError> {
+    forward::originate_with_attachments(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        vec![dst],
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        None,
+        process_on_transit,
+        attachments,
         options,
     )
     .await
@@ -433,6 +524,43 @@ pub(crate) async fn send_multicast_with_options(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_multicast_with_routing_metric_unordered_and_attachments(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    dsts: &[NodeIdentifier],
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+    attachments: Vec<OverlayAttachment>,
+    options: OverlaySendOptions,
+) -> Result<(), OverlayError> {
+    forward::originate_with_attachments(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        dsts.to_vec(),
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        None,
+        process_on_transit,
+        attachments,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_multicast_with_transit_processing(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
@@ -606,7 +734,7 @@ pub(crate) async fn send_multicast_with_routing_metric_unordered_and_options(
 }
 
 /// Send an unordered multicast using a source-rooted forwarding tree.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) async fn send_multicast_tree_unordered_with_routing_metric_and_options(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
@@ -640,6 +768,47 @@ pub(crate) async fn send_multicast_tree_unordered_with_routing_metric_and_option
         class,
         body,
         false,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_multicast_tree_unordered_with_routing_metric_and_attachments(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    monitor: &NeighborMonitor,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    tree: &TreeState,
+    key: TreeKey,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    attachments: Vec<OverlayAttachment>,
+    options: OverlaySendOptions,
+) -> Result<(), OverlayError> {
+    forward::originate_tree_with_attachments(
+        transport,
+        routing,
+        distribution,
+        monitor,
+        self_id,
+        boot_epoch,
+        ordering,
+        tree,
+        key,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        false,
+        attachments,
         options,
     )
     .await

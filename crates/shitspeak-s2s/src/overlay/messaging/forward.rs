@@ -8,12 +8,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::future::join_all;
+use prost::Message as _;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use crate::application::proto::VOICE_SERVICE_TAG;
 use crate::overlay::LaneId;
+use crate::overlay::attachments::{AttachmentCache, AttachmentKey, TREE_HINT_ATTACHMENT_KIND};
 use crate::overlay::config::OverlayConfig;
 use crate::overlay::distribution::{
     DistributionPlane, PendingDistributionFrame, TreeKey, TreeState, UnknownTreeEnqueue,
@@ -23,6 +25,7 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{
     ConnectionManager, MessageClass, SendError, SendOptions as TransportSendOptions, ServiceLevel,
+    TransportKind, TransportPayloadPlan, TransportPayloadVariant,
 };
 
 use super::super::OverlayNetwork;
@@ -35,13 +38,16 @@ use super::super::proto::{
 use super::super::routing::{RoutingHandle, RoutingMetric, RoutingTables};
 use super::delivery;
 use super::ordering::OverlayOrdering;
-use super::{OverlaySendOptions, ServiceRegistry};
+use super::{OverlayAttachment, OverlaySendOptions, ServiceRegistry};
 
 const FORWARD_PAYLOAD_LOG_BYTES: usize = 256;
 const CONTROL_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
 const CONTROL_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
 const VOICE_TRANSPORT_TTL: Duration = Duration::from_millis(750);
 const DISTRIBUTION_PROCESSING_GUARD: Duration = Duration::from_millis(20);
+const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
+const MAX_ATTACHMENT_CHUNKS: usize = 512;
+const MAX_ATTACHMENT_CHUNK_BYTES: usize = 512;
 
 fn unix_time_ms() -> u64 {
     SystemTime::now()
@@ -228,6 +234,44 @@ pub(crate) async fn originate(
     process_on_transit: bool,
     options: OverlaySendOptions,
 ) -> Result<(), OverlayError> {
+    originate_with_attachments(
+        transport,
+        routing,
+        self_id,
+        boot_epoch,
+        ordering,
+        dsts,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        lane,
+        process_on_transit,
+        Vec::new(),
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn originate_with_attachments(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    dsts: Vec<NodeIdentifier>,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    lane: Option<LaneId>,
+    process_on_transit: bool,
+    attachments: Vec<OverlayAttachment>,
+    options: OverlaySendOptions,
+) -> Result<(), OverlayError> {
     let dsts: Vec<NodeIdentifier> = dsts.into_iter().filter(|dst| *dst != self_id).collect();
     if dsts.is_empty() {
         return Ok(());
@@ -250,7 +294,7 @@ pub(crate) async fn originate(
             lane_id: None,
             origin_boot_epoch: boot_epoch,
             origin_message_id: ordering.next_origin_message_id(),
-            allow_l1_compression: options.l1_compression_allowed(),
+            allow_l1_compression: options.l1_compression_allowed() && tag != VOICE_SERVICE_TAG,
             distribution_profile: None,
             distribution_tree_version: None,
             distribution_group: None,
@@ -261,6 +305,7 @@ pub(crate) async fn originate(
             distribution_repair_target: None,
             distribution_deadline_issuer: None,
             distribution_deadline_unix_us: None,
+            inline_attachments: attachments_to_proto(&attachments),
         };
         return forward_pb_as(
             transport,
@@ -306,7 +351,7 @@ pub(crate) async fn originate(
             lane_id: Some(lane.get()),
             origin_boot_epoch: boot_epoch,
             origin_message_id: message_id,
-            allow_l1_compression: options.l1_compression_allowed(),
+            allow_l1_compression: options.l1_compression_allowed() && tag != VOICE_SERVICE_TAG,
             distribution_profile: None,
             distribution_tree_version: None,
             distribution_group: None,
@@ -317,6 +362,7 @@ pub(crate) async fn originate(
             distribution_repair_target: None,
             distribution_deadline_issuer: None,
             distribution_deadline_unix_us: None,
+            inline_attachments: attachments_to_proto(&attachments),
         };
         ordering.store_pending(lane, data.clone()).await;
         ordering.cache_ordered_packet(&data).await;
@@ -346,7 +392,7 @@ pub(crate) async fn originate(
 
 /// Originate an unordered source-rooted multicast tree after its control-plane
 /// state has been acknowledged by every tree node.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) async fn originate_tree(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
@@ -363,6 +409,48 @@ pub(crate) async fn originate_tree(
     class: MessageClass,
     body: Bytes,
     process_on_transit: bool,
+    options: OverlaySendOptions,
+) -> Result<(), OverlayError> {
+    originate_tree_with_attachments(
+        transport,
+        routing,
+        distribution,
+        monitor,
+        self_id,
+        boot_epoch,
+        ordering,
+        tree,
+        key,
+        tag,
+        level,
+        routing_metric,
+        class,
+        body,
+        process_on_transit,
+        Vec::new(),
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn originate_tree_with_attachments(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    monitor: &NeighborMonitor,
+    self_id: NodeIdentifier,
+    boot_epoch: u64,
+    ordering: &OverlayOrdering,
+    tree: &TreeState,
+    key: TreeKey,
+    tag: u32,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    body: Bytes,
+    process_on_transit: bool,
+    attachments: Vec<OverlayAttachment>,
     options: OverlaySendOptions,
 ) -> Result<(), OverlayError> {
     let uses_hop_local_ttl = tree.hop_ttl().is_some();
@@ -382,7 +470,7 @@ pub(crate) async fn originate_tree(
         lane_id: None,
         origin_boot_epoch: boot_epoch,
         origin_message_id: ordering.next_origin_message_id(),
-        allow_l1_compression: options.l1_compression_allowed(),
+        allow_l1_compression: options.l1_compression_allowed() && tag != VOICE_SERVICE_TAG,
         distribution_profile: Some(key.profile),
         distribution_tree_version: Some(key.version),
         distribution_group: Some(key.group),
@@ -401,6 +489,7 @@ pub(crate) async fn originate_tree(
                     .min(u128::from(u64::MAX)) as u64,
             )
         }),
+        inline_attachments: attachments_to_proto(&attachments),
     };
     forward_tree_data(
         transport,
@@ -423,12 +512,19 @@ pub(crate) async fn handle_inbound_with_distribution(
     services: &ServiceRegistry,
     ordering: &OverlayOrdering,
     distribution: &DistributionPlane,
+    attachments: &AttachmentCache,
     monitor: &NeighborMonitor,
     self_id: NodeIdentifier,
     from: NodeIdentifier,
     mut data: pb::OverlayData,
     route_transit_messages: bool,
 ) {
+    if data.service_tag == super::OVERLAY_ATTACHMENT_SERVICE_TAG {
+        if consume_attachment_sidecar(attachments, self_id, &data) {
+            return;
+        }
+    }
+    cache_inline_attachments(attachments, &data);
     let Some(profile) = data.distribution_profile else {
         return handle_inbound(
             transport,
@@ -578,6 +674,21 @@ pub(crate) async fn handle_inbound_with_distribution(
     }
     let tree = match distribution.get(key) {
         Some(tree) => tree,
+        None if is_realtime_distribution_frame(&data) => {
+            let Some(tree) = decode_tree_hint(&data, key, self_id, attachments) else {
+                tracing::debug!(
+                    %source,
+                    profile,
+                    group,
+                    topology_epoch,
+                    version,
+                    "dropping cacheless realtime distribution branch without inline tree hint"
+                );
+                crate::overlay::attachment_metrics::record_cacheless_branch_drop();
+                return;
+            };
+            Arc::new(tree)
+        }
         None => match distribution.queue_unknown(
             key,
             PendingDistributionFrame::new(from, data, route_transit_messages),
@@ -700,6 +811,7 @@ pub(crate) async fn replay_distribution_frame(
         &overlay.inner.services,
         overlay.inner.ordering(),
         &overlay.inner.distribution,
+        &overlay.inner.attachments,
         &overlay.inner.neighbor,
         overlay.inner.self_id,
         frame.from,
@@ -1193,6 +1305,373 @@ fn append_path_trace(path_trace: &mut Vec<u32>, self_id: NodeIdentifier) {
     }
 }
 
+fn encode_overlay_data(data: &pb::OverlayData) -> Result<Bytes, prost::EncodeError> {
+    encode_message(&wrap(OverlayBody::Data(data.clone())))
+}
+
+fn attachments_to_proto(attachments: &[OverlayAttachment]) -> Vec<pb::OverlayAttachment> {
+    let mut ordered: Vec<_> = attachments.iter().collect();
+    ordered.sort_by(|left, right| right.priority().cmp(&left.priority()));
+    ordered
+        .into_iter()
+        .map(OverlayAttachment::to_proto)
+        .collect()
+}
+
+fn attachment_key(data: &pb::OverlayData, kind: u32, attachment_id: u64) -> Option<AttachmentKey> {
+    attachment_key_for_origin(data, data.origin_message_id, kind, attachment_id)
+}
+
+fn attachment_key_for_origin(
+    data: &pb::OverlayData,
+    origin_message_id: u64,
+    kind: u32,
+    attachment_id: u64,
+) -> Option<AttachmentKey> {
+    Some(AttachmentKey::new(
+        NodeIdentifier::try_from(data.src).ok()?,
+        data.origin_boot_epoch,
+        origin_message_id,
+        kind,
+        attachment_id,
+    ))
+}
+
+fn cache_inline_attachments(cache: &AttachmentCache, data: &pb::OverlayData) {
+    for attachment in &data.inline_attachments {
+        let Some(key) = attachment_key(data, attachment.kind, attachment.attachment_id) else {
+            continue;
+        };
+        crate::overlay::attachment_metrics::record_inline_bytes(attachment.payload.len());
+        let _ = cache.insert_inline(key, Bytes::copy_from_slice(&attachment.payload));
+    }
+}
+
+/// Consume a sidecar only at its final overlay destination. A transit node
+/// must leave it as an ordinary unicast envelope so older and newer nodes can
+/// route it without knowing the attachment schema.
+fn consume_attachment_sidecar(
+    cache: &AttachmentCache,
+    self_id: NodeIdentifier,
+    data: &pb::OverlayData,
+) -> bool {
+    let is_for_self = data
+        .dsts
+        .iter()
+        .any(|dst| NodeIdentifier::try_from(*dst).ok() == Some(self_id));
+    if !is_for_self {
+        return false;
+    }
+    let Ok(chunk) = pb::AttachmentChunk::decode(data.payload.as_ref()) else {
+        crate::overlay::attachment_metrics::record_sidecar_chunk_dropped();
+        return true;
+    };
+    if chunk.base_origin_boot_epoch != data.origin_boot_epoch
+        || chunk.base_origin_message_id == 0
+        || chunk.kind == TREE_HINT_ATTACHMENT_KIND && chunk.attachment_id == 0
+    {
+        crate::overlay::attachment_metrics::record_sidecar_chunk_dropped();
+        return true;
+    }
+    let Some(key) = attachment_key_for_origin(
+        data,
+        chunk.base_origin_message_id,
+        chunk.kind,
+        chunk.attachment_id,
+    ) else {
+        return true;
+    };
+    let completed = cache.insert_chunk(
+        key,
+        chunk.chunk_index as usize,
+        chunk.chunk_count as usize,
+        chunk.total_bytes as usize,
+        Bytes::from(chunk.payload),
+    );
+    if completed.is_some() {
+        crate::overlay::attachment_metrics::record_sidecar_reassembled();
+    }
+    true
+}
+
+fn is_realtime_distribution_frame(data: &pb::OverlayData) -> bool {
+    data.service_tag == VOICE_SERVICE_TAG
+        || data.distribution_profile
+            == Some(crate::overlay::distribution::VOICE_REALTIME_PROFILE_ID)
+}
+
+fn decode_tree_hint(
+    data: &pb::OverlayData,
+    key: TreeKey,
+    self_id: NodeIdentifier,
+    cache: &AttachmentCache,
+) -> Option<TreeState> {
+    let payload = data
+        .inline_attachments
+        .iter()
+        .find(|attachment| attachment.kind == TREE_HINT_ATTACHMENT_KIND)
+        .map(|attachment| Bytes::copy_from_slice(&attachment.payload))
+        .or_else(|| {
+            attachment_key(data, TREE_HINT_ATTACHMENT_KIND, key.version.max(1))
+                .and_then(|key| cache.get(key))
+        })?;
+    let install = pb::DistributionTreeInstall::decode(payload.as_ref()).ok()?;
+    if install.source != u32::from(key.source)
+        || install.profile != key.profile
+        || install.version != key.version
+        || install.group != key.group
+        || install.group_version != key.group_version
+        || install.topology_epoch != key.topology_epoch
+        || install.members.len() > 4096
+        || install.edges.len() > 8192
+    {
+        return None;
+    }
+    let members = install
+        .members
+        .iter()
+        .filter_map(|node| NodeIdentifier::try_from(*node).ok());
+    let edges = install.edges.iter().filter_map(|edge| {
+        Some((
+            NodeIdentifier::try_from(edge.parent).ok()?,
+            NodeIdentifier::try_from(edge.child).ok()?,
+        ))
+    });
+    let tree = TreeState::new(key.source, members, edges)
+        .with_hop_ttl(Duration::from_millis(u64::from(install.hop_ttl_ms)));
+    if tree.children(key.source).len() != 1
+        || !tree.is_valid_for_source(key.source)
+        || !tree.is_reachable_from(key.source, self_id)
+    {
+        return None;
+    }
+    Some(tree)
+}
+
+fn tree_hint_for_child(
+    key: TreeKey,
+    tree: &TreeState,
+    child: NodeIdentifier,
+) -> Option<pb::OverlayAttachment> {
+    let branch = tree.branch_for_child(key.source, child)?;
+    let install = pb::DistributionTreeInstall {
+        source: key.source.into(),
+        profile: key.profile,
+        version: key.version,
+        members: branch.members().map(u32::from).collect(),
+        edges: branch
+            .edges()
+            .map(|(parent, child)| pb::OverlayTreeEdge {
+                parent: parent.into(),
+                child: child.into(),
+            })
+            .collect(),
+        group: key.group,
+        topology_epoch: key.topology_epoch,
+        group_version: key.group_version,
+        playout_delays: Vec::new(),
+        hop_ttl_ms: branch
+            .hop_ttl()
+            .map(|ttl| ttl.as_millis().min(u128::from(u32::MAX)) as u32)
+            .unwrap_or_default(),
+    };
+    Some(pb::OverlayAttachment {
+        kind: TREE_HINT_ATTACHMENT_KIND,
+        attachment_id: key.version.max(1),
+        payload: install.encode_to_vec(),
+    })
+}
+
+fn tree_branch_data(
+    data: &pb::OverlayData,
+    tree: &TreeState,
+    child: NodeIdentifier,
+    path_trace: Vec<u32>,
+) -> pb::OverlayData {
+    let mut forwarded = reconstruct_forwarded_data(data, vec![node_to_wire(child)], path_trace);
+    forwarded
+        .inline_attachments
+        .retain(|attachment| attachment.kind != TREE_HINT_ATTACHMENT_KIND);
+    if let Some(key) = tree_key_from_data(data)
+        && let Some(hint) = tree_hint_for_child(key, tree, child)
+    {
+        forwarded.inline_attachments.insert(0, hint);
+    }
+    forwarded
+}
+
+fn transport_payload_plan(
+    transport: &ConnectionManager,
+    next_hop: NodeIdentifier,
+    level: ServiceLevel,
+    class: MessageClass,
+    data: &pb::OverlayData,
+    path_trace: &[u32],
+) -> Result<TransportPayloadPlan, prost::EncodeError> {
+    let rich_payload = encode_overlay_data(data)?;
+    if data.inline_attachments.is_empty() {
+        return Ok(TransportPayloadPlan::new(rich_payload));
+    }
+
+    let mut udp_data = data.clone();
+    udp_data.inline_attachments.clear();
+    let mut selected = Vec::with_capacity(data.inline_attachments.len());
+    for attachment in &data.inline_attachments {
+        let mut candidate = udp_data.clone();
+        candidate.inline_attachments = selected
+            .iter()
+            .cloned()
+            .chain(std::iter::once(attachment.clone()))
+            .collect();
+        let candidate_payload = encode_overlay_data(&candidate)?;
+        if transport.payload_fits_transport(
+            next_hop,
+            TransportKind::Udp,
+            level,
+            class,
+            &candidate_payload,
+        ) {
+            selected.push(attachment.clone());
+        }
+    }
+    let omitted = data
+        .inline_attachments
+        .iter()
+        .filter(|attachment| {
+            !selected.iter().any(|chosen| {
+                chosen.kind == attachment.kind && chosen.attachment_id == attachment.attachment_id
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    udp_data.inline_attachments = selected;
+    let udp_payload = encode_overlay_data(&udp_data)?;
+    let sidecars = encode_attachment_sidecars(
+        transport, next_hop, level, class, data, path_trace, &omitted,
+    )?;
+    Ok(TransportPayloadPlan::new(rich_payload).with_variant(
+        TransportKind::Udp,
+        TransportPayloadVariant::new(udp_payload).with_sidecars(sidecars),
+    ))
+}
+
+fn encode_attachment_sidecars(
+    transport: &ConnectionManager,
+    next_hop: NodeIdentifier,
+    level: ServiceLevel,
+    class: MessageClass,
+    base: &pb::OverlayData,
+    path_trace: &[u32],
+    attachments: &[pb::OverlayAttachment],
+) -> Result<Vec<Bytes>, prost::EncodeError> {
+    let mut sidecars = Vec::new();
+    for attachment in attachments {
+        if attachment.payload.len() > MAX_ATTACHMENT_BYTES {
+            continue;
+        }
+        let mut chunk_size = MAX_ATTACHMENT_CHUNK_BYTES.min(attachment.payload.len().max(1));
+        loop {
+            let chunk_count = attachment.payload.len().div_ceil(chunk_size);
+            if chunk_count > MAX_ATTACHMENT_CHUNKS {
+                break;
+            }
+            let mut chunks = Vec::with_capacity(chunk_count);
+            let mut fits = true;
+            for chunk_index in 0..chunk_count {
+                let start = chunk_index * chunk_size;
+                let end = (start + chunk_size).min(attachment.payload.len());
+                let chunk = pb::AttachmentChunk {
+                    base_origin_boot_epoch: base.origin_boot_epoch,
+                    base_origin_message_id: base.origin_message_id,
+                    kind: attachment.kind,
+                    attachment_id: attachment.attachment_id,
+                    chunk_index: chunk_index as u32,
+                    chunk_count: chunk_count as u32,
+                    total_bytes: attachment.payload.len() as u32,
+                    payload: attachment.payload[start..end].to_vec(),
+                };
+                let mut chunk_bytes = Vec::with_capacity(chunk.encoded_len());
+                chunk.encode(&mut chunk_bytes)?;
+                let sidecar =
+                    attachment_sidecar_data(base, next_hop, level, path_trace, &chunk, chunk_bytes);
+                let encoded = encode_overlay_data(&sidecar)?;
+                if !transport.payload_fits_transport(
+                    next_hop,
+                    TransportKind::Udp,
+                    level,
+                    class,
+                    &encoded,
+                ) {
+                    fits = false;
+                    break;
+                }
+                chunks.push(encoded);
+            }
+            if fits {
+                sidecars.extend(chunks);
+                break;
+            }
+            if chunk_size == 1 {
+                break;
+            }
+            chunk_size = (chunk_size / 2).max(1);
+        }
+    }
+    crate::overlay::attachment_metrics::record_sidecar_chunks_emitted(sidecars.len());
+    Ok(sidecars)
+}
+
+fn attachment_sidecar_data(
+    base: &pb::OverlayData,
+    next_hop: NodeIdentifier,
+    level: ServiceLevel,
+    path_trace: &[u32],
+    chunk: &pb::AttachmentChunk,
+    chunk_bytes: Vec<u8>,
+) -> pb::OverlayData {
+    pb::OverlayData {
+        src: base.src,
+        dsts: vec![node_to_wire(next_hop)],
+        path_trace: path_trace.to_vec(),
+        service_tag: super::OVERLAY_ATTACHMENT_SERVICE_TAG,
+        service_level: level_to_wire(level),
+        message_class: class_to_wire(MessageClass::Regular),
+        payload: Bytes::from(chunk_bytes),
+        process_on_transit: false,
+        route_metric: route_metric_to_wire(routing_metric_for_sidecar(level)),
+        ordered_delivery: false,
+        ordering_seq: 0,
+        ordering_dst: 0,
+        lane_id: None,
+        origin_boot_epoch: base.origin_boot_epoch,
+        origin_message_id: sidecar_message_id(base.origin_message_id, chunk),
+        allow_l1_compression: false,
+        distribution_profile: None,
+        distribution_tree_version: None,
+        distribution_group: None,
+        distribution_group_version: None,
+        distribution_topology_epoch: None,
+        distribution_deadline_unix_ms: None,
+        distribution_repair: false,
+        distribution_repair_target: None,
+        distribution_deadline_issuer: None,
+        distribution_deadline_unix_us: None,
+        inline_attachments: Vec::new(),
+    }
+}
+
+fn routing_metric_for_sidecar(level: ServiceLevel) -> RoutingMetric {
+    RoutingMetric::default_for_level(level)
+}
+
+fn sidecar_message_id(base_message_id: u64, chunk: &pb::AttachmentChunk) -> u64 {
+    base_message_id
+        .wrapping_add(u64::from(chunk.kind).wrapping_mul(0x9e37_79b9))
+        .wrapping_add(chunk.attachment_id.rotate_left(17))
+        .wrapping_add(u64::from(chunk.chunk_index).wrapping_mul(0x1000_0001))
+        .max(1)
+}
+
 /// Forward an `OverlayData` whose `dsts` may contain multiple final destinations.
 async fn forward_pb_as(
     transport: &ConnectionManager,
@@ -1324,10 +1803,17 @@ async fn forward_pb_as(
             );
         }
 
-        let body = OverlayBody::Data(pb_msg);
+        let body = OverlayBody::Data(pb_msg.clone());
         let packet_kind = crate::debug_io::classify_overlay_body(&body);
-        let payload = match encode_message(&wrap(body)) {
-            Ok(b) => b,
+        let payload_plan = match transport_payload_plan(
+            transport,
+            next_hop,
+            level,
+            transport_class,
+            &pb_msg,
+            &new_trace,
+        ) {
+            Ok(plan) => plan,
             Err(e) => {
                 if is_originator {
                     return Err(OverlayError::Encode(e));
@@ -1336,17 +1822,17 @@ async fn forward_pb_as(
                 continue;
             }
         };
-        let payload_len = payload.len();
+        let payload_len = payload_plan.default_variant().primary().len();
         let transport = transport.clone();
         sends.push(Box::pin(async move {
             crate::debug_io::record_send_attempt(self_id, next_hop, packet_kind.clone());
             let result = transport
-                .try_send_with_options(
+                .try_send_with_payload_plan(
                     next_hop,
                     level,
                     Some(routing_metric),
                     transport_class,
-                    payload,
+                    payload_plan,
                     send_options,
                 )
                 .await;
@@ -1455,13 +1941,20 @@ async fn send_direct_tree_edge_with_routing(
     let routing_metric = route_metric_from_wire(data.route_metric, level)
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let pb_msg = reconstruct_forwarded_data(data, vec![node_to_wire(child)], path_trace.clone());
-    let body = OverlayBody::Data(pb_msg);
+    let body = OverlayBody::Data(pb_msg.clone());
     let packet_kind = crate::debug_io::classify_overlay_body(&body);
-    let payload = match encode_message(&wrap(body)) {
-        Ok(payload) => payload,
+    let payload_plan = match transport_payload_plan(
+        transport,
+        child,
+        level,
+        transport_class,
+        &pb_msg,
+        &path_trace,
+    ) {
+        Ok(payload_plan) => payload_plan,
         Err(error) => return TreeEdgeSendOutcome::Transport(SendError::Encode(error)),
     };
-    let payload_len = payload.len();
+    let payload_len = payload_plan.default_variant().primary().len();
     // `expire_after` captures a fresh monotonic Instant here, independently
     // for this physical tree edge. No wall-clock translation is involved.
     let options = transport_options_for_overlay_data(data, Some(hop_ttl));
@@ -1543,12 +2036,12 @@ async fn send_direct_tree_edge_with_routing(
 
     crate::debug_io::record_send_attempt(self_id, child, packet_kind.clone());
     match transport
-        .try_send_with_options(
+        .try_send_with_payload_plan(
             child,
             level,
             Some(routing_metric),
             transport_class,
-            payload,
+            payload_plan,
             options,
         )
         .await
@@ -1583,9 +2076,9 @@ async fn forward_tree_data_v3(
     append_path_trace(&mut path_trace, self_id);
     let mut sends = Vec::new();
     for child in tree.children(self_id).iter().copied() {
-        let edge_data = &data;
         let edge_path_trace = path_trace.clone();
         let fallback_recipients = tree.descendant_members(child);
+        let edge_data = tree_branch_data(&data, tree, child, edge_path_trace.clone());
         sends.push(async move {
             let outcome = send_direct_tree_edge_with_routing(
                 transport,
@@ -1593,7 +2086,7 @@ async fn forward_tree_data_v3(
                 self_id,
                 child,
                 fallback_recipients,
-                edge_data,
+                &edge_data,
                 edge_path_trace,
                 transport_class,
                 hop_ttl,
@@ -1767,8 +2260,7 @@ async fn forward_tree_data(
                 continue;
             }
         }
-        let pb_msg =
-            reconstruct_forwarded_data(&data, vec![node_to_wire(child)], path_trace.clone());
+        let pb_msg = tree_branch_data(&data, tree, child, path_trace.clone());
         sends.push(Box::pin(async move {
             let result = forward_pb_as(
                 transport,
@@ -1920,6 +2412,7 @@ fn reconstruct_forwarded_data(
         distribution_repair_target: data.distribution_repair_target,
         distribution_deadline_issuer: data.distribution_deadline_issuer,
         distribution_deadline_unix_us: data.distribution_deadline_unix_us,
+        inline_attachments: data.inline_attachments.clone(),
     }
 }
 
@@ -1928,7 +2421,7 @@ fn transport_options_for_overlay_data(
     transport_ttl: Option<std::time::Duration>,
 ) -> TransportSendOptions {
     let mut options = TransportSendOptions::default();
-    if data.allow_l1_compression {
+    if data.allow_l1_compression && data.service_tag != VOICE_SERVICE_TAG {
         options = options.allow_l1_compression();
     }
     if let Some(ttl) = transport_ttl {
@@ -2092,6 +2585,7 @@ mod tests {
     use super::super::super::routing::{RouteEntry, dijkstra::EdgeCost, new_handle};
     use super::super::{OverlayInboundMessage, ServiceInbound};
     use super::*;
+    use crate::overlay::attachments::AttachmentKey;
     use crate::overlay::duplicate::DuplicateDetector;
     use shitspeak_s2s_transport::{SendError, TransportKind};
     use tokio::sync::{broadcast, mpsc};
@@ -2132,6 +2626,7 @@ mod tests {
             distribution_repair_target: None,
             distribution_deadline_issuer: None,
             distribution_deadline_unix_us: None,
+            inline_attachments: Vec::new(),
         }
     }
 
@@ -2568,6 +3063,118 @@ mod tests {
             panic!("not overlay data");
         };
         assert!(decoded.allow_l1_compression);
+    }
+
+    #[test]
+    fn overlay_attachment_roundtrips_without_affecting_the_base_payload() {
+        let mut data = test_overlay_data(false);
+        data.inline_attachments.push(pb::OverlayAttachment {
+            kind: 9,
+            attachment_id: 77,
+            payload: b"metadata".to_vec(),
+        });
+        let encoded = encode_message(&wrap(OverlayBody::Data(data))).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+        let Some(OverlayBody::Data(decoded)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(decoded.payload, Bytes::from_static(b"payload"));
+        assert_eq!(decoded.inline_attachments[0].payload, b"metadata");
+    }
+
+    #[test]
+    fn attachment_priority_is_packed_in_deterministic_order() {
+        let attachments = vec![
+            OverlayAttachment::new(1, 1, Bytes::from_static(b"low")).with_priority(1),
+            OverlayAttachment::new(2, 2, Bytes::from_static(b"high")).with_priority(9),
+        ];
+        let encoded = attachments_to_proto(&attachments);
+        assert_eq!(
+            encoded.iter().map(|item| item.kind).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_udp_attachment_is_emitted_as_disposable_sidecars() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let mut data = test_overlay_data(false);
+        data.inline_attachments.push(pb::OverlayAttachment {
+            kind: 9,
+            attachment_id: 77,
+            payload: vec![0xab; 16 * 1024],
+        });
+        let plan = transport_payload_plan(
+            &transport,
+            2,
+            ServiceLevel::Reliable,
+            MessageClass::Regular,
+            &data,
+            &data.path_trace,
+        )
+        .expect("payload plan");
+        let udp = plan.variant(TransportKind::Udp);
+        assert!(udp.primary().len() < plan.default_variant().primary().len());
+        assert!(!udp.sidecars().is_empty());
+    }
+
+    #[test]
+    fn tree_hint_is_trimmed_to_one_branch_and_validated() {
+        let tree = TreeState::new(1, [4, 5, 8], [(1, 2), (2, 4), (2, 5), (5, 8)]);
+        let key = TreeKey {
+            source: 1,
+            profile: 3,
+            group: 4,
+            group_version: 5,
+            topology_epoch: 6,
+            version: 7,
+        };
+        let hint = tree_hint_for_child(key, &tree, 2).expect("branch hint");
+        let mut data = test_overlay_data(false);
+        data.src = node_to_wire(1);
+        data.distribution_profile = Some(key.profile);
+        data.distribution_tree_version = Some(key.version);
+        data.distribution_group = Some(key.group);
+        data.distribution_group_version = Some(key.group_version);
+        data.distribution_topology_epoch = Some(key.topology_epoch);
+        data.inline_attachments = vec![hint];
+        let decoded = decode_tree_hint(&data, key, 2, &AttachmentCache::default())
+            .expect("valid branch hint");
+        assert_eq!(decoded.children(1), &[2]);
+        assert_eq!(decoded.children(2), &[4, 5]);
+        assert!(decoded.is_member(4));
+        assert!(decoded.is_reachable_from(2, 8));
+    }
+
+    #[test]
+    fn sidecar_reassembly_uses_the_base_message_identity() {
+        let cache = AttachmentCache::default();
+        let data = pb::OverlayData {
+            src: node_to_wire(1),
+            dsts: vec![node_to_wire(2)],
+            origin_boot_epoch: 11,
+            origin_message_id: 900,
+            service_tag: super::super::OVERLAY_ATTACHMENT_SERVICE_TAG,
+            ..test_overlay_data(false)
+        };
+        let chunk = pb::AttachmentChunk {
+            base_origin_boot_epoch: 11,
+            base_origin_message_id: 22,
+            kind: 9,
+            attachment_id: 77,
+            chunk_index: 0,
+            chunk_count: 1,
+            total_bytes: 4,
+            payload: b"hint".to_vec(),
+        };
+        let mut sidecar = data;
+        sidecar.payload = chunk.encode_to_vec().into();
+        assert!(consume_attachment_sidecar(&cache, 2, &sidecar));
+        assert_eq!(
+            cache.get(AttachmentKey::new(1, 11, 22, 9, 77)),
+            Some(Bytes::from_static(b"hint"))
+        );
     }
 
     #[test]

@@ -1150,6 +1150,31 @@ impl<'a> PrometheusWriter<'a> {
             "gauge",
         );
         self.header(
+            "shitspeak_s2s_overlay_attachment_inline_bytes_total",
+            "Bytes of optional overlay attachments received inline.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_overlay_attachment_sidecar_chunks_emitted_total",
+            "Disposable overlay attachment chunks generated for sidecar delivery.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_overlay_attachment_sidecar_chunks_dropped_total",
+            "Invalid disposable overlay attachment chunks discarded at their destination.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_overlay_attachment_reassemblies_total",
+            "Complete disposable overlay attachments reassembled from sidecar chunks.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_overlay_attachment_cacheless_branch_drops_total",
+            "Realtime tree branches dropped without cached or inline tree hints.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_distribution_peer_clock_offset_us",
             "Direct peer wall-clock offset in microseconds, positive when the peer is ahead.",
             "gauge",
@@ -1211,6 +1236,7 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
     out.extend(crate::overlay::distribution_metrics::prometheus_samples(
         snapshot.local_node,
     ));
+    out.extend(crate::overlay::attachment_metrics::prometheus_samples());
     let local_node = snapshot.local_node.to_string();
     for node in snapshot
         .nodes

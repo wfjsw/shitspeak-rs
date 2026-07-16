@@ -711,6 +711,7 @@ mod tests {
             distribution_repair_target: None,
             distribution_deadline_issuer: None,
             distribution_deadline_unix_us: None,
+            inline_attachments: Vec::new(),
         }
     }
 

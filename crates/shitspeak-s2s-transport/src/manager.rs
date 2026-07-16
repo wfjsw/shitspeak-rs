@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
@@ -25,20 +25,23 @@ use super::adaptive_queue::{
     SendAdaptiveError, TryAdaptiveSendError,
 };
 use super::config::{KcpTuning, TransportConfig, TransportRoutingPolicy};
-use super::connection::OutboundEnvelope;
 use super::connection::{
     AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerOutboundReceiver, PeerOutboundSender,
     PeerState,
 };
+use super::connection::{OutboundEnvelope, TransportPayloadPlan};
 use super::endpoint::{
     EndpointRegistry,
     kcp::KcpEndpoint,
-    mux::{UdpMuxQueueTuning, UdpMuxSet},
+    mux::{DISCRIMINATOR_LEN, UdpMuxQueueTuning, UdpMuxSet},
     quic::QuicEndpoint,
     tcp::TcpEndpoint,
-    udp::UdpEndpoint,
+    udp::{
+        UDP_ENCRYPTED_OVERHEAD, UdpEndpoint, initial_udp_datagram_mtu, udp_datagram_mtu_ceiling,
+    },
 };
 use super::error::{ConfigError, SendError, TransportError};
+use super::frame::encoded_data_frame_len;
 use super::identity::NodeIdentity;
 use super::metrics::{
     ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
@@ -175,7 +178,8 @@ pub type AdaptiveInboundReceiver = AdaptiveQueueReceiver<InboundMessage>;
 
 impl AdaptiveQueueItem for OutboundEnvelope {
     fn estimated_queue_bytes(&self) -> usize {
-        super::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES.saturating_add(self.payload().len())
+        super::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES
+            .saturating_add(self.payloads().estimated_bytes())
     }
 }
 
@@ -437,6 +441,10 @@ impl ManagerInner {
             },
             outbound_queue_bytes,
         );
+        new.set_udp_datagram_mtu_limits(
+            initial_udp_datagram_mtu(self.cfg.udp_mtu()),
+            udp_datagram_mtu_ceiling(self.cfg.udp_mtu()),
+        );
         match self.peers.entry_sync(id) {
             scc::hash_map::Entry::Occupied(e) => e.get().clone(),
             scc::hash_map::Entry::Vacant(e) => {
@@ -563,6 +571,52 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
+    /// Check whether an identity-encoded data payload fits as one frame on a
+    /// selected transport. Stream transports have no datagram ceiling.
+    pub fn payload_fits_transport(
+        &self,
+        node: NodeIdentifier,
+        transport: TransportKind,
+        level: ServiceLevel,
+        class: MessageClass,
+        payload: &[u8],
+    ) -> bool {
+        match transport {
+            TransportKind::Tcp | TransportKind::Kcp | TransportKind::Quic => true,
+            TransportKind::Udp => self
+                .udp_datagram_len(node, level, class, payload.len())
+                .is_some_and(|bytes| bytes <= self.udp_datagram_mtu_for(node)),
+        }
+    }
+
+    fn udp_datagram_mtu_for(&self, node: NodeIdentifier) -> usize {
+        self.inner
+            .get_peer(node)
+            .map(|peer| peer.udp_datagram_mtu())
+            .unwrap_or_else(|| initial_udp_datagram_mtu(self.inner.cfg().udp_mtu()))
+    }
+
+    fn udp_datagram_len(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        class: MessageClass,
+        payload_len: usize,
+    ) -> Option<usize> {
+        Some(
+            DISCRIMINATOR_LEN
+                .saturating_add(UDP_ENCRYPTED_OVERHEAD)
+                .saturating_add(encoded_data_frame_len(
+                    self.inner.self_id(),
+                    node,
+                    level,
+                    class,
+                    transport_timestamp_us(),
+                    payload_len,
+                )),
+        )
+    }
+
     /// Force a transport kind down for a peer in fault-injection tests.
     /// Reconnection remains owned by the normal transport supervisor.
     #[cfg(any(test, feature = "test-support"))]
@@ -949,7 +1003,28 @@ impl ConnectionManager {
         payload: Bytes,
         options: SendOptions,
     ) -> Result<(), SendError> {
-        self.send_ranked(node, level, routing_metric, class, payload, options, true)
+        self.send_ranked(
+            node,
+            level,
+            routing_metric,
+            class,
+            TransportPayloadPlan::new(payload),
+            options,
+            true,
+        )
+        .await
+    }
+
+    pub async fn send_with_payload_plan(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: Option<RoutingMetric>,
+        class: MessageClass,
+        payloads: TransportPayloadPlan,
+        options: SendOptions,
+    ) -> Result<(), SendError> {
+        self.send_ranked(node, level, routing_metric, class, payloads, options, true)
             .await
     }
 
@@ -981,7 +1056,28 @@ impl ConnectionManager {
         payload: Bytes,
         options: SendOptions,
     ) -> Result<(), SendError> {
-        self.send_ranked(node, level, routing_metric, class, payload, options, false)
+        self.send_ranked(
+            node,
+            level,
+            routing_metric,
+            class,
+            TransportPayloadPlan::new(payload),
+            options,
+            false,
+        )
+        .await
+    }
+
+    pub async fn try_send_with_payload_plan(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: Option<RoutingMetric>,
+        class: MessageClass,
+        payloads: TransportPayloadPlan,
+        options: SendOptions,
+    ) -> Result<(), SendError> {
+        self.send_ranked(node, level, routing_metric, class, payloads, options, false)
             .await
     }
 
@@ -991,7 +1087,7 @@ impl ConnectionManager {
         level: ServiceLevel,
         routing_metric: Option<RoutingMetric>,
         class: MessageClass,
-        payload: Bytes,
+        payloads: TransportPayloadPlan,
         options: SendOptions,
         wait_on_final_transport: bool,
     ) -> Result<(), SendError> {
@@ -1002,19 +1098,35 @@ impl ConnectionManager {
             .get_peer(node)
             .ok_or(SendError::UnknownNode { node })?;
 
-        if !has_eligible_transport(
+        let selection = TransportSelectionConfig::from_config(self.inner.cfg());
+        let choices = pick_transports(
             &peer,
             level,
             routing_metric,
             class,
             options,
-            payload.len(),
-            TransportSelectionConfig::from_config(self.inner.cfg()),
-        ) {
+            payloads.default_variant().primary().len(),
+            selection,
+        );
+        if choices.is_empty() {
+            return Err(SendError::NoSuitableTransport { node });
+        }
+        let choices_fit = choices.iter().any(|transport| {
+            *transport == TransportKind::Udp
+                || self.payload_fits_transport(
+                    node,
+                    *transport,
+                    level,
+                    class,
+                    payloads.variant(*transport).primary(),
+                )
+        });
+        if !choices_fit {
             return Err(SendError::NoSuitableTransport { node });
         }
 
-        let envelope = OutboundEnvelope::routed(level, routing_metric, class, payload, options);
+        let envelope =
+            OutboundEnvelope::routed_with_payloads(level, routing_metric, class, payloads, options);
         self.enqueue_outbound(&peer, envelope, wait_on_final_transport)
             .await
     }
@@ -1427,27 +1539,6 @@ fn pick_transports(
     }
 
     ranked
-}
-
-fn has_eligible_transport(
-    peer: &PeerState,
-    level: ServiceLevel,
-    routing_metric: RoutingMetric,
-    class: MessageClass,
-    options: SendOptions,
-    payload_len: usize,
-    selection: impl Into<TransportSelectionConfig>,
-) -> bool {
-    !pick_transports(
-        peer,
-        level,
-        routing_metric,
-        class,
-        options,
-        payload_len,
-        selection,
-    )
-    .is_empty()
 }
 
 fn advertisable_transport_kinds(
@@ -2455,9 +2546,9 @@ fn try_dispatch_envelope_with_policy(
         return Err(envelope);
     }
 
-    let frame = envelope.clone().into_frame();
     for transport in choices {
-        if frame.options().is_expired() {
+        let options = envelope.options();
+        if options.is_expired() {
             peer.record_expired_outbound_drop(
                 ExpiredOutboundDropStage::PeerQueueDispatch,
                 Some(transport),
@@ -2468,17 +2559,26 @@ fn try_dispatch_envelope_with_policy(
         let Some(sender) = peer.try_get_stream(transport) else {
             continue;
         };
+        let variant = envelope.payloads().variant(transport);
+        let frame = OutboundFrame::from_variant(class, variant, options);
         if class == MessageClass::Regular
             && !allow_regular_backlog
-            && frame.options().expires_at().is_none()
+            && options.expires_at().is_none()
             && sender.depth_bytes() > 0
         {
             record_outbound_stream_queue_sample(peer, transport, class, &sender, true);
             continue;
         }
         record_outbound_stream_queue_sample(peer, transport, class, &sender, false);
-        match sender.try_send(frame.clone()) {
+        match sender.try_send(frame) {
             Ok(()) => {
+                for sidecar in variant.sidecars() {
+                    let _ = sender.try_send(OutboundFrame::with_options(
+                        class,
+                        sidecar.clone(),
+                        options,
+                    ));
+                }
                 record_outbound_stream_queue_sample(peer, transport, class, &sender, false);
                 return Ok(());
             }
@@ -2509,6 +2609,14 @@ fn kind_order(k: TransportKind) -> u8 {
         TransportKind::Kcp => 2,
         TransportKind::Udp => 0,
     }
+}
+
+fn transport_timestamp_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn advertised_addresses(
@@ -2843,6 +2951,7 @@ fn udp_family_listen_addrs(cfg: &TransportConfig) -> Vec<(TransportKind, SocketA
 #[cfg(test)]
 mod tests {
     use super::super::connection::ActiveStream;
+    use super::super::connection::TransportPayloadVariant;
     use super::*;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -4488,5 +4597,84 @@ mod tests {
                 TransportKind::Tcp
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn udp_payload_preflight_honors_the_exact_frame_boundary() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let level = ServiceLevel::BestEffort;
+        let class = MessageClass::HighPriority;
+        let mut low = 0usize;
+        let mut high = transport.inner.cfg().udp_mtu();
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if transport.payload_fits_transport(
+                2,
+                TransportKind::Udp,
+                level,
+                class,
+                &vec![0; middle],
+            ) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        assert!(transport.payload_fits_transport(
+            2,
+            TransportKind::Udp,
+            level,
+            class,
+            &vec![0; low]
+        ));
+        assert!(!transport.payload_fits_transport(
+            2,
+            TransportKind::Udp,
+            level,
+            class,
+            &vec![0; low + 1]
+        ));
+        assert_eq!(
+            transport
+                .udp_datagram_len(2, level, class, low)
+                .expect("udp length"),
+            transport.udp_datagram_mtu_for(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_udp_send_is_admitted_for_transport_fragmentation() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let mut udp_rx = transport.test_install_live_stream(2, TransportKind::Udp);
+        transport
+            .send_via(
+                2,
+                TransportKind::Udp,
+                MessageClass::Regular,
+                Bytes::from(vec![0; 128 * 1024]),
+            )
+            .await
+            .expect("transport fragments oversized UDP payloads");
+        assert_eq!(udp_rx.recv().await.unwrap().payload().len(), 128 * 1024);
+    }
+
+    #[test]
+    fn payload_plan_keeps_transport_variants_independent() {
+        let plan = TransportPayloadPlan::new(Bytes::from_static(b"rich")).with_variant(
+            TransportKind::Udp,
+            TransportPayloadVariant::new(Bytes::from_static(b"udp"))
+                .with_sidecars([Bytes::from_static(b"sidecar")]),
+        );
+        assert_eq!(
+            plan.variant(TransportKind::Tcp).primary(),
+            &Bytes::from_static(b"rich")
+        );
+        assert_eq!(
+            plan.variant(TransportKind::Udp).primary(),
+            &Bytes::from_static(b"udp")
+        );
+        assert_eq!(plan.variant(TransportKind::Udp).sidecars().len(), 1);
     }
 }

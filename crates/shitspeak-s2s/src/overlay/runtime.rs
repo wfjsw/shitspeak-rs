@@ -143,6 +143,7 @@ pub(crate) struct OverlayInner {
     pub neighbor: Arc<NeighborMonitor>,
     pub routing: RoutingHandle,
     pub distribution: Arc<DistributionPlane>,
+    pub attachments: Arc<super::attachments::AttachmentCache>,
     pub services: Arc<ServiceRegistry>,
     pub duplicate_detector: Arc<DuplicateDetector>,
     ordering: Arc<OverlayOrdering>,
@@ -186,6 +187,7 @@ impl OverlayInner {
 
         let routing = new_routing_handle();
         let distribution = Arc::new(DistributionPlane::default());
+        let attachments = Arc::new(super::attachments::AttachmentCache::default());
         let services = Arc::new(ServiceRegistry::new());
         let ordering = Arc::new(OverlayOrdering::new(&cfg));
 
@@ -231,6 +233,7 @@ impl OverlayInner {
             neighbor,
             routing,
             distribution,
+            attachments,
             services,
             duplicate_detector,
             ordering,
@@ -369,6 +372,7 @@ impl OverlayInner {
             lsdb: self.lsdb.clone(),
             routing: self.routing.clone(),
             distribution: self.distribution.clone(),
+            attachments: self.attachments.clone(),
             services: self.services.clone(),
             duplicate_detector: self.duplicate_detector.clone(),
             ordering: self.ordering.clone(),

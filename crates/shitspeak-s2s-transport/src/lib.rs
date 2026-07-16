@@ -79,9 +79,12 @@ mod tls;
 pub use adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 pub use compression::SendOptions;
 pub use config::{KcpTuning, TransportConfig, TransportRoutingPolicy, TransportTuning};
-pub use connection::AddressBackoffSnapshot;
+pub use connection::{AddressBackoffSnapshot, TransportPayloadPlan, TransportPayloadVariant};
 pub use error::{ConfigError, SendError, TransportError};
-pub use frame::{Frame, FrameType, build_frame, decode_frame, encode_frame, encode_frame_to_bytes};
+pub use frame::{
+    Frame, FrameType, build_frame, decode_frame, encode_frame, encode_frame_to_bytes,
+    encoded_data_frame_len,
+};
 pub use identity::node_id_from_cert_file;
 pub use manager::PeerAddressSnapshot;
 pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage};
