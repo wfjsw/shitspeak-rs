@@ -174,6 +174,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         )
         .await;
 
+        self.wake_delivery_and_clock_tick();
         self.spawn_propose_retries(op_id);
 
         Ok(())

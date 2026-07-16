@@ -104,12 +104,16 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         // Trigger shutdown so Server::run stops accept loops and can exit.
-        // We can't await the JoinHandle from Drop, so we abort it as a fallback;
-        // the run task will already have noticed the shutdown signal.
+        //
+        // Do not abort the run task here. `Server::run` owns the join handle
+        // for the independently spawned S2S runtime; aborting it would drop
+        // that handle without running the runtime's shutdown sequence, which
+        // leaves S2S transports/replication tasks alive after a panic. Detach
+        // the task instead and let it observe the shutdown watch and join its
+        // children. Tests that complete normally use `shutdown_gracefully`
+        // and still await this handle directly.
         self.server.shutdown();
-        if let Some(h) = self.run_handle.take() {
-            h.abort();
-        }
+        let _ = self.run_handle.take();
     }
 }
 

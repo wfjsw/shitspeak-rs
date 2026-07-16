@@ -13,7 +13,6 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use shitspeak_s2s::testing::chaos::FaultSelector;
 use shitspeak_s2s::testing::{
     Capture, Cluster, MessageType, full_mesh_seeds, install_provider_once, line_seeds, loopback,
     mint_pki, overlay_cfg, pick_free_port, s2s_network_test_guard, transport_cfg,
@@ -890,7 +889,11 @@ async fn distribution_tree_repairs_direct_child_send_failure() {
 /// update, so sending again cannot publish another tree version.
 #[tokio::test]
 async fn distribution_tree_epoch_is_stable_across_metric_churn() {
-    let cluster = Cluster::build(&[1, 2], full_mesh_seeds).await;
+    let cluster = Cluster::build_with_cfg(&[1, 2], full_mesh_seeds, |_idx, cfg| {
+        cfg.with_lsa_metric_hold(Duration::from_millis(100))
+            .with_lsa_metric_min_emit_interval(Duration::from_millis(100))
+    })
+    .await;
     let source = cluster.node(1);
     let receiver = cluster.node(2);
     let (tx, mut rx) = mpsc::channel(32);
@@ -931,33 +934,36 @@ async fn distribution_tree_epoch_is_stable_across_metric_churn() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     while rx.try_recv().is_ok() {}
 
-    let initial_rtt = source
+    let initial_lsa = source
         .overlay
         .link_state_snapshot()
         .into_iter()
         .find(|lsa| lsa.origin == 1)
-        .and_then(|lsa| {
-            lsa.links
-                .into_iter()
-                .find(|link| link.neighbor == 2)
-                .map(|link| link.rtt_us)
-        })
-        .unwrap_or_default();
+        .expect("source LSA should include its direct neighbor");
+    let initial_seq = initial_lsa.seq;
+    let initial_rtt = initial_lsa
+        .links
+        .into_iter()
+        .find(|link| link.neighbor == 2)
+        .map(|link| link.rtt_us)
+        .expect("source LSA should advertise its direct neighbor RTT");
     source.chaos.add_latency(2, Duration::from_millis(120));
     assert!(
-        wait_until(Duration::from_secs(5), || {
+        wait_until(Duration::from_secs(10), || {
             source
                 .overlay
                 .link_state_snapshot()
                 .into_iter()
                 .find(|lsa| lsa.origin == 1)
-                .and_then(|lsa| {
-                    lsa.links
-                        .into_iter()
-                        .find(|link| link.neighbor == 2)
-                        .map(|link| link.rtt_us)
+                .is_some_and(|lsa| {
+                    lsa.seq > initial_seq
+                        && lsa
+                            .links
+                            .into_iter()
+                            .find(|link| link.neighbor == 2)
+                            .map(|link| link.rtt_us)
+                            .is_some_and(|rtt| rtt > initial_rtt.saturating_add(50_000))
                 })
-                .is_some_and(|rtt| rtt > initial_rtt.saturating_add(50_000))
         })
         .await,
         "source LSA did not advertise the injected RTT churn"
@@ -995,8 +1001,8 @@ async fn distribution_tree_epoch_is_stable_across_metric_churn() {
 
 /// Checks that losing every ACK for a replacement tree does not deactivate
 /// the predecessor. A direct-child failure excludes that edge from the
-/// candidate, whose ACKs route via node 3. Once the direct transport recovers,
-/// the prior active tree must keep delivering while those ACKs are dropped.
+/// candidate. Once the direct transport recovers, the prior active tree must
+/// keep delivering while every replacement ACK is dropped at the source.
 #[tokio::test]
 async fn distribution_tree_lost_candidate_ack_keeps_active_tree_delivering() {
     let cluster = Cluster::build(&[1, 2, 3], full_mesh_seeds).await;
@@ -1092,8 +1098,12 @@ async fn distribution_tree_lost_candidate_ack_keeps_active_tree_delivering() {
     while rx2.try_recv().is_ok() {}
     while rx3.try_recv().is_ok() {}
 
-    let ack_fault = FaultSelector::new(3, TransportKind::Tcp, MessageType::DistributionAck);
-    source.chaos.drop_next(ack_fault, 100);
+    source
+        .chaos
+        .drop_next_of_type_from(2, MessageType::DistributionAck, 100);
+    source
+        .chaos
+        .drop_next_of_type_from(3, MessageType::DistributionAck, 100);
     source
         .overlay
         .send_multicast_tree_unordered_with_routing_metric_and_group_options(
@@ -1110,12 +1120,18 @@ async fn distribution_tree_lost_candidate_ack_keeps_active_tree_delivering() {
         .await
         .unwrap();
     assert!(
-        wait_until(Duration::from_secs(10), || source
-            .chaos
-            .remaining_drops(ack_fault)
-            < 100)
+        wait_until(Duration::from_secs(10), || {
+            source
+                .chaos
+                .remaining_type_drops_from(2, MessageType::DistributionAck)
+                < 100
+                && source
+                    .chaos
+                    .remaining_type_drops_from(3, MessageType::DistributionAck)
+                    < 100
+        })
         .await,
-        "replacement tree did not emit an ACK on the expected routed hop"
+        "replacement tree did not emit every expected ACK"
     );
     assert_eq!(
         distribution_event_total(&cluster, 1, "activation"),

@@ -1607,6 +1607,7 @@ impl Server {
                         *self.geoip_resolver.write() =
                             Arc::new(GeoIpResolver::new(new_config.geoip.clone()));
                         invalidate_acl_cache = true;
+                        visibility_reload = true;
                     }
                     if current.send_permission_info != new_config.send_permission_info {
                         tracing::info!(

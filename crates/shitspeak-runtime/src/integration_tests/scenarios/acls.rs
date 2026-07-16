@@ -1100,6 +1100,87 @@ async fn traverse_visibility_reconciles_acl_changes() {
 }
 
 #[tokio::test]
+async fn traverse_visibility_retains_viewer_self_and_channel_after_losing_traverse() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(3), vec!["admin".into()]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(89, "Current".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    alice.move_to_channel(89).await;
+    alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice.session_id) && us.channel_id == Some(89))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice enters her current channel");
+    alice.drain_now().await;
+
+    carol
+        .set_acls(
+            89,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: false,
+                inherited: false,
+                user_id: None,
+                group: Some("all".to_owned()),
+                grant: 0,
+                deny: ACLPermissions::Traverse as u32,
+            }],
+            true,
+        )
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut self_removed = false;
+    let mut current_channel_removed = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = alice.recv(remaining).await else {
+            break;
+        };
+        self_removed |=
+            matches!(&message, Message::UserRemove(remove) if remove.session == alice.session_id);
+        current_channel_removed |=
+            matches!(&message, Message::ChannelRemove(remove) if remove.channel_id == 89);
+    }
+
+    assert!(
+        !self_removed,
+        "a viewer must not receive UserRemove for themselves after losing Traverse"
+    );
+    assert!(
+        !current_channel_removed,
+        "a viewer must retain their current channel after losing Traverse"
+    );
+}
+
+#[tokio::test]
 async fn traverse_visibility_reconciles_online_group_changes() {
     let server = spawn_test_server(TestServerOpts {
         hide_users_without_traverse: true,

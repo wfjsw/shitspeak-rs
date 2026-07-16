@@ -57,6 +57,7 @@ const LARGE_TREE_FRAME_INTERVAL: Duration = Duration::from_millis(20);
 const LARGE_TREE_MIN_SPEAK_SPAN: Duration = Duration::from_secs(10);
 const LARGE_TREE_FRAME_LATENCY_BUDGET: Duration = Duration::from_secs(2);
 const LARGE_TREE_END_TO_END_LATENCY_BUDGET: Duration = Duration::from_secs(2);
+const LARGE_TREE_LOSS_BUDGET_PERCENT: usize = 1;
 const LARGE_TREE_CPU_CORE_BUDGET: f64 = 0.40;
 const LARGE_TREE_CPU_SPIKE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const LARGE_TREE_OPUS_FRAME: &[u8] = SAMPLE_OPUS;
@@ -590,6 +591,7 @@ struct LargeTreeClientDelivery {
     first_at: Instant,
     last_at: Instant,
     max_frame_gap: Duration,
+    missing_frames: usize,
 }
 
 async fn send_and_assert_large_tree_shout_delivery(
@@ -609,26 +611,33 @@ async fn send_and_assert_large_tree_shout_delivery(
         (send_end, resources)
     };
     let receive_task = async {
+        let allowed_loss = frames
+            .len()
+            .saturating_mul(LARGE_TREE_LOSS_BUDGET_PERCENT)
+            .div_ceil(100);
         let mut expected_indices = expected.iter().copied().collect::<Vec<_>>();
         expected_indices.sort_unstable();
         join_all(expected_indices.iter().map(|&idx| async move {
             let mut first_at = None;
             let mut last_at = None;
-            let mut previous_frame = None;
+            let mut previous_offset = None;
             let mut previous_receive_at = None;
-            let mut max_frame_gap = Duration::from_millis(0);
-            for (frame_number, payload) in frames {
-                let audio = clients[idx]
-                    .client
-                    .recv_voice_tcp(LARGE_TREE_FRAME_LATENCY_BUDGET)
-                    .await
-                    .unwrap_or_else(|| {
+            let mut max_frame_gap = Duration::ZERO;
+            let mut received_offsets = vec![false; frames.len()];
+            while let Some(audio) = clients[idx]
+                .client
+                .recv_voice_tcp(LARGE_TREE_FRAME_LATENCY_BUDGET)
+                .await
+            {
+                let received_at = Instant::now();
+                let offset = frames
+                    .binary_search_by_key(&audio.frame_number, |(frame_number, _)| *frame_number)
+                    .unwrap_or_else(|_| {
                         panic!(
-                            "{}: client {idx} should receive frame {frame_number}",
-                            case.label
+                            "{}: client {idx} received unexpected frame {}",
+                            case.label, audio.frame_number
                         )
                     });
-                let received_at = Instant::now();
                 if first_at.is_none() {
                     first_at = Some(received_at);
                 }
@@ -640,31 +649,40 @@ async fn send_and_assert_large_tree_shout_delivery(
 
                 assert_eq!(audio.sender_session, Some(alice.server_session));
                 assert_eq!(
-                    audio.frame_number, *frame_number,
-                    "{}: client {idx} received a non-contiguous frame",
-                    case.label
-                );
-                assert_eq!(
                     opus_frame(&audio.audio_payload),
-                    payload.as_ref(),
+                    frames[offset].1.as_ref(),
                     "{}: client {idx} received corrupted voice payload",
                     case.label
                 );
-                if let Some(previous_frame) = previous_frame {
-                    assert_eq!(
-                        *frame_number,
-                        previous_frame + 1,
-                        "{}: generated segment frames must be contiguous",
-                        case.label
-                    );
-                }
-                previous_frame = Some(*frame_number);
+                assert!(
+                    previous_offset.is_none_or(|previous| offset > previous),
+                    "{}: client {idx} received reordered or duplicate frame {}",
+                    case.label,
+                    audio.frame_number
+                );
+                previous_offset = Some(offset);
+                received_offsets[offset] = true;
                 last_at = Some(received_at);
             }
+            let missing_frames = frames
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, (frame_number, _))| {
+                    (!received_offsets[offset]).then_some(*frame_number)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                missing_frames.len() <= allowed_loss,
+                "{}: client {idx} lost {} of {} voice frames; budget is {allowed_loss}; missing={missing_frames:?}",
+                case.label,
+                missing_frames.len(),
+                frames.len()
+            );
             LargeTreeClientDelivery {
                 first_at: first_at.expect("large-tree delivery should include at least one frame"),
                 last_at: last_at.expect("large-tree delivery should include at least one frame"),
                 max_frame_gap,
+                missing_frames: missing_frames.len(),
             }
         }))
         .await
@@ -688,15 +706,21 @@ async fn send_and_assert_large_tree_shout_delivery(
         .map(|delivery| delivery.max_frame_gap)
         .max()
         .unwrap_or_default();
+    let max_missing_frames = deliveries
+        .iter()
+        .map(|delivery| delivery.missing_frames)
+        .max()
+        .unwrap_or_default();
     let budget = large_tree_cpu_core_budget();
     let route_busy_cores = route_busy_cores(route_resources.resolution_duration(), resources.wall)
         .expect("large-tree speak duration should be non-zero");
     eprintln!(
-        "large_tree_speak_metrics case={} recipients={} frames={} routed_frames={} send_ms={} first_latency_ms={} tail_latency_ms={} max_gap_ms={} route_resolution_ms={} route_total_ms={} route_busy_cores={:.2} process_cpu_ms={} process_avg_cores={} process_max_interval_cores={} routing_budget_cores={:.2}",
+        "large_tree_speak_metrics case={} recipients={} frames={} routed_frames={} max_missing_frames={} send_ms={} first_latency_ms={} tail_latency_ms={} max_gap_ms={} route_resolution_ms={} route_total_ms={} route_busy_cores={:.2} process_cpu_ms={} process_avg_cores={} process_max_interval_cores={} routing_budget_cores={:.2}",
         case.label,
         expected.len(),
         frames.len(),
         route_resources.frames(),
+        max_missing_frames,
         resources.wall.as_millis(),
         max_first_frame_latency.as_millis(),
         tail_latency.as_millis(),

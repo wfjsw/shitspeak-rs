@@ -558,6 +558,13 @@ mod e2e_tests {
             },
         )
         .await;
+        rt.recv_clock_tick(
+            2,
+            super::super::proto::StrictClockTick {
+                src_node: 2,
+                src_clock: ts_propose + 2,
+            },
+        );
 
         tokio::time::timeout(Duration::from_secs(1), accepted_rx)
             .await

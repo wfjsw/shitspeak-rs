@@ -569,6 +569,14 @@ impl NeighborMonitor {
         st.pending.insert(nonce, now);
     }
 
+    /// Remove a Hello that could not be handed to the transport. This avoids
+    /// treating a local send failure as an unacknowledged network probe.
+    pub fn cancel_outbound_ping(&self, dst: NodeIdentifier, nonce: u64) {
+        if let Some(state) = self.state.lock().get_mut(&dst) {
+            state.pending.remove(&nonce);
+        }
+    }
+
     /// Caller: inbound dispatcher when a `Hello` arrives. Updates
     /// boot_epoch tracking and returns `Restarted` if this is a higher
     /// boot_epoch than we'd seen for `from`.

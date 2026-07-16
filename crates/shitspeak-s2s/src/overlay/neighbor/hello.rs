@@ -80,6 +80,9 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
         }
     };
     let payload_len = payload.len();
+    // Register before the await: a local loopback peer can return HelloAck
+    // before try_send completes, and that ACK must still match this probe.
+    ctx.monitor.record_outbound_ping(dst, nonce);
     match ctx
         .transport
         .try_send(
@@ -93,9 +96,11 @@ pub async fn send_hello(ctx: &HelloContext, dst: NodeIdentifier) {
     {
         Ok(()) => {
             crate::debug_io::record_sent(ctx.self_id, dst, packet_kind, payload_len);
-            ctx.monitor.record_outbound_ping(dst, nonce);
         }
-        Err(e) => trace!(peer=%dst, error=%e, "hello send failed"),
+        Err(e) => {
+            ctx.monitor.cancel_outbound_ping(dst, nonce);
+            trace!(peer=%dst, error=%e, "hello send failed");
+        }
     }
 }
 

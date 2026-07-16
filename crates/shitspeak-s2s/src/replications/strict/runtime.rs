@@ -1259,7 +1259,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.clock_tick_signal.notify_one();
     }
 
-    fn wake_delivery_and_clock_tick(&self) {
+    pub(crate) fn wake_delivery_and_clock_tick(&self) {
         self.deliver_signal.notify_one();
         self.wake_clock_tick_loop();
     }
@@ -1509,19 +1509,36 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         };
         let op_id: OpId = (p.op_id_hi, p.op_id_lo);
-        // Update peer clock + advance our clock; reply with ack. Stash the
-        // op so a takeover can recover it via the slow-path if `coord` dies.
-        let ts_local;
-        let local_clock_after;
+        // A retransmitted Propose must reuse the original ACK timestamp.
+        // Advancing the local clock again would move this replica's pending
+        // ordering barrier past a timestamp the coordinator can still commit.
+        let (ts_local, local_clock_after);
         {
             let mut s = self.state.lock();
             s.observe_peer(from, p.src_clock);
-            ts_local = s.advance_clock(p.ts_propose);
-            local_clock_after = s.clock;
-            s.peer_clocks.insert(self.self_id, local_clock_after);
-            // Skip stash if we've already buffered a Commit/RecoveryCommit
-            // for this op_id (a stale Propose retransmission).
-            if !s.committed_ids.contains(&op_id) {
+            if let Some(pending) = s.pending_proposes.get(&op_id) {
+                if pending.coord_node != coord {
+                    warn!(
+                        op_id_hi = op_id.0,
+                        op_id_lo = op_id.1,
+                        expected_coord = pending.coord_node,
+                        coord,
+                        "strict propose ignored: op id reused by another coordinator"
+                    );
+                    return;
+                }
+                ts_local = pending.ts_local;
+                local_clock_after = s.clock;
+            } else if let Some(ts_final) = s.committed_ts_final.get(&op_id).copied() {
+                // A late retry for an already committed operation is harmless.
+                // Reuse its decided timestamp instead of creating a second ACK
+                // value for the same operation.
+                ts_local = ts_final;
+                local_clock_after = s.clock;
+            } else {
+                ts_local = s.advance_clock(p.ts_propose);
+                local_clock_after = s.clock;
+                s.peer_clocks.insert(self.self_id, local_clock_after);
                 s.record_pending_propose(
                     op_id,
                     coord,
@@ -1530,6 +1547,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     Instant::now(),
                 );
             }
+            s.peer_clocks.insert(self.self_id, local_clock_after);
         }
         let ack = StrictBody::ProposeAck(StrictProposeAck {
             ack_node: self.self_id as u32,
@@ -1543,6 +1561,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if let Err(e) = self.net.send_unicast(coord, &self.topic, ack).await {
             trace!(error=%e, "send propose-ack failed");
         }
+        self.wake_delivery_and_clock_tick();
     }
 
     pub async fn recv_propose_ack(&self, from: NodeIdentifier, ack: StrictProposeAck) {
@@ -2040,11 +2059,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             self.wake_delivery_and_clock_tick();
         }
 
-        let dsts: Vec<NodeIdentifier> = target
-            .iter()
-            .filter(|n| **n != self.self_id)
-            .copied()
-            .collect();
+        let dsts = recovery_commit_repair_dsts(self.net.as_ref(), self.self_id, &target);
         let body = StrictBody::RecoveryCommit(StrictRecoveryCommit {
             takeover_node: self.self_id as u32,
             ballot,
@@ -2056,10 +2071,23 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             src_clock: clock_now,
         });
         if !dsts.is_empty() {
-            if let Err(e) = self.net.send_multicast(&dsts, &self.topic, body).await {
+            if let Err(e) = self
+                .net
+                .send_multicast(&dsts, &self.topic, body.clone())
+                .await
+            {
                 trace!(error=%e, "send recovery-commit multicast failed");
             }
         }
+        spawn_recovery_commit_repair_retries(
+            self.net.clone(),
+            self.shutdown.clone(),
+            self.topic.clone(),
+            self.self_id,
+            target,
+            body,
+            self.cfg.delivery_tick_interval(),
+        );
     }
 
     /// Phase 2 (Accept-and-Commit): apply if our promise still allows it.
@@ -2449,6 +2477,48 @@ fn spawn_commit_fanout_retries(
     });
 }
 
+fn recovery_commit_repair_dsts(
+    net: &dyn StrictNet,
+    self_id: NodeIdentifier,
+    frozen_targets: &HashSet<NodeIdentifier>,
+) -> Vec<NodeIdentifier> {
+    let mut dsts: Vec<_> = frozen_targets
+        .iter()
+        .copied()
+        .chain(net.alive_members())
+        .filter(|node| *node != self_id)
+        .collect();
+    dsts.sort_unstable();
+    dsts.dedup();
+    dsts
+}
+
+fn spawn_recovery_commit_repair_retries(
+    net: Arc<dyn StrictNet>,
+    shutdown: CancellationToken,
+    topic: String,
+    self_id: NodeIdentifier,
+    frozen_targets: HashSet<NodeIdentifier>,
+    body: StrictBody,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        for _ in 0..COMMIT_FANOUT_RETRY_TICKS {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {},
+            }
+            let dsts = recovery_commit_repair_dsts(net.as_ref(), self_id, &frozen_targets);
+            if dsts.is_empty() {
+                continue;
+            }
+            if let Err(e) = net.send_multicast(&dsts, &topic, body.clone()).await {
+                trace!(error=%e, "recovery commit repair retry failed");
+            }
+        }
+    });
+}
+
 fn spawn_delivery_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
     let weak = {
         let rt = rt;
@@ -2480,8 +2550,11 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
         let mut s = rt.state.lock();
         let watermark = delivery_watermark(&s, rt.self_id, &alive);
         let raw_high_water = watermark.high_water;
+        // A peer at exactly `ts_final` can still coordinate or forward a
+        // different commit with that same timestamp. Wait until every live
+        // peer has advanced beyond the timestamp before draining its tie set.
+        let mut effective_high_water = raw_high_water.saturating_sub(1);
         let pending_blocker = earliest_uncommitted_proposal_blocker(&s, rt.self_id, now);
-        let mut effective_high_water = raw_high_water;
         if let Some(ts) = s.earliest_uncommitted_proposal_ts() {
             effective_high_water = effective_high_water.min(ts.saturating_sub(1));
         }
@@ -2966,7 +3039,7 @@ fn clock_tick_needed_for_state(
     self_id: NodeIdentifier,
     alive: &[NodeIdentifier],
 ) -> bool {
-    if !state.commit_buffer.is_empty() {
+    if !state.commit_buffer.is_empty() || state.earliest_uncommitted_proposal_ts().is_some() {
         return true;
     }
     alive
@@ -3284,6 +3357,16 @@ mod tests {
     }
 
     #[test]
+    fn clock_tick_needed_for_pending_propose() {
+        let mut s = StrictState::new();
+        s.finish_history_election();
+        s.peer_clocks.insert(20, 3);
+        s.record_pending_propose((1, 1), 20, Bytes::new(), 5, Instant::now());
+
+        assert!(clock_tick_needed_for_state(&s, 10, &[10, 20]));
+    }
+
+    #[test]
     fn clock_tick_needed_for_unobserved_alive_peer() {
         let mut s = StrictState::new();
         s.finish_history_election();
@@ -3570,6 +3653,17 @@ mod tests {
     }
 
     #[test]
+    fn recovery_commit_repair_includes_live_replacement_members() {
+        let net = MockNet::new(2, vec![1, 2, 3]);
+        let frozen_targets = HashSet::from([2, 3]);
+
+        assert_eq!(
+            recovery_commit_repair_dsts(net.as_ref(), 2, &frozen_targets),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
     fn make_ballot_orders_by_node_then_attempt() {
         let a = make_ballot(2, 1);
         let b = make_ballot(2, 5);
@@ -3710,6 +3804,52 @@ mod tests {
             }
             other => panic!("unexpected capture: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_propose_reuses_the_original_ack_timestamp() {
+        use crate::replications::test_support::CapturedFrame;
+
+        let net = MockNet::new(2, vec![1, 2]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            2,
+            0,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let proposal = StrictPropose {
+            coord_node: 1,
+            op_id_hi: 1,
+            op_id_lo: 7,
+            ts_propose: 10,
+            op_msgpack: Bytes::from(rmp_serde::to_vec(&1234u64).unwrap()),
+            src_clock: 10,
+        };
+
+        rt.recv_propose(1, proposal.clone()).await;
+        let mut retry = proposal;
+        retry.src_clock = 100;
+        rt.recv_propose(1, retry).await;
+
+        let ack_timestamps: Vec<_> = net
+            .drain_captures()
+            .into_iter()
+            .filter_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::ProposeAck(ack),
+                    ..
+                } => Some((ack.ts_local, ack.src_clock)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ack_timestamps, vec![(11, 11), (11, 11)]);
+
+        let state = rt.state.lock();
+        assert_eq!(state.clock, 11);
+        assert_eq!(state.pending_proposes[&(1, 7)].ts_local, 11);
     }
 
     #[tokio::test]

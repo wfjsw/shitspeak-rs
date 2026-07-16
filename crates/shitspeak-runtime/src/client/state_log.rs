@@ -422,7 +422,7 @@ impl ClientStateLogEntry {
                 delta,
                 ..
             } if *session_id == viewer_session_id && delta.affects_acl_generation() => {
-                if *client_instance_id != viewer_client_instance_id {
+                if *client_instance_id != 0 && *client_instance_id != viewer_client_instance_id {
                     return None;
                 }
                 let client = repo.get_client_in_server(server_id, *session_id).await?;
@@ -499,7 +499,9 @@ impl ClientStateLogEntry {
                 ban,
             } => {
                 if let Some(client) = repo.get_client_in_server(server_id, *session_id).await {
-                    if client.client_instance_id() != *client_instance_id {
+                    if *client_instance_id != 0
+                        && client.client_instance_id() != *client_instance_id
+                    {
                         return None;
                     }
                 }
@@ -524,7 +526,7 @@ impl ClientStateLogEntry {
                     return None;
                 }
                 let client = repo.get_client_in_server(server_id, *session_id).await?;
-                if client.client_instance_id() != *client_instance_id {
+                if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
                     return None;
                 }
                 let mut us = crate::messages::encoder::UserState {
@@ -682,6 +684,68 @@ mod tests {
         ] {
             assert!(!delta.affects_voice_routing());
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_wildcard_update_projects_current_client_and_flushes_acl_cache() {
+        let repo = ClientRepository::new(1, 16);
+        let server_id = "alpha".to_owned();
+        let session_id = ClientSessionIdentifier::new(2, 7).unwrap();
+        let client_instance_id = 42;
+        let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(ip, 30_001);
+        let local_addr = SocketAddr::new(ip, 64_738);
+        let add = Arc::new(ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id: server_id.clone(),
+                session_id,
+                client_instance_id,
+                real_ip: ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+        });
+        repo.apply_remote_operation(add, 0).await.unwrap();
+
+        let update = ClientStateLogEntry {
+            version: 2,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::UpdateGlobalState {
+                server_id,
+                session_id,
+                client_instance_id: 0,
+                sender_session_id: None,
+                delta: ClientGlobalStateDelta {
+                    display_name: Some(Some("updated".to_owned())),
+                    groups: Some(HashSet::from(["staff".to_owned()])),
+                    ..Default::default()
+                },
+            },
+        };
+        repo.apply_remote_operation(Arc::new(update.clone()), 0)
+            .await
+            .unwrap();
+
+        let messages = update
+            .messages_for_client(&repo, session_id, client_instance_id)
+            .await;
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                crate::messages::Message::PermissionQuery(query),
+                crate::messages::Message::UserState(user_state),
+            ] if query.flush == Some(true) && user_state.name.as_deref() == Some("updated")
+        ));
     }
 
     #[test]

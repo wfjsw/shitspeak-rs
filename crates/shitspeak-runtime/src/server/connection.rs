@@ -437,7 +437,7 @@ fn permission_info_refresh_scope_for_entry(
             delta,
             ..
         } if *session_id == viewer_session_id
-            && *client_instance_id == viewer_client_instance_id =>
+            && (*client_instance_id == 0 || *client_instance_id == viewer_client_instance_id) =>
         {
             permission_info_refresh_scope_for_delta(delta)
         }

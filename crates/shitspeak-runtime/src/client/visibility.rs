@@ -15,12 +15,13 @@ use shitspeak_state::{ChannelOp, ChannelOperation};
 
 const DELETE_FANOUT_CACHE_MAX_ENTRIES: usize = 128;
 const SUPERUSER_NODE_DISPLAY_TRAIT_PREFIX: &str = " [n";
+type PackedSessionId = u32;
 
 #[derive(Debug)]
 pub struct UserVisibilityState {
-    known: HashMap<ClientSessionIdentifier, KnownUserVisibility>,
-    sessions_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
-    sessions_by_listener_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
+    known: HashMap<PackedSessionId, KnownUserVisibility>,
+    sessions_by_channel: HashMap<u32, HashSet<PackedSessionId>>,
+    sessions_by_listener_channel: HashMap<u32, HashSet<PackedSessionId>>,
     registration: Option<VisibilityRegistration>,
 }
 
@@ -397,9 +398,9 @@ fn remove_viewer_from_channel_index(
 
 #[derive(Debug, Clone, Default)]
 pub struct VisibilityRefreshScope {
-    sessions: HashSet<ClientSessionIdentifier>,
+    sessions: HashSet<PackedSessionId>,
     channels: HashSet<u32>,
-    listener_channel_removals: HashMap<ClientSessionIdentifier, HashSet<u32>>,
+    listener_channel_removals: HashMap<PackedSessionId, HashSet<u32>>,
     include_all_channels: bool,
     include_known_users: bool,
     include_user_state_names: bool,
@@ -417,14 +418,14 @@ impl VisibilityRefreshScope {
     }
 
     pub fn include_session(&mut self, session: ClientSessionIdentifier) {
-        self.sessions.insert(session);
+        self.sessions.insert(u32::from(session));
     }
 
     pub fn include_sessions(
         &mut self,
         sessions: impl IntoIterator<Item = ClientSessionIdentifier>,
     ) {
-        self.sessions.extend(sessions);
+        self.sessions.extend(sessions.into_iter().map(u32::from));
     }
 
     pub fn include_channel(&mut self, channel_id: u32) {
@@ -441,7 +442,7 @@ impl VisibilityRefreshScope {
         channel_ids: impl IntoIterator<Item = u32>,
     ) {
         self.listener_channel_removals
-            .entry(session)
+            .entry(u32::from(session))
             .or_default()
             .extend(channel_ids);
     }
@@ -533,11 +534,13 @@ impl UserVisibilityState {
     }
 
     pub fn known_channel(&self, session: ClientSessionIdentifier) -> Option<u32> {
-        self.known.get(&session).map(|known| known.channel_id)
+        self.known
+            .get(&u32::from(session))
+            .map(|known| known.channel_id)
     }
 
     fn get(&self, session: ClientSessionIdentifier) -> Option<&KnownUserVisibility> {
-        self.known.get(&session)
+        self.known.get(&u32::from(session))
     }
 
     fn insert(
@@ -547,6 +550,7 @@ impl UserVisibilityState {
         listener_channels: HashSet<u32>,
     ) {
         self.remove(session);
+        let packed_session = u32::from(session);
         let current_bucket_was_empty = self
             .sessions_by_channel
             .get(&channel_id)
@@ -554,7 +558,7 @@ impl UserVisibilityState {
         self.sessions_by_channel
             .entry(channel_id)
             .or_default()
-            .insert(session);
+            .insert(packed_session);
         if current_bucket_was_empty {
             if let Some(registration) = &self.registration {
                 registration.add_current_channel(channel_id);
@@ -568,7 +572,7 @@ impl UserVisibilityState {
             self.sessions_by_listener_channel
                 .entry(*listener_channel_id)
                 .or_default()
-                .insert(session);
+                .insert(packed_session);
             if listener_bucket_was_empty {
                 if let Some(registration) = &self.registration {
                     registration.add_listener_channel(*listener_channel_id);
@@ -576,7 +580,7 @@ impl UserVisibilityState {
             }
         }
         self.known.insert(
-            session,
+            packed_session,
             KnownUserVisibility {
                 channel_id,
                 listener_channels,
@@ -585,10 +589,15 @@ impl UserVisibilityState {
     }
 
     fn remove(&mut self, session: ClientSessionIdentifier) -> bool {
-        let Some(known) = self.known.remove(&session) else {
+        let packed_session = u32::from(session);
+        let Some(known) = self.known.remove(&packed_session) else {
             return false;
         };
-        if remove_indexed_session(&mut self.sessions_by_channel, known.channel_id, session) {
+        if remove_indexed_session(
+            &mut self.sessions_by_channel,
+            known.channel_id,
+            packed_session,
+        ) {
             if let Some(registration) = &self.registration {
                 registration.remove_current_channel(known.channel_id);
             }
@@ -597,7 +606,7 @@ impl UserVisibilityState {
             if remove_indexed_session(
                 &mut self.sessions_by_listener_channel,
                 listener_channel_id,
-                session,
+                packed_session,
             ) {
                 if let Some(registration) = &self.registration {
                     registration.remove_listener_channel(listener_channel_id);
@@ -608,14 +617,18 @@ impl UserVisibilityState {
     }
 
     fn known_sessions(&self) -> impl Iterator<Item = ClientSessionIdentifier> + '_ {
+        self.known_session_ids().map(ClientSessionIdentifier::from)
+    }
+
+    fn known_session_ids(&self) -> impl Iterator<Item = PackedSessionId> + '_ {
         self.known.keys().copied()
     }
 
-    fn known_sessions_in_channels<'a>(
-        &'a self,
-        channel_ids: &'a HashSet<u32>,
-    ) -> HashSet<ClientSessionIdentifier> {
-        self.sessions_in_indexed_channels(channel_ids)
+    fn known_session_ids_in_channels(
+        &self,
+        channel_ids: &HashSet<u32>,
+    ) -> HashSet<PackedSessionId> {
+        self.session_ids_in_indexed_channels(channel_ids)
     }
 
     fn referenced_channel_ids(&self) -> HashSet<u32> {
@@ -625,10 +638,10 @@ impl UserVisibilityState {
         channel_ids
     }
 
-    fn sessions_in_indexed_channels(
+    fn session_ids_in_indexed_channels(
         &self,
         channel_ids: &HashSet<u32>,
-    ) -> HashSet<ClientSessionIdentifier> {
+    ) -> HashSet<PackedSessionId> {
         let mut sessions = HashSet::new();
         for channel_id in channel_ids {
             if let Some(channel_sessions) = self.sessions_by_channel.get(channel_id) {
@@ -645,6 +658,16 @@ impl UserVisibilityState {
         &self,
         channel_ids: &HashSet<u32>,
     ) -> HashSet<ClientSessionIdentifier> {
+        self.session_ids_in_current_channels(channel_ids)
+            .into_iter()
+            .map(ClientSessionIdentifier::from)
+            .collect()
+    }
+
+    fn session_ids_in_current_channels(
+        &self,
+        channel_ids: &HashSet<u32>,
+    ) -> HashSet<PackedSessionId> {
         let mut sessions = HashSet::new();
         for channel_id in channel_ids {
             if let Some(channel_sessions) = self.sessions_by_channel.get(channel_id) {
@@ -658,6 +681,16 @@ impl UserVisibilityState {
         &self,
         channel_ids: &HashSet<u32>,
     ) -> HashSet<ClientSessionIdentifier> {
+        self.session_ids_listening_to_channels(channel_ids)
+            .into_iter()
+            .map(ClientSessionIdentifier::from)
+            .collect()
+    }
+
+    fn session_ids_listening_to_channels(
+        &self,
+        channel_ids: &HashSet<u32>,
+    ) -> HashSet<PackedSessionId> {
         let mut sessions = HashSet::new();
         for channel_id in channel_ids {
             if let Some(listener_sessions) = self.sessions_by_listener_channel.get(channel_id) {
@@ -672,7 +705,8 @@ impl UserVisibilityState {
         session: ClientSessionIdentifier,
         channel_ids: &HashSet<u32>,
     ) -> Vec<u32> {
-        let Some(known) = self.known.get_mut(&session) else {
+        let packed_session = u32::from(session);
+        let Some(known) = self.known.get_mut(&packed_session) else {
             return Vec::new();
         };
         let mut removed = known
@@ -686,8 +720,11 @@ impl UserVisibilityState {
         removed.sort_unstable();
         for channel_id in &removed {
             known.listener_channels.remove(channel_id);
-            if remove_indexed_session(&mut self.sessions_by_listener_channel, *channel_id, session)
-            {
+            if remove_indexed_session(
+                &mut self.sessions_by_listener_channel,
+                *channel_id,
+                packed_session,
+            ) {
                 if let Some(registration) = &self.registration {
                     registration.remove_listener_channel(*channel_id);
                 }
@@ -698,9 +735,9 @@ impl UserVisibilityState {
 }
 
 fn remove_indexed_session(
-    index: &mut HashMap<u32, HashSet<ClientSessionIdentifier>>,
+    index: &mut HashMap<u32, HashSet<PackedSessionId>>,
     channel_id: u32,
-    session: ClientSessionIdentifier,
+    session: PackedSessionId,
 ) -> bool {
     let Some(sessions) = index.get_mut(&channel_id) else {
         return false;
@@ -742,6 +779,11 @@ async fn can_project_user(
     viewer: &Arc<Box<Client>>,
     target: &Arc<Box<Client>>,
 ) -> bool {
+    // A viewer must always retain their own UserState. The matching channel
+    // and its parent chain are retained separately by channel projection.
+    if viewer.get_session_id() == target.get_session_id() {
+        return true;
+    }
     if !can_view_user(server, viewer, target).await {
         return false;
     }
@@ -881,18 +923,22 @@ pub async fn visibility_config_reload_messages(
 
     let old_sessions = session_channel_shadow
         .iter()
-        .map(|(session, _)| *session)
+        .map(|(session, _)| session)
         .collect::<HashSet<_>>();
     let old_channel_ids = channel_tree_shadow.channel_ids().clone();
 
     let channels = server.get_channels().get_all_in_server(&server_id).await;
     let mut visible_channel_ids = HashSet::with_capacity(channels.len());
     for channel in &channels {
-        if crate::channel_handler::can_view_channel_with_ancestors(server, viewer, channel.id).await
-        {
+        if crate::channel_handler::can_view_channel(server, viewer, channel.id).await {
             visible_channel_ids.insert(channel.id);
         }
     }
+    visible_channel_ids.extend(crate::channel_handler::channel_and_ancestor_ids(
+        &channels,
+        viewer.get_current_channel_id(),
+    ));
+    crate::channel_handler::close_visible_channel_ancestors(&channels, &mut visible_channel_ids);
 
     let mut visible_targets = Vec::new();
     let mut new_sessions = HashSet::new();
@@ -1012,11 +1058,10 @@ pub async fn visibility_config_reload_messages(
 
     messages.extend(link_updates_before_removals);
 
-    let mut removed_channel_ids = old_channel_ids
-        .difference(&visible_channel_ids)
-        .copied()
-        .collect::<Vec<_>>();
-    removed_channel_ids.sort_unstable_by(|left, right| right.cmp(left));
+    let removed_channel_ids = crate::channel_handler::channel_removal_ids_descendant_first(
+        &channels,
+        &removed_channel_id_set,
+    );
     for channel_id in &removed_channel_ids {
         channel_tree_shadow.remove(channel_id);
         messages.push(
@@ -1214,7 +1259,7 @@ pub async fn visibility_refresh_messages(
     let mut sessions = std::mem::take(&mut scope.sessions);
     if scope.include_known_users {
         if hide_users_without_traverse {
-            sessions.extend(visibility.known_sessions());
+            sessions.extend(visibility.known_session_ids());
         } else if include_user_state_names {
             sessions.extend(
                 server
@@ -1223,7 +1268,7 @@ pub async fn visibility_refresh_messages(
                     .await
                     .into_iter()
                     .filter(|target| target.is_authenticated() && target.is_published())
-                    .map(|target| target.get_session_id()),
+                    .map(|target| u32::from(target.get_session_id())),
             );
         }
     }
@@ -1242,7 +1287,7 @@ pub async fn visibility_refresh_messages(
 
     if !channels.is_empty() {
         if hide_users_without_traverse {
-            sessions.extend(visibility.known_sessions_in_channels(&channels));
+            sessions.extend(visibility.known_session_ids_in_channels(&channels));
         }
         sessions.extend(
             server
@@ -1251,7 +1296,7 @@ pub async fn visibility_refresh_messages(
                 .await
                 .into_iter()
                 .filter(|target| target.is_authenticated())
-                .map(|target| target.get_session_id()),
+                .map(|target| u32::from(target.get_session_id())),
         );
     }
 
@@ -1261,6 +1306,7 @@ pub async fn visibility_refresh_messages(
             if sessions.contains(&session) {
                 continue;
             }
+            let session = ClientSessionIdentifier::from(session);
             let removed = visibility.remove_visible_listener_channels(session, &channel_ids);
             if removed.is_empty() {
                 continue;
@@ -1277,10 +1323,11 @@ pub async fn visibility_refresh_messages(
     }
 
     let mut sessions = sessions.into_iter().collect::<Vec<_>>();
-    sessions.sort_by_key(|session| u32::from(*session));
+    sessions.sort_unstable();
     sessions.dedup();
 
-    for session in sessions {
+    for packed_session in sessions {
+        let session = ClientSessionIdentifier::from(packed_session);
         match server
             .get_clients()
             .get_client_in_server(&server_id, session)
@@ -1354,7 +1401,7 @@ pub async fn visibility_refresh_scope_for_client_log_entry(
             delta,
             ..
         } if *session_id == viewer.get_session_id()
-            && *client_instance_id == viewer.client_instance_id() =>
+            && (*client_instance_id == 0 || *client_instance_id == viewer.client_instance_id()) =>
         {
             scope.merge(
                 visibility_refresh_scope_for_viewer_delta(
@@ -1408,19 +1455,20 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
                 // channels whose ACL chains depend on that hierarchy as well as
                 // the moved subtree itself. The repository owns this affected-set
                 // calculation so visibility and ACL-cache invalidation stay aligned.
-                let moved_subtree = channels.subtree_ids_in_server(&op.server_id, *id).await;
-                if server.get_hide_users_without_traverse() {
-                    if let Some(affected_channel_ids) = channels
+                let mut affected_channel_ids = if server.get_hide_users_without_traverse() {
+                    channels
                         .acl_affected_channel_ids_for_op(&op.server_id, &op.op)
                         .await
-                    {
-                        scope.include_channels(affected_channel_ids);
-                    } else {
-                        scope.include_channels(moved_subtree);
-                    }
+                        .unwrap_or_else(|| HashSet::from([*id]))
                 } else {
-                    scope.include_channels(moved_subtree);
-                }
+                    HashSet::from([*id])
+                };
+                let all_channels = channels.get_all_in_server(&op.server_id).await;
+                crate::channel_handler::expand_channel_ids_to_descendant_closure(
+                    &all_channels,
+                    &mut affected_channel_ids,
+                );
+                scope.include_channels(affected_channel_ids);
             }
         }
         ChannelOp::SetAcls { channel_id, .. } => {
@@ -1505,16 +1553,20 @@ fn include_delete_visibility_refresh_for_channels(
     current_channel_ids: &HashSet<u32>,
     listener_channel_ids: &HashSet<u32>,
 ) {
-    let current_sessions = visibility.sessions_in_current_channels(current_channel_ids);
-    scope.include_sessions(current_sessions.iter().copied());
+    let current_sessions = visibility.session_ids_in_current_channels(current_channel_ids);
+    scope.sessions.extend(current_sessions.iter().copied());
 
     for channel_id in listener_channel_ids {
         if let Some(listener_sessions) = visibility.sessions_by_listener_channel.get(channel_id) {
-            for session in listener_sessions {
-                if current_sessions.contains(session) {
+            for packed_session in listener_sessions {
+                if current_sessions.contains(packed_session) {
                     continue;
                 }
-                scope.include_listener_channel_removal(*session, std::iter::once(*channel_id));
+                scope
+                    .listener_channel_removals
+                    .entry(*packed_session)
+                    .or_default()
+                    .insert(*channel_id);
             }
         }
     }
@@ -1538,6 +1590,13 @@ async fn visibility_refresh_scope_for_viewer_delta(
             scope.include_user_state_names();
         }
     } else if let Some(new_channel_id) = delta.current_channel_id {
+        // The viewer's old channel may no longer be retained after a move,
+        // while the new channel and its parents must be introduced before
+        // the self UserState points at them.
+        scope.include_channel(new_channel_id);
+        if let Some(old_channel_id) = old_viewer_channel_id {
+            scope.include_channel(old_channel_id);
+        }
         scope.include_channels(
             crate::channel_handler::home_channel_dependent_channel_ids(
                 server,
@@ -1933,16 +1992,26 @@ mod tests {
         let mut scope = VisibilityRefreshScope::new();
         include_delete_visibility_refresh(&mut scope, &visibility, &channels(&[7, 8]));
 
-        assert_eq!(scope.sessions, HashSet::from([session(11)]));
+        assert_eq!(scope.sessions, HashSet::from([u32::from(session(11))]));
         assert_eq!(
-            scope.listener_channel_removals.get(&session(10)).cloned(),
+            scope
+                .listener_channel_removals
+                .get(&u32::from(session(10)))
+                .cloned(),
             Some(channels(&[7]))
         );
         assert_eq!(
-            scope.listener_channel_removals.get(&session(12)).cloned(),
+            scope
+                .listener_channel_removals
+                .get(&u32::from(session(12)))
+                .cloned(),
             Some(channels(&[8]))
         );
-        assert!(!scope.listener_channel_removals.contains_key(&session(11)));
+        assert!(
+            !scope
+                .listener_channel_removals
+                .contains_key(&u32::from(session(11)))
+        );
     }
 
     #[test]

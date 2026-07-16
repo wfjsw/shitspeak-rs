@@ -260,20 +260,33 @@ async fn strict_concurrent_proposers_total_order() {
     .await;
     assert!(warmed, "all nodes must apply the warm-up proposal");
 
-    let tasks = [(handles[0].clone(), 1000), (handles[1].clone(), 2000)]
+    let tasks: Vec<_> = [(handles[0].clone(), 1000), (handles[1].clone(), 2000)]
         .into_iter()
         .map(|(handle, base)| {
-            tokio::spawn(async move {
-                for k in 0..10u64 {
-                    handle.propose(base + k).await.unwrap();
-                }
-            })
-        });
-    for task in tasks {
-        timeout(Duration::from_secs(90), task)
+            (
+                base,
+                tokio::spawn(async move {
+                    for k in 0..10u64 {
+                        handle.propose(base + k).await?;
+                    }
+                    Ok::<(), ReplicationError>(())
+                }),
+            )
+        })
+        .collect();
+    for (base, task) in tasks {
+        let result = timeout(Duration::from_secs(90), task)
             .await
             .expect("concurrent proposer hung")
             .expect("concurrent proposer panicked");
+        if let Err(error) = result {
+            panic!(
+                "concurrent proposer {base} failed: {error:?}, node10={:?}, node20={:?}, node30={:?}",
+                handles[0].debug_state(),
+                handles[1].debug_state(),
+                handles[2].debug_state(),
+            );
+        }
     }
 
     let ok = wait_until(Duration::from_secs(15), || {
@@ -289,7 +302,12 @@ async fn strict_concurrent_proposers_total_order() {
         "the committed log must contain every proposal"
     );
     for repo in &repos[1..] {
-        assert_eq!(repo.log(), log0, "replicas diverged on total order");
+        let log = repo.log();
+        let metadata = repo.state.lock().1.clone();
+        assert_eq!(
+            log, log0,
+            "replicas diverged on total order: metadata={metadata:?}"
+        );
     }
 
     cluster.shutdown().await;
@@ -486,6 +504,10 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
     assert!(
         repos[1].log().iter().any(|(_, op)| *op == 2222),
         "the post-restart proposal is absent from the converged log"
+    );
+    assert!(
+        repos[1].log().iter().any(|(_, op)| *op == 1111),
+        "the recovered pre-restart proposal is absent from the converged log"
     );
 
     new_manager.shutdown().await;
@@ -966,7 +988,17 @@ async fn strict_unreachable_node_during_replication_survives() {
 #[tokio::test]
 async fn strict_replication_survives_random_cross_node_link_failures() {
     let node_ids: Vec<u16> = (1..=7).collect();
-    let cluster = ReplCluster::build_full_mesh(&node_ids).await;
+    // Keep the retry cadence bounded while the test deliberately churns
+    // routes.  The production default allows the adaptive clock tick to
+    // grow to five seconds; under this synthetic jitter that leaves too
+    // little time for a proposal's retry fanout before its ten-second TTL.
+    let repl_cfg = ReplicationConfig::default()
+        .with_fallback_clock_tick(Duration::from_millis(100))
+        .with_min_clock_tick(Duration::from_millis(50))
+        .with_max_clock_tick(Duration::from_millis(500))
+        .with_propose_ttl(Duration::from_secs(20))
+        .with_pending_propose_ttl(Duration::from_secs(40));
+    let cluster = ReplCluster::build_full_mesh_with_config(&node_ids, repl_cfg).await;
     let repos: Vec<Arc<CountingStrictRepo>> =
         node_ids.iter().map(|_| CountingStrictRepo::new()).collect();
     let mut handles = Vec::new();
@@ -990,7 +1022,9 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
     let mut rng = SmallRng::seed_from_u64(0x52_32_52_4f_42_55_53_54);
     let mut blocked_pairs = Vec::new();
     for round in 0..10u64 {
-        while blocked_pairs.len() < 5 {
+        // Keep enough alternate paths for the 6-of-7 fast quorum while still
+        // forcing every round to exercise indirect routing.
+        while blocked_pairs.len() < 3 {
             let a = rng.random_range(1..=7);
             let mut b = rng.random_range(1..=7);
             while b == a {
@@ -1030,6 +1064,21 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
             wait_for_full_routing(&cluster.cluster, Duration::from_secs(10)).await,
             "routing did not converge while hostile links were failing"
         );
+        let strict_idle = wait_until(Duration::from_secs(15), || {
+            handles.iter().all(|handle| {
+                let state = handle.debug_state();
+                !state.election_pending() && !state.election_active()
+            })
+        })
+        .await;
+        assert!(
+            strict_idle,
+            "strict history election did not quiesce while hostile links were failing: states={:?}",
+            handles
+                .iter()
+                .map(|handle| handle.debug_state())
+                .collect::<Vec<_>>()
+        );
 
         let proposer = rng.random_range(0..handles.len());
         let handle = handles[proposer].clone();
@@ -1037,9 +1086,9 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
         let task = tokio::spawn(async move { handle.propose(9000 + round).await });
         let version = timeout(Duration::from_secs(30), task)
             .await
-            .expect("proposal hung while cross-node links were failing")
-            .expect("proposal task panicked while cross-node links were failing")
-            .expect("strict replication should route around hostile link failures");
+            .unwrap_or_else(|_| panic!("proposal hung while cross-node links were failing: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}"))
+            .unwrap_or_else(|e| panic!("proposal task panicked while cross-node links were failing: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, join_error={e}"))
+            .unwrap_or_else(|e| panic!("strict replication should route around hostile link failures: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, error={e:?}, states={:?}", handles.iter().map(|h| h.debug_state()).collect::<Vec<_>>()));
         assert_eq!(version, expected_version);
 
         let ok = wait_until(Duration::from_secs(15), || {

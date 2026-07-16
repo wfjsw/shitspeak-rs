@@ -516,7 +516,27 @@ where
     let mut session = SignalingSession::default();
     send_gateway_config(&mut stream, &context, &mut session).await?;
     loop {
+        drain_web_visibility_reloads(&mut stream, &context, &mut session, false).await?;
         tokio::select! {
+            biased;
+
+            visibility_reload = async {
+                match session.visibility_reload_rx.as_mut() {
+                    Some(rx) => Some(rx.recv().await),
+                    None => std::future::pending::<Option<
+                        Result<(), tokio::sync::broadcast::error::RecvError>,
+                    >>().await,
+                }
+            }, if session.visibility_reload_rx.is_some() => {
+                match visibility_reload {
+                    Some(Ok(())) | Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                        drain_web_visibility_reloads(&mut stream, &context, &mut session, true).await?;
+                    }
+                    Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
+                        session.visibility_reload_rx = None;
+                    }
+                }
+            }
             frame = reader.read_frame(&mut stream) => {
                 match frame? {
                     WebSocketFrame::Text(payload) => {
@@ -601,42 +621,15 @@ where
             }, if session.channel_log_rx.is_some() => {
                 match channel_update {
                     Some(Ok(op)) => {
+                        drain_web_visibility_reloads(&mut stream, &context, &mut session, false).await?;
                         send_web_channel_log_update(&mut stream, &context, &mut session, op).await?;
                     }
                     Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                        drain_web_visibility_reloads(&mut stream, &context, &mut session, false).await?;
                         send_web_channel_log_gap(&mut stream, &context, &mut session).await?;
                     }
                     Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
                         send_websocket_error(&mut stream, "web channel update stream closed").await?;
-                    }
-                }
-            }
-            visibility_reload = async {
-                match session.visibility_reload_rx.as_mut() {
-                    Some(rx) => Some(rx.recv().await),
-                    None => std::future::pending::<Option<
-                        Result<(), tokio::sync::broadcast::error::RecvError>,
-                    >>().await,
-                }
-            }, if session.visibility_reload_rx.is_some() => {
-                match visibility_reload {
-                    Some(Ok(())) | Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-                        if let (Some(server), Some(client)) = (context.server.as_ref(), session.client.as_ref()) {
-                            let messages = shitspeak_runtime::client::visibility::visibility_config_reload_messages(
-                                server,
-                                client,
-                                &mut session.user_visibility,
-                                &mut session.channel_tree_shadow,
-                                &mut session.channel_shadow,
-                            )
-                            .await;
-                            for message in messages {
-                                send_web_outbound_message(&mut stream, session.peer.as_ref(), message).await?;
-                            }
-                        }
-                    }
-                    Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
-                        session.visibility_reload_rx = None;
                     }
                 }
             }
@@ -653,9 +646,11 @@ where
             }, if session.client_log_rx.is_some() => {
                 match client_update {
                     Some(Ok(payload)) => {
+                        drain_web_visibility_reloads(&mut stream, &context, &mut session, false).await?;
                         send_web_client_log_update(&mut stream, &context, &mut session, payload).await?;
                     }
                     Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                        drain_web_visibility_reloads(&mut stream, &context, &mut session, false).await?;
                         send_web_client_log_gap(&mut stream, &context, &mut session).await?;
                     }
                     Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
@@ -665,6 +660,59 @@ where
             }
         }
     }
+}
+
+async fn drain_web_visibility_reloads(
+    stream: &mut (impl AsyncWrite + Unpin),
+    context: &SignalingContext,
+    session: &mut SignalingSession,
+    mut reload_requested: bool,
+) -> io::Result<()> {
+    reload_requested |= drain_visibility_reload_receiver(&mut session.visibility_reload_rx);
+    if !reload_requested {
+        return Ok(());
+    }
+
+    let (Some(server), Some(client)) = (context.server.as_ref(), session.client.as_ref()) else {
+        return Ok(());
+    };
+    let messages = shitspeak_runtime::client::visibility::visibility_config_reload_messages(
+        server,
+        client,
+        &mut session.user_visibility,
+        &mut session.channel_tree_shadow,
+        &mut session.channel_shadow,
+    )
+    .await;
+    for message in messages {
+        send_web_outbound_message(stream, session.peer.as_ref(), message).await?;
+    }
+    Ok(())
+}
+
+fn drain_visibility_reload_receiver(
+    receiver: &mut Option<tokio::sync::broadcast::Receiver<()>>,
+) -> bool {
+    let mut reload_requested = false;
+    let mut receiver_closed = false;
+    if let Some(rx) = receiver.as_mut() {
+        loop {
+            match rx.try_recv() {
+                Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    reload_requested = true;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    receiver_closed = true;
+                    break;
+                }
+            }
+        }
+    }
+    if receiver_closed {
+        *receiver = None;
+    }
+    reload_requested
 }
 
 async fn send_web_outbound_message(
@@ -1824,11 +1872,19 @@ fn permission_info_refresh_scope_for_delta(
 fn permission_info_refresh_scope_for_entry(
     entry: &ClientStateLogEntry,
     viewer_session_id: ClientSessionIdentifier,
+    viewer_client_instance_id: shitspeak_runtime::client::ClientInstanceId,
 ) -> Option<PermissionInfoRefreshScope> {
     match &entry.op {
         ClientStateOperation::UpdateGlobalState {
-            session_id, delta, ..
-        } if *session_id == viewer_session_id => permission_info_refresh_scope_for_delta(delta),
+            session_id,
+            client_instance_id,
+            delta,
+            ..
+        } if *session_id == viewer_session_id
+            && (*client_instance_id == 0 || *client_instance_id == viewer_client_instance_id) =>
+        {
+            permission_info_refresh_scope_for_delta(delta)
+        }
         _ => None,
     }
 }
@@ -2008,19 +2064,22 @@ async fn send_web_client_log_entry(
     entry: &ClientStateLogEntry,
 ) -> io::Result<()> {
     let old_viewer_channel_id = channel_shadow.get(&client.get_session_id()).copied();
-    let permission_refresh_scope =
-        permission_info_refresh_scope_for_entry(entry, client.get_session_id())
-            .map(|scope| match scope {
-                PermissionInfoRefreshScope::HomeChannelDependent {
-                    old_channel_id: _,
-                    new_channel_id,
-                } => PermissionInfoRefreshScope::HomeChannelDependent {
-                    old_channel_id: old_viewer_channel_id,
-                    new_channel_id,
-                },
-                scope => scope,
-            })
-            .unwrap_or(PermissionInfoRefreshScope::All);
+    let permission_refresh_scope = permission_info_refresh_scope_for_entry(
+        entry,
+        client.get_session_id(),
+        client.client_instance_id(),
+    )
+    .map(|scope| match scope {
+        PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id: _,
+            new_channel_id,
+        } => PermissionInfoRefreshScope::HomeChannelDependent {
+            old_channel_id: old_viewer_channel_id,
+            new_channel_id,
+        },
+        scope => scope,
+    })
+    .unwrap_or(PermissionInfoRefreshScope::All);
     let visibility_refresh_scope =
         shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
             server,
@@ -2435,6 +2494,21 @@ mod tests {
         assert_eq!(negotiated_speaker_slots(Some(64), 8), 8);
         assert_eq!(negotiated_speaker_slots(Some(0), 8), 1);
         assert_eq!(negotiated_speaker_slots(Some(0), 0), 1);
+    }
+
+    #[test]
+    fn visibility_reload_receiver_drains_queued_notifications() {
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let mut rx = Some(rx);
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+
+        assert!(drain_visibility_reload_receiver(&mut rx));
+        assert!(!drain_visibility_reload_receiver(&mut rx));
+
+        drop(tx);
+        assert!(!drain_visibility_reload_receiver(&mut rx));
+        assert!(rx.is_none());
     }
 
     #[tokio::test]

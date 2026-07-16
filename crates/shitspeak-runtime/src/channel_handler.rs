@@ -20,10 +20,18 @@ use crate::{
     server::Server,
 };
 
+type PackedSessionId = u32;
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionChannelShadow {
-    session_channel: HashMap<ClientSessionIdentifier, u32>,
-    sessions_by_channel: HashMap<u32, HashSet<ClientSessionIdentifier>>,
+    session_channel: HashMap<PackedSessionId, u32>,
+    sessions_by_channel: HashMap<u32, HashSet<PackedSessionId>>,
+}
+
+fn unpack_session_entry(
+    (session, channel): (PackedSessionId, u32),
+) -> (ClientSessionIdentifier, u32) {
+    (ClientSessionIdentifier::from(session), channel)
 }
 
 impl SessionChannelShadow {
@@ -32,24 +40,26 @@ impl SessionChannelShadow {
     }
 
     pub fn insert(&mut self, session: ClientSessionIdentifier, channel_id: u32) -> Option<u32> {
-        let old = self.session_channel.insert(session, channel_id);
-        if old == Some(channel_id) {
-            return old;
+        let packed_session = u32::from(session);
+        let old_channel_id = self.session_channel.insert(packed_session, channel_id);
+        if old_channel_id == Some(channel_id) {
+            return old_channel_id;
         }
-        if let Some(old_channel_id) = old {
-            self.remove_index_entry(session, old_channel_id);
+        if let Some(old_channel_id) = old_channel_id {
+            self.remove_index_entry(packed_session, old_channel_id);
         }
         self.sessions_by_channel
             .entry(channel_id)
             .or_default()
-            .insert(session);
-        old
+            .insert(packed_session);
+        old_channel_id
     }
 
     pub fn remove(&mut self, session: &ClientSessionIdentifier) -> Option<u32> {
-        let old = self.session_channel.remove(session)?;
-        self.remove_index_entry(*session, old);
-        Some(old)
+        let packed_session = u32::from(*session);
+        let old_channel_id = self.session_channel.remove(&packed_session)?;
+        self.remove_index_entry(packed_session, old_channel_id);
+        Some(old_channel_id)
     }
 
     pub fn clear(&mut self) {
@@ -64,15 +74,17 @@ impl SessionChannelShadow {
     }
 
     pub fn get(&self, session: &ClientSessionIdentifier) -> Option<&u32> {
-        self.session_channel.get(session)
+        self.session_channel.get(&u32::from(*session))
     }
 
     pub fn contains_key(&self, session: &ClientSessionIdentifier) -> bool {
-        self.session_channel.contains_key(session)
+        self.session_channel.contains_key(&u32::from(*session))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ClientSessionIdentifier, &u32)> {
-        self.session_channel.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (ClientSessionIdentifier, &u32)> {
+        self.session_channel
+            .iter()
+            .map(|(session, channel)| (ClientSessionIdentifier::from(*session), channel))
     }
 
     pub fn values(&self) -> impl Iterator<Item = &u32> {
@@ -86,12 +98,15 @@ impl SessionChannelShadow {
                 sessions.extend(channel_sessions.iter().copied());
             }
         }
-        let mut sessions = sessions.into_iter().collect::<Vec<_>>();
+        let mut sessions = sessions
+            .into_iter()
+            .map(ClientSessionIdentifier::from)
+            .collect::<Vec<_>>();
         sessions.sort_by_key(|session| u32::from(*session));
         sessions
     }
 
-    fn remove_index_entry(&mut self, session: ClientSessionIdentifier, channel_id: u32) {
+    fn remove_index_entry(&mut self, session: PackedSessionId, channel_id: u32) {
         let Some(sessions) = self.sessions_by_channel.get_mut(&channel_id) else {
             return;
         };
@@ -104,10 +119,13 @@ impl SessionChannelShadow {
 
 impl IntoIterator for SessionChannelShadow {
     type Item = (ClientSessionIdentifier, u32);
-    type IntoIter = std::collections::hash_map::IntoIter<ClientSessionIdentifier, u32>;
+    type IntoIter = std::iter::Map<
+        std::collections::hash_map::IntoIter<PackedSessionId, u32>,
+        fn((PackedSessionId, u32)) -> (ClientSessionIdentifier, u32),
+    >;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.session_channel.into_iter()
+        self.session_channel.into_iter().map(unpack_session_entry)
     }
 }
 
@@ -162,6 +180,117 @@ impl ChannelTreeShadow {
             _ => {}
         }
     }
+}
+
+/// Returns a channel and its complete parent chain from an in-memory channel
+/// snapshot. The result is used to retain the viewer's own placement even
+/// when an ACL update removes Traverse from that channel.
+pub(crate) fn channel_and_ancestor_ids(
+    channels: &[shitspeak_state::Channel],
+    channel_id: u32,
+) -> HashSet<u32> {
+    let by_id: HashMap<u32, &shitspeak_state::Channel> = channels
+        .iter()
+        .map(|channel| (channel.id, channel))
+        .collect();
+    let mut result = HashSet::new();
+    let mut current_id = channel_id;
+    while let Some(channel) = by_id.get(&current_id) {
+        if !result.insert(current_id) {
+            break;
+        }
+        let Some(parent_id) = channel.parent_id else {
+            break;
+        };
+        current_id = parent_id;
+    }
+    result
+}
+
+/// Extends `channel_ids` with every descendant of an already-affected
+/// channel. Building the parent-to-children index once keeps reparent and
+/// home-channel refreshes linear in the channel tree rather than repeatedly
+/// walking it per affected root.
+pub(crate) fn expand_channel_ids_to_descendant_closure(
+    channels: &[shitspeak_state::Channel],
+    channel_ids: &mut HashSet<u32>,
+) {
+    if channel_ids.is_empty() {
+        return;
+    }
+
+    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    for channel in channels {
+        if let Some(parent_id) = channel.parent_id {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(channel.id);
+        }
+    }
+
+    let mut pending = channel_ids.iter().copied().collect::<VecDeque<_>>();
+    while let Some(channel_id) = pending.pop_front() {
+        let Some(children) = children_by_parent.get(&channel_id) else {
+            continue;
+        };
+        for child_id in children {
+            if channel_ids.insert(*child_id) {
+                pending.push_back(*child_id);
+            }
+        }
+    }
+}
+
+/// Orders a set of channel removals so descendants are removed before their
+/// parents. A client treats a removed parent as a subtree removal, so numeric
+/// ID ordering can otherwise make the socket-local tree diverge.
+pub(crate) fn channel_removal_ids_descendant_first(
+    channels: &[shitspeak_state::Channel],
+    channel_ids: &HashSet<u32>,
+) -> Vec<u32> {
+    let present_ids = channels
+        .iter()
+        .map(|channel| channel.id)
+        .collect::<HashSet<_>>();
+    let mut ordered = ordered_snapshot_channels(channels)
+        .into_iter()
+        .map(|channel| channel.id)
+        .filter(|channel_id| channel_ids.contains(channel_id))
+        .collect::<Vec<_>>();
+    ordered.reverse();
+
+    let mut missing = channel_ids
+        .iter()
+        .filter(|channel_id| !present_ids.contains(channel_id))
+        .copied()
+        .collect::<Vec<_>>();
+    missing.sort_unstable_by(|left, right| right.cmp(left));
+    ordered.extend(missing);
+    ordered
+}
+
+async fn viewer_current_channel_and_ancestor_ids(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+) -> HashSet<u32> {
+    let server_id = client.server_id();
+    let channels = server.get_channels();
+    let mut result = HashSet::new();
+    let mut current_id = client.get_current_channel_id();
+    loop {
+        if !result.insert(current_id) {
+            break;
+        }
+        let Some(channel) = channels.get_channel_in_server(&server_id, current_id).await else {
+            break;
+        };
+        let Some(parent_id) = channel.parent_id else {
+            break;
+        };
+        current_id = parent_id;
+    }
+    result
 }
 
 pub async fn can_view_channel(
@@ -220,14 +349,30 @@ async fn channel_is_visible_in_shadow(
 
     let channels = server.get_channels();
     let server_id = client.server_id();
+    let mut retained_channel_ids = None;
     let mut current_id = channel_id;
     let mut visited = HashSet::new();
     loop {
-        if !visited.insert(current_id)
-            || !channel_tree_shadow.contains(&current_id)
-            || !can_view_channel(server, client, current_id).await
-        {
+        if !visited.insert(current_id) || !channel_tree_shadow.contains(&current_id) {
             return false;
+        }
+        if !can_view_channel(server, client, current_id).await {
+            let retained = match retained_channel_ids.as_ref() {
+                Some(retained) => retained,
+                None => {
+                    retained_channel_ids =
+                        Some(viewer_current_channel_and_ancestor_ids(server, client).await);
+                    retained_channel_ids
+                        .as_ref()
+                        .expect("retained viewer channel IDs were just set")
+                }
+            };
+            // Only updates to the viewer's own current channel or an
+            // ancestor of it may bypass Traverse. A sibling must still be
+            // rejected when one of its ancestors is hidden.
+            if !retained.contains(&channel_id) {
+                return false;
+            }
         }
         let Some(channel) = channels.get_channel_in_server(&server_id, current_id).await else {
             return current_id == 0;
@@ -272,6 +417,10 @@ pub async fn build_visible_channel_snapshot_messages(
                 visible_channel_ids.insert(channel.id);
             }
         }
+        visible_channel_ids.extend(channel_and_ancestor_ids(
+            snapshot,
+            client.get_current_channel_id(),
+        ));
         close_visible_channel_ancestors(snapshot, &mut visible_channel_ids);
     } else {
         visible_channel_ids.extend(snapshot.iter().map(|channel| channel.id));
@@ -490,6 +639,10 @@ pub async fn prepare_channel_visibility_refresh(
             visible_channel_ids.insert(channel.id);
         }
     }
+    visible_channel_ids.extend(channel_and_ancestor_ids(
+        &candidate_channels,
+        client.get_current_channel_id(),
+    ));
     close_visible_channel_ancestors(&candidate_channels, &mut visible_channel_ids);
 
     let mut removed_channel_ids = channel_tree_shadow
@@ -500,7 +653,9 @@ pub async fn prepare_channel_visibility_refresh(
         })
         .copied()
         .collect::<Vec<_>>();
-    removed_channel_ids.sort_unstable_by(|left, right| right.cmp(left));
+    let removed_channel_id_set = removed_channel_ids.into_iter().collect::<HashSet<_>>();
+    let removed_channel_ids =
+        channel_removal_ids_descendant_first(&candidate_channels, &removed_channel_id_set);
 
     let mut final_visible_channel_ids = channel_tree_shadow.channel_ids().clone();
     for channel_id in &removed_channel_ids {
@@ -1155,8 +1310,11 @@ async fn replay_channel_snapshot(
         server.get_send_permission_info(),
     )
     .await;
-    let mut removed = previous.difference(&current).copied().collect::<Vec<_>>();
-    removed.sort_unstable();
+    let removed_channel_ids = previous
+        .difference(&current)
+        .copied()
+        .collect::<HashSet<_>>();
+    let removed = channel_removal_ids_descendant_first(&snapshot, &removed_channel_ids);
 
     let mut outbound = Vec::with_capacity(messages.len() + removed.len());
     *channel_tree_shadow = current;
@@ -1247,7 +1405,7 @@ pub fn ordered_snapshot_channels(
 /// present too.  ACLs may make a non-inheriting child traversable while its
 /// parent is not, so close the direct visibility result over the channel tree
 /// before emitting any ChannelState messages.
-fn close_visible_channel_ancestors(
+pub(crate) fn close_visible_channel_ancestors(
     channels: &[shitspeak_state::Channel],
     visible_channel_ids: &mut HashSet<u32>,
 ) {
@@ -1297,9 +1455,10 @@ mod tests {
     use shitspeak_state::ChannelHierarchy;
 
     use super::{
-        ChannelTreeShadow, SessionChannelShadow, channels_affected_by_home_channel_move,
+        ChannelTreeShadow, SessionChannelShadow, channel_and_ancestor_ids,
+        channel_removal_ids_descendant_first, channels_affected_by_home_channel_move,
         channels_with_home_channel_dependent_acls, close_visible_channel_ancestors,
-        ordered_snapshot_channels,
+        expand_channel_ids_to_descendant_closure, ordered_snapshot_channels,
     };
 
     fn channel(id: u32, parent_id: Option<u32>, position: i32) -> Channel {
@@ -1452,6 +1611,56 @@ mod tests {
     }
 
     #[test]
+    fn viewer_channel_path_includes_the_current_channel_and_every_ancestor() {
+        let channels = vec![
+            channel(0, None, 0),
+            channel(40, Some(0), 0),
+            channel(7, Some(40), 0),
+            channel(99, Some(0), 1),
+        ];
+
+        assert_eq!(
+            channel_and_ancestor_ids(&channels, 7),
+            HashSet::from([0, 7, 40])
+        );
+    }
+
+    #[test]
+    fn descendant_closure_expands_each_affected_root_once() {
+        let channels = vec![
+            channel(0, None, 0),
+            channel(100, Some(0), 0),
+            channel(2, Some(100), 0),
+            channel(3, Some(2), 0),
+            channel(50, Some(0), 1),
+            channel(51, Some(50), 0),
+            channel(99, Some(0), 2),
+        ];
+        let mut affected = HashSet::from([100, 50]);
+
+        expand_channel_ids_to_descendant_closure(&channels, &mut affected);
+
+        assert_eq!(affected, HashSet::from([100, 2, 3, 50, 51]));
+    }
+
+    #[test]
+    fn channel_removals_are_descendant_first_even_when_ids_are_not() {
+        let channels = vec![
+            channel(0, None, 0),
+            channel(100, Some(0), 0),
+            channel(2, Some(100), 0),
+            channel(1, Some(2), 0),
+            channel(50, Some(0), 1),
+        ];
+        let removed = HashSet::from([100, 2, 1]);
+
+        assert_eq!(
+            channel_removal_ids_descendant_first(&channels, &removed),
+            vec![1, 2, 100]
+        );
+    }
+
+    #[test]
     fn home_channel_dependent_acl_scan_matches_effective_chain_inheritance() {
         let mut root = channel(0, None, 0);
         root.acls = vec![home_acl("in", false, true)];
@@ -1557,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn session_channel_shadow_extend_and_bucket_union_are_indexed() {
+    fn session_channel_shadow_extend_and_bucket_union() {
         let mut base = SessionChannelShadow::new();
         base.insert(session(10), 1);
         base.insert(session(11), 2);
@@ -1574,7 +1783,7 @@ mod tests {
         assert_eq!(
             shadow
                 .iter()
-                .map(|(session, _)| *session)
+                .map(|(session, _)| session)
                 .collect::<HashSet<_>>(),
             HashSet::from([session(10), session(11), session(12), session(13)])
         );
@@ -1789,13 +1998,14 @@ pub async fn home_channel_dependent_channel_ids(
 ) -> Vec<u32> {
     let server_id = client.server_id();
     let all_channels = server.get_channels().get_all_in_server(&server_id).await;
-    let channels = match old_channel_id {
-        Some(old_channel_id) => {
-            channels_affected_by_home_channel_move(all_channels, old_channel_id, new_channel_id)
-        }
-        None => channels_with_home_channel_dependent_acls(all_channels),
+    let tree = ChannelTree::new(&all_channels);
+    let mut affected = match old_channel_id {
+        Some(old_channel_id) => tree
+            .home_channel_move_affected_channel_ids_for_channel_ids(old_channel_id, new_channel_id),
+        None => tree.home_channel_dependent_acl_channel_ids(),
     };
-    channels.into_iter().map(|channel| channel.id).collect()
+    tree.expand_descendant_closure(&mut affected);
+    affected.into_iter().collect()
 }
 
 async fn build_channel_permission_info_refresh_messages_for_channels(
@@ -1855,8 +2065,7 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
 }
 
 fn channels_with_home_channel_dependent_acls(channels: Vec<Channel>) -> Vec<Channel> {
-    let tree = ChannelTree::new(&channels);
-    let affected = tree.home_channel_dependent_acl_channel_ids();
+    let affected = ChannelTree::new(&channels).home_channel_dependent_acl_channel_ids();
 
     channels
         .into_iter()
@@ -1869,16 +2078,10 @@ fn channels_affected_by_home_channel_move(
     old_channel_id: u32,
     new_channel_id: u32,
 ) -> Vec<Channel> {
-    let tree = ChannelTree::new(&channels);
-    let Some(old_ancestors) = tree.ancestor_ids_for_channel(old_channel_id) else {
-        return channels_with_home_channel_dependent_acls(channels);
+    let affected = {
+        let tree = ChannelTree::new(&channels);
+        tree.home_channel_move_affected_channel_ids_for_channel_ids(old_channel_id, new_channel_id)
     };
-    let Some(new_ancestors) = tree.ancestor_ids_for_channel(new_channel_id) else {
-        return channels_with_home_channel_dependent_acls(channels);
-    };
-    let old_home = ChannelHierarchy::new(old_channel_id, &old_ancestors);
-    let new_home = ChannelHierarchy::new(new_channel_id, &new_ancestors);
-    let affected = tree.home_channel_move_affected_channel_ids(old_home, new_home);
 
     channels
         .into_iter()
@@ -2027,6 +2230,36 @@ impl<'a> ChannelTree<'a> {
             );
         }
         affected
+    }
+
+    fn home_channel_move_affected_channel_ids_for_channel_ids(
+        &self,
+        old_channel_id: u32,
+        new_channel_id: u32,
+    ) -> HashSet<u32> {
+        let Some(old_ancestors) = self.ancestor_ids_for_channel(old_channel_id) else {
+            return self.home_channel_dependent_acl_channel_ids();
+        };
+        let Some(new_ancestors) = self.ancestor_ids_for_channel(new_channel_id) else {
+            return self.home_channel_dependent_acl_channel_ids();
+        };
+        let old_home = ChannelHierarchy::new(old_channel_id, &old_ancestors);
+        let new_home = ChannelHierarchy::new(new_channel_id, &new_ancestors);
+        self.home_channel_move_affected_channel_ids(old_home, new_home)
+    }
+
+    fn expand_descendant_closure(&self, channel_ids: &mut HashSet<u32>) {
+        let mut pending = channel_ids.iter().copied().collect::<VecDeque<_>>();
+        while let Some(channel_id) = pending.pop_front() {
+            let Some(children) = self.children_by_parent_id.get(&Some(channel_id)) else {
+                continue;
+            };
+            for child_id in children {
+                if channel_ids.insert(*child_id) {
+                    pending.push_back(*child_id);
+                }
+            }
+        }
     }
 
     fn collect_home_channel_move_affected_channel_ids(

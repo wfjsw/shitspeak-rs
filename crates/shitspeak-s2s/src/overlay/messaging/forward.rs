@@ -1380,7 +1380,12 @@ async fn forward_pb_as(
 #[derive(Debug)]
 enum TreeEdgeSendOutcome {
     Sent,
-    FallbackSent,
+    /// The frame reached the child through an alternate first hop.  A missing
+    /// direct transport still makes the tree edge ineligible for future
+    /// sends, whereas a queue-pressure detour does not.
+    FallbackSent {
+        direct_unavailable: bool,
+    },
     NoRoute,
     Loop,
     Backpressure(SendError),
@@ -1391,7 +1396,7 @@ impl TreeEdgeSendOutcome {
     fn label(&self) -> &'static str {
         match self {
             Self::Sent => "sent",
-            Self::FallbackSent => "fallback_sent",
+            Self::FallbackSent { .. } => "fallback_sent",
             Self::NoRoute => "no_route",
             Self::Loop => "loop",
             Self::Backpressure(_) => "backpressure",
@@ -1401,7 +1406,7 @@ impl TreeEdgeSendOutcome {
 
     fn into_error(self, child: NodeIdentifier, level: ServiceLevel) -> Option<OverlayError> {
         match self {
-            Self::Sent | Self::FallbackSent => None,
+            Self::Sent | Self::FallbackSent { .. } => None,
             Self::NoRoute | Self::Loop => Some(OverlayError::NoRoute { dst: child, level }),
             Self::Backpressure(error) | Self::Transport(error) => Some(OverlayError::Send(error)),
         }
@@ -1423,6 +1428,7 @@ async fn send_direct_tree_edge(
         None,
         self_id,
         child,
+        vec![child],
         data,
         path_trace,
         transport_class,
@@ -1436,6 +1442,7 @@ async fn send_direct_tree_edge_with_routing(
     routing: Option<&RoutingHandle>,
     self_id: NodeIdentifier,
     child: NodeIdentifier,
+    fallback_recipients: Vec<NodeIdentifier>,
     data: &pb::OverlayData,
     path_trace: Vec<u32>,
     transport_class: MessageClass,
@@ -1459,6 +1466,15 @@ async fn send_direct_tree_edge_with_routing(
     // for this physical tree edge. No wall-clock translation is involved.
     let options = transport_options_for_overlay_data(data, Some(hop_ttl));
 
+    // A pressure-aware selection may have no usable queue even while the
+    // direct transport remains live. Only a genuinely unavailable transport
+    // invalidates this tree edge; queue pressure is handled by the fallback
+    // path without forcing a tree rebuild.
+    let direct_unavailable = routing.is_some()
+        && transport
+            .ranked_live_transports_for(child, level, routing_metric)
+            .is_empty();
+
     // A tree edge is normally sent directly to its child so the child can
     // continue the tree without another route calculation. Under queue
     // pressure, however, the direct peer queue can accept the frame and let
@@ -1467,6 +1483,7 @@ async fn send_direct_tree_edge_with_routing(
     // tree metadata removed for that one branch.
     if data.service_tag == VOICE_SERVICE_TAG
         && options.expires_at().is_some()
+        && !fallback_recipients.is_empty()
         && let Some(routing) = routing
         && let Some(next_hop) = select_forward_next_hop_for_send(
             &routing.load(),
@@ -1496,7 +1513,9 @@ async fn send_direct_tree_edge_with_routing(
             %next_hop,
             "using pressure-aware alternate for voice tree edge"
         );
-        let fallback = legacy_subtree_fallback_data(data, vec![child], path_trace.clone());
+        // Legacy fallback removes tree metadata, so it must carry every
+        // final recipient below this child rather than only the relay itself.
+        let fallback = legacy_subtree_fallback_data(data, fallback_recipients, path_trace.clone());
         return match forward_pb_as(
             transport,
             routing,
@@ -1509,7 +1528,7 @@ async fn send_direct_tree_edge_with_routing(
         )
         .await
         {
-            Ok(()) => TreeEdgeSendOutcome::FallbackSent,
+            Ok(()) => TreeEdgeSendOutcome::FallbackSent { direct_unavailable },
             Err(OverlayError::NoRoute { .. }) => TreeEdgeSendOutcome::NoRoute,
             Err(OverlayError::Send(error)) => match error {
                 SendError::UnknownNode { .. } | SendError::NoSuitableTransport { .. } => {
@@ -1566,12 +1585,14 @@ async fn forward_tree_data_v3(
     for child in tree.children(self_id).iter().copied() {
         let edge_data = &data;
         let edge_path_trace = path_trace.clone();
+        let fallback_recipients = tree.descendant_members(child);
         sends.push(async move {
             let outcome = send_direct_tree_edge_with_routing(
                 transport,
                 Some(routing),
                 self_id,
                 child,
+                fallback_recipients,
                 edge_data,
                 edge_path_trace,
                 transport_class,
@@ -1598,7 +1619,12 @@ async fn forward_tree_data_v3(
             trace!(parent = %self_id, %child, outcome = outcome_label, "sent direct distribution tree edge");
             continue;
         }
-        if matches!(&outcome, TreeEdgeSendOutcome::FallbackSent) {
+        if let TreeEdgeSendOutcome::FallbackSent { direct_unavailable } = &outcome {
+            if *direct_unavailable {
+                if let Some(key) = tree_key_from_data(&data) {
+                    distribution.report_edge_failure(key, self_id, child);
+                }
+            }
             trace!(
                 parent = %self_id,
                 %child,
@@ -2188,17 +2214,27 @@ mod tests {
     fn voice_routing_with_direct_and_indirect_route() -> RoutingHandle {
         let routing = new_handle();
         let mut tables = RoutingTables::empty();
-        let table = HashMap::from([(
-            4,
-            RouteEntry {
-                next_hop: 4,
-                cost: 1,
-                latency_us: 1,
-            },
-        )]);
+        let table = HashMap::from([
+            (
+                4,
+                RouteEntry {
+                    next_hop: 4,
+                    cost: 1,
+                    latency_us: 1,
+                },
+            ),
+            (
+                5,
+                RouteEntry {
+                    next_hop: 3,
+                    cost: 6,
+                    latency_us: 6,
+                },
+            ),
+        ]);
         let adjacency = HashMap::from([
             (1, vec![(4, edge(1)), (3, edge(5))]),
-            (3, vec![(4, edge(1))]),
+            (3, vec![(4, edge(1)), (5, edge(1))]),
         ]);
         for level in ServiceLevel::ALL {
             tables.insert_table_with_adjacency(
@@ -2299,6 +2335,7 @@ mod tests {
             Some(&routing),
             1,
             4,
+            vec![4, 5],
             &data,
             vec![node_to_wire(1)],
             MessageClass::HighPriority,
@@ -2306,7 +2343,12 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(outcome, TreeEdgeSendOutcome::FallbackSent));
+        assert!(matches!(
+            outcome,
+            TreeEdgeSendOutcome::FallbackSent {
+                direct_unavailable: false
+            }
+        ));
         let forwarded = timeout(Duration::from_millis(50), alternate_rx.recv())
             .await
             .expect("alternate first hop should receive the fallback")
@@ -2315,8 +2357,49 @@ mod tests {
         let Some(OverlayBody::Data(forwarded)) = decoded.body else {
             panic!("not overlay data");
         };
-        assert_eq!(forwarded.dsts, vec![node_to_wire(4)]);
+        assert_eq!(forwarded.dsts, vec![node_to_wire(4), node_to_wire(5)]);
         assert_eq!(forwarded.distribution_profile, None);
+    }
+
+    #[tokio::test]
+    async fn unavailable_voice_tree_edge_marks_fallback_as_failed_direct_edge() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 3, &[TransportKind::Tcp]);
+        let mut alternate_rx = receivers.pop().expect("alternate child receiver");
+
+        let routing = voice_routing_with_direct_and_indirect_route();
+        let mut data = test_overlay_data(false);
+        data.service_tag = VOICE_SERVICE_TAG;
+        data.service_level = level_to_wire(ServiceLevel::BestEffort);
+        data.message_class = class_to_wire(MessageClass::HighPriority);
+        data.route_metric = route_metric_to_wire(RoutingMetric::ConversationalQuality);
+        data.distribution_profile = Some(1);
+
+        let outcome = send_direct_tree_edge_with_routing(
+            &transport,
+            Some(&routing),
+            1,
+            4,
+            vec![4],
+            &data,
+            vec![node_to_wire(1)],
+            MessageClass::HighPriority,
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            TreeEdgeSendOutcome::FallbackSent {
+                direct_unavailable: true
+            }
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), alternate_rx.recv())
+                .await
+                .expect("alternate first hop should receive the fallback")
+                .is_some()
+        );
     }
 
     fn tables_with_direct_and_indirect_route() -> RoutingTables {

@@ -13,9 +13,9 @@
 //! `AudioSink::deliver` calls remain serialized (per-sender ordering is
 //! preserved).
 //!
-//! `sender_epoch` remains on the repair wire identity, but deliberately does
-//! not participate in reorder state. A delayed ordinary original may rebase a
-//! speaker stream after a sender restart; repair copies never do.
+//! `sender_epoch` distinguishes a restarted sender from a delayed copy of an
+//! existing stream. A newer ordinary original resets the speaker state; late
+//! same-epoch originals are discarded so they cannot rewind delivery.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
@@ -211,6 +211,7 @@ struct ReorderInner {
 }
 
 struct SenderState {
+    sender_epoch: u64,
     next_seq: u64,
     pending: BTreeMap<u64, ReorderEmission>,
     deadline: Option<Instant>,
@@ -277,7 +278,10 @@ impl Reorderer {
         let Some(entry) = state.per_sender.get(&frame.sender_session) else {
             return false;
         };
-        if entry.deadline.is_some() || frame.s2s_seq <= entry.next_seq {
+        if entry.sender_epoch != frame.sender_epoch
+            || entry.deadline.is_some()
+            || frame.s2s_seq <= entry.next_seq
+        {
             return false;
         }
         if let Some(existing) = entry.pending.get(&frame.s2s_seq) {
@@ -576,13 +580,13 @@ impl Reorderer {
         }
 
         // Bootstrap from the first original or proactive sequence instead of
-        // assuming a source always starts at zero. `sender_epoch` is
-        // intentionally not a state key or reset condition.
+        // assuming a source always starts at zero.
         let initial_adaptive_delay_ms = self.initial_adaptive_delay_ms();
         if !state.per_sender.contains_key(&session) {
             state.per_sender.insert(
                 session,
                 SenderState {
+                    sender_epoch,
                     next_seq: frame_seq,
                     pending: BTreeMap::new(),
                     deadline: None,
@@ -601,14 +605,12 @@ impl Reorderer {
             .per_sender
             .remove(&session)
             .expect("speaker state was just inserted or already present");
-        entry.last_activity = now;
 
-        // Only an ordinary older original can rebase. Proactive and reactive
-        // copies must not rewind an established speaker cursor. The original
-        // rebase deliberately permits old/new stream mixing after a source
-        // restart without coupling reorder state to sender epochs.
-        if frame_seq < entry.next_seq {
-            if copy_kind != VoiceCopyKind::Original {
+        // A newer ordinary original is the sender-restart discriminator. A
+        // proactive or reactive copy must never reset an established stream,
+        // and a delayed frame from an older epoch cannot be useful anymore.
+        if sender_epoch != entry.sender_epoch {
+            if sender_epoch < entry.sender_epoch || copy_kind != VoiceCopyKind::Original {
                 results.push(ReorderResultCount::new(
                     VoiceReceiveResult::DuplicateOrLate,
                     1,
@@ -616,11 +618,27 @@ impl Reorderer {
                 state.per_sender.insert(session, entry);
                 return ReorderReport::new(emit, results, state.total_pending, None);
             }
+
             let dropped = std::mem::take(&mut entry.pending).len();
             state.total_pending = state.total_pending.saturating_sub(dropped);
+            entry.sender_epoch = sender_epoch;
+            entry.next_seq = frame_seq;
             entry.deadline = None;
-            entry.next_seq = frame.s2s_seq;
+            entry.adaptive_delay_ms = initial_adaptive_delay_ms;
             entry.in_order_run = 0;
+        }
+        entry.last_activity = now;
+
+        // Once a stream has advanced, every lower same-epoch sequence is a
+        // duplicate or late arrival. Rewinding here re-emits audio and breaks
+        // the receiver's monotonic stream contract.
+        if frame_seq < entry.next_seq {
+            results.push(ReorderResultCount::new(
+                VoiceReceiveResult::DuplicateOrLate,
+                1,
+            ));
+            state.per_sender.insert(session, entry);
+            return ReorderReport::new(emit, results, state.total_pending, None);
         }
 
         // In-order frames emit immediately and drain a contiguous buffered
@@ -856,7 +874,10 @@ impl Reorderer {
         }
         let state = self.state.lock();
         let entry = state.per_sender.get(&frame.sender_session)?;
-        if entry.next_seq >= frame.s2s_seq || !entry.pending.contains_key(&frame.s2s_seq) {
+        if entry.sender_epoch != frame.sender_epoch
+            || entry.next_seq >= frame.s2s_seq
+            || !entry.pending.contains_key(&frame.s2s_seq)
+        {
             return None;
         }
         Some(GapReport {
@@ -873,7 +894,9 @@ impl Reorderer {
         let Some(entry) = state.per_sender.get(&gap.sender_session) else {
             return false;
         };
-        entry.next_seq <= gap.last_seq && !entry.pending.is_empty()
+        entry.sender_epoch == gap.sender_epoch
+            && entry.next_seq <= gap.last_seq
+            && !entry.pending.is_empty()
     }
     #[cfg(test)]
     pub fn pending_total(&self) -> usize {
@@ -1285,16 +1308,19 @@ mod tests {
     }
 
     #[test]
-    fn sender_epoch_does_not_reset_state() {
+    fn newer_sender_epoch_resets_state() {
         let r = Reorderer::new(cfg());
         r.push(11, frame(0xABC, 1, 0, false));
-        r.push(11, frame(0xABC, 1, 2, false));
-        // A changed epoch but ordinary contiguous sequence continues to
-        // deliver and drains the buffered suffix.
-        let emits = r.push(11, frame(0xABC, 2, 1, false));
+        r.push(11, frame(0xABC, 1, 5, false));
+
+        // A newer epoch starts a fresh sequence and discards stale buffered
+        // audio from the previous stream.
+        let emits = r.push(11, frame(0xABC, 2, 0, false));
         let seqs: Vec<u64> = emits.iter().map(|(_, f)| f.s2s_seq).collect();
-        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(seqs, vec![0]);
         assert_eq!(r.pending_total(), 0);
+        assert_eq!(r.push(11, frame(0xABC, 2, 1, false)).len(), 1);
+        assert!(r.push(11, frame(0xABC, 1, 6, false)).is_empty());
     }
 
     #[test]
@@ -1439,19 +1465,21 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_lower_sequence_rebases_and_clears_pending() {
+    fn late_same_epoch_original_does_not_rebase_or_double_emit() {
         let r = Reorderer::new(cfg());
         r.push(11, frame(0xABC, 1, 10, false));
         r.push(11, frame(0xABC, 1, 12, false));
         assert_eq!(r.pending_total(), 1);
 
-        let emits = r.push(11, frame(0xABC, 99, 4, false));
+        assert!(r.push(11, frame(0xABC, 1, 4, false)).is_empty());
+        assert_eq!(r.pending_total(), 1);
+
+        let emits = r.push(11, frame(0xABC, 1, 11, false));
         assert_eq!(
             emits.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
-            vec![4]
+            vec![11, 12]
         );
         assert_eq!(r.pending_total(), 0);
-        assert_eq!(r.push(11, frame(0xABC, 99, 5, false)).len(), 1);
     }
 
     #[test]

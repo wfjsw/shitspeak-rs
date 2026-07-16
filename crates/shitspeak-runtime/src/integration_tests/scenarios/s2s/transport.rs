@@ -265,8 +265,7 @@ async fn one_way_tcp_data_updates_directional_passive_throughput() {
     assert_eq!(recv.transport(), TransportKind::Tcp);
     assert_eq!(recv.payload(), &payload);
 
-    let sender = tcp_metrics(&mgr_a, 202);
-    let receiver = tcp_metrics(&mgr_b, 101);
+    let (sender, receiver) = wait_for_one_way_tcp_passive_metrics(&mgr_a, 202, &mgr_b, 101).await;
     assert!(sender.observed_sent_bps() > 0.0);
     assert_eq!(sender.observed_recv_bps(), 0.0);
     assert_eq!(
@@ -733,4 +732,28 @@ fn tcp_metrics(mgr: &ConnectionManager, node: u16) -> LinkMetrics {
         .and_then(|per_transport| per_transport.get(&TransportKind::Tcp))
         .cloned()
         .expect("tcp metrics")
+}
+
+async fn wait_for_one_way_tcp_passive_metrics(
+    sender_manager: &ConnectionManager,
+    sender_node: u16,
+    receiver_manager: &ConnectionManager,
+    receiver_node: u16,
+) -> (LinkMetrics, LinkMetrics) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let sender = tcp_metrics(sender_manager, sender_node);
+            let receiver = tcp_metrics(receiver_manager, receiver_node);
+            if sender.observed_sent_bps() > 0.0
+                && sender.observed_recv_bps() == 0.0
+                && receiver.observed_recv_bps() > 0.0
+                && receiver.observed_sent_bps() == 0.0
+            {
+                return (sender, receiver);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("one-way TCP passive throughput metrics did not converge")
 }
