@@ -1300,6 +1300,7 @@ mod tests {
 
     use crate::overlay::proto::node_to_wire;
     use crate::overlay::routing::dijkstra;
+    use shitspeak_proto::s2s_overlay_proto::link_state_advert_capabilities as lsa_caps;
     use shitspeak_s2s_transport::ServiceLevel;
 
     fn snap(ids: &[NodeIdentifier]) -> Vec<NeighborSnapshot> {
@@ -1361,6 +1362,11 @@ mod tests {
             origin: node_to_wire(origin),
             boot_epoch: 1,
             seq,
+            available_routing_capabilities: lsa_caps::ROUTING_TRANSIT,
+            available_services: lsa_caps::SERVICE_STRICT_REPLICATION
+                | lsa_caps::SERVICE_CONTENT_REPLICATION
+                | lsa_caps::SERVICE_OWNER_REPLICATION
+                | lsa_caps::SERVICE_VOICE,
             ..Default::default()
         }
     }

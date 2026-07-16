@@ -37,6 +37,7 @@ use shitspeak_s2s_transport::{PeerAddress, TransportKind};
 
 use super::super::proto::{address_from_pb, address_to_pb, kind_to_u32, u32_to_kind};
 use shitspeak_proto::s2s_overlay_proto as pb;
+use shitspeak_proto::s2s_overlay_proto::link_state_advert_capabilities as lsa_caps;
 
 /// Replication service kinds advertised by one overlay member.
 ///
@@ -657,14 +658,14 @@ impl LsaEntry {
             addresses,
             links,
             max_users: pb.max_users,
-            transit_disabled: pb.transit_disabled,
+            transit_disabled: pb.available_routing_capabilities & lsa_caps::ROUTING_TRANSIT == 0,
             replication_services: ReplicationServices::new(
-                !pb.strict_replication_disabled,
-                !pb.content_replication_disabled,
-                !pb.owner_replication_disabled,
+                pb.available_services & lsa_caps::SERVICE_STRICT_REPLICATION != 0,
+                pb.available_services & lsa_caps::SERVICE_CONTENT_REPLICATION != 0,
+                pb.available_services & lsa_caps::SERVICE_OWNER_REPLICATION != 0,
             ),
             application_services: ApplicationServices::with_distribution_capabilities(
-                !pb.voice_service_disabled,
+                pb.available_services & lsa_caps::SERVICE_VOICE != 0,
                 DistributionCapabilities::from_wire(
                     pb.distribution_protocol_version,
                     pb.distribution_profile_ids.iter().copied(),
@@ -713,11 +714,28 @@ impl LsaEntry {
                 })
                 .collect(),
             max_users: self.max_users,
-            transit_disabled: self.transit_disabled,
-            strict_replication_disabled: !self.replication_services.strict(),
-            content_replication_disabled: !self.replication_services.content(),
-            owner_replication_disabled: !self.replication_services.owner(),
-            voice_service_disabled: !self.application_services.voice(),
+            available_routing_capabilities: if self.transit_disabled {
+                0
+            } else {
+                lsa_caps::ROUTING_TRANSIT
+            },
+            available_services: (if self.replication_services.strict() {
+                lsa_caps::SERVICE_STRICT_REPLICATION
+            } else {
+                0
+            }) | (if self.replication_services.content() {
+                lsa_caps::SERVICE_CONTENT_REPLICATION
+            } else {
+                0
+            }) | (if self.replication_services.owner() {
+                lsa_caps::SERVICE_OWNER_REPLICATION
+            } else {
+                0
+            }) | (if self.application_services.voice() {
+                lsa_caps::SERVICE_VOICE
+            } else {
+                0
+            }),
             distribution_protocol_version: self
                 .application_services
                 .distribution()
@@ -1494,11 +1512,11 @@ mod tests {
         }];
         let pb = lsa.to_pb();
         assert_eq!(pb.max_users, 250);
-        assert!(pb.transit_disabled);
-        assert!(!pb.strict_replication_disabled);
-        assert!(!pb.content_replication_disabled);
-        assert!(pb.owner_replication_disabled);
-        assert!(pb.voice_service_disabled);
+        assert_eq!(pb.available_routing_capabilities, 0);
+        assert_eq!(
+            pb.available_services,
+            lsa_caps::SERVICE_STRICT_REPLICATION | lsa_caps::SERVICE_CONTENT_REPLICATION
+        );
         let wire_link = pb.links.first().unwrap();
         assert_eq!(wire_link.loss_ppm, 25_000);
         assert_eq!(wire_link.probe_loss_ppm, 10_000);
@@ -1548,6 +1566,74 @@ mod tests {
                 64,
             )]
         );
+    }
+
+    #[test]
+    fn capability_masks_map_independent_bits() {
+        let pb = pb::LinkStateAdvert {
+            origin: 1,
+            boot_epoch: 100,
+            seq: 1,
+            available_routing_capabilities: lsa_caps::ROUTING_TRANSIT,
+            available_services: lsa_caps::SERVICE_CONTENT_REPLICATION | lsa_caps::SERVICE_VOICE,
+            ..Default::default()
+        };
+
+        let lsa = LsaEntry::from_pb(&pb).unwrap();
+        assert!(!lsa.transit_disabled);
+        assert!(!lsa.replication_services.strict());
+        assert!(lsa.replication_services.content());
+        assert!(!lsa.replication_services.owner());
+        assert!(lsa.application_services.voice());
+
+        let roundtrip = lsa.to_pb();
+        assert_eq!(
+            roundtrip.available_routing_capabilities,
+            lsa_caps::ROUTING_TRANSIT
+        );
+        assert_eq!(
+            roundtrip.available_services,
+            lsa_caps::SERVICE_CONTENT_REPLICATION | lsa_caps::SERVICE_VOICE
+        );
+    }
+
+    #[test]
+    fn absent_capability_masks_mean_no_advertised_capabilities() {
+        let pb = pb::LinkStateAdvert {
+            origin: 1,
+            boot_epoch: 100,
+            seq: 1,
+            ..Default::default()
+        };
+
+        let lsa = LsaEntry::from_pb(&pb).unwrap();
+        assert!(lsa.transit_disabled);
+        assert_eq!(lsa.replication_services, ReplicationServices::NONE);
+        assert!(!lsa.application_services.voice());
+        assert_eq!(
+            lsa.application_services.distribution().protocol_version(),
+            DistributionCapabilities::UNSUPPORTED.protocol_version()
+        );
+    }
+
+    #[test]
+    fn unknown_capability_bits_do_not_change_known_capabilities() {
+        let pb = pb::LinkStateAdvert {
+            origin: 1,
+            boot_epoch: 100,
+            seq: 1,
+            available_routing_capabilities: lsa_caps::ROUTING_TRANSIT | (1 << 31),
+            available_services: lsa_caps::SERVICE_OWNER_REPLICATION | (1 << 31),
+            ..Default::default()
+        };
+
+        let lsa = LsaEntry::from_pb(&pb).unwrap();
+        assert!(!lsa.transit_disabled);
+        assert_eq!(
+            lsa.replication_services,
+            ReplicationServices::new(false, false, true)
+        );
+        assert!(!lsa.application_services.voice());
     }
 
     #[test]

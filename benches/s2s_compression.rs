@@ -47,14 +47,19 @@ fn link_ads(count: u32, links_per_ad: u32) -> Vec<overlay_pb::LinkStateAdvert> {
                     native_loss_ppm: 10,
                     data_health_ppm: 10,
                     loss_sample_count: 100,
+                    transport_metrics: Vec::new(),
                 })
                 .collect(),
             max_users: 100,
-            transit_disabled: false,
-            strict_replication_disabled: false,
-            content_replication_disabled: false,
-            owner_replication_disabled: false,
-            voice_service_disabled: false,
+            available_routing_capabilities:
+                overlay_pb::link_state_advert_capabilities::ROUTING_TRANSIT,
+            available_services:
+                overlay_pb::link_state_advert_capabilities::SERVICE_STRICT_REPLICATION
+                    | overlay_pb::link_state_advert_capabilities::SERVICE_CONTENT_REPLICATION
+                    | overlay_pb::link_state_advert_capabilities::SERVICE_OWNER_REPLICATION
+                    | overlay_pb::link_state_advert_capabilities::SERVICE_VOICE,
+            distribution_protocol_version: 0,
+            distribution_profile_ids: Vec::new(),
         })
         .collect()
 }
@@ -82,6 +87,7 @@ fn overlay_data(service_tag: u32, payload: Bytes) -> Bytes {
             origin_boot_epoch: 1,
             origin_message_id: 1,
             allow_l1_compression: true,
+            ..Default::default()
         },
     ))
 }

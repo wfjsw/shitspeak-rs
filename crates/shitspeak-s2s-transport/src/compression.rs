@@ -1178,11 +1178,12 @@ mod tests {
                         })
                         .collect(),
                     max_users: 100,
-                    transit_disabled: false,
-                    strict_replication_disabled: false,
-                    content_replication_disabled: false,
-                    owner_replication_disabled: false,
-                    voice_service_disabled: false,
+                    available_routing_capabilities:
+                        overlay_pb::link_state_advert_capabilities::ROUTING_TRANSIT,
+                    available_services: overlay_pb::link_state_advert_capabilities::SERVICE_STRICT_REPLICATION
+                        | overlay_pb::link_state_advert_capabilities::SERVICE_CONTENT_REPLICATION
+                        | overlay_pb::link_state_advert_capabilities::SERVICE_OWNER_REPLICATION
+                        | overlay_pb::link_state_advert_capabilities::SERVICE_VOICE,
                     distribution_protocol_version: 0,
                     distribution_profile_ids: Vec::new(),
                 })

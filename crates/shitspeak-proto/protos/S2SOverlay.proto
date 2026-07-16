@@ -58,11 +58,15 @@ message LinkStateAdvert {
   repeated AddressEntry addresses = 6;  // origin's own listen addresses
   repeated LinkAdvert links = 7;
   uint64 max_users = 8;     // origin's local max_users capacity
-  bool transit_disabled = 9; // origin should not be used as a transit router
-  bool strict_replication_disabled = 10;  // origin does not run strict replication
-  bool content_replication_disabled = 11; // origin does not run content/blob replication
-  bool owner_replication_disabled = 12;   // origin does not run owner-scoped replication
-  bool voice_service_disabled = 13;       // origin does not run application voice service
+  // Bitmask of routing capabilities advertised by the origin.
+  // Bit 0: origin may be used as a transit router.
+  uint32 available_routing_capabilities = 9;
+  // Bitmask of services advertised by the origin.
+  // Bit 0: strict replication.
+  // Bit 1: content/blob replication.
+  // Bit 2: owner-scoped replication.
+  // Bit 3: application voice service.
+  uint32 available_services = 10;
   // Zero means this node does not support versioned distribution trees.
   // This deliberately defaults to unsupported for rolling-upgrade safety.
   uint32 distribution_protocol_version = 14;
